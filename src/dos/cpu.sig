@@ -51,11 +51,14 @@
 //! bits, #PF with its error code and CR2, a 256-entry direct-mapped TLB
 //! flushed by CR3 writes, per page by INVLPG).
 //!
+//! Task switches too: far JMP/CALL to a TSS or task gate, task gates in
+//! the IDT, IRET with NT (386 and 286 TSSes; CR0.TS is set, so the next
+//! x87 instruction is #NM).
+//!
 //! What it is: CPUID says GenuineIntel family 4 model 3 (a 486DX2) with
-//! an FPU; EFLAGS.AC and .ID toggle; CR0 reads ET=1. Not here: task
-//! switches (a task gate, a TSS as a jump/call target, IRET with NT, all
-//! stop with .fault and fault_op = FAULT_TASK | selector), virtual-8086
-//! mode (an IRET to VM=1 stops with FAULT_V86), a triple fault (stops
+//! an FPU; EFLAGS.AC and .ID toggle; CR0 reads ET=1. Not here:
+//! virtual-8086 mode (an IRET or a task switch to VM=1 stops with
+//! FAULT_V86), a triple fault (stops
 //! with FAULT_TRIPLE | first << 8 | second vector), #AC (CR0.AM is
 //! ignored), debug-register breakpoints, the segment limits of real mode
 //! (no #GP at offset 0xFFFF; and real mode always runs 16-bit code on a
@@ -114,7 +117,7 @@ pub const IRET32: u32 = POPF32 | RF;
 /// CR0: PE, MP, EM, TS, ET, WP, PG; a 486's at reset (CD NW ET).
 pub const CR0_PE: u32 = 1 << 0;
 const CR0_EM: u32 = 1 << 2;
-const CR0_TS: u32 = 1 << 3;
+pub const CR0_TS: u32 = 1 << 3;
 const CR0_ET: u32 = 1 << 4;
 pub const CR0_WP: u32 = 1 << 16;
 pub const CR0_PG: u32 = 1 << 31;
@@ -124,9 +127,8 @@ const CR0_RESET: u32 = 0x6000_0010;
 pub const SIGNATURE: u32 = 0x0435;
 
 /// fault_op when the core stops on something protected mode has that
-/// it does not: a task switch (| the selector), virtual-8086 mode, a
-/// triple fault (| the first exception's vector << 8 | the second's).
-pub const FAULT_TASK: u32 = 0x7D00_0000;
+/// it does not: virtual-8086 mode, a triple fault (| the first
+/// exception's vector << 8 | the second's).
 pub const FAULT_V86: u32 = 0x7E00_0000;
 pub const FAULT_TRIPLE: u32 = 0x7F00_0000;
 
@@ -375,6 +377,9 @@ pub const Cpu = struct {
     exc_code: u32 = 0,
     /// An x87 operand's access page-faulted (exc_* say how).
     sticky: bool = false,
+    /// The exception raised belongs to the task just switched to: the
+    /// instruction's start is not put back.
+    keep: bool = false,
     /// Stopped for good (a triple fault while delivering an interrupt the
     /// machine asked for): run returns .fault.
     dead: bool = false,
@@ -428,9 +433,13 @@ pub const Cpu = struct {
                 self.ins_esp = self.regs.r[ESP];
                 self.ins_flags = self.regs.flags;
                 const res = self.step(bus, end) catch |e| blk: {
-                    self.regs.eip = self.ins_ip;
-                    self.regs.r[ESP] = self.ins_esp;
-                    self.regs.flags = self.ins_flags;
+                    // (unless a task switch got as far as the new task)
+                    if (!self.keep) {
+                        self.regs.eip = self.ins_ip;
+                        self.regs.r[ESP] = self.ins_esp;
+                        self.regs.flags = self.ins_flags;
+                    }
+                    self.keep = false;
                     if (e == error.Stop) break :blk Exit.fault;
                     self.poll = true;
                     break :blk pm.exception(self, bus.b);

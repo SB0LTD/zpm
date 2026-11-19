@@ -9,10 +9,16 @@
 //! and leaves the CPU's state alone until nothing more can fault: an
 //! instruction that faults part way is restarted as it began.
 //!
-//! Not here (the CPU stops with .fault, and fault_op says which): task
-//! switches (a task gate in the IDT, a TSS or task gate as a far JMP/CALL
-//! target, IRET with NT set: FAULT_TASK | the selector) and virtual-8086
-//! mode (an IRET that would set VM: FAULT_V86).
+//! Task switches (386 and 286 TSSes): far JMP/CALL to a TSS or a task
+//! gate, interrupts and exceptions through task gates in the IDT, IRET
+//! with NT back to the TSS the back link names. An error the new task's
+//! own state causes (its LDT, segments, EIP) is an exception in the new
+//! task, the switch done (`keep`: the faulting instruction's EIP, ESP and
+//! EFLAGS are not put back).
+//!
+//! Not here (the CPU stops with .fault, and fault_op says which):
+//! virtual-8086 mode (an IRET or a task switch that would set VM:
+//! FAULT_V86). The TSS's debug trap bit is ignored.
 
 const std = @import("std");
 const cpu_mod = @import("cpu.sig");
@@ -382,7 +388,17 @@ pub fn far(c: *Cpu, b: anytype, sel: u16, off: u32, o32: bool, call: bool) Exc!v
     }
     switch (d.typ()) {
         4, 12 => return gate(c, b, sel, d, call),
-        1, 5, 9 => return c.stop(cpu_mod.FAULT_TASK | sel),
+        1, 9 => {
+            if (d.dpl() < c.cpl or d.dpl() < rpl) return c.raise(13, se);
+            return taskSwitch(c, b, sel, d, if (call) .call else .jmp, 0);
+        },
+        5 => {
+            if (d.dpl() < c.cpl or d.dpl() < rpl) return c.raise(13, se);
+            if (!d.present()) return c.raise(11, se);
+            const tsel: u16 = @truncate(d.lo >> 16);
+            const td = try taskGateTss(c, b, tsel, 0);
+            return taskSwitch(c, b, tsel, td, if (call) .call else .jmp, 0);
+        },
         else => return c.raise(13, se),
     }
 }
@@ -505,7 +521,15 @@ pub fn farRet(c: *Cpu, b: anytype, n: u16, o32: bool) Exc!void {
 /// IRET: to this level or an outer one; IOPL changes only from CPL 0,
 /// IF only at CPL <= IOPL.
 pub fn iret(c: *Cpu, b: anytype, o32: bool) Exc!void {
-    if (c.regs.flags & NT != 0) return c.stop(cpu_mod.FAULT_TASK | c.tr);
+    if (c.regs.flags & NT != 0) {
+        // (a nested task's return: to the TSS its back link names)
+        const back = try rdLin(c, b, u16, c.tr_base, false);
+        const bse: u32 = back & 0xFFFC;
+        if (back & 4 != 0) return c.raise(10, bse);
+        const d = (try peek(c, b, back)) orelse return c.raise(10, bse);
+        if (d.seg() or (d.typ() != 3 and d.typ() != 11)) return c.raise(10, bse);
+        return taskSwitch(c, b, back, d, .iret, 0);
+    }
     var st = Stk.current(c);
     const off = try popW(&st, c, b, o32);
     const sel: u16 = @truncate(try popW(&st, c, b, o32));
@@ -574,7 +598,21 @@ pub fn intr(c: *Cpu, b: anytype, vec: u8, kind: Kind, code: u32) Exc!void {
     if (kind == .soft and @as(u2, @truncate(hi >> 13)) < c.cpl) return c.raise(13, ierr);
     if (hi & 0x8000 == 0) return c.raise(11, ierr);
     const sel: u16 = @truncate(lo >> 16);
-    if (typ == 0x05) return c.stop(cpu_mod.FAULT_TASK | sel);
+    if (typ == 0x05) {
+        const td = try taskGateTss(c, b, sel, ext);
+        try taskSwitch(c, b, sel, td, .int, ext);
+        // (an exception's error code goes on the new task's stack)
+        if (kind == .exc and hasCode(vec)) {
+            c.keep = true;
+            var st = Stk.current(c);
+            try pushW(&st, c, b, td.typ() & 8 != 0, code);
+            st.commit(c);
+            c.keep = false;
+        }
+        c.halted = false;
+        c.poll = true;
+        return;
+    }
     const wide = typ & 8 != 0;
     const off: u32 = if (wide) (lo & 0xFFFF) | (hi & 0xFFFF_0000) else lo & 0xFFFF;
     if (sel & 0xFFFC == 0) return c.raise(13, ext);
@@ -648,6 +686,13 @@ pub fn exception(c: *Cpu, b: anytype) ?Exit {
                 return .fault;
             }
             const nv = c.exc_vec;
+            if (c.keep) {
+                // (raised in a new task, its switch done: delivered anew)
+                c.keep = false;
+                vec = nv;
+                code = c.exc_code;
+                continue;
+            }
             if (vec == 8) return triple(c, vec, nv);
             if ((contributory(vec) and contributory(nv)) or (vec == 14 and (nv == 14 or contributory(nv)))) {
                 vec = 8;
@@ -670,6 +715,7 @@ pub fn external(c: *Cpu, b: anytype, vec: u8) void {
             c.dead = true;
             return;
         }
+        c.keep = false;
         if (exception(c, b) != null) c.dead = true;
     };
 }
@@ -857,4 +903,175 @@ pub fn wrPaged(c: *Cpu, b: anytype, comptime T: type, a: u32, v: T, user: bool) 
         return;
     }
     wrM(b, T, try translate(c, b, a, true, user), v);
+}
+
+// ── Task switches ───────────────────────────────────────────────────────
+
+pub const Switch = enum { jmp, call, iret, int };
+
+const TSS386_MIN: u32 = 0x67;
+const TSS286_MIN: u32 = 0x2B;
+
+/// The TSS a task gate names: an available TSS in the GDT (#GP(sel)).
+fn taskGateTss(c: *Cpu, b: anytype, tsel: u16, ext: u32) Exc!Desc {
+    const tse: u32 = (tsel & 0xFFFC) | ext;
+    if (tsel & 4 != 0 or tsel & 0xFFFC == 0) return c.raise(13, tse);
+    const d = (try peek(c, b, tsel)) orelse return c.raise(13, tse);
+    if (d.seg()) return c.raise(13, tse);
+    switch (d.typ()) {
+        1, 9 => {},
+        else => return c.raise(13, tse),
+    }
+    return d;
+}
+
+/// Sets (on) or clears the busy bit of the TSS descriptor `sel` names.
+fn setBusy(c: *Cpu, b: anytype, sel: u16, on: bool) Exc!void {
+    const at = c.gdt_base +% (sel & 0xFFF8) +% 5;
+    const a = try rdLin(c, b, u8, at, false);
+    try wrLin(c, b, u8, at, if (on) a | 2 else a & ~@as(u8, 2), false);
+}
+
+/// Switches to the task whose TSS descriptor is `d` (selector `sel`):
+/// the current state into the current TSS, the new one out of its own;
+/// busy bits, NT and the back link as `how` asks; CR0.TS set. Up to the
+/// new TSS taking over, a fault leaves everything as it was.
+fn taskSwitch(c: *Cpu, b: anytype, sel: u16, d: Desc, how: Switch, ext: u32) Exc!void {
+    const se: u32 = (sel & 0xFFFC) | ext;
+    if (sel & 4 != 0) return c.raise(if (how == .iret) 10 else 13, se);
+    const nbig = d.typ() & 8 != 0;
+    const busy = d.typ() & 2 != 0;
+    if (how == .iret) {
+        if (!busy) return c.raise(10, se);
+    } else if (busy) {
+        return c.raise(13, se);
+    }
+    if (!d.present()) return c.raise(11, se);
+    if (d.limit() < (if (nbig) TSS386_MIN else TSS286_MIN)) return c.raise(10, se);
+    const obig = c.tr_type & 8 != 0;
+    const oerr: u32 = c.tr & 0xFFFC;
+    if (c.tr_type == 0 or c.tr_limit < (if (obig) TSS386_MIN else TSS286_MIN)) return c.raise(10, oerr);
+
+    // The new state, read whole before anything changes.
+    const nb = d.base();
+    var ncr3: u32 = c.cr3;
+    var neip: u32 = undefined;
+    var nfl: u32 = undefined;
+    var nr: [8]u32 = c.regs.r;
+    var nseg: [6]u16 = c.regs.seg;
+    var nldt: u16 = undefined;
+    if (nbig) {
+        ncr3 = try rdLin(c, b, u32, nb +% 0x1C, false);
+        neip = try rdLin(c, b, u32, nb +% 0x20, false);
+        nfl = try rdLin(c, b, u32, nb +% 0x24, false);
+        for (0..8) |i| nr[i] = try rdLin(c, b, u32, nb +% 0x28 +% @as(u32, @intCast(i)) * 4, false);
+        for (0..6) |i| nseg[i] = try rdLin(c, b, u16, nb +% 0x48 +% @as(u32, @intCast(i)) * 4, false);
+        nldt = try rdLin(c, b, u16, nb +% 0x60, false);
+    } else {
+        neip = try rdLin(c, b, u16, nb +% 0x0E, false);
+        nfl = try rdLin(c, b, u16, nb +% 0x10, false);
+        for (0..8) |i| {
+            const v = try rdLin(c, b, u16, nb +% 0x12 +% @as(u32, @intCast(i)) * 2, false);
+            nr[i] = (nr[i] & 0xFFFF_0000) | v;
+        }
+        for (0..4) |i| nseg[i] = try rdLin(c, b, u16, nb +% 0x22 +% @as(u32, @intCast(i)) * 2, false);
+        nldt = try rdLin(c, b, u16, nb +% 0x2A, false);
+    }
+
+    // The current state into the current TSS (EIP: where the task goes
+    // on, after the JMP/CALL/INT, or the faulting instruction).
+    const ob = c.tr_base;
+    var ofl = c.regs.flags;
+    if (how == .iret) ofl &= ~NT;
+    if (obig) {
+        try wrLin(c, b, u32, ob +% 0x20, c.regs.eip, false);
+        try wrLin(c, b, u32, ob +% 0x24, ofl, false);
+        for (0..8) |i| try wrLin(c, b, u32, ob +% 0x28 +% @as(u32, @intCast(i)) * 4, c.regs.r[i], false);
+        for (0..6) |i| try wrLin(c, b, u16, ob +% 0x48 +% @as(u32, @intCast(i)) * 4, c.regs.seg[i], false);
+    } else {
+        try wrLin(c, b, u16, ob +% 0x0E, @truncate(c.regs.eip), false);
+        try wrLin(c, b, u16, ob +% 0x10, @truncate(ofl), false);
+        for (0..8) |i| try wrLin(c, b, u16, ob +% 0x12 +% @as(u32, @intCast(i)) * 2, @truncate(c.regs.r[i]), false);
+        for (0..4) |i| try wrLin(c, b, u16, ob +% 0x22 +% @as(u32, @intCast(i)) * 2, c.regs.seg[i], false);
+    }
+    // JMP and IRET leave the old task; CALL and INT nest the new one.
+    if (how == .jmp or how == .iret) try setBusy(c, b, c.tr, false);
+    if (how == .call or how == .int) try wrLin(c, b, u16, nb, c.tr, false);
+    if (how != .iret) try setBusy(c, b, sel, true);
+
+    // The new task is current from here: what fails is its exception.
+    c.tr = sel;
+    c.tr_base = nb;
+    c.tr_limit = d.limit();
+    c.tr_type = @as(u8, d.typ()) | 2;
+    c.cr0 |= cpu_mod.CR0_TS;
+    if (nbig) {
+        c.cr3 = ncr3;
+        c.tlb.flush();
+    } else {
+        nfl &= 0xFFFF;
+    }
+    if (how == .call or how == .int) nfl |= NT;
+    c.regs.flags = (nfl & ~RF) | FIXED;
+    c.regs.eip = neip;
+    c.regs.r = nr;
+    c.ldtr = nldt;
+    c.ldt_base = 0;
+    c.ldt_limit = 0;
+    for (0..6) |i| {
+        c.regs.seg[i] = nseg[i];
+        c.regs.attr[i] = 0;
+        syncSeg(c, @intCast(i));
+    }
+    c.cpl = @truncate(nseg[CS]);
+    c.keep = true;
+    if (nfl & VM != 0) return c.stop(cpu_mod.FAULT_V86);
+
+    // Its LDT, CS, SS, then DS ES FS GS: #TS(selector) for a wrong one,
+    // #NP (#SS for SS) for one not present.
+    if (nldt & 0xFFFC != 0) {
+        const le: u32 = nldt & 0xFFFC;
+        if (nldt & 4 != 0) return c.raise(10, le);
+        const ld = (try peek(c, b, nldt)) orelse return c.raise(10, le);
+        if (ld.seg() or ld.typ() != 2 or !ld.present()) return c.raise(10, le);
+        c.ldt_base = ld.base();
+        c.ldt_limit = ld.limit();
+    }
+    const cs = nseg[CS];
+    const ce: u32 = cs & 0xFFFC;
+    if (ce == 0) return c.raise(10, 0);
+    const cd = (try peek(c, b, cs)) orelse return c.raise(10, ce);
+    if (!cd.code()) return c.raise(10, ce);
+    if (cd.conforming()) {
+        if (cd.dpl() > c.cpl) return c.raise(10, ce);
+    } else if (cd.dpl() != c.cpl) {
+        return c.raise(10, ce);
+    }
+    if (!cd.present()) return c.raise(11, ce);
+    try touch(c, b, cd);
+    setCache(c, CS, cs, cd);
+    const ss = nseg[SS];
+    const sse: u32 = ss & 0xFFFC;
+    if (sse == 0) return c.raise(10, 0);
+    const sd = (try peek(c, b, ss)) orelse return c.raise(10, sse);
+    if (!sd.writable() or sd.dpl() != c.cpl or @as(u2, @truncate(ss)) != c.cpl) return c.raise(10, sse);
+    if (!sd.present()) return c.raise(12, sse);
+    try touch(c, b, sd);
+    setCache(c, SS, ss, sd);
+    for ([_]u3{ DS, ES, FS, GS }) |s| {
+        const v = nseg[s];
+        const ve: u32 = v & 0xFFFC;
+        if (ve == 0) {
+            setNull(c, s, v);
+            continue;
+        }
+        const vd = (try peek(c, b, v)) orelse return c.raise(10, ve);
+        if (!vd.readable()) return c.raise(10, ve);
+        if (!vd.conforming() and (vd.dpl() < c.cpl or vd.dpl() < @as(u2, @truncate(v)))) return c.raise(10, ve);
+        if (!vd.present()) return c.raise(11, ve);
+        try touch(c, b, vd);
+        setCache(c, s, v, vd);
+    }
+    if (neip > cd.limit()) return c.raise(13, 0);
+    c.keep = false;
 }

@@ -712,6 +712,78 @@ const t12h = [_]u8{
     0x30, 0x8b, 0x46, 0x06, 0xa3, 0x18, 0x30, 0x8c, 0x0e, 0x1c, 0x30, 0xcf,
 };
 
+// at 0x10000:
+//   .code32
+//   mov $5, %ebx
+//   ljmp $0x68, $0
+const t13 = [_]u8{
+    0xbb, 0x05, 0x00, 0x00, 0x00, 0xea, 0x00, 0x00, 0x00, 0x00, 0x68, 0x00,
+};
+
+// at 0x13000:
+//   .code32
+//   mov %eax, 0x3000
+//   mov %ebx, 0x3004
+//   str %cx
+//   hlt
+const t13b = [_]u8{
+    0xa3, 0x00, 0x30, 0x00, 0x00, 0x89, 0x1d, 0x04, 0x30, 0x00, 0x00, 0x66,
+    0x0f, 0x00, 0xc9, 0xf4,
+};
+
+// at 0x10000:
+//   .code32
+//   lcall $0x68, $0
+//   mov %eax, 0x3008
+//   hlt
+const t14 = [_]u8{
+    0x9a, 0x00, 0x00, 0x00, 0x00, 0x68, 0x00, 0xa3, 0x08, 0x30, 0x00, 0x00,
+    0xf4,
+};
+
+// at 0x13000:
+//   .code32
+//   movl $0x77, 0x3010
+//   pushf
+//   pop %ecx
+//   mov %ecx, 0x3014
+//   iret
+const t14b = [_]u8{
+    0xc7, 0x05, 0x10, 0x30, 0x00, 0x00, 0x77, 0x00, 0x00, 0x00, 0x9c, 0x59,
+    0x89, 0x0d, 0x14, 0x30, 0x00, 0x00, 0xcf,
+};
+
+// at 0x10000:
+//   .code32
+//   int $0x40
+//   mov %eax, 0x3008
+//   mov $0x70, %ax
+//   mov %ax, %ds
+//   hlt
+const t15 = [_]u8{
+    0xcd, 0x40, 0xa3, 0x08, 0x30, 0x00, 0x00, 0x66, 0xb8, 0x70, 0x00, 0x8e,
+    0xd8, 0xf4,
+};
+
+// at 0x13000:
+//   .code32
+//   movl $0x77, 0x3010
+//   iret
+//   popl 0x3020
+//   hlt
+const t15b = [_]u8{
+    0xc7, 0x05, 0x10, 0x30, 0x00, 0x00, 0x77, 0x00, 0x00, 0x00, 0xcf, 0x8f,
+    0x05, 0x20, 0x30, 0x00, 0x00, 0xf4,
+};
+
+// at 0x13800:
+//   .code16
+//   mov %ax, 0x3030
+//   hlt
+const t17c = [_]u8{
+    0xa3, 0x30, 0x30, 0xf4,
+};
+
 // ── The tests ───────────────────────────────────────────────────────────
 
 test "pm: real mode to protected mode and back; unreal mode survives" {
@@ -1063,4 +1135,126 @@ test "pm: a 286 interrupt gate from ring 3: the 286 TSS's SP0, 16-bit pushes, 16
     try t.expectEqual(@as(u32, 0xA000), rd32(OUT));
     try t.expectEqual(@as(u32, 0xA000), rd32(OUT + 4));
     try t.expectEqual(@as(u16, 0x1B), rd16(OUT + 8));
+}
+
+// ── Task switches ───────────────────────────────────────────────────────
+
+const TSSB: u32 = 0x1C00;
+
+/// Task B: a 386 TSS at 0x1C00 (selector 68h, available), to run ring 0
+/// code at 0x13000 on its own stack (ESP 7000h), EAX 1234h.
+fn taskB() void {
+    seg(0x68, TSSB, 0x67, 0x89, 0);
+    bus.ram[GDT + 0x28 + 5] = 0x8B; // (the current task's TSS is busy)
+    wr32(TSSB + 0x20, 0x13000);
+    wr32(TSSB + 0x24, regs.FIXED);
+    wr32(TSSB + 0x28, 0x1234);
+    wr32(TSSB + 0x38, 0x7000);
+    for ([_]u32{ 0x48, 0x50, 0x54 }) |o| wr32(TSSB + o, 0x10);
+    wr32(TSSB + 0x4C, 0x08);
+}
+
+test "pm: a far JMP to a TSS switches tasks: state saved and loaded, busy bits, CR0.TS" {
+    const r = flat();
+    taskB();
+    put(0x10000, &t13);
+    put(0x13000, &t13b);
+    try t.expectEqual(Exit.halt, go(100));
+    try t.expectEqual(@as(u32, 0x1234), rd32(OUT));
+    try t.expectEqual(@as(u32, 0), rd32(OUT + 4));
+    try t.expectEqual(@as(u32, 0x68), r.r[ECX] & 0xFFFF);
+    try t.expectEqual(@as(u16, 0x68), cpu.tr);
+    try t.expectEqual(@as(u32, 0x7000), r.r[ESP]);
+    // The old task's state in its TSS: EIP after the JMP, its EBX.
+    try t.expectEqual(@as(u32, 0x1000C), rd32(TSS + 0x20));
+    try t.expectEqual(@as(u32, 5), rd32(TSS + 0x34));
+    try t.expectEqual(@as(u32, 0x9000), rd32(TSS + 0x38));
+    try t.expectEqual(@as(u32, 0x08), rd32(TSS + 0x4C));
+    // JMP: the old TSS is free again, the new one busy, no back link.
+    try t.expectEqual(@as(u8, 0x89), bus.ram[GDT + 0x28 + 5]);
+    try t.expectEqual(@as(u8, 0x8B), bus.ram[GDT + 0x68 + 5]);
+    try t.expectEqual(@as(u16, 0), rd16(TSSB));
+    try t.expectEqual(@as(u32, 0), r.flags & cpu_mod.NT);
+    try t.expect(cpu.cr0 & cpu_mod.CR0_TS != 0);
+}
+
+test "pm: a far CALL to a TSS nests the task (NT, the back link); IRET returns to the caller" {
+    const r = flat();
+    taskB();
+    put(0x10000, &t14);
+    put(0x13000, &t14b);
+    r.r[EAX] = 0xABCD;
+    try t.expectEqual(Exit.halt, go(100));
+    // In task B: NT set; its back link names the caller.
+    try t.expectEqual(@as(u32, 0x77), rd32(OUT + 0x10));
+    try t.expect(rd32(OUT + 0x14) & cpu_mod.NT != 0);
+    try t.expectEqual(@as(u16, 0x28), rd16(TSSB));
+    // IRET took the back link: the caller as it was, after its CALL.
+    try t.expectEqual(@as(u16, 0x28), cpu.tr);
+    try t.expectEqual(@as(u32, 0xABCD), rd32(OUT + 8));
+    try t.expectEqual(@as(u32, 0x1000D), r.eip);
+    try t.expectEqual(@as(u32, 0x9000), r.r[ESP]);
+    try t.expectEqual(@as(u32, 0), r.flags & cpu_mod.NT);
+    try t.expectEqual(@as(u8, 0x8B), bus.ram[GDT + 0x28 + 5]);
+    try t.expectEqual(@as(u8, 0x89), bus.ram[GDT + 0x68 + 5]);
+    // Task B's own state was saved by its IRET: it would go on after it.
+    try t.expectEqual(@as(u32, 0x13000 + t14b.len), rd32(TSSB + 0x20));
+}
+
+test "pm: task gates in the IDT: INT n, and #GP with its error code on the new task's stack" {
+    const r = flat();
+    taskB();
+    put(0x10000, &t15);
+    put(0x13000, &t15b);
+    gate(IDT + 0x40 * 8, 0x68, 0, 0x85, 0);
+    gate(IDT + 13 * 8, 0x68, 0, 0x85, 0);
+    r.r[EAX] = 0xABCD;
+    try t.expectEqual(Exit.halt, go(100));
+    // INT 40h ran task B to its IRET, back to the caller...
+    try t.expectEqual(@as(u32, 0x77), rd32(OUT + 0x10));
+    try t.expectEqual(@as(u32, 0xABCD), rd32(OUT + 8));
+    // ...whose bad DS load (#GP(70h)) went to task B again: it went on
+    // after its IRET and popped the error code from its own stack.
+    try t.expectEqual(@as(u32, 0x70), rd32(OUT + 0x20));
+    try t.expectEqual(@as(u32, 0x7000), r.r[ESP]);
+    try t.expectEqual(@as(u16, 0x68), cpu.tr);
+    try t.expect(r.flags & cpu_mod.NT != 0);
+    // The faulting task was saved on the faulting instruction.
+    try t.expectEqual(@as(u32, 0x1000B), rd32(TSS + 0x20));
+}
+
+test "pm: a TSS too small for one is #TS(selector); a 286 TSS" {
+    // (a 386 TSS needs a limit of at least 67h)
+    var r = flat();
+    taskB();
+    seg(0x68, TSSB, 0x50, 0x89, 0);
+    put(0x10000, &t13);
+    put(0x11300, &rec);
+    vec(10, 0x11300, 0x8E);
+    try t.expectEqual(Exit.halt, go(100));
+    try t.expectEqual(@as(u32, 0x68), rd32(OUT));
+    try t.expectEqual(@as(u32, 0x10005), rd32(OUT + 4));
+    try t.expectEqual(@as(u16, 0x28), cpu.tr);
+    try t.expectEqual(@as(u8, 0x89), bus.ram[GDT + 0x68 + 5]);
+
+    // A 286 TSS: 16-bit code at 30:3800, AX 4321h; the upper halves of
+    // the registers stay.
+    r = flat();
+    seg(0x68, TSSB, 0x2B, 0x81, 0);
+    bus.ram[GDT + 0x28 + 5] = 0x8B;
+    put(0x10000, &t13);
+    put(0x13800, &t17c);
+    r.r[EAX] = 0xFFFF_0000;
+    const w = [_]struct { o: u32, v: u16 }{
+        .{ .o = 0x0E, .v = 0x3800 }, .{ .o = 0x10, .v = 0x0002 }, .{ .o = 0x12, .v = 0x4321 },
+        .{ .o = 0x1A, .v = 0x7000 }, .{ .o = 0x22, .v = 0x10 },   .{ .o = 0x24, .v = 0x30 },
+        .{ .o = 0x26, .v = 0x10 },   .{ .o = 0x28, .v = 0x10 },
+    };
+    for (w) |x| std.mem.writeInt(u16, bus.ram[TSSB + x.o ..][0..2], x.v, .little);
+    try t.expectEqual(Exit.halt, go(100));
+    try t.expectEqual(@as(u16, 0x4321), rd16(OUT + 0x30));
+    try t.expectEqual(@as(u32, 0xFFFF_4321), r.r[EAX]);
+    try t.expectEqual(@as(u8, 3), cpu.tr_type);
+    try t.expect(!cpu.code32);
+    try t.expectEqual(@as(u32, 0x3804), r.eip);
 }
