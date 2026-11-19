@@ -268,10 +268,116 @@ fn testAppendBatch() !void {
     try check(uncertain.sequence == 4 and !uncertain.truncated_tail and replay.count == 4);
 }
 
+const checkpoint_marker = "snapshot generation 7";
+const checkpoint_kind: u16 = 7;
+const checkpoint_suffix_kinds = @as(u32, 1) << 3;
+
+const CheckpointReplay = struct {
+    expected: []const u8 = checkpoint_marker,
+    sequence: u64 = 0,
+    next_offset: u64 = 0,
+    replayed: usize = 0,
+    verified: bool = false,
+    finished: bool = false,
+    reject_finish: bool = false,
+
+    fn verify(self: *CheckpointReplay, marker: log.Frame, payload: []const u8) !void {
+        if (!std.mem.eql(u8, payload, self.expected)) return error.CheckpointMismatch;
+        self.verified = true;
+        self.sequence = marker.sequence;
+        self.next_offset = marker.offset + log.overhead + marker.payload_len;
+    }
+
+    fn apply(self: *CheckpointReplay, frame: log.Frame, payload: []const u8) !void {
+        try check(self.verified and !self.finished and frame.kind == 3);
+        try check(frame.sequence == self.sequence + 1 and frame.offset == self.next_offset);
+        try check(std.mem.eql(u8, payload, "committed change"));
+        self.sequence = frame.sequence;
+        self.next_offset += log.overhead + frame.payload_len;
+        self.replayed += 1;
+    }
+
+    fn finish(self: *CheckpointReplay) !void {
+        if (self.reject_finish) return error.InjectedFinalizerFailure;
+        try check(self.verified);
+        self.finished = true;
+    }
+};
+
+fn rejectCheckpoint(file: *Mock, scratch: []u8, marker: log.Frame, replay: *CheckpointReplay, wanted: anyerror) !void {
+    const before = file.*;
+    if (log.recoverAfterFrame(file, scratch, marker, replay, CheckpointReplay.verify, CheckpointReplay.apply, CheckpointReplay.finish, checkpoint_suffix_kinds)) |_|
+        return error.BadCheckpointAccepted
+    else |err| try check(err == wanted);
+    try check(file.len == before.len and file.stable == before.stable and std.mem.eql(u8, &file.bytes, &before.bytes));
+    try check(!replay.finished);
+}
+
+fn testCheckpointSuffix() !void {
+    for ([_]bool{ false, true }) |prefix| {
+        var original: Mock = .{ .read_chunk = 1 };
+        if (prefix) try log.appendKind(&original, 1, "covered history", 3);
+        const marker: log.Frame = .{ .offset = original.len, .sequence = 2, .kind = checkpoint_kind, .payload_len = checkpoint_marker.len };
+        try log.appendKind(&original, marker.sequence, checkpoint_marker, marker.kind);
+        const end_of_marker = original.len;
+        try log.appendKind(&original, 3, "committed change", 3);
+        const end_of_first = original.len;
+        try log.appendKind(&original, 4, "committed change", 3);
+
+        var scratch: [64]u8 = undefined;
+        var replay: CheckpointReplay = .{};
+        var file = original;
+        const all = try log.recoverAfterFrame(&file, &scratch, marker, &replay, CheckpointReplay.verify, CheckpointReplay.apply, CheckpointReplay.finish, checkpoint_suffix_kinds);
+        try check(all.sequence == 4 and all.valid_bytes == original.len and !all.truncated_tail);
+        try check(replay.verified and replay.finished and replay.replayed == 2 and file.stable == original.stable);
+
+        file = original;
+        file.len -= 1;
+        replay = .{ .expected = "different checkpoint" };
+        try rejectCheckpoint(&file, &scratch, marker, &replay, error.CheckpointMismatch);
+        try check(!replay.verified and replay.replayed == 0);
+
+        replay = .{ .reject_finish = true };
+        try rejectCheckpoint(&file, &scratch, marker, &replay, error.InjectedFinalizerFailure);
+        try check(replay.verified and replay.replayed == 1);
+
+        replay = .{};
+        const repaired = try log.recoverAfterFrame(&file, &scratch, marker, &replay, CheckpointReplay.verify, CheckpointReplay.apply, CheckpointReplay.finish, checkpoint_suffix_kinds);
+        try check(repaired.truncated_tail and repaired.sequence == 3 and repaired.valid_bytes == end_of_first);
+        try check(replay.finished and replay.replayed == 1 and file.len == end_of_first and file.stable == file.len);
+
+        file = original;
+        file.len = end_of_marker - 1;
+        replay = .{};
+        try rejectCheckpoint(&file, &scratch, marker, &replay, error.UnexpectedEndOfLog);
+        try check(!replay.verified and replay.replayed == 0);
+
+        file = original;
+        file.bytes[@as(usize, @intCast(marker.offset)) + log.header_size] ^= 1;
+        replay = .{};
+        try rejectCheckpoint(&file, &scratch, marker, &replay, error.CorruptLogRecord);
+        try check(!replay.verified);
+
+        file = original;
+        file.bytes[end_of_first + log.header_size] ^= 1;
+        replay = .{};
+        try rejectCheckpoint(&file, &scratch, marker, &replay, error.CorruptLogRecord);
+        try check(replay.verified and replay.replayed == 1);
+
+        file = original;
+        file.len = end_of_marker;
+        try log.appendKind(&file, 4, "committed change", 3);
+        replay = .{};
+        try rejectCheckpoint(&file, &scratch, marker, &replay, error.InvalidSequence);
+        try check(replay.verified and replay.replayed == 0);
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     try check(log.checksum("123456789") == 0xcbf43926);
     try testPositionedFrames();
     try testAppendBatch();
+    try testCheckpointSuffix();
     // Exact staging boundary and streaming fallback retain identical framing,
     // CRCs, replay payloads and stable-storage acknowledgement.
     var staged_payload: [4096]u8 = @splat('a');

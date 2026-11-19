@@ -16,6 +16,15 @@ const Replay = struct {
         try check(sequence == self.sequence + 1 and std.mem.eql(u8, payload, "durable transaction"));
         self.sequence = sequence;
     }
+
+    fn verifyCheckpoint(self: *Replay, marker: log.Frame, payload: []const u8) !void {
+        try check(marker.sequence == 1 and std.mem.eql(u8, payload, "durable transaction"));
+        self.sequence = marker.sequence;
+    }
+
+    fn applyFrame(self: *Replay, frame: log.Frame, payload: []const u8) !void {
+        return self.apply(frame.sequence, payload);
+    }
 };
 
 fn expectWriterBusy(lock: *disk.WriterLock, path: []const u8) !void {
@@ -28,15 +37,18 @@ fn testWriterLock(pid: u32, first_generation: []const u8, manifest: []const u8, 
     var generation_buffer: [256]u8 = undefined;
     const second_generation = try std.fmt.bufPrint(&generation_buffer, "sig-out/db-file-contract-{d}.wal.2", .{pid});
 
+    var owner: disk.WriterLock = .{};
+    var contender: disk.WriterLock = .{};
+    if (owner.acquireExisting(lock_path)) |_| return error.MissingWriterLockCreated else |err| try check(err == error.FileNotFound);
     var seed = try disk.File.createExclusive(lock_path);
     defer disk.remove(lock_path) catch {};
     seed.close();
-    var owner: disk.WriterLock = .{};
     defer owner.close();
-    var contender: disk.WriterLock = .{};
     defer contender.close();
     if (owner.acquire("")) |_| return error.EmptyLockPathAccepted else |err| try check(err == error.InvalidPath);
-    try owner.acquire(lock_path);
+    try owner.acquireExisting(lock_path);
+    if (owner.acquireExisting(second_generation)) |_| return error.HeldWriterReplaced else |err| try check(err == error.DataDirectoryBusy);
+    if (contender.acquireExisting(lock_path)) |_| return error.ConcurrentWriterAccepted else |err| try check(err == error.DataDirectoryBusy);
     try expectWriterBusy(&owner, second_generation);
     try expectWriterBusy(&contender, lock_path);
 
@@ -177,6 +189,10 @@ pub fn main(init: std.process.Init) !void {
     try check(twice.sequence == 2 and !twice.truncated_tail);
     const first_frame: log.Frame = .{ .offset = 0, .sequence = 1, .kind = 1, .payload_len = "durable transaction".len };
     try check(std.mem.eql(u8, try log.readFrame(&file, &scratch, first_frame), "durable transaction"));
+    replay = .{};
+    const anchored = try log.recoverAfterFrame(&file, &scratch, first_frame, &replay, Replay.verifyCheckpoint, Replay.applyFrame, null, @as(u32, 1) << 1);
+    try check(anchored.sequence == 2 and anchored.valid_bytes == twice.valid_bytes and !anchored.truncated_tail);
+    try check(replay.sequence == 2);
     try check(try file.length() == twice.valid_bytes);
     var empty: [0]u8 = .{};
     try check(try file.readAt(0, &empty) == 0);
