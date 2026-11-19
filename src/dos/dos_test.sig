@@ -463,7 +463,7 @@ test "dos: exec runs a child; its exit returns to the parent" {
     try t.expectEqual(@as(u16, 0x0007), r.ax());
     // The child's memory is free again; the parent's exit ends it all.
     try t.expect(mcb.owner(&mem, child - 1) == 0);
-    _ = call(&r, 0x4C03);
+    try t.expect(!call(&r, 0x4C03));
     try t.expect(st.exited);
     try t.expectEqual(@as(u8, 3), st.exit_code);
 }

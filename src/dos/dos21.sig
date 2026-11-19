@@ -230,7 +230,12 @@ pub fn int21(st: *State, r: *Regs, mem: *Memory, host: Host) bool {
 /// area: a game that reads a picture straight into A000:0 gets it there.
 pub fn int21Bus(st: *State, r: *Regs, mem: *Memory, host: Host, bus: anytype) bool {
     switch (r.ah()) {
-        0x00 => proc.terminate(st, r, mem, host, 0, 0, 0),
+        // The ends of a process. The first program's end returns false: the
+        // CPU stops on the trap and the machine sees `exited`.
+        0x00 => {
+            proc.terminate(st, r, mem, host, 0, 0, 0);
+            return !st.exited;
+        },
         0x01 => {
             const c = con.getChar(st, mem) orelse return false;
             con.out(st, mem, host, c);
@@ -383,7 +388,10 @@ pub fn int21Bus(st: *State, r: *Regs, mem: *Memory, host: Host, bus: anytype) bo
             r.setBl(0);
             r.setCx(0);
         },
-        0x31 => proc.terminate(st, r, mem, host, r.al(), 3, r.dx()),
+        0x31 => {
+            proc.terminate(st, r, mem, host, r.al(), 3, r.dx());
+            return !st.exited;
+        },
         0x33 => switch (r.al()) {
             0x00 => r.setDl(@intFromBool(st.break_on)),
             0x01 => st.break_on = r.dl() != 0,
@@ -474,7 +482,10 @@ pub fn int21Bus(st: *State, r: *Regs, mem: *Memory, host: Host, bus: anytype) bo
             r.ok();
         },
         0x4B => proc.exec(st, r, mem, host),
-        0x4C => proc.terminate(st, r, mem, host, r.al(), 0, 0),
+        0x4C => {
+            proc.terminate(st, r, mem, host, r.al(), 0, 0);
+            return !st.exited;
+        },
         0x4D => {
             r.setAx(st.return_code);
             st.return_code = 0;
