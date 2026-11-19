@@ -30,6 +30,10 @@ pub const LinuxHost = struct {
     /// The clock: another host's last reading (lockstep's twin reads the
     /// time the machine it follows read), else the real-time clock.
     clock_of: ?*const LinuxHost = null,
+    /// The code memory one mapping whose protection flips (else two
+    /// mappings): for emulators that see a code change only through the
+    /// mapping it is run from (QEMU's user mode).
+    code_flip: bool = false,
     last_now: host_mod.Time = undefined,
 
     pub fn host(self: *LinuxHost) host_mod.Host {
@@ -230,7 +234,7 @@ pub const LinuxHost = struct {
 
     fn codeMemF(ctx: *anyopaque, len: usize) ?host_mod.CodeMem {
         if (!me(ctx).jit) return null;
-        return mapCode(len);
+        return mapCode(len, me(ctx).code_flip);
     }
 };
 
@@ -252,8 +256,8 @@ fn flipRx(_: *anyopaque) void {
 /// address and executable at another (never both at one: W^X), else
 /// private memory whose protection flips between writable and
 /// executable around the translator's writes. Null if neither works.
-pub fn mapCode(len: usize) ?host_mod.CodeMem {
-    const r = linux.memfd_create("dos-jit", linux.MFD.CLOEXEC);
+pub fn mapCode(len: usize, flip: bool) ?host_mod.CodeMem {
+    const r = if (flip) @as(usize, 0) -% 1 else linux.memfd_create("dos-jit", linux.MFD.CLOEXEC);
     if (!failedR(r)) {
         const fd: i32 = @intCast(r);
         defer _ = linux.close(fd);

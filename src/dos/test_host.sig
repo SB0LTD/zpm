@@ -236,7 +236,8 @@ pub const TestHost = struct {
 
     fn codeMemF(ctx: *anyopaque, len: usize) ?host_mod.CodeMem {
         if (!me(ctx).jit or builtin.os.tag != .linux) return null;
-        if (code_region == null) code_region = @import("host_linux.sig").mapCode(len);
+        // (AArch64's tests run under QEMU's user mode: one mapping)
+        if (code_region == null) code_region = @import("host_linux.sig").mapCode(len, builtin.cpu.arch == .aarch64);
         const c = code_region orelse return null;
         return if (c.len >= len) c else null;
     }

@@ -1070,6 +1070,11 @@ pub const Cpu = struct {
         return r;
     }
 
+    /// The translator's (AArch64's flags): `shift` as it is.
+    pub fn shiftPub(self: *Cpu, comptime T: type, op: u3, a: T, count: u8) T {
+        return self.shift(T, op, a, count);
+    }
+
     /// SHLD (left) / SHRD: `a` shifted, filled from `b`.
     fn shiftD(self: *Cpu, comptime T: type, a: T, b: T, count: u8, left: bool) T {
         const bits = @bitSizeOf(T);

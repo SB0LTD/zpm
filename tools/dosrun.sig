@@ -190,6 +190,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             wav_path = it.next();
         } else if (std.mem.eql(u8, a, "--profile")) {
             prof_path = it.next();
+        } else if (std.mem.eql(u8, a, "--jit-flip")) {
+            host.code_flip = true;
         } else if (std.mem.eql(u8, a, "--progress")) {
             progress = true;
         } else if (std.mem.eql(u8, a, "--jit")) {

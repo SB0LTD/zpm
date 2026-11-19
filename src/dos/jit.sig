@@ -56,8 +56,7 @@ const Exit = cpu_mod.Exit;
 /// The host's code generator, if there is one for it.
 pub const be = switch (builtin.cpu.arch) {
     .x86_64 => @import("jit_x64.sig"),
-    // (AArch64: jit_a64.sig, once it has the templates)
-    .aarch64 => void,
+    .aarch64 => @import("jit_a64.sig"),
     else => void,
 };
 pub const have_backend = be != void;
@@ -116,6 +115,11 @@ pub const Ctx = extern struct {
     /// The machine's page marks (jit_pages), the lockstep write log.
     pages: usize = 0,
     wlog: usize = 0,
+    /// (AArch64's) the guest's registers, the TLB's tags and host offsets.
+    regs: usize = 0,
+    rtag: usize = 0,
+    wtag: usize = 0,
+    hoff: usize = 0,
     /// The helpers generated code calls (backend's table).
     helpers: [24]usize = [_]usize{0} ** 24,
     /// The lockstep write log: host address and size of each store.
@@ -597,6 +601,10 @@ pub fn attach(c: *Cpu, host: host_mod.Host, pages: *[PAGES]u8, ram: *[mem_mod.RA
     j.ctx.fast = @intFromPtr(&fast);
     j.ctx.pages = @intFromPtr(pages);
     j.ctx.wlog = @intFromPtr(&wlog);
+    j.ctx.regs = @intFromPtr(&c.regs);
+    j.ctx.rtag = @intFromPtr(&c.tlb.rtag);
+    j.ctx.wtag = @intFromPtr(&c.tlb.wtag);
+    j.ctx.hoff = @intFromPtr(&c.tlb.hoff);
     j.unlock();
     j.stub_end = be.emitStubs(j);
     j.lock();
@@ -631,6 +639,98 @@ pub fn run(c: *Cpu, bus: anytype, budget: u32) Exit {
             Mode(@TypeOf(bus), false).loop(c, bus, end);
         if (why) |w| return w;
     }
+}
+
+/// The flags of an operation exactly as the interpreter computes them,
+/// merged into the guest's (for a code generator whose host has other
+/// flags: AArch64's). info: the class (F_*), the size in bytes << 8. a and
+/// b are the operands (b: the count for shifts); the result is recomputed
+/// here. The carry in (ADC, SBB) and the CF kept (INC, DEC) are the
+/// guest's flags as they are.
+pub const F_ADD = 0;
+pub const F_OR = 1;
+pub const F_ADC = 2;
+pub const F_SBB = 3;
+pub const F_AND = 4;
+pub const F_SUB = 5;
+pub const F_XOR = 6;
+pub const F_CMP = 7;
+pub const F_INC = 8;
+pub const F_DEC = 9;
+pub const F_NEG = 10;
+pub const F_SHL = 11;
+pub const F_SHR = 12;
+pub const F_SAR = 13;
+pub const F_ROL = 14;
+pub const F_ROR = 15;
+
+pub fn hFlags(ctx: *Ctx, a: u64, b: u64, info: u64) callconv(.c) void {
+    const c: *Cpu = @ptrFromInt(ctx.cpu);
+    const sz: u32 = @truncate((info >> 8) & 7);
+    const cls: u32 = @truncate(info & 0xFF);
+    switch (sz) {
+        1 => flagsT(u8, c, cls, @truncate(a), @truncate(b)),
+        2 => flagsT(u16, c, cls, @truncate(a), @truncate(b)),
+        else => flagsT(u32, c, cls, @truncate(a), @truncate(b)),
+    }
+}
+
+fn flagsT(comptime T: type, c: *Cpu, cls: u32, a: T, b: T) void {
+    const bits = @bitSizeOf(T);
+    const msb: T = @as(T, 1) << (bits - 1);
+    const old = c.regs.flags;
+    const cin: u1 = @truncate(old & regs_mod.CF);
+    const ARITH: u32 = dec.ARITH;
+    var f: u32 = 0;
+    var tm: u32 = ARITH;
+    switch (cls) {
+        F_ADD, F_ADC, F_INC => {
+            const y: T = if (cls == F_INC) 1 else b;
+            const ci: u1 = if (cls == F_ADC) cin else 0;
+            const w: u64 = @as(u64, a) + y + ci;
+            const r: T = @truncate(w);
+            f = szp(T, r) | @as(u32, (a ^ y ^ r) & 0x10) | @as(u32, @truncate((w >> bits) & 1));
+            if ((a ^ r) & (y ^ r) & msb != 0) f |= regs_mod.OF;
+            if (cls == F_INC) tm = ARITH & ~regs_mod.CF;
+        },
+        F_SUB, F_CMP, F_SBB, F_DEC, F_NEG => {
+            const x: T = if (cls == F_NEG) 0 else a;
+            const y: T = if (cls == F_DEC) 1 else if (cls == F_NEG) a else b;
+            const ci: u1 = if (cls == F_SBB) cin else 0;
+            const r: T = x -% y -% ci;
+            f = szp(T, r) | @as(u32, (x ^ y ^ r) & 0x10);
+            if (@as(u64, x) < @as(u64, y) + ci) f |= regs_mod.CF;
+            if ((x ^ y) & (x ^ r) & msb != 0) f |= regs_mod.OF;
+            if (cls == F_DEC) tm = ARITH & ~regs_mod.CF;
+        },
+        F_OR => f = szp(T, a | b),
+        F_AND => f = szp(T, a & b),
+        F_XOR => f = szp(T, a ^ b),
+        F_SHL, F_SHR, F_SAR, F_ROL, F_ROR => {
+            // (the interpreter's own: cpu.sig's shift)
+            const n: u8 = @truncate(b);
+            const save = c.regs.flags;
+            _ = c.shiftPub(T, @as(u3, switch (cls) {
+                F_SHL => 4,
+                F_SHR => 5,
+                F_SAR => 7,
+                F_ROL => 0,
+                else => 1,
+            }), a, n);
+            f = c.regs.flags;
+            c.regs.flags = save;
+            tm = if (cls == F_ROL or cls == F_ROR) regs_mod.CF | regs_mod.OF else ARITH;
+        },
+        else => {},
+    }
+    c.regs.flags = (old & ~tm) | (f & tm);
+}
+
+fn szp(comptime T: type, r: T) u32 {
+    var f: u32 = if (@popCount(@as(u8, @truncate(r))) & 1 == 0) regs_mod.PF else 0;
+    if (r == 0) f |= regs_mod.ZF;
+    if (r & (@as(T, 1) << (@bitSizeOf(T) - 1)) != 0) f |= regs_mod.SF;
+    return f;
 }
 
 /// Block-local flag liveness: after[i], the arithmetic flags read after
