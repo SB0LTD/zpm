@@ -175,6 +175,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var prof_path: ?[]const u8 = null;
     const JitMode = enum { off, on, check };
     var jit_mode: JitMode = .off;
+    var progress = false;
 
     var it = init.args.iterate();
     _ = it.next();
@@ -189,6 +190,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             wav_path = it.next();
         } else if (std.mem.eql(u8, a, "--profile")) {
             prof_path = it.next();
+        } else if (std.mem.eql(u8, a, "--progress")) {
+            progress = true;
         } else if (std.mem.eql(u8, a, "--jit")) {
             jit_mode = .on;
         } else if (std.mem.eql(u8, a, "--no-jit")) {
@@ -255,9 +258,14 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (!machine.jitEnable()) {
             out("dosrun: no translator here (no code memory): interpreting", .{});
         } else if (jit_mode == .check) {
-            twin.init(twin_host.host(), p.dir);
-            twin.ips = ips;
-            if (!twin.start(p.dos_path, tail[0..tl])) return 1;
+            // (the twin: this PC as it is now, on a host whose clock
+            // says what this one's last said)
+            twin = machine;
+            twin.host = twin_host.host();
+            twin.cpu.jit = null;
+            twin.twin = null;
+            twin_host.clock_of = &host;
+            host.last_now = host.host().now();
             machine.twin = &twin;
             machine.cpu.jit.?.check = true;
             machine.cpu.jit.?.flush();
@@ -326,6 +334,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             mo.done = true;
         };
         status = machine.run(step_us);
+        if (progress and t_us % 100_000 == 0) {
+            const r = &machine.cpu.regs;
+            out("dosrun: {d} ms: {d} instructions, at {x:0>4}:{x:0>8}, {d} ms of host time", .{ t_us / 1000, machine.cpu.executed, r.seg[dos.regs.CS], r.eip, (nowNs() - t0) / 1_000_000 });
+        }
         // (the sound is pulled as a host would, and dropped)
         machine.audio(&audio, 48000);
         for (audio) |v| {

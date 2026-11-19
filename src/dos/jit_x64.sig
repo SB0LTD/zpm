@@ -484,6 +484,7 @@ const E = struct {
         switch (n) {
             1 => a.op(4, &.{ 0x0F, if (signed) 0xBE else 0xB6 }, RAX, .{ .m = m }),
             2 => a.op(4, &.{ 0x0F, if (signed) 0xBF else 0xB7 }, RAX, .{ .m = m }),
+            8 => a.movRegMem(8, RAX, m),
             else => a.movRegMem(4, RAX, m),
         }
     }
@@ -636,10 +637,10 @@ const E = struct {
     fn probe(e: *E) void {
         const a = &e.a;
         a.movMemReg(4, cpuMem(O_EIP), RAX);
-        if (!e.P or e.mode & jit.M_CSFLAT != 0) {
+        {
             a.movRR(4, RCX, RAX);
             a.aluRegRm(4, 0, RAX, .{ .m = cpuMem(O_BASE + 4 * @as(usize, regs_mod.CS)) }); // add eax, [cs base]
-            var miss: [2]usize = .{ 0, 0 };
+            var miss: [3]usize = .{ 0, 0, 0 };
             var nm: usize = 0;
             if (e.P) {
                 a.movRR(4, RDX, RAX);
@@ -663,8 +664,7 @@ const E = struct {
             a.bytes(&.{ 0x48, 0xC1, 0xE0, 0x07 }); // shl rax, 7
             a.aluRmReg(8, 6, .{ .r = RAX }, RDX); // xor rax, rdx
             a.aluImm(4, 4, .{ .r = RAX }, jit.FAST_N - 1);
-            a.op(8, &.{0x8D}, RAX, .{ .m = .{ .base = RAX, .index = RAX, .scale = 1 } }); // lea rax, [rax+rax*2]
-            a.bytes(&.{ 0x48, 0xC1, 0xE0, 0x03 }); // shl rax, 3
+            a.bytes(&.{ 0x48, 0xC1, 0xE0, 0x05 }); // shl rax, 5 (32-byte entries)
             a.movRegMem(8, RSI, ctxMem(@offsetOf(jit.Ctx, "fast")));
             a.aluRegRm(8, 7, RDX, .{ .m = .{ .base = RSI, .index = RAX } }); // cmp rdx, [host]
             miss[nm] = a.jccFwd(CC_NZ);
@@ -673,6 +673,13 @@ const E = struct {
             a.aluImm(8, 1, .{ .r = RCX }, e.mode); // or rcx, mode
             a.aluRegRm(8, 7, RCX, .{ .m = .{ .base = RSI, .index = RAX, .disp = 8 } });
             const miss2 = a.jccFwd(CC_NZ);
+            if (e.P) {
+                // (CS's limit reaches the block's end)
+                a.movRegMem(4, R8, cpuMem(@offsetOf(Cpu, "fetch_hi")));
+                a.aluRegRm(8, 7, R8, .{ .m = .{ .base = RSI, .index = RAX, .disp = 24 } });
+                miss[nm] = a.jccFwd(2); // jb: limit below the end
+                nm += 1;
+            }
             a.op(4, &.{0xFF}, 4, .{ .m = .{ .base = RSI, .index = RAX, .disp = 16 } }); // jmp [..]
             for (miss[0..nm]) |m| a.here(m);
             a.here(miss2);
@@ -994,6 +1001,7 @@ fn native(e: *E, x: *const dec.Ins, need: u32) bool {
         },
         .x87 => {
             if (e.mode & jit.M_FPU == 0) return false;
+            if (x87native(e, x)) return true;
             if (x.mem) e.ea(x, true) else a.movImm32(R12, 0);
             a.movRR(4, RSI, R12);
             a.movImm64(RDX, @as(u64, x.op & 0xFF) | (@as(u64, x.modrm) << 8) | (@as(u64, @intFromBool(x.o32)) << 16) | (@as(u64, e.adj) << 24));
@@ -1166,7 +1174,15 @@ pub fn emitBlock(j: *Jit, b: u32, ins: []const dec.Ins, mode: u32, comptime B: t
         while (q < e.ns) : (q += 1) e.stubs[q].cont = a.at;
         eip = e.next;
     }
-    if (!ended) e.exitTo(0, eip);
+    if (!ended) e.exitTo(0, eip) else {
+        // (a branch's slow path that fell through after all, a CALL or
+        // RET to the next instruction: EIP is that, and the dispatcher)
+        var q = e.stub0;
+        while (q < e.ns) : (q += 1) e.stubs[q].cont = a.at;
+        a.movMemImm(4, cpuMem(O_EIP), eip);
+        a.movImm32(RAX, @intCast(jit.X_NEXT));
+        a.jmpTo(off_exit);
+    }
     // The slow stubs: the interpreter runs the whole instruction.
     for (e.stubs[0..e.ns]) |st| {
         a.here(st.at);
@@ -1197,4 +1213,452 @@ pub fn emitBlock(j: *Jit, b: u32, ins: []const dec.Ins, mode: u32, comptime B: t
 
 fn mode32(mode: u32) bool {
     return mode & jit.M_CODE32 != 0;
+}
+
+// ── The x87's common instructions, natively (SSE2 on the FPU's f64s) ───
+//
+// The same results as cpu_x87.sig's code: ST(i) is st[(top + i) & 7], an
+// f64; `empty` and `exact` bits per register; precision control 00 rounds
+// to single; the status word's C0/C3 from compares. Anything out of the
+// ordinary (an empty or full register, a NaN result, a divisor of 0, a
+// rounding mode other than the nearest on a store) goes to the FPU's own
+// code (hX87) for the whole instruction: the template has changed nothing
+// by then.
+
+const Fpu = @import("cpu_x87.sig").Fpu;
+const O_FPU = @offsetOf(Cpu, "fpu");
+const F_ST = O_FPU + @offsetOf(Fpu, "st");
+const F_RAW = O_FPU + @offsetOf(Fpu, "raw");
+const F_EXACT = O_FPU + @offsetOf(Fpu, "exact");
+const F_EMPTY = O_FPU + @offsetOf(Fpu, "empty");
+const F_TOP = O_FPU + @offsetOf(Fpu, "top");
+const F_CW = O_FPU + @offsetOf(Fpu, "cw");
+const F_SW = O_FPU + @offsetOf(Fpu, "sw");
+const F_FIP = O_FPU + @offsetOf(Fpu, "fip");
+const F_FOP = O_FPU + @offsetOf(Fpu, "fop");
+const F_FDP = O_FPU + @offsetOf(Fpu, "fdp");
+const X_C0: u32 = 1 << 8;
+const X_C1: u32 = 1 << 9;
+const X_C3: u32 = 1 << 14;
+const X_CC: u32 = (1 << 8) | (1 << 9) | (1 << 10) | (1 << 14);
+const RAW_SZ = @sizeOf(u80);
+
+comptime {
+    if (RAW_SZ != 16) @compileError("the FPU's 80-bit images: 16 bytes each");
+}
+
+/// An SSE instruction: [pfx] (REX) 0F op /r with xmm `x` in ModRM.reg.
+fn sse(a: *A, pfx: u8, op: u8, x: u4, rm: Rm, w: bool) void {
+    if (pfx != 0) a.b(pfx);
+    const bb: u4 = switch (rm) {
+        .r => |r| r,
+        .m => |m| m.base,
+    };
+    const ix: u4 = switch (rm) {
+        .r => 0,
+        .m => |m| m.index orelse 0,
+    };
+    a.rex(w, x, ix, bb);
+    a.b(0x0F);
+    a.b(op);
+    a.modrm(x, rm);
+}
+
+fn stMem(idx: u4) Mem {
+    return .{ .base = RBX, .index = idx, .scale = 3, .disp = @intCast(F_ST) };
+}
+fn rawMem(idx: u4, half: u32) Mem {
+    // (raw entries are 16 bytes: index*16 = (index*2)*8)
+    return .{ .base = RBX, .index = idx, .scale = 3, .disp = @intCast(F_RAW + half) };
+}
+
+/// eax = top.
+fn x87Top(a: *A) void {
+    a.op(4, &.{ 0x0F, 0xB6 }, RAX, .{ .m = cpuMem(F_TOP) });
+    a.aluImm(4, 4, .{ .r = RAX }, 7);
+}
+/// r = (eax + i) & 7.
+fn x87Idx(a: *A, r: u4, i: u3) void {
+    a.op(4, &.{0x8D}, r, .{ .m = .{ .base = RAX, .disp = i } });
+    a.aluImm(4, 4, .{ .r = r }, 7);
+}
+/// The slow path unless register `r`'s index is full (not empty).
+fn x87Full(e: *E, r: u4) void {
+    const a = &e.a;
+    a.op(4, &.{ 0x0F, 0xB6 }, RCX, .{ .m = cpuMem(F_EMPTY) });
+    a.op(4, &.{ 0x0F, 0xA3 }, r, .{ .r = RCX }); // bt ecx, r
+    e.slow(2); // jc
+}
+/// Clears bit `r` of the byte at `off` (exact, empty).
+fn x87Clear(a: *A, off: usize, r: u4) void {
+    a.op(4, &.{ 0x0F, 0xB6 }, RCX, .{ .m = cpuMem(off) });
+    a.op(4, &.{ 0x0F, 0xB3 }, r, .{ .r = RCX }); // btr ecx, r
+    a.movMemReg(1, cpuMem(off), RCX);
+}
+fn x87Set(a: *A, off: usize, r: u4) void {
+    a.op(4, &.{ 0x0F, 0xB6 }, RCX, .{ .m = cpuMem(off) });
+    a.op(4, &.{ 0x0F, 0xAB }, r, .{ .r = RCX }); // bts ecx, r
+    a.movMemReg(1, cpuMem(off), RCX);
+}
+/// st[r] = xmm0 (its exact bit cleared: put).
+fn x87Put(a: *A, r: u4) void {
+    sse(a, 0xF2, 0x11, 0, .{ .m = stMem(r) }, false);
+    x87Clear(a, F_EXACT, r);
+}
+/// The slow path unless xmm0 is a number (not a NaN).
+fn x87NotNan(e: *E) void {
+    sse(&e.a, 0x66, 0x2E, 0, .{ .r = 0 }, false); // ucomisd xmm0, xmm0
+    e.slow(10); // jp
+}
+/// Precision control 00: xmm0 rounded to single.
+fn x87Prec(a: *A) void {
+    a.op(2, &.{0xF7}, 0, .{ .m = cpuMem(F_CW) });
+    a.b(0x00);
+    a.b(0x03);
+    const skip = a.jccFwd(CC_NZ);
+    sse(a, 0xF2, 0x5A, 0, .{ .r = 0 }, false); // cvtsd2ss
+    sse(a, 0xF3, 0x5A, 0, .{ .r = 0 }, false); // cvtss2sd
+    a.here(skip);
+}
+/// The last instruction's address, opcode and operand (non-control).
+fn x87Note(e: *E, x: *const dec.Ins) void {
+    const a = &e.a;
+    a.movRegMem(4, RCX, cpuMem(O_BASE + 4 * @as(usize, regs_mod.CS)));
+    a.aluImm(4, 0, .{ .r = RCX }, e.eip);
+    a.movMemReg(4, cpuMem(F_FIP), RCX);
+    a.movMemImm(2, cpuMem(F_FOP), (@as(u32, x.op & 7) << 8) | x.modrm);
+    if (x.mem) a.movMemReg(4, cpuMem(F_FDP), R12);
+}
+/// pop: ST(0) empty, top + 1 (eax = top).
+fn x87Pop(a: *A) void {
+    x87Set(a, F_EMPTY, RAX);
+    x87Clear(a, F_EXACT, RAX);
+    a.op(4, &.{0x8D}, RAX, .{ .m = .{ .base = RAX, .disp = 1 } });
+    a.aluImm(4, 4, .{ .r = RAX }, 7);
+    a.movMemReg(1, cpuMem(F_TOP), RAX);
+}
+/// xmm0 = xmm0 op xmm1 (arith's op: 0 add, 1 mul, 4 a-b, 5 b-a, 6 a/b,
+/// 7 b/a), checked, rounded.
+fn x87Arith(e: *E, op: u8) void {
+    const a = &e.a;
+    if (op == 5 or op == 7) {
+        sse(a, 0x66, 0x28, 2, .{ .r = 0 }, false); // movapd xmm2, xmm0
+        sse(a, 0x66, 0x28, 0, .{ .r = 1 }, false);
+        sse(a, 0x66, 0x28, 1, .{ .r = 2 }, false);
+    }
+    if (op >= 6) {
+        sse(a, 0x66, 0x57, 2, .{ .r = 2 }, false); // xorpd xmm2, xmm2
+        sse(a, 0x66, 0x2E, 1, .{ .r = 2 }, false); // ucomisd xmm1, xmm2
+        e.slow(CC_Z); // (0 or a NaN divisor)
+    }
+    const code: u8 = switch (op) {
+        0 => 0x58,
+        1 => 0x59,
+        4, 5 => 0x5C,
+        else => 0x5E,
+    };
+    sse(a, 0xF2, code, 0, .{ .r = 1 }, false);
+    x87NotNan(e);
+    x87Prec(a);
+}
+/// compare(xmm0, xmm1): C0 below, C3 equal (a NaN: the slow path).
+fn x87Cmp(e: *E) void {
+    const a = &e.a;
+    a.op(4, &.{ 0x0F, 0xB7 }, RDX, .{ .m = cpuMem(F_SW) });
+    a.aluImm(4, 4, .{ .r = RDX }, ~X_CC);
+    sse(a, 0x66, 0x2E, 0, .{ .r = 1 }, false); // ucomisd xmm0, xmm1
+    e.slow(10); // jp
+    const nb = a.jccFwd(3); // jae: not below
+    a.aluImm(4, 1, .{ .r = RDX }, X_C0);
+    a.here(nb);
+    const ne = a.jccFwd(CC_NZ);
+    a.aluImm(4, 1, .{ .r = RDX }, X_C3);
+    a.here(ne);
+    a.movMemReg(2, cpuMem(F_SW), RDX);
+}
+/// Push xmm0 (eax = top; the slow path on a full stack): eax = new top.
+fn x87PushCheck(e: *E) void {
+    const a = &e.a;
+    a.op(4, &.{0x8D}, RAX, .{ .m = .{ .base = RAX, .disp = -1 } });
+    a.aluImm(4, 4, .{ .r = RAX }, 7);
+    a.op(4, &.{ 0x0F, 0xB6 }, RCX, .{ .m = cpuMem(F_EMPTY) });
+    a.op(4, &.{ 0x0F, 0xA3 }, RAX, .{ .r = RCX });
+    e.slow(3); // jnc: not empty, an overflow
+}
+fn x87PushDo(a: *A) void {
+    sse(a, 0xF2, 0x11, 0, .{ .m = stMem(RAX) }, false);
+    x87Clear(a, F_EMPTY, RAX);
+    x87Clear(a, F_EXACT, RAX);
+    a.movMemReg(1, cpuMem(F_TOP), RAX);
+}
+
+/// The x87 instruction natively, or false (then hX87 runs it).
+fn x87native(e: *E, x: *const dec.Ins) bool {
+    const a = &e.a;
+    const op: u8 = @truncate(x.op);
+    const reg: u8 = (x.modrm >> 3) & 7;
+    const i: u3 = @truncate(x.modrm);
+    if (x.mem) {
+        switch (op) {
+            0xD8, 0xDC => {
+                // ST(0) op m32 / m64
+                e.ea(x, true);
+                e.rd(if (op == 0xD8) 4 else 8, false);
+                if (op == 0xD8) {
+                    sse(a, 0x66, 0x6E, 1, .{ .r = RAX }, false); // movd xmm1, eax
+                    sse(a, 0xF3, 0x5A, 1, .{ .r = 1 }, false); // cvtss2sd
+                } else sse(a, 0x66, 0x6E, 1, .{ .r = RAX }, true); // movq xmm1, rax
+                x87Top(a);
+                x87Full(e, RAX);
+                sse(a, 0xF2, 0x10, 0, .{ .m = stMem(RAX) }, false);
+                if (reg == 2 or reg == 3) {
+                    x87Cmp(e);
+                    if (reg == 3) x87Pop(a);
+                } else {
+                    x87Arith(e, reg);
+                    x87Put(a, RAX);
+                }
+                x87Note(e, x);
+                return true;
+            },
+            0xD9, 0xDD => {
+                const w = op == 0xDD;
+                switch (reg) {
+                    0 => {
+                        e.ea(x, true);
+                        e.rd(if (w) 8 else 4, false);
+                        if (w) sse(a, 0x66, 0x6E, 0, .{ .r = RAX }, true) else {
+                            sse(a, 0x66, 0x6E, 0, .{ .r = RAX }, false);
+                            sse(a, 0xF3, 0x5A, 0, .{ .r = 0 }, false);
+                        }
+                        x87Top(a);
+                        x87PushCheck(e);
+                        x87PushDo(a);
+                        x87Note(e, x);
+                        return true;
+                    },
+                    2, 3 => {
+                        e.ea(x, true);
+                        x87Top(a);
+                        x87Full(e, RAX);
+                        if (!w) {
+                            // (toF32 with the nearest rounding only)
+                            a.op(2, &.{0xF7}, 0, .{ .m = cpuMem(F_CW) });
+                            a.b(0x00);
+                            a.b(0x0C);
+                            e.slow(CC_NZ);
+                            sse(a, 0xF2, 0x10, 0, .{ .m = stMem(RAX) }, false);
+                            sse(a, 0xF2, 0x5A, 0, .{ .r = 0 }, false); // cvtsd2ss
+                            sse(a, 0x66, 0x7E, 0, .{ .r = RCX }, false); // movd ecx, xmm0
+                        } else a.movRegMem(8, RCX, stMem(RAX));
+                        a.movRR(4, R9, RAX); // (wr's check uses eax)
+                        e.wr(if (w) 8 else 4);
+                        a.movRR(4, RAX, R9);
+                        if (reg == 3) x87Pop(a);
+                        x87Note(e, x);
+                        return true;
+                    },
+                    else => return false,
+                }
+            },
+            else => return false,
+        }
+    }
+    // Register forms.
+    switch (op) {
+        0xD8 => {
+            x87Top(a);
+            x87Full(e, RAX);
+            x87Idx(a, R8, i);
+            x87Full(e, R8);
+            sse(a, 0xF2, 0x10, 0, .{ .m = stMem(RAX) }, false);
+            sse(a, 0xF2, 0x10, 1, .{ .m = stMem(R8) }, false);
+            if (reg == 2 or reg == 3) {
+                x87Cmp(e);
+                if (reg == 3) x87Pop(a);
+            } else {
+                x87Arith(e, reg);
+                x87Put(a, RAX);
+            }
+        },
+        0xDC, 0xDE => {
+            // ST(i) = ST(i) op' ST(0) (DE: then pop); compares
+            if (reg == 2 or reg == 3) {
+                if (op == 0xDE and !(reg == 3 and i == 1)) return false;
+                x87Top(a);
+                x87Full(e, RAX);
+                x87Idx(a, R8, i);
+                x87Full(e, R8);
+                sse(a, 0xF2, 0x10, 0, .{ .m = stMem(RAX) }, false);
+                sse(a, 0xF2, 0x10, 1, .{ .m = stMem(R8) }, false);
+                x87Cmp(e);
+                if (reg == 3) x87Pop(a);
+                if (op == 0xDE) x87Pop(a);
+            } else {
+                const sw: u8 = switch (reg) {
+                    4 => 5,
+                    5 => 4,
+                    6 => 7,
+                    7 => 6,
+                    else => reg,
+                };
+                x87Top(a);
+                x87Full(e, RAX);
+                x87Idx(a, R8, i);
+                x87Full(e, R8);
+                sse(a, 0xF2, 0x10, 0, .{ .m = stMem(R8) }, false); // a = ST(i)
+                sse(a, 0xF2, 0x10, 1, .{ .m = stMem(RAX) }, false); // b = ST(0)
+                x87Arith(e, sw);
+                x87Put(a, R8);
+                if (op == 0xDE) x87Pop(a);
+            }
+        },
+        0xD9 => switch (reg) {
+            0, 1 => {
+                // FLD ST(i) (its 80-bit image too), FXCH ST(i)
+                x87Top(a);
+                x87Full(e, RAX);
+                x87Idx(a, R8, i);
+                x87Full(e, R8);
+                if (reg == 0) {
+                    a.movRR(4, R10, RAX);
+                    x87PushCheck(e);
+                    sse(a, 0xF2, 0x10, 0, .{ .m = stMem(R8) }, false);
+                    copyRaw(a, RAX, R8);
+                    x87PushDo(a);
+                    // (exact if ST(i) was)
+                    a.op(4, &.{ 0x0F, 0xB6 }, RCX, .{ .m = cpuMem(F_EXACT) });
+                    a.op(4, &.{ 0x0F, 0xA3 }, R8, .{ .r = RCX });
+                    const no = a.jccFwd(3);
+                    x87Set(a, F_EXACT, RAX);
+                    a.here(no);
+                } else {
+                    a.movRegMem(8, RCX, stMem(RAX));
+                    a.movRegMem(8, RDX, stMem(R8));
+                    a.movMemReg(8, stMem(RAX), RDX);
+                    a.movMemReg(8, stMem(R8), RCX);
+                    swapRaw(a, RAX, R8); // (r10, r11: before the exact bits)
+                    // exact bits exchanged
+                    a.op(4, &.{ 0x0F, 0xB6 }, RCX, .{ .m = cpuMem(F_EXACT) });
+                    a.movRR(4, RDX, RCX);
+                    a.op(4, &.{ 0x0F, 0xA3 }, RAX, .{ .r = RCX }); // CF = bit(top)
+                    a.op(4, &.{ 0x0F, 0x92 }, 0, .{ .r = R9 }); // setc r9b
+                    a.op(4, &.{ 0x0F, 0xA3 }, R8, .{ .r = RCX });
+                    a.op(4, &.{ 0x0F, 0x92 }, 0, .{ .r = R10 }); // setc r10b
+                    a.op(4, &.{ 0x0F, 0xB3 }, RAX, .{ .r = RDX }); // btr
+                    a.op(4, &.{ 0x0F, 0xB3 }, R8, .{ .r = RDX });
+                    a.op(4, &.{ 0x0F, 0xB6 }, R9, .{ .r = R9 }); // movzx r9d, r9b
+                    a.op(4, &.{ 0x0F, 0xB6 }, R10, .{ .r = R10 });
+                    a.movRR(4, RCX, R8);
+                    a.op(4, &.{0xD3}, 4, .{ .r = R9 }); // shl r9d, cl (bit(top) to ST(i))
+                    a.movRR(4, RCX, RAX);
+                    a.op(4, &.{0xD3}, 4, .{ .r = R10 }); // shl r10d, cl
+                    a.aluRmReg(4, 1, .{ .r = RDX }, R9);
+                    a.aluRmReg(4, 1, .{ .r = RDX }, R10);
+                    a.movMemReg(1, cpuMem(F_EXACT), RDX);
+                    a.aluImm(2, 4, .{ .m = cpuMem(F_SW) }, ~X_C1 & 0xFFFF);
+                }
+            },
+            4 => {
+                if (i > 1) return false;
+                // FCHS, FABS: the sign bit
+                x87Top(a);
+                x87Full(e, RAX);
+                a.movRegMem(8, RCX, stMem(RAX));
+                a.op(8, &.{ 0x0F, 0xBA }, if (i == 0) 7 else 6, .{ .r = RCX }); // btc/btr rcx, 63
+                a.b(63);
+                a.movMemReg(8, stMem(RAX), RCX);
+                x87Clear(a, F_EXACT, RAX);
+            },
+            5 => {
+                if (i != 0 and i != 6) return false;
+                // FLD1, FLDZ
+                a.movImm64(RCX, if (i == 0) @as(u64, @bitCast(@as(f64, 1.0))) else 0);
+                sse(a, 0x66, 0x6E, 0, .{ .r = RCX }, true);
+                x87Top(a);
+                x87PushCheck(e);
+                x87PushDo(a);
+            },
+            else => return false,
+        },
+        0xDD => switch (reg) {
+            2, 3, 4, 5 => {
+                x87Top(a);
+                x87Full(e, RAX);
+                x87Idx(a, R8, i);
+                if (reg <= 3) {
+                    // FST / FSTP ST(i): a copy (the 80-bit image too)
+                    a.movRegMem(8, RCX, stMem(RAX));
+                    a.movMemReg(8, stMem(R8), RCX);
+                    copyRaw(a, R8, RAX);
+                    x87Clear(a, F_EMPTY, R8);
+                    // (ST(i) exact as ST(0) was)
+                    a.op(4, &.{ 0x0F, 0xB6 }, RCX, .{ .m = cpuMem(F_EXACT) });
+                    a.op(4, &.{ 0x0F, 0xA3 }, RAX, .{ .r = RCX }); // bt: ST(0)'s
+                    const no = a.jccFwd(3);
+                    a.op(4, &.{ 0x0F, 0xAB }, R8, .{ .r = RCX }); // bts
+                    const done = a.jmpFwd();
+                    a.here(no);
+                    a.op(4, &.{ 0x0F, 0xB3 }, R8, .{ .r = RCX }); // btr
+                    a.here(done);
+                    a.movMemReg(1, cpuMem(F_EXACT), RCX);
+                    if (reg == 3) x87Pop(a);
+                } else {
+                    x87Full(e, R8);
+                    sse(a, 0xF2, 0x10, 0, .{ .m = stMem(RAX) }, false);
+                    sse(a, 0xF2, 0x10, 1, .{ .m = stMem(R8) }, false);
+                    x87Cmp(e);
+                    if (reg == 5) x87Pop(a);
+                }
+            },
+            else => return false,
+        },
+        0xDA => {
+            if (x.modrm != 0xE9) return false;
+            // FUCOMPP
+            x87Top(a);
+            x87Full(e, RAX);
+            x87Idx(a, R8, 1);
+            x87Full(e, R8);
+            sse(a, 0xF2, 0x10, 0, .{ .m = stMem(RAX) }, false);
+            sse(a, 0xF2, 0x10, 1, .{ .m = stMem(R8) }, false);
+            x87Cmp(e);
+            x87Pop(a);
+            x87Pop(a);
+        },
+        0xDF => {
+            if (x.modrm != 0xE0) return false;
+            // FNSTSW AX (a control instruction: no note)
+            a.op(4, &.{ 0x0F, 0xB7 }, RCX, .{ .m = cpuMem(F_SW) });
+            a.aluImm(4, 4, .{ .r = RCX }, ~@as(u32, 0x3800));
+            x87Top(a);
+            a.bytes(&.{ 0xC1, 0xE0, 0x0B }); // shl eax, 11
+            a.aluRmReg(4, 1, .{ .r = RCX }, RAX);
+            a.movMemReg(2, gr(0, 2), RCX);
+            return true;
+        },
+        else => return false,
+    }
+    x87Note(e, x);
+    return true;
+}
+
+/// raw[dst] = raw[src] (16-byte entries: the index doubled).
+fn copyRaw(a: *A, dst: u4, src: u4) void {
+    a.op(4, &.{0x8D}, R11, .{ .m = .{ .base = src, .index = src } }); // r11 = src*2
+    a.op(4, &.{0x8D}, R10, .{ .m = .{ .base = dst, .index = dst } });
+    a.movRegMem(8, RCX, rawMem(R11, 0));
+    a.movMemReg(8, rawMem(R10, 0), RCX);
+    a.movRegMem(8, RCX, rawMem(R11, 8));
+    a.movMemReg(8, rawMem(R10, 8), RCX);
+}
+fn swapRaw(a: *A, x: u4, y: u4) void {
+    a.op(4, &.{0x8D}, R11, .{ .m = .{ .base = x, .index = x } });
+    a.op(4, &.{0x8D}, R10, .{ .m = .{ .base = y, .index = y } });
+    inline for (.{ 0, 8 }) |h| {
+        a.movRegMem(8, RCX, rawMem(R11, h));
+        a.movRegMem(8, RDX, rawMem(R10, h));
+        a.movMemReg(8, rawMem(R11, h), RDX);
+        a.movMemReg(8, rawMem(R10, h), RCX);
+    }
 }

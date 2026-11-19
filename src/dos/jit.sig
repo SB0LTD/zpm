@@ -128,6 +128,8 @@ pub const FastEnt = extern struct {
     host: u64 = 0,
     key: u64 = 0,
     code: u64 = 0,
+    /// The block's last byte's EIP (CS's limit must reach it).
+    last: u64 = 0,
 };
 
 pub const Block = struct {
@@ -557,6 +559,7 @@ pub const Jit = struct {
 pub var the: Jit = .{};
 
 
+
 /// The JIT for this bus type: a machine with RAM pages to watch.
 pub fn supports(comptime B: type) bool {
     if (!have_backend) return false;
@@ -789,9 +792,7 @@ pub fn Mode(comptime B: type, comptime P: bool) type {
                 break :blk translate(j, c, host, lin, eip, mode) orelse return null;
             };
             // (generated code's own lookup: blocks it may enter unchecked)
-            if (!P or mode & M_CSFLAT != 0) {
-                fast[Jit.fastIdx(host, eip)] = .{ .host = host, .key = (@as(u64, eip) << 32) | mode, .code = j.rxAddr(blocks[b].code) };
-            }
+            fast[Jit.fastIdx(host, eip)] = .{ .host = host, .key = (@as(u64, eip) << 32) | mode, .code = j.rxAddr(blocks[b].code), .last = if (P) blocks[b].last_eip else 0 };
             return b;
         }
 

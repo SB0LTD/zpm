@@ -27,6 +27,10 @@ pub const LinuxHost = struct {
     /// Executable memory for the CPU's translator (false: none; the CPU
     /// interprets everything, e.g. galaxy-dos's GALAXY_DOS_JIT=0).
     jit: bool = true,
+    /// The clock: another host's last reading (lockstep's twin reads the
+    /// time the machine it follows read), else the real-time clock.
+    clock_of: ?*const LinuxHost = null,
+    last_now: host_mod.Time = undefined,
 
     pub fn host(self: *LinuxHost) host_mod.Host {
         return .{ .ctx = self, .vt = &vtable };
@@ -168,7 +172,13 @@ pub const LinuxHost = struct {
         if (d.fd >= 0) _ = linux.close(d.fd);
         d.fd = -1;
     }
-    fn nowF(_: *anyopaque) host_mod.Time {
+    fn nowF(ctx: *anyopaque) host_mod.Time {
+        const s = me(ctx);
+        if (s.clock_of) |o| return o.last_now;
+        s.last_now = realNow();
+        return s.last_now;
+    }
+    fn realNow() host_mod.Time {
         var ts: linux.timespec = undefined;
         _ = linux.clock_gettime(.REALTIME, &ts);
         const es = std.time.epoch.EpochSeconds{ .secs = @intCast(ts.sec) };

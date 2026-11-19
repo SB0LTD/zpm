@@ -109,10 +109,11 @@ pub fn check(m: *Machine, t: *Machine, info: *const jit.CheckInfo) bool {
     return ok;
 }
 
-fn fpuEql(a: anytype, b: anytype) bool {
+pub fn fpuEql(a: anytype, b: anytype) bool {
     for (0..8) |i| {
         if (@as(u64, @bitCast(a.st[i])) != @as(u64, @bitCast(b.st[i]))) return false;
-        if (a.raw[i] != b.raw[i]) return false;
+        // (an image matters only where it is exact)
+        if (a.exact & (@as(u8, 1) << @intCast(i)) != 0 and a.raw[i] != b.raw[i]) return false;
     }
     return a.exact == b.exact and a.empty == b.empty and a.top == b.top and a.cw == b.cw and a.sw == b.sw;
 }

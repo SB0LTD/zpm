@@ -198,7 +198,7 @@ const Gen = struct {
     /// operand size is 32 bits (else 16).
     fn one(g: *Gen, wide: bool) void {
         const mem = g.r().boolean();
-        const pick = g.r().uintLessThan(u8, 22);
+        const pick = g.r().uintLessThan(u8, 23);
         // operand size: 1, the default, or the other (0x66)
         const szk = g.r().uintLessThan(u8, 3);
         const byte = szk == 0;
@@ -343,6 +343,17 @@ const Gen = struct {
                 g.b(0x11);
                 g.modrm(g.any(), g.dst(), mem);
             },
+            22 => { // CALL to the next instruction, POP its address
+                if (szk == 2) g.n -= 1;
+                g.b(0xE8);
+                g.b(0);
+                g.b(0);
+                if (wide) {
+                    g.b(0);
+                    g.b(0);
+                }
+                g.b(0x58 | g.dst());
+            },
             else => { // a flags reader: Jcc over a NOP, then the NOP
                 if (szk == 2) g.n -= 1;
                 g.b(0x70 | g.r().uintLessThan(u8, 16));
@@ -407,4 +418,245 @@ test "jit: templates against the interpreter on random operands (real mode)" {
     if (!have()) return;
     try fuzz(false, 3);
     try fuzz(false, 4);
+}
+
+// ── Code that changes, faults, interrupts, remapped code ───────────────
+
+fn both(at: u32, bytes: []const u8) void {
+    for ([_]*machine.Machine{ &mj, &mi }) |m| @memcpy(m.mem.ram[at..][0..bytes.len], bytes);
+}
+
+test "jit: code that writes its own immediate, in protected mode" {
+    if (!have()) return;
+    // l: mov eax,0; inc dword [0x10001]; add ebx,eax; dec ecx; jnz l; jmp $
+    try t.expect(flat(&.{ 0xB8, 0, 0, 0, 0, 0xFF, 0x05, 0x01, 0x00, 0x01, 0x00, 0x01, 0xC3, 0x49, 0x75, 0xF0, 0xEB, 0xFE }, false));
+    for ([_]*machine.Machine{ &mj, &mi }) |m| m.cpu.regs.r[regs.ECX] = 100;
+    try runBoth(1000, 1000);
+    try t.expectEqual(@as(u32, 99 * 100 / 2), mj.cpu.regs.r[regs.EBX]);
+}
+
+test "jit: code that writes its own immediate, in real mode" {
+    if (!have()) return;
+    // l: mov ax,0; inc word [cs:1]; add bx,ax; dec cx; jnz l; jmp $
+    try t.expect(boot(&.{ 0xB8, 0, 0, 0x2E, 0xFF, 0x06, 0x01, 0x00, 0x01, 0xC3, 0x49, 0x75, 0xF3, 0xEB, 0xFE }));
+    for ([_]*machine.Machine{ &mj, &mi }) |m| m.cpu.regs.r[regs.ECX] = 100;
+    try runBoth(1000, 1000);
+    try t.expectEqual(@as(u32, 99 * 100 / 2), mj.cpu.regs.r[regs.EBX] & 0xFFFF);
+}
+
+test "jit: a page fault inside a block restarts its instruction after the handler maps the page" {
+    if (!have()) return;
+    // mov eax,5; mov ebx,7; mov ecx,[0x50000]; add ebx,ecx; add ebx,eax; jmp $
+    try t.expect(flat(&.{ 0xB8, 5, 0, 0, 0, 0xBB, 7, 0, 0, 0, 0x8B, 0x0D, 0x00, 0x00, 0x05, 0x00, 0x01, 0xCB, 0x01, 0xC3, 0xEB, 0xFE }, true));
+    // #PF: add esp,4; mov dword [0x21140],0x50007; mov eax,cr2; invlpg [eax]; iretd
+    both(0x11000, &.{ 0x83, 0xC4, 0x04, 0xC7, 0x05, 0x40, 0x11, 0x02, 0x00, 0x07, 0x00, 0x05, 0x00, 0x0F, 0x20, 0xD0, 0x0F, 0x01, 0x38, 0xCF });
+    for ([_]*machine.Machine{ &mj, &mi }) |m| {
+        wr32(m, 0x1000 + 14 * 8, (0x11000 & 0xFFFF) | (0x08 << 16));
+        wr32(m, 0x1000 + 14 * 8 + 4, (0x11000 & 0xFFFF_0000) | (0x8E << 8));
+        m.cpu.idt_base = 0x1000;
+        m.cpu.idt_limit = 0x7FF;
+        wr32(m, 0x21140, 0);
+        wr32(m, 0x50000, 0x1234);
+    }
+    try runBoth(200, 200);
+    try t.expectEqual(@as(u32, 7 + 0x1234 + 0x50000), mj.cpu.regs.r[regs.EBX]);
+    try t.expectEqual(@as(u32, 0x50000), mj.cpu.cr2);
+}
+
+test "jit: interrupts are taken where the interpreter takes them (a 1 kHz timer, real mode)" {
+    if (!have()) return;
+    // the PIT at 1193 (out 43h,34h; out 40h,A9h; out 40h,04h); sti;
+    // l: inc ax; add bx,ax; jmp l
+    try t.expect(boot(&.{ 0xB0, 0x34, 0xE6, 0x43, 0xB0, 0xA9, 0xE6, 0x40, 0xB0, 0x04, 0xE6, 0x40, 0xFB, 0x40, 0x01, 0xC3, 0xEB, 0xFB }));
+    for ([_]*machine.Machine{ &mj, &mi }) |m| m.ips = 20_000_000;
+    var i: u32 = 0;
+    while (i < 50) : (i += 1) {
+        try t.expectEqual(mi.run(1000), mj.run(1000));
+        try same();
+    }
+    try t.expect(std.mem.eql(u8, &mi.mem.ram, &mj.mem.ram));
+    // (the BIOS's tick count went on: interrupts were taken)
+    try t.expect(std.mem.readInt(u32, mj.mem.ram[0x46C..][0..4], .little) > 0);
+}
+
+test "jit: code remapped under it by INVLPG and by CR3 runs anew" {
+    if (!have()) return;
+    const code = [_]u8{
+        0xE8, 0xFB, 0xFF, 0x04, 0x00, // call 0x60000
+        0x89, 0xC3, // mov ebx,eax
+        0xC7, 0x05, 0x80, 0x11, 0x02, 0x00, 0x07, 0x10, 0x05, 0x00, // mov dword [0x21180],0x51007
+        0x0F, 0x01, 0x3D, 0x00, 0x00, 0x06, 0x00, // invlpg [0x60000]
+        0xE8, 0xE3, 0xFF, 0x04, 0x00, // call 0x60000
+        0x01, 0xC3, // add ebx,eax
+        0xB8, 0x00, 0x20, 0x02, 0x00, // mov eax,0x22000
+        0x0F, 0x22, 0xD8, // mov cr3,eax
+        0xE8, 0xD4, 0xFF, 0x04, 0x00, // call 0x60000
+        0x6B, 0xDB, 0x0A, // imul ebx,ebx,10
+        0x01, 0xC3, // add ebx,eax
+        0xEB, 0xFE,
+    };
+    try t.expect(flat(&code, true));
+    both(0x50000, &.{ 0xB8, 1, 0, 0, 0, 0xC3 });
+    both(0x51000, &.{ 0xB8, 2, 0, 0, 0, 0xC3 });
+    for ([_]*machine.Machine{ &mj, &mi }) |m| {
+        wr32(m, 0x21180, 0x50007);
+        // a second directory: the same map but 0x60000 at 0x50000
+        wr32(m, 0x22000, 0x23007);
+        for (0..1024) |i| wr32(m, 0x23000 + @as(u32, @intCast(i)) * 4, (@as(u32, @intCast(i)) << 12) | 7);
+        wr32(m, 0x23180, 0x50007);
+    }
+    try runBoth(100, 100);
+    try t.expectEqual(@as(u32, (1 + 2) * 10 + 1), mj.cpu.regs.r[regs.EBX]);
+}
+
+// ── The x87's templates on random operands ─────────────────────────────
+
+fn x87One(g: *Gen) void {
+    const r = g.r();
+    const i = r.uintLessThan(u8, 8);
+    const reg = r.uintLessThan(u8, 8);
+    const disp = r.uintLessThan(u8, 14) * 8;
+    switch (r.uintLessThan(u8, 18)) {
+        0 => {
+            g.b(0xD8);
+            g.b(0x47 | (reg << 3));
+            g.b(disp);
+        },
+        1 => {
+            g.b(0xDC);
+            g.b(0x47 | (reg << 3));
+            g.b(disp);
+        },
+        2 => {
+            g.b(0xD8);
+            g.b(0xC0 | (reg << 3) | i);
+        },
+        3 => {
+            g.b(0xDC);
+            g.b(0xC0 | (reg << 3) | i);
+        },
+        4 => {
+            g.b(0xDE);
+            g.b(0xC0 | (reg << 3) | i);
+        },
+        5, 6 => { // FLD m32 / m64
+            g.b(if (r.boolean()) 0xD9 else 0xDD);
+            g.b(0x47);
+            g.b(disp);
+        },
+        7 => { // FST(P) m32 / m64 (into the scratch area past the inputs)
+            g.b(if (r.boolean()) 0xD9 else 0xDD);
+            g.b(0x47 | ((2 + r.uintLessThan(u8, 2)) << 3));
+            g.b(0x80 + r.uintLessThan(u8, 8) * 8);
+        },
+        8 => {
+            g.b(0xD9);
+            g.b(0xC0 | i);
+        },
+        9 => {
+            g.b(0xD9);
+            g.b(0xC8 | i);
+        },
+        10 => {
+            g.b(0xD9);
+            const ops = [_]u8{ 0xE0, 0xE1, 0xE8, 0xEE };
+            g.b(ops[r.uintLessThan(usize, 4)]);
+        },
+        11 => {
+            g.b(0xDD);
+            g.b(0xD0 | (r.uintLessThan(u8, 4) << 3) | i);
+        },
+        12 => {
+            g.b(0xDA);
+            g.b(0xE9);
+        },
+        13 => {
+            g.b(0xDF);
+            g.b(0xE0);
+        },
+        14 => {
+            g.b(0xDE);
+            g.b(0xD9);
+        },
+        15 => { // FLDCW: the default, single precision, rounding up
+            g.b(0xD9);
+            g.b(0x6F);
+            g.b(0x70 + r.uintLessThan(u8, 3) * 2);
+        },
+        16 => { // FSTP ST(1)
+            g.b(0xDD);
+            g.b(0xD9);
+        },
+        else => { // a flags producer and a Jcc over a NOP between them
+            g.b(0x85);
+            g.b(0xC0);
+            g.b(0x74);
+            g.b(1);
+            g.b(0x90);
+            return;
+        },
+    }
+}
+
+fn x87Fuzz(wide: bool, seed: u64) !void {
+    var g = Gen{ .rng = std.Random.DefaultPrng.init(seed) };
+    var round: u32 = 0;
+    while (round < 300) : (round += 1) {
+        g.n = 0;
+        const count = 3 + g.r().uintLessThan(u32, 40);
+        for (0..count) |_| {
+            if (!wide) g.b(0x67); // (the [edi+disp8] form in 16-bit code)
+            x87One(&g);
+        }
+        g.b(0xE9);
+        if (wide) {
+            g.d(@bitCast(-@as(i32, @intCast(g.n + 4))));
+        } else {
+            const rel: u16 = @truncate(@as(u32, @bitCast(-@as(i32, @intCast(g.n + 2)))));
+            g.b(@truncate(rel));
+            g.b(@truncate(rel >> 8));
+        }
+        const ok = if (wide) flat(g.buf[0..g.n], round & 1 == 0) else boot(g.buf[0..g.n]);
+        try t.expect(ok);
+        // Inputs: f64s and f32s, some special.
+        var data: [0x80]u8 = undefined;
+        var k: usize = 0;
+        while (k < 0x70) : (k += 8) {
+            const v: u64 = switch (g.r().uintLessThan(u8, 8)) {
+                0 => 0,
+                1 => @bitCast(@as(f64, 1.0)),
+                2 => @bitCast(-@as(f64, 2.5)),
+                3 => 0x7FF0_0000_0000_0000, // inf
+                4 => 0x7FF8_0000_0000_0001, // a NaN
+                5 => (@as(u64, @as(u32, @bitCast(@as(f32, @floatFromInt(g.r().int(i16)))))) << 32) | @as(u32, @bitCast(@as(f32, 3.25))),
+                else => g.r().int(u64) & 0xBFFF_FFFF_FFFF_FFFF,
+            };
+            std.mem.writeInt(u64, data[k..][0..8], v, .little);
+        }
+        std.mem.writeInt(u16, data[0x70..][0..2], 0x037F, .little);
+        std.mem.writeInt(u16, data[0x72..][0..2], 0x007F, .little);
+        std.mem.writeInt(u16, data[0x74..][0..2], 0x0B7F, .little);
+        for ([_]*machine.Machine{ &mj, &mi }) |m| {
+            const r = &m.cpu.regs;
+            r.r[regs.ESP] = if (wide) 0x9000 else 0xFF00;
+            r.r[regs.EDI] = if (wide) 0x30000 else 0x100;
+            const at: usize = if (wide) 0x30000 else 0x30100;
+            @memcpy(m.mem.ram[at..][0..0x80], &data);
+        }
+        runBoth(@intCast(count * 3 + 7), 1_000_000) catch |e| {
+            std.debug.print("\nx87 fuzz ({s}, seed {d}, round {d}): {x}\n", .{ if (wide) "32-bit" else "16-bit", seed, round, g.buf[0..g.n] });
+            return e;
+        };
+        if (!check.fpuEql(&mj.cpu.fpu, &mi.cpu.fpu)) {
+            std.debug.print("\nx87 fuzz ({s}, seed {d}, round {d}): the FPU differs: {x}\n", .{ if (wide) "32-bit" else "16-bit", seed, round, g.buf[0..g.n] });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "jit: the x87's templates against the FPU's code on random operands" {
+    if (!have()) return;
+    try x87Fuzz(true, 11);
+    try x87Fuzz(true, 12);
+    try x87Fuzz(false, 13);
 }
