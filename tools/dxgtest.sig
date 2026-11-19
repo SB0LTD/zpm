@@ -375,48 +375,13 @@ pub fn main(init: std.process.Init) void {
         // ("draw edges": step 4 too, the graphics dispatches through the
         // GPU-neutral adapter)
         const edges = argv.len > 2 and std.mem.eql(u8, std.mem.span(argv[2]), "edges");
-        // ("draw edges nodepth": step 4's draws without their depth target)
-        if (argv.len > 3 and std.mem.eql(u8, std.mem.span(argv[3]), "nodepth")) gpu.nvidia_draw.edges_depth = false;
-        // ("draw edges blobdepth FILE": step 4's depth target an allocation
-        // made with NVIDIA's private data from FILE: its D3D12 driver's
-        // depth surface, recorded)
-        if (argv.len > 4 and std.mem.eql(u8, std.mem.span(argv[3]), "blobdepth")) {
-            var data: [dxg.nv.ALLOCATION_BYTES]u8 = undefined;
-            const fd: isize = @bitCast(linux.open(argv[4], .{ .ACCMODE = .RDONLY }, 0));
-            if (fd < 0) linux.exit(1);
-            const got = linux.read(@intCast(fd), &data, data.len);
-            if (got != data.len) linux.exit(1);
-            const z = g.allocWith(&data, 0x80000, null) catch |e| {
-                out("blobdepth: {s} (status {d})\n", .{ @errorName(e), dxg.kmt.last_status });
-                linux.exit(1);
-            };
-            out("blobdepth: allocation at 0x{x}\n", .{z.va});
-            gpu.nvidia_draw.edges_depth_va = z.va;
-        }
-        // ("draw edges zprobe FILE": step 5 a probe of the depth target's
-        // layout, its bytes into FILE: nvidia_draw.z_probe)
-        var zbuf: [8192]u8 = undefined;
-        if (argv.len > 4 and std.mem.eql(u8, std.mem.span(argv[3]), "zprobe")) gpu.nvidia_draw.z_probe = &zbuf;
-        // ("draw edges zprobes FILE": the stencil's probe)
-        if (argv.len > 4 and std.mem.eql(u8, std.mem.span(argv[3]), "zprobes")) {
-            gpu.nvidia_draw.z_probe = &zbuf;
-            gpu.nvidia_draw.z_probe_stencil = true;
-        }
-        // ("draw edges vramdepth": step 4's depth target in VRAM)
-        if (argv.len > 3 and std.mem.eql(u8, std.mem.span(argv[3]), "vramdepth")) {
-            const z = g.allocVideo(1 << 20) catch linux.exit(1);
-            gpu.nvidia_draw.edges_depth_va = z.va;
+        if (edges and argv.len > 3) {
+            out("draw edges uses the current renderer test groups; extra mode is unsupported\n", .{});
+            linux.exit(2);
         }
         const t4 = nowUs();
         const h = gpu.nvidia_draw.hardwareTest(dev.device(), if (edges) d else null, &over3d, &kst, &model, logLine, nowUs);
         out("4. 3D engine: started {}, object {}, state {}, {d} passed, {d} failed, lost {}, {d} Mpx/s ({d} ms)\n", .{ h.started, h.object, h.state, h.passed, h.failed, h.lost, h.mpx_per_s, (nowUs() - t4) / 1000 });
-        if (gpu.nvidia_draw.z_probe != null) {
-            const zf: isize = @bitCast(linux.open(argv[4], .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644));
-            if (zf >= 0) {
-                _ = linux.write(@intCast(zf), &zbuf, zbuf.len);
-                _ = linux.close(@intCast(zf));
-            }
-        }
         if (h.lost or h.failed != 0) if (g.fault()) |pf| out("   the device: execution state {d}, page fault at 0x{x} (stage {d}, flags 0x{x}, code 0x{x})\n", .{ pf.execution, pf.va, pf.stage, pf.flags, pf.code });
         ch.close();
         g.close();

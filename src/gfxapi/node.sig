@@ -86,6 +86,11 @@ pub const G_VERSION: u32 = 1;
 /// (the RTX's; without it, system memory the GPU maps).
 pub const G_WC: u32 = 1;
 pub const G_VRAM: u32 = 2;
+/// With G_VRAM: no CPU view wanted (never mapped here): VRAM the CPU
+/// cannot reach is as good (a forwarded RTX's, whose VRAM the guest's CPU
+/// has no way into). A kernel that does not know it refuses it (EINVAL):
+/// asked once, then plain G_VRAM.
+pub const G_NOCPU: u32 = 4;
 /// DRM's PRIME export (struct drm_prime_handle: u32 handle, u32 flags,
 /// s32 fd), and its flags: DRM_CLOEXEC, DRM_RDWR.
 pub const PRIME_HANDLE_TO_FD: u32 = 0xc00c_642d;
@@ -115,7 +120,7 @@ pub fn kindOf(chip: u32) ?Kind {
 }
 
 /// Where an RTX buffer lives (see the top).
-pub const Where = enum { vram, system };
+pub const Where = enum { vram, system, gpu_only };
 
 const EINTR = 4;
 const EIO = 5;
@@ -153,6 +158,10 @@ pub fn Node(comptime Sys: type) type {
         fd: i32 = -1,
         /// The GPU hung or went away: nothing more is asked of it.
         lost: bool = false,
+        /// The kernel refused G_NOCPU once: GPU-only buffers are plain
+        /// VRAM from then on. The last G_ALLOC's answer.
+        no_gpu_only: bool = false,
+        last_alloc: i64 = 0,
         /// Which GPU answered (open: G_INFO's chip).
         kind: Kind = .adreno,
         dma_import: bool = false,
@@ -266,6 +275,7 @@ pub fn Node(comptime Sys: type) type {
                 .vtable = switch (where) {
                     .vram => &nv_vram_vtable,
                     .system => &nv_system_vtable,
+                    .gpu_only => &nv_gpu_only_vtable,
                 },
                 .timestamp_hz = nvidia.push.TIMESTAMP_HZ,
             };
@@ -307,6 +317,15 @@ pub fn Node(comptime Sys: type) type {
             .fromDevice = nvFromDevice,
         };
 
+        const nv_gpu_only_vtable = NvDevice.VTable{
+            .alloc = nvAllocGpuOnly,
+            .free = nvFree,
+            .submit = nvSubmit,
+            .wait = nvWait,
+            .toDevice = nvNoCache,
+            .fromDevice = nvNoCache,
+        };
+
         const nv_system_vtable = NvDevice.VTable{
             .alloc = nvAllocSystem,
             .free = nvFree,
@@ -340,6 +359,10 @@ pub fn Node(comptime Sys: type) type {
             wr32(&a, 8, flags);
             wr64(&a, 16, at);
             const result = g.call(G_ALLOC, &a);
+            g.last_alloc = result;
+            // (G_NOCPU refused by an older kernel: said by the caller's
+            // fallback, not here)
+            if (result == -EINVAL and flags & G_NOCPU != 0) return null;
             if (result != 0) {
                 report.say(.egl_error, "render-node allocation of {d} bytes failed: {d}", .{ size, result });
                 return null;
@@ -399,6 +422,24 @@ pub fn Node(comptime Sys: type) type {
             const need = std.mem.alignForward(usize, size, PAGE);
             const len = std.mem.alignForward(usize, size, g.unit);
             e.* = .{ .used = true, .first = @min(len, piece), .gen = g.buffers[idx].gen };
+            if (flags & G_NOCPU != 0) {
+                // (no CPU view: pieces at consecutive GPU addresses only)
+                const n = (len + piece - 1) / piece;
+                if (n > 1) {
+                    var r = [_]u8{0} ** 16;
+                    wr64(&r, 0, len);
+                    if (g.call(G_RESERVE, &r) != 0) return g.undo(e);
+                    e.va = rd64(&r, 8);
+                    e.reserved = true;
+                }
+                for (0..n) |k| {
+                    const p = g.newPiece(@min(piece, need - k * piece), if (n > 1) e.va + k * piece else 0, flags) orelse return g.undo(e);
+                    e.handles[k] = p.handle;
+                    e.n = k + 1;
+                    if (n == 1) e.va = p.va;
+                }
+                return .{ .va = e.va, .cpu = &.{}, .handle = g.handleOf(idx) };
+            }
             if (len <= piece) {
                 const p = g.newPiece(need, 0, flags) orelse return g.undo(e);
                 e.handles[0] = p.handle;
@@ -645,6 +686,19 @@ pub fn Node(comptime Sys: type) type {
             return of(ctx).nvAlloc(size, 0);
         }
 
+        /// VRAM with no CPU view (G_NOCPU), else plain VRAM (whose CPU view
+        /// is then not used).
+        fn nvAllocGpuOnly(ctx: *anyopaque, size: usize) ?NvBuffer {
+            const g = of(ctx);
+            if (!g.no_gpu_only) {
+                if (g.nvAlloc(size, G_VRAM | G_NOCPU)) |b| return b;
+                if (g.last_alloc == -EINVAL) g.no_gpu_only = true;
+            }
+            return g.nvAlloc(size, G_VRAM);
+        }
+
+        fn nvNoCache(_: *anyopaque, _: NvBuffer, _: usize, _: usize) void {}
+
         fn nvFree(ctx: *anyopaque, b: NvBuffer) void {
             of(ctx).freeIn(b.handle);
         }
@@ -712,7 +766,10 @@ pub fn Gpu(comptime Sys: type, comptime targets: []const gpu.Target) type {
                 .nvidia => if (with_nv) {
                     var caps = gpu.nvidia_device.rtx5070(@as(u64, info.vram_mib) << 20);
                     if (g.want_graphics and g.node.graphics()) caps = gpu.nvidia_device.withGraphics(caps);
-                    return gpu.nvidia_device.over(&g.nv, g.node.nvDevice(.vram), g.node.nvDevice(.system), caps);
+                    const dev = gpu.nvidia_device.over(&g.nv, g.node.nvDevice(.vram), g.node.nvDevice(.system), caps);
+                    // (images in VRAM no CPU reaches: the forwarded RTX's)
+                    g.nv.gpu_only = g.node.nvDevice(.gpu_only);
+                    return dev;
                 },
             }
             g.node.close();

@@ -21,6 +21,16 @@
 //!   for bit. When a run fails, its batch is done again on the CPU and the
 //!   engine stays on the CPU (`lost`, which GL reports as a reset).
 //!
+//! - **VRAM.** On a discrete GPU (an RTX) an image the GPU draws into or
+//!   reads (a texture, a renderbuffer, a pbuffer; not a window's buffer,
+//!   which the compositor reads) lives in VRAM: its `buf`'s GPU address is
+//!   the VRAM copy's, its CPU view a shadow in system memory (`host`). The
+//!   two hooks of the CPU's accesses move bytes between them on the GPU
+//!   (gfx_words): fromDevice brings the whole image down once after the
+//!   GPU wrote it (Track.shadow_old), toDevice only notes the bytes the CPU
+//!   wrote (Track.dirty), which go up before the next GPU use of the image
+//!   (vramIn). An image shared as an EGLImage goes back to system memory
+//!   first. GALAXY_GL_CHECK keeps them all in system memory.
 //! - **Shared memory.** An EGLImage and the GL textures made of it name one
 //!   memory (`Shared`): what the GPU has pending on it is tracked once,
 //!   for every name, and it is freed with the last of them.
@@ -169,6 +179,10 @@ pub const Image = struct {
     /// a color image without alpha (an XRGB surface's): read, and copied
     /// from, as opaque whatever its top byte holds
     no_alpha: bool = false,
+    /// in VRAM (see the top): that buffer, and the shadow (`buf.cpu` is
+    /// its CPU view; its GPU address what the copies use)
+    vram: ?gpu.Buffer = null,
+    host: gpu.Buffer = .{},
     /// mipmap levels held (newImageChain), each after the one before: level
     /// l is levelWidth(l) x levelHeight(l), rows levelStride(l) bytes
     /// apart, from byte level_at[l]; level 0 is the image itself
@@ -267,7 +281,20 @@ pub const Track = struct {
     last: u64 = 0,
     /// the GPU wrote it since the CPU last fetched it
     gpu_wrote: bool = false,
+    /// an image in VRAM: the GPU wrote VRAM since the shadow last had it
+    shadow_old: bool = false,
+    /// an image in VRAM: the shadow's bytes [dirty_lo, dirty_hi) the CPU
+    /// wrote since VRAM last had them
+    dirty_lo: usize = 0,
+    dirty_hi: usize = 0,
 };
+
+/// The GPU writes `img` in the open batch.
+fn gpuWrites(img: *Image) void {
+    const t = img.trk();
+    t.gpu_wrote = true;
+    if (img.vram != null) t.shadow_old = true;
+}
 
 /// Memory several images name (an EGLImage, the GL textures and
 /// renderbuffers made of it): one track, freed with the last name.
@@ -388,7 +415,7 @@ pub const Pool = struct {
 /// Threads per group (a row of pixels: one thread each).
 pub const GROUP = 64;
 
-const Prog = enum(u8) { fill, fill_masked, copy, bin, blit, mip };
+const Prog = enum(u8) { fill, fill_masked, copy, bin, blit, mip, words };
 const N_PROGS = @typeInfo(Prog).@"enum".field_names.len;
 /// A program's code as the backend emits it (ir3, sm_120 or KIR's own).
 pub const CODE_BYTES = 16 * 1024;
@@ -532,6 +559,24 @@ fn copyKernel(s: kir.Storage) kir.Kernel {
     const kept = k.op2(.@"or", .u32, r(k.op2(.@"and", .u32, r(v), r(k.param(.u32, 9)))), r(swapped));
     const out = k.op2(.@"or", .u32, r(kept), r(k.param(.u32, 11)));
     pixelStore(&k, dst, dbpp, dat, out);
+    k.endif();
+    return k;
+}
+
+/// words: 32-bit words from binding 0 to binding 1 (an image's VRAM copy
+/// and its shadow): params 0 the source's byte offset, 1 the
+/// destination's, 2 the words, 3 the grid's width in groups.
+fn wordsKernel(s: kir.Storage) kir.Kernel {
+    var k = kir.Kernel.init(s, "gfx_words", .{ GROUP, 1, 1 });
+    const src = k.binding();
+    const dst = k.binding();
+    const g = k.op3(.imad, .u32, r(k.gid(1)), r(k.param(.u32, 3)), r(k.gid(0)));
+    const i = k.op3(.imad, .u32, r(g), u(GROUP), r(k.tid(0)));
+    k.ifp(r(k.cmp(.u32, .lt, r(i), r(k.param(.u32, 2)))));
+    const b = k.op2(.shl, .u32, r(i), u(2));
+    const v = k.reg(.u32);
+    k.setAux(v, .ld, r(k.op2(.iadd, .u32, r(k.param(.u32, 0)), r(b))), kir.no, kir.no, @bitCast(kir.global(src, 32)));
+    k.store(.u32, kir.global(dst, 32), r(k.op2(.iadd, .u32, r(k.param(.u32, 1)), r(b))), r(v));
     k.endif();
     return k;
 }
@@ -1070,6 +1115,10 @@ pub const Config = struct {
     /// colour images stay rows, such draws on the compute kernels.
     /// GALAXY_GL_BLOCK=0 turns it off.
     block_targets: bool = true,
+    /// Allow depth and stencil draws on the graphics pipeline.
+    graphics_depth: bool = true,
+    /// Use GPU-local images on discrete GPUs.
+    vram_images: bool = true,
 };
 
 /// A kernel the CPU ran, kept in Config.cpu_kernels: what it was built
@@ -1143,6 +1192,9 @@ pub const Stats = struct {
     /// to rows (Engine.toRows): each image at most once each way
     promoted: u32 = 0,
     demoted: u32 = 0,
+    /// Copies between images' VRAM and their shadows (gfx_words), bytes.
+    vram_copies: u64 = 0,
+    vram_bytes: u64 = 0,
 };
 
 pub const Engine = struct {
@@ -1179,6 +1231,10 @@ pub const Engine = struct {
     /// Draws kept on the compute kernels for now (tests: a frame split
     /// between the two rasterizers on purpose).
     compute_only: bool = false,
+    /// Images go to VRAM (Config.vram_images, a discrete GPU, no check).
+    vram_images: bool = false,
+    /// Images in VRAM now, and their bytes (stats).
+    vram_count: u32 = 0,
     said_graphics: bool = false,
     said_compute: [8][]const u8 = @splat(""),
     said_promote: bool = false,
@@ -1235,8 +1291,9 @@ pub const Engine = struct {
     pub fn init(e: *Engine, cfg: Config) void {
         e.* = .{ .pool = Pool.init(cfg.pool), .slabs = cfg.slabs, .compiler = cfg.compiler, .work = cfg.work, .cpu_work = cfg.cpu_work, .cpu_insts = cfg.cpu_kernels, .check = cfg.check };
         if (cfg.dev) |d| e.graphics = cfg.graphics and d.caps.graphics and d.caps.target == .sm_120;
-        e.depth_float = e.graphics and cfg.depth_float;
+        e.depth_float = e.graphics and cfg.depth_float and cfg.graphics_depth;
         e.block_targets = e.graphics and cfg.block_targets;
+        if (cfg.dev) |d| e.vram_images = cfg.vram_images and d.caps.memory == .discrete and cfg.check.mem.len == 0;
         for (e.slabs) |*slab| slab.* = .{};
         const d = cfg.dev orelse return;
         e.loadAll(d, cfg.compiler, cfg.work) catch |err| {
@@ -1260,6 +1317,7 @@ pub const Engine = struct {
                 .bin => raster.binKernel(s),
                 .blit => blitKernel(s),
                 .mip => mipKernel(s),
+                .words => wordsKernel(s),
             };
             try k.finish();
             var w = gpu.Work.init(work_mem);
@@ -1300,6 +1358,8 @@ pub const Engine = struct {
             .waits = e.stats.waits,
             .wait_us = e.stats.wait_us,
             .cpu_draws = e.stats.cpu_draws,
+            .vram_images = e.vram_count,
+            .vram_bytes = e.stats.vram_bytes,
         };
     }
 
@@ -1391,7 +1451,9 @@ pub const Engine = struct {
     /// An image of width x height in `format` (rows of width texels,
     /// rounded up to 4 bytes), or null when there is no memory for it.
     pub fn newImage(e: *Engine, width: u32, height: u32, format: Format) ?Image {
-        return e.allocImage(width, height, format, true);
+        var img = e.allocImage(width, height, format, true) orelse return null;
+        e.toVram(&img);
+        return img;
     }
 
     /// A multisampled image (samples 2, 4 or 8; 1: newImage's): a pixel's
@@ -1402,6 +1464,7 @@ pub const Engine = struct {
         var img = e.allocImage(width * samples, height, format, true) orelse return null;
         img.width = width;
         img.samples = samples;
+        e.toVram(&img);
         return img;
     }
 
@@ -1429,7 +1492,9 @@ pub const Engine = struct {
             return .{ .buf = m.buf, .width = width, .height = height, .stride = pitch, .format = .d24s8, .own = true, .pooled = m.pooled, .layout = layout, .depth_float = true, .s8_at = @intCast(bytes) };
         }
         const m = e.allocBytes(@intCast(bytes), true) orelse return null;
-        return .{ .buf = m.buf, .width = width, .height = height, .stride = pitch, .format = .d24s8, .own = true, .pooled = m.pooled, .layout = layout };
+        var img: Image = .{ .buf = m.buf, .width = width, .height = height, .stride = pitch, .format = .d24s8, .own = true, .pooled = m.pooled, .layout = layout };
+        e.toVram(&img);
+        return img;
     }
 
     /// A colour image block linear from the start (32-bit texels: RGBA8,
@@ -1478,6 +1543,7 @@ pub const Engine = struct {
             e.freeImage(&blk);
             return false;
         }
+        e.fromVram(img);
         blk.top_down = img.top_down;
         blk.no_alpha = img.no_alpha;
         e.copy(img, 0, 0, &blk, 0, 0, img.width, img.height);
@@ -1505,6 +1571,7 @@ pub const Engine = struct {
         // readers take its layout from the modifier)
         if (img.share != null) return false;
         var rows = e.allocImage(img.width, img.height, img.format, true) orelse return false;
+        e.fromVram(img);
         rows.top_down = img.top_down;
         rows.no_alpha = img.no_alpha;
         e.copy(img, 0, 0, &rows, 0, 0, img.width, img.height);
@@ -1557,6 +1624,10 @@ pub const Engine = struct {
                     external.release(external.context);
                 }
             }
+        } else if (img.own and img.vram != null) {
+            e.freeBytes(img.vram.?, false, img.track.last);
+            e.freeBytes(img.host, false, img.track.last);
+            e.vram_count -|= 1;
         } else if (img.own and img.buf.cpu.len != 0) e.freeBytes(img.buf, img.pooled, img.track.last);
         img.* = .{};
     }
@@ -1570,6 +1641,7 @@ pub const Engine = struct {
         std.debug.assert(img.share == null and img.own);
         // (a dma-buf's readers take rows: exported images stay rows)
         if (img.layout.block and img.format.renderable() and !e.toRows(img, "exported (an EGLImage of a GL texture)")) return false;
+        e.fromVram(img);
         if (img.pooled or e.slabOf(img.buf) != null) {
             const n = img.buf.cpu.len;
             const m = e.allocBytes(n, false) orelse return false;
@@ -1607,6 +1679,7 @@ pub const Engine = struct {
         img.buf = m.buf;
         img.own = true;
         img.pooled = m.pooled;
+        e.toVram(&img);
         return img;
     }
 
@@ -1854,12 +1927,13 @@ pub const Engine = struct {
     /// A dispatch of `prog` in the open batch; `writes`: the bindings it
     /// writes (bit i, binding i).
     fn recordProg(e: *Engine, prog: *const gpu.Program, groups: [3]u32, bufs: []const *Image, writes: u32, params: []const u32, cpu: ?CpuOp) void {
+        for (bufs) |img| e.vramIn(img);
         e.room();
         const i = e.n_ops;
         for (bufs, 0..) |img, j| {
             e.op_bufs[i][j] = img.buf;
             img.trk().last = e.batch;
-            if (writes & (@as(u32, 1) << @intCast(j)) != 0) img.trk().gpu_wrote = true;
+            if (writes & (@as(u32, 1) << @intCast(j)) != 0) gpuWrites(img);
         }
         @memcpy(e.op_params[i][0..params.len], params);
         e.ops[i] = .{ .prog = prog, .groups = groups, .buffers = e.op_bufs[i][0..bufs.len], .params = e.op_params[i][0..params.len] };
@@ -2448,11 +2522,13 @@ pub const Engine = struct {
             .cull = d.cull,
             .front_ccw = d.front_ccw != flip,
         };
+        if (d.stencil) |st| if (st != zimg) e.vramIn(st);
         e.recordGraphics(&p.gfx[1].?, g, bs[0..nb], params, t, zimg, &more_imgs);
         // (a stencil image apart from the depth image: its S8 plane written)
         if (d.stencil) |st| if (st != zimg) {
             st.trk().last = e.batch;
             st.trk().gpu_wrote = true;
+            if (st.vram != null) st.trk().shadow_old = true;
         };
         e.stats.graphics_draws += 1;
         if (!e.said_graphics) {
@@ -2479,6 +2555,10 @@ pub const Engine = struct {
     /// program as its dispatch's, `g` kept beside it; its bindings read,
     /// the target written.
     fn recordGraphics(e: *Engine, pixel: *const gpu.Program, g: gpu.Graphics, bufs: []const *Image, params: []const u32, target: *Image, depth: ?*Image, more: []const ?*Image) void {
+        for (bufs) |img| e.vramIn(img);
+        e.vramIn(target);
+        if (depth) |z| e.vramIn(z);
+        for (more) |mi| if (mi) |m| e.vramIn(m);
         if (e.n_gfx >= e.dev.?.caps.max_graphics) e.flush();
         e.room();
         const i = e.n_ops;
@@ -2487,15 +2567,15 @@ pub const Engine = struct {
             img.trk().last = e.batch;
         }
         target.trk().last = e.batch;
-        target.trk().gpu_wrote = true;
+        gpuWrites(target);
         if (depth) |z| {
             z.trk().last = e.batch;
-            z.trk().gpu_wrote = true;
+            gpuWrites(z);
         }
         for (more) |mi| {
             const m = mi orelse continue;
             m.trk().last = e.batch;
-            m.trk().gpu_wrote = true;
+            gpuWrites(m);
         }
         @memcpy(e.op_params[i][0..params.len], params);
         e.op_gfx[i] = g;
@@ -3183,7 +3263,107 @@ pub const Engine = struct {
         @memcpy(dst, b.buf.cpu[off..][0..dst.len]);
     }
 
+    // ── Images in VRAM ─────────────────────────────────────────────────────
+
+    /// `img` (just made, the engine's, a buffer of its own) moved to VRAM
+    /// where images go there: its memory now the shadow, all of which VRAM
+    /// takes at its first GPU use. Left where it is when VRAM has no room.
+    fn toVram(e: *Engine, img: *Image) void {
+        if (!e.vram_images or !e.onGpu() or img.pooled or img.share != null or !img.own) return;
+        if (e.slabOf(img.buf) != null) return;
+        const n = img.buf.cpu.len;
+        if (n == 0 or n % 4 != 0) return;
+        const v = e.dev.?.alloc(n, .device) catch return;
+        if (v.gpu == 0) {
+            e.dev.?.free(v);
+            return;
+        }
+        img.host = img.buf;
+        img.vram = v;
+        img.buf = .{ .gpu = v.gpu, .cpu = img.host.cpu, .bytes = img.host.bytes, .handle = v.handle, .kind = .device };
+        img.track.dirty_lo = 0;
+        img.track.dirty_hi = n;
+        e.vram_count += 1;
+    }
+
+    /// `img` back in system memory (its shadow made current): an image
+    /// shared beyond the engine (an EGLImage's dma-buf) is one buffer.
+    fn fromVram(e: *Engine, img: *Image) void {
+        const v = img.vram orelse return;
+        e.settle(img);
+        e.vramOut(img);
+        e.freeBytes(v, false, img.track.last);
+        img.buf = img.host;
+        img.vram = null;
+        img.host = .{};
+        img.track.shadow_old = false;
+        img.track.dirty_lo = 0;
+        img.track.dirty_hi = 0;
+        e.vram_count -|= 1;
+    }
+
+    /// What the CPU wrote of `img`'s shadow, up to VRAM ahead of its next
+    /// GPU use (in the open batch, before that use).
+    fn vramIn(e: *Engine, img: *Image) void {
+        const v = img.vram orelse return;
+        const t = img.trk();
+        if (t.dirty_hi <= t.dirty_lo) return;
+        const lo = std.mem.alignBackward(usize, t.dirty_lo, 4);
+        const hi = @min(std.mem.alignForward(usize, t.dirty_hi, 4), img.host.cpu.len);
+        t.dirty_lo = 0;
+        t.dirty_hi = 0;
+        e.recordWords(img.host, lo, v, lo, hi - lo);
+        t.last = e.batch;
+    }
+
+    /// `img`'s VRAM down into its shadow if the GPU wrote it since (the
+    /// open batch run and waited for).
+    fn vramOut(e: *Engine, img: *Image) void {
+        const v = img.vram orelse return;
+        const t = img.trk();
+        if (!t.shadow_old) return;
+        t.shadow_old = false;
+        e.recordWords(v, 0, img.host, 0, img.host.cpu.len);
+        t.last = e.batch;
+        e.finish();
+    }
+
+    /// A gfx_words dispatch in the open batch: `bytes` (whole words) from
+    /// src + soff to dst + doff.
+    fn recordWords(e: *Engine, src: gpu.Buffer, soff: usize, dst: gpu.Buffer, doff: usize, bytes: usize) void {
+        const n: u32 = @intCast(bytes / 4);
+        if (n == 0) return;
+        e.room();
+        const groups = (n + GROUP - 1) / GROUP;
+        const gx = @min(groups, 32768);
+        const gy = (groups + gx - 1) / gx;
+        const i = e.n_ops;
+        e.op_bufs[i][0] = src;
+        e.op_bufs[i][1] = dst;
+        const p = [_]u32{ @intCast(soff), @intCast(doff), n, gx };
+        @memcpy(e.op_params[i][0..p.len], &p);
+        e.ops[i] = .{ .prog = &e.progs[@backingInt(Prog.words)], .groups = .{ gx, gy, 1 }, .buffers = e.op_bufs[i][0..2], .params = e.op_params[i][0..p.len] };
+        e.op_cpu[i] = null;
+        e.n_ops += 1;
+        e.stats.dispatches += 1;
+        e.stats.vram_copies += 1;
+        e.stats.vram_bytes += bytes;
+    }
+
     fn toDevice(e: *Engine, img: *const Image, off: usize, len: usize) void {
+        if (img.vram != null) {
+            // (noted: VRAM takes it before the image's next GPU use)
+            const t = @constCast(img).trk();
+            if (t.dirty_hi <= t.dirty_lo) {
+                t.dirty_lo = off;
+                t.dirty_hi = off + len;
+            } else {
+                t.dirty_lo = @min(t.dirty_lo, off);
+                t.dirty_hi = @max(t.dirty_hi, off + len);
+            }
+            e.dev.?.toDevice(img.host, off, len);
+            return;
+        }
         if (!e.gpuUsable(img)) return;
         if (e.slabOf(img.buf)) |slab| {
             const base = @intFromPtr(img.buf.cpu.ptr) - @intFromPtr(slab.buf.cpu.ptr);
@@ -3198,6 +3378,11 @@ pub const Engine = struct {
 
     fn fromDevice(e: *Engine, img: *const Image, off: usize, len: usize) void {
         if (!e.gpuUsable(img)) return;
+        if (img.vram != null) {
+            e.vramOut(@constCast(img));
+            e.dev.?.fromDevice(img.host, off, len);
+            return;
+        }
         if (e.slabOf(img.buf)) |slab| {
             const base = @intFromPtr(img.buf.cpu.ptr) - @intFromPtr(slab.buf.cpu.ptr);
             e.dev.?.fromDevice(slab.buf, base + off, len);
