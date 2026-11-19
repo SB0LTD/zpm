@@ -2051,6 +2051,10 @@ pub fn Database(comptime config: Config) type {
                 if (size[1] != 0 or end[1] != 0) return error.InvalidParameterValue;
                 return .{ .start = start, .end = end[0] };
             }
+
+            fn overlaps(left: StorageSpan, right: StorageSpan) bool {
+                return left.start < left.end and right.start < right.end and left.start < right.end and right.start < left.end;
+            }
         };
 
         /// Bind distinct caller-owned storage to a fresh external-storage DB.
@@ -2073,26 +2077,9 @@ pub fn Database(comptime config: Config) type {
                 }
             }
             for (spans, 0..) |a, i| for (spans[i + 1 ..]) |b| {
-                if (a.start == a.end or b.start == b.end) continue;
-                if (a.start < b.end and b.start < a.end) return error.InvalidParameterValue;
+                if (a.overlaps(b)) return error.InvalidParameterValue;
             };
-            for (&self.tables, backings) |*table, backing| {
-                table.rows = backing.rows;
-                table.versions = backing.versions;
-                if (comptime S.split_versions) table.version_rows = backing.version_rows;
-                if (comptime S.integral_enabled) {
-                    table.integral_rows = backing.integral_rows;
-                    table.integral_row_words = backing.integral_row_words;
-                }
-                table.row_index = backing.row_index;
-                table.key_index = backing.key_index;
-                table.scan_values = backing.scan_values;
-                table.scan_nonnull = backing.scan_nonnull;
-                table.scan_live = backing.scan_live;
-                table.scan_presence = backing.scan_presence;
-                table.index_slots = backing.index_slots;
-                table.scan_index_limit = backing.scan_index_limit;
-            }
+            for (&self.tables, backings) |*table, backing| S.bindBacking(table, backing);
             self.workspace.query.refs = refs;
             self.workspace.query.ref_high = refs.len;
             self.contiguous_backing = null;
@@ -2123,17 +2110,98 @@ pub fn Database(comptime config: Config) type {
             self.copyState(source);
         }
 
-        /// Copies into independently bound external buffers, rejecting a small
-        /// destination before modifying it. Indices are rebuilt for its masks.
+        fn copyBankFits(dst: *const S.Table, src: *const S.Table) bool {
+            return dst.rows.len >= src.row_high and dst.versions.len >= src.version_high and dst.row_index.len != 0 and dst.key_index.len != 0 and
+                S.indexFits(dst, src.index_count, src.version_used) and S.schemaFits(dst, src.columns[0..src.column_count]);
+        }
+
+        const CopyBankPlan = struct {
+            owner: [config.tables]?usize = @splat(null),
+            selected: [config.tables]?usize = @splat(null),
+
+            /// Find an augmenting path through already matched banks.
+            fn add(plan: *CopyBankPlan, destination: *const Self, source: *const Self, logical: usize) bool {
+                var parent: [config.tables]?usize = @splat(null);
+                var queue: [config.tables]usize = undefined;
+                queue[0] = logical;
+                var count: usize = 1;
+                var head: usize = 0;
+                while (head < count) : (head += 1) {
+                    const request = queue[head];
+                    // Prefer the same slot when it fits, then search all banks.
+                    for (0..config.tables) |offset| {
+                        const bank = (request + offset) % config.tables;
+                        if (parent[bank] != null or !copyBankFits(&destination.tables[bank], &source.tables[request])) continue;
+                        parent[bank] = request;
+                        if (plan.owner[bank]) |previous| {
+                            queue[count] = previous;
+                            count += 1;
+                            continue;
+                        }
+                        var available = bank;
+                        while (true) {
+                            const next = parent[available].?;
+                            const before = plan.selected[next];
+                            plan.owner[available] = next;
+                            plan.selected[next] = available;
+                            available = before orelse return true;
+                        }
+                    }
+                }
+                return false;
+            }
+        };
+
+        const CopySpans = [config.tables * storage_fields.len + 3]StorageSpan;
+
+        fn boundCopySpans(self: *const Self) Error!CopySpans {
+            var spans: CopySpans = undefined;
+            spans[0] = .{ .start = @intFromPtr(self), .end = @intFromPtr(self) + @sizeOf(Self) };
+            spans[1] = try StorageSpan.of(self.workspace.query.refs);
+            spans[spans.len - 1] = if (comptime config.external_workspace) try StorageSpan.of(self.workspace.query.cells) else .{ .start = 0, .end = 0 };
+            for (&self.tables, 0..) |*table, bank| {
+                inline for (storage_fields, 0..) |field, index| {
+                    spans[2 + bank * storage_fields.len + index] = try StorageSpan.of(@field(table, field));
+                }
+            }
+            return spans;
+        }
+
+        fn rebindCopyBanks(self: *Self, source: *const Self) Error!void {
+            const targets = try self.boundCopySpans();
+            const sources = try source.boundCopySpans();
+            for (targets) |destination| for (sources) |origin| {
+                if (destination.overlaps(origin)) return error.InvalidParameterValue;
+            };
+            var plan: CopyBankPlan = .{};
+            for (&source.tables, 0..) |*table, slot| {
+                if (table.live and !plan.add(self, source, slot)) return error.WorkspaceCapacity;
+            }
+            var banks: [config.tables]StorageBacking = undefined;
+            for (&banks, &self.tables) |*backing, *table| backing.* = S.backingOf(table);
+            var unused: usize = 0;
+            for (&self.tables, plan.selected) |*table, selected| {
+                const bank = selected orelse blk: {
+                    while (plan.owner[unused] != null) : (unused += 1) {}
+                    defer unused += 1;
+                    break :blk unused;
+                };
+                S.bindBacking(table, banks[bank]);
+            }
+        }
+
+        /// Copies into independently bound external buffers. Experimental
+        /// heterogeneous banks may be permuted before the logical copy.
+        /// Capacity and ownership checks complete before any bank changes.
         pub fn copyFromInto(self: *Self, source: *const Self) Error!void {
             if (self == source) return;
             for (&self.txs) |*tx| if (tx.active) return error.InvalidParameterValue;
             for (&source.txs) |*tx| if (tx.active) return error.InvalidParameterValue;
-            for (&self.tables, &source.tables) |*dst, *src| if (src.live) {
-                if (dst.rows.len < src.row_high or dst.versions.len < src.version_high or dst.row_index.len == 0 or dst.key_index.len == 0) return error.WorkspaceCapacity;
-                if (!S.indexFits(dst, src.index_count, src.version_used)) return error.WorkspaceCapacity;
-                if (!S.schemaFits(dst, src.columns[0..src.column_count])) return error.WorkspaceCapacity;
-            };
+            if (comptime S.integral_enabled) {
+                try self.rebindCopyBanks(source);
+            } else for (&self.tables, &source.tables) |*dst, *src| {
+                if (src.live and !copyBankFits(dst, src)) return error.WorkspaceCapacity;
+            }
             self.copyState(source);
         }
 
