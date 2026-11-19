@@ -91,6 +91,7 @@ fn rejects(source: []const u8, wanted: anyerror) !void {
 fn sqlstate(err: anyerror, wanted: []const u8) !void {
     const table = [_]struct { name: []const u8, state: []const u8 }{
         .{ .name = "StringDataRightTruncation", .state = "22001" },
+        .{ .name = "CharacterNotInRepertoire", .state = "22021" },
         .{ .name = "StringDataLengthMismatch", .state = "22026" },
         .{ .name = "InvalidTimeZoneDisplacement", .state = "22009" },
         .{ .name = "InvalidTextRepresentation", .state = "22P02" },
@@ -174,6 +175,20 @@ fn replay(statements: []const []const u8, query: []const u8) !void {
 // ---- VARCHAR(n) / CHAR(n) / BPCHAR ---------------------------------------
 
 fn character() !void {
+    // Wire values and casts use the same type input functions.
+    for ([_]sql.Type{ .varchar, .bpchar }) |ty| {
+        for ([_][]const u8{ "\x00", "\x80", "\xc0\xaf", "\xed\xa0\x80", "\xf0\x9f", "\xf4\x90\x80\x80" }) |invalid| {
+            if (DB.Io.parse(ty, 5, invalid, DB.Result.default_session)) |_| return error.InvalidCharacterAccepted
+            else |err| try check(err == error.CharacterNotInRepertoire);
+            if (DB.Io.parse(ty, -1, invalid, DB.Result.default_session)) |_| return error.InvalidCharacterAccepted
+            else |err| try check(err == error.CharacterNotInRepertoire);
+            if (DB.Io.parseCast(ty, 5, invalid, DB.Result.default_session)) |_| return error.InvalidCharacterAccepted
+            else |err| try check(err == error.CharacterNotInRepertoire);
+        }
+    }
+    try sqlstate(error.CharacterNotInRepertoire, "22021");
+    try rows("SELECT '\xf0\x9f\x8e\xb5ab'::varchar(1), CAST('\xf0\x9f\x8e\xb5' AS CHAR(2))", "\xf0\x9f\x8e\xb5|\xf0\x9f\x8e\xb5 ");
+
     // oracle: PG.TYPE.CHARACTER.
     try exec("CREATE TABLE tdd_type(v VARCHAR(8))");
     try exec("INSERT INTO tdd_type VALUES('abc'),(NULL)");

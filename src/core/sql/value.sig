@@ -659,8 +659,10 @@ pub fn Io(comptime config: types.Config) type {
                 .timestamptz => .{ .timestamptz = try temporal.parseTimestamp(input, .timestamptz, &session.zone, session.resolver) },
                 .interval => .{ .interval = try temporal.parseInterval(input) },
                 .jsonb => try jsonbCellControlled(input, session.control),
-                .varchar => try textCell(input),
-                .bpchar => .{ .bpchar = (try textCell(input)).text },
+                .varchar, .bpchar => {
+                    try character.validateText(input);
+                    return characterCell(input, ty, typmod, .implicit);
+                },
                 .uuid => .{ .uuid = try uuid.parse(input) },
                 .bytea => blk: {
                     var bytes: V.Text = .{};
@@ -749,6 +751,10 @@ pub fn Io(comptime config: types.Config) type {
         /// -1 to the input function and then applies the explicit length
         /// coercion, so VARCHAR/CHAR truncate here instead of raising 22001.
         pub fn parseCast(ty: Type, typmod: i32, input: []const u8, session: *const Session) Error!V.Cell {
+            if (ty == .varchar or ty == .bpchar) {
+                try character.validateText(input);
+                return characterCell(input, ty, typmod, .explicit);
+            }
             return applyTypmodExplicit(try parse(ty, -1, input, session), ty, typmod);
         }
 
