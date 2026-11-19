@@ -5,6 +5,7 @@
 //! 8, 15, 16, 24 and 32-bit modes; then back to the VGA.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const t = std.testing;
 const machine = @import("machine.sig");
 const TestHost = @import("test_host.sig").TestHost;
@@ -412,4 +413,28 @@ test "vesa: back to text mode 3 and the VGA's picture and window" {
     try t.expectEqual(@as(u16, 0x0013), r2.bx());
     r2 = call(0x4F05, 0, 0, 1);
     try t.expectEqual(@as(u16, 0x034F), r2.ax());
+}
+
+fn monoNs() u64 {
+    if (builtin.os.tag != .linux) return 0;
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
+test "vesa: a 1280x1024 frame at 8, 16 and 32 bits renders fast" {
+    boot();
+    const modes = [_]u16{ 0x107, 0x11A, 0x143 };
+    var us: [3]u64 = undefined;
+    for (modes, 0..) |mode, k| {
+        _ = call(0x4F02, 0x4000 | mode, 0, 0);
+        for (m.vga.svga.mem[0..0x200000], 0..) |*b, i| b.* = @truncate(i * 7);
+        const n = 20;
+        const t0 = monoNs();
+        var i: u32 = 0;
+        while (i < n) : (i += 1) _ = frame();
+        us[k] = (monoNs() - t0) / n / 1000;
+    }
+    std.debug.print("vesa render: 1280x1024x8 {d} us, 1280x1024x16 {d} us, 1024x768x32 {d} us a frame\n", .{ us[0], us[1], us[2] });
+    if (builtin.mode != .debug) try t.expect(us[0] < 20_000);
 }
