@@ -1311,6 +1311,9 @@ pub fn Database(comptime config: Config) type {
                     try disjointParts(parts, bounds, try StorageSpan.of(db.workspace.query.cells[0..]));
                 }
                 if (comptime config.external_storage) {
+                    if (db.contiguous_backing) |backing| {
+                        if (!overlaps(bounds, backing)) return;
+                    }
                     try disjointParts(parts, bounds, try StorageSpan.of(db.workspace.query.refs[0..]));
                 }
                 for (&db.tables) |*table| inline for (storage_fields) |name| {
@@ -1803,6 +1806,9 @@ pub fn Database(comptime config: Config) type {
         session: value_module.Session = .{},
         workspace: Workspace = .{},
         startup_recovery_active: bool = false,
+        // All external table slices and query refs lie in this extent after
+        // bindMemoryFor. Individual backing bindings have no such proof.
+        contiguous_backing: if (config.external_storage) ?StorageSpan else void = if (config.external_storage) null else {},
         /// Tx-session lane: the caller's session state for the next call
         /// (null: default_session_state), cursors and notifications of every
         /// session, SERIALIZABLE records and EXECUTE parameter values.
@@ -2006,6 +2012,7 @@ pub fn Database(comptime config: Config) type {
             if (comptime !config.external_storage) @compileError("bindMemory requires external_storage");
             const layout = try backingLayoutFor(budgets, refs);
             if (bytes.len < layout.bytes) return error.WorkspaceCapacity;
+            const span = try StorageSpan.of(bytes[0..layout.bytes]);
             var backings: [config.tables]StorageBacking = undefined;
             for (&backings, layout.offsets, layout.row_index, layout.key_index, budgets) |*backing, offsets, ri, ki, budget| {
                 const hashes = budget.secondary_hashes orelse S.bound_indexes;
@@ -2028,6 +2035,7 @@ pub fn Database(comptime config: Config) type {
                 };
             }
             try self.bindStorage(backings, try storageView(u32, bytes, layout.refs, refs));
+            self.contiguous_backing = span;
         }
 
         const StorageSpan = struct {
@@ -2085,6 +2093,7 @@ pub fn Database(comptime config: Config) type {
             }
             self.workspace.query.refs = refs;
             self.workspace.query.ref_high = refs.len;
+            self.contiguous_backing = null;
         }
 
         /// The startup owner holds exclusive access across replay, including
