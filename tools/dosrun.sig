@@ -4,13 +4,16 @@
 //!   sig build-exe -target x86_64-linux-none -OReleaseFast --dep dos \
 //!     -Mroot=tools/dosrun.sig -Mdos=src/dos/dos.sig --name dosrun
 //!   dosrun PROGRAM.EXE [ARGS...] [--secs N] [--shot OUT.ppm] [--every S]
-//!          [--key T=CODE[,CODE...]]... [--ips N] [--trace] [--wav OUT.wav]
+//!          [--key T=CODE[,CODE...]]... [--mouse T=DX,DY,BUTTONS]...
+//!          [--ips N] [--trace] [--wav OUT.wav]
 //!
 //! --secs N: emulated seconds to run (default 10); --shot: the picture at
 //! the end as a PPM (--every S: also OUT-<t>.ppm every S seconds); --key
 //! T=CODE: set-1 scan codes (hex) pushed at T emulated seconds, e.g.
 //! --key 3=1c,9c (Enter pressed and released at 3 s). The log says why a
-//! program stopped, and how fast the PC ran. --wav: the sound (48 kHz
+//! program stopped, and how fast the PC ran. --mouse T=DX,DY,B: at T
+//! emulated seconds the mouse moves by DX,DY mickeys with buttons B (bit 0
+//! left, 1 right, 2 middle). --wav: the sound (48 kHz
 //! stereo, 16-bit) into a WAV file, and its loudness in the log.
 
 const std = @import("std");
@@ -38,6 +41,7 @@ fn nowNs() u64 {
 }
 
 const Key = struct { at_us: u64, codes: [16]u8, n: u8, done: bool = false };
+const Mouse = struct { at_us: u64, dx: i32, dy: i32, b: u3, done: bool = false };
 
 fn shot(path: []const u8) void {
     const sz = machine.frame(&screen, MAX_W, .{ .w = MAX_W, .h = MAX_H });
@@ -76,6 +80,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var shot_path: ?[]const u8 = null;
     var keys: [64]Key = undefined;
     var nk: usize = 0;
+    var mice: [64]Mouse = undefined;
+    var nm: usize = 0;
     var ips: u32 = 25_000_000;
     var trace = false;
     var wav_path: ?[]const u8 = null;
@@ -95,6 +101,17 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             trace = true;
         } else if (std.mem.eql(u8, a, "--ips")) {
             ips = std.fmt.parseInt(u32, it.next() orelse "25000000", 10) catch ips;
+        } else if (std.mem.eql(u8, a, "--mouse")) {
+            const spec = it.next() orelse break;
+            const eq = std.mem.indexOfScalar(u8, spec, '=') orelse continue;
+            if (nm >= mice.len) continue;
+            const t = std.fmt.parseFloat(f64, spec[0..eq]) catch continue;
+            var parts = std.mem.splitScalar(u8, spec[eq + 1 ..], ',');
+            const dx = std.fmt.parseInt(i32, parts.next() orelse "0", 10) catch 0;
+            const dy = std.fmt.parseInt(i32, parts.next() orelse "0", 10) catch 0;
+            const b = std.fmt.parseInt(u3, parts.next() orelse "0", 10) catch 0;
+            mice[nm] = .{ .at_us = @intFromFloat(t * 1e6), .dx = dx, .dy = dy, .b = b };
+            nm += 1;
         } else if (std.mem.eql(u8, a, "--key")) {
             const spec = it.next() orelse break;
             const eq = std.mem.indexOfScalar(u8, spec, '=') orelse continue;
@@ -183,6 +200,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         for (keys[0..nk]) |*k| if (!k.done and t_us >= k.at_us) {
             for (k.codes[0..k.n]) |c| machine.key(c);
             k.done = true;
+        };
+        for (mice[0..nm]) |*mo| if (!mo.done and t_us >= mo.at_us) {
+            machine.mouseMove(mo.dx, mo.dy);
+            machine.mouseButtons(mo.b);
+            mo.done = true;
         };
         status = machine.run(step_us);
         // (the sound is pulled as a host would, and dropped)
