@@ -1087,8 +1087,14 @@ pub fn Mode(comptime B: type, comptime P: bool) type {
             if (eip != k.slot_eip[s]) return;
             if (c.poll) return;
             const lin = c.regs.base[CS] +% eip;
+            const flushes = j.stats.flushes;
             const t = lookup(j, c, bus, eip, lin) orelse return;
-            // (the source may have been dropped by a flush in lookup)
+            // (a flush in lookup dropped every block, the source too: a
+            // flush leaves the old entries in `blocks` as they were, so
+            // the source still looks alive, but its code's bytes are the
+            // new blocks' now, and chaining it would patch a jump into
+            // them)
+            if (j.stats.flushes != flushes) return;
             if (k.host == 0 or blocks[t].host == 0) return;
             if (blocks[t].mode != k.mode) return;
             // (another page: only where linear pages cannot move)

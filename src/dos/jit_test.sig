@@ -134,6 +134,19 @@ test "jit: a real-mode loop, as the interpreter runs it" {
     try t.expect(jit.the.stats.entered > 0);
 }
 
+test "jit: a flush while a block's exit is being chained leaves the new blocks whole" {
+    if (!have()) return;
+    // a: inc ax; jmp b; (nop); b: add bx,ax; jmp a
+    try t.expect(boot(&.{ 0x40, 0xEB, 0x01, 0x90, 0x01, 0xC3, 0xEB, 0xF8 }));
+    // (block a takes the table's last slot, so making b flushes the
+    // cache: b's code goes where a's was, and a's exit must not be
+    // chained into it)
+    jit.the.nblocks = jit.MAX_BLOCKS - 1;
+    try runBoth(10_000, 997);
+    try t.expect(jit.the.stats.flushes > 0);
+    try t.expect(jit.the.stats.entered > 0);
+}
+
 test "jit: a protected-mode loop with paging" {
     if (!have()) return;
     // l: add eax,ebx; mov [esi+0x30000],eax; add esi,4; and esi,0xFFF;
