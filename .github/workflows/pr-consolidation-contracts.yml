@@ -1,0 +1,60 @@
+name: ZPM PR consolidation contracts
+on:
+  push:
+    branches: [ci/zpm-pr-consolidation-20261119]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  hosted:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - contract: tcp-completion
+            source: 48deff234b180a42eb817232a1d6eac6b5c3d506
+            targets: run-contract-tcp-completion
+          - contract: joined-projection
+            source: 4652206846e921da5715a16edd93d1b866ee95ab
+            targets: run-contract-sql-joined-projection
+          - contract: detached-ownership
+            source: ce4620287452b2c9e60789009f128c02a4cc73f7
+            targets: run-contract-parallel-read
+          - contract: remappable-banks
+            source: 4ac0a40897dfbeec4a94d2770e6c86fe5759130b
+            targets: run-contract-sql-integral-versions
+          - contract: ps5
+            source: 194045d2d7f18f59907c7fb84ca9befd25740987
+            targets: test-ps5
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.source }}
+      - name: Install exact hosted Sig
+        run: |
+          set -euo pipefail
+          tag=sig-0.6.5-zig0.17.0.3c72687
+          asset="$tag-x86_64-linux.tar.xz"
+          curl -fsSL --retry 3 "https://github.com/SB0LTD/sig/releases/download/$tag/$asset" -o "$RUNNER_TEMP/$asset"
+          echo "179094228e2e6b0db3a5a1e01a8a57e8e91db6aa3b5ca80094ca22d870cc373a  $RUNNER_TEMP/$asset" | sha256sum -c
+          mkdir "$RUNNER_TEMP/sdk"
+          tar -xf "$RUNNER_TEMP/$asset" -C "$RUNNER_TEMP/sdk"
+          compiler=$(find "$RUNNER_TEMP/sdk" -type f -name sig -print -quit)
+          standard=$(find "$RUNNER_TEMP/sdk" -type f -path '*/lib/std/std.sig' -print -quit)
+          printf 'SIG=%s\nSIG_LIB_DIR=%s\n' "$compiler" "${standard%/std/std.sig}" >> "$GITHUB_ENV"
+      - name: Run the exact candidate and retain raw output
+        run: |
+          set -euo pipefail
+          mkdir evidence
+          git rev-parse HEAD > evidence/source.txt
+          if [ "${{ matrix.contract }}" = ps5 ]; then
+            "$SIG" test src/ps5/ps5.sig --Sig-lib-dir "$SIG_LIB_DIR" -OReleaseSafe 2>&1 | tee evidence/ps5-direct.log
+          fi
+          "$SIG" build ${{ matrix.targets }} --Sig-lib-dir "$SIG_LIB_DIR" -Doptimize=ReleaseSafe -j1 2>&1 | tee evidence/hosted.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zpm-qualification-${{ matrix.contract }}
+          path: evidence/
