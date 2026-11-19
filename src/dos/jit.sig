@@ -1010,6 +1010,7 @@ pub fn Mode(comptime B: type, comptime P: bool) type {
             c.regs.eip = eip;
             c.executed = @intCast(@as(i64, @intCast(ctx.end)) - ctx.r14 - @as(i64, a));
             const s0 = Sig.of(c);
+            const key0 = mapKey(bus);
             ctx.inval = 0;
             if (dbg_ops) {
                 var q = c.regs.base[CS] +% eip;
@@ -1029,7 +1030,16 @@ pub fn Mode(comptime B: type, comptime P: bool) type {
                 ctx.ret = @intFromEnum(e);
                 return exitCode(X_RET, a, 0);
             }
-            if (c.regs.eip != next or c.poll or ctx.inval != 0 or !Sig.of(c).eql(s0)) return exitCode(X_NEXT, a, 0);
+            if (c.regs.eip != next or ctx.inval != 0 or !Sig.of(c).eql(s0) or mapKey(bus) != key0) return exitCode(X_NEXT, a, 0);
+            if (c.poll) {
+                // (what the dispatcher would do next, here: an I/O loop
+                // goes on without leaving the block)
+                if (c.shadow) return exitCode(X_NEXT, a, 0);
+                const f = c.regs.flags;
+                if (f & TF != 0 or (f & IF != 0 and bus.irq())) return exitCode(X_NEXT, a, 0);
+                if ((c.cr0 & PE != 0) != P) return exitCode(X_NEXT, a, 0);
+                c.poll = false;
+            }
             return 0;
         }
 

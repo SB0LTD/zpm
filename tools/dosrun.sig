@@ -19,8 +19,8 @@
 //! --profile: the host's own profile (x86-64): every 250 us of the
 //! process's CPU time (SIGPROF) the interrupted instruction's address,
 //! one hex number a line, for addr2line -f -i on an unstripped build.
-//! --jit: the CPU's translator (jit.sig) runs the program; --no-jit: the
-//! interpreter alone; --jit-check: the translator, in lockstep with a
+//! --jit (the default): the CPU's translator (jit.sig) runs the program;
+//! --no-jit: the interpreter alone; --jit-check: the translator, in lockstep with a
 //! second, interpreted PC that must agree after every block (slow; the
 //! first difference is logged and the run stops).
 
@@ -174,7 +174,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var wav_path: ?[]const u8 = null;
     var prof_path: ?[]const u8 = null;
     const JitMode = enum { off, on, check };
-    var jit_mode: JitMode = .off;
+    var jit_mode: JitMode = .on;
     var progress = false;
 
     var it = init.args.iterate();
@@ -250,12 +250,13 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         tl += 1 + a.len;
     }
 
+    host.jit = jit_mode != .off;
     machine.init(host.host(), p.dir);
     machine.ips = ips;
     machine.trace = trace;
     if (!machine.start(p.dos_path, tail[0..tl])) return 1;
     if (jit_mode != .off) {
-        if (!machine.jitEnable()) {
+        if (machine.cpu.jit == null) {
             out("dosrun: no translator here (no code memory): interpreting", .{});
         } else if (jit_mode == .check) {
             // (the twin: this PC as it is now, on a host whose clock
@@ -373,6 +374,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     if (machine.cpu.jit) |j| {
         const st = j.stats;
         out("dosrun: jit: {d} blocks made, {d} dropped ({d} written, {d} by the check after services), {d} flushes, {d} entered, {d} chained, {d} interpreted steps, {d} checked by bytes, {d} KiB code", .{ st.blocks, st.invalidated, st.drop_written, st.drop_verify, st.flushes, st.entered, st.chained, st.interp, st.verified, j.used / 1024 });
+        if (dos.jit.dbg_ops) for (dos.jit.hstep_ops, 0..) |cnt, i| if (cnt > 2_000_000) out("hstep op {x}: {d} M", .{ i, cnt / 1_000_000 });
         out("dosrun: jit: exits {d} through a chain slot, {d} other, {d} for the budget", .{ st.exit_slot, st.exit_other, st.exit_budget });
         if (machine.twin) |tw| {
             if (status != .fault) {

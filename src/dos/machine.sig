@@ -144,6 +144,9 @@ pub const Machine = struct {
         // (DOS's console output goes through int 10h's teletype, which
         // writes the VGA's own memory)
         m.dos.tty_direct = false;
+        // The translator, where the host has code memory for it (else,
+        // or if the host says no, the interpreter runs everything).
+        _ = m.jitEnable();
     }
 
     /// DOS's console output since the last call, through int 10h/0Eh on
@@ -320,7 +323,9 @@ pub const Machine = struct {
     fn codeWrite(m: *Machine, a: u32, n: u32) void {
         if (m.cpu.jit) |j| j.written(a, n);
     }
-    /// The translator on (the host's code memory), or false.
+    /// The translator on (the host's code memory), or false. `init` does
+    /// it; a host without code memory (or one told not to give it, e.g.
+    /// LinuxHost.jit = false) leaves the interpreter.
     pub fn jitEnable(m: *Machine) bool {
         return jit.attach(&m.cpu, m.host, &m.jit_pages, &m.mem.ram);
     }
