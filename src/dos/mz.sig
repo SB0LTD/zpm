@@ -104,7 +104,10 @@ pub fn load(host: Host, fd: i32, mem: *Memory, img: *const Image, seg: u16, fact
     var done: u32 = 0;
     var buf: [256]u8 = undefined;
     while (done < img.relocs) {
-        const batch = @min(@as(u32, img.relocs) - done, 64);
+        // (u32: @min with 64 would narrow to u7, and 64 entries' 256 bytes
+        // wrapped to 0 in a release build: Aladdin's 394 relocations
+        // came from a stale buffer)
+        const batch: u32 = @min(@as(u32, img.relocs) - done, 64);
         const want = buf[0 .. batch * 4];
         const got = host.read(fd, want);
         if (got != @as(i32, @intCast(want.len))) return error.Format;

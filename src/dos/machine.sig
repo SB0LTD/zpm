@@ -45,6 +45,8 @@ pub const ROM_SEG: u16 = 0xF000;
 const STUBS: u16 = 0x1000;
 /// The XMS driver's entry point (F000:XMS_ENTRY: `FE 39 00 CB`).
 pub const XMS_ENTRY: u16 = 0x0F00;
+/// Where the mouse's user handler returns to (F000:MOUSE_RET: `FE 39 01`).
+pub const MOUSE_RET: u16 = 0x0F10;
 /// Where the EMS device header lives (its name, "EMMXXXX0", at +10).
 const EMS_DEV_SEG: u16 = 0xF080;
 
@@ -85,8 +87,13 @@ pub const Machine = struct {
     /// An invalid opcode reached the ROM's int 6 (no handler of the
     /// program's): `run` returns .fault.
     stopped: bool = false,
+    /// Every BIOS and DOS service called (but the timer's and keyboard's)
+    /// in the host's log, with its registers and caller.
+    trace: bool = false,
     /// Port accesses in the current CPU run (each costs a microsecond).
     io_count: u32 = 0,
+    /// The program's state while the mouse's user handler runs.
+    mouse_saved: ?struct { regs: regs.Regs, halted: bool } = null,
 
     /// (Every field is set here: a host may keep its Machine `undefined`
     /// in .bss, so 16 MiB of RAM costs nothing in its file.)
@@ -98,6 +105,8 @@ pub const Machine = struct {
         m.fault_why = "";
         m.stopped = false;
         m.io_count = 0;
+        m.mouse_saved = null;
+        m.trace = false;
         m.cpu.reset();
         m.pic.reset();
         m.pit.reset();
@@ -120,6 +129,49 @@ pub const Machine = struct {
         xms_mod.boot(&m.xms, &m.mem, 0x110000, mem_mod.RAM, EMS_DEV_SEG);
         // DOS's own data below 0x0700; programs from 0x0700 to 0x9FFF.
         dos21.boot(&m.dos, &m.mem, host, c_root, 0x0070, 0x9FFF);
+        // (DOS's console output goes through int 10h's teletype, which
+        // writes the VGA's own memory)
+        m.dos.tty_direct = false;
+    }
+
+    /// DOS's console output since the last call, through int 10h/0Eh on
+    /// the BIOS's active page.
+    fn conFlush(m: *Machine) void {
+        var buf: [256]u8 = undefined;
+        while (true) {
+            const n = dos21.conDrain(&m.dos, &buf);
+            if (n == 0) return;
+            for (buf[0..n]) |ch| {
+                var t = regs.Regs{};
+                t.setAh(0x0E);
+                t.setAl(ch);
+                t.setBh(m.mem.rdB(0x40, 0x62));
+                t.setBl(0x07);
+                video_bios.int10(&t, &m.mem, &m.vga);
+            }
+            if (n < buf.len) return;
+        }
+    }
+
+    /// A mouse event the program's handler waits for: a far call to it
+    /// with the driver's registers (it returns through F000:MOUSE_RET).
+    fn mouseCall(m: *Machine) void {
+        if (m.mouse_saved != null) return;
+        const call = m.mouse.userCall() orelse return;
+        m.mouse_saved = .{ .regs = m.cpu.regs, .halted = m.cpu.halted };
+        const r = &m.cpu.regs;
+        m.mouse.handlerRegs(r, call.mask);
+        var sp = r.sp();
+        const ss = r.base[regs.SS];
+        sp -%= 2;
+        m.wr16(ss +% sp, ROM_SEG);
+        sp -%= 2;
+        m.wr16(ss +% sp, MOUSE_RET);
+        r.set16(regs.ESP, sp);
+        r.flags &= ~regs.IF;
+        r.eip = call.off;
+        r.setSeg(regs.CS, call.seg);
+        m.cpu.halted = false;
     }
 
     /// The vector table and the ROM: each vector's stub, the hardware
@@ -152,6 +204,8 @@ pub const Machine = struct {
         m.patchJump(rom + STUBS + 0x09 * 8 + 3, tail8);
         // The XMS driver's far entry: FE 39 00; RETF.
         m.mem.copyIn(rom + XMS_ENTRY, &.{ 0xFE, 0x39, 0x00, 0xCB });
+        // Where the mouse's user handler returns: FE 39 01.
+        m.mem.copyIn(rom + MOUSE_RET, &.{ 0xFE, 0x39, 0x01 });
         // The BIOS's date and the machine's model (an AT).
         m.mem.copyIn(rom + 0xFFF5, "11/19/26");
         m.mem.wrB(ROM_SEG, 0xFFFE, 0xFC);
@@ -331,6 +385,11 @@ pub const Machine = struct {
     pub fn hle(m: *Machine, c: *Cpu, id: u16) bool {
         const r = &c.regs;
         var done = true;
+        if (m.trace and id != 0x08 and id != 0x09 and !(id >= 0x0A and id <= 0x0F) and !(id >= 0x70 and id <= 0x77)) {
+            m.host.say("svc {x:0>3} ax={x:0>4} bx={x:0>4} cx={x:0>4} dx={x:0>4} ds={x:0>4} es={x:0>4} from {x:0>4}:{x:0>4}", .{
+                id, r.ax(), r.bx(), r.cx(), r.dx(), r.seg[regs.DS], r.seg[regs.ES], m.rd16(r.base[regs.SS] +% @as(u32, r.sp() +% 2)), m.rd16(r.base[regs.SS] +% @as(u32, r.sp())),
+            });
+        }
         switch (id) {
             // A divide error or an invalid opcode the program has no
             // handler for: DOS ends a program on the first ("Divide
@@ -357,20 +416,41 @@ pub const Machine = struct {
             0x11 => bios.int11(r, &m.mem),
             0x12 => bios.int12(r, &m.mem),
             0x13 => bios.int13(r, &m.mem),
-            0x15 => bios.int15(&m.bios, r, &m.mem, &m.mem.a20),
+            0x15 => done = bios.int15Wait(&m.bios, r, &m.mem, &m.mem.a20, m),
             0x16 => done = bios.int16(&m.bios, r, &m.mem),
             0x1A => bios.int1a(&m.bios, r, &m.mem, m.host),
             0x20 => {
                 r.setAh(0x00);
-                done = dos21.int21(&m.dos, r, &m.mem, m.host);
+                done = dos21.int21Bus(&m.dos, r, &m.mem, m.host, m);
             },
-            0x21 => done = dos21.int21(&m.dos, r, &m.mem, m.host),
+            0x21 => {
+                done = dos21.int21Bus(&m.dos, r, &m.mem, m.host, m);
+                m.conFlush();
+            },
+            // (the critical error handler: fail the call)
+            0x24 => dos21.int24(r),
+            // int 27h: stay resident, DX bytes of the PSP at CS kept.
+            0x27 => {
+                r.setDx(@intCast((@as(u32, r.dx()) + 15) / 16));
+                r.setAx(0x3100);
+                done = dos21.int21Bus(&m.dos, r, &m.mem, m.host, m);
+            },
             0x2F => dos21.int2f(&m.dos, r, &m.mem),
             0x33 => mouse_mod.int33(&m.mouse, r, &m.mem),
-            0x67 => xms_mod.int67(&m.xms, r, &m.mem),
+            0x67 => xms_mod.int67Bus(&m.xms, r, &m.mem, m),
             0x100 => {
-                xms_mod.xms(&m.xms, r, &m.mem);
+                xms_mod.xmsBus(&m.xms, r, &m.mem, m);
                 return true; // (a far call: its flags are the CPU's own)
+            },
+            // The mouse's user handler returned (RETF to F000:MOUSE_RET):
+            // the program goes on as it was.
+            0x101 => {
+                if (m.mouse_saved) |sv| {
+                    c.regs = sv.regs;
+                    c.halted = sv.halted;
+                    m.mouse_saved = null;
+                }
+                return true;
             },
             else => {},
         }
@@ -398,6 +478,7 @@ pub const Machine = struct {
             const slice: u32 = @max(1, @min(left, 250, until_us));
             left -= slice;
             m.devices(slice);
+            m.mouseCall();
             var budget: u32 = @intCast(@as(u64, m.ips) * slice / 1_000_000);
             while (budget > 0) {
                 const before = m.cpu.executed;

@@ -4,7 +4,7 @@
 //!   sig build-exe -target x86_64-linux-none -OReleaseFast --dep dos \
 //!     -Mroot=tools/dosrun.sig -Mdos=src/dos/dos.sig --name dosrun
 //!   dosrun PROGRAM.EXE [ARGS...] [--secs N] [--shot OUT.ppm] [--every S]
-//!          [--key T=CODE[,CODE...]]... [--ips N]
+//!          [--key T=CODE[,CODE...]]... [--ips N] [--trace]
 //!
 //! --secs N: emulated seconds to run (default 10); --shot: the picture at
 //! the end as a PPM (--every S: also OUT-<t>.ppm every S seconds); --key
@@ -73,6 +73,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var keys: [64]Key = undefined;
     var nk: usize = 0;
     var ips: u32 = 25_000_000;
+    var trace = false;
 
     var it = init.args.iterate();
     _ = it.next();
@@ -83,6 +84,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             every = std.fmt.parseInt(u64, it.next() orelse "0", 10) catch 0;
         } else if (std.mem.eql(u8, a, "--shot")) {
             shot_path = it.next();
+        } else if (std.mem.eql(u8, a, "--trace")) {
+            trace = true;
         } else if (std.mem.eql(u8, a, "--ips")) {
             ips = std.fmt.parseInt(u32, it.next() orelse "25000000", 10) catch ips;
         } else if (std.mem.eql(u8, a, "--key")) {
@@ -124,8 +127,26 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     machine.init(host.host(), p.dir);
     machine.ips = ips;
+    machine.trace = trace;
     if (!machine.start(p.dos_path, tail[0..tl])) return 1;
     out("dosrun: {s}, C: = {s}, {d} s at {d} M instructions/s", .{ p.dos_path, p.dir, secs, ips / 1_000_000 });
+    {
+        const r = &machine.cpu.regs;
+        out("dosrun: starts at {x:0>4}:{x:0>4}, stack {x:0>4}:{x:0>4}, PSP {x:0>4}{s}", .{ r.seg[dos.regs.CS], @as(u16, @truncate(r.eip)), r.seg[dos.regs.SS], r.sp(), r.seg[dos.regs.DS], if (machine.dos.exited) " (already ended?)" else "" });
+        var code: [16]u8 = undefined;
+        for (&code, 0..) |*c, i| c.* = machine.rd8(r.base[dos.regs.CS] +% r.eip +% @as(u32, @intCast(i)));
+        out("dosrun: its first bytes {x}", .{code});
+        // DOSRUN_DUMP: the first 64 KiB from CS:0 into /tmp/dosrun-cs.bin
+        {
+            var dump: [65536]u8 = undefined;
+            for (&dump, 0..) |*c, i| c.* = machine.rd8(r.base[dos.regs.CS] +% @as(u32, @intCast(i)));
+            const fd = linux.openat(linux.AT.FDCWD, "/tmp/dosrun-cs.bin", .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+            if (@as(isize, @bitCast(fd)) >= 0) {
+                _ = linux.write(@intCast(fd), &dump, dump.len);
+                _ = linux.close(@intCast(fd));
+            }
+        }
+    }
 
     const t0 = nowNs();
     const step_us: u32 = 10_000;

@@ -53,4 +53,10 @@ test {
     _ = @import("mouse.sig");
     _ = @import("machine_test.sig");
     _ = @import("host_linux.sig");
+    _ = @import("cpu_test.sig");
+    _ = @import("vga_test.sig");
+    _ = @import("bios_test.sig");
+    _ = @import("xms_test.sig");
+    _ = @import("mouse_test.sig");
+    _ = @import("sb_ring.sig");
 }
