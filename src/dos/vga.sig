@@ -9,6 +9,12 @@
 //! double scanning; the status register's retraces follow emulated time
 //! (the CRTC's own timing: 70 Hz for 400 lines, 60 Hz for 480).
 //!
+//! SVGA: `svga` (vesa.sig) is the card's 4 MiB frame buffer and VESA
+//! mode. While one is set, render shows it (8 bits through this DAC, or
+//! direct colour) and the machine sends window A and the linear frame
+//! buffer to it; the VGA's registers, DAC and retrace stay as they are.
+//! The DAC is 6 bits a component, or 8 after VBE's 4F08 (`dac8`).
+//!
 //! Clean room, from IBM's VGA technical reference and the FreeVGA
 //! project's register descriptions.
 //!
@@ -31,8 +37,9 @@
 //! double-buffered one is shown whole whenever the host asks.
 
 const std = @import("std");
+const vesa = @import("vesa.sig");
 
-pub const Size = struct { w: u16 = 0, h: u16 = 0 };
+pub const Size = vesa.Size;
 
 /// Bytes in each plane.
 pub const PLANE: u32 = 0x10000;
@@ -112,6 +119,9 @@ inline fn rgb6(r: u8, g: u8, b: u8) u32 {
     }.f;
     return (e(r) << 16) | (e(g) << 8) | e(b);
 }
+inline fn rgb8(r: u8, g: u8, b: u8) u32 {
+    return (@as(u32, r) << 16) | (@as(u32, g) << 8) | b;
+}
 
 /// The CRTC's timing in nanoseconds and lines.
 pub const Timing = struct {
@@ -143,8 +153,10 @@ pub const Vga = struct {
     ac_data: bool = false,
     ac: [0x15]u8 = @splat(0),
 
-    /// The DAC: 6-bit components, and each entry as XRGB8888.
+    /// The DAC: 6-bit components (8-bit with `dac8`), and each entry as
+    /// XRGB8888.
     dac: [256][3]u8 = @splat(.{ 0, 0, 0 }),
+    dac8: bool = false,
     dac_rgb: [256]u32 = @splat(0),
     dac_mask: u8 = 0xFF,
     dac_w: u8 = 0,
@@ -181,9 +193,15 @@ pub const Vga = struct {
     line: [MAX_LINE]u8 = undefined,
     lut: [256]u32 = undefined,
 
+    /// The SVGA's memory and VESA mode (see the header).
+    svga: vesa.Svga = .{},
+
     pub fn reset(self: *Vga) void {
+        // (written in place: the planes and the SVGA's memory are not
+        // copied through the stack)
         self.* = .{};
         @memset(&self.vram, 0);
+        @memset(&self.svga.mem, 0);
     }
 
     // ── Time ─────────────────────────────────────────────────────────────
@@ -505,14 +523,30 @@ pub const Vga = struct {
         };
     }
 
-    /// A DAC entry (6-bit components).
+    /// A DAC entry (6-bit components, or 8-bit with `dac8`).
     pub fn setDac(self: *Vga, i: u8, r: u8, g: u8, b: u8) void {
-        self.dac[i] = .{ r & 0x3F, g & 0x3F, b & 0x3F };
-        self.dac_rgb[i] = rgb6(r, g, b);
+        if (self.dac8) {
+            self.dac[i] = .{ r, g, b };
+            self.dac_rgb[i] = rgb8(r, g, b);
+        } else {
+            self.dac[i] = .{ r & 0x3F, g & 0x3F, b & 0x3F };
+            self.dac_rgb[i] = rgb6(r, g, b);
+        }
+    }
+
+    /// The DAC's width: 6 or 8 bits a component. The colours stay as they
+    /// look (each entry scaled to the new width).
+    pub fn setDacWidth(self: *Vga, eight: bool) void {
+        if (eight == self.dac8) return;
+        self.dac8 = eight;
+        for (&self.dac, 0..) |*c, i| {
+            for (c) |*x| x.* = if (eight) (x.* << 2) | (x.* >> 4) else x.* >> 2;
+            self.setDac(@intCast(i), c[0], c[1], c[2]);
+        }
     }
 
     fn dacWrite(self: *Vga, v: u8) void {
-        self.dac_buf[self.dac_wc] = v & 0x3F;
+        self.dac_buf[self.dac_wc] = if (self.dac8) v else v & 0x3F;
         self.dac_wc += 1;
         if (self.dac_wc == 3) {
             self.setDac(self.dac_w, self.dac_buf[0], self.dac_buf[1], self.dac_buf[2]);
@@ -535,6 +569,7 @@ pub const Vga = struct {
 
     /// The size `render` makes now (before clipping).
     pub fn displaySize(self: *const Vga) Size {
+        if (self.svga.active) return self.svga.displaySize();
         const graphics = self.ac[0x10] & 1 != 0;
         const hde: u32 = @as(u32, self.crtc[1]) + 1;
         const w: u32 = if (!graphics)
@@ -556,6 +591,7 @@ pub const Vga = struct {
     /// (`stride` pixels a row, at most `max.w` x `max.h`): its size, before
     /// any aspect correction (320x200 for mode 13h, 720x400 for text).
     pub fn render(self: *Vga, out: []u32, stride: u32, max: Size) Size {
+        if (self.svga.active) return self.renderSvga(out, stride, max);
         const full = self.displaySize();
         if (stride == 0) return .{};
         const w: u32 = @min(@min(full.w, max.w), stride);
@@ -647,6 +683,18 @@ pub const Vga = struct {
             } else rs += 1;
         }
         return .{ .w = @intCast(w), .h = @intCast(y) };
+    }
+
+    /// A VESA mode's picture (its own size, up to 1600x1200): 8 bits
+    /// through the DAC and its mask; black while the screen is off.
+    fn renderSvga(self: *Vga, out: []u32, stride: u32, max: Size) Size {
+        for (0..256) |v| self.lut[v] = self.dac_rgb[v & self.dac_mask];
+        const sz = self.svga.render(&self.lut, out, stride, max);
+        if (self.seq[1] & 0x20 != 0) {
+            var y: u32 = 0;
+            while (y < sz.h) : (y += 1) @memset(out[y * stride ..][0..sz.w], 0);
+        }
+        return sz;
     }
 
     /// The colours: attribute palette (colour plane enable, colour select),

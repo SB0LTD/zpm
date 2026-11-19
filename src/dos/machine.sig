@@ -1,7 +1,7 @@
-//! The PC: a 386 with 16 MiB, the chipset's devices, a VGA, a Sound
-//! Blaster 16 with its OPL3, and a BIOS and DOS written in Sig. One
-//! `Machine` holds all of it (about 16.5 MiB: the host puts it in static
-//! memory); nothing allocates.
+//! The PC: a 386 with 16 MiB, the chipset's devices, a VGA with VESA's
+//! SVGA modes (4 MiB of its own), a Sound Blaster 16 with its OPL3, and a
+//! BIOS and DOS written in Sig. One `Machine` holds all of it (about
+//! 21 MiB: the host puts it in static memory); nothing allocates.
 //!
 //!   init(host, c_root)   boots: the vector table, the ROM's service traps,
 //!                        the BIOS data area, video, DOS, XMS and EMS
@@ -34,6 +34,8 @@ const bios = @import("bios.sig");
 const dos21 = @import("dos21.sig");
 const xms_mod = @import("xms.sig");
 const mouse_mod = @import("mouse.sig");
+const vesa = @import("vesa.sig");
+const vesa_bios = @import("vesa_bios.sig");
 
 pub const Memory = mem_mod.Memory;
 pub const Cpu = cpu_mod.Cpu;
@@ -249,8 +251,28 @@ pub const Machine = struct {
 
     /// A linear address on the bus: the A20 gate off masks address line
     /// 20 (FFFF:0010 is 0:0); nothing past the RAM's end aliases into it.
+    ///
+    /// The map: RAM below 0xA0000 and from 1 MiB to 16 MiB; the VGA at
+    /// 0xA0000-0xBFFFF (while a VESA mode is set, 0xA0000-0xAFFFF is the
+    /// SVGA's window A instead); the ROMs and EMS's page frame up to 1 MiB;
+    /// the SVGA's linear frame buffer at vesa.LFB_BASE (4 MiB); nothing
+    /// else (0xFF).
     inline fn phys(m: *const Machine, a: u32) u32 {
         return if (m.mem.a20) a else a & ~mem_mod.MEG;
+    }
+
+    /// Where an `n`-byte access at bus address `w` lands in the SVGA's
+    /// memory, if all of it does (the frame buffer, or window A in a
+    /// VESA mode): the 16- and 32-bit paths' straight route there.
+    inline fn svgaAt(m: *const Machine, w: u32, comptime n: u32) ?u32 {
+        const lo = w -% vesa.LFB_BASE;
+        if (lo <= vesa.VRAM - n) return lo;
+        const wo = w -% 0xA0000;
+        if (wo <= vesa.WIN_SIZE - n and m.vga.svga.active) {
+            const o = m.vga.svga.bank_off + wo;
+            if (o <= vesa.VRAM - n) return o;
+        }
+        return null;
     }
 
     pub inline fn rd8(m: *Machine, a0: u32) u8 {
@@ -259,9 +281,16 @@ pub const Machine = struct {
         return m.rdHigh(a);
     }
     fn rdHigh(m: *Machine, a: u32) u8 {
-        // (no memory there: the bus floats high)
-        if (a >= mem_mod.RAM) return 0xFF;
-        if (a < 0xC0000) return m.vga.read(a - 0xA0000);
+        if (a >= mem_mod.RAM) {
+            const lo = a -% vesa.LFB_BASE;
+            if (lo < vesa.VRAM) return m.vga.svga.mem[lo];
+            // (no memory there: the bus floats high)
+            return 0xFF;
+        }
+        if (a < 0xC0000) {
+            if (a < 0xB0000 and m.vga.svga.active) return m.vga.svga.winRead(a - 0xA0000);
+            return m.vga.read(a - 0xA0000);
+        }
         if (a >= 0xE0000 and a < 0xF0000) {
             if (m.xms.emsWindow(a - 0xE0000)) |r| return m.mem.ram[r];
             return 0xFF;
@@ -277,8 +306,15 @@ pub const Machine = struct {
         m.wrHigh(a, v);
     }
     fn wrHigh(m: *Machine, a: u32, v: u8) void {
-        if (a >= mem_mod.RAM) return;
-        if (a < 0xC0000) return m.vga.write(a - 0xA0000, v);
+        if (a >= mem_mod.RAM) {
+            const lo = a -% vesa.LFB_BASE;
+            if (lo < vesa.VRAM) m.vga.svga.mem[lo] = v;
+            return;
+        }
+        if (a < 0xC0000) {
+            if (a < 0xB0000 and m.vga.svga.active) return m.vga.svga.winWrite(a - 0xA0000, v);
+            return m.vga.write(a - 0xA0000, v);
+        }
         if (a >= 0xE0000 and a < 0xF0000) {
             if (m.xms.emsWindow(a - 0xE0000)) |r| m.mem.ram[r] = v;
             return;
@@ -286,26 +322,43 @@ pub const Machine = struct {
         // (the ROMs: read only; 0xC8000-0xDFFFF: nothing there)
     }
     // (words and dwords straight from RAM in conventional and extended
-    // memory: a protected-mode game's code and data live above 1 MiB)
+    // memory: a protected-mode game's code and data live above 1 MiB; and
+    // straight from the SVGA's memory, where a game draws its frames)
     pub inline fn rd16(m: *Machine, a: u32) u16 {
         const w = m.phys(a);
         if (w < 0x9FFFF or (w >= mem_mod.MEG and w < mem_mod.RAM - 1)) return std.mem.readInt(u16, m.mem.ram[w..][0..2], .little);
+        return m.rd16Slow(a, w);
+    }
+    fn rd16Slow(m: *Machine, a: u32, w: u32) u16 {
+        if (m.svgaAt(w, 2)) |o| return std.mem.readInt(u16, m.vga.svga.mem[o..][0..2], .little);
         return @as(u16, m.rd8(a)) | (@as(u16, m.rd8(a +% 1)) << 8);
     }
     pub inline fn wr16(m: *Machine, a: u32, v: u16) void {
         const w = m.phys(a);
         if (w < 0x9FFFF or (w >= mem_mod.MEG and w < mem_mod.RAM - 1)) return std.mem.writeInt(u16, m.mem.ram[w..][0..2], v, .little);
+        m.wr16Slow(a, w, v);
+    }
+    fn wr16Slow(m: *Machine, a: u32, w: u32, v: u16) void {
+        if (m.svgaAt(w, 2)) |o| return std.mem.writeInt(u16, m.vga.svga.mem[o..][0..2], v, .little);
         m.wr8(a, @truncate(v));
         m.wr8(a +% 1, @truncate(v >> 8));
     }
     pub inline fn rd32(m: *Machine, a: u32) u32 {
         const w = m.phys(a);
         if (w < 0x9FFFD or (w >= mem_mod.MEG and w < mem_mod.RAM - 3)) return std.mem.readInt(u32, m.mem.ram[w..][0..4], .little);
+        return m.rd32Slow(a, w);
+    }
+    fn rd32Slow(m: *Machine, a: u32, w: u32) u32 {
+        if (m.svgaAt(w, 4)) |o| return std.mem.readInt(u32, m.vga.svga.mem[o..][0..4], .little);
         return @as(u32, m.rd16(a)) | (@as(u32, m.rd16(a +% 2)) << 16);
     }
     pub inline fn wr32(m: *Machine, a: u32, v: u32) void {
         const w = m.phys(a);
         if (w < 0x9FFFD or (w >= mem_mod.MEG and w < mem_mod.RAM - 3)) return std.mem.writeInt(u32, m.mem.ram[w..][0..4], v, .little);
+        m.wr32Slow(a, w, v);
+    }
+    fn wr32Slow(m: *Machine, a: u32, w: u32, v: u32) void {
+        if (m.svgaAt(w, 4)) |o| return std.mem.writeInt(u32, m.vga.svga.mem[o..][0..4], v, .little);
         m.wr16(a, @truncate(v));
         m.wr16(a +% 2, @truncate(v >> 16));
     }
@@ -467,6 +520,11 @@ pub const Machine = struct {
                 xms_mod.xmsBus(&m.xms, r, &m.mem, m);
                 return true; // (a far call: its flags are the CPU's own)
             },
+            // VESA's far window function (C000:WIN_FUNC, then RETF).
+            0x100 + @as(u16, vesa_bios.WIN_TRAP) => {
+                vesa_bios.winFunc(r, &m.vga);
+                return true;
+            },
             // The mouse's user handler returned (RETF to F000:MOUSE_RET):
             // the program goes on as it was.
             0x101 => {
@@ -553,7 +611,8 @@ pub const Machine = struct {
 
     // ── The host's side ──────────────────────────────────────────────────
 
-    /// The picture (vga.render's contract).
+    /// The picture (vga.render's contract): the VGA's, or a VESA mode's
+    /// at its own size (up to vesa.MAX_W x MAX_H, 1600x1200).
     pub fn frame(m: *Machine, out: []u32, stride: u32, max: Size) Size {
         return m.vga.render(out, stride, max);
     }

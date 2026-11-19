@@ -3,7 +3,9 @@
 //! cursor, scrolling, characters and pixels, palette and DAC functions
 //! (AH=10h), fonts (AH=11h, the 8x8/8x14/8x16 font pointers), alternate
 //! select (AH=12h), write string (AH=13h), display combination (AH=1Ah),
-//! state (AH=1Bh), and VESA's 4Fh answered "not supported" until it is.
+//! state (AH=1Bh), and VESA's VBE 2.0 (AH=4Fh: vesa_bios.sig, on the
+//! SVGA's modes in vesa.sig: 8, 15, 16, 24 and 32 bits, banked and
+//! linear). Setting a VGA mode (here or through 4F02) leaves a VESA one.
 //! The BIOS data area's video fields stay in step (0x449-0x489).
 //!
 //! Clean room, from IBM's VGA technical reference (the modes' register
@@ -12,7 +14,8 @@
 //!
 //! The video ROM at C000:0000 (RAM the machine treats as ROM): the option
 //! ROM header, the static functionality table (C000:0040), the empty
-//! 9-dot alternate tables, then the 8x8, 8x14 and 8x16 fonts (vga_font.sig).
+//! 9-dot alternate tables, then the 8x8, 8x14 and 8x16 fonts (vga_font.sig),
+//! then VESA's tables from C000:3000 (vesa_bios.sig).
 //! The services work on the planes directly (as the BIOS's own code would
 //! through the graphics controller), so they do not disturb a program's
 //! register settings.
@@ -24,6 +27,7 @@ const Memory = @import("mem.sig").Memory;
 const vga_mod = @import("vga.sig");
 const Vga = vga_mod.Vga;
 const font = @import("vga_font.sig");
+const vesa_bios = @import("vesa_bios.sig");
 
 /// The video ROM's segment and where its tables are.
 pub const ROM_SEG: u16 = 0xC000;
@@ -330,6 +334,7 @@ pub fn boot(vga: *Vga, mem: *Memory) void {
     mem.copyIn(rom + FONT8, &font.font8);
     mem.copyIn(rom + FONT14, &font.font14);
     mem.copyIn(rom + FONT16, &font.font16);
+    vesa_bios.boot(mem);
     // int 1Fh: the 8x8 font's upper half; int 43h: set by each mode.
     setVector(mem, 0x1F, ROM_SEG, FONT8 + 128 * 8);
     setVector(mem, 0x43, ROM_SEG, FONT8);
@@ -350,6 +355,9 @@ pub fn setMode(vga: *Vga, mem: *Memory, al: u8) void {
     const keep = al & 0x80 != 0;
     const base = modeOf(n) orelse return;
     var md = base.*;
+    // (a VESA mode ends; the DAC is 6 bits again)
+    vga.svga.active = false;
+    vga.setDacWidth(false);
     // Text modes: the scan lines AH=12h/BL=30h chose (0x489 bits 7 and 4).
     if (md.kind == .text or md.kind == .mono) {
         const sl = mem.rdB(BDA, 0x89) & 0x90;
@@ -793,7 +801,7 @@ pub fn int10(r: *Regs, mem: *Memory, vga: *Vga) void {
             r.setAl(0x1A);
         },
         0x1B => if (r.bx() == 0) state(r, mem, vga),
-        0x4F => r.setAx(0x014F), // VESA: not yet
+        0x4F => vesa_bios.int10(r, mem, vga),
         else => {},
     }
 }
