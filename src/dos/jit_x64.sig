@@ -1234,6 +1234,38 @@ fn branch(e: *E, x: *const dec.Ins, live_out: u32) bool {
             e.exitTo(0, x.target);
             return true;
         },
+        .loop => {
+            // the count in CX (ECX with 32-bit addresses); LOOPNE/LOOPE
+            // also ZF; JCXZ only looks
+            const w: u8 = if (x.a32) 4 else 2;
+            if (e.pend) |f| {
+                e.mat(f, null);
+                e.pend = null;
+            }
+            a.movRegMem(w, RAX, gr(regs_mod.ECX, w));
+            var fall: [2]usize = .{ 0, 0 };
+            var nf: usize = 0;
+            if (x.sub == 3) {
+                a.op(w, &.{0x85}, RAX, .{ .r = RAX });
+                fall[nf] = a.jccFwd(CC_NZ);
+                nf += 1;
+            } else {
+                a.aluImm(w, 5, .{ .r = RAX }, 1);
+                a.movMemReg(w, gr(regs_mod.ECX, w), RAX);
+                fall[nf] = a.jccFwd(CC_Z);
+                nf += 1;
+                if (x.sub < 2) {
+                    a.op(1, &.{0xF6}, 0, .{ .m = FLAGS });
+                    a.b(0x40);
+                    fall[nf] = a.jccFwd(if (x.sub == 0) CC_NZ else CC_Z);
+                    nf += 1;
+                }
+            }
+            e.exitTo(1, x.target);
+            for (fall[0..nf]) |f| a.here(f);
+            e.exitTo(0, e.next);
+            return true;
+        },
         .call => {
             const n: u8 = if (x.o32) 4 else 2;
             a.movImm32(RCX, e.next);

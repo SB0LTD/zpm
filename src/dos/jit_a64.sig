@@ -1217,6 +1217,35 @@ fn branch(e: *E, x: *const dec.Ins, live_out: u32) bool {
             e.exitTo(0, x.target);
             return true;
         },
+        .loop => {
+            const w: u8 = if (x.a32) 4 else 2;
+            if (e.pend) |p| {
+                e.mat(p.cls, p.sz);
+                e.pend = null;
+            }
+            a.guest(true, w, 0, regs_mod.ECX);
+            var fall: [2]usize = .{ 0, 0 };
+            var nf: usize = 0;
+            if (x.sub == 3) {
+                fall[nf] = a.cbz(true, false, 0);
+                nf += 1;
+            } else {
+                a.addi(false, true, false, 0, 0, 1);
+                a.guest(false, w, 0, regs_mod.ECX);
+                if (w == 2) a.ext(0, 0, 2, false);
+                fall[nf] = a.cbz(false, false, 0);
+                nf += 1;
+                if (x.sub < 2) {
+                    a.ld(4, 9, XREG, R_FLAGS);
+                    fall[nf] = a.tbz(x.sub == 0, 9, 6);
+                    nf += 1;
+                }
+            }
+            e.exitTo(1, x.target);
+            for (fall[0..nf]) |f| a.here(f);
+            e.exitTo(0, e.next);
+            return true;
+        },
         .call => {
             const n: u8 = if (x.o32) 4 else 2;
             a.movw(3, e.next);

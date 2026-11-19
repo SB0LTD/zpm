@@ -206,7 +206,7 @@ const Gen = struct {
     /// operand size is 32 bits (else 16).
     fn one(g: *Gen, wide: bool) void {
         const mem = g.r().boolean();
-        const pick = g.r().uintLessThan(u8, 26);
+        const pick = g.r().uintLessThan(u8, 27);
         // operand size: 1, the default, or the other (0x66)
         const szk = g.r().uintLessThan(u8, 3);
         const byte = szk == 0;
@@ -379,6 +379,13 @@ const Gen = struct {
                 if (szk == 2) g.n -= 1;
                 g.b(0x9C);
                 g.b(0x58 | g.dst());
+            },
+            26 => { // LOOP/LOOPE/LOOPNE/JCXZ over a NOP
+                if (szk == 2) g.n -= 1;
+                if (g.r().boolean()) g.b(0x67);
+                g.b(0xE0 | g.r().uintLessThan(u8, 4));
+                g.b(1);
+                g.b(0x90);
             },
             22 => { // CALL to the next instruction, POP its address
                 if (szk == 2) g.n -= 1;

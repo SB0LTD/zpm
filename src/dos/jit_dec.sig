@@ -89,6 +89,8 @@ pub const Kind = enum(u8) {
     bswap,
     /// PUSHF(D).
     pushf,
+    /// LOOPNE (sub 0), LOOPE (1), LOOP (2), JCXZ (3) to target.
+    loop,
     /// SHLD (sub 0) / SHRD (sub 1) dst, sreg, imm (the count, not 0).
     shxd,
     /// F6/F7 /4-/7 (sub): MUL IMUL DIV IDIV on src.
@@ -689,7 +691,9 @@ pub fn decode(p: [*]const u8, n: u32, d32: bool, eip: u32, wrap: u32) ?Ins {
             ins.fw = 0;
         },
         0xE0...0xE3 => {
-            _ = r.b();
+            ins.kind = .loop;
+            ins.sub = @truncate(op & 3);
+            ins.target = sx8(r.b());
             ins.fr = if (op <= 0xE1) ZF else 0;
             ins.fw = 0;
             ins.term = true;
@@ -844,7 +848,7 @@ pub fn decode(p: [*]const u8, n: u32, d32: bool, eip: u32, wrap: u32) ?Ins {
     ins.len = @intCast(r.i);
     // (relative targets from the next instruction; 16 bits unless o32)
     switch (ins.kind) {
-        .jcc, .jmp, .call => {
+        .jcc, .jmp, .call, .loop => {
             const mask: u32 = if (o32) wrap else 0xFFFF;
             ins.target = (eip +% ins.len +% ins.target) & mask;
         },
