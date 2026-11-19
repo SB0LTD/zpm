@@ -23,6 +23,10 @@ const std = @import("std");
 const linux = std.os.linux;
 const dos = @import("dos");
 
+/// The CPU's opcode counts (cpu.sig's count_ops): a profiling build
+/// sets this true; dosrun then prints the most frequent at the end.
+pub const dos_cpu_ops = false;
+
 var machine: dos.Machine = undefined;
 var host: dos.host_linux.LinuxHost = .{ .prefix = "[dos] " };
 /// The largest picture: VESA's 1600x1200.
@@ -84,6 +88,29 @@ fn profSave(path: []const u8) void {
     _ = linux.write(fd, &buf, n);
     _ = linux.close(fd);
     out("dosrun: {d} profile samples in {s}", .{ prof_n, path });
+}
+
+fn opsReport() void {
+    const c = &dos.cpu.op_counts;
+    var total: u64 = 0;
+    for (c) |n| total += n;
+    var done: [512]bool = [_]bool{false} ** 512;
+    out("dosrun: {d} M opcodes counted; the most frequent:", .{total / 1_000_000});
+    for (0..40) |_| {
+        var best: usize = 0;
+        var bn: u64 = 0;
+        for (c, 0..) |n, i| if (!done[i] and n > bn) {
+            bn = n;
+            best = i;
+        };
+        if (bn == 0) break;
+        done[best] = true;
+        if (best >= 256) {
+            out("  0F {x:0>2}  {d:.2}%", .{ best - 256, @as(f64, @floatFromInt(bn)) * 100 / @as(f64, @floatFromInt(total)) });
+        } else {
+            out("  {x:0>2}     {d:.2}%", .{ best, @as(f64, @floatFromInt(bn)) * 100 / @as(f64, @floatFromInt(total)) });
+        }
+    }
 }
 
 fn nowNs() u64 {
@@ -289,6 +316,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
     const wall = @as(f64, @floatFromInt(nowNs() - t0)) / 1e9;
     if (prof_path) |pp| profSave(pp);
+    if (dos.cpu.count_ops) opsReport();
     const emu = @as(f64, @floatFromInt(t_us)) / 1e6;
     out("dosrun: {s} after {d:.2} emulated s in {d:.2} s ({d:.1}x real time), {d} M instructions", .{
         @tagName(status), emu, wall, emu / @max(wall, 1e-6), machine.cpu.executed / 1_000_000,

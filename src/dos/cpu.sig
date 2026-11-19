@@ -132,6 +132,16 @@ pub const SIGNATURE: u32 = 0x0435;
 pub const FAULT_V86: u32 = 0x7E00_0000;
 pub const FAULT_TRIPLE: u32 = 0x7F00_0000;
 
+/// A profile of the guest's instructions, for a profiling build: with
+/// the root module's `dos_cpu_ops = true` each instruction's first byte
+/// (a prefix too) is counted, a 0F opcode's second at 256 + it. Off,
+/// there is no code for it.
+pub const count_ops = blk: {
+    const root = @import("root");
+    break :blk @hasDecl(root, "dos_cpu_ops") and root.dos_cpu_ops;
+};
+pub var op_counts: [512]u64 = [_]u64{0} ** 512;
+
 pub const Exit = enum {
     /// The budget is spent.
     budget,
@@ -307,6 +317,14 @@ inline fn outP(bus: anytype, comptime T: type, port: u16, v: T) void {
 
 /// EIP after a near transfer: 16 bits in real mode and for 16-bit
 /// operands.
+/// `p` as the compiler cannot know it (a volatile load); a non-pointer
+/// as it is.
+inline fn opaquePtr(p: anytype) @TypeOf(p) {
+    if (comptime @typeInfo(@TypeOf(p)) != .pointer) return p;
+    var h = p;
+    return @as(*volatile @TypeOf(p), &h).*;
+}
+
 inline fn ipMask(comptime P: bool, o32: bool) u32 {
     return if (P and o32) 0xFFFF_FFFF else 0xFFFF;
 }
@@ -395,7 +413,12 @@ pub const Cpu = struct {
     }
 
     /// Runs at most `budget` instructions.
-    pub fn run(self: *Cpu, bus: anytype, budget: u32) Exit {
+    pub fn run(self_: *Cpu, bus_: anytype, budget: u32) Exit {
+        // (the CPU and the bus through pointers the compiler cannot see
+        // through: a machine kept in a global otherwise has every field
+        // at an absolute address that takes two instructions to reach)
+        const self = opaquePtr(self_);
+        const bus = opaquePtr(bus_);
         self.poll = true;
         if (self.dead) return .fault;
         if (self.halted) {
@@ -1620,7 +1643,9 @@ pub const Cpu = struct {
         var p: Pfx = .{ .o32 = d32, .a32 = d32 };
         var npfx: u8 = 0;
         const r = &self.regs;
-        sw: switch (try self.fetch8(bus)) {
+        const op0 = try self.fetch8(bus);
+        if (count_ops) op_counts[op0] += 1;
+        sw: switch (op0) {
             // Prefixes.
             0x26, 0x2E, 0x36, 0x3E => |op| {
                 p.seg = @truncate((op >> 3) & 3);
@@ -2070,6 +2095,7 @@ pub const Cpu = struct {
         @setEvalBranchQuota(100_000);
         const r = &self.regs;
         const op = try self.fetch8(bus);
+        if (count_ops) op_counts[256 + @as(u32, op)] += 1;
         const code: u32 = 0x0F00 | @as(u32, op);
         switch (op) {
             0x00 => return self.grp6(bus, p),
