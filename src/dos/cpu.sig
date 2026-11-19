@@ -415,12 +415,7 @@ pub const Cpu = struct {
     }
 
     /// Runs at most `budget` instructions.
-    pub fn run(self_: *Cpu, bus_: anytype, budget: u32) Exit {
-        // (the CPU and the bus through pointers the compiler cannot see
-        // through: a machine kept in a global otherwise has every field
-        // at an absolute address that takes two instructions to reach)
-        const self = opaquePtr(self_);
-        const bus = opaquePtr(bus_);
+    pub fn run(self: *Cpu, bus: anytype, budget: u32) Exit {
         self.poll = true;
         if (self.dead) return .fault;
         if (self.halted) {
@@ -428,9 +423,15 @@ pub const Cpu = struct {
             return .halt;
         }
         const end = self.executed + budget;
+        // (protected mode reaches the CPU and the bus through pointers the
+        // compiler cannot see through: a machine kept in a global otherwise
+        // has every field at an absolute address that takes two
+        // instructions to reach; real mode is faster without)
+        const me = opaquePtr(self);
+        const ob = opaquePtr(bus);
         while (true) {
             const why = if (self.cr0 & CR0_PE != 0)
-                self.loop(PmBus(@TypeOf(bus)){ .b = bus, .c = self }, end)
+                me.loop(PmBus(@TypeOf(bus)){ .b = ob, .c = me }, end)
             else
                 self.loop(bus, end);
             if (why) |w| return w;
@@ -1554,6 +1555,9 @@ pub const Cpu = struct {
         const sz: A = @sizeOf(T);
         const d: A = if (self.regs.flags & DF != 0) 0 -% sz else sz;
         const ss = dataSeg(p);
+        // (real mode adds the bases itself, as they are now)
+        const sb = self.regs.base[ss];
+        const eb = self.regs.base[ES];
         const port: u16 = @truncate(self.regs.r[EDX]);
         const acc: T = self.getR(T, EAX);
         var si: A = @truncate(self.regs.r[ESI]);
@@ -1565,7 +1569,7 @@ pub const Cpu = struct {
         // (a fault part way keeps what is done: the restart goes on)
         errdefer self.strCommit(k, A, si, di);
         if (p.rep == 0) {
-            try self.strIter(bus, k, T, A, ss, &si, &di, d, port, acc);
+            try self.strIter(bus, k, T, A, ss, sb, eb, &si, &di, d, port, acc);
         } else {
             var cx: A = @truncate(self.regs.r[ECX]);
             errdefer self.setA(A, ECX, cx);
@@ -1580,7 +1584,7 @@ pub const Cpu = struct {
                     self.executed += 1;
                 }
                 first = false;
-                try self.strIter(bus, k, T, A, ss, &si, &di, d, port, acc);
+                try self.strIter(bus, k, T, A, ss, sb, eb, &si, &di, d, port, acc);
                 cx -%= 1;
                 if (k == .cmps or k == .scas) {
                     if ((self.regs.flags & ZF != 0) != (p.rep == 1)) break;
@@ -1608,7 +1612,27 @@ pub const Cpu = struct {
     }
 
     /// One iteration: the accesses first, then SI/DI move.
-    inline fn strIter(self: *Cpu, bus: anytype, comptime k: Str, comptime T: type, comptime A: type, ss: u3, si: *A, di: *A, d: A, port: u16, acc: T) Er(@TypeOf(bus))!void {
+    inline fn strIter(self: *Cpu, bus: anytype, comptime k: Str, comptime T: type, comptime A: type, ss: u3, sb: u32, eb: u32, si: *A, di: *A, d: A, port: u16, acc: T) Er(@TypeOf(bus))!void {
+        if (comptime !prot(@TypeOf(bus))) {
+            switch (k) {
+                .movs => wrM(bus, T, eb +% di.*, rdM(bus, T, sb +% si.*)),
+                .cmps => _ = self.sub(T, rdM(bus, T, sb +% si.*), rdM(bus, T, eb +% di.*), 0),
+                .stos => wrM(bus, T, eb +% di.*, acc),
+                .lods => self.setR(T, EAX, rdM(bus, T, sb +% si.*)),
+                .scas => _ = self.sub(T, self.getR(T, EAX), rdM(bus, T, eb +% di.*), 0),
+                .ins => wrM(bus, T, eb +% di.*, inP(bus, T, port)),
+                .outs => outP(bus, T, port, rdM(bus, T, sb +% si.*)),
+            }
+            switch (k) {
+                .movs, .cmps => {
+                    si.* +%= d;
+                    di.* +%= d;
+                },
+                .lods, .outs => si.* +%= d,
+                .stos, .scas, .ins => di.* +%= d,
+            }
+            return;
+        }
         switch (k) {
             .movs => {
                 try self.wrS(bus, T, ES, di.*, try self.rdS(bus, T, ss, si.*));
