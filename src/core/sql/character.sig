@@ -15,6 +15,7 @@
 //! PostgreSQL, up to 10485760) but every non-NULL value then raises
 //! TextCapacity (54000).
 const types = @import("types.sig");
+const lexer = @import("lexer.sig");
 const Error = types.Error;
 
 /// PostgreSQL MaxAttrSize: the largest declarable length.
@@ -87,8 +88,22 @@ fn clipped(bytes: []const u8, length: usize, mode: Mode) Error!usize {
     return keep;
 }
 
+/// PostgreSQL character input uses UTF-8 and rejects embedded NUL.
+pub fn validateText(bytes: []const u8) Error!void {
+    var check: lexer.Utf8Check = .{};
+    for (bytes) |byte| check.feed(byte);
+    if (!check.finish()) return error.CharacterNotInRepertoire;
+}
+
+/// An internal-char cast can form one raw byte followed by bpchar padding.
+/// Its stored representation is valid even if the byte is NUL or non-UTF-8.
+pub fn validateBpchar(bytes: []const u8) Error!void {
+    if (!rawInternalChar(bytes)) try validateText(bytes);
+}
+
 /// varchar(): the bytes a VARCHAR(n) value keeps.
 pub fn varchar(bytes: []const u8, typmod: i32, mode: Mode) Error!Shape {
+    try validateText(bytes);
     const length = declared(typmod) orelse return .{ .keep = bytes.len };
     if (bytes.len <= length) return .{ .keep = bytes.len };
     return .{ .keep = try clipped(bytes, length, mode) };
@@ -96,6 +111,7 @@ pub fn varchar(bytes: []const u8, typmod: i32, mode: Mode) Error!Shape {
 
 /// bpchar(): the bytes a CHAR(n) value keeps and the spaces it gains.
 pub fn bpchar(bytes: []const u8, typmod: i32, mode: Mode) Error!Shape {
+    try validateBpchar(bytes);
     const length = declared(typmod) orelse return .{ .keep = bytes.len };
     // bpchar(internal char) carries one raw byte, even when it is not a
     // complete UTF-8 sequence. A zero ends its character count but remains
