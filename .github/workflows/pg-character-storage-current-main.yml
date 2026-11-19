@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: e303c3a7b9c4e870e1e6951105a7ac2557db7c9d
+          ref: c6e5b31787d5b6308effdbbff5f1e0c511496dc3
       - name: Install checksum-verified Sig 0.6.5
         shell: bash
         run: |
@@ -34,11 +34,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir evidence
-          test "$(git rev-parse HEAD)" = "e303c3a7b9c4e870e1e6951105a7ac2557db7c9d"
+          test "$(git rev-parse HEAD)" = "c6e5b31787d5b6308effdbbff5f1e0c511496dc3"
           git rev-parse HEAD >evidence/source.txt
           "$SIG" version | tee evidence/sig-version.log
-          curl -fsSL --retry 3 "https://codeload.github.com/SB0LTD/zpm/tar.gz/e303c3a7b9c4e870e1e6951105a7ac2557db7c9d" -o "$RUNNER_TEMP/source.tar.gz"
-          echo "903bd729e1bb6be1ff351523751d2b4c5f2c46cd2644c4ee1cd6f2cd7c49d5a7  $RUNNER_TEMP/source.tar.gz" | sha256sum -c | tee evidence/source-archive.log
+          curl -fsSL --retry 3 "https://codeload.github.com/SB0LTD/zpm/tar.gz/c6e5b31787d5b6308effdbbff5f1e0c511496dc3" -o "$RUNNER_TEMP/source.tar.gz"
+          echo "c4e6b40f8de8f1a5123937a9498e4efebbeffa8dfec14c00332e5efda5000cfe  $RUNNER_TEMP/source.tar.gz" | sha256sum -c | tee evidence/source-archive.log
           "$SIG" build run-contract-sql-types-core run-contract-sql-integral-versions run-contract-postgres run-contract-sql-change-log run-contract-sql-ddl-core run-contract-sql-catalog-security \
             --Sig-lib-dir "$SIG_LIB_DIR" -Doptimize=ReleaseSafe -j1 2>&1 | tee evidence/contracts.log
       - name: Verify native internal-char to bpchar byte output
