@@ -671,6 +671,54 @@ fn schemaDependencies() !void {
     try sameState();
 }
 
+fn namespaceCreateAuthority() !void {
+    try reset();
+    try run("CREATE ROLE create_owner SUPERUSER");
+    try run("CREATE ROLE create_member");
+    try run("CREATE ROLE usage_only");
+    try as("create_owner");
+    try run("CREATE SCHEMA create_space");
+    try as("ramsql");
+    try run("ALTER ROLE create_owner NOSUPERUSER");
+    try run("GRANT create_owner TO create_member");
+    try run("GRANT USAGE ON SCHEMA create_space TO usage_only");
+
+    try as("create_owner");
+    try run("REVOKE USAGE ON SCHEMA create_space FROM CURRENT_ROLE");
+    try run("CREATE TABLE create_space.owner_data (id INT NOT NULL)");
+    try run("CREATE TABLE IF NOT EXISTS create_space.owner_data (id INT PRIMARY KEY)");
+    try fails("CREATE TABLE create_space.denied_pk (id INT PRIMARY KEY)", error.InsufficientPrivilege);
+    try fails("CREATE TABLE create_space.denied_unique (id INT UNIQUE)", error.InsufficientPrivilege);
+    try fails("SELECT id FROM create_space.owner_data", error.InsufficientPrivilege);
+    try run("GRANT USAGE ON SCHEMA create_space TO CURRENT_ROLE");
+    try run("INSERT INTO create_space.owner_data VALUES (5)");
+    try expect("SELECT id FROM create_space.owner_data", "5");
+
+    try as("usage_only");
+    try fails("CREATE TABLE create_space.denied (id INT)", error.InsufficientPrivilege);
+    try fails("CREATE TABLE IF NOT EXISTS create_space.owner_data (id INT)", error.InsufficientPrivilege);
+    try fails("CREATE TABLE public.denied (id INT)", error.InsufficientPrivilege);
+
+    try as("create_member");
+    try run("CREATE TABLE create_space.member_data (id INT PRIMARY KEY)");
+    try run("INSERT INTO create_space.member_data VALUES (9)");
+    try expect("SELECT id FROM create_space.member_data", "9");
+    try fails("CREATE TABLE create_space.derived AS SELECT id FROM create_space.member_data", error.InsufficientPrivilege);
+
+    try as("create_owner");
+    try fails("SELECT id FROM create_space.member_data", error.InsufficientPrivilege);
+    const owners = "SELECT tablename, tableowner FROM pg_tables WHERE schemaname = 'create_space' ORDER BY tablename";
+    try expect(owners, "member_data|create_member;owner_data|create_owner");
+    try same(try query(&replica, owners), "member_data|create_member;owner_data|create_owner");
+    try as("ramsql");
+    try fails("DROP ROLE create_member", error.DependentObjects);
+    try as("create_member");
+    try run("DROP TABLE create_space.member_data");
+    try as("ramsql");
+    try run("DROP ROLE create_member");
+    try sameState();
+}
+
 fn comments() !void {
     try reset();
     const probe = "SELECT objoid = 'tdd_a'::regclass, classoid, objsubid, description FROM pg_description ORDER BY objoid, objsubid";
@@ -1482,6 +1530,7 @@ pub fn main() !void {
     try namespaceGrants();
     try namespaceAclMaterialization();
     try schemaDependencies();
+    try namespaceCreateAuthority();
     try comments();
     try roles();
     try privileges();
