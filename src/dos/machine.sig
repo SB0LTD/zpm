@@ -157,6 +157,9 @@ pub const Machine = struct {
     /// with the driver's registers (it returns through F000:MOUSE_RET).
     fn mouseCall(m: *Machine) void {
         if (m.mouse_saved != null) return;
+        // (a real-mode handler: while a DOS extender's protected mode
+        // runs, the call waits for its next switch back to real mode)
+        if (m.cpu.cr0 & 1 != 0) return;
         const call = m.mouse.userCall() orelse return;
         m.mouse_saved = .{ .regs = m.cpu.regs, .halted = m.cpu.halted };
         const r = &m.cpu.regs;

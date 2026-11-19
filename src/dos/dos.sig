@@ -9,7 +9,8 @@
 //!   mem.sig         16 MiB of RAM, the A20 gate
 //!   host.sig        what the PC asks of its host (files, clock, log)
 //!   host_linux.sig  that host on Linux system calls (no libc)
-//!   cpu.sig         the 386 in real mode, and the x87
+//!   cpu.sig         the 386 in real and protected mode, and the x87
+//!   cpu_pm.sig      protected mode: descriptors, gates, the IDT, paging
 //!   pic.sig         the two 8259 interrupt controllers
 //!   pit.sig         the 8254 timer, the PC speaker
 //!   kbd.sig         the 8042 keyboard controller
