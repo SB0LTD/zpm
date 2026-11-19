@@ -837,6 +837,7 @@ pub const Tlb = struct {
     key: u32 = 0,
 
     pub fn flush(t: *Tlb) void {
+        if (cpu_mod.count_ops) stats[0] += 1;
         @memset(&t.tag, 0);
         inline for (0..2) |u| {
             @memset(&t.rtag[u], 0);
@@ -939,7 +940,11 @@ fn fill(c: *Cpu, b: anytype, lin: u32, frame: u32, perm0: u8) void {
     if (i == c.tlb.fw_idx) c.tlb.fw_len = 0;
 }
 
+/// The profiling build's counts (cpu.count_ops): TLB flushes, misses.
+pub var stats: [4]u64 = [_]u64{0} ** 4;
+
 fn walk(c: *Cpu, b: anytype, lin: u32, write: bool, user: bool) Exc!u32 {
+    if (cpu_mod.count_ops) stats[1] += 1;
     if (!c.paging) {
         fill(c, b, lin, lin & 0xFFFF_F000, K_SR | K_SW | K_UR | K_UW);
         return lin;

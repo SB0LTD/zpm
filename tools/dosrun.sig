@@ -95,7 +95,7 @@ fn opsReport() void {
     var total: u64 = 0;
     for (c) |n| total += n;
     var done: [512]bool = [_]bool{false} ** 512;
-    out("dosrun: {d} M opcodes counted; the most frequent:", .{total / 1_000_000});
+    out("dosrun: {d} M opcodes counted; TLB flushes {d}, misses {d}; the most frequent:", .{ total / 1_000_000, dos.cpu.tlb_stats[0], dos.cpu.tlb_stats[1] });
     for (0..40) |_| {
         var best: usize = 0;
         var bn: u64 = 0;

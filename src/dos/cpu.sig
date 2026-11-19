@@ -141,6 +141,8 @@ pub const count_ops = blk: {
     break :blk @hasDecl(root, "dos_cpu_ops") and root.dos_cpu_ops;
 };
 pub var op_counts: [512]u64 = [_]u64{0} ** 512;
+/// (and the TLB's flushes and misses: cpu_pm.sig's stats)
+pub const tlb_stats = &pm.stats;
 
 pub const Exit = enum {
     /// The budget is spent.
