@@ -614,7 +614,11 @@ pub const Machine = struct {
     /// The picture (vga.render's contract): the VGA's, or a VESA mode's
     /// at its own size (up to vesa.MAX_W x MAX_H, 1600x1200).
     pub fn frame(m: *Machine, out: []u32, stride: u32, max: Size) Size {
-        return m.vga.render(out, stride, max);
+        const sz = m.vga.render(out, stride, max);
+        // (the mouse driver's cursor, when shown: over the picture, never
+        // in video memory)
+        mouse_mod.overlay(&m.mouse, &m.mem, m.vga.svga.active, out, stride, sz.w, sz.h);
+        return sz;
     }
     /// The sound since the last call: interleaved stereo i16 at `rate`
     /// (the host asks for as many frames as its device took).

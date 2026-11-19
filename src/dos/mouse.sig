@@ -219,12 +219,13 @@ pub const State = struct {
 /// character cell under it (0Ah's software cursor inverts its colours as
 /// the default attribute masks do; the hardware one marks its scan lines),
 /// in graphics modes the 16x16 masks at the position less the hot spot,
-/// in the mode's own pixels (the driver's virtual screen scaled to it).
-pub fn overlay(st: *const State, mem: *const Memory, out: []u32, stride: u32, w: u32, h: u32) void {
+/// in the mode's own pixels (the driver's virtual screen scaled to it; in
+/// a VESA mode, `vesa`, the virtual screen is the mode's resolution).
+pub fn overlay(st: *const State, mem: *const Memory, vesa: bool, out: []u32, stride: u32, w: u32, h: u32) void {
     if (st.visible < 0 or !st.enabled or w == 0 or h == 0) return;
     const x: i32 = st.x;
     const y: i32 = st.y;
-    if (textMode(mem)) {
+    if (!vesa and textMode(mem)) {
         const cols: u32 = @max(mem.rdW(0x40, 0x4A), 1);
         const rows: u32 = @as(u32, mem.rdB(0x40, 0x84)) + 1;
         const cw = w / cols;
@@ -247,7 +248,7 @@ pub fn overlay(st: *const State, mem: *const Memory, out: []u32, stride: u32, w:
         }
         return;
     }
-    const mode = mem.rdB(0x40, 0x49) & 0x7F;
+    const mode: u8 = if (vesa) 0xFF else mem.rdB(0x40, 0x49) & 0x7F;
     // The mode's pixels per virtual pixel: 640 virtual columns; rows as
     // the mode has them (a mode the BIOS table doesn't know: 1:1).
     const vw: i32 = if (mode <= 0x13) 640 else @intCast(w);

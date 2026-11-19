@@ -136,10 +136,10 @@ test "mouse: the cursor over the picture (mode 13h's arrow, hot spot, masks; tex
     const grey: u32 = 0x00808080;
     @memset(pic[0 .. 320 * 200], grey);
     // Hidden after a reset: nothing drawn.
-    mouse.overlay(&st, &mem, &pic, 320, 320, 200);
+    mouse.overlay(&st, &mem, false, &pic, 320, 320, 200);
     try t.expectEqual(grey, pic[100 * 320 + 160]);
     call(&st, &r, 0x0001);
-    mouse.overlay(&st, &mem, &pic, 320, 320, 200);
+    mouse.overlay(&st, &mem, false, &pic, 320, 320, 200);
     // (320, 100) virtual is pixel (160, 100): the arrow's tip is outline
     // (black), inside it white, past its edge the picture.
     try t.expectEqual(@as(u32, 0), pic[100 * 320 + 160]);
@@ -157,7 +157,7 @@ test "mouse: the cursor over the picture (mode 13h's arrow, hot spot, masks; tex
     r.setDx(0);
     call(&st, &r, 0x0009);
     @memset(pic[0 .. 320 * 200], grey);
-    mouse.overlay(&st, &mem, &pic, 320, 320, 200);
+    mouse.overlay(&st, &mem, false, &pic, 320, 320, 200);
     try t.expectEqual(grey ^ 0x00FFFFFF, pic[92 * 320 + 152]);
     try t.expectEqual(grey ^ 0x00FFFFFF, pic[107 * 320 + 167]);
     try t.expectEqual(grey, pic[108 * 320 + 168]);
@@ -165,7 +165,7 @@ test "mouse: the cursor over the picture (mode 13h's arrow, hot spot, masks; tex
     // Hidden again (02h): the picture as it was.
     call(&st, &r, 0x0002);
     @memset(pic[0 .. 320 * 200], grey);
-    mouse.overlay(&st, &mem, &pic, 320, 320, 200);
+    mouse.overlay(&st, &mem, false, &pic, 320, 320, 200);
     try t.expectEqual(grey, pic[100 * 320 + 160]);
 
     // Text mode 3, 80x25 at 720x400: the cell under the cursor inverted.
@@ -178,7 +178,7 @@ test "mouse: the cursor over the picture (mode 13h's arrow, hot spot, masks; tex
     r.setDx(24); // row 3
     call(&st, &r, 0x0004);
     @memset(&pic, 0);
-    mouse.overlay(&st, &mem, &pic, 720, 720, 400);
+    mouse.overlay(&st, &mem, false, &pic, 720, 720, 400);
     try t.expectEqual(@as(u32, 0x00FFFFFF), pic[(3 * 16) * 720 + 2 * 9]);
     try t.expectEqual(@as(u32, 0x00FFFFFF), pic[(3 * 16 + 15) * 720 + 2 * 9 + 8]);
     try t.expectEqual(@as(u32, 0), pic[(3 * 16) * 720 + 3 * 9]);
