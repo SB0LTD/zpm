@@ -1,0 +1,66 @@
+name: Current-main PostgreSQL character and internal-char contracts
+
+on:
+  push:
+    branches: [ci/pg-character-storage-current-main-20261119]
+
+permissions:
+  contents: read
+
+jobs:
+  simple-query-stream:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: e303c3a7b9c4e870e1e6951105a7ac2557db7c9d
+      - name: Install checksum-verified Sig 0.6.5
+        shell: bash
+        run: |
+          tag=sig-0.6.5-zig0.17.0.3c72687
+          asset="$tag-aarch64-linux.tar.xz"
+          curl -fsSL --retry 3 "https://github.com/SB0LTD/sig/releases/download/$tag/$asset" -o "$RUNNER_TEMP/$asset"
+          echo "ef890f870f3215e60d25588742b74fa9d2808addbc0112b7c37818a73dfb0643  $RUNNER_TEMP/$asset" | sha256sum -c
+          mkdir "$RUNNER_TEMP/sdk"
+          tar -xf "$RUNNER_TEMP/$asset" -C "$RUNNER_TEMP/sdk"
+          compiler=$(find "$RUNNER_TEMP/sdk" -type f -name sig | head -n 1)
+          standard=$(find "$RUNNER_TEMP/sdk" -type f -path '*/lib/std/std.sig' | head -n 1)
+          test -x "$compiler"
+          test -f "$standard"
+          printf 'SIG=%s\nSIG_LIB_DIR=%s\n' "$compiler" "${standard%/std/std.sig}" >> "$GITHUB_ENV"
+      - name: Run ordinary wire and bounded stream contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir evidence
+          test "$(git rev-parse HEAD)" = "e303c3a7b9c4e870e1e6951105a7ac2557db7c9d"
+          git rev-parse HEAD >evidence/source.txt
+          "$SIG" version | tee evidence/sig-version.log
+          curl -fsSL --retry 3 "https://codeload.github.com/SB0LTD/zpm/tar.gz/e303c3a7b9c4e870e1e6951105a7ac2557db7c9d" -o "$RUNNER_TEMP/source.tar.gz"
+          echo "903bd729e1bb6be1ff351523751d2b4c5f2c46cd2644c4ee1cd6f2cd7c49d5a7  $RUNNER_TEMP/source.tar.gz" | sha256sum -c | tee evidence/source-archive.log
+          "$SIG" build run-contract-sql-types-core run-contract-sql-integral-versions run-contract-postgres run-contract-sql-change-log run-contract-sql-ddl-core run-contract-sql-catalog-security \
+            --Sig-lib-dir "$SIG_LIB_DIR" -Doptimize=ReleaseSafe -j1 2>&1 | tee evidence/contracts.log
+      - name: Verify native internal-char to bpchar byte output
+        shell: bash
+        run: |
+          set -euo pipefail
+          image=postgres:18.3-bookworm@sha256:80630f83606d8db77d30b3851b16a9f78be2d0d4dda6f7b82a1fdca5ebe3acba
+          echo "$image" > evidence/native-image.txt
+          docker run --detach --name character-oracle -e POSTGRES_HOST_AUTH_METHOD=trust "$image"
+          trap 'docker rm --force --volumes character-oracle >/dev/null' EXIT
+          for attempt in $(seq 1 60); do
+            if docker exec character-oracle pg_isready -U postgres; then break; fi
+            sleep 1
+          done
+          docker exec character-oracle postgres --version | tee evidence/native-version.txt
+          docker exec -i character-oracle psql -U postgres -XAtq -v ON_ERROR_STOP=1 <<'SQL' > evidence/native-bpchar.txt
+          SELECT encode(pg_catalog.bpcharsend((-1)::"char"::CHAR(3)), 'hex'), encode(pg_catalog.bpcharsend(0::"char"::CHAR(3)), 'hex');
+          SQL
+          echo 'ff2020|00202020' > "$RUNNER_TEMP/expected-bpchar.txt"
+          diff -u "$RUNNER_TEMP/expected-bpchar.txt" evidence/native-bpchar.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pg-character-current-main-contracts
+          path: evidence/
