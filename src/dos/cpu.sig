@@ -585,12 +585,13 @@ pub const Cpu = struct {
 
     /// The host address of a T at linear `a` if the TLB has its page's
     /// bytes, with the rights for this access, and all of T is on it.
+    /// (the entry of T's last byte, matched against its first byte's
+    /// page: a hit is also an access within one page)
     inline fn tlbHit(self: *const Cpu, comptime T: type, a: u32, comptime write: bool) ?usize {
-        const i = (a >> 12) & (pm.TLB_N - 1);
-        const need = (if (write) pm.D_W else pm.D_R) | pm.access(self.cpl, write);
-        if (self.tlb.tag[i] == (a & 0xFFFF_F000) | 1 and self.tlb.perm[i] & need == need and
-            (T == u8 or a & 0xFFF <= 0x1000 - @sizeOf(T)))
-            return self.tlb.hoff[i] +% a;
+        const i = ((a +% (@sizeOf(T) - 1)) >> 12) & (pm.TLB_N - 1);
+        const u = @intFromBool(self.cpl == 3);
+        const tags = if (write) &self.tlb.wtag[u] else &self.tlb.rtag[u];
+        if (tags[i] == (a & 0xFFFF_F000) | 1) return self.tlb.hoff[i] +% a;
         return null;
     }
 

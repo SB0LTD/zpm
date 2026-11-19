@@ -823,6 +823,11 @@ pub const Tlb = struct {
     perm: [TLB_N]u8 = [_]u8{0} ** TLB_N,
     /// The host address of the page's byte 0, less its linear address.
     hoff: [TLB_N]usize = [_]usize{0} ** TLB_N,
+    /// The fast paths' own tags, [0] for CPL 0-2, [1] for CPL 3: the
+    /// page | 1 where its host bytes may be read (written) at that level,
+    /// else 0. One compare is a hit.
+    rtag: [2][TLB_N]u32 = [_][TLB_N]u32{[_]u32{0} ** TLB_N} ** 2,
+    wtag: [2][TLB_N]u32 = [_][TLB_N]u32{[_]u32{0} ** TLB_N} ** 2,
     fw_base: u32 = 0,
     fw_len: u32 = 0,
     fw_host: usize = 0,
@@ -833,12 +838,22 @@ pub const Tlb = struct {
 
     pub fn flush(t: *Tlb) void {
         @memset(&t.tag, 0);
+        inline for (0..2) |u| {
+            @memset(&t.rtag[u], 0);
+            @memset(&t.wtag[u], 0);
+        }
         t.fw_len = 0;
     }
 
     pub fn flushPage(t: *Tlb, lin: u32) void {
         const i = (lin >> 12) & (TLB_N - 1);
-        if (t.tag[i] == (lin & 0xFFFF_F000) | 1) t.tag[i] = 0;
+        if (t.tag[i] == (lin & 0xFFFF_F000) | 1) {
+            t.tag[i] = 0;
+            inline for (0..2) |u| {
+                t.rtag[u][i] = 0;
+                t.wtag[u][i] = 0;
+            }
+        }
         t.fw_len = 0;
     }
 };
@@ -915,6 +930,11 @@ fn fill(c: *Cpu, b: anytype, lin: u32, frame: u32, perm0: u8) void {
     c.tlb.phys[i] = frame;
     c.tlb.perm[i] = perm;
     c.tlb.hoff[i] = hoff;
+    const t = page | 1;
+    c.tlb.rtag[0][i] = if (perm & D_R != 0) t else 0;
+    c.tlb.rtag[1][i] = if (perm & (D_R | K_UR) == D_R | K_UR) t else 0;
+    c.tlb.wtag[0][i] = if (perm & (D_W | K_SW) == D_W | K_SW) t else 0;
+    c.tlb.wtag[1][i] = if (perm & (D_W | K_UW) == D_W | K_UW) t else 0;
     // (the window may be on the entry this one replaces)
     if (i == c.tlb.fw_idx) c.tlb.fw_len = 0;
 }
