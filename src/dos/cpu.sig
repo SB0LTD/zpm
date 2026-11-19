@@ -58,7 +58,9 @@
 //! mode (an IRET to VM=1 stops with FAULT_V86), a triple fault (stops
 //! with FAULT_TRIPLE | first << 8 | second vector), #AC (CR0.AM is
 //! ignored), debug-register breakpoints, the segment limits of real mode
-//! (no #GP at offset 0xFFFF), #MF/IRQ13 for unmasked FPU exceptions, and
+//! (no #GP at offset 0xFFFF; and real mode always runs 16-bit code on a
+//! 16-bit stack: a D or B bit protected mode leaves in CS's or SS's cache
+//! is not used there), #MF/IRQ13 for unmasked FPU exceptions, and
 //! the Pentium's RDTSC/CMPXCHG8B and later (invalid opcodes here, as on a
 //! 486). A page fault during an x87 memory operand restarts the
 //! instruction with the FPU's state as the faulting access left it.
