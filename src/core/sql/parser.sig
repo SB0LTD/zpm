@@ -351,7 +351,7 @@ pub fn Parser(comptime config: types.Config) type {
             try self.advance();
             if (self.current.kind == .end) return null;
             const name = try self.identifier();
-            if (!typeWord(self.current)) {
+            if (!typeWord(self.current) and !self.internalCharName() and !(try self.internalCharQualifier())) {
                 if (self.current.kind == .word or self.current.kind == .quoted_word) return error.UnsupportedStatement;
                 return error.Syntax;
             }
@@ -1632,7 +1632,42 @@ pub fn Parser(comptime config: types.Config) type {
 
         /// A type name with an optional array suffix: `[]`, `[n]` (repeated;
         /// sizes and dimensions are ignored) or `ARRAY [n]`.
+        fn internalCharName(self: *const Self) bool {
+            return self.mode == .standard and self.tokens.dialect == .postgres and
+                self.current.kind == .quoted_word and types.same(
+                    self.source[self.current.start..self.current.end], "char",
+                );
+        }
+
+        fn internalCharQualifier(self: *Self) Error!bool {
+            if (self.mode != .standard or self.tokens.dialect != .postgres or !self.rawWord("pg_catalog")) return false;
+            const next = try self.peek();
+            if (next.kind != .symbol or next.symbol != .dot) return false;
+            var lookahead = self.after_peek;
+            const type_name = try lookahead.next();
+            return wordIs(self.source, type_name, "char") or
+                (type_name.kind == .quoted_word and types.same(type_name.raw(self.source), "char"));
+        }
+
+        fn internalCharLiteral(self: *Self) Error!bool {
+            if (self.internalCharName()) return (try self.peek()).kind == .string;
+            if (!(try self.internalCharQualifier())) return false;
+            var lookahead = self.after_peek;
+            _ = try lookahead.next();
+            return (try lookahead.next()).kind == .string;
+        }
+
         fn typeName(self: *Self) Error!TypeSpec {
+            if (try self.internalCharQualifier()) {
+                try self.advance();
+                try self.expectSymbol(.dot);
+                try self.advance();
+                return self.typeArraySuffix(.{ .ty = .pg_internal_char });
+            }
+            if (self.internalCharName()) {
+                try self.advance();
+                return self.typeArraySuffix(.{ .ty = .pg_internal_char });
+            }
             return self.typeArraySuffix(try self.scalarTypeName());
         }
 
@@ -2069,7 +2104,7 @@ pub fn Parser(comptime config: types.Config) type {
                     break;
                 }
             } else {
-                if (self.mode == .standard and !typeWord(self.current) and
+                if (self.mode == .standard and !typeWord(self.current) and !self.internalCharName() and !(try self.internalCharQualifier()) and
                     (self.current.kind == .quoted_word or (self.current.kind == .word and !lexer.reserved(self.current.keyword)))) {
                     return error.UnsupportedStatement;
                 }
@@ -3884,7 +3919,7 @@ pub fn Parser(comptime config: types.Config) type {
         }
 
         fn castTarget(self: *Self, inner: u16) Error!u16 {
-            if (typeWord(self.current)) {
+            if (typeWord(self.current) or self.internalCharName()) {
                 const next = try self.peek();
                 if (next.kind != .symbol or next.symbol != .dot) {
                     const target = try self.typeName();
@@ -4574,6 +4609,13 @@ pub fn Parser(comptime config: types.Config) type {
                 },
                 .end => return error.Syntax,
                 .word, .quoted_word => {},
+            }
+            if (try self.internalCharLiteral()) {
+                _ = try self.typeName();
+                const literal = self.current;
+                try self.advance();
+                const inner = try self.pool.add(.{ .kind = .text_literal, .text = literal.quoted() });
+                return self.pool.add(.{ .kind = .cast, .cast_type = .pg_internal_char, .a = inner, .typmod = -1 });
             }
             if (token.kind == .word) {
                 if (try self.takeWord("NULL")) return self.pool.add(.{ .kind = .null_literal });

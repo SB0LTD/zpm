@@ -99,6 +99,7 @@ pub const Subscripts = struct {
 
 fn Unsigned(comptime T: type) type {
     return switch (@sizeOf(T)) {
+        1 => u8,
         2 => u16,
         4 => u32,
         8 => u64,
@@ -262,6 +263,7 @@ pub fn Arrays(comptime V: type) type {
                 },
                 .macaddr => |*value| try put(out, value),
                 .regtype => |value| try putInt(out, u32, value),
+                .pg_internal_char => |value| try putInt(out, u8, value),
                 .point => |value| {
                     try putInt(out, u64, @bitCast(value.x));
                     try putInt(out, u64, @bitCast(value.y));
@@ -299,6 +301,7 @@ pub fn Arrays(comptime V: type) type {
                 .range => .{ .range = takeText(bytes, at) },
                 .xml => .{ .xml = takeText(bytes, at) },
                 .regtype => .{ .regtype = getInt(u32, bytes, at) },
+                .pg_internal_char => .{ .pg_internal_char = getInt(u8, bytes, at) },
                 .tsvector => .{ .tsvector = takeText(bytes, at) },
                 .tsquery => .{ .tsquery = takeText(bytes, at) },
                 .float4 => .{ .float4 = @bitCast(getInt(u32, bytes, at)) },
