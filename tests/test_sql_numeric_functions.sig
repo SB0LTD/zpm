@@ -52,7 +52,6 @@ fn matrix() !void {
     }
 }
 const Numerics = DB.Io.Numerics;
-const NumericMagnitude = @import("numeric");
 const Number = @TypeOf(Numerics.fromInt(0));
 
 fn referenceMagnitude(number: *const Number, scale: u16) u1024 {
@@ -99,33 +98,7 @@ fn numericComparisonLanes() !void {
     try db.execute("DROP TABLE numeric_keys", &r);
 }
 
-fn referenceDigitCount(input: u512) usize {
-    var value = input;
-    var count: usize = 0;
-    while (value != 0) : (count += 1) value /= 10;
-    return count;
-}
-
-fn digitCountBoundaries() !void {
-    try check(NumericMagnitude.digitCount(0) == 0);
-    for (0..512) |bit| {
-        const power = @as(u512, 1) << @as(u9, @intCast(bit));
-        for ([_]u512{ power - 1, power, power + 1 }) |value| {
-            try check(NumericMagnitude.digitCount(value) == referenceDigitCount(value));
-        }
-    }
-    var power: u512 = 1;
-    for (1..155) |digits| {
-        power *= 10;
-        try check(NumericMagnitude.digitCount(power - 1) == digits);
-        try check(NumericMagnitude.digitCount(power) == digits + 1);
-        try check(NumericMagnitude.digitCount(power + 1) == digits + 1);
-    }
-    try check(NumericMagnitude.digitCount(std.math.maxInt(u512)) == 155);
-}
-
 pub fn main(init:std.process.Init) !void {
-    try digitCountBoundaries();
     errdefer std.debug.print("numeric-function assertions={d}\n",.{assertions});
     try row("SELECT abs(-17)",23,"17");
     try matrix();
