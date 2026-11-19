@@ -13,6 +13,7 @@ GCN 4 uses GCN 3's encodings, so the instruction set is AMD's public "AMD GCN3 I
 | `dispatch.sig` | What a dispatch consumes: the 64-byte AMDHSA kernel descriptor, `COMPUTE_PGM_RSRC1`/`RSRC2`, the user and system SGPR layout, the `COMPUTE_*` registers a PM4 `SET_SH_REG` writes, and buffer resources (V#). |
 | `gcn3_emu.sig` | An emulator of wave64 waves, used to test kernels on the host. |
 | `gcn3_vectors.txt`, `testdata/` | LLVM's encodings and kernels, used as test data. |
+| `gfx10.sig`, `gfx10_rows.sig`, `gfx10_vectors.txt` | The gfx10 dialect (the PS5's shaders), decoded into the same kind of instruction structure; see below. |
 
 ## The instruction set
 
@@ -148,6 +149,51 @@ The LFM3 matrix kernels are built per GPU (the Adreno's has eight threads a row,
 - **No dot instruction.** sm_120 has `IDP4A`; gcn4 needs seven instructions per dot of four bytes.
 - **Explicit waits.** sm_120 and ir3 encode theirs in instruction bits; the tile kernel has 227 `s_waitcnt`.
 - **EXEC-mask flow.** The tile kernel's `if`s and `cont`s are about 500 scalar instructions.
+
+## The gfx10 dialect (the PS5's shaders)
+
+A PS5 shader is AMD machine code in the gfx10 family's encodings; LLVM calls the PS5's GPU `gfx1013` (gfx10.1 with ray tracing). `gfx10.sig` decodes it into the same kind of instruction structure, and prints (LLVM's text) and encodes it back. `gfx10.parse` does not exist yet: tests write gfx10 code as words.
+
+| File | What it is |
+|---|---|
+| `gfx10.sig` | The machinery: `decode`, `format`/`formatWave`, `encode`, `imageAddrs`, `imageData`. |
+| `gfx10_rows.sig` | The rows (name, encoding, opcode, VOP3 opcode, shape, types, flags), and the names LLVM gives hwreg ids and MTBUF formats. Made by the generator, not by hand. |
+| `gfx10_vectors.txt` | LLVM's text and words, the test data. |
+
+- **A second file, not a dialect parameter.** gfx10 renumbers nearly every opcode, moves fields (SMEM, MUBUF's slc, MIMG), adds formats and changes the register names (null, ttmp at 108, no flat_scratch). The gfx8 machinery would need a branch in every function. `gfx10.sig` reuses gcn3's `Ty`, `Text`, `Error`, the operand numbering (9-bit codes, VGPR n = 256 + n) and the inline constants. Its `Instr` keeps gcn3's field names where they mean the same, and adds the fields of the new formats.
+- **One op per operation.** A VOP1, VOP2 or VOPC op in the VOP3 encoding is the same op with `e64` set.
+- **The formats:**
+  - SOP1, SOP2, SOPC, SOPK, SOPP (with `sendmsg(...)`, `s_waitcnt`'s 6-bit counters and `depctr_*`);
+  - SMEM (21-bit signed offset and soffset together);
+  - VOP1, VOP2, VOPC (`v_cmpx` writes only EXEC), and VOP3a/b with a literal, abs, neg, clamp, omod and op_sel;
+  - VINTRP (attr, channel);
+  - EXP (mrt0-7, mrtz, null, pos0-4, prim, param0-31, enable mask, done, vm, compr);
+  - MUBUF and MTBUF (dlc, gfx10's unified formats);
+  - MIMG: loads, stores, atomics, `get_resinfo`, `get_lod`, every `image_sample`/`image_gather4` suffix, the BVH ray queries; dmask, dim, unorm, glc, slc, dlc, r128, a16, d16, tfe, lwe; the NSA form. The address count comes from the op, the dim and a16, as LLVM counts it.
+- **Wave size.** The words are the same in wave32 and wave64. `format` prints wave32 (LLVM's default); `formatWave(.wave64)` prints the lane masks as SGPR pairs.
+- **Strict decoding**, as for gfx8. A decoded instruction must encode back to the same words, its operands must be ones LLVM can name (aligned SGPR pairs and quads), and its modifiers must be ones the row takes. Not modelled (NoMatch):
+  - SDWA and DPP (LLVM does take SDWA on gfx1013);
+  - VOP3P (`v_pk_*`, `v_fma_mix*`) and the VOP3 interpolation forms (`v_interp_*_e64`, `v_interp_p1ll_f16`...);
+  - DS and FLAT/GLOBAL/SCRATCH;
+  - the scalar atomics and `s_atc_probe`.
+
+**The generator** (`tools/gen_gfx10_vectors.py`) holds a list of candidates: every gfx8 row of `gcn3.sig` (renamed where gfx10 renamed it), the instructions new in gfx10, and the MIMG families. For each candidate it writes lines (registers, constants, literals, special registers, each modifier), and LLVM assembles them for gfx1013. What LLVM accepts becomes:
+- the rows: every opcode is read from LLVM's bytes, and the modifier flags from the modifier lines LLVM took;
+- the vectors: LLVM's text, with runs of spaces made one.
+
+It also tries the candidates on gfx1030 and prints the differences:
+- only in gfx1013: `v_mac_f32`, `v_mad_f32`, `v_madmk_f32`, `v_madak_f32`, the legacy mac/mad forms, the scalar stores, `s_dcache_wb`, `s_get_waveid_in_workgroup`;
+- only in gfx1030: `v_dot2c_f32_f16`, `v_dot4c_i32_i8`, `v_fma_legacy_f32`, `buffer_atomic_csub`.
+
+LLVM quirks the generator avoids:
+- it takes `dlc` on a buffer atomic without encoding it;
+- it encodes some `clamp` lines as SDWA (dropped);
+- it prints a valid message's name for `s_sendmsg` even with bits outside its fields set; the printer does the same.
+
+**The tests** (in `gfx10.sig`):
+- Every vector decodes, prints as LLVM printed it (the wave64 section with wave64 masks), and encodes back to its words.
+- 300,000 random words in every format, and LLVM's vectors with one to three bits flipped: whatever decodes prints and encodes back to itself. The flipped vectors include every format.
+- Hand-checked decodes of an `exp`, a `v_interp_p2_f32`, an NSA `image_sample`, an `s_load_dwordx4` and a `buffer_load_format_xyzw`.
 
 ## Next (the backend)
 
