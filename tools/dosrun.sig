@@ -235,6 +235,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         const r = &machine.cpu.regs;
         var code: [16]u8 = undefined;
         for (&code, 0..) |*c, i| c.* = machine.rd8(r.base[dos.regs.CS] +% r.eip +% @as(u32, @intCast(i)));
+        // (with paging on, CS:EIP is a linear address the bytes are not at)
+        if (machine.cpu.cr0 & 0x8000_0000 != 0) @memset(&code, 0);
         out("dosrun: ends at {x:0>4}:{x:0>8} (CR0 {x}), eax {x} ecx {x} edx {x} ebx {x} esp {x}, bytes {x}", .{ r.seg[dos.regs.CS], r.eip, machine.cpu.cr0, r.r[0], r.r[1], r.r[2], r.r[3], r.r[4], code });
     }
     if (shot_path) |sp| shot(sp);
