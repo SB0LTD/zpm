@@ -54,6 +54,9 @@ pub const texfmt = @import("texfmt.sig");
 pub const glsl = @import("glsl/glsl.sig");
 pub const dxbc = @import("dxbc/dxbc.sig");
 pub const dxbc_gen = @import("dxbc/gen.sig");
+/// Shaders Microsoft's compiler made (dxbc/fixtures.hlsl): the tests', and
+/// tools/drawbench's pipeline.
+pub const dxbc_fixtures = @import("dxbc/fixtures.sig");
 pub const report = @import("report.sig");
 
 test {

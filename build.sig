@@ -1640,6 +1640,22 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
             importEntry("lfm3_any", "src/core/lfm3_any.sig"),
         },
     });
+    // drawbench: a Direct3D 6 game's frame through gfxapi's engine on the
+    // real GPU behind /dev/dxg (WSL), the 3D engine on: each draw's cost on
+    // the CPU and the GPU, and the frame's readback.
+    _ = try ctx.addCompileStep(.{
+        .source_path = "tools/drawbench.sig",
+        .output_name = "drawbench",
+        .cache_dir = ctx.cache_dir[0..ctx.cache_dir_len],
+        .optimize = ctx.optimize,
+        .target = null,
+        .compiler_path = "",
+        .imports = &.{
+            importEntry("gpu", "src/gpu/gpu.sig"),
+            importEntry("dxg", "src/dxg/dxg.sig"),
+            importEntry("gfxapi", "src/gfxapi/gfxapi.sig"),
+        },
+    });
     // voicebench: LFM3-Audio's depthformer on the real GPU behind /dev/dxg
     // (WSL), its weights in VRAM without a CPU view, timed and profiled.
     _ = try ctx.addCompileStep(.{

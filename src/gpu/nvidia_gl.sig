@@ -73,6 +73,10 @@ pub fn compileStage(k: *const kir.Kernel, caps: device.Caps, st: *kir_sm120.Stat
     bin.code = out[0 .. sph.BYTES + bin.code.len];
     bin.extra[EXTRA_STAGE] = @intFromEnum(stage);
     bin.extra[EXTRA_OUTPUTS] = st.io.outputs;
+    // (the memory it stores to: its stores through `io` are the stage's
+    // outputs, not memory; nvidia_device lets draws that store nowhere
+    // overlap)
+    bin.writes = kir.writtenBindings(k) & ~(if (io < 32) @as(u32, 1) << @intCast(io) else 0);
     return bin;
 }
 

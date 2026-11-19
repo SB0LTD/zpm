@@ -945,6 +945,16 @@ fn floatTo24(bits: u32) u32 {
 
 pub const MAX_OPS = 256;
 pub const MAX_DOOMED = 128;
+/// Draws' uniforms (Draw.uniforms) go one after another into a host
+/// buffer of UNI_RING_BYTES (Engine.uniformsFor), in UNI_CHUNK pieces,
+/// each written again once the batches that read it are done.
+pub const UNI_RING_BYTES = 4 << 20;
+const UNI_CHUNK = 64 << 10;
+const UNI_CHUNKS = UNI_RING_BYTES / UNI_CHUNK;
+/// A draw's uniforms start on this many bytes.
+const UNI_ALIGN = 256;
+/// Reads begun at once (Engine.readStart) at most.
+pub const READ_SLOTS = 4;
 const RING = 64;
 
 /// A batch's programs as said when the GPU is lost: each one's dispatches
@@ -1268,6 +1278,16 @@ pub const Engine = struct {
     sums: [RING]BatchSum = undefined,
     doomed: [MAX_DOOMED]Doomed = undefined,
     n_doomed: usize = 0,
+    /// The draws' uniforms (uniformsFor): the ring, where the next goes,
+    /// and the last batch that read each piece of it. A draw's uniforms
+    /// were a buffer made and freed each draw: the GPU was asked whether
+    /// batches were done before every one, and once MAX_DOOMED frees were
+    /// pending (every 128 draws) the CPU waited for the GPU.
+    uni_ring: gpu.Buffer = .{},
+    uni_at: usize = 0,
+    uni_chunk: [UNI_CHUNKS]u64 = @splat(0),
+    /// Reads' rows (readStart), kept between reads.
+    read_slots: [READ_SLOTS]ReadSlot = @splat(.{}),
     stats: Stats = .{},
     /// Triangles a bin's list holds at most (raster.BIN_CAP; tests lower
     /// it to make lists run over).
@@ -1337,6 +1357,12 @@ pub const Engine = struct {
         e.freeImage(&e.zero);
         e.reap(true);
         if (e.dev) |d| {
+            if (e.uni_ring.cpu.len != 0) d.free(e.uni_ring);
+            e.uni_ring = .{};
+            for (&e.read_slots) |*sl| {
+                if (sl.buf.cpu.len != 0) d.free(sl.buf);
+                sl.* = .{};
+            }
             if (!e.lost) for (&e.progs) |*p| d.unload(p);
             for (e.slabs) |*slab| {
                 if (slab.buf.cpu.len != 0) d.free(slab.buf);
@@ -1741,6 +1767,60 @@ pub const Engine = struct {
     pub fn newBuffer(e: *Engine, bytes: usize) ?Image {
         const m = e.allocBytes(bytes, true) orelse return null;
         return .{ .buf = m.buf, .width = 0, .height = 0, .own = true, .pooled = m.pooled };
+    }
+
+    /// A draw's uniforms as a buffer the GPU reads in the open batch: the
+    /// words copied to the uniform ring's next place (not the engine's to
+    /// free: freeImage only forgets it), or a buffer of its own where
+    /// there is no ring (no GPU, no memory for it, words past a piece).
+    fn uniformsFor(e: *Engine, words: []const u32) ?Image {
+        const bytes = @max(words.len * 4, 16);
+        if (e.onGpu() and bytes <= UNI_CHUNK) if (e.uniRing(bytes)) |at| {
+            const ring = e.uni_ring;
+            @memcpy(ring.cpu[at..][0 .. words.len * 4], std.mem.sliceAsBytes(words));
+            e.dev.?.toDevice(ring, at, bytes);
+            return .{ .buf = .{ .gpu = ring.gpu + at, .cpu = ring.cpu[at..][0..bytes], .bytes = bytes, .handle = ring.handle, .kind = ring.kind } };
+        };
+        var uni = e.newBuffer(bytes) orelse return null;
+        e.writeBytes(&uni, 0, std.mem.sliceAsBytes(words));
+        return uni;
+    }
+
+    /// Room for `bytes` in the uniform ring (made at its first use): their
+    /// offset, the pieces they are in free of batches in flight (waited
+    /// for: a lap of the ring is thousands of draws) and now the open
+    /// batch's. Null: no ring.
+    fn uniRing(e: *Engine, bytes: usize) ?usize {
+        if (e.uni_ring.cpu.len == 0) {
+            const b = e.dev.?.alloc(UNI_RING_BYTES, .host) catch return null;
+            if (b.cpu.len < UNI_RING_BYTES or b.gpu == 0) {
+                e.dev.?.free(b);
+                return null;
+            }
+            e.uni_ring = b;
+            e.uni_at = 0;
+            e.uni_chunk = @splat(0);
+        }
+        var at = std.mem.alignForward(usize, e.uni_at, UNI_ALIGN);
+        if (at + bytes > UNI_RING_BYTES) at = 0;
+        const first = at / UNI_CHUNK;
+        const last = (at + bytes - 1) / UNI_CHUNK;
+        // (the piece the last uniforms went into: waited for when the ring
+        // came into it, its bytes past them a lap old)
+        const now = if (e.uni_at == 0 or at == 0) UNI_CHUNKS else (e.uni_at - 1) / UNI_CHUNK;
+        for (first..last + 1) |c| {
+            if (c != now) {
+                const b = e.uni_chunk[c];
+                // (the open batch itself a lap ago: one batch went round
+                // the whole ring)
+                if (b == e.batch) e.flush();
+                if (b != 0 and b > e.done_upto) e.waitBatch(b);
+                if (!e.onGpu()) return null;
+            }
+            e.uni_chunk[c] = e.batch;
+        }
+        e.uni_at = at + bytes;
+        return at;
     }
 
     // ── Batches ────────────────────────────────────────────────────────────
@@ -2411,9 +2491,8 @@ pub const Engine = struct {
         // the bindings: the vertex kernel's, its first the stage's words
         var bs: [MAX_BIND]*Image = undefined;
         bs[0] = &e.zero;
-        var uni = e.newBuffer(@max(d.uniforms.len * 4, 16)) orelse return false;
+        var uni = e.uniformsFor(d.uniforms) orelse return false;
         defer e.freeImage(&uni);
-        e.writeBytes(&uni, 0, std.mem.sliceAsBytes(d.uniforms));
         bs[1] = &uni;
         bs[2] = d.index orelse &e.zero;
         for (d.attrs, 0..) |a, j| bs[3 + j] = if (a.buf != null and a.comps != 0) a.buf.? else &e.zero;
@@ -2612,9 +2691,8 @@ pub const Engine = struct {
         const bins: raster.Bins = if (e.binning) raster.binsOf(d, e.bin_cap) else .{};
         var tris = e.newBuffer((@as(usize, d.instances) * nrec * p.sstride + bins.words()) * 4) orelse return false;
         defer e.freeImage(&tris);
-        var uni = e.newBuffer(@max(d.uniforms.len * 4, 16)) orelse return false;
+        var uni = e.uniformsFor(d.uniforms) orelse return false;
         defer e.freeImage(&uni);
-        e.writeBytes(&uni, 0, std.mem.sliceAsBytes(d.uniforms));
         var vp: [MAX_PARAMS]u32 = undefined;
         var sp: [MAX_PARAMS]u32 = undefined;
         var rp: [MAX_PARAMS]u32 = undefined;
@@ -3134,6 +3212,16 @@ pub const Engine = struct {
     /// img's own format.
     pub fn read(e: *Engine, img: *Image, x: u32, y: u32, w: u32, h: u32, dst: []u8, dst_stride: usize, want: Format) void {
         if (w == 0 or h == 0) return;
+        // (what the GPU drew into an image in VRAM or block linear: its
+        // rectangle copied to rows by the GPU, one wait; else the image
+        // copied down whole after its draws, a second wait, and each pixel
+        // found in its GOB by the CPU)
+        if (img.gpuWrote() and (img.vram != null or img.layout.block)) {
+            var rb: Readback = .{};
+            if (e.readStart(img, x, y, w, h, want, &rb)) {
+                if (e.readFinish(&rb, dst, dst_stride)) return;
+            }
+        }
         e.settle(img);
         const swap = keepOf(img.format, want) != 0xffff_ffff;
         const sb = img.format.bytes();
@@ -3192,6 +3280,108 @@ pub const Engine = struct {
             }
         }
         e.stats.cpu_ops += 1;
+    }
+
+    /// A read begun (readStart): the GPU copies the rectangle into rows of
+    /// host memory in a batch now running; readFinish waits for it (or
+    /// finds it done) and hands the rows over.
+    pub const Readback = struct {
+        rows: Image = .{},
+        mark: u64 = 0,
+        slot: u8 = 0,
+        pub fn pending(rb: *const Readback) bool {
+            return rb.rows.live();
+        }
+    };
+
+    /// Host memory for reads' rows, kept (a frame's target read each
+    /// frame: no buffer made and freed each time), READ_SLOTS reads begun
+    /// at once at most.
+    const ReadSlot = struct { buf: gpu.Buffer = .{}, used: bool = false, last: u64 = 0 };
+
+    fn readSlot(e: *Engine, bytes: usize) ?u8 {
+        var pick: ?usize = null;
+        for (&e.read_slots, 0..) |*sl, i| {
+            if (sl.used) continue;
+            if (sl.buf.cpu.len >= bytes) {
+                pick = i;
+                break;
+            }
+            if (pick == null) pick = i;
+        }
+        const i = pick orelse return null;
+        const sl = &e.read_slots[i];
+        if (sl.buf.cpu.len < bytes) {
+            if (sl.buf.cpu.len != 0) e.freeBytes(sl.buf, false, sl.last);
+            sl.* = .{};
+            const b = e.dev.?.alloc(std.mem.alignForward(usize, bytes, 1 << 20), .host) catch return null;
+            if (b.cpu.len < bytes or b.gpu == 0) {
+                e.dev.?.free(b);
+                return null;
+            }
+            sl.buf = b;
+        }
+        sl.used = true;
+        return @intCast(i);
+    }
+
+    /// Begins reading img's rectangle (GL's coordinates, inside it) in
+    /// `want` (RGBA8 or BGRA8): the GPU's copy recorded after everything
+    /// recorded before, and run now; the CPU goes on. A caller that reads
+    /// a frame's target each frame (a game drawing on the CPU over it, a
+    /// window shown) begins frame N's read after its draws and finishes it
+    /// while or after frame N+1 is drawn: the GPU's time for frame N is
+    /// not waited for. False (nothing begun): no GPU, or an image or
+    /// format the GPU's copy does not take: read it with `read`.
+    pub fn readStart(e: *Engine, img: *Image, x: u32, y: u32, w: u32, h: u32, want: Format, rb: *Readback) bool {
+        rb.* = .{};
+        if (w == 0 or h == 0 or !e.onGpu() or !e.gpuUsable(img) or !kernelLayout(img)) return false;
+        if (!img.format.isColor() or !want.isColor() or img.depth_float or img.samples != 1) return false;
+        if (x + w > img.width or y + h > img.height) return false;
+        // (rows of host memory the engine keeps: never VRAM)
+        const stride = w * want.bytes();
+        const slot = e.readSlot(@as(usize, stride) * h) orelse return false;
+        const sl = &e.read_slots[slot];
+        var b = sl.buf;
+        b.cpu = b.cpu[0 .. @as(usize, stride) * h];
+        b.bytes = b.cpu.len;
+        rb.rows = wrap(b, w, h, stride, want, false);
+        rb.slot = slot;
+        e.copy(img, x, y, &rb.rows, 0, 0, w, h);
+        sl.last = e.batch;
+        rb.mark = e.mark();
+        return true;
+    }
+
+    /// Whether readStart's copy is done (readFinish then does not wait).
+    pub fn readDone(e: *Engine, rb: *const Readback) bool {
+        return !rb.pending() or e.markDone(rb.mark);
+    }
+
+    /// The rows readStart began into `dst` (row j at dst[j * dst_stride
+    /// ..], the rectangle's GL row y + j, as `read` puts them), once the
+    /// GPU's copy is done (waited for); its memory given back. False: the
+    /// GPU was lost first (nothing read: read again with `read`).
+    pub fn readFinish(e: *Engine, rb: *Readback, dst: []u8, dst_stride: usize) bool {
+        if (!rb.pending()) return false;
+        defer e.readCancel(rb);
+        e.waitBatch(rb.mark);
+        if (e.lost) return false;
+        const rows = &rb.rows;
+        const n = @as(usize, rows.width) * rows.format.bytes();
+        e.fromDevice(rows, 0, rows.buf.cpu.len);
+        for (0..rows.height) |j| {
+            @memcpy(dst[j * dst_stride ..][0..n], rows.buf.cpu[@as(usize, rows.rowOf(@intCast(j))) * rows.stride ..][0..n]);
+        }
+        e.stats.cpu_ops += 1;
+        return true;
+    }
+
+    /// Lets a begun read go (its rows never read; its memory the next
+    /// read's, after the GPU's copy into it).
+    pub fn readCancel(e: *Engine, rb: *Readback) void {
+        if (rb.pending()) e.read_slots[rb.slot].used = false;
+        rb.* = .{};
     }
 
     /// A depth-stencil image's depth words of a rectangle (GL's
