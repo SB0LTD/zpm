@@ -88,10 +88,16 @@ fn clipped(bytes: []const u8, length: usize, mode: Mode) Error!usize {
     return keep;
 }
 
-/// PostgreSQL character values use UTF-8 and reject embedded NUL.
+/// PostgreSQL character input uses UTF-8 and rejects embedded NUL.
 pub fn validateText(bytes: []const u8) Error!void {
     if (std.mem.indexOfScalar(u8, bytes, 0) != null or !std.unicode.utf8ValidateSlice(bytes))
         return error.CharacterNotInRepertoire;
+}
+
+/// An internal-char cast can form one raw byte followed by bpchar padding.
+/// Its stored representation is valid even if the byte is NUL or non-UTF-8.
+pub fn validateBpchar(bytes: []const u8) Error!void {
+    if (!rawInternalChar(bytes)) try validateText(bytes);
 }
 
 /// varchar(): the bytes a VARCHAR(n) value keeps.
@@ -104,11 +110,31 @@ pub fn varchar(bytes: []const u8, typmod: i32, mode: Mode) Error!Shape {
 
 /// bpchar(): the bytes a CHAR(n) value keeps and the spaces it gains.
 pub fn bpchar(bytes: []const u8, typmod: i32, mode: Mode) Error!Shape {
-    try validateText(bytes);
+    try validateBpchar(bytes);
     const length = declared(typmod) orelse return .{ .keep = bytes.len };
+    // bpchar(internal char) carries one raw byte, even when it is not a
+    // complete UTF-8 sequence. A zero ends its character count but remains
+    // in the binary value before its padding.
+    if (rawInternalChar(bytes)) {
+        const prefix: usize = if (bytes[0] == 0) 1 else 0;
+        const count = bytes.len - prefix;
+        return if (count > length) .{ .keep = length + prefix } else .{ .keep = bytes.len, .pad = length - count };
+    }
     const count = characters(bytes);
     if (count > length) return .{ .keep = try clipped(bytes, length, mode) };
     return .{ .keep = bytes.len, .pad = length - count };
+}
+
+fn rawInternalChar(bytes: []const u8) bool {
+    if (bytes.len == 0 or (bytes[0] != 0 and bytes[0] < 128)) return false;
+    for (bytes[1..]) |byte| if (byte != ' ') return false;
+    return true;
+}
+
+pub fn fitsBpchar(bytes: []const u8, typmod: i32) bool {
+    const length = declared(typmod) orelse return true;
+    if (rawInternalChar(bytes)) return bytes.len - @as(usize, @intFromBool(bytes[0] == 0)) <= length;
+    return fits(bytes, typmod);
 }
 
 /// Stored-value check: a value never exceeds its declared length.

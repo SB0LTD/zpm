@@ -985,6 +985,21 @@ pub fn Database(comptime config: Config) type {
             }
         }
 
+        fn bindNamespaceCreate(pointer: *const anyopaque, role: u32, namespace: u32, snap: Snapshot, plain: bool) Error!void {
+            const self: *const Self = @ptrCast(@alignCast(pointer));
+            var authority = snap;
+            authority.csn = self.csn;
+            if (self.catalog_objects.superuser(role, authority)) return;
+            if (!plain or namespace < change_log.first_oid) return error.InsufficientPrivilege;
+            for (&self.schemas) |*schema| {
+                if (!schema.live or schema.oid != namespace) continue;
+                if (schema.dead_csn != 0) return error.UndefinedSchema;
+                if (schema.private_usage and self.catalog_objects.memberOf(role, schema.owner, true, authority)) return;
+                break;
+            }
+            return error.InsufficientPrivilege;
+        }
+
         fn bindNamespaceUsage(pointer: *const anyopaque, role: u32, namespace: u32, snap: Snapshot) Error!void {
             const self: *const Self = @ptrCast(@alignCast(pointer));
             return self.checkNamespaceUsage(role, namespace, snap);
@@ -2894,7 +2909,8 @@ pub fn Database(comptime config: Config) type {
         fn bindContext(self: *Self, source: []const u8, mode: ParseMode, snap: Snapshot) B.Context {
             return .{ .source = source, .tables = &self.tables, .catalog = &self.catalog, .snapshot = snap, .pool = &self.workspace.nodes, .legacy = mode == .legacy_alpha, .dialect = self.dialect, .session = &self.session, .plans = &self.workspace.plans, .params = self.active_params,
                 .routines = &self.objects, .variables = if (self.routine_frame) |frame| &frame.variables else null,
-                .namespace_usage = .{ .ptr = self, .check = &bindNamespaceUsage } };
+                .namespace_usage = .{ .ptr = self, .check = &bindNamespaceUsage },
+                .namespace_create = .{ .ptr = self, .check = &bindNamespaceCreate } };
         }
 
         fn evalContext(self: *const Self, source: []const u8) E.Context {
@@ -4094,7 +4110,7 @@ pub fn Database(comptime config: Config) type {
                     if (owned_before) return error.DependentObjects;
                 }
                 for (&self.catalog_objects.items) |*o| {
-                    const affected = (CO.userType(o.kind) or o.kind == .statistics) and o.owner == oid or
+                    const affected = (CO.userType(o.kind) or o.kind == .statistics or o.kind == .relation) and o.owner == oid or
                         o.kind == .schema_acl and (o.owner == oid or o.grantee == oid);
                     if (affected and O.visible(o, latest) != O.visible(o, snap)) return error.SerializationFailure;
                     if (!O.visible(o, snap)) continue;
@@ -4823,9 +4839,9 @@ pub fn Database(comptime config: Config) type {
 
         /// Table privileges of a bound statement for a role that is not a
         /// superuser (FROM items were checked while expanding relations).
-        /// Creating objects needs CREATE on a schema, which only superusers
-        /// hold here (PostgreSQL 15+ public schema); altering or dropping a
-        /// relation needs its ownership.
+        /// Creation of a plain table was authorized against its destination
+        /// namespace at bind time. Other creation paths still require a
+        /// superuser. Altering or dropping a relation needs its ownership.
         fn checkPrivileges(self: *const Self, bound: *const B.Bound, snap: Snapshot) Error!void {
             if (self.privilegedRole(snap)) return;
             switch (bound.*) {
@@ -4857,7 +4873,8 @@ pub fn Database(comptime config: Config) type {
                 .drop_relation => |*drop| try self.needOwner(drop.slot, snap),
                 .alter_table => |*alter| try self.needOwner(alter.table, snap),
                 .refresh_view => |*refresh| try self.needOwner(refresh.slot, snap),
-                .create_table, .create_sequence, .drop_sequence, .alter_sequence, .create_schema => return error.InsufficientPrivilege,
+                .create_table => |*create| if (self.dialect != .postgres or !create.plain_definition) return error.InsufficientPrivilege,
+                .create_sequence, .drop_sequence, .alter_sequence, .create_schema => return error.InsufficientPrivilege,
                 else => {},
             }
         }
@@ -5819,8 +5836,64 @@ pub fn Database(comptime config: Config) type {
                 var fields = object.compositeFields();
                 var ordinal: i64 = 1;
                 while (fields.next()) |field| : (ordinal += 1) {
-                    const collation_oid = if (types.typeFromOid(field.oid)) |ty| collation.typeCollation(types.typeOfData(ty)) else 0;
-                    try sink.add(&.{ intCell(relation), nameCell(field.name), intCell(field.oid), intCell(field.typmod), intCell(ordinal), boolCell(false), boolCell(false), nameCell(""), nameCell(""), boolCell(false), intCell(collation_oid) });
+                    const data_type = types.typeFromOid(field.oid) orelse return error.UndefinedObject;
+                    const info = types.typeInfo(data_type);
+                    const collation_oid = collation.typeCollation(types.typeOfData(data_type));
+                    try sink.add(&.{ intCell(relation), nameCell(field.name), intCell(field.oid), intCell(field.typmod), intCell(ordinal), boolCell(false), boolCell(false), .{ .pg_internal_char = 0 }, .{ .pg_internal_char = 0 }, boolCell(false), intCell(collation_oid), intCell(info.len), .{ .pg_internal_char = info.alignment } });
+                }
+            }
+        }
+
+        fn dependencyRow(sink: *X.RowSink, class: u32, object: u32, referenced_class: u32, referenced_object: u32, referenced_subobject: i64, kind: u8) Error!void {
+            try sink.add(&.{
+                intCell(class), intCell(object), intCell(0), intCell(referenced_class),
+                intCell(referenced_object), intCell(referenced_subobject), .{ .pg_internal_char = kind },
+            });
+        }
+
+        /// Derive only dependencies represented by visible stored definitions.
+        /// No additional catalog identities or independently versioned rows are needed.
+        fn dependencyRows(self: *const Self, snapshot: Snapshot, relations: []const K.Found, sink: *X.RowSink) Error!void {
+            const relation = CO.class_relation;
+            const namespace = CO.class_namespace;
+            const constraint_class = catalog_module.constraint_catalog;
+            for (relations) |found| {
+                if (found.kind == 'S') {
+                    const seq = &self.seqs[found.slot];
+                    try dependencyRow(sink, relation, seq.oid, namespace, catalog_module.public_namespace, 0, 'n');
+                    if (seq.owner == 0) continue;
+                    const slot = self.visibleTableSlot(seq.owner, snapshot) orelse continue;
+                    const owner = &self.tables[slot];
+                    if (seq.owner_column >= owner.column_count) continue;
+                    const kind: u8 = switch (owner.columns[seq.owner_column].default_kind) {
+                        .identity_always, .identity_by_default => 'i',
+                        .default => 'a',
+                        else => continue,
+                    };
+                    try dependencyRow(sink, relation, seq.oid, relation, owner.oid, @as(i64, seq.owner_column) + 1, kind);
+                    continue;
+                }
+                const table = &self.tables[found.slot];
+                try dependencyRow(sink, relation, table.oid, namespace, table.namespace, 0, 'n');
+                if (S.keyed(table) and table.primary_constraint_oid != 0) {
+                    const primary_index = S.primaryIndexOid(table);
+                    try dependencyRow(sink, relation, primary_index, constraint_class, table.primary_constraint_oid, 0, 'i');
+                    var keys: [config.columns]u8 = undefined;
+                    for (primaryColumns(table, &keys)) |column| {
+                        try dependencyRow(sink, constraint_class, table.primary_constraint_oid, relation, table.oid, @as(i64, column) + 1, 'a');
+                    }
+                }
+                for (table.constraints[0..table.constraint_count]) |*item| {
+                    if (item.kind != .foreign or item.oid == 0) continue;
+                    if (self.visibleTableSlot(item.ref_oid, snapshot) == null) continue;
+                    for (item.keyColumns()) |column| {
+                        try dependencyRow(sink, constraint_class, item.oid, relation, table.oid, @as(i64, column) + 1, 'a');
+                    }
+                    for (item.refColumns()) |column| {
+                        try dependencyRow(sink, constraint_class, item.oid, relation, item.ref_oid, @as(i64, column) + 1, 'n');
+                    }
+                    const index = self.referencedConstraintIndex(item, snapshot);
+                    if (index != 0) try dependencyRow(sink, constraint_class, item.oid, relation, index, 0, 'n');
                 }
             }
         }
@@ -5854,6 +5927,7 @@ pub fn Database(comptime config: Config) type {
             if (view == .pg_class or view == .pg_attribute) try self.compositeCatalogRows(view, snapshot, sink);
             switch (view) {
                 .pg_proc, .pg_trigger, .pg_rewrite, .pg_rules => return self.objectViewRows(snapshot, view, sink),
+                .pg_depend => return self.dependencyRows(snapshot, relations[0..count], sink),
                 .pg_type => {
                     inline for (@typeInfo(DataType).@"enum".field_names) |field| {
                         const data_type = @field(DataType, field);
@@ -6036,14 +6110,17 @@ pub fn Database(comptime config: Config) type {
                         .pg_attribute, .pg_attrdef, .columns => for (table.columns[0..table.column_count], 0..) |*column, index| {
                             const attnum: i64 = @intCast(index + 1);
                             const kind = column.default_kind;
-                            const identity: []const u8 = switch (kind) {
-                                .identity_always => "a",
-                                .identity_by_default => "d",
-                                else => "",
+                            const identity: u8 = switch (kind) {
+                                .identity_always => 'a',
+                                .identity_by_default => 'd',
+                                else => 0,
                             };
                             const has_expression = kind == .default or kind == .generated;
                             switch (view) {
-                                .pg_attribute => try sink.add(&.{ intCell(oid), nameCell(column.name.slice()), intCell(types.typeOid(column.data_type)), intCell(column.typmod), intCell(attnum), boolCell(column.not_null), boolCell(false), nameCell(identity), nameCell(if (kind != .generated) "" else if (column.virtual) "v" else "s"), boolCell(has_expression), intCell(collation.typeCollation(types.typeOfData(column.data_type))) }),
+                                .pg_attribute => {
+                                    const info = types.typeInfo(column.data_type);
+                                    try sink.add(&.{ intCell(oid), nameCell(column.name.slice()), intCell(info.oid), intCell(column.typmod), intCell(attnum), boolCell(column.not_null), boolCell(false), .{ .pg_internal_char = identity }, .{ .pg_internal_char = if (kind != .generated) 0 else if (column.virtual) 'v' else 's' }, boolCell(has_expression), intCell(collation.typeCollation(types.typeOfData(column.data_type))), intCell(info.len), .{ .pg_internal_char = info.alignment } });
+                                },
                                 .pg_attrdef => if (has_expression) {
                                     try sink.add(&.{ intCell(oid), intCell(attnum), expressionTextWithPool(pool,column) });
                                 },
@@ -6053,7 +6130,7 @@ pub fn Database(comptime config: Config) type {
                                         nameCell(database),                                       nameCell(schema_name),                          nameCell(name),            nameCell(column.name.slice()),
                                         intCell(attnum),                                          if (kind == .default) expressionTextWithPool(pool,column) else .null_value, nameCell(if (column.not_null) "NO" else "YES"), nameCell(if (types.elementData(column.data_type) != null) "ARRAY" else types.sqlTypeName(column.data_type)),
                                         optionalInt(characterMaximumLength(column)),              optionalInt(numeric[0]),                     optionalInt(numeric[1]),   optionalInt(numeric[2]),
-                                        optionalInt(datetimePrecision(column)),                   nameCell(if (identity.len != 0) "YES" else "NO"), if (identity.len == 0) .null_value else nameCell(if (kind == .identity_always) "ALWAYS" else "BY DEFAULT"), nameCell(if (kind == .generated) "ALWAYS" else "NEVER"),
+                                        optionalInt(datetimePrecision(column)),                   nameCell(if (identity != 0) "YES" else "NO"), if (identity == 0) .null_value else nameCell(if (kind == .identity_always) "ALWAYS" else "BY DEFAULT"), nameCell(if (kind == .generated) "ALWAYS" else "NEVER"),
                                         if (kind == .generated) expressionTextWithPool(pool,column) else .null_value,
                                     });
                                 },
@@ -6694,7 +6771,15 @@ pub fn Database(comptime config: Config) type {
                 if (schema.dead_csn != 0) return error.UndefinedSchema;
                 break;
             }
-            try self.reserveWrites(slot, 2 + create.count);
+            const creator = self.session.role;
+            const write_owner = self.dialect == .postgres and create.plain_definition and creator != CO.bootstrap_role;
+            if (write_owner) {
+                if (self.catalog_objects.pendingReference(creator, snap)) |other| return self.objectPark(slot, other);
+                var authority = snap;
+                authority.csn = self.csn;
+                if (self.catalog_objects.roleName(creator, authority) == null) return error.InsufficientPrivilege;
+            }
+            try self.reserveWrites(slot, 2 + create.count + @intFromBool(write_owner));
             const columns = create.columns[0..create.count];
             var destination: ?usize = null;
             for (0..2) |attempt| {
@@ -6726,6 +6811,10 @@ pub fn Database(comptime config: Config) type {
             var changes: [K.max_changes]K.Change = undefined;
             const count = try self.catalog.create(index, table, tx.ref(slot), snap.cid, 0, self.horizon(), &changes);
             for (changes[0..count]) |change| tx.push(.{ .kind = .catalog_insert, .table = @intFromEnum(change.relation), .new = change.version }) catch unreachable;
+            if (write_owner) {
+                var ownership: O.Object = .{ .kind = .relation, .target = table.oid, .owner = creator };
+                _ = try self.objectInsert(slot, &ownership, false, snap);
+            }
             if (create.identity) |identity| try self.createSequence(slot, identity.name, identity.spec, table.oid, identity.column, snap);
             for (create.serials[0..create.serial_count]) |serial| try self.createSequence(slot, serial.name, serial.spec, table.oid, serial.column, snap);
             const generated_context = self.bindContext("", .standard, snap);

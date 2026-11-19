@@ -91,7 +91,7 @@
 //!   f64 bits u64} | 26 box {high x, high y, low x, low y as f64 bits}
 //!   | 27 xml len u32 + the stored text | 28 tsvector / 29 tsquery len u32
 //!   + canonical output text (re-read and checked on replay) | 30 regtype
-//!   OID u32.
+//!   OID u32 | 31 PostgreSQL internal "char" byte.
 //!    70 object_create / 71 object_drop: catalog objects (roles, grants,
 //!                     policies, comments, wrappers, servers, publications);
 //!                     layout in catalog_objects.sig (B11 wave 3)
@@ -382,6 +382,10 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     try writer.int(u8, 27);
                     try writer.int(u32, @intCast(text.len));
                     try writer.bytes(text.slice());
+                },
+                .pg_internal_char => |value| {
+                    try writer.int(u8, 31);
+                    try writer.int(u8, value);
                 },
                 .regtype => |oid| {
                     try writer.int(u8, 30);
@@ -1146,6 +1150,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 },
                 24 => .{ .macaddr = (try reader.take(6))[0..6].* },
                 30 => .{ .regtype = try reader.int(u32) },
+                31 => .{ .pg_internal_char = try reader.int(u8) },
                 28, 29 => blk: {
                     const len = try reader.int(u32);
                     if (len > config.text_bytes) return error.ChangeRecordConflict;

@@ -198,18 +198,23 @@ fn fixedCharacterVersions() !void {
     try change("INSERT INTO labels_bounded VALUES (1,'',''),(2,'\xf0\x9f\x8e\xb5Q','\xc3\xb6'),(3,NULL,NULL)");
     try reject("INSERT INTO labels_bounded VALUES (4,'123456','abc')", error.StringDataRightTruncation);
     try change("UPDATE labels_bounded SET label='12345  ' WHERE id=1");
+    // Native internal-char casts retain a raw byte and its bpchar padding.
+    // They remain valid through typed packing, dense copies and logical WAL.
+    try change("INSERT INTO labels_bounded VALUES (4,'raw',(-1)::\"char\"::CHAR(3)),(5,'zero',0::\"char\"::CHAR(3))");
     try copied.copyFromInto(&db);
     try dense_copy.copyFromInto(&db);
     try copied.copyFromInto(&dense_copy);
     for ([_]*DB{ &db, &recovered, &copied, &dense_copy }) |database| {
         try execute(database, "SELECT label,mark FROM labels_bounded ORDER BY id");
-        try check(result.row_count == 3);
+        try check(result.row_count == 5);
         const first = &result.rows[0].cells;
         const second = &result.rows[1].cells;
         const nulls = &result.rows[2].cells;
         try check(std.mem.eql(u8, first[0].text.slice(), "12345") and std.mem.eql(u8, first[1].bpchar.slice(), "   "));
         try check(std.mem.eql(u8, second[0].text.slice(), "\xf0\x9f\x8e\xb5Q") and std.mem.eql(u8, second[1].bpchar.slice(), "\xc3\xb6  "));
         try check(nulls[0] == .null_value and nulls[1] == .null_value);
+        try check(std.mem.eql(u8, result.rows[3].cells[1].bpchar.slice(), "\xff  "));
+        try check(std.mem.eql(u8, result.rows[4].cells[1].bpchar.slice(), "\x00   "));
         try execute(database, "SELECT id FROM labels_bounded WHERE mark = '\xc3\xb6'::char(1)");
         try check(result.row_count == 1 and result.rows[0].cells[0].integer == 2);
     }

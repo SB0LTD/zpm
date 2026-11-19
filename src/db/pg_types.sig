@@ -17,13 +17,15 @@
 //! length and the subtype's binary form}. inet/cidr use inet_send
 //! {family 2 (IPv4) or 3 (IPv6), bits, is_cidr, address size, address};
 //! macaddr is six bytes. point is two float8 and box four (high corner
-//! first). xml is its output text.
+//! first). xml is its output text. PostgreSQL internal "char" is one byte.
 //! Parameters are rendered as
 //! SQL literals `'...'::type` (integers and booleans stay bare, as before),
 //! so binary input is decoded and re-encoded as text; malformed binary input
-//! is a protocol violation (08P01).
+//! is reported by the type codec.
 
-pub const Error = error{ BufferTooSmall, ProtocolViolation, UnsupportedBinaryType };
+const std = @import("std");
+
+pub const Error = error{ BufferTooSmall, ProtocolViolation, InvalidBinaryRepresentation, CharacterNotInRepertoire, UnsupportedBinaryType };
 
 fn put(out: []u8, at: *usize, bytes: []const u8) Error!void {
     if (bytes.len > out.len - at.*) return error.BufferTooSmall;
@@ -148,6 +150,7 @@ pub fn Types(comptime Result: type) type {
                 .xml => at += try sendText(cell, session, out),
                 // regtypesend is oidsend.
                 .regtype => |value| try putInt(u32, out, &at, value),
+                .pg_internal_char => |value| try put(out, &at, &.{value}),
                 // tsvectorsend / tsquerysend binary forms are not provided.
                 .tsvector, .tsquery => return error.UnsupportedBinaryType,
                 .point => |value| {
@@ -199,7 +202,7 @@ pub fn Types(comptime Result: type) type {
             var names: [fields.len][]const u8 = undefined;
             for (fields, 0..) |field, index| {
                 const element = @field(DataType, field);
-                names[index] = (if (element == .bit) "varbit" else Io.typeInfo(element).name) ++ "[]";
+                names[index] = (if (element == .bit) "varbit" else if (element == .pg_internal_char) "\"char\"" else Io.typeInfo(element).name) ++ "[]";
             }
             break :blk names;
         };
@@ -213,6 +216,7 @@ pub fn Types(comptime Result: type) type {
                 // `::bit` would mean BIT(1); varbit keeps every bit and is
                 // implicitly castable to BIT(n).
                 .bit => "varbit",
+                .pg_internal_char => "\"char\"",
                 else => Io.typeInfo(data_type).name,
             };
         }
@@ -238,7 +242,15 @@ pub fn Types(comptime Result: type) type {
             const name = castName(type_oid) orelse return error.UnsupportedBinaryType;
             var at: usize = 0;
             if (format == 0) {
-                try quote(out, &at, bytes);
+                const input = if (type_oid == 18) blk: {
+                    // charin consumes a C string; conversion validates its
+                    // prefix before the first zero. Binary is a raw byte.
+                    const end = std.mem.indexOfScalar(u8, bytes, 0) orelse bytes.len;
+                    const prefix = bytes[0..end];
+                    if (!std.unicode.utf8ValidateSlice(prefix)) return error.CharacterNotInRepertoire;
+                    break :blk prefix;
+                } else bytes;
+                try quote(out, &at, input);
             } else {
                 var text: [Io.format_bytes]u8 = undefined;
                 const cell = try decodeBinary(bytes, Io.typeFromOid(type_oid).?);
@@ -381,6 +393,11 @@ pub fn Types(comptime Result: type) type {
                 .macaddr => {
                     if (bytes.len != 6) return error.ProtocolViolation;
                     return .{ .macaddr = bytes[0..6].* };
+                },
+                .pg_internal_char => {
+                    if (bytes.len == 0) return error.ProtocolViolation;
+                    if (bytes.len > 1) return error.InvalidBinaryRepresentation;
+                    return .{ .pg_internal_char = bytes[0] };
                 },
                 .regtype => {
                     if (bytes.len != 4) return error.ProtocolViolation;

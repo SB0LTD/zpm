@@ -57,6 +57,7 @@ pub fn Binder(comptime config: types.Config) type {
             constraints: [config.table_constraints]S.Constraint = undefined,
             constraint_count: usize = 0,
             namespace: u32 = catalog.public_namespace,
+            plain_definition: bool = false,
             /// SERIAL columns' owned sequences, created after the table.
             serials: [config.columns]Identity = undefined,
             serial_count: usize = 0,
@@ -321,6 +322,11 @@ pub fn Binder(comptime config: types.Config) type {
             check: *const fn (*const anyopaque, u32, u32, storage.Snapshot) Error!void,
         };
 
+        pub const NamespaceCreate = struct {
+            ptr: *const anyopaque,
+            check: *const fn (*const anyopaque, u32, u32, storage.Snapshot, bool) Error!void,
+        };
+
         pub const Context = struct {
             source: []const u8,
             tables: *const [config.tables]S.Table,
@@ -336,6 +342,7 @@ pub fn Binder(comptime config: types.Config) type {
             /// Time zone and resolver for datetime literals parsed at bind time.
             session: *const value.Session = &value.default_session,
             namespace_usage: ?NamespaceUsage = null,
+            namespace_create: ?NamespaceCreate = null,
             /// Start of stored source appended by view and policy expansion.
             /// Existing stored references use their original public path.
             stored_source_start: usize = 0,
@@ -4361,9 +4368,14 @@ pub fn Binder(comptime config: types.Config) type {
             return found.oid;
         }
 
-        fn qualifierNamespace(context: *const Context, schema: ?ast.Ident) Error!u32 {
+        fn specifiedNamespace(context: *const Context, schema: ?ast.Ident) Error!u32 {
             const qualifier = schema orelse return if (context.session.public_schema_on_path) catalog.public_namespace else error.UndefinedSchema;
-            const namespace = try namespaceOf(context, toName(context, qualifier).slice());
+            return namespaceOf(context, toName(context, qualifier).slice());
+        }
+
+        fn qualifierNamespace(context: *const Context, schema: ?ast.Ident) Error!u32 {
+            const namespace = try specifiedNamespace(context, schema);
+            const qualifier = schema orelse return namespace;
             const direct = context.stored_source_start == 0 or qualifier.span.start < context.stored_source_start;
             if (direct) if (context.namespace_usage) |usage| {
                 try usage.check(usage.ptr, context.session.role, namespace, context.snapshot);
@@ -7651,23 +7663,55 @@ pub fn Binder(comptime config: types.Config) type {
             try validateDiscardedRows(context);
         }
 
+        fn plainTableDefinition(create: *const Ast.CreateTable) bool {
+            if (create.temporary or create.as_query != none or create.like != null or create.inherits != null or
+                create.partition_by != .none or create.partition_of != null) return false;
+            for (create.columns[0..create.count]) |*column| {
+                if (column.serial != 0 or column.default_kind != .none) return false;
+            }
+            for (create.constraints[0..create.constraint_count]) |*constraint| {
+                if (constraint.kind != .primary and constraint.kind != .unique) return false;
+            }
+            return true;
+        }
+
         fn bindStatement(context: *const Context, statement: *const Ast.Statement) Error!Bound {
             if (context.plans) |plans| if (!context.nested_dml) plans.reset();
             switch (statement.*) {
                 .create_table => |*create| {
                     const table_name = toName(context, create.name);
-                    const namespace = try qualifierNamespace(context, create.schema);
-                    // pg_catalog / information_schema are not writable here.
+                    const postgres_acl = context.dialect == .postgres and context.namespace_create != null;
+                    const namespace = if (postgres_acl)
+                        try specifiedNamespace(context, create.schema)
+                    else
+                        try qualifierNamespace(context, create.schema);
+                    // System namespaces are not writable here.
                     if (namespace == catalog.catalog_namespace or namespace == catalog.information_namespace or namespace == catalog.toast_namespace) return error.UnsupportedStatement;
+                    const plain = plainTableDefinition(create);
+                    if (postgres_acl) {
+                        const privilege = context.namespace_create.?;
+                        try privilege.check(privilege.ptr, context.session.role, namespace, context.snapshot, plain);
+                    }
                     if (context.catalog.findIn(namespace, table_name.slice(), context.snapshot) != null) {
                         if (create.if_not_exists) return .{ .noop = if (create.as_query != none) .create_table_as else .create_table };
                         return error.TableExists;
+                    }
+                    // PRIMARY KEY and UNIQUE create an index through a lookup
+                    // of the newly created relation. PostgreSQL requires USAGE
+                    // for that lookup, after an IF NOT EXISTS early return.
+                    if (postgres_acl) {
+                        var index_lookup = false;
+                        for (create.columns[0..create.count]) |*column| index_lookup = index_lookup or column.primary_key;
+                        for (create.constraints[0..create.constraint_count]) |*constraint| {
+                            index_lookup = index_lookup or constraint.kind == .primary or constraint.kind == .unique;
+                        }
+                        if (index_lookup) _ = try qualifierNamespace(context, create.schema);
                     }
                     if (create.invalid_definition) return error.Syntax;
                     if (create.as_query != none) return bindCreateAs(context, create, table_name, namespace);
                     if (create.partition_of) |parent| return bindPartitionOf(context, create, table_name, namespace, parent);
                     if (create.inherits != null and (create.like != null or create.partition_by != .none)) return error.UnsupportedStatement;
-                    var out: Create = .{ .name = table_name, .columns = @splat(.{}), .count = create.count, .namespace = namespace };
+                    var out: Create = .{ .name = table_name, .columns = @splat(.{}), .count = create.count, .namespace = namespace, .plain_definition = plain };
                     // Owned sequences live in public: identity and SERIAL
                     // columns stay outside other schemas (0A000).
                     if (namespace != catalog.public_namespace) for (create.columns[0..create.count]) |*definition| {
