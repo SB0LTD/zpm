@@ -209,7 +209,7 @@ pub fn recover(file: anytype, scratch: []u8, context: anytype, comptime replay: 
 
 /// Refuses incompatible payload semantics without modifying the original WAL.
 pub fn recoverKind(file: anytype, scratch: []u8, context: anytype, comptime replay: anytype, kind: u16) !Recovery {
-    return recoverImpl(file, scratch, context, replay, null, try kindMask(kind), .sequence);
+    return recoverImpl(file, scratch, context, replay, null, try kindMask(kind), .sequence, .{});
 }
 
 /// Like recoverKind, but accepts every kind whose bit is set in accepted_mask
@@ -218,7 +218,7 @@ pub fn recoverKind(file: anytype, scratch: []u8, context: anytype, comptime repl
 /// UnsupportedLogVersion before its payload is replayed.
 pub fn recoverKinds(file: anytype, scratch: []u8, context: anytype, comptime replay: anytype, accepted_mask: u32) !Recovery {
     if (accepted_mask & ~@as(u32, 1) == 0) return error.UnsupportedLogVersion;
-    return recoverImpl(file, scratch, context, replay, null, accepted_mask, .kind);
+    return recoverImpl(file, scratch, context, replay, null, accepted_mask, .kind, .{});
 }
 
 /// Like recoverKinds, but calls replay(context, frame, payload). A caller
@@ -232,14 +232,48 @@ pub fn recoverFrames(file: anytype, scratch: []u8, context: anytype, comptime re
 /// torn-tail repair. A finalizer error leaves the source bytes untouched.
 pub fn recoverFramesWithFinish(file: anytype, scratch: []u8, context: anytype, comptime replay: anytype, comptime finish: anytype, accepted_mask: u32) !Recovery {
     if (accepted_mask & ~@as(u32, 1) == 0) return error.UnsupportedLogVersion;
-    return recoverImpl(file, scratch, context, replay, finish, accepted_mask, .frame);
+    return recoverImpl(file, scratch, context, replay, finish, accepted_mask, .frame, .{});
+}
+
+/// Recover a WAL suffix after a durable checkpoint marker. The caller holds
+/// exclusive writer ownership and has verified the corresponding snapshot.
+/// verify(context, marker, payload) must check that the marker identifies that
+/// snapshot before any later frame replays or any torn tail may be repaired.
+/// The marker need not use a kind accepted for replay. Its coordinates
+/// and the returned valid byte count are absolute within this file.
+pub fn recoverAfterFrame(
+    file: anytype,
+    scratch: []u8,
+    marker: Frame,
+    context: anytype,
+    comptime verify: anytype,
+    comptime replay: anytype,
+    comptime finish: anytype,
+    accepted_mask: u32,
+) !Recovery {
+    if (accepted_mask & ~@as(u32, 1) == 0) return error.UnsupportedLogVersion;
+    const payload = try readFrame(file, scratch, marker);
+    try verify(context, marker, payload);
+    // readFrame checked that the complete marker fits in the file length.
+    const start: Recovery = .{ .sequence = marker.sequence, .valid_bytes = marker.offset + marker.byteCount() };
+    return recoverImpl(file, scratch, context, replay, finish, accepted_mask, .frame, start);
 }
 
 const ReplayMode = enum { sequence, kind, frame };
 
-fn recoverImpl(file: anytype, scratch: []u8, context: anytype, comptime replay: anytype, comptime finish: anytype, accepted_mask: u32, comptime mode: ReplayMode) !Recovery {
+fn recoverImpl(
+    file: anytype,
+    scratch: []u8,
+    context: anytype,
+    comptime replay: anytype,
+    comptime finish: anytype,
+    accepted_mask: u32,
+    comptime mode: ReplayMode,
+    start: Recovery,
+) !Recovery {
     const length: u64 = try file.length();
-    var result: Recovery = .{};
+    if (start.valid_bytes > length) return error.UnexpectedEndOfLog;
+    var result = start;
     while (result.valid_bytes < length) {
         const remaining = length - result.valid_bytes;
         if (remaining < header_size) break;

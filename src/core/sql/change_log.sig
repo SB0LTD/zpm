@@ -1682,8 +1682,29 @@ pub fn ChangeLog(comptime config: types.Config) type {
             }
         }
 
-        fn validate(db: anytype, record: []const u8, scratch: *Scratch) Error!void {
+        pub const BaseImageRecord = struct {
+            csn: u64,
+            op: Op,
+            bank: usize = 0,
+            table_count: usize = 0,
+        };
+
+        fn baseImageSchema(namespace: u32, relkind: u8, indexes: usize, parent: u32, dependencies: usize, constraints: usize, columns: []const V.Column) bool {
+            if (namespace != public_namespace or relkind != 'r' or indexes != 0 or parent != 0 or dependencies != 0 or constraints != 0) return false;
+            for (columns) |column| if (column.default_kind != .none or column.virtual) return false;
+            return true;
+        }
+
+        pub fn supportsBaseImage(table: *const S.Table) bool {
+            return baseImageSchema(table.namespace, table.relkind, table.index_count, table.parent, table.depend_count, table.constraint_count, table.columns[0..table.column_count]);
+        }
+
+        fn validate(db: anytype, record: []const u8, scratch: *Scratch, image: anytype) Error!void {
+            const base_image = @TypeOf(image) == BaseImageRecord;
             const count = try opCount(record);
+            if (comptime base_image) {
+                if (count == 0 or count > config.tx_writes or (image.op != .insert and count != 1)) return error.InvalidChangeRecord;
+            }
             scratch.epoch +%= 1;
             if (scratch.epoch == 0) {
                 @memset(&scratch.rows, .{});
@@ -1734,6 +1755,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
             var check_schema_owners = false;
             for (0..count) |_| {
                 const tag = try reader.int(u8);
+                if (comptime base_image) if (tag != @intFromEnum(image.op)) return error.InvalidChangeRecord;
                 switch (tag) {
                     @intFromEnum(Op.create_table) => {
                         var definition = try decodeCreate(&reader);
@@ -1752,6 +1774,11 @@ pub fn ChangeLog(comptime config: types.Config) type {
                             if (!vt.live and free == null and S.createBankFits(&db.tables[index], columns, definition.extras.index_count)) free = index;
                         }
                         const index = free orelse return error.ChangeRecordConflict;
+                        if (comptime base_image) {
+                            const extras = &definition.extras;
+                            if (index != image.bank or !baseImageSchema(definition.namespace, extras.relkind, extras.index_count,
+                                extras.parent, extras.depend_count, definition.constraint_count, columns)) return error.ChangeRecordConflict;
+                        }
                         if (!S.indexFits(&db.tables[index], definition.extras.index_count, 0)) return error.ChangeRecordConflict;
                         try validateExtras(db, scratch, &definition, null);
                         try resolveConstraintOids(&definition, &.{}, &next_constraint_oid);
@@ -1860,6 +1887,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     },
                     @intFromEnum(Op.insert) => {
                         const index = try findVTable(scratch, try reader.int(u32));
+                        if (comptime base_image) if (index != image.bank) return error.ChangeRecordConflict;
                         const vt = &scratch.tables[index];
                         try noteMutation(vt);
                         const rowid = try reader.int(u64);
@@ -1921,9 +1949,15 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         if (counter < next_oid) return error.ChangeRecordConflict;
                         next_oid = counter;
                         const tables = try reader.int(u8);
+                        if (comptime base_image) if (tables != image.table_count) return error.InvalidChangeRecord;
                         if (tables > config.tables) return error.ChangeRecordConflict;
+                        var seen: if (base_image) [config.tables]bool else void = if (base_image) @splat(false) else {};
                         for (0..tables) |_| {
                             const index = try findVTable(scratch, try reader.int(u32));
+                            if (comptime base_image) {
+                                if (seen[index]) return error.InvalidChangeRecord;
+                                seen[index] = true;
+                            }
                             const next = try reader.int(u64);
                             if (next < scratch.tables[index].next_rowid) return error.ChangeRecordConflict;
                             scratch.tables[index].next_rowid = next;
@@ -2087,6 +2121,22 @@ pub fn ChangeLog(comptime config: types.Config) type {
 
         /// `db` provides tables, catalog OID counters, csn, cid and epoch.
         pub fn apply(db: anytype, record: []const u8, scratch: *Scratch) Error!void {
+            return applyRecord(db, record, scratch, null);
+        }
+
+        /// Restore one checked image part into an unpublished startup store.
+        /// All image parts share the original committed SQL CSN.
+        pub fn applyBaseImageRecord(db: anytype, record: []const u8, scratch: *Scratch, image: BaseImageRecord) Error!void {
+            if (image.csn == 0 or (db.csn != 0 and db.csn != image.csn)) return error.InvalidParameterValue;
+            switch (image.op) {
+                .create_table, .insert => if (image.bank >= config.tables) return error.InvalidChangeRecord,
+                .catalog_counters, .catalog_counters_with_constraints => if (image.table_count == 0 or image.table_count > config.tables) return error.InvalidChangeRecord,
+                else => return error.InvalidChangeRecord,
+            }
+            return applyRecord(db, record, scratch, image);
+        }
+
+        fn applyRecord(db: anytype, record: []const u8, scratch: *Scratch, image: anytype) Error!void {
             const scratch_start = @intFromPtr(scratch);
             if (rangesOverlap(scratch_start, @sizeOf(Scratch), @intFromPtr(db), @sizeOf(@TypeOf(db.*))) or
                 rangesOverlap(scratch_start, @sizeOf(Scratch), @intFromPtr(record.ptr), record.len)) return error.InvalidParameterValue;
@@ -2094,9 +2144,9 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 const bank = table.key_index;
                 if (rangesOverlap(scratch_start, @sizeOf(Scratch), @intFromPtr(bank.ptr), bank.len * @sizeOf(u32))) return error.InvalidParameterValue;
             };
-            try validate(db, record, scratch);
+            try validate(db, record, scratch, image);
             // Validated: the remaining errors are unreachable invariants.
-            const csn = db.csn + 1;
+            const csn = if (comptime @TypeOf(image) == BaseImageRecord) image.csn else db.csn + 1;
             db.epoch +%= 1;
             if (db.epoch == 0) db.epoch = 1;
             db.cid +%= 1;

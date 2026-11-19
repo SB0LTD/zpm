@@ -107,6 +107,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addContract(ctx, test_sql, "contract-sql-index", "tests/test_sql_index.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-storage", "tests/test_sql_storage.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-change-log", "tests/test_sql_change_log.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    _ = try addContract(ctx, test_sql, "contract-sql-base-snapshot", "tests/test_sql_base_snapshot.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-two-phase", "tests/test_sql_two_phase.sig", &.{importEntry("sql", "src/core/sql.sig"), importEntry("db_store", "src/db/store.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-expr", "tests/test_sql_expr.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-distinct", "tests/test_sql_distinct.sig", &.{importEntry("sql", "src/core/sql.sig")});
@@ -225,6 +226,14 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     });
     _ = try addContract(ctx, test_db, "contract-pg-settings", "tests/test_db_pg_settings.sig", &.{
         importEntry("sql", "src/core/sql.sig"), importEntry("db_store", "src/db/store.sig"),
+    });
+    _ = try addContract(ctx, test_db, "contract-snapshot-envelope", "tests/test_snapshot_envelope.sig", &.{
+        importEntry("db_file", "src/platform/db_file.sig"), importEntry("snapshot_envelope", "src/db/snapshot_envelope.sig"),
+    });
+    _ = try addContract(ctx, test_db, "contract-native-store-checkpoint", "tests/test_native_store_checkpoint.sig", &.{
+        importEntry("db_file", "src/platform/db_file.sig"), importEntry("durable_log", "src/db/durable_log.sig"),
+        importEntry("snapshot_envelope", "src/db/snapshot_envelope.sig"), importEntry("sql", "src/core/sql.sig"),
+        importEntry("db_store", "src/db/store.sig"), importEntry("checkpoint_manifest", "src/db/checkpoint_manifest.sig"),
     });
     _ = try ctx.addModule("wall_clock", "src/platform/wall_clock.sig");
     inline for (.{ "postgres", "mysql", "tds", "db_store", "tcp_server", "scram", "durable_log", "db_file", "entropy", "db_stream", "pg_stream", "wall_clock", "pg_copy", "pg_explain", "page_region" }) |name| {

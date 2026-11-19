@@ -97,6 +97,7 @@ const parser_module = @import("sql/parser.sig");
 const binder_module = @import("sql/binder.sig");
 const storage = @import("sql/storage.sig");
 const change_log = @import("sql/change_log.sig");
+const base_snapshot = @import("sql/base_snapshot.sig");
 const two_phase = @import("sql/two_phase.sig");
 const expr_module = @import("sql/expr.sig");
 const exec_module = @import("sql/exec.sig");
@@ -274,6 +275,7 @@ pub fn Database(comptime config: Config) type {
         pub const StorageVersionRow = S.VersionRow;
         pub const integralRowWords = S.integralRowWords;
         pub const ReplayScratch = C.Scratch;
+        pub const BaseSnapshot = base_snapshot.Image(config, Self);
         pub const PreparedWal = two_phase;
         pub const Snapshot = storage.Snapshot;
         pub const LockSet = L.Set;
