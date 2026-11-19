@@ -1,0 +1,98 @@
+name: Numeric digit count hosted and pinned native compatibility
+on:
+  push:
+    branches: [ci/numeric-digit-count-native-20261119]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  hosted:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: a2045a158a71853cea52cb7e45c64f9f473392b0
+      - name: Install exact hosted Sig
+        run: |
+          tag=sig-0.6.5-zig0.17.0.3c72687
+          asset="$tag-aarch64-linux.tar.xz"
+          curl -fsSL --retry 3 "https://github.com/SB0LTD/sig/releases/download/$tag/$asset" -o "$RUNNER_TEMP/$asset"
+          echo "ef890f870f3215e60d25588742b74fa9d2808addbc0112b7c37818a73dfb0643  $RUNNER_TEMP/$asset" | sha256sum -c
+          mkdir "$RUNNER_TEMP/sdk"
+          tar -xf "$RUNNER_TEMP/$asset" -C "$RUNNER_TEMP/sdk"
+          compiler=$(find "$RUNNER_TEMP/sdk" -type f -name sig -print -quit)
+          standard=$(find "$RUNNER_TEMP/sdk" -type f -path '*/lib/std/std.sig' -print -quit)
+          printf 'SIG=%s
+SIG_LIB_DIR=%s
+' "$compiler" "${standard%/std/std.sig}" >> "$GITHUB_ENV"
+      - name: Numeric boundaries and existing SQL numeric contracts
+        run: |
+          mkdir evidence
+          git rev-parse HEAD > evidence/source.txt
+          "$SIG" build run-contract-sql-numeric-functions run-contract-sql-types-core --Sig-lib-dir "$SIG_LIB_DIR" -Doptimize=ReleaseSafe -j1 2>&1 | tee evidence/hosted.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: numeric-digit-count-hosted
+          path: evidence/
+  pinned-native:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: SB0LTD/ramsql
+          ref: cc2d6c8525196ed6e6aba193b3be5ca15ae7a289
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify exact previously built native toolchain
+        run: |
+          mkdir evidence
+          gh api repos/SB0LTD/ramsql/actions/artifacts/14452745044/zip > "$RUNNER_TEMP/native.zip"
+          echo "82331986ee8468584813c77302232bf8ce427da44b4d077dab3b3afe68c48f23  $RUNNER_TEMP/native.zip" | sha256sum -c
+          python - <<'PY'
+          import hashlib,json,os,zipfile
+          from pathlib import Path
+          root=Path(os.environ['RUNNER_TEMP'])/'native-toolchain'
+          with zipfile.ZipFile(root.parent/'native.zip') as archive:
+              archive.extractall(root)
+          manifest=json.loads((root/'toolchain.json').read_text())
+          assert manifest['source_revision']=='15a714dcdd58521b46868c036ce55cca4d283cfd'
+          assert manifest['library_revision']==manifest['source_revision']
+          assert hashlib.sha256((root/'bin/sig').read_bytes()).hexdigest()==manifest['compiler_sha256']
+          (root/'bin/sig').chmod(0o755)
+          Path('evidence/native-toolchain.json').write_text(json.dumps(manifest,indent=2))
+          with open(os.environ['GITHUB_ENV'],'a') as env:
+              env.write(f"SIG={root}/bin/sig
+SIG_LIB_DIR={root}/lib
+")
+          PY
+      - name: Pin only reviewed ZPM numeric candidate in ephemeral product checkout
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          source=Path('build.sig.zon').read_text()
+          assert source.count('245b6a0ff4577e3c12da47723942a23341105cb0')==1
+          source=source.replace('245b6a0ff4577e3c12da47723942a23341105cb0','a2045a158a71853cea52cb7e45c64f9f473392b0')
+          source=source.replace('0fbdb5db371c12899c0dc7cc07e00884d530529f16e9553b2db2c83cc06b2a79','56f5923aeb07fb4f9455874dcfad4ab0767224d1823610638f00fa9d91baa1dd')
+          Path('build.sig.zon').write_text(source)
+          PY
+          git diff -- build.sig.zon > evidence/product-manifest.patch
+          git rev-parse HEAD > evidence/product-source.txt
+          sudo apt-get -o Acquire::Retries=2 update -q
+          sudo apt-get -o Acquire::Retries=2 install --no-install-recommends -y qemu-system-arm ipxe-qemu
+      - name: Compile and execute actual SB0X and SB0K products
+        run: |
+          for format in sb0x sb0k; do
+            python tools/build_sb0.py --format "$format" --optimize ReleaseSmall --output "evidence/ramsql.$format" 2>&1 | tee "evidence/build-$format.log"
+            python tools/test_sb0.py --format "$format" --image "evidence/ramsql.$format" --report "evidence/runtime-$format.json"
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: numeric-digit-count-pinned-native
+          path: evidence/
