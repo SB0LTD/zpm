@@ -24,6 +24,17 @@ pub const LinuxHost = struct {
     prefix: []const u8 = "[dos] ",
     /// Quiet: the log is kept to lines that say a program stopped.
     quiet: bool = false,
+    /// Executable memory for the CPU's translator (false: none; the CPU
+    /// interprets everything, e.g. galaxy-dos's GALAXY_DOS_JIT=0).
+    jit: bool = true,
+    /// The clock: another host's last reading (lockstep's twin reads the
+    /// time the machine it follows read), else the real-time clock.
+    clock_of: ?*const LinuxHost = null,
+    /// The code memory one mapping whose protection flips (else two
+    /// mappings): for emulators that see a code change only through the
+    /// mapping it is run from (QEMU's user mode).
+    code_flip: bool = false,
+    last_now: host_mod.Time = undefined,
 
     pub fn host(self: *LinuxHost) host_mod.Host {
         return .{ .ctx = self, .vt = &vtable };
@@ -165,7 +176,13 @@ pub const LinuxHost = struct {
         if (d.fd >= 0) _ = linux.close(d.fd);
         d.fd = -1;
     }
-    fn nowF(_: *anyopaque) host_mod.Time {
+    fn nowF(ctx: *anyopaque) host_mod.Time {
+        const s = me(ctx);
+        if (s.clock_of) |o| return o.last_now;
+        s.last_now = realNow();
+        return s.last_now;
+    }
+    fn realNow() host_mod.Time {
         var ts: linux.timespec = undefined;
         _ = linux.clock_gettime(.REALTIME, &ts);
         const es = std.time.epoch.EpochSeconds{ .secs = @intCast(ts.sec) };
@@ -212,8 +229,57 @@ pub const LinuxHost = struct {
         .dir_close = dirCloseF,
         .now = nowF,
         .log = logF,
+        .code_mem = codeMemF,
     };
+
+    fn codeMemF(ctx: *anyopaque, len: usize) ?host_mod.CodeMem {
+        if (!me(ctx).jit) return null;
+        return mapCode(len, me(ctx).code_flip);
+    }
 };
+
+// ── Executable memory (the translator's code) ──────────────────────────
+
+/// The flipping provider's region (one per process).
+var flip_at: [*]u8 = undefined;
+var flip_len: usize = 0;
+var flip_ctx: u8 = 0;
+
+fn flipRw(_: *anyopaque) void {
+    _ = linux.mprotect(flip_at, flip_len, .{ .READ = true, .WRITE = true });
+}
+fn flipRx(_: *anyopaque) void {
+    _ = linux.mprotect(flip_at, flip_len, .{ .READ = true, .EXEC = true });
+}
+
+/// `len` bytes of code memory: a memfd mapped twice, writable at one
+/// address and executable at another (never both at one: W^X), else
+/// private memory whose protection flips between writable and
+/// executable around the translator's writes. Null if neither works.
+pub fn mapCode(len: usize, flip: bool) ?host_mod.CodeMem {
+    const r = if (flip) @as(usize, 0) -% 1 else linux.memfd_create("dos-jit", linux.MFD.CLOEXEC);
+    if (!failedR(r)) {
+        const fd: i32 = @intCast(r);
+        defer _ = linux.close(fd);
+        if (!failedR(linux.ftruncate(fd, @intCast(len)))) {
+            const rw = linux.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0);
+            if (!failedR(rw)) {
+                const rx = linux.mmap(null, len, .{ .READ = true, .EXEC = true }, .{ .TYPE = .SHARED }, fd, 0);
+                if (!failedR(rx)) return .{ .rw = @ptrFromInt(rw), .rx = @ptrFromInt(rx), .len = len, .ctx = &flip_ctx };
+                _ = linux.munmap(@ptrFromInt(rw), len);
+            }
+        }
+    }
+    const a = linux.mmap(null, len, .{ .READ = true, .EXEC = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    if (failedR(a)) return null;
+    flip_at = @ptrFromInt(a);
+    flip_len = len;
+    return .{ .rw = flip_at, .rx = flip_at, .len = len, .ctx = &flip_ctx, .unlock = flipRw, .lock = flipRx };
+}
+
+fn failedR(r: usize) bool {
+    return r > std.math.maxInt(usize) - 4096;
+}
 
 /// The program's folder (drive C:) and its DOS path, from a host path:
 /// "/winapps/games/aladdin/aladdin.exe" → "/winapps/games/aladdin",

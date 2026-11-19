@@ -132,10 +132,13 @@ pub fn syncSeg(c: *Cpu, s: u3) void {
     c.seg_lo[s] = b.lo;
     c.seg_rhi[s] = b.rhi;
     c.seg_whi[s] = b.whi;
+    const bit = @as(u8, 1) << s;
+    if (b.lo == 0 and b.rhi == 0xFFFF_FFFF and b.whi == 0xFFFF_FFFF) c.seg_flat |= bit else c.seg_flat &= ~bit;
     if (s == CS) {
         c.code32 = a & A_DB != 0;
         c.ip_wrap = if (c.code32) 0xFFFF_FFFF else 0xFFFF;
         c.fetch_hi = lim;
+        c.tlb.fw_len = 0;
     } else if (s == SS) {
         c.stack32 = a & A_DB != 0;
     }
@@ -144,6 +147,7 @@ pub fn syncSeg(c: *Cpu, s: u3) void {
 /// All of it (on entering protected mode; harmless at any time).
 pub fn syncAll(c: *Cpu) void {
     c.paging = c.cr0 & cpu_mod.CR0_PG != 0;
+    c.tlb.fw_len = 0;
     for (0..6) |i| syncSeg(c, @intCast(i));
 }
 
@@ -165,13 +169,11 @@ fn setNull(c: *Cpu, s: u3, sel: u16) void {
 // ── Linear memory (system accesses are the supervisor's) ────────────────
 
 inline fn rdLin(c: *Cpu, b: anytype, comptime T: type, a: u32, user: bool) Exc!T {
-    if (!c.paging) return rdM(b, T, a);
-    return rdPaged(c, b, T, a, user);
+    return rdSlow(c, b, T, a, user);
 }
 
 inline fn wrLin(c: *Cpu, b: anytype, comptime T: type, a: u32, v: T, user: bool) Exc!void {
-    if (!c.paging) return wrM(b, T, a, v);
-    return wrPaged(c, b, T, a, v, user);
+    return wrSlow(c, b, T, a, v, user);
 }
 
 // ── Descriptors ─────────────────────────────────────────────────────────
@@ -797,35 +799,124 @@ pub fn ioBitmap(c: *Cpu, b: anytype, port: u16, n: u32) Exc!void {
     return c.raise(13, 0);
 }
 
-// ── Paging ──────────────────────────────────────────────────────────────
+// ── Paging and the TLB ──────────────────────────────────────────────────
 
 pub const TLB_N = 256;
 
 /// Direct-mapped by the page number's low bits: the linear page (| 1:
-/// valid), its frame, and what it allows (K_*: a write only once the
-/// dirty bit is set in the page table).
+/// valid), its frame, what it allows (K_*: a write only once the dirty
+/// bit is set in the page table), and where the host has its bytes.
+///
+/// Protected mode always goes through it, paging on or off (off: each
+/// page is its own frame). When the bus can say where a page's bytes
+/// are (`page`: RAM, the frame buffer), the entry keeps that (`hoff`,
+/// D_R/D_W), and a hit is a load or a store; a device's page has no
+/// pointer and every access to it goes to the bus.
+///
+/// The fetch window: the code page EIP is in, as host bytes (EIP from
+/// `fw_base`, `fw_len` bytes, at `fw_host`); every flush and every CS
+/// load empties it. Code is read where it is, so code that writes
+/// itself needs nothing more.
 pub const Tlb = struct {
     tag: [TLB_N]u32 = [_]u32{0} ** TLB_N,
     phys: [TLB_N]u32 = [_]u32{0} ** TLB_N,
     perm: [TLB_N]u8 = [_]u8{0} ** TLB_N,
+    /// The host address of the page's byte 0, less its linear address.
+    hoff: [TLB_N]usize = [_]usize{0} ** TLB_N,
+    /// The fast paths' own tags, [0] for CPL 0-2, [1] for CPL 3: the
+    /// page | 1 where its host bytes may be read (written) at that level,
+    /// else 0. One compare is a hit.
+    rtag: [2][TLB_N]u32 = [_][TLB_N]u32{[_]u32{0} ** TLB_N} ** 2,
+    wtag: [2][TLB_N]u32 = [_][TLB_N]u32{[_]u32{0} ** TLB_N} ** 2,
+    fw_base: u32 = 0,
+    fw_len: u32 = 0,
+    fw_host: usize = 0,
+    /// The window's TLB entry.
+    fw_idx: u32 = 0,
+    /// The bus's map key (its A20 gate) the entries were made under.
+    key: u32 = 0,
+    /// Counts flushes (whole or a page's): the translator's code ends
+    /// its block when a mapping it may have used can have changed.
+    gen: u32 = 0,
 
     pub fn flush(t: *Tlb) void {
+        if (cpu_mod.count_ops) stats[0] += 1;
+        t.gen +%= 1;
         @memset(&t.tag, 0);
+        inline for (0..2) |u| {
+            @memset(&t.rtag[u], 0);
+            @memset(&t.wtag[u], 0);
+        }
+        t.fw_len = 0;
     }
 
     pub fn flushPage(t: *Tlb, lin: u32) void {
+        t.gen +%= 1;
         const i = (lin >> 12) & (TLB_N - 1);
-        if (t.tag[i] == (lin & 0xFFFF_F000) | 1) t.tag[i] = 0;
+        if (t.tag[i] == (lin & 0xFFFF_F000) | 1) {
+            t.tag[i] = 0;
+            inline for (0..2) |u| {
+                t.rtag[u][i] = 0;
+                t.wtag[u][i] = 0;
+            }
+        }
+        t.fw_len = 0;
+    }
+
+    /// The translator's: no entry may write the host's page at `host`
+    /// directly any more (it holds translated code: writes take the slow
+    /// path, which sees them).
+    pub fn dropWrite(t: *Tlb, host: usize) void {
+        for (0..TLB_N) |i| {
+            if (t.tag[i] & 1 == 0 or t.perm[i] & D_W == 0) continue;
+            if (t.hoff[i] +% (t.tag[i] & 0xFFFF_F000) != host) continue;
+            t.perm[i] &= ~D_W;
+            inline for (0..2) |u| t.wtag[u][i] = 0;
+        }
     }
 };
 
-const K_SR: u8 = 1;
-const K_SW: u8 = 2;
-const K_UR: u8 = 4;
-const K_UW: u8 = 8;
+pub const K_SR: u8 = 1;
+pub const K_SW: u8 = 2;
+pub const K_UR: u8 = 4;
+pub const K_UW: u8 = 8;
+/// The host's bytes may be read (written) directly.
+pub const D_R: u8 = 16;
+pub const D_W: u8 = 32;
+
+/// K_SR or K_UR (`write`: K_SW, K_UW) for an access at CPL.
+pub inline fn access(cpl: u2, comptime write: bool) u8 {
+    const k: u8 = if (cpl == 3) K_UR else K_SR;
+    return if (write) k << 1 else k;
+}
+
+fn hasPage(comptime B: type) bool {
+    const T = switch (@typeInfo(B)) {
+        .pointer => |info| info.child,
+        else => B,
+    };
+    return @hasDecl(T, "page");
+}
+
+/// The bus's map key (0 for a bus without one): entries made under
+/// another key are stale.
+pub inline fn mapKey(b: anytype) u32 {
+    if (comptime hasPage(@TypeOf(b))) return b.mapKey();
+    return 0;
+}
+
+/// Empties the TLB if the bus's map changed (the A20 gate).
+pub inline fn checkKey(c: *Cpu, b: anytype) void {
+    const k = mapKey(b);
+    if (k != c.tlb.key) {
+        c.tlb.flush();
+        c.tlb.key = k;
+    }
+}
 
 /// The physical address for a linear one: the TLB, else a walk of the
-/// page directory and table (#PF, CR2).
+/// page directory and table (#PF, CR2), or the page itself with paging
+/// off; a miss fills the entry.
 pub inline fn translate(c: *Cpu, b: anytype, lin: u32, write: bool, user: bool) Exc!u32 {
     const i = (lin >> 12) & (TLB_N - 1);
     const k: u8 = @as(u8, if (user) K_UR else K_SR) << @intFromBool(write);
@@ -841,7 +932,40 @@ fn pf(c: *Cpu, lin: u32, protection: bool, write: bool, user: bool) Exc {
     return c.raise(14, e);
 }
 
+fn fill(c: *Cpu, b: anytype, lin: u32, frame: u32, perm0: u8) void {
+    var perm = perm0;
+    const i = (lin >> 12) & (TLB_N - 1);
+    const page = lin & 0xFFFF_F000;
+    var hoff: usize = 0;
+    if (comptime hasPage(@TypeOf(b))) {
+        if (b.page(frame, false)) |p| {
+            hoff = @intFromPtr(p) -% page;
+            perm |= D_R;
+            if (b.page(frame, true) != null) perm |= D_W;
+        }
+    }
+    c.tlb.tag[i] = page | 1;
+    c.tlb.phys[i] = frame;
+    c.tlb.perm[i] = perm;
+    c.tlb.hoff[i] = hoff;
+    const t = page | 1;
+    c.tlb.rtag[0][i] = if (perm & D_R != 0) t else 0;
+    c.tlb.rtag[1][i] = if (perm & (D_R | K_UR) == D_R | K_UR) t else 0;
+    c.tlb.wtag[0][i] = if (perm & (D_W | K_SW) == D_W | K_SW) t else 0;
+    c.tlb.wtag[1][i] = if (perm & (D_W | K_UW) == D_W | K_UW) t else 0;
+    // (the window may be on the entry this one replaces)
+    if (i == c.tlb.fw_idx) c.tlb.fw_len = 0;
+}
+
+/// The profiling build's counts (cpu.count_ops): TLB flushes, misses.
+pub var stats: [4]u64 = [_]u64{0} ** 4;
+
 fn walk(c: *Cpu, b: anytype, lin: u32, write: bool, user: bool) Exc!u32 {
+    if (cpu_mod.count_ops) stats[1] += 1;
+    if (!c.paging) {
+        fill(c, b, lin, lin & 0xFFFF_F000, K_SR | K_SW | K_UR | K_UW);
+        return lin;
+    }
     const pde_at = (c.cr3 & 0xFFFF_F000) +% ((lin >> 22) << 2);
     const pde = b.rd32(pde_at);
     if (pde & 1 == 0) return pf(c, lin, false, write, user);
@@ -864,16 +988,14 @@ fn walk(c: *Cpu, b: anytype, lin: u32, write: bool, user: bool) Exc!u32 {
         perm |= K_UR;
         if (dirty and w) perm |= K_UW;
     }
-    const i = (lin >> 12) & (TLB_N - 1);
-    c.tlb.tag[i] = (lin & 0xFFFF_F000) | 1;
-    c.tlb.phys[i] = npte & 0xFFFF_F000;
-    c.tlb.perm[i] = perm;
+    fill(c, b, lin, npte & 0xFFFF_F000, perm);
     return (npte & 0xFFFF_F000) | (lin & 0xFFF);
 }
 
-/// T at linear `a` with paging on (an access across a page boundary
-/// translates both pages before it reads).
-pub fn rdPaged(c: *Cpu, b: anytype, comptime T: type, a: u32, user: bool) Exc!T {
+/// T at linear `a` (what the inline hit in cpu.sig's rdL leaves): a
+/// device's page, an access across a page boundary (both pages
+/// translated before it reads), or a miss.
+pub fn rdSlow(c: *Cpu, b: anytype, comptime T: type, a: u32, user: bool) Exc!T {
     const n = @sizeOf(T);
     if (n > 1 and (a & 0xFFF) > 0x1000 - n) {
         const p0 = try translate(c, b, a, false, user);
@@ -886,11 +1008,14 @@ pub fn rdPaged(c: *Cpu, b: anytype, comptime T: type, a: u32, user: bool) Exc!T 
         }
         return v;
     }
-    return rdM(b, T, try translate(c, b, a, false, user));
+    const ph = try translate(c, b, a, false, user);
+    const i = (a >> 12) & (TLB_N - 1);
+    if (c.tlb.perm[i] & D_R != 0) return @as(*align(1) const T, @ptrFromInt(c.tlb.hoff[i] +% a)).*;
+    return rdM(b, T, ph);
 }
 
 /// The same for writes (both pages translated before either is written).
-pub fn wrPaged(c: *Cpu, b: anytype, comptime T: type, a: u32, v: T, user: bool) Exc!void {
+pub fn wrSlow(c: *Cpu, b: anytype, comptime T: type, a: u32, v: T, user: bool) Exc!void {
     const n = @sizeOf(T);
     if (n > 1 and (a & 0xFFF) > 0x1000 - n) {
         const p0 = try translate(c, b, a, true, user);
@@ -902,7 +1027,34 @@ pub fn wrPaged(c: *Cpu, b: anytype, comptime T: type, a: u32, v: T, user: bool) 
         }
         return;
     }
-    wrM(b, T, try translate(c, b, a, true, user), v);
+    const ph = try translate(c, b, a, true, user);
+    const i = (a >> 12) & (TLB_N - 1);
+    if (c.tlb.perm[i] & D_W != 0) {
+        @as(*align(1) T, @ptrFromInt(c.tlb.hoff[i] +% a)).* = v;
+        return;
+    }
+    wrM(b, T, ph, v);
+}
+
+/// The fetch window for EIP `ip` at linear `lin`, if its page has host
+/// bytes (the TLB entry made by a fetch just now): to the page's end or
+/// CS's limit, whichever comes first.
+pub fn window(c: *Cpu, ip: u32, lin: u32) void {
+    const i = (lin >> 12) & (TLB_N - 1);
+    const need = D_R | access(c.cpl, false);
+    if (c.tlb.tag[i] != (lin & 0xFFFF_F000) | 1 or c.tlb.perm[i] & need != need) return;
+    const off = lin & 0xFFF;
+    const back = @min(off, ip);
+    const start = ip - back;
+    var len: u64 = 0x1000 - off + back;
+    // (short of EIP's wrap: a fetch from the window never has to wrap)
+    const last: u64 = @min(c.fetch_hi, c.ip_wrap - 1);
+    if (ip > last) return;
+    if (start + len - 1 > last) len = last - start + 1;
+    c.tlb.fw_idx = i;
+    c.tlb.fw_base = start;
+    c.tlb.fw_len = @intCast(len);
+    c.tlb.fw_host = c.tlb.hoff[i] +% (lin - back);
 }
 
 // ── Task switches ───────────────────────────────────────────────────────

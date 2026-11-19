@@ -52,3 +52,17 @@ test "cpu bench: simple instructions and REP MOVSD on the machine's bus" {
     const ns1 = nowNs() - t1;
     if (ns1 > 0) std.debug.print("cpu on Machine: rep movsd to A000: {d} M dwords/s\n", .{@as(u64, k) * 1000 / ns1});
 }
+
+test "cpu bench: the same loop under the translator (jit.sig)" {
+    th = .{ .jit = true };
+    var r = load(&.{ 0x01, 0xD8, 0x89, 0x04, 0x46, 0x8B, 0x1C, 0x81, 0xE6, 0xFF, 0x3F, 0x39, 0xD0, 0x74, 0xF1, 0xE2, 0xEF, 0xEB, 0xED });
+    if (m.cpu.jit == null) return; // (no code memory here)
+    r.setBx(1);
+    r.setDx(0xFFFF);
+    const n: u32 = if (builtin.mode == .debug) 2_000_000 else 1_000_000_000;
+    const t0 = nowNs();
+    try t.expectEqual(@import("cpu.sig").Exit.budget, m.cpu.run(&m, n));
+    const ns = nowNs() - t0;
+    if (ns > 0) std.debug.print("\ncpu on Machine, translated: {d} M instructions/s ({s})\n", .{ @as(u64, n) * 1000 / ns, @tagName(builtin.mode) });
+    th = .{};
+}

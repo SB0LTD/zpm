@@ -5,7 +5,8 @@
 //!     -Mroot=tools/dosrun.sig -Mdos=src/dos/dos.sig --name dosrun
 //!   dosrun PROGRAM.EXE [ARGS...] [--secs N] [--shot OUT.ppm] [--every S]
 //!          [--key T=CODE[,CODE...]]... [--mouse T=DX,DY,BUTTONS]...
-//!          [--ips N] [--trace] [--wav OUT.wav]
+//!          [--ips N] [--trace] [--wav OUT.wav] [--profile OUT.txt]
+//!          [--jit | --no-jit | --jit-check]
 //!
 //! --secs N: emulated seconds to run (default 10); --shot: the picture at
 //! the end as a PPM (--every S: also OUT-<t>.ppm every S seconds); --key
@@ -15,13 +16,27 @@
 //! emulated seconds the mouse moves by DX,DY mickeys with buttons B (bit 0
 //! left, 1 right, 2 middle). --wav: the sound (48 kHz
 //! stereo, 16-bit) into a WAV file, and its loudness in the log.
+//! --profile: the host's own profile (x86-64): every 250 us of the
+//! process's CPU time (SIGPROF) the interrupted instruction's address,
+//! one hex number a line, for addr2line -f -i on an unstripped build.
+//! --jit (the default): the CPU's translator (jit.sig) runs the program;
+//! --no-jit: the interpreter alone; --jit-check: the translator, in lockstep with a
+//! second, interpreted PC that must agree after every block (slow; the
+//! first difference is logged and the run stops).
 
 const std = @import("std");
 const linux = std.os.linux;
 const dos = @import("dos");
 
+/// The CPU's opcode counts (cpu.sig's count_ops): a profiling build
+/// sets this true; dosrun then prints the most frequent at the end.
+pub const dos_cpu_ops = false;
+
 var machine: dos.Machine = undefined;
 var host: dos.host_linux.LinuxHost = .{ .prefix = "[dos] " };
+/// --jit-check's interpreted twin.
+var twin: dos.Machine = undefined;
+var twin_host: dos.host_linux.LinuxHost = .{ .prefix = "[twin] ", .jit = false };
 /// The largest picture: VESA's 1600x1200.
 const MAX_W = 1600;
 const MAX_H = 1200;
@@ -32,6 +47,78 @@ fn out(comptime f: []const u8, args: anytype) void {
     var b: [400]u8 = undefined;
     const s = std.fmt.bufPrint(&b, f ++ "\n", args) catch return;
     _ = linux.write(2, s.ptr, s.len);
+}
+
+// The profiler: SIGPROF's interrupted RIP (ucontext: uc_flags, uc_link,
+// uc_stack (24 bytes), then mcontext's gregs[], RIP the 17th: 21st u64).
+var prof_buf: [1 << 21]u64 = undefined;
+var prof_n: usize = 0;
+
+fn onProf(sig: linux.SIG, info: *const linux.siginfo_t, ctx: ?*anyopaque) callconv(.c) void {
+    _ = sig;
+    _ = info;
+    const uc: [*]const u64 = @ptrCast(@alignCast(ctx orelse return));
+    if (prof_n < prof_buf.len) {
+        prof_buf[prof_n] = uc[21];
+        prof_n += 1;
+    }
+}
+
+fn profStart() void {
+    if (@import("builtin").cpu.arch != .x86_64) return;
+    var sa = linux.Sigaction{ .handler = .{ .sigaction = onProf }, .mask = linux.sigemptyset(), .flags = linux.SA.SIGINFO | linux.SA.RESTART };
+    _ = linux.sigaction(.PROF, &sa, null);
+    // (setitimer takes timevals: the "nsec" fields are microseconds)
+    const it = linux.itimerspec{ .it_interval = .{ .sec = 0, .nsec = 250 }, .it_value = .{ .sec = 0, .nsec = 250 } };
+    _ = linux.setitimer(@intFromEnum(linux.ITIMER.PROF), &it, null);
+}
+
+fn profSave(path: []const u8) void {
+    const it = linux.itimerspec{ .it_interval = .{ .sec = 0, .nsec = 0 }, .it_value = .{ .sec = 0, .nsec = 0 } };
+    _ = linux.setitimer(@intFromEnum(linux.ITIMER.PROF), &it, null);
+    var pb: [512]u8 = undefined;
+    if (path.len >= pb.len) return;
+    @memcpy(pb[0..path.len], path);
+    pb[path.len] = 0;
+    const r = linux.openat(linux.AT.FDCWD, @ptrCast(&pb), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o644);
+    if (@as(isize, @bitCast(r)) < 0) return;
+    const fd: i32 = @intCast(r);
+    var buf: [65536]u8 = undefined;
+    var n: usize = 0;
+    for (prof_buf[0..prof_n]) |a| {
+        const line = std.fmt.bufPrint(buf[n..], "{x}\n", .{a}) catch break;
+        n += line.len;
+        if (n > buf.len - 64) {
+            _ = linux.write(fd, &buf, n);
+            n = 0;
+        }
+    }
+    _ = linux.write(fd, &buf, n);
+    _ = linux.close(fd);
+    out("dosrun: {d} profile samples in {s}", .{ prof_n, path });
+}
+
+fn opsReport() void {
+    const c = &dos.cpu.op_counts;
+    var total: u64 = 0;
+    for (c) |n| total += n;
+    var done: [512]bool = [_]bool{false} ** 512;
+    out("dosrun: {d} M opcodes counted; TLB flushes {d}, misses {d}; the most frequent:", .{ total / 1_000_000, dos.cpu.tlb_stats[0], dos.cpu.tlb_stats[1] });
+    for (0..40) |_| {
+        var best: usize = 0;
+        var bn: u64 = 0;
+        for (c, 0..) |n, i| if (!done[i] and n > bn) {
+            bn = n;
+            best = i;
+        };
+        if (bn == 0) break;
+        done[best] = true;
+        if (best >= 256) {
+            out("  0F {x:0>2}  {d:.2}%", .{ best - 256, @as(f64, @floatFromInt(bn)) * 100 / @as(f64, @floatFromInt(total)) });
+        } else {
+            out("  {x:0>2}     {d:.2}%", .{ best, @as(f64, @floatFromInt(bn)) * 100 / @as(f64, @floatFromInt(total)) });
+        }
+    }
 }
 
 fn nowNs() u64 {
@@ -85,6 +172,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var ips: u32 = 25_000_000;
     var trace = false;
     var wav_path: ?[]const u8 = null;
+    var prof_path: ?[]const u8 = null;
+    const JitMode = enum { off, on, check };
+    var jit_mode: JitMode = .on;
+    var progress = false;
 
     var it = init.args.iterate();
     _ = it.next();
@@ -97,6 +188,18 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             shot_path = it.next();
         } else if (std.mem.eql(u8, a, "--wav")) {
             wav_path = it.next();
+        } else if (std.mem.eql(u8, a, "--profile")) {
+            prof_path = it.next();
+        } else if (std.mem.eql(u8, a, "--jit-flip")) {
+            host.code_flip = true;
+        } else if (std.mem.eql(u8, a, "--progress")) {
+            progress = true;
+        } else if (std.mem.eql(u8, a, "--jit")) {
+            jit_mode = .on;
+        } else if (std.mem.eql(u8, a, "--no-jit")) {
+            jit_mode = .off;
+        } else if (std.mem.eql(u8, a, "--jit-check")) {
+            jit_mode = .check;
         } else if (std.mem.eql(u8, a, "--trace")) {
             trace = true;
         } else if (std.mem.eql(u8, a, "--ips")) {
@@ -149,10 +252,29 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         tl += 1 + a.len;
     }
 
+    host.jit = jit_mode != .off;
     machine.init(host.host(), p.dir);
     machine.ips = ips;
     machine.trace = trace;
     if (!machine.start(p.dos_path, tail[0..tl])) return 1;
+    if (jit_mode != .off) {
+        if (machine.cpu.jit == null) {
+            out("dosrun: no translator here (no code memory): interpreting", .{});
+        } else if (jit_mode == .check) {
+            // (the twin: this PC as it is now, on a host whose clock
+            // says what this one's last said)
+            twin = machine;
+            twin.host = twin_host.host();
+            twin.cpu.jit = null;
+            twin.twin = null;
+            twin_host.clock_of = &host;
+            host.last_now = host.host().now();
+            machine.twin = &twin;
+            machine.cpu.jit.?.check = true;
+            machine.cpu.jit.?.flush();
+            out("dosrun: the translator, checked in lockstep with the interpreter", .{});
+        } else out("dosrun: the translator runs the program", .{});
+    }
     out("dosrun: {s}, C: = {s}, {d} s at {d} M instructions/s", .{ p.dos_path, p.dir, secs, ips / 1_000_000 });
     {
         const r = &machine.cpu.regs;
@@ -172,6 +294,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         }
     }
 
+    if (prof_path != null) profStart();
     const t0 = nowNs();
     const step_us: u32 = 10_000;
     var t_us: u64 = 0;
@@ -198,15 +321,26 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var status: dos.Status = .ran;
     while (t_us < secs * 1_000_000) : (t_us += step_us) {
         for (keys[0..nk]) |*k| if (!k.done and t_us >= k.at_us) {
-            for (k.codes[0..k.n]) |c| machine.key(c);
+            for (k.codes[0..k.n]) |c| {
+                machine.key(c);
+                if (machine.twin) |tw| tw.key(c);
+            }
             k.done = true;
         };
         for (mice[0..nm]) |*mo| if (!mo.done and t_us >= mo.at_us) {
             machine.mouseMove(mo.dx, mo.dy);
             machine.mouseButtons(mo.b);
+            if (machine.twin) |tw| {
+                tw.mouseMove(mo.dx, mo.dy);
+                tw.mouseButtons(mo.b);
+            }
             mo.done = true;
         };
         status = machine.run(step_us);
+        if (progress and t_us % 100_000 == 0) {
+            const r = &machine.cpu.regs;
+            out("dosrun: {d} ms: {d} instructions, at {x:0>4}:{x:0>8}, {d} ms of host time", .{ t_us / 1000, machine.cpu.executed, r.seg[dos.regs.CS], r.eip, (nowNs() - t0) / 1_000_000 });
+        }
         // (the sound is pulled as a host would, and dropped)
         machine.audio(&audio, 48000);
         for (audio) |v| {
@@ -232,11 +366,25 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         }
     }
     const wall = @as(f64, @floatFromInt(nowNs() - t0)) / 1e9;
+    if (prof_path) |pp| profSave(pp);
+    if (dos.cpu.count_ops) opsReport();
     const emu = @as(f64, @floatFromInt(t_us)) / 1e6;
     out("dosrun: {s} after {d:.2} emulated s in {d:.2} s ({d:.1}x real time), {d} M instructions", .{
         @tagName(status), emu, wall, emu / @max(wall, 1e-6), machine.cpu.executed / 1_000_000,
     });
     if (status == .exited) out("dosrun: exit code {d}", .{machine.dos.exit_code});
+    if (machine.cpu.jit) |j| {
+        const st = j.stats;
+        out("dosrun: jit: {d} blocks made, {d} dropped ({d} written, {d} by the check after services), {d} flushes, {d} entered, {d} chained, {d} interpreted steps, {d} checked by bytes, {d} KiB code", .{ st.blocks, st.invalidated, st.drop_written, st.drop_verify, st.flushes, st.entered, st.chained, st.interp, st.verified, j.used / 1024 });
+        if (dos.jit.dbg_ops) for (dos.jit.hstep_ops, 0..) |cnt, i| if (cnt > 2_000_000) out("hstep op {x}: {d} M", .{ i, cnt / 1_000_000 });
+        out("dosrun: jit: exits {d} through a chain slot, {d} other, {d} for the budget", .{ st.exit_slot, st.exit_other, st.exit_budget });
+        if (machine.twin) |tw| {
+            if (status != .fault) {
+                const same = dos.jit_check.memEql(&machine, tw);
+                out("dosrun: jit-check: {s}", .{if (same) "the interpreter agrees to the end" else "memory differs at the end"});
+            }
+        }
+    }
     if (samples > 0) out("dosrun: sound peak {d}, rms {d:.0}", .{ peak, @sqrt(sum_sq / @as(f64, @floatFromInt(samples))) });
     if (wav_fd >= 0) {
         var hdr: [44]u8 = undefined;

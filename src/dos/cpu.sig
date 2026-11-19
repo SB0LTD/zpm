@@ -72,6 +72,7 @@ const std = @import("std");
 const regs_mod = @import("regs.sig");
 const x87 = @import("cpu_x87.sig");
 const pm = @import("cpu_pm.sig");
+const jit_mod = @import("jit.sig");
 pub const Regs = regs_mod.Regs;
 pub const Fpu = x87.Fpu;
 
@@ -131,6 +132,18 @@ pub const SIGNATURE: u32 = 0x0435;
 /// exception's vector << 8 | the second's).
 pub const FAULT_V86: u32 = 0x7E00_0000;
 pub const FAULT_TRIPLE: u32 = 0x7F00_0000;
+
+/// A profile of the guest's instructions, for a profiling build: with
+/// the root module's `dos_cpu_ops = true` each instruction's first byte
+/// (a prefix too) is counted, a 0F opcode's second at 256 + it. Off,
+/// there is no code for it.
+pub const count_ops = blk: {
+    const root = @import("root");
+    break :blk @hasDecl(root, "dos_cpu_ops") and root.dos_cpu_ops;
+};
+pub var op_counts: [512]u64 = [_]u64{0} ** 512;
+/// (and the TLB's flushes and misses: cpu_pm.sig's stats)
+pub const tlb_stats = &pm.stats;
 
 pub const Exit = enum {
     /// The budget is spent.
@@ -307,6 +320,14 @@ inline fn outP(bus: anytype, comptime T: type, port: u16, v: T) void {
 
 /// EIP after a near transfer: 16 bits in real mode and for 16-bit
 /// operands.
+/// `p` as the compiler cannot know it (a volatile load); a non-pointer
+/// as it is.
+inline fn opaquePtr(p: anytype) @TypeOf(p) {
+    if (comptime @typeInfo(@TypeOf(p)) != .pointer) return p;
+    var h = p;
+    return @as(*volatile @TypeOf(p), &h).*;
+}
+
 inline fn ipMask(comptime P: bool, o32: bool) u32 {
     return if (P and o32) 0xFFFF_FFFF else 0xFFFF;
 }
@@ -369,6 +390,8 @@ pub const Cpu = struct {
     seg_lo: [6]u32 = [_]u32{0} ** 6,
     seg_rhi: [6]i64 = [_]i64{0xFFFF} ** 6,
     seg_whi: [6]i64 = [_]i64{0xFFFF} ** 6,
+    /// Bit s: segment s is flat (0 to 4 GiB, read and write): no checks.
+    seg_flat: u8 = 0,
     /// ESP and EFLAGS at the instruction's start (a fault restores them).
     ins_esp: u32 = 0,
     ins_flags: u32 = 0,
@@ -384,9 +407,14 @@ pub const Cpu = struct {
     /// machine asked for): run returns .fault.
     dead: bool = false,
     tlb: pm.Tlb = .{},
+    /// The translator (jit.sig), when the host gave it code memory: `run`
+    /// goes through it; null, everything is interpreted.
+    jit: ?*jit_mod.Jit = null,
 
     pub fn reset(self: *Cpu) void {
+        const j = self.jit;
         self.* = .{};
+        self.jit = j;
         self.regs.setSeg(CS, 0xF000);
         self.regs.eip = 0xFFF0;
         self.regs.r[EDX] = SIGNATURE;
@@ -394,16 +422,35 @@ pub const Cpu = struct {
 
     /// Runs at most `budget` instructions.
     pub fn run(self: *Cpu, bus: anytype, budget: u32) Exit {
-        self.poll = true;
+        if (comptime jit_mod.supports(@TypeOf(bus))) {
+            if (self.jit) |j| if (j.on) return jit_mod.run(self, bus, budget);
+        }
+        return self.interp(bus, budget);
+    }
+
+    /// `run` without the translator.
+    pub fn interp(self: *Cpu, bus: anytype, budget: u32) Exit {
+        return self.interpFrom(bus, budget, true);
+    }
+
+    /// The same, with `poll` as given (lockstep: as the translator had it).
+    pub fn interpFrom(self: *Cpu, bus: anytype, budget: u32, poll: bool) Exit {
+        self.poll = poll;
         if (self.dead) return .fault;
         if (self.halted) {
             if (self.regs.flags & IF != 0 and bus.irq()) return .irq;
             return .halt;
         }
         const end = self.executed + budget;
+        // (protected mode reaches the CPU and the bus through pointers the
+        // compiler cannot see through: a machine kept in a global otherwise
+        // has every field at an absolute address that takes two
+        // instructions to reach; real mode is faster without)
+        const me = opaquePtr(self);
+        const ob = opaquePtr(bus);
         while (true) {
             const why = if (self.cr0 & CR0_PE != 0)
-                self.loop(PmBus(@TypeOf(bus)){ .b = bus, .c = self }, end)
+                me.loop(PmBus(@TypeOf(bus)){ .b = ob, .c = me }, end)
             else
                 self.loop(bus, end);
             if (why) |w| return w;
@@ -414,11 +461,16 @@ pub const Cpu = struct {
     /// CR0.PE changes (null: `run` goes on in the other).
     fn loop(self: *Cpu, bus: anytype, end: u64) ?Exit {
         const P = comptime prot(@TypeOf(bus));
-        if (P) pm.syncAll(self);
+        if (P) {
+            pm.syncAll(self);
+            pm.checkKey(self, bus.b);
+        }
         while (self.executed < end) {
             var trace = false;
             if (self.poll) {
                 if ((self.cr0 & CR0_PE != 0) != P) return null;
+                // (IN/OUT and the services can move the A20 gate)
+                if (P) pm.checkKey(self, bus.b);
                 if (self.shadow) {
                     self.shadow = false;
                 } else {
@@ -458,6 +510,40 @@ pub const Cpu = struct {
         return .budget;
     }
 
+    /// The translator's: one instruction as `loop` runs it (counted unless
+    /// the block it is part of counted it already; a fault delivered; the
+    /// trace trap after it with `trace`), with `poll`, interrupts and the
+    /// mode left to the caller. `bus` is the mode's (PmBus in protected
+    /// mode).
+    pub fn stepJit(self: *Cpu, bus: anytype, end: u64, comptime count: bool, trace: bool) ?Exit {
+        if (count) self.executed += 1;
+        if (comptime prot(@TypeOf(bus))) {
+            self.ins_esp = self.regs.r[ESP];
+            self.ins_flags = self.regs.flags;
+            const res = self.step(bus, end) catch |e| blk: {
+                if (!self.keep) {
+                    self.regs.eip = self.ins_ip;
+                    self.regs.r[ESP] = self.ins_esp;
+                    self.regs.flags = self.ins_flags;
+                }
+                self.keep = false;
+                if (e == error.Stop) break :blk Exit.fault;
+                self.poll = true;
+                break :blk pm.exception(self, bus.b);
+            };
+            if (res) |why| return why;
+        } else {
+            const res = self.step(bus, end) catch unreachable;
+            if (res) |why| return why;
+        }
+        if (trace) {
+            self.interrupt(bus, 1);
+            self.poll = true;
+            if (self.dead) return .fault;
+        }
+        return null;
+    }
+
     /// Delivers interrupt `vec` now. In real mode as INT does: pushes
     /// FLAGS, CS and IP, clears IF and TF, and jumps through the vector
     /// table (at 0:vec*4 unless LIDT moved it). In protected mode as a
@@ -467,6 +553,7 @@ pub const Cpu = struct {
         if (comptime prot(@TypeOf(bus))) return pm.external(self, bus.b, vec);
         if (self.cr0 & CR0_PE != 0) {
             pm.syncAll(self);
+            pm.checkKey(self, bus);
             return pm.external(self, bus, vec);
         }
         const r = &self.regs;
@@ -535,22 +622,39 @@ pub const Cpu = struct {
     // ── Memory ──────────────────────────────────────────────────────────
 
     /// T at linear `a`: the bus itself in real mode; in protected mode
-    /// through paging (with CPL 3's rights at CPL 3).
+    /// through the TLB (paging, with CPL 3's rights at CPL 3): a hit on a
+    /// page the host has the bytes of is one load (cpu_pm.sig's Tlb).
     inline fn rdL(self: *Cpu, bus: anytype, comptime T: type, a: u32) Er(@TypeOf(bus))!T {
         if (comptime !prot(@TypeOf(bus))) return rdM(bus, T, a);
-        if (!self.paging) return rdM(bus.b, T, a);
-        return pm.rdPaged(self, bus.b, T, a, self.cpl == 3);
+        if (self.tlbHit(T, a, false)) |h| return @as(*align(1) const T, @ptrFromInt(h)).*;
+        return pm.rdSlow(self, bus.b, T, a, self.cpl == 3);
     }
 
     inline fn wrL(self: *Cpu, bus: anytype, comptime T: type, a: u32, v: T) Er(@TypeOf(bus))!void {
         if (comptime !prot(@TypeOf(bus))) return wrM(bus, T, a, v);
-        if (!self.paging) return wrM(bus.b, T, a, v);
-        return pm.wrPaged(self, bus.b, T, a, v, self.cpl == 3);
+        if (self.tlbHit(T, a, true)) |h| {
+            @as(*align(1) T, @ptrFromInt(h)).* = v;
+            return;
+        }
+        return pm.wrSlow(self, bus.b, T, a, v, self.cpl == 3);
+    }
+
+    /// The host address of a T at linear `a` if the TLB has its page's
+    /// bytes, with the rights for this access, and all of T is on it.
+    /// (the entry of T's last byte, matched against its first byte's
+    /// page: a hit is also an access within one page)
+    inline fn tlbHit(self: *const Cpu, comptime T: type, a: u32, comptime write: bool) ?usize {
+        const i = ((a +% (@sizeOf(T) - 1)) >> 12) & (pm.TLB_N - 1);
+        const u = @intFromBool(self.cpl == 3);
+        const tags = if (write) &self.tlb.wtag[u] else &self.tlb.rtag[u];
+        if (tags[i] == (a & 0xFFFF_F000) | 1) return self.tlb.hoff[i] +% a;
+        return null;
     }
 
     /// Segment s's limit and rights for `n` bytes at `off`: #GP(0), or
     /// #SS(0) for the stack. Two compares (a flat segment passes both).
     inline fn limit(self: *Cpu, s: u3, off: u32, comptime n: u32, comptime write: bool) Exc!void {
+        if (self.seg_flat & (@as(u8, 1) << s) != 0) return;
         const e: i64 = @as(i64, off) + (n - 1);
         const hi = if (write) self.seg_whi[s] else self.seg_rhi[s];
         if (e > hi or off < self.seg_lo[s]) return self.raise(if (s == SS) 12 else 13, 0);
@@ -568,19 +672,32 @@ pub const Cpu = struct {
     }
 
     /// The x87's accesses in protected mode (PmBus): a fault is noted.
-    fn stickyRd(self: *Cpu, b: anytype, comptime T: type, a: u32) T {
-        if (!self.paging) return rdM(b, T, a);
+    inline fn stickyRd(self: *Cpu, b: anytype, comptime T: type, a: u32) T {
+        if (self.tlbHit(T, a, false)) |h| return @as(*align(1) const T, @ptrFromInt(h)).*;
+        return self.stickyRdSlow(b, T, a);
+    }
+
+    fn stickyRdSlow(self: *Cpu, b: anytype, comptime T: type, a: u32) T {
         if (self.sticky) return 0;
-        return pm.rdPaged(self, b, T, a, self.cpl == 3) catch {
+        return pm.rdSlow(self, b, T, a, self.cpl == 3) catch {
             self.sticky = true;
             return 0;
         };
     }
 
-    fn stickyWr(self: *Cpu, b: anytype, comptime T: type, a: u32, v: T) void {
-        if (!self.paging) return wrM(b, T, a, v);
+    inline fn stickyWr(self: *Cpu, b: anytype, comptime T: type, a: u32, v: T) void {
+        if (!self.sticky) {
+            if (self.tlbHit(T, a, true)) |h| {
+                @as(*align(1) T, @ptrFromInt(h)).* = v;
+                return;
+            }
+        }
+        self.stickyWrSlow(b, T, a, v);
+    }
+
+    fn stickyWrSlow(self: *Cpu, b: anytype, comptime T: type, a: u32, v: T) void {
         if (self.sticky) return;
-        pm.wrPaged(self, b, T, a, v, self.cpl == 3) catch {
+        pm.wrSlow(self, b, T, a, v, self.cpl == 3) catch {
             self.sticky = true;
         };
     }
@@ -593,9 +710,30 @@ pub const Cpu = struct {
             self.regs.eip = (ip +% 1) & 0xFFFF;
             return bus.rd8(self.regs.base[CS] +% ip);
         }
-        if (ip > self.fetch_hi) return self.raise(13, 0);
-        self.regs.eip = (ip +% 1) & self.ip_wrap;
-        return self.rdL(bus, u8, self.regs.base[CS] +% ip);
+        return self.fetchPm(bus, u8, ip);
+    }
+
+    /// A protected-mode fetch: from the fetch window, else checked
+    /// against CS's limit, through the TLB, and the window moved there.
+    inline fn fetchPm(self: *Cpu, bus: anytype, comptime T: type, ip: u32) Exc!T {
+        const n: u32 = @sizeOf(T);
+        const d = ip -% self.tlb.fw_base;
+        if (@as(u64, d) + n <= self.tlb.fw_len) {
+            // (no wrap to mask: the window stops short of it)
+            self.regs.eip = ip + n;
+            return @as(*align(1) const T, @ptrFromInt(self.tlb.fw_host +% d)).*;
+        }
+        return self.fetchSlow(bus, T, ip);
+    }
+
+    fn fetchSlow(self: *Cpu, bus: anytype, comptime T: type, ip: u32) Exc!T {
+        const n: u32 = @sizeOf(T);
+        if (@as(u64, ip) + (n - 1) > self.fetch_hi) return self.raise(13, 0);
+        const lin = self.regs.base[CS] +% ip;
+        const v = try self.rdL(bus, T, lin);
+        self.regs.eip = (ip +% n) & self.ip_wrap;
+        pm.window(self, ip, lin);
+        return v;
     }
 
     inline fn fetch16(self: *Cpu, bus: anytype) Er(@TypeOf(bus))!u16 {
@@ -608,9 +746,7 @@ pub const Cpu = struct {
             const lo = try self.fetch8(bus);
             return lo | (@as(u16, try self.fetch8(bus)) << 8);
         }
-        if (@as(u64, ip) + 1 > self.fetch_hi) return self.raise(13, 0);
-        self.regs.eip = (ip +% 2) & self.ip_wrap;
-        return self.rdL(bus, u16, self.regs.base[CS] +% ip);
+        return self.fetchPm(bus, u16, ip);
     }
 
     inline fn fetch32(self: *Cpu, bus: anytype) Er(@TypeOf(bus))!u32 {
@@ -623,9 +759,7 @@ pub const Cpu = struct {
             const lo = try self.fetch16(bus);
             return lo | (@as(u32, try self.fetch16(bus)) << 16);
         }
-        if (@as(u64, ip) + 3 > self.fetch_hi) return self.raise(13, 0);
-        self.regs.eip = (ip +% 4) & self.ip_wrap;
-        return self.rdL(bus, u32, self.regs.base[CS] +% ip);
+        return self.fetchPm(bus, u32, ip);
     }
 
     inline fn fetchT(self: *Cpu, bus: anytype, comptime T: type) Er(@TypeOf(bus))!T {
@@ -644,15 +778,20 @@ pub const Cpu = struct {
         return self.modrmB(bus, p, try self.fetch8(bus));
     }
 
-    fn modrmB(self: *Cpu, bus: anytype, p: Pfx, b: u8) Er(@TypeOf(bus))!Mod {
-        var m = Mod{ .reg = @truncate(b >> 3), .rm = @truncate(b), .mem = b < 0xC0 };
-        if (!m.mem) return m;
+    /// (a register operand right here; memory operands out of line)
+    inline fn modrmB(self: *Cpu, bus: anytype, p: Pfx, b: u8) Er(@TypeOf(bus))!Mod {
+        if (b >= 0xC0) return Mod{ .reg = @truncate(b >> 3), .rm = @truncate(b), .mem = false };
+        return self.modrmMem(bus, p, b);
+    }
+
+    fn modrmMem(self: *Cpu, bus: anytype, p: Pfx, b: u8) Er(@TypeOf(bus))!Mod {
+        var m = Mod{ .reg = @truncate(b >> 3), .rm = @truncate(b), .mem = true };
         if (p.a32) try self.ea32(bus, &m, b >> 6) else try self.ea16(bus, &m, b >> 6);
         if (p.seg != NOSEG) m.seg = p.seg;
         return m;
     }
 
-    fn ea16(self: *Cpu, bus: anytype, m: *Mod, mode: u8) Er(@TypeOf(bus))!void {
+    inline fn ea16(self: *Cpu, bus: anytype, m: *Mod, mode: u8) Er(@TypeOf(bus))!void {
         const r = &self.regs.r;
         const bx: u16 = @truncate(r[EBX]);
         const bp: u16 = @truncate(r[EBP]);
@@ -679,7 +818,7 @@ pub const Cpu = struct {
         m.off = off;
     }
 
-    fn ea32(self: *Cpu, bus: anytype, m: *Mod, mode: u8) Er(@TypeOf(bus))!void {
+    inline fn ea32(self: *Cpu, bus: anytype, m: *Mod, mode: u8) Er(@TypeOf(bus))!void {
         const r = &self.regs.r;
         var off: u32 = 0;
         if (m.rm == 4) {
@@ -929,6 +1068,11 @@ pub const Cpu = struct {
         }
         self.regs.flags = f;
         return r;
+    }
+
+    /// The translator's (AArch64's flags): `shift` as it is.
+    pub fn shiftPub(self: *Cpu, comptime T: type, op: u3, a: T, count: u8) T {
+        return self.shift(T, op, a, count);
     }
 
     /// SHLD (left) / SHRD: `a` shifted, filled from `b`.
@@ -1469,6 +1613,9 @@ pub const Cpu = struct {
         const sz: A = @sizeOf(T);
         const d: A = if (self.regs.flags & DF != 0) 0 -% sz else sz;
         const ss = dataSeg(p);
+        // (real mode adds the bases itself, as they are now)
+        const sb = self.regs.base[ss];
+        const eb = self.regs.base[ES];
         const port: u16 = @truncate(self.regs.r[EDX]);
         const acc: T = self.getR(T, EAX);
         var si: A = @truncate(self.regs.r[ESI]);
@@ -1480,7 +1627,7 @@ pub const Cpu = struct {
         // (a fault part way keeps what is done: the restart goes on)
         errdefer self.strCommit(k, A, si, di);
         if (p.rep == 0) {
-            try self.strIter(bus, k, T, A, ss, &si, &di, d, port, acc);
+            try self.strIter(bus, k, T, A, ss, sb, eb, &si, &di, d, port, acc);
         } else {
             var cx: A = @truncate(self.regs.r[ECX]);
             errdefer self.setA(A, ECX, cx);
@@ -1495,7 +1642,7 @@ pub const Cpu = struct {
                     self.executed += 1;
                 }
                 first = false;
-                try self.strIter(bus, k, T, A, ss, &si, &di, d, port, acc);
+                try self.strIter(bus, k, T, A, ss, sb, eb, &si, &di, d, port, acc);
                 cx -%= 1;
                 if (k == .cmps or k == .scas) {
                     if ((self.regs.flags & ZF != 0) != (p.rep == 1)) break;
@@ -1523,7 +1670,27 @@ pub const Cpu = struct {
     }
 
     /// One iteration: the accesses first, then SI/DI move.
-    inline fn strIter(self: *Cpu, bus: anytype, comptime k: Str, comptime T: type, comptime A: type, ss: u3, si: *A, di: *A, d: A, port: u16, acc: T) Er(@TypeOf(bus))!void {
+    inline fn strIter(self: *Cpu, bus: anytype, comptime k: Str, comptime T: type, comptime A: type, ss: u3, sb: u32, eb: u32, si: *A, di: *A, d: A, port: u16, acc: T) Er(@TypeOf(bus))!void {
+        if (comptime !prot(@TypeOf(bus))) {
+            switch (k) {
+                .movs => wrM(bus, T, eb +% di.*, rdM(bus, T, sb +% si.*)),
+                .cmps => _ = self.sub(T, rdM(bus, T, sb +% si.*), rdM(bus, T, eb +% di.*), 0),
+                .stos => wrM(bus, T, eb +% di.*, acc),
+                .lods => self.setR(T, EAX, rdM(bus, T, sb +% si.*)),
+                .scas => _ = self.sub(T, self.getR(T, EAX), rdM(bus, T, eb +% di.*), 0),
+                .ins => wrM(bus, T, eb +% di.*, inP(bus, T, port)),
+                .outs => outP(bus, T, port, rdM(bus, T, sb +% si.*)),
+            }
+            switch (k) {
+                .movs, .cmps => {
+                    si.* +%= d;
+                    di.* +%= d;
+                },
+                .lods, .outs => si.* +%= d,
+                .stos, .scas, .ins => di.* +%= d,
+            }
+            return;
+        }
         switch (k) {
             .movs => {
                 try self.wrS(bus, T, ES, di.*, try self.rdS(bus, T, ss, si.*));
@@ -1572,7 +1739,7 @@ pub const Cpu = struct {
 
     // ── One instruction ─────────────────────────────────────────────────
 
-    fn step(self: *Cpu, bus: anytype, end: u64) Er(@TypeOf(bus))!?Exit {
+    inline fn step(self: *Cpu, bus: anytype, end: u64) Er(@TypeOf(bus))!?Exit {
         @setEvalBranchQuota(100_000);
         const P = comptime prot(@TypeOf(bus));
         self.ins_ip = self.regs.eip;
@@ -1580,7 +1747,9 @@ pub const Cpu = struct {
         var p: Pfx = .{ .o32 = d32, .a32 = d32 };
         var npfx: u8 = 0;
         const r = &self.regs;
-        sw: switch (try self.fetch8(bus)) {
+        const op0 = try self.fetch8(bus);
+        if (count_ops) op_counts[op0] += 1;
+        sw: switch (op0) {
             // Prefixes.
             0x26, 0x2E, 0x36, 0x3E => |op| {
                 p.seg = @truncate((op >> 3) & 3);
@@ -2030,6 +2199,7 @@ pub const Cpu = struct {
         @setEvalBranchQuota(100_000);
         const r = &self.regs;
         const op = try self.fetch8(bus);
+        if (count_ops) op_counts[256 + @as(u32, op)] += 1;
         const code: u32 = 0x0F00 | @as(u32, op);
         switch (op) {
             0x00 => return self.grp6(bus, p),

@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const host_mod = @import("host.sig");
+const builtin = @import("builtin");
 
 pub const MAX_FILES = 32;
 pub const MAX_SIZE = 512 * 1024;
@@ -31,6 +32,9 @@ pub const TestHost = struct {
     time: host_mod.Time = .{ .year = 1994, .month = 11, .day = 11, .weekday = 5, .hour = 12, .minute = 0, .second = 0, .hundredths = 0 },
     log_buf: [8192]u8 = undefined,
     log_len: usize = 0,
+    /// Executable memory for the CPU's translator (Linux only: the JIT's
+    /// tests turn it on; one region for the whole test run).
+    jit: bool = false,
 
     pub fn host(self: *TestHost) host_mod.Host {
         return .{ .ctx = self, .vt = &vtable };
@@ -227,5 +231,16 @@ pub const TestHost = struct {
         .dir_close = dirCloseF,
         .now = nowF,
         .log = logF,
+        .code_mem = codeMemF,
     };
+
+    fn codeMemF(ctx: *anyopaque, len: usize) ?host_mod.CodeMem {
+        if (!me(ctx).jit or builtin.os.tag != .linux) return null;
+        // (AArch64's tests run under QEMU's user mode: one mapping)
+        if (code_region == null) code_region = @import("host_linux.sig").mapCode(len, builtin.cpu.arch == .aarch64);
+        const c = code_region orelse return null;
+        return if (c.len >= len) c else null;
+    }
 };
+
+var code_region: ?host_mod.CodeMem = null;

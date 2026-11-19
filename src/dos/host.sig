@@ -59,6 +59,23 @@ pub const DirEntry = struct {
     }
 };
 
+/// Executable memory for the CPU's translator (jit.sig): one region the
+/// host maps once, written through `rw` and run from `rx` (the same
+/// bytes). A host that maps it twice (W^X: never writable and executable
+/// at one address) gives two pointers and no `unlock`/`lock`; a host that
+/// flips the protection gives one pointer twice, and the JIT calls
+/// `unlock` before it writes code and `lock` before it runs any again.
+/// The JIT itself makes written code visible to instruction fetch (on
+/// AArch64 with DC CVAU / IC IVAU; x86-64 needs nothing).
+pub const CodeMem = struct {
+    rw: [*]u8,
+    rx: [*]u8,
+    len: usize,
+    ctx: *anyopaque,
+    unlock: ?*const fn (ctx: *anyopaque) void = null,
+    lock: ?*const fn (ctx: *anyopaque) void = null,
+};
+
 pub const VTable = struct {
     open: *const fn (ctx: *anyopaque, path: []const u8, how: Open) i32,
     close: *const fn (ctx: *anyopaque, h: i32) void,
@@ -81,6 +98,9 @@ pub const VTable = struct {
     /// A line for the host's log (the machine's notices: an unknown
     /// service, a program's exit).
     log: *const fn (ctx: *anyopaque, line: []const u8) void,
+    /// `len` bytes of executable memory for the translator, once (null:
+    /// the host has none, and the CPU interprets everything).
+    code_mem: ?*const fn (ctx: *anyopaque, len: usize) ?CodeMem = null,
 };
 
 pub const Host = struct {
@@ -134,6 +154,10 @@ pub const Host = struct {
     }
     pub fn log(h: Host, line: []const u8) void {
         h.vt.log(h.ctx, line);
+    }
+    pub fn codeMem(h: Host, len: usize) ?CodeMem {
+        const f = h.vt.code_mem orelse return null;
+        return f(h.ctx, len);
     }
     /// A formatted log line (cut at 200 bytes).
     pub fn say(h: Host, comptime fmt: []const u8, args: anytype) void {
