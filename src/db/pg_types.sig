@@ -247,7 +247,7 @@ pub fn Types(comptime Result: type) type {
                     // prefix before the first zero. Binary is a raw byte.
                     const end = std.mem.indexOfScalar(u8, bytes, 0) orelse bytes.len;
                     const prefix = bytes[0..end];
-                    if (!std.unicode.utf8ValidateSlice(prefix)) return error.CharacterNotInRepertoire;
+                    if (!Io.validTextUtf8(prefix)) return error.CharacterNotInRepertoire;
                     break :blk prefix;
                 } else bytes;
                 try quote(out, &at, input);

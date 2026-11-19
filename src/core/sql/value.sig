@@ -451,6 +451,15 @@ pub fn Io(comptime config: types.Config) type {
         pub const Text = V.Text;
         pub const Cell = V.Cell;
         pub const Numerics = N;
+
+        /// Validate PostgreSQL UTF-8 text using the scalar streaming lexer.
+        /// NUL is invalid. Callers with C-string input semantics clip first.
+        pub fn validTextUtf8(input: []const u8) bool {
+            var check: @import("lexer.sig").Utf8Check = .{};
+            for (input) |byte| check.feed(byte);
+            return check.finish();
+        }
+
         pub const Documents = J;
         pub const SessionValues = SessionType;
         pub const typeInfo = types.typeInfo;
