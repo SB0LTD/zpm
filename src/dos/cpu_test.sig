@@ -821,13 +821,15 @@ test "cpu: invalid opcodes are int 6; CR0 and the system instructions" {
     try t.expectEqual(@as(u16, 0x0010), r.bx());
     try t.expectEqual(@as(u16, 0xFFFF), bus.rd16(DATA + 0x100));
 
-    // MOV CR0 with PE stops: .fault on the instruction.
+    // MOV CR0 and LMSW with PE enter protected mode (cpu_pm_test.sig):
+    // the HLT after them runs there, at CPL 0 on the real-mode caches.
     r = setup(&.{ 0x66, 0x83, 0xC8, 0x01, 0x0F, 0x22, 0xC0, 0xF4 });
-    try t.expectEqual(Exit.fault, go(10));
-    try t.expectEqual(@as(u32, 4), r.eip);
-    try t.expectEqual(@as(u32, 0x0F22C0), cpu.fault_op);
+    try t.expectEqual(Exit.halt, go(10));
+    try t.expectEqual(@as(u32, 8), r.eip);
+    try t.expectEqual(@as(u32, 1), cpu.cr0 & 1);
     r = setup(&.{ 0xB8, 0x01, 0x00, 0x0F, 0x01, 0xF0, 0xF4 });
-    try t.expectEqual(Exit.fault, go(10));
+    try t.expectEqual(Exit.halt, go(10));
+    try t.expectEqual(@as(u32, 1), cpu.cr0 & 1);
     // ...without PE it is fine.
     r = setup(&.{ 0x0F, 0x20, 0xC0, 0x66, 0x83, 0xC8, 0x08, 0x0F, 0x22, 0xC0, 0x0F, 0x06, 0x0F, 0x20, 0xC3, 0xF4 });
     try t.expectEqual(Exit.halt, go(10));

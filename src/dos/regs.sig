@@ -39,6 +39,15 @@ pub const Regs = struct {
     seg: [6]u16 = [_]u16{0} ** 6,
     /// Each segment's base: seg << 4 in real mode.
     base: [6]u32 = [_]u32{0} ** 6,
+    /// The rest of each segment's descriptor cache: the limit in bytes
+    /// (G applied) and the attributes, as LAR returns them shifted right
+    /// by 8 (bits 0-7: type, S, DPL, P; bits 12-15: AVL, 0, D/B, G).
+    /// Protected mode loads them from descriptors; real mode's loads
+    /// (`setSeg`) change only `seg` and `base`, so a 4 GiB limit set in
+    /// protected mode outlives the return to real mode ("unreal mode").
+    /// 0 in `attr` (not present) is an unusable (null) segment.
+    limit: [6]u32 = [_]u32{0xFFFF} ** 6,
+    attr: [6]u16 = .{ 0x93, 0x9B, 0x93, 0x93, 0x93, 0x93 },
     eip: u32 = 0,
     flags: u32 = FIXED,
 
