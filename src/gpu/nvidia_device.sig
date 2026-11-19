@@ -74,7 +74,7 @@ const CODE_GAP = 256;
 /// clcec0.h's WAIT_FOR_IDLE.
 const WAIT_FOR_IDLE: u32 = 0x0110;
 /// Run slots in flight: a run reuses a set only after its fence.
-const SETS = 2;
+const SETS = 4;
 
 /// The RTX 5070 Laptop's (GB206) caps, `vram` bytes of VRAM.
 pub fn rtx5070(vram: u64) gpu.Caps {
@@ -143,6 +143,97 @@ const Set = struct {
     dispatches: u32 = 0,
 };
 
+/// What the 3D engine's draws since its last wait for idle write (their
+/// colour, depth and stencil targets: a target's rows, block linear to its
+/// whole blocks) and read (their bindings: textures, buffers). A later
+/// draw that reads what they write, or writes what they read (a texture
+/// drawn into after a draw sampled it), waits for them.
+const Drawn = struct {
+    const MAX = 32;
+    writes: [MAX][2]u64 = undefined,
+    nw: usize = 0,
+    reads: [MAX][2]u64 = undefined,
+    nr: usize = 0,
+    /// more ranges than room: the next draw waits
+    full: bool = false,
+
+    /// [lo, hi) into `set`, merged with a range it meets or nearly meets
+    /// (a draw's uniforms follow the one before's in the engine's ring).
+    fn note(dn: *Drawn, set: *[MAX][2]u64, n: *usize, lo: u64, hi: u64) void {
+        const GAP = 4096;
+        for (set[0..n.*]) |*x| {
+            if (lo <= x[1] + GAP and x[0] <= hi + GAP) {
+                x[0] = @min(x[0], lo);
+                x[1] = @max(x[1], hi);
+                return;
+            }
+        }
+        if (n.* == MAX) {
+            dn.full = true;
+            return;
+        }
+        set[n.*] = .{ lo, hi };
+        n.* += 1;
+    }
+
+    fn meets(set: []const [2]u64, lo: u64, hi: u64) bool {
+        for (set) |x| if (lo < x[1] and x[0] < hi) return true;
+        return false;
+    }
+
+    /// Draw g's targets' memory: colour (and the others), depth, stencil.
+    fn targets(g: *const gpu.Graphics, out: *[10][2]u64) []const [2]u64 {
+        // (block linear: rows to a whole block of GOBs, 8 rows a GOB, 2^n
+        // GOBs a block)
+        const rows: u64 = if (g.gobs_log2) |b| std.mem.alignForward(u64, g.height, @as(u64, 8) << b) else g.height;
+        var n: usize = 0;
+        out[n] = .{ g.va, g.va + @as(u64, g.stride) * rows };
+        n += 1;
+        for (g.more) |m| if (m) |c| {
+            out[n] = .{ c.va, c.va + @as(u64, c.stride) * rows };
+            n += 1;
+        };
+        if (g.depth) |z| {
+            const zrows: u64 = std.mem.alignForward(u64, z.height, @as(u64, 8) << z.gobs_log2);
+            out[n] = .{ z.va, z.va + std.mem.alignForward(u64, @as(u64, z.width) * 4, 64) * zrows };
+            n += 1;
+            if (z.stencil_va) |sv| {
+                out[n] = .{ sv, sv + std.mem.alignForward(u64, z.width, 64) * zrows };
+                n += 1;
+            }
+        }
+        return out[0..n];
+    }
+
+    /// Whether draw d (g its state) must wait for the draws noted.
+    fn hazard(dn: *const Drawn, d: gpu.Dispatch, g: *const gpu.Graphics) bool {
+        if (dn.full) return true;
+        for (d.buffers) |b| {
+            if (meets(dn.writes[0..dn.nw], b.gpu, b.gpu +| @max(b.bytes, 1))) return true;
+        }
+        var t: [10][2]u64 = undefined;
+        for (targets(g, &t)) |x| {
+            if (meets(dn.reads[0..dn.nr], x[0], x[1])) return true;
+        }
+        return false;
+    }
+
+    fn add(dn: *Drawn, d: gpu.Dispatch, g: *const gpu.Graphics) void {
+        var t: [10][2]u64 = undefined;
+        for (targets(g, &t)) |x| dn.note(&dn.writes, &dn.nw, x[0], x[1]);
+        for (d.buffers) |b| {
+            if (b.gpu == 0) continue;
+            dn.note(&dn.reads, &dn.nr, b.gpu, b.gpu +| @max(b.bytes, 1));
+        }
+    }
+};
+
+/// A graphics dispatch whose programs store to memory (a storage buffer,
+/// a query's word): it waits for the draws before it, and they for it.
+fn writesMemory(d: gpu.Dispatch, g: *const gpu.Graphics) bool {
+    return d.prog.bin.writes != 0 or g.vertex.bin.writes != 0;
+}
+
 pub const Adapter = struct {
     vram: nv.Device = undefined,
     host: ?nv.Device = null,
@@ -171,6 +262,9 @@ pub const Adapter = struct {
     zero: nv.Buffer = .{},
     /// Graphics dispatches run.
     draws: u64 = 0,
+    /// Every graphics dispatch waits for the one before it to be done
+    /// (as before draws overlapped: to compare).
+    serial_draws: bool = false,
     /// Why the last graphics dispatch was refused (gl3d.whyNot:
     /// the 3D engine would lose the channel to it), or null.
     refused: ?[]const u8 = null,
@@ -370,12 +464,22 @@ pub const Adapter = struct {
         // (the patch kernels' QMDs, in the slots after the dispatches')
         var extra: usize = 0;
         var graphics: u32 = 0;
+        // The 3D engine's draws since its last wait for idle (`drawn`:
+        // what they write), when the dispatch before was one of them.
+        var drawn = Drawn{};
+        var after_draw = false;
         for (ds, 0..) |d0, i| {
             var d = d0;
             if (d.graphics) |g| {
                 // (the 3D engine draws in the dispatch's place: what came
                 // before it done first, and done itself before what comes
-                // after: WAIT_FOR_IDLE on either side)
+                // after: WAIT_FOR_IDLE on either side. Between two draws
+                // the engine keeps their order itself (its blending and
+                // depth tests are in order): a draw waits for the ones
+                // before only when it reads what they write (a texture
+                // drawn into), or writes memory beside its targets.
+                // tools/drawbench: 200 small textured draws a frame took
+                // the GPU 15 ms one at a time, each its warps alone.)
                 if (!a.caps.graphics) return error.Unsupported;
                 graphics += 1;
                 if (graphics > MAX_GRAPHICS) return error.Unsupported;
@@ -387,14 +491,31 @@ pub const Adapter = struct {
                     return error.Unsupported;
                 }
                 try a.graphicsSlot(s, i, d, g);
-                p.method(push.SUBCH_COMPUTE, WAIT_FOR_IDLE, &.{0});
-                gl3d.emit(&p, &draw);
-                p.method(gl3dSubch(), WAIT_FOR_IDLE, &.{0});
-                p.invalidateShaderCaches();
-                a.barriers += 2;
+                if (!after_draw) {
+                    p.method(push.SUBCH_COMPUTE, WAIT_FOR_IDLE, &.{0});
+                    a.barriers += 1;
+                } else if (a.serial_draws or drawn.hazard(d, g) or writesMemory(d, g)) {
+                    p.method(gl3dSubch(), WAIT_FOR_IDLE, &.{0});
+                    p.invalidateShaderCaches();
+                    a.barriers += 1;
+                    drawn = .{};
+                }
+                // (the 3D engine's whole state at the run's first draw; a
+                // later one's own state alone, but each whole with serial_draws)
+                if (graphics == 1 or a.serial_draws) gl3d.emit(&p, &draw) else gl3d.emitNext(&p, &draw);
+                drawn.add(d, g);
+                after_draw = true;
                 hz = .{};
                 a.draws += 1;
                 continue;
+            }
+            if (after_draw) {
+                // (what the draws wrote done before a dispatch reads it)
+                p.method(gl3dSubch(), WAIT_FOR_IDLE, &.{0});
+                p.invalidateShaderCaches();
+                a.barriers += 1;
+                after_draw = false;
+                drawn = .{};
             }
             if (d.indirect) |ind| {
                 // the counts into this dispatch's QMD and cbuf0, by the
@@ -430,6 +551,11 @@ pub const Adapter = struct {
                 a.barriers += 1;
             }
             p.launch(s.slots.va + i * SLOT_BYTES);
+        }
+        if (after_draw) {
+            p.method(gl3dSubch(), WAIT_FOR_IDLE, &.{0});
+            p.invalidateShaderCaches();
+            a.barriers += 1;
         }
         p.method(push.SUBCH_COMPUTE, WAIT_FOR_IDLE, &.{0});
         p.reportTimestamp(s.stamps.va + 16, 2);
@@ -995,6 +1121,113 @@ test "graphics dispatches: a quad's colors carried across it by the emulated 3D 
     try testing.expect(T.dev.adapter.draws == 2);
     d.free(target);
     d.free(vb);
+    d.unload(&vp);
+    d.unload(&pp);
+}
+
+test "graphics dispatches in one run: the 3D engine's state once, a draw waiting for those before only where it reads what they drew" {
+    const gl = @import("nvidia_gl.sig");
+    T.dev.init(&T.arena, &T.view, &T.work);
+    T.dev.withEngine(&GT.engine);
+    const d = T.dev.device();
+    var vk = newKernel("vs", .{ 1, 1, 1 });
+    glVertex(&vk);
+    try vk.finish();
+    T.st.asm_work.sched = .{};
+    const vbin = try gl.compileStage(&vk, d.caps, &T.st, .vertex, 0, &GT.vcode);
+    var pk = newKernel("ps", .{ 1, 1, 1 });
+    glPixel(&pk);
+    try pk.finish();
+    T.st.asm_work.sched = .{};
+    const pbin = try gl.compileStage(&pk, d.caps, &T.st, .pixel, 0, &GT.pcode);
+    // (the stages store only their outputs: nothing in memory)
+    try testing.expectEqual(@as(u32, 0), vbin.writes);
+    try testing.expectEqual(@as(u32, 0), pbin.writes);
+    const vp = try d.load(&vbin);
+    const pp = try d.load(&pbin);
+    const W = 32;
+    const H = 16;
+    const target = try d.alloc(W * H * 4, .host);
+    const vb = try d.alloc(6 * 6 * 4, .host);
+    const vb2 = try d.alloc(6 * 6 * 4, .host);
+    const quad = [6][2]f32{ .{ -1, -1 }, .{ 1, -1 }, .{ -1, 1 }, .{ 1, -1 }, .{ 1, 1 }, .{ -1, 1 } };
+    const f1: []f32 = @alignCast(std.mem.bytesAsSlice(f32, vb.cpu[0 .. 6 * 6 * 4]));
+    const f2: []f32 = @alignCast(std.mem.bytesAsSlice(f32, vb2.cpu[0 .. 6 * 6 * 4]));
+    // the first: colours across the target; the second half-transparent
+    // black over the left half, red and alpha written, blended
+    for (quad, 0..) |q, i| f1[6 * i ..][0..6].* = .{ q[0], q[1], (q[0] + 1) / 2, 0.5, (1 - q[1]) / 2, 1 };
+    for (quad, 0..) |q, i| f2[6 * i ..][0..6].* = .{ @min(q[0], 0), q[1], 0, 0, 0, 0.5 };
+    d.toDevice(vb, 0, 6 * 6 * 4);
+    d.toDevice(vb2, 0, 6 * 6 * 4);
+    const g1 = gpu.Graphics{
+        .vertex = &vp,
+        .va = target.gpu,
+        .width = W,
+        .height = H,
+        .stride = W * 4,
+        .format = .rgba8,
+        .scale = .{ W / 2, H / 2, 0.5 },
+        .offset = .{ W / 2, H / 2, 0.5 },
+        .scissor = .{ 0, 0, W, H },
+        .count = 6,
+    };
+    var g2 = g1;
+    g2.blend = .{ .src_rgb = .src_alpha, .dst_rgb = .one_minus_src_alpha, .src_a = .one, .dst_a = .one_minus_src_alpha };
+    g2.mask = 0b1001;
+    const a1 = gpu.Dispatch{ .prog = &pp, .groups = .{ 1, 1, 1 }, .buffers = &.{ vb, vb }, .params = &.{}, .graphics = &g1 };
+    const a2 = gpu.Dispatch{ .prog = &pp, .groups = .{ 1, 1, 1 }, .buffers = &.{ vb2, vb2 }, .params = &.{}, .graphics = &g2 };
+    // (the first drawn again after the second: its state, blend off and
+    // every channel, set again over the second's)
+    const a3 = a1;
+    // the draws a run each: what one run of all three must draw
+    var want: [W * H * 4]u8 = undefined;
+    @memset(target.cpu[0 .. W * H * 4], 0x11);
+    d.toDevice(target, 0, W * H * 4);
+    try runWait(d, &.{a1});
+    try runWait(d, &.{a2});
+    d.fromDevice(target, 0, W * H * 4);
+    const mid = target.cpu[0 .. W * H * 4].*;
+    try runWait(d, &.{a3});
+    d.fromDevice(target, 0, W * H * 4);
+    @memcpy(&want, target.cpu[0 .. W * H * 4]);
+    try testing.expect(!std.mem.eql(u8, &mid, &want));
+    // one run: a wait before the first draw and after the last, none
+    // between (no draw reads the target)
+    @memset(target.cpu[0 .. W * H * 4], 0x11);
+    d.toDevice(target, 0, W * H * 4);
+    try runWait(d, &.{ a1, a2, a3 });
+    try testing.expectEqual(@as(u32, 2), T.dev.adapter.barriers);
+    d.fromDevice(target, 0, W * H * 4);
+    try testing.expectEqualSlices(u8, &want, target.cpu[0 .. W * H * 4]);
+    // (the second blended over the first in the same run: its blend and
+    // channels set over the first's state)
+    @memset(target.cpu[0 .. W * H * 4], 0x11);
+    d.toDevice(target, 0, W * H * 4);
+    try runWait(d, &.{ a1, a2 });
+    d.fromDevice(target, 0, W * H * 4);
+    try testing.expectEqualSlices(u8, &mid, target.cpu[0 .. W * H * 4]);
+    // a draw whose bindings meet the target (a texture drawn into) waits
+    var a4 = a2;
+    a4.buffers = &.{ target, vb2 };
+    @memset(target.cpu[0 .. W * H * 4], 0x11);
+    d.toDevice(target, 0, W * H * 4);
+    try runWait(d, &.{ a1, a4, a3 });
+    // (and the third, drawing into what the second read, waits for it)
+    try testing.expectEqual(@as(u32, 4), T.dev.adapter.barriers);
+    d.fromDevice(target, 0, W * H * 4);
+    try testing.expectEqualSlices(u8, &want, target.cpu[0 .. W * H * 4]);
+    // serial_draws: each waits, each with the whole state
+    T.dev.adapter.serial_draws = true;
+    @memset(target.cpu[0 .. W * H * 4], 0x11);
+    d.toDevice(target, 0, W * H * 4);
+    try runWait(d, &.{ a1, a2, a3 });
+    try testing.expectEqual(@as(u32, 4), T.dev.adapter.barriers);
+    d.fromDevice(target, 0, W * H * 4);
+    try testing.expectEqualSlices(u8, &want, target.cpu[0 .. W * H * 4]);
+    T.dev.adapter.serial_draws = false;
+    d.free(target);
+    d.free(vb);
+    d.free(vb2);
     d.unload(&vp);
     d.unload(&pp);
 }

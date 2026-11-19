@@ -68,8 +68,14 @@ fn uniforms(tint: [4]f32, out: []u32) void {
 /// Draws the triangle with `vs` and `ps` into a cleared target; the pixel
 /// at the middle.
 fn drawOne(vs: []const u8, ps: []const u8, verts: [3]Vert, uni: []const u32, texture_img: ?*engine.Image) ![4]u8 {
+    return drawInto(.rgba8, .rgba8, vs, ps, verts, uni, texture_img);
+}
+
+/// drawOne into a target of format `target_format`, its middle pixel read
+/// back as `read_as` (its bytes in that format's order).
+fn drawInto(target_format: engine.Format, read_as: engine.Format, vs: []const u8, ps: []const u8, verts: [3]Vert, uni: []const u32, texture_img: ?*engine.Image) ![4]u8 {
     const e = engineCpu();
-    var target = e.newImage(W, H, .rgba8) orelse return error.NoImage;
+    var target = e.newImage(W, H, target_format) orelse return error.NoImage;
     defer e.freeImage(&target);
     e.fill(&target, .{ .x0 = 0, .y0 = 0, .x1 = W, .y1 = H }, 0, 0);
     var vb = e.newBuffer(@sizeOf([3]Vert)) orelse return error.NoBuffer;
@@ -98,7 +104,7 @@ fn drawOne(vs: []const u8, ps: []const u8, verts: [3]Vert, uni: []const u32, tex
         return error.Generation;
     }
     var px: [W * H * 4]u8 = undefined;
-    e.read(&target, 0, 0, W, H, &px, W * 4, .rgba8);
+    e.read(&target, 0, 0, W, H, &px, W * 4, read_as);
     const at = ((H / 2) * W + W / 2) * 4;
     return px[at..][0..4].*;
 }
@@ -162,6 +168,76 @@ test "Direct3D: sample, the immediate constant buffer in a loop, frc, discard" {
     defer e.freeImage(&img2);
     const px2 = try drawOne(&fx.vs40, &fx.pstex40, coverAll(.{ 0.5, 0.5, 0, 1 }), &uni, &img2);
     try near(px2, .{ 0, 0, 0, 0 }, 0);
+}
+
+/// A 2x2 texture of format `format`, each texel the bytes `stored` (as the
+/// format keeps them), and its descriptor.
+fn textureStored(e: *engine.Engine, format: engine.Format, stored: [4]u8, no_alpha: bool, img: *engine.Image, desc: []u32) void {
+    img.* = e.newImage(2, 2, format).?;
+    img.no_alpha = no_alpha;
+    var texels: [16]u8 = undefined;
+    for (0..4) |i| @memcpy(texels[i * 4 ..][0..4], &stored);
+    e.write(img, 0, 0, 2, 2, &texels, 8, format);
+    var dw: [texture.DESC_WORDS]u32 = undefined;
+    texture.descriptor(.{ .img = img }, &dw);
+    @memcpy(desc[0..texture.DESC_WORDS], &dw);
+}
+
+/// The sampled colour (ps_tex: its red, green and blue times a white tint)
+/// of a texture made of `stored` texels, drawn into `target` (read back
+/// as R, G, B, A).
+fn sampledRgb(format: engine.Format, stored: [4]u8, no_alpha: bool, target: engine.Format) ![3]u8 {
+    const e = engineCpu();
+    var uni: [CB_WORDS + texture.DESC_WORDS]u32 = undefined;
+    uniforms(.{ 1, 1, 1, 1 }, uni[0..CB_WORDS]);
+    var img: engine.Image = undefined;
+    textureStored(e, format, stored, no_alpha, &img, uni[CB_WORDS..]);
+    defer e.freeImage(&img);
+    const px = try drawInto(target, .rgba8, &fx.vs40, &fx.pstex40, coverAll(.{ 0.5, 0.5, 0, 1 }), &uni, &img);
+    return px[0..3].*;
+}
+
+test "Direct3D: B8G8R8A8, B8G8R8X8 and R8G8B8A8 textures sample as R, G, B" {
+    // (red 200, green 100, blue 30: each format's bytes as Direct3D keeps
+    // them; a swapped red and blue reads 30, 100, 200)
+    const want = [3]u8{ 200, 100, 30 };
+    // R8G8B8A8: bytes R, G, B, A
+    try std.testing.expectEqual(want, try sampledRgb(.rgba8, .{ 200, 100, 30, 255 }, false, .rgba8));
+    // B8G8R8A8 (DXGI 87): bytes B, G, R, A
+    try std.testing.expectEqual(want, try sampledRgb(.bgra8, .{ 30, 100, 200, 255 }, false, .rgba8));
+    // B8G8R8X8 (DXGI 88): the X byte 0, alpha read as 1 (ps_tex discards
+    // alpha under 0.5: a drawn pixel says it read 1)
+    try std.testing.expectEqual(want, try sampledRgb(.bgra8, .{ 30, 100, 200, 0 }, true, .rgba8));
+    // into a B8G8R8A8 render target too (read back as R, G, B, A)
+    try std.testing.expectEqual(want, try sampledRgb(.bgra8, .{ 30, 100, 200, 255 }, false, .bgra8));
+    try std.testing.expectEqual(want, try sampledRgb(.rgba8, .{ 200, 100, 30, 255 }, false, .bgra8));
+}
+
+test "Direct3D: a B8G8R8A8 render target keeps B, G, R, A bytes" {
+    var uni: [CB_WORDS]u32 = undefined;
+    uniforms(.{ 1, 1, 1, 1 }, &uni);
+    const c = [4]f32{ 200.0 / 255.0, 100.0 / 255.0, 30.0 / 255.0, 1 };
+    try near(try drawInto(.bgra8, .bgra8, &fx.vs40, &fx.ps40, coverAll(c), &uni, null), .{ 30, 100, 200, 255 }, 0);
+    try near(try drawInto(.bgra8, .rgba8, &fx.vs40, &fx.ps40, coverAll(c), &uni, null), .{ 200, 100, 30, 255 }, 0);
+    try near(try drawInto(.rgba8, .rgba8, &fx.vs40, &fx.ps40, coverAll(c), &uni, null), .{ 200, 100, 30, 255 }, 0);
+}
+
+test "texture: the descriptor puts R, G, B, A where the format keeps them" {
+    const e = engineCpu();
+    var img = e.newImage(2, 2, .bgra8).?;
+    defer e.freeImage(&img);
+    var dw: [texture.DESC_WORDS]u32 = undefined;
+    // (the API's swizzle, in R, G, B, A; the border red 1.0, blue 0.25)
+    texture.descriptor(.{ .img = &img, .swizzle = .{ 0, 1, 2, texture.SWZ_ONE }, .border = .{ @bitCast(@as(f32, 1)), 0, @bitCast(@as(f32, 0.25)), 0 } }, &dw);
+    const swz = dw[4];
+    try std.testing.expectEqual(@as(u32, 2 | 1 << 3 | 0 << 6 | texture.SWZ_ONE << 9), swz);
+    // (the border's words in the texel's order: blue first)
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, 0.25))), dw[texture.DESC_WORDS - 4]);
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, 1))), dw[texture.DESC_WORDS - 2]);
+    var rgba = e.newImage(2, 2, .rgba8).?;
+    defer e.freeImage(&rgba);
+    texture.descriptor(.{ .img = &rgba }, &dw);
+    try std.testing.expectEqual(texture.IDENTITY, dw[4]);
 }
 
 test "Direct3D: a wrong stage or a damaged blob fails with a log, not a crash" {

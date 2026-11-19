@@ -53,7 +53,8 @@ const D_AT = 11; // level l's byte offset at D_AT + l
 const D_LAYERS = D_AT + engine.MAX_LEVELS;
 const D_IMAGE_LEVELS = D_LAYERS + 1;
 /// The border color (CLAMP_TO_BORDER), in the texel's channel order: four
-/// words, a float's bits or an integer's.
+/// words, a float's bits or an integer's (State.border is in R, G, B, A:
+/// `descriptor` stores it so).
 const D_BORDER = D_IMAGE_LEVELS + 1;
 pub const DESC_WORDS = D_BORDER + 4;
 
@@ -89,8 +90,13 @@ pub const State = struct {
     img: ?*engine.Image = null,
     layers: u32 = 1,
     srgb: bool = false,
-    /// GL's channels as the texel's (or SWZ_ZERO, SWZ_ONE), the format's
-    /// swizzle (BGRA, LUMINANCE ...) and TEXTURE_SWIZZLE_* composed
+    /// The API's channels as the format's R, G, B, A (or SWZ_ZERO,
+    /// SWZ_ONE): a format's swizzle (LUMINANCE, ALPHA ...) and
+    /// TEXTURE_SWIZZLE_* composed. Where the image keeps R, G, B and A in
+    /// its texels (bgra8's bytes are B, G, R, A) is `descriptor`'s to add,
+    /// from the image's format, never the caller's: Direct3D's B8G8R8A8
+    /// textures (galaxy-pe's) were sampled with red and blue exchanged
+    /// while GL and Vulkan each swapped them themselves.
     swizzle: [4]u3 = .{ 0, 1, 2, 3 },
     wrap_s: Wrap = .repeat,
     wrap_t: Wrap = .repeat,
@@ -107,9 +113,15 @@ pub const State = struct {
     last: u8 = 0,
     min_lod: f32 = -1000,
     max_lod: f32 = 1000,
-    /// the border color in the texel's channel order (before the swizzle)
+    /// the border color: R, G, B, A (before the swizzle)
     border: [4]u32 = .{ 0, 0, 0, 0 },
 };
+
+/// Where format `fmt` keeps R, G, B and A in its texel: channel i of
+/// the format is the texel's channel storedAt(fmt)[i].
+pub fn storedAt(fmt: engine.Format) [4]u3 {
+    return if (fmt == .bgra8) .{ 2, 1, 0, 3 } else .{ 0, 1, 2, 3 };
+}
 
 /// A texture's descriptor words.
 pub fn descriptor(s: State, out: *[DESC_WORDS]u32) void {
@@ -130,10 +142,13 @@ pub fn descriptor(s: State, out: *[DESC_WORDS]u32) void {
     if (img.layout.block) {
         out[D_FMT] |= F_BLOCK | @as(u32, @intFromEnum(img.layout.swizzle)) << 16 | @as(u32, img.layout.gobs_log2) << 18;
     }
+    // (the format's R, G, B, A as the texel's channels: bgra8's B, G, R, A)
+    const at = storedAt(fmt);
     var swz: u32 = 0;
     for (s.swizzle, 0..) |c, i| {
+        const stored: u32 = if (c < 4) at[c] else c;
         // (an image without alpha reads opaque)
-        const cc: u32 = if (img.no_alpha and c == 3) SWZ_ONE else c;
+        const cc: u32 = if (img.no_alpha and stored == 3) SWZ_ONE else stored;
         swz |= cc << @intCast(3 * i);
     }
     out[D_SWZ] = swz;
@@ -149,7 +164,7 @@ pub fn descriptor(s: State, out: *[DESC_WORDS]u32) void {
     for (0..img.levels) |l| out[D_AT + l] = img.level_at[l];
     out[D_LAYERS] = s.layers;
     out[D_IMAGE_LEVELS] = img.levels;
-    for (s.border, 0..) |w, i| out[D_BORDER + i] = w;
+    for (s.border, at) |w, c| out[D_BORDER + @as(u32, c)] = w;
 }
 
 /// What a sampler returns: floats, or int or uint bits.

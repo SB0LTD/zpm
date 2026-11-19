@@ -470,7 +470,11 @@ pub const Channel = struct {
         return c.progress.* > c.fence;
     }
 
-    /// Waits for fence `f` (polling, `timeout_us` at most).
+    /// Waits for fence `f` (polling, `timeout_us` at most). A timeout of 0
+    /// looks once (gpu.Device.done's question: is it done yet?): the spins
+    /// before the first sleep were each such question's, 20000 pauses, a
+    /// draw's 75 us in gfxapi's engine (tools/drawbench: it asks whether
+    /// the batches in flight are done before each allocation).
     pub fn wait(c: *Channel, f: u64, timeout_us: u64) Error!void {
         var spins: u32 = 0;
         var slept_us: u64 = 0;
@@ -478,6 +482,7 @@ pub const Channel = struct {
             const p = c.progress.*;
             if (p > c.fence) return error.DeviceLost;
             if (p >= f) return;
+            if (timeout_us == 0) return error.Timeout;
             if (spins < 20_000) {
                 spins += 1;
                 std.atomic.spinLoopHint();

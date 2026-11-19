@@ -2896,3 +2896,146 @@ test "draw: GL's depth-tested frames into a framebuffer object on the RTX: its t
         try std.testing.expectEqual(@as(u32, 0), apart(&want, &got, W, 0, "GL frames: the CPU against the RTX"));
     }
 }
+
+// ── A Direct3D 6 game's frame (galaxy-pe's ddraw over pe_gpu) ─────────────
+
+const d3d = struct {
+    const gen = gfxapi.dxbc_gen;
+    const fx = gfxapi.dxbc_fixtures;
+    const texture = gfxapi.texture;
+    const FW = 48;
+    const FH = 32;
+    const DRAWS = 24;
+    const CB_WORDS = 20;
+    const DVert = extern struct { pos: [3]f32, color: [4]f32 };
+
+    fn varying(_: ?*const anyopaque, name: []const u8, index: u32) ?u32 {
+        if (std.ascii.eqlIgnoreCase(name, "COLOR") and index == 0) return 0;
+        return null;
+    }
+    fn cbuffer(_: ?*const anyopaque, slot: u32) ?gen.CBuffer {
+        return if (slot == 0) .{ .word = 0, .vecs = 5 } else null;
+    }
+    fn tex(_: ?*const anyopaque, t: u32, s: u32) ?u32 {
+        return if (t == 0 and (s == 0 or s == gen.NO_SAMPLER)) 0 else null;
+    }
+    var log: gen.Log = .{};
+    var pair: gen.Pair = undefined;
+    var pipe: raster.Pipeline = undefined;
+    var cpu_eng: engine.Engine = undefined;
+    var cpu_pool: [4 << 20]u8 align(64) = undefined;
+
+    /// The frame: a clear, DRAWS small textured, depth-tested draws (each
+    /// its own 4 x 4 B8G8R8A8 texture of four and its own constants), the
+    /// target read back, BGRA8, by `read` and by readStart and readFinish.
+    fn frame(e: *engine.Engine, out: *[FW * FH * 4]u8, out_begun: *[FW * FH * 4]u8) !void {
+        pair = .{ .vs = &fx.vs40, .ps = &fx.pstex40, .lay = .{ .varying = varying, .cbuffer = cbuffer, .texture = tex, .desc_base = CB_WORDS }, .log = &log };
+        pipe = raster.Pipeline.init(pair.shaders(2, 4, 1));
+        defer e.unloadPipeline(&pipe);
+        var target = e.newImage(FW, FH, .bgra8) orelse return error.OutOfMemory;
+        defer e.freeImage(&target);
+        var depth = e.newDepthImage(FW, FH) orelse return error.OutOfMemory;
+        defer e.freeImage(&depth);
+        _ = e.promote(&target);
+        var texs: [4]engine.Image = undefined;
+        for (&texs, 0..) |*t, i| {
+            t.* = e.newImage(4, 4, .bgra8) orelse return error.OutOfMemory;
+            var texels: [64]u8 = undefined;
+            for (0..16) |k| texels[k * 4 ..][0..4].* = .{ @intCast(40 * i + 3 * k), @intCast(200 - 30 * i), @intCast(10 + 16 * k), 255 };
+            e.write(t, 0, 0, 4, 4, &texels, 16, .bgra8);
+        }
+        defer for (&texs) |*t| e.freeImage(t);
+        e.fill(&target, target.bounds(), 0xff20_4060, 0);
+        e.fillDepth(&depth, depth.bounds(), 1.0, 0, 0xff);
+        var verts: [DRAWS * 6]DVert = undefined;
+        var idx: [DRAWS * 6]u16 = undefined;
+        for (0..DRAWS) |k| {
+            const fk: f32 = @floatFromInt(k);
+            const cx = -0.9 + 1.4 * @mod(fk * 0.37, 1.0);
+            const cy = -0.9 + 1.4 * @mod(fk * 0.61, 1.0);
+            const z = 0.1 + 0.8 * @mod(fk * 0.29, 1.0);
+            const q = [6][2]f32{ .{ 0, 0 }, .{ 0.5, 0 }, .{ 0, 0.6 }, .{ 0.5, 0 }, .{ 0.5, 0.6 }, .{ 0, 0.6 } };
+            for (q, 0..) |p, j| {
+                verts[k * 6 + j] = .{ .pos = .{ cx + p[0], cy + p[1], z }, .color = .{ p[0] * 2, p[1] / 0.6, 0, 1 } };
+                idx[k * 6 + j] = @intCast(j);
+            }
+        }
+        var vb = e.newBuffer(@sizeOf(@TypeOf(verts))) orelse return error.OutOfMemory;
+        defer e.freeImage(&vb);
+        var ib = e.newBuffer(@sizeOf(@TypeOf(idx))) orelse return error.OutOfMemory;
+        defer e.freeImage(&ib);
+        e.writeBytes(&vb, 0, std.mem.asBytes(&verts));
+        e.writeBytes(&ib, 0, std.mem.asBytes(&idx));
+        var uni: [DRAWS][CB_WORDS + texture.DESC_WORDS]u32 = undefined;
+        for (0..DRAWS) |k| {
+            const u = &uni[k];
+            @memset(u, 0);
+            for (0..4) |i| u[i * 4 + i] = @bitCast(@as(f32, 1));
+            const tint = [4]f32{ 1, 1 - @as(f32, @floatFromInt(k % 4)) / 8, 1, 1 };
+            for (0..4) |c| u[16 + c] = @bitCast(tint[c]);
+            var dw: [texture.DESC_WORDS]u32 = undefined;
+            texture.descriptor(.{ .img = &texs[k % 4], .wrap_s = .clamp, .wrap_t = .clamp }, &dw);
+            @memcpy(u[CB_WORDS..][0..texture.DESC_WORDS], &dw);
+            var dr = raster.Draw{
+                .pipe = &pipe,
+                .color = &target,
+                .depth = &depth,
+                .count = 6,
+                .center = .{ FW / 2, FH / 2 },
+                .half = .{ FW / 2, FH / 2 },
+                .rect = target.bounds(),
+                .uniforms = u,
+                .depth_test = true,
+                .depth_write = true,
+                .depth_func = 0b011,
+            };
+            dr.attrs[0] = .{ .buf = &vb, .offset = @intCast(k * 6 * @sizeOf(DVert)), .stride = @sizeOf(DVert), .comps = 3 };
+            dr.attrs[1] = .{ .buf = &vb, .offset = @intCast(k * 6 * @sizeOf(DVert) + 12), .stride = @sizeOf(DVert), .comps = 4 };
+            dr.index = &ib;
+            dr.index_size = 2;
+            dr.textures[0] = &texs[k % 4];
+            if (!e.draw(&dr)) return error.DrawRefused;
+        }
+        if (log.len != 0) {
+            std.debug.print("{s}\n", .{log.text()});
+            return error.Generation;
+        }
+        var rb: engine.Engine.Readback = .{};
+        const begun = e.readStart(&target, 0, 0, FW, FH, .bgra8, &rb);
+        e.read(&target, 0, 0, FW, FH, out, FW * 4, .bgra8);
+        if (begun) {
+            if (!e.readFinish(&rb, out_begun, FW * 4)) return error.ReadFailed;
+        } else @memcpy(out_begun, out);
+        e.finish();
+    }
+};
+
+test "Direct3D's frame through the emulated RTX's 3D engine: textured B8G8R8A8 draws batched (their uniforms in the ring, the draws overlapping), the target read back as begun and finished: the CPU's pixels" {
+    var want: [d3d.FW * d3d.FH * 4]u8 = undefined;
+    var want2: [d3d.FW * d3d.FH * 4]u8 = undefined;
+    d3d.cpu_eng.init(.{ .pool = &d3d.cpu_pool, .cpu_work = &cpu_work });
+    try d3d.frame(&d3d.cpu_eng, &want, &want2);
+    try std.testing.expectEqualSlices(u8, &want, &want2);
+    // (the clear's colour somewhere, a texel's somewhere)
+    var drawn: u32 = 0;
+    for (0..d3d.FW * d3d.FH) |i| drawn += @intFromBool(std.mem.readInt(u32, want[i * 4 ..][0..4], .little) != 0xff20_4060);
+    try std.testing.expect(drawn > 100 and drawn < d3d.FW * d3d.FH);
+    Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+    Rtx.dev.withEngine(&Rtx3d.engine3d);
+    eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs, .graphics = true });
+    defer eng_rtx.deinit();
+    var got: [d3d.FW * d3d.FH * 4]u8 = undefined;
+    var got2: [d3d.FW * d3d.FH * 4]u8 = undefined;
+    d3d.frame(&eng_rtx, &got, &got2) catch |err| {
+        std.debug.print("Direct3D frame: {s}; the 3D engine: {s}\n", .{ @errorName(err), Rtx3d.engine3d.why });
+        return err;
+    };
+    const s = eng_rtx.stats;
+    for (eng_rtx.said_compute) |w| if (w.len != 0) std.debug.print("Direct3D frame: on the compute kernels: {s}\n", .{w});
+    try std.testing.expectEqual(@as(u64, d3d.DRAWS), s.graphics_draws);
+    try std.testing.expectEqual(@as(u64, 0), s.compute_draws);
+    // (one run for the draws: they and the reads wait for the GPU once each)
+    try std.testing.expect(eng_rtx.uni_ring.cpu.len != 0);
+    try std.testing.expectEqual(@as(u32, 0), apart(&want, &got, d3d.FW, 0, "Direct3D frame: the CPU against the RTX (read)"));
+    try std.testing.expectEqual(@as(u32, 0), apart(&want, &got2, d3d.FW, 0, "Direct3D frame: the CPU against the RTX (readStart, readFinish)"));
+}

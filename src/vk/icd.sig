@@ -4385,15 +4385,9 @@ fn createImageView(_: ?*anyopaque, info: ?*const abi.ImageViewCreateInfo, _: ?*c
     const layers = if (r_.layerCount == 0xffff_ffff) total_layers -| r_.baseArrayLayer else r_.layerCount;
     const cs = [4]u32{ ci.components.r, ci.components.g, ci.components.b, ci.components.a };
     var swz: [4]u3 = undefined;
+    // (in the view format's R, G, B, A: where its texels keep them,
+    // BGRA8's B, G, R, A, is texture.descriptor's, from texImage's format)
     for (0..4) |c| swz[c] = swizzleOf(cs[c], @intCast(c));
-    // (BGRA8's texels are B, G, R, A in memory)
-    if (fi.fmt == .bgra8) {
-        for (&swz) |*s| s.* = switch (s.*) {
-            0 => 2,
-            2 => 0,
-            else => s.*,
-        };
-    }
     T.views[i] = .{ .live = true, .image = ii, .vtype = ci.viewType, .fi = fi, .swz = swz, .aspect = r_.aspectMask, .base_level = r_.baseMipLevel, .levels = @max(levels, 1), .base_layer = r_.baseArrayLayer, .layers = @max(layers, 1) };
     (out orelse return R.error_initialization_failed).* = handle(.view, i);
     return R.success;
@@ -5053,7 +5047,10 @@ fn texImage(v: *const View) engine.Image {
     const im = &T.images[v.image];
     const b = v.base_level;
     const buf = sliceBuf(T.memories[im.mem].buf, im.offset, im.size);
-    var img = engine.wrap(buf, im.lw(b), im.lh(b), im.pitch(b), im.fi.fmt, false);
+    // (a view's texels read as its own format: an R8G8B8A8 view of a
+    // B8G8R8A8 image (MUTABLE_FORMAT) takes its bytes as R, G, B, A)
+    const f = if (v.fi.fmt.isColor() and im.fi.fmt.isColor()) v.fi.fmt else im.fi.fmt;
+    var img = engine.wrap(buf, im.lw(b), im.lh(b), im.pitch(b), f, false);
     const n = @min(v.levels, MAX_LEVELS - b, im.levels - b);
     img.levels = @intCast(n);
     for (0..n) |l| {
