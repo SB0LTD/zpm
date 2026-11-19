@@ -28,7 +28,7 @@ pub fn check(m: *Machine, t: *Machine, info: *const jit.CheckInfo) bool {
         var left = info.n;
         while (left > 0) {
             const before = t.cpu.executed;
-            const why = t.cpu.interp(t, @intCast(@min(left, 1 << 30)));
+            const why = t.cpu.interpFrom(t, @intCast(@min(left, 1 << 30)), info.poll and left == info.n);
             const ran = t.cpu.executed - before;
             if (ran >= left) break;
             left -= ran;

@@ -88,6 +88,7 @@ pub const M_FPU: u32 = 1 << 12; // CR0.EM and TS clear: x87 runs directly
 pub const M_A20: u32 = 1 << 13;
 pub const M_CSFLAT: u32 = 1 << 14; // CS limit 4 GiB (chains may cross pages... no: may skip the limit check)
 pub const M_CHECK: u32 = 1 << 15; // made for lockstep (no chaining)
+pub const M_PAGING: u32 = 1 << 16; // CR0.PG: linear pages may move
 
 /// An exit's code (the value generated code returns): the kind, the
 /// instructions of the block not run (`adj`), the exit's chain slot.
@@ -112,6 +113,9 @@ pub const Ctx = extern struct {
     inval: u32 = 0,
     /// The direct-mapped lookup table generated code probes.
     fast: usize = 0,
+    /// The machine's page marks (jit_pages), the lockstep write log.
+    pages: usize = 0,
+    wlog: usize = 0,
     /// The helpers generated code calls (backend's table).
     helpers: [24]usize = [_]usize{0} ** 24,
     /// The lockstep write log: host address and size of each store.
@@ -153,7 +157,51 @@ pub const Block = struct {
     /// Incoming chains: the first edge (src*2+slot, +1); each edge's next.
     in_head: u32 = 0,
     in_next: [2]u32 = .{ 0, 0 },
+    /// Bytes [dyn_lo, dyn_hi) of its page the code does not depend on
+    /// (instructions that are written while they run: the interpreter
+    /// reads them anew each time).
+    dyn_lo: [2]u16 = .{ 0, 0 },
+    dyn_hi: [2]u16 = .{ 0, 0 },
+
+    fn dynamic(k: *const Block, lo: u32, hi: u32) bool {
+        inline for (0..2) |i| {
+            if (k.dyn_hi[i] > k.dyn_lo[i] and lo >= k.dyn_lo[i] and hi <= k.dyn_hi[i]) return true;
+        }
+        return false;
+    }
 };
+
+/// Code that writes itself while it runs (a routine patching an operand
+/// of its own loop): the bytes written on a page while a block used them.
+/// A block made again over them leaves their instructions to the
+/// interpreter, so the writes no longer drop it. A few pages' worth.
+const VOL_N = 64;
+var vol_slot: [PAGES]u8 = undefined;
+var vol_bits: [VOL_N][512]u8 = undefined;
+var vol_used: u32 = 0;
+
+fn volMark(p: u32, lo: u32, hi: u32) void {
+    var s = vol_slot[p];
+    if (s == 0) {
+        if (vol_used >= VOL_N) return;
+        vol_used += 1;
+        s = @intCast(vol_used);
+        vol_slot[p] = s;
+        @memset(&vol_bits[s - 1], 0);
+    }
+    var i = lo;
+    while (i < hi) : (i += 1) vol_bits[s - 1][i >> 3] |= @as(u8, 1) << @intCast(i & 7);
+}
+
+pub fn volatileAt(p: u32, lo: u32, hi: u32) bool {
+    const s = vol_slot[p];
+    if (s == 0) return false;
+    var i = lo;
+    while (i < hi) : (i += 1) {
+        if (vol_bits[s - 1][i >> 3] & (@as(u8, 1) << @intCast(i & 7)) != 0) return true;
+    }
+    return false;
+}
 
 pub var blocks: [MAX_BLOCKS]Block = undefined;
 var hash_head: [HASH_N]u32 = undefined;
@@ -172,6 +220,8 @@ pub const CheckInfo = struct {
     dead: u32 = 0,
     /// A block (else a single interpreted step).
     block: bool,
+    /// `poll` as the stretch began (the twin starts with the same).
+    poll: bool = false,
     /// The stores it made (host addresses, sizes).
     wlog: []const WLog,
 };
@@ -188,6 +238,13 @@ pub const Stats = struct {
     interp: u64 = 0,
     chained: u64 = 0,
     helper_calls: u64 = 0,
+    /// Drops by cause: a write to their bytes, a check after a service.
+    drop_written: u64 = 0,
+    drop_verify: u64 = 0,
+    /// Exits to the dispatcher: through a chain slot, other.
+    exit_slot: u64 = 0,
+    exit_other: u64 = 0,
+    exit_budget: u64 = 0,
 };
 
 pub const Jit = struct {
@@ -256,6 +313,8 @@ pub const Jit = struct {
         @memset(std.mem.sliceAsBytes(&fast), 0);
         @memset(&pg_head, 0);
         @memset(&pg_mask, 0);
+        @memset(&vol_slot, 0);
+        vol_used = 0;
         @memset(j.pages, 0);
         j.ctx.inval = 1;
     }
@@ -266,7 +325,7 @@ pub const Jit = struct {
     }
 
     pub inline fn fastIdx(host: usize, eip: u32) u32 {
-        return @truncate(((host ^ (@as(usize, eip) << 7)) >> 0) & (FAST_N - 1));
+        return @truncate((host ^ (@as(usize, eip) << 7)) & (FAST_N - 1));
     }
 
     pub fn find(j: *Jit, host: usize, eip: u32, mode: u32) ?u32 {
@@ -413,22 +472,41 @@ pub const Jit = struct {
             var b = pg_head[p];
             while (b != 0) {
                 const nx = blocks[b].next_pg;
-                if (blocks[b].lo < hi and blocks[b].hi > lo) j.invalidate(b);
+                if (blocks[b].lo < hi and blocks[b].hi > lo and !blocks[b].dynamic(lo, hi)) {
+                    volMark(p, lo, hi);
+                    j.stats.drop_written += 1;
+                    j.invalidate(b);
+                }
                 b = nx;
             }
         }
     }
 
-    /// After a BIOS or DOS service: the ones a game calls all the time
-    /// (the timer's and keyboard's interrupts, the keyboard and clock
-    /// services) write only the BIOS's data and the stack; any other may
-    /// have written anywhere, and every block is checked.
-    pub fn afterService(j: *Jit, id: u16) void {
+    /// After a BIOS or DOS service (id: its trap's number, ax: AX as it
+    /// was called): those that only change registers, the stack, the
+    /// BIOS's data or the vector table (the timer's and keyboard's
+    /// interrupts, the keyboard, clock and mouse, DOS's time, handles
+    /// and console) cost a look at page 0; any other may have written
+    /// anywhere (a file read, a block move, an EXEC), and every block's
+    /// bytes are checked.
+    pub fn afterService(j: *Jit, id: u16, ax: u16) void {
         if (!j.on) return;
-        switch (id) {
-            0x08, 0x09, 0x0A...0x0F, 0x70...0x77, 0x16, 0x1A, 0x11, 0x12 => j.verifyPage(0),
-            else => j.verifyAll(),
-        }
+        const ah: u8 = @truncate(ax >> 8);
+        const al: u8 = @truncate(ax);
+        const safe = switch (id) {
+            0x08, 0x09, 0x0A...0x0F, 0x70...0x77, 0x11, 0x12, 0x16, 0x1A, 0x1C, 0x2F, 0x101 => true,
+            0x10 => !(ah == 0x1B or ah == 0x1C or ah == 0x4F or (ah == 0x10 and (al == 0x09 or al == 0x17))),
+            0x15 => ah != 0x87,
+            0x21 => switch (ah) {
+                0x01, 0x02, 0x06, 0x07, 0x08, 0x09, 0x0B, 0x0E, 0x19, 0x25, 0x2A, 0x2C, 0x2D, 0x30, 0x33, 0x35, 0x3D, 0x3E, 0x40, 0x41, 0x42, 0x43, 0x45, 0x46, 0x57, 0x58, 0x62 => true,
+                else => false,
+            },
+            0x33 => ax != 0x16,
+            0x100 => ah != 0x0B,
+            0x67 => ah != 0x57,
+            else => false,
+        };
+        if (safe) j.verifyPage(0) else j.verifyAll();
     }
 
     pub fn verifyPage(j: *Jit, p: u32) void {
@@ -450,22 +528,34 @@ pub const Jit = struct {
     fn verify(j: *Jit, b: u32) void {
         const k = &blocks[b];
         j.stats.verified += 1;
-        if (sumOf(j.ram, k) != k.sum) j.invalidate(b);
+        if (sumOf(j.ram, k) != k.sum) {
+            j.stats.drop_verify += 1;
+            j.invalidate(b);
+        }
     }
 
     pub fn sumOf(ram: [*]u8, k: *const Block) u64 {
         const page: [*]const u8 = ram + @as(usize, k.page) * 4096;
         var h: u64 = 0xCBF2_9CE4_8422_2325;
         var i: usize = k.lo;
-        while (i + 8 <= k.hi) : (i += 8) {
-            h = (h ^ std.mem.readInt(u64, page[i..][0..8], .little)) *% 0x100_0000_01B3;
+        while (i < k.hi) {
+            if (k.dyn_hi[0] > k.dyn_lo[0] and i == k.dyn_lo[0]) {
+                i = k.dyn_hi[0];
+                continue;
+            }
+            if (k.dyn_hi[1] > k.dyn_lo[1] and i == k.dyn_lo[1]) {
+                i = k.dyn_hi[1];
+                continue;
+            }
+            h = (h ^ page[i]) *% 0x100_0000_01B3;
+            i += 1;
         }
-        while (i < k.hi) : (i += 1) h = (h ^ page[i]) *% 0x100_0000_01B3;
         return h;
     }
 };
 
 pub var the: Jit = .{};
+
 
 /// The JIT for this bus type: a machine with RAM pages to watch.
 pub fn supports(comptime B: type) bool {
@@ -492,6 +582,8 @@ pub fn attach(c: *Cpu, host: host_mod.Host, pages: *[PAGES]u8, ram: *[mem_mod.RA
     j.ctx.cpu = @intFromPtr(c);
     j.ctx.ram = @intFromPtr(ram);
     j.ctx.fast = @intFromPtr(&fast);
+    j.ctx.pages = @intFromPtr(pages);
+    j.ctx.wlog = @intFromPtr(&wlog);
     j.unlock();
     j.stub_end = be.emitStubs(j);
     j.lock();
@@ -528,6 +620,33 @@ pub fn run(c: *Cpu, bus: anytype, budget: u32) Exit {
     }
 }
 
+/// Block-local flag liveness: after[i], the arithmetic flags read after
+/// instruction i before they are written again; returns what is live at
+/// the block's end (all of them). In lockstep (`check`) anything that can
+/// fault or leave through the interpreter counts as reading them all, so
+/// the flags are exact wherever the twin may look.
+pub fn liveness(ins: []const dec.Ins, after: []u32, check: bool) u32 {
+    const live_out: u32 = dec.ARITH;
+    var live = live_out;
+    var i = ins.len;
+    while (i > 0) {
+        i -= 1;
+        after[i] = live;
+        const x = &ins[i];
+        var rd: u32 = x.fr;
+        if (check) {
+            switch (x.kind) {
+                .helper, .x87, .push, .pop, .call, .ret, .leave, .call_ind, .jmp_ind => rd = dec.ARITH,
+                else => if (x.mem) {
+                    rd = dec.ARITH;
+                },
+            }
+        }
+        live = (live & ~@as(u32, x.fw)) | rd;
+    }
+    return live_out;
+}
+
 /// The mode's block key for the CPU as it is.
 pub fn modeKey(c: *const Cpu, comptime P: bool, a20: bool, check: bool) u32 {
     var m: u32 = 0;
@@ -536,6 +655,7 @@ pub fn modeKey(c: *const Cpu, comptime P: bool, a20: bool, check: bool) u32 {
     if (check) m |= M_CHECK;
     if (!P) return m;
     m |= M_PE;
+    if (c.paging) m |= M_PAGING;
     if (c.code32) m |= M_CODE32;
     if (c.stack32) m |= M_STACK32;
     if (c.cpl == 3) m |= M_USER;
@@ -612,13 +732,13 @@ pub fn Mode(comptime B: type, comptime P: bool) type {
                     if (P) pm.checkKey(c, bus);
                     if (c.shadow) {
                         c.shadow = false;
-                        if (single(j, c, bus, end, false)) |w| return w;
+                        if (single(j, c, bus, end, false, true)) |w| return w;
                         continue;
                     }
                     const f = c.regs.flags;
                     if (f & IF != 0 and bus.irq()) return .irq;
                     if (f & TF != 0) {
-                        if (single(j, c, bus, end, true)) |w| return w;
+                        if (single(j, c, bus, end, true, true)) |w| return w;
                         continue;
                     }
                     c.poll = false;
@@ -626,7 +746,7 @@ pub fn Mode(comptime B: type, comptime P: bool) type {
                 const eip = c.regs.eip;
                 const lin = c.regs.base[CS] +% eip;
                 const b = lookup(j, c, bus, eip, lin) orelse {
-                    if (single(j, c, bus, end, false)) |w| return w;
+                    if (single(j, c, bus, end, false, false)) |w| return w;
                     continue;
                 };
                 if (enter(j, c, bus, b, end)) |w| return w;
@@ -636,14 +756,14 @@ pub fn Mode(comptime B: type, comptime P: bool) type {
 
         /// One instruction through the interpreter (the shadow, the trace
         /// trap, code with no block).
-        fn single(j: *Jit, c: *Cpu, bus: B, end: u64, trace: bool) ?Exit {
+        fn single(j: *Jit, c: *Cpu, bus: B, end: u64, trace: bool, poll0: bool) ?Exit {
             j.stats.interp += 1;
             const e0 = c.executed;
             const eip0 = c.regs.eip;
             const cs0 = c.regs.seg[CS];
             const res = c.stepJit(modeBus(c, bus), end, true, trace);
             if (j.check) {
-                const info = CheckInfo{ .n = c.executed - e0, .eip = eip0, .cs = cs0, .block = false, .wlog = &.{} };
+                const info = CheckInfo{ .n = c.executed - e0, .eip = eip0, .cs = cs0, .block = false, .poll = poll0, .wlog = &.{} };
                 if (!bus.jitCheck(&info)) return checkFailed(c);
             }
             return res;
@@ -661,16 +781,24 @@ pub fn Mode(comptime B: type, comptime P: bool) type {
             if (!P and eip > 0xFFFF) return null;
             const host = codeHost(j, c, bus, lin) orelse return null;
             const mode = modeKey(c, P, mapKey(bus) != 0, j.check);
-            if (j.find(host, eip, mode)) |b| {
-                if (P and blocks[b].last_eip > c.fetch_hi) return null;
-                return b;
+            const b = blk: {
+                if (j.find(host, eip, mode)) |b| {
+                    if (P and blocks[b].last_eip > c.fetch_hi) return null;
+                    break :blk b;
+                }
+                break :blk translate(j, c, host, lin, eip, mode) orelse return null;
+            };
+            // (generated code's own lookup: blocks it may enter unchecked)
+            if (!P or mode & M_CSFLAT != 0) {
+                fast[Jit.fastIdx(host, eip)] = .{ .host = host, .key = (@as(u64, eip) << 32) | mode, .code = j.rxAddr(blocks[b].code) };
             }
-            return translate(j, c, host, lin, eip, mode);
+            return b;
         }
 
         fn translate(j: *Jit, c: *Cpu, host: usize, lin: u32, eip: u32, mode: u32) ?u32 {
             var ins: [MAX_INS]dec.Ins = undefined;
-            const n = decodeBlock(c, host, lin, eip, &ins);
+            var dyn: [2][2]u16 = .{ .{ 0, 0 }, .{ 0, 0 } };
+            const n = decodeBlock(j, c, host, lin, eip, &ins, &dyn);
             if (n == 0) return null;
             if (j.used + MAX_CODE > j.cm.len or j.nblocks >= MAX_BLOCKS) j.flush();
             const b = j.newBlock() orelse return null;
@@ -686,6 +814,10 @@ pub fn Mode(comptime B: type, comptime P: bool) type {
             k.last_eip = eip +% len -% 1;
             k.lo = @intCast(host & 0xFFF);
             k.hi = @intCast((host & 0xFFF) + len);
+            inline for (0..2) |i| {
+                k.dyn_lo[i] = dyn[i][0];
+                k.dyn_hi[i] = dyn[i][1];
+            }
             j.unlock();
             const ok = be.emitBlock(j, b, ins[0..n], mode, B, P);
             j.lock();
@@ -702,8 +834,10 @@ pub fn Mode(comptime B: type, comptime P: bool) type {
 
         /// The block's instructions from `host` (EIP `eip`): to a branch,
         /// the page's end, CS's limit or the 64 KiB wrap, MAX_INS.
-        fn decodeBlock(c: *Cpu, host: usize, lin: u32, eip: u32, out: *[MAX_INS]dec.Ins) u32 {
+        fn decodeBlock(j: *Jit, c: *Cpu, host: usize, lin: u32, eip: u32, out: *[MAX_INS]dec.Ins, dyn: *[2][2]u16) u32 {
             _ = lin;
+            const page: u32 = @intCast((host - @intFromPtr(j.ram)) >> 12);
+            var ndyn: u32 = 0;
             const d32 = P and c.code32;
             const wrap: u32 = if (d32) 0xFFFF_FFFF else 0xFFFF;
             var n: u32 = 0;
@@ -719,10 +853,19 @@ pub fn Mode(comptime B: type, comptime P: bool) type {
                 }
                 if (avail == 0) break;
                 const p: [*]const u8 = @ptrFromInt(host - (host & 0xFFF) + off);
-                const x = dec.decode(p, @intCast(avail), d32, ip, wrap) orelse break;
+                var x = dec.decode(p, @intCast(avail), d32, ip, wrap) orelse break;
                 // (16-bit code: an instruction that would wrap IP is left
                 // to the interpreter)
                 if (!d32 and @as(u64, ip) + x.len > 0x10000) break;
+                if (volatileAt(page, off, off + x.len)) {
+                    // (written while it runs: the interpreter's, read anew)
+                    if (ndyn == 2) break;
+                    dyn[ndyn] = .{ @intCast(off), @intCast(off + x.len) };
+                    ndyn += 1;
+                    x.kind = .helper;
+                    x.fr = dec.ARITH;
+                    x.fw = dec.ARITH;
+                }
                 out[n] = x;
                 n += 1;
                 off += x.len;
@@ -752,8 +895,9 @@ pub fn Mode(comptime B: type, comptime P: bool) type {
             if (kind == X_RET) return @enumFromInt(j.ctx.ret);
             // (the block is longer than the budget left: the rest of it
             // one instruction at a time, so `executed` stays exact)
-            if (kind == X_BUDGET and c.executed < end) return single(j, c, bus, end, false);
-            if (kind == X_NEXT and !j.check) {
+            if (kind == X_BUDGET and c.executed < end) return single(j, c, bus, end, false, false);
+            if (kind == X_BUDGET) j.stats.exit_budget += 1 else if (code >> 32 != 0) j.stats.exit_slot += 1 else j.stats.exit_other += 1;
+            if (kind == X_NEXT) {
                 const edge: u32 = @truncate(code >> 32);
                 if (edge != 0) chainExit(j, c, bus, edge - 1);
             }
@@ -775,7 +919,9 @@ pub fn Mode(comptime B: type, comptime P: bool) type {
             const t = lookup(j, c, bus, eip, lin) orelse return;
             // (the source may have been dropped by a flush in lookup)
             if (k.host == 0 or blocks[t].host == 0) return;
-            if (blocks[t].page != k.page or blocks[t].mode != k.mode) return;
+            if (blocks[t].mode != k.mode) return;
+            // (another page: only where linear pages cannot move)
+            if (blocks[t].page != k.page and k.mode & M_PAGING != 0) return;
             j.chain(src, s, t);
         }
 
@@ -801,6 +947,40 @@ pub fn Mode(comptime B: type, comptime P: bool) type {
                 return exitCode(X_RET, a, 0);
             }
             if (c.regs.eip != next or c.poll or ctx.inval != 0 or !Sig.of(c).eql(s0)) return exitCode(X_NEXT, a, 0);
+            return 0;
+        }
+
+        /// An x87 instruction: the FPU's own code at linear `lin` (info:
+        /// opcode, ModRM, o32, adj; ip: its EIP and the next's).
+        pub fn hX87(ctx: *Ctx, lin: u64, info: u64, ip: u64) callconv(.c) u64 {
+            const c: *Cpu = @ptrFromInt(ctx.cpu);
+            const bus: B = @ptrFromInt(ctx.bus);
+            const op: u8 = @truncate(info);
+            const modrm: u8 = @truncate(info >> 8);
+            const o32 = (info >> 16) & 1 != 0;
+            const a: u32 = @truncate((info >> 24) & 0xFF);
+            const eip: u32 = @truncate(ip);
+            c.executed = @intCast(@as(i64, @intCast(ctx.end)) - ctx.r14 - @as(i64, a));
+            ctx.inval = 0;
+            if (!c.fpu.esc(modeBus(c, bus), &c.regs, op, modrm, @truncate(lin), o32, c.regs.base[CS] +% eip)) {
+                // (not an instruction after all: the interpreter's #UD)
+                return hStep(ctx, ip, a);
+            }
+            if (P and c.sticky) {
+                c.sticky = false;
+                c.regs.eip = eip;
+                c.poll = true;
+                c.keep = false;
+                if (pm.exception(c, bus)) |e| {
+                    ctx.ret = @intFromEnum(e);
+                    return exitCode(X_RET, a, 0);
+                }
+                return exitCode(X_NEXT, a, 0);
+            }
+            if (ctx.inval != 0) {
+                c.regs.eip = @truncate(ip >> 32);
+                return exitCode(X_NEXT, a, 0);
+            }
             return 0;
         }
     };

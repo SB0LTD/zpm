@@ -529,10 +529,11 @@ pub const Machine = struct {
     /// A trap in the ROM: the service it names. False: the service waits
     /// (the trap runs again once time has gone on).
     pub fn hle(m: *Machine, c: *Cpu, id: u16) bool {
+        const ax = c.regs.ax();
         const done = m.hleRun(c, id);
         // (a service writes memory past the CPU's view of it: translated
         // code it may have overwritten is checked)
-        if (c.jit) |j| j.afterService(id);
+        if (c.jit) |j| j.afterService(id, ax);
         return done;
     }
 

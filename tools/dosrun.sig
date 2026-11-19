@@ -360,7 +360,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     if (status == .exited) out("dosrun: exit code {d}", .{machine.dos.exit_code});
     if (machine.cpu.jit) |j| {
         const st = j.stats;
-        out("dosrun: jit: {d} blocks made, {d} dropped, {d} flushes, {d} entered, {d} chained, {d} interpreted steps, {d} checked by bytes, {d} KiB code", .{ st.blocks, st.invalidated, st.flushes, st.entered, st.chained, st.interp, st.verified, j.used / 1024 });
+        out("dosrun: jit: {d} blocks made, {d} dropped ({d} written, {d} by the check after services), {d} flushes, {d} entered, {d} chained, {d} interpreted steps, {d} checked by bytes, {d} KiB code", .{ st.blocks, st.invalidated, st.drop_written, st.drop_verify, st.flushes, st.entered, st.chained, st.interp, st.verified, j.used / 1024 });
+        out("dosrun: jit: exits {d} through a chain slot, {d} other, {d} for the budget", .{ st.exit_slot, st.exit_other, st.exit_budget });
         if (machine.twin) |tw| {
             if (status != .fault) {
                 const same = dos.jit_check.memEql(&machine, tw);

@@ -430,7 +430,12 @@ pub const Cpu = struct {
 
     /// `run` without the translator.
     pub fn interp(self: *Cpu, bus: anytype, budget: u32) Exit {
-        self.poll = true;
+        return self.interpFrom(bus, budget, true);
+    }
+
+    /// The same, with `poll` as given (lockstep: as the translator had it).
+    pub fn interpFrom(self: *Cpu, bus: anytype, budget: u32, poll: bool) Exit {
+        self.poll = poll;
         if (self.dead) return .fault;
         if (self.halted) {
             if (self.regs.flags & IF != 0 and bus.irq()) return .irq;
