@@ -236,6 +236,11 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("snapshot_envelope", "src/db/snapshot_envelope.sig"), importEntry("sql", "src/core/sql.sig"),
         importEntry("db_store", "src/db/store.sig"), importEntry("checkpoint_manifest", "src/db/checkpoint_manifest.sig"),
     });
+    if (builtin.os.tag == .linux) {
+        _ = try addContract(ctx, test_db, "contract-tcp-completion", "tests/test_tcp_completion.sig", &.{
+            importEntry("tcp_server", "src/platform/tcp_server.sig"), importEntry("tcp_completion", "src/platform/tcp_completion.sig"),
+        });
+    }
     _ = try ctx.addModule("wall_clock", "src/platform/wall_clock.sig");
     inline for (.{ "postgres", "mysql", "tds", "db_store", "tcp_server", "scram", "durable_log", "db_file", "entropy", "db_stream", "pg_stream", "wall_clock", "pg_copy", "pg_explain", "page_region" }) |name| {
         _ = try addContract(ctx, test_db, "contract-" ++ name, "tests/test_" ++ name ++ ".sig", &.{
