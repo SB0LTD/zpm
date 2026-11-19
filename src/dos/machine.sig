@@ -180,6 +180,17 @@ pub const Machine = struct {
         const rom = mem_mod.Memory.lin(ROM_SEG, 0);
         var v: u32 = 0;
         while (v < 256) : (v += 1) {
+            // A real PC's vectors nobody owns are 0000:0000, and programs
+            // count on it: DOS/4GW looks for a vector equal to int BDh's
+            // (an unused one) and loops until it finds one. The BIOS's
+            // and DOS's own (00-2F), the mouse's (33), the RTC alarm's
+            // (4A), EMS's (67) and the IRQs get the ROM's stubs.
+            const owned = v <= 0x2F or v == 0x33 or v == 0x4A or v == 0x67 or (v >= 0x70 and v <= 0x77);
+            if (!owned) {
+                m.mem.wrW(0, @intCast(v * 4), 0);
+                m.mem.wrW(0, @intCast(v * 4 + 2), 0);
+                continue;
+            }
             const off: u16 = @intCast(STUBS + v * 8);
             const at = rom + off;
             switch (v) {

@@ -179,6 +179,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         @tagName(status), emu, wall, emu / @max(wall, 1e-6), machine.cpu.executed / 1_000_000,
     });
     if (status == .exited) out("dosrun: exit code {d}", .{machine.dos.exit_code});
+    {
+        const r = &machine.cpu.regs;
+        var code: [16]u8 = undefined;
+        for (&code, 0..) |*c, i| c.* = machine.rd8(r.base[dos.regs.CS] +% r.eip +% @as(u32, @intCast(i)));
+        out("dosrun: ends at {x:0>4}:{x:0>8} (CR0 {x}), eax {x} ecx {x} edx {x} ebx {x} esp {x}, bytes {x}", .{ r.seg[dos.regs.CS], r.eip, machine.cpu.cr0, r.r[0], r.r[1], r.r[2], r.r[3], r.r[4], code });
+    }
     if (shot_path) |sp| shot(sp);
     return if (status == .fault) 1 else 0;
 }
