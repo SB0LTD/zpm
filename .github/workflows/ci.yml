@@ -12,7 +12,7 @@ permissions:
 jobs:
   native-sig:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 50
     steps:
       - name: Free disk space
         run: |

@@ -64,6 +64,13 @@ pub const SET_SHADER_LOCAL_MEMORY_WINDOW_B: u32 = 0x07b4;
 
 /// INVALIDATE_SHADER_CACHES: instructions (bit 0), data (4), constants (12).
 pub const INVALIDATE_ALL: u32 = (1 << 0) | (1 << 4) | (1 << 12);
+/// Data and constants only: what a barrier between two dispatches of one
+/// batch needs (the first's stores seen by the second's loads). The code
+/// does not change within a batch, so the SMs keep their instructions:
+/// with them thrown away at every barrier, each dependent dispatch fetched
+/// its kernel cold (a 3000-instruction kernel ~100 us from system memory
+/// behind /dev/dxg, and again for every layer).
+pub const INVALIDATE_DATA: u32 = (1 << 4) | (1 << 12);
 /// SEND_SIGNALING_PCAS2_B's PCAS_ACTION.
 pub const PCAS_SCHEDULE: u32 = 2;
 pub const PCAS_PREFETCH: u32 = 8;
@@ -236,6 +243,12 @@ pub const Push = struct {
     /// the CPU wrote code or constants the SMs may hold.
     pub fn invalidateShaderCaches(p: *Push) void {
         p.method(SUBCH_COMPUTE, INVALIDATE_SHADER_CACHES, &.{INVALIDATE_ALL});
+    }
+
+    /// The data and constant caches invalidated, the instructions kept: a
+    /// barrier's, between dispatches of one batch (after a WAIT_FOR_IDLE).
+    pub fn invalidateDataCaches(p: *Push) void {
+        p.method(SUBCH_COMPUTE, INVALIDATE_SHADER_CACHES, &.{INVALIDATE_DATA});
     }
 
     /// The QMD at `qmd_va` (256-aligned) prefetched and scheduled.

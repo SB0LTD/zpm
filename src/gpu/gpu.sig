@@ -25,6 +25,9 @@ pub const draw = @import("draw.sig");
 pub const adreno_draw = @import("adreno_draw.sig");
 /// The RTX's 3D engine as a draw.Renderer (the adapter over nvidia/draw.sig).
 pub const nvidia_draw = @import("nvidia_draw.sig");
+/// The RTX's depth-stencil GOB (the 3D engine's depth target), for the
+/// engines above that convert to and from it.
+pub const blackwell_z24 = @import("nvidia").emu3d.BLACKWELL_Z24;
 /// GL-shaped draws on the RTX's 3D engine: KIR graphics stages and their headers.
 pub const nvidia_gl = @import("nvidia_gl.sig");
 

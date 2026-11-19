@@ -85,6 +85,10 @@ pub const Options = struct {
     index: u32 = 0,
 };
 
+/// A context's private data at most (NVIDIA's video contexts' are 3569
+/// bytes, its CUDA contexts' CONTEXT_BYTES).
+pub const MAX_CONTEXT_BYTES = 4096;
+
 pub const ChannelOptions = struct {
     name: []const u8 = "zpm",
     engine: Engine = .graphics_compute,
@@ -99,6 +103,15 @@ pub const ChannelOptions = struct {
     /// fence to (its low 32 bits, after the work): for a reader that cannot
     /// see the progress fence (a guest, through mapped memory). 0: none.
     notify: u64 = 0,
+    /// The context's private data as it is (another driver's, recorded),
+    /// instead of nv.context's; and the call's flags (0: ours).
+    context_data: ?[]const u8 = null,
+    context_flags: u32 = 0,
+    /// The node the context is on, instead of `engine`'s (the host's
+    /// numbering: NVIDIA's video contexts are on nodes of their own).
+    node: ?u32 = null,
+    /// create_hw_queue's flags (NVIDIA's CUDA queues 1, its encoder's 0).
+    queue_flags: u32 = 1,
 };
 
 /// Memory the GPU maps: its GPU address, the CPU's view (empty for video
@@ -203,6 +216,19 @@ pub const Gpu = struct {
     fn create(g: *Gpu, memory: nv.Memory, sysmem: ?[]u8, bytes: u64, at: ?u64) Error!Region {
         if (bytes == 0 or bytes % nv.ALLOCATION_UNIT != 0) return error.BadMemory;
         nv.allocation(&g.alloc_data, memory, bytes);
+        return g.createAs(sysmem, bytes, at);
+    }
+
+    /// An allocation with NVIDIA's private data `data` as it is (a
+    /// surface of a kind the linear buffers are not: a depth target, from
+    /// a recording), `bytes` of it mapped at `at`.
+    pub fn allocWith(g: *Gpu, data: []const u8, bytes: u64, at: ?u64) Error!Region {
+        if (data.len != nv.ALLOCATION_BYTES or bytes == 0 or bytes % nv.ALLOCATION_UNIT != 0) return error.BadMemory;
+        @memcpy(&g.alloc_data, data);
+        return g.createAs(null, bytes, at);
+    }
+
+    fn createAs(g: *Gpu, sysmem: ?[]u8, bytes: u64, at: ?u64) Error!Region {
         var info = kmt.AllocationInfo2{
             .sysmem = if (sysmem) |m| @intFromPtr(m.ptr) else 0,
             .priv = @intFromPtr(&g.alloc_data),
@@ -270,6 +296,25 @@ pub const Gpu = struct {
     }
 
     /// Closes the device (its channels first: Channel.close).
+    /// What dxgkrnl says of the device: its execution state (1 active, 3
+    /// hung, 6 DMA fault, 7 a page fault ...) and the last page fault's
+    /// address, stage and flags (null: it did not answer).
+    pub const Fault = struct { execution: u32, va: u64, stage: u32, flags: u32, code: u32 };
+
+    pub fn fault(g: *Gpu) ?Fault {
+        var ex = kmt.GetDeviceState{ .device = g.device, .state_type = kmt.DEVICESTATE_EXECUTION };
+        _ = kmt.call(g.fd, .get_device_state, &ex) catch return null;
+        var pf = kmt.GetDeviceState{ .device = g.device, .state_type = kmt.DEVICESTATE_PAGE_FAULT };
+        const got = if (kmt.call(g.fd, .get_device_state, &pf)) |_| true else |_| false;
+        return .{
+            .execution = @truncate(ex.seq),
+            .va = if (got) pf.va else 0,
+            .stage = if (got) pf.stage else 0,
+            .flags = if (got) pf.flags else 0,
+            .code = if (got) pf.error_code else 0,
+        };
+    }
+
     pub fn close(g: *Gpu) void {
         if (g.fd < 0) return;
         if (g.paging_queue != 0) {
@@ -301,7 +346,7 @@ pub const Channel = struct {
     put: u64 = 0,
     /// The last submission's fence.
     fence: u64 = 0,
-    ctx_data: [nv.CONTEXT_BYTES]u8 = undefined,
+    ctx_data: [MAX_CONTEXT_BYTES]u8 = undefined,
     queue_data: [nv.QUEUE_BYTES]u8 = undefined,
     submit_data: [nv.SUBMIT_BYTES]u8 = undefined,
 
@@ -310,13 +355,18 @@ pub const Channel = struct {
     pub fn open(c: *Channel, g: *Gpu, ring_memory: []align(4096) u8, opts: ChannelOptions) Error!void {
         c.* = .{ .gpu = g, .notify = opts.notify };
         errdefer c.close();
-        nv.context(&c.ctx_data, opts.name, opts.client);
+        var ctx_len: u32 = nv.CONTEXT_BYTES;
+        if (opts.context_data) |cd| {
+            if (cd.len > MAX_CONTEXT_BYTES) return error.BadMemory;
+            @memcpy(c.ctx_data[0..cd.len], cd);
+            ctx_len = @intCast(cd.len);
+        } else nv.context(c.ctx_data[0..nv.CONTEXT_BYTES], opts.name, opts.client);
         var cc = kmt.CreateContextVirtual{
             .device = g.device,
-            .node_ordinal = @intFromEnum(opts.engine),
-            .flags = kmt.CONTEXT_DISABLE_GPU_TIMEOUT | kmt.CONTEXT_HW_QUEUE_SUPPORTED,
+            .node_ordinal = opts.node orelse @intFromEnum(opts.engine),
+            .flags = if (opts.context_flags != 0) opts.context_flags else kmt.CONTEXT_DISABLE_GPU_TIMEOUT | kmt.CONTEXT_HW_QUEUE_SUPPORTED,
             .priv = @intFromPtr(&c.ctx_data),
-            .priv_size = nv.CONTEXT_BYTES,
+            .priv_size = ctx_len,
             .client_hint = opts.client,
         };
         _ = try kmt.call(g.fd, .create_context_virtual, &cc);
@@ -327,7 +377,7 @@ pub const Channel = struct {
         nv.queue(&c.queue_data, opts.engines, c.ring.va, GPFIFO_BYTES, c.ring.handle);
         var hq = kmt.CreateHwQueue{
             .context = c.context,
-            .flags = 1,
+            .flags = opts.queue_flags,
             .priv_size = nv.QUEUE_BYTES,
             .priv = @intFromPtr(&c.queue_data),
         };
@@ -455,6 +505,58 @@ pub const Channel = struct {
             _ = kmt.call(g.fd, .destroy_context, &d) catch {};
             c.context = 0;
         }
+    }
+};
+
+/// A video engine's channel (NVDEC, NVENC): a legacy context of its own on
+/// the engine's node, fed by submit_command (nv.sig's VideoEngine: NVIDIA's
+/// own decode and encode do so on WSL). The engine is bound on
+/// subchannel 4 by the host; work runs in order, and the host keeps no
+/// fence for it: a pushbuffer ends with the engine's own semaphore release
+/// where its caller wants to see it finish.
+pub const VideoChannel = struct {
+    gpu: *Gpu = undefined,
+    context: kmt.Handle = 0,
+    engine: nv.VideoEngine = .decoder,
+    ctx_data: [nv.VIDEO_CONTEXT_BYTES]u8 = undefined,
+    submit_data: [nv.VIDEO_SUBMIT_BYTES]u8 = undefined,
+
+    pub fn open(c: *VideoChannel, g: *Gpu, e: nv.VideoEngine) Error!void {
+        c.* = .{ .gpu = g, .engine = e };
+        nv.videoContext(&c.ctx_data, e);
+        var cc = kmt.CreateContextVirtual{
+            .device = g.device,
+            .node_ordinal = nv.videoNode(e),
+            .flags = 0,
+            .priv = @intFromPtr(&c.ctx_data),
+            .priv_size = nv.VIDEO_CONTEXT_BYTES,
+            .client_hint = 1,
+        };
+        _ = try kmt.call(g.fd, .create_context_virtual, &cc);
+        c.context = cc.context;
+    }
+
+    /// Runs `dwords` of pushbuffer at GPU address `va` (memory the GPU
+    /// maps for this device).
+    pub fn submit(c: *VideoChannel, va: u64, dwords: u32) Error!void {
+        nv.videoSubmit(&c.submit_data, va, dwords);
+        var s = kmt.SubmitCommand{
+            .command_buffer = va,
+            .command_length = dwords * 4,
+            .broadcast_context_count = 1,
+            .priv = @intFromPtr(&c.submit_data),
+            .priv_size = nv.VIDEO_SUBMIT_BYTES,
+        };
+        s.broadcast_context[0] = c.context;
+        fullFence();
+        _ = try kmt.call(c.gpu.fd, .submit_command, &s);
+    }
+
+    pub fn close(c: *VideoChannel) void {
+        if (c.context == 0 or c.gpu.fd < 0) return;
+        var d = kmt.DestroyContext{ .context = c.context };
+        _ = kmt.call(c.gpu.fd, .destroy_context, &d) catch {};
+        c.context = 0;
     }
 };
 

@@ -104,6 +104,7 @@ fn openDriver() ?*engine.Engine {
         .check = if (check_px) |px| .{ .mem = anonymous(CHECK_BYTES), .max_px = px } else .{},
         .graphics = d.caps.graphics,
         .depth_float = zf32,
+        .graphics_depth = !envRefused("GALAXY_GL_3D_DEPTH="),
         .block_targets = block,
     });
     if (want3d) {

@@ -2007,7 +2007,7 @@ fn lowerCvt(l: *Lw) Error!void {
     if (from == .f32 and to == .f16) {
         const src = try l.arg(in.a, .c6, false, false);
         return switch (cv.round) {
-            .rne => cov(w, d, true, src, .f32, .f16, .even),
+            .rne => lowerToHalfRne(l, src),
             .rz => lowerToHalfRz(l, src),
             else => error.Unsupported,
         };
@@ -2108,6 +2108,39 @@ fn lowerCvt(l: *Lw) Error!void {
         return;
     }
     return error.BadType;
+}
+
+/// f32 to f16, rounded to nearest even, subnormal halves included: the
+/// X1-45's cov.f32f16 gives 0 for a result below 2^-14 (the self-test's
+/// 2^-24 case; the Surface's attention lost every softmax weight and KV
+/// element that small, 80e52a6b). Below 2^-14 the half's bits are
+/// rne(|x| * 2^24), formed in full-width arithmetic (the product is exact:
+/// a power of two; 1024 at the top is the smallest normal's bits).
+fn lowerToHalfRne(l: *Lw, raw: Opnd) Error!void {
+    const w = l.w;
+    const normal = try newVreg(w, .half);
+    const normal_bits = try newVreg(w, .full);
+    try cov(w, normal, true, raw, .f32, .f16, .even);
+    try cov(w, normal_bits, false, Opnd.reg(normal, true), .u16, .u32, .none);
+    const magnitude = try newVreg(w, .full);
+    const small = try newVreg(w, .full);
+    const scaled = try newVreg(w, .full);
+    const rounded = try newVreg(w, .full);
+    const fraction = try newVreg(w, .full);
+    try alu2(w, .and_b, magnitude, false, raw, try fit(w, Opnd.imm(0x7fffffff), .c2, false, l.loop));
+    try cmp2(w, .cmps_u, .lt, small, Opnd.reg(magnitude, false), try fit(w, Opnd.imm(0x38800000), .c2, false, l.loop));
+    try alu2(w, .mul_f, scaled, false, Opnd.reg(magnitude, false), try fit(w, Opnd.imm(0x4b800000), .c2f, true, l.loop));
+    try alu1(w, .rndne_f, rounded, false, Opnd.reg(scaled, false));
+    try cov(w, fraction, false, Opnd.reg(rounded, false), .f32, .u32, .none);
+    const high = try newVreg(w, .full);
+    const sign = try newVreg(w, .full);
+    const small_bits = try newVreg(w, .full);
+    const bits = try newVreg(w, .full);
+    try alu2(w, .shr_b, high, false, raw, Opnd.imm(16));
+    try alu2(w, .and_b, sign, false, Opnd.reg(high, false), try fit(w, Opnd.imm(0x8000), .c2, false, l.loop));
+    try alu2(w, .or_b, small_bits, false, Opnd.reg(sign, false), Opnd.reg(fraction, false));
+    try alu3(w, .sel_b32, bits, false, Opnd.reg(small_bits, false), Opnd.reg(small, false), Opnd.reg(normal_bits, false));
+    try cov(w, l.dst(), true, Opnd.reg(bits, false), .u32, .u16, .none);
 }
 
 fn lowerToHalfRz(l: *Lw, raw: Opnd) Error!void {

@@ -20,7 +20,9 @@
 //!   1 the argument before the call, 2 the argument after it,
 //!   3 memory the argument points at, before, 4 the same after,
 //!   5 a command buffer at submission (its GPU address translated through
-//!     the allocations the process mapped and locked), 6 a note (text).
+//!     the allocations the process mapped and locked), 6 a note (text),
+//!   9 an allocation's bytes before unlock2 (at its GPU address; the
+//!     result field its handle).
 //! Fixed buffers, no allocator.
 
 const std = @import("std");
@@ -32,6 +34,22 @@ const RTLD_NEXT: ?*anyopaque = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))))
 
 const IoctlFn = *const fn (c_int, c_ulong, usize) callconv(.c) c_int;
 var real_ioctl: ?IoctlFn = null;
+
+/// dlopen without RTLD_DEEPBIND (0x8): NVIDIA's video libraries are loaded
+/// with it, which binds their ioctl to libc's past this library (the
+/// trace then lost every call after them: 191 submissions of an encode's
+/// 606 seen, its per-frame submit_command none).
+const DlopenFn = *const fn (?[*:0]const u8, c_int) callconv(.c) ?*anyopaque;
+var real_dlopen: ?DlopenFn = null;
+const RTLD_DEEPBIND: c_int = 0x8;
+
+export fn dlopen(file: ?[*:0]const u8, flags: c_int) callconv(.c) ?*anyopaque {
+    if (real_dlopen == null) {
+        const p = dlsym(RTLD_NEXT, "dlopen") orelse return null;
+        real_dlopen = @ptrCast(p);
+    }
+    return real_dlopen.?(file, flags & ~RTLD_DEEPBIND);
+}
 
 const MAX_BLOB = 1 << 20;
 const MAX_ALLOC = 4096;
@@ -59,6 +77,7 @@ const SUBMIT_COMMAND = 0x0f;
 const ENUM_ADAPTERS2 = 0x14;
 const CREATE_HW_QUEUE = 0x18;
 const LOCK2 = 0x25;
+const UNLOCK2 = 0x37;
 const SUBMIT_TO_HW_QUEUE = 0x34;
 const WAIT_FROM_CPU = 0x3a;
 const ENUM_ADAPTERS3 = 0x3e;
@@ -100,8 +119,10 @@ export fn ioctl(fd: c_int, req: c_ulong, arg: usize) callconv(.c) c_int {
     record(1, nr, my, arg, a[0..size], 0);
     follow(3, nr, my, a[0..size], 0);
     if (nr == SUBMIT_COMMAND) submitted(nr, my, a, 0, 8);
+    if (nr == UNLOCK2) unlocking(my, a);
     if (nr == SUBMIT_TO_HW_QUEUE) submitted(nr, my, a, 16, 24);
     lock.store(0, .release);
+    if (nr == SUBMIT_TO_HW_QUEUE) snapSubmit();
 
     const rc = real_ioctl.?(fd, req, arg);
 
@@ -112,6 +133,23 @@ export fn ioctl(fd: c_int, req: c_ulong, arg: usize) callconv(.c) c_int {
     // (259: STATUS_PENDING, a map or residency the paging fence finishes)
     if (rc == 0 or rc == 259) learn(nr, a[0..size]);
     return rc;
+}
+
+/// DXGTRACE_SNAP_SUBMITS=N (with DXGTRACE_SNAP): a step at each of the
+/// first N hardware-queue doorbells, so a program that marks nothing (a
+/// GL demo through NVIDIA's D3D12 driver) leaves the pushbuffers it wrote
+/// before each in the snapshots.
+var snap_submits: u32 = 0;
+
+fn snapSubmit() void {
+    const v = getenv("DXGTRACE_SNAP_SUBMITS") orelse return;
+    const most = std.fmt.parseInt(u32, std.mem.span(v), 10) catch return;
+    if (snap_submits >= most) return;
+    snap_submits += 1;
+    var buf: [32]u8 = undefined;
+    const t = std.fmt.bufPrint(buf[0 .. buf.len - 1], "submit {d}", .{snap_submits}) catch return;
+    buf[t.len] = 0;
+    dxgtrace_mark(@ptrCast(&buf));
 }
 
 /// A note in the trace from the traced program (cudaprobe calls it, found
@@ -394,6 +432,22 @@ export fn dxgtrace_cpu(va: u64) callconv(.c) u64 {
 /// For a program running under the tracer: how many /dev/dxg ioctls so far.
 export fn dxgtrace_count() callconv(.c) u32 {
     return seq;
+}
+
+/// Before unlock2 (d3dkmt_unlock2: device, allocation): what the process
+/// wrote into the allocation through its lock (kind 9, at its GPU
+/// address, up to 64 KiB): a legacy context's command buffer is written
+/// so, then unlocked, then submitted (submit_command), so the bytes are
+/// only readable here.
+fn unlocking(my: u32, a: [*]const u8) void {
+    const h = std.mem.readInt(u32, a[4..8], .little);
+    for (allocs[0..allocs_n]) |*al| {
+        if (al.handle != h or al.cpu == 0) continue;
+        const n: usize = @intCast(@min(if (al.bytes != 0) al.bytes else 4096, 64 << 10));
+        const p: [*]const u8 = @ptrFromInt(al.cpu);
+        record(9, UNLOCK2, my, al.gpu, p[0..n], @bitCast(h));
+        return;
+    }
 }
 
 fn slot(handle: u32) ?*Alloc {

@@ -229,11 +229,24 @@ fn expectSameState(gpu_state: *const enc.State(LIMITS), cpu: *const enc.State(LI
 /// is lost in the call's second run); the GPU's state then handed to the
 /// CPU (with `tolerance` 0: the CPU's own, bit for bit) and, with
 /// `takeover`, the CPU's state handed to a new GPU stream for the rest.
+/// A discrete GPU's VRAM for the audio parts' weights (the mmproj, 304 MB)
+/// and buffers: none of it has a CPU view (the forwarded RTX's case).
+var audio_vram: [384 << 20]u8 align(4096) = undefined;
+
+/// Caps of a discrete GPU (the RTX's: fused, no import).
+fn discreteCaps() gpu.Caps {
+    var caps = gpu.interp_caps;
+    caps.memory = .discrete;
+    caps.import = false;
+    return caps;
+}
+
 fn hearAgainstCpu(caps: gpu.Caps, src: gguf.Source, frames: []const f32, chunks: []const usize, tolerance: f64, lost_at: ?usize, takeover: bool) !void {
     const p = &audio_plan;
     const f = p.mels;
     const width = p.projection;
     emu = gpu.EmuDevice.init(caps, &mem, &interp_work);
+    if (caps.memory == .discrete) emu.vram = &audio_vram;
     var flaky = Flaky{ .inner = emu.device() };
     var encoder = Encoder.init(flaky.device(), p, &audio_index, src, .{ .positions = POSITIONS }, &work) catch |e| return failure(e, "encoder init", null);
     defer encoder.deinit();
@@ -304,6 +317,9 @@ test "LFM3-Audio's hearing encoder on the GPU (when its mmproj is here): a clip 
     caps.mad = .unfused;
     caps.subgroup = 64;
     try hearAgainstCpu(caps, src, frames[0 .. 23 * p.mels], &.{ 16, 7 }, 0, null, false);
+    // a discrete GPU (the forwarded RTX): the weights staged into VRAM
+    // without a CPU view; 16 + 16 frames, then the CPU's state
+    try hearAgainstCpu(discreteCaps(), src, frames, &.{ 16, 16 }, 0, null, true);
 }
 
 // ── GELU against the CPU ────────────────────────────────────────────────────

@@ -397,14 +397,27 @@ fn finishBoth(cd: *Codec, tolerance: f64) !void {
 /// call each then two frames in one call, finished; the second after the
 /// reset, a frame on the GPU, the windows handed to the CPU for the next,
 /// then the GPU again from the CPU's state.
+/// A discrete GPU's VRAM for the audio parts' weights (the mmproj, 304 MB)
+/// and buffers: none of it has a CPU view (the forwarded RTX's case).
+var audio_vram: [384 << 20]u8 align(4096) = undefined;
+
+/// Caps of a discrete GPU (the RTX's: fused, no import).
+fn discreteCaps() gpu.Caps {
+    var caps = gpu.interp_caps;
+    caps.memory = .discrete;
+    caps.import = false;
+    return caps;
+}
+
 fn codecAgainstCpu(where: gpu.Caps, src: gguf.Source, single: usize, tolerance: f64) !void {
     emu = gpu.EmuDevice.init(where, &mem, &interp_work);
+    if (where.memory == .discrete) emu.vram = &audio_vram;
     var cd = Codec.init(emu.device(), &plan, &index, src, .{}, &work) catch |e| {
         std.debug.print("codec init: {s} (compile: {s})\n", .{ @errorName(e), "-" });
         return e;
     };
     defer cd.deinit();
-    try std.testing.expect(cd.imported);
+    try std.testing.expect(cd.imported == (where.memory == .unified and where.import));
     cpu_state.reset();
     cd.reset(L, &gpu_state);
     pcm_values = 0;
@@ -470,4 +483,7 @@ test "LFM3-Audio's codec on the GPU (when its mmproj is here): two utterances fr
     try codecAgainstCpu(gpu.interp_caps, src, 4, 0);
     // the Adreno's measured caps: Builder.fma's exact emulation, within 1e-6
     try codecAgainstCpu(adrenoCaps(), src, 2, 1e-6);
+    // a discrete GPU (the forwarded RTX): weights and windows in VRAM
+    // without a CPU view; the CPU's bits still
+    try codecAgainstCpu(discreteCaps(), src, 2, 0);
 }

@@ -430,8 +430,15 @@ pub const Emu = struct {
     /// `arena`: buffers (CPU view); `gpu_view` (as long, or empty): the
     /// GPU's own copy, so cache maintenance is checked.
     pub fn init(e: *Emu, arena: []u8, gpu_view: []u8) void {
-        e.gpu = .{ .arena = arena, .gpu_view = gpu_view };
-        var c = emuCaps(arena.len);
+        e.initWith(arena, gpu_view, false);
+    }
+
+    /// `as_hardware`: the X1-45's own Caps (denormals flushed), with the
+    /// emulator flushing f32 subnormals as the hardware does: the code the
+    /// Surface runs, not the preserving variant.
+    pub fn initWith(e: *Emu, arena: []u8, gpu_view: []u8, as_hardware: bool) void {
+        e.gpu = .{ .arena = arena, .gpu_view = gpu_view, .flush_denormals = as_hardware };
+        var c = if (as_hardware) x1_45_caps(arena.len) else emuCaps(arena.len);
         c.name = "ir3_emu (Adreno X1-45)";
         c.coherent = gpu_view.len == 0;
         // (the strict device: each dispatch's code checked, buffers apart)

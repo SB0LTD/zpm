@@ -337,6 +337,10 @@ pub const EmuDevice = struct {
     /// check_operands on (such code is refused first): for reproducing
     /// what the hardware did with code that breaks the rule.
     uniform_port_quirk: bool = false,
+    /// f32 arithmetic flushes subnormals (ir3_emu.Dispatch.ftz): the
+    /// X1-45's behaviour, for running code compiled with its Caps
+    /// (denormals = .flush).
+    flush_denormals: bool = false,
     regs: [0x10000]u32 = [_]u32{0} ** 0x10000,
     consts: [512 * 4]u32 = [_]u32{0} ** (512 * 4),
     // The graphics pipeline's state beside the registers.
@@ -661,10 +665,10 @@ pub const EmuDevice = struct {
                 in.src[0].num = b.num;
             }
         };
-        const d = ir3_emu.Dispatch{ .kernel = &k, .consts = &e.consts, .groups = groups, .group_stride = e.group_stride };
+        const d = ir3_emu.Dispatch{ .kernel = &k, .consts = &e.consts, .groups = groups, .group_stride = e.group_stride, .ftz = e.flush_denormals };
         ir3_emu.run(&e.emu, &m, &d, &e.stats) catch |err| return e.failedRun(&k, &m, err);
         if (e.sample_last and e.group_stride > 1 and groups[0] > 1 and (groups[0] - 1) % e.group_stride != 0) {
-            const last = ir3_emu.Dispatch{ .kernel = &k, .consts = &e.consts, .groups = groups, .first_group = groups[0] - 1, .group_stride = 1 };
+            const last = ir3_emu.Dispatch{ .kernel = &k, .consts = &e.consts, .groups = groups, .first_group = groups[0] - 1, .group_stride = 1, .ftz = e.flush_denormals };
             ir3_emu.run(&e.emu, &m, &last, &e.stats) catch |err| return e.failedRun(&k, &m, err);
         }
         e.fault.code_va = 0;

@@ -11,6 +11,7 @@
 //! Allocation-free: each builder fills the caller's bytes.
 
 const std = @import("std");
+const push = @import("nvidia").push;
 
 pub const MAGIC: u32 = 0x4e56_4441; // "ADVN" in memory: NVDA
 pub const MAGIC2: u32 = 0x4e56_2a2a; // "**VN"
@@ -53,6 +54,53 @@ pub fn context(b: *[CONTEXT_BYTES]u8, name: []const u8, client: u32) void {
     put(b, 0xc40, 0x418);
     for (0..6) |i| put(b, 0xc48 + 4 * i, 0xffff_ffff);
     put(b, 0xc74, 1);
+}
+
+// ── A video engine's context (NVDEC, NVENC) ─────────────────────────────────
+
+/// NVIDIA's video engines on WSL: each a legacy context of its own (no
+/// hardware queue, flags 0, client hint 1) on its node, fed by
+/// submit_command (NVIDIA's own decode and encode, traced 11-16: ffmpeg's
+/// h264_cuvid and h264_nvenc). The engine's object is the host's, bound on
+/// subchannel 4: a pushbuffer has no SET_OBJECT.
+pub const VideoEngine = enum(u32) { decoder = 0, encoder = 1 };
+/// Their nodes on the RTX 5070 Laptop's host (NVIDIA's driver 592).
+pub fn videoNode(e: VideoEngine) u32 {
+    return switch (e) {
+        .decoder => 1,
+        .encoder => 5,
+    };
+}
+pub const VIDEO_SUBCH: u32 = 4;
+pub const VIDEO_CONTEXT_BYTES = 3569;
+
+/// A video context's data, as NVIDIA's driver gives it (only the engine's
+/// word differs between the two).
+pub fn videoContext(b: *[VIDEO_CONTEXT_BYTES]u8, e: VideoEngine) void {
+    head(b, KIND_ALLOCATION);
+    put(b, 0x10, 5);
+    put(b, 0x14, 0x400f);
+    put(b, 0x1c, 0x200);
+    put(b, 0x20, 0x8000_0000 | @intFromEnum(e));
+    @memset(b[0xdc1..0xdd9], 0xff);
+}
+
+pub const VIDEO_SUBMIT_BYTES = 868;
+
+/// A video context's submission data: the command buffer at `va`, `dwords`
+/// long, as the GPFIFO entry the host copies into the engine's ring
+/// (subroutine level, as every entry NVIDIA writes).
+pub fn videoSubmit(b: *[VIDEO_SUBMIT_BYTES]u8, va: u64, dwords: u32) void {
+    @memset(b, 0);
+    put(b, 0, MAGIC);
+    put(b, 4, KIND_ALLOCATION);
+    put(b, 0x0c, 0x354);
+    put(b, 0x14, 1);
+    put(b, 0x18, 2);
+    put(b, 0x1c, 8);
+    put(b, 0x358, 4);
+    const e = push.gpEntry(va, dwords) | ENTRY_SUBROUTINE;
+    put64(b, 0x35c, e);
 }
 
 // ── A hardware queue (create_hw_queue) ──────────────────────────────────────
