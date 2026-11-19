@@ -859,6 +859,8 @@ pub fn Io(comptime config: types.Config) type {
         /// Explicit, assignment or implicit cast of a value of type `from`.
         pub fn cast(cell: V.Cell, from: Type, to: Type, typmod: i32, session: *const Session) Error!V.Cell {
             if (cell == .null_value) return .null_value;
+            // Ordinary text must not enter the raw internal-char BPCHAR path.
+            if (to == .bpchar and cell == .text) try character.validateText(cell.text.slice());
             if (from == to and typmod < 0) return cell;
             if (cell == .pg_internal_char) {
                 if (to == .int4) return .{ .integer = @as(i8, @bitCast(cell.pg_internal_char)) };

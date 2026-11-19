@@ -184,6 +184,9 @@ fn character() !void {
             else |err| try check(err == error.CharacterNotInRepertoire);
             if (DB.Io.parseCast(ty, 5, invalid, DB.Result.default_session)) |_| return error.InvalidCharacterAccepted
             else |err| try check(err == error.CharacterNotInRepertoire);
+            const text = try DB.Io.parse(.text, -1, invalid, DB.Result.default_session);
+            if (DB.Io.cast(text, .text, ty, 5, DB.Result.default_session)) |_| return error.InvalidCharacterAccepted
+            else |err| try check(err == error.CharacterNotInRepertoire);
         }
     }
     try sqlstate(error.CharacterNotInRepertoire, "22021");
