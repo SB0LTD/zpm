@@ -8,6 +8,7 @@
 //!   regs.sig        the CPU's registers as services see them
 //!   mem.sig         16 MiB of RAM, the A20 gate
 //!   host.sig        what the PC asks of its host (files, clock, log)
+//!   host_linux.sig  that host on Linux system calls (no libc)
 //!   cpu.sig         the 386 in real mode, and the x87
 //!   pic.sig         the two 8259 interrupt controllers
 //!   pit.sig         the 8254 timer, the PC speaker
@@ -29,6 +30,8 @@ pub const host = @import("host.sig");
 pub const Host = host.Host;
 pub const regs = @import("regs.sig");
 pub const cpu = @import("cpu.sig");
+/// The host on Linux system calls (galaxy-dos, tools/dosrun.sig).
+pub const host_linux = @import("host_linux.sig");
 
 test {
     _ = @import("regs.sig");
@@ -49,4 +52,5 @@ test {
     _ = @import("xms.sig");
     _ = @import("mouse.sig");
     _ = @import("machine_test.sig");
+    _ = @import("host_linux.sig");
 }
