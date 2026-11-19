@@ -16,14 +16,15 @@ pub fn Server(comptime Database: type, comptime Protocol: type, comptime input_c
         pub fn run(self: *Self, io: anytype, database: *Database, session: *Protocol) !void {
             self.used = 0;
             while (true) {
-                if (self.used != 0) {
+                const queued = if (comptime @hasDecl(Protocol, "queuedSimpleQuery")) session.queuedSimpleQuery() else false;
+                if (self.used != 0 or queued) {
                     const reply = try session.handle(database, self.input[0..self.used], &self.output);
                     if (reply.consumed > self.used or reply.written > self.output.len) return error.InvalidProtocolReply;
                     // One stream is one session: nothing else could release a
                     // lock it waits for, so a parked statement ends the session.
                     if (@hasField(@TypeOf(reply), "blocked") and reply.blocked) return error.StatementBlocked;
                     const partial = reply.consumed == 0 and reply.written != 0;
-                    if (partial) {
+                    if (partial and !queued) {
                         if (comptime @hasDecl(Protocol, "continuingSimpleQuery")) {
                             if (!session.continuingSimpleQuery()) return error.InvalidProtocolReply;
                         } else return error.InvalidProtocolReply;
@@ -40,6 +41,7 @@ pub fn Server(comptime Database: type, comptime Protocol: type, comptime input_c
                     // A simple Query batch keeps its original frame until
                     // the last step. Drain each reply before running the next.
                     if (partial) continue;
+                    if (queued) return error.InvalidProtocolReply;
                 }
                 if (self.used == self.input.len) return error.RequestTooLarge;
                 const count = try io.read(self.input[self.used..]);
