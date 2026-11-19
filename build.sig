@@ -1167,6 +1167,20 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     const test_nvidia = try ctx.addStep("test-nvidia", "Encode ptxas's sm_120 vectors and assemble its kernels from their listings", &noopStep);
     try ctx.addDependency(test_all, test_nvidia);
     _ = try addTest(ctx, test_nvidia, "test-nvidia-module", "src/nvidia/nvidia.sig", &.{});
+    // ── NVIDIA GPUs through WSL's /dev/dxg (dxgkrnl): the calls, NVIDIA's
+    //    private data, a Gpu and an nvidia Device over it ──
+    const dxg_module = try ctx.addModule("dxg", "src/dxg/dxg.sig");
+    try wire(ctx, dxg_module, "nvidia", "src/nvidia/nvidia.sig");
+    const test_dxg = try ctx.addStep("test-dxg", "Check dxgkrnl's argument layouts and NVIDIA's private data for /dev/dxg", &noopStep);
+    try ctx.addDependency(test_all, test_dxg);
+    _ = try addTest(ctx, test_dxg, "test-dxg-module", "src/dxg/dxg.sig", &.{
+        importEntry("nvidia", "src/nvidia/nvidia.sig"),
+    });
+    // ── vhost-user device backends (QEMU's virtio devices served here) ──
+    _ = try ctx.addModule("vhost", "src/vhost/vhost.sig");
+    const test_vhost = try ctx.addStep("test-vhost", "Check the vhost-user protocol's layouts and guest memory lookups", &noopStep);
+    try ctx.addDependency(test_all, test_vhost);
+    _ = try addTest(ctx, test_vhost, "test-vhost-module", "src/vhost/vhost.sig", &.{});
     // ── AMD GCN3/GCN4 (gfx803, Polaris) compute: the ISA, a kernel assembler,
     //    the kernel descriptor and dispatch registers, a wave64 emulator ──
     _ = try ctx.addModule("amdgpu", "src/amdgpu/amdgpu.sig");
