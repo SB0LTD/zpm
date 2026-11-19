@@ -357,7 +357,8 @@ test "a buffer written with these calls, carried out by the driver: state, draws
     var records align(16) = [_]u32{ 4, 1, 0, 0 };
     var table align(16) = [_]u32{ lo32(@intFromPtr(&idx32)), hi32(@intFromPtr(&idx32)), 6, 1 };
     var gate: u32 = 1;
-    var zero: u32 = 0;
+    // SET_PREDICATION encodes its address on a 16-byte boundary.
+    var zero: u32 align(16) = 0;
     var one: u32 = 1;
     var row = [_]u32{0} ** 4;
     var wide: u64 align(8) = 0;
