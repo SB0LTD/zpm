@@ -82,6 +82,11 @@ pub const Machine = struct {
     cmos_index: u8 = 0,
     /// The last fault's reason, for the host's log.
     fault_why: []const u8 = "",
+    /// An invalid opcode reached the ROM's int 6 (no handler of the
+    /// program's): `run` returns .fault.
+    stopped: bool = false,
+    /// Port accesses in the current CPU run (each costs a microsecond).
+    io_count: u32 = 0,
 
     /// (Every field is set here: a host may keep its Machine `undefined`
     /// in .bss, so 16 MiB of RAM costs nothing in its file.)
@@ -91,6 +96,8 @@ pub const Machine = struct {
         m.ips = 25_000_000;
         m.cmos_index = 0;
         m.fault_why = "";
+        m.stopped = false;
+        m.io_count = 0;
         m.cpu.reset();
         m.pic.reset();
         m.pit.reset();
@@ -227,6 +234,7 @@ pub const Machine = struct {
     // ── Ports ────────────────────────────────────────────────────────────
 
     pub fn in8(m: *Machine, port: u16) u8 {
+        m.io_count +%= 1;
         return switch (port) {
             0x00...0x0F, 0x80...0x8F, 0xC0...0xDF => m.dma.in8(port),
             0x20, 0x21, 0xA0, 0xA1 => m.pic.in8(port),
@@ -246,6 +254,7 @@ pub const Machine = struct {
         };
     }
     pub fn out8(m: *Machine, port: u16, v: u8) void {
+        m.io_count +%= 1;
         switch (port) {
             0x00...0x0F, 0x80...0x8F, 0xC0...0xDF => m.dma.out8(port, v),
             0x20, 0x21, 0xA0, 0xA1 => m.pic.out8(port, v),
@@ -323,6 +332,19 @@ pub const Machine = struct {
         const r = &c.regs;
         var done = true;
         switch (id) {
+            // A divide error or an invalid opcode the program has no
+            // handler for: DOS ends a program on the first ("Divide
+            // overflow"); the second stops the PC with where and what.
+            0x00 => {
+                m.host.say("dos: divide overflow at {x:0>4}:{x:0>4}: the program ends", .{ r.seg[regs.CS], @as(u16, @truncate(r.eip)) });
+                m.dos.exited = true;
+                m.dos.exit_code = 0xFF;
+                return false;
+            },
+            0x06 => {
+                m.stopped = true;
+                return false;
+            },
             0x08 => bios.timerTick(&m.bios, &m.mem),
             0x09 => bios.keyIrq(&m.bios, &m.mem, m.kbd.in8(0x60)),
             // The slave's IRQs: EOI to both; the master's: EOI.
@@ -370,20 +392,33 @@ pub const Machine = struct {
     pub fn run(m: *Machine, us: u32) Status {
         var left = us;
         while (left > 0) {
-            const slice: u32 = @min(left, 250);
+            // A slice ends at the timer's next edge (a game's 1 kHz or
+            // faster timer gets every tick), else after 250 us.
+            const until_us: u32 = @intCast((@as(u64, m.pit.untilIrq()) * 1_000_000 + pit_mod.HZ - 1) / pit_mod.HZ);
+            const slice: u32 = @max(1, @min(left, 250, until_us));
             left -= slice;
             m.devices(slice);
             var budget: u32 = @intCast(@as(u64, m.ips) * slice / 1_000_000);
             while (budget > 0) {
                 const before = m.cpu.executed;
+                m.io_count = 0;
                 const why = m.cpu.run(m, budget);
-                const ran: u32 = @intCast(@min(m.cpu.executed - before, budget));
+                // (an ISA port access takes about a microsecond: what the
+                // CPU did meanwhile is that much less)
+                const io_cost: u64 = @as(u64, m.io_count) * (m.ips / 1_000_000);
+                const ran: u32 = @intCast(@min(m.cpu.executed - before + io_cost, budget));
                 budget -= ran;
                 if (m.dos.exited) return .exited;
+                if (m.stopped) {
+                    m.host.say("dos: an invalid opcode ({x}) at {x:0>5}, and the program has no handler for it", .{ m.cpu.fault_op, m.cpu.fault_at });
+                    return .fault;
+                }
                 switch (why) {
                     .budget => break,
                     .irq => {
-                        if (m.pic.acknowledge()) |vec| m.cpu.interrupt(m, vec);
+                        // (no vector after all: the rest of the slice idles
+                        // rather than spinning on .irq)
+                        if (m.pic.acknowledge()) |vec| m.cpu.interrupt(m, vec) else break;
                     },
                     // Idle until the next slice's interrupts.
                     .halt, .wait => break,
@@ -420,6 +455,7 @@ pub const Machine = struct {
     /// (the host asks for as many frames as its device took).
     pub fn audio(m: *Machine, out: []i16, rate: u32) void {
         @memset(out, 0);
+        m.opl.gain = m.sb.fmGain();
         m.sb.mix(out, rate);
         m.opl.mix(out, rate);
         m.pit.speaker(out, rate);
