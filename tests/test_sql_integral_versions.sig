@@ -28,11 +28,15 @@ const dense: [3]DB.TableBudget = .{
     .{ .rows = 4, .versions = 8 },
 };
 const refs = 4096;
-var memory: [4][131072]u8 align(64) = undefined;
+var memory: [7][131072]u8 align(64) = undefined;
 var db: DB = .{};
 var recovered: DB = .{};
 var copied: DB = .{};
 var dense_copy: DB = .{};
+var remap_source: DB = .{};
+var remap_target: DB = .{};
+var remap_small: DB = .{};
+var remap_alias: DB = .{};
 var result: DB.Result = .{};
 var replay: DB.ReplayScratch = .{};
 var record: [8192]u8 = undefined;
@@ -190,6 +194,58 @@ fn placementFences() !void {
     db.abort(reader);
 }
 
+fn remapSnapshot() !void {
+    const narrow: DB.TableBudget = .{ .rows = 2, .versions = 4, .integral_row_words = 1 };
+    const wide: DB.TableBudget = .{ .rows = 8, .versions = 16, .integral_row_words = 6 };
+    const text: DB.TableBudget = .{ .rows = 8, .versions = 16 };
+    const origin = [3]DB.TableBudget{ narrow, wide, text };
+    const reordered = [3]DB.TableBudget{ wide, narrow, text };
+    try bind(&remap_source, 4, origin);
+    try bind(&remap_target, 5, reordered);
+    try bind(&remap_small, 6, .{ wide, .{ .rows = 1, .versions = 2, .integral_row_words = 1 }, text });
+    try execute(&remap_source, "CREATE TABLE small (id INT PRIMARY KEY)");
+    try execute(&remap_source, "CREATE TABLE large (id BIGINT PRIMARY KEY, amount BIGINT)");
+    try execute(&remap_source, "CREATE TABLE labels (id INT PRIMARY KEY, label TEXT)");
+    try execute(&remap_source, "INSERT INTO small VALUES (-1),(7)");
+    try execute(&remap_source, "INSERT INTO large VALUES (-3,9223372036854775807)");
+    try execute(&remap_source, "INSERT INTO labels VALUES (5,'copied')");
+
+    const wide_bank = remap_target.tables[0].integral_rows.ptr;
+    const narrow_bank = remap_target.tables[1].integral_rows.ptr;
+    const dense_bank = remap_target.tables[2].version_rows.ptr;
+    try remap_target.copyFromInto(&remap_source);
+    // First choices place small in wide and large in dense. Placing labels
+    // then frees dense by rematching large to wide and small to narrow.
+    try check(remap_target.tables[0].integral_rows.ptr == narrow_bank and
+        remap_target.tables[1].integral_rows.ptr == wide_bank and
+        remap_target.tables[2].version_rows.ptr == dense_bank);
+    for (&remap_target.tables, &remap_source.tables) |*target, *source| try check(target.oid == source.oid);
+    try execute(&remap_target, "SELECT SUM(id) FROM small");
+    try check(result.rows[0].cells[0].integer == 6);
+    try execute(&remap_target, "SELECT label FROM labels WHERE id=5");
+    try check(std.mem.eql(u8, result.rows[0].cells[0].text.slice(), "copied"));
+
+    var used: usize = 0;
+    try remap_source.executeChanges("UPDATE large SET amount=-11 WHERE id=-3", &result, &record, &used, null, null);
+    try remap_target.applyChangeRecord(record[0..used], &replay);
+    try execute(&remap_target, "SELECT amount FROM large WHERE id=-3");
+    try check(result.row_count == 1 and result.rows[0].cells[0].integer == -11);
+
+    try execute(&remap_small, "CREATE TABLE existing (label TEXT)");
+    try execute(&remap_small, "INSERT INTO existing VALUES ('saved')");
+    const old_csn = remap_small.csn;
+    const old_first = remap_small.tables[0].integral_rows.ptr;
+    if (remap_small.copyFromInto(&remap_source)) |_| return error.UnfitCopyAccepted else |err| try check(err == error.WorkspaceCapacity);
+    try check(remap_small.csn == old_csn and remap_small.tables[0].integral_rows.ptr == old_first);
+    try execute(&remap_small, "SELECT label FROM existing");
+    try check(result.row_count == 1 and std.mem.eql(u8, result.rows[0].cells[0].text.slice(), "saved"));
+
+    const bytes = try DB.backingBytesFor(origin, refs);
+    try remap_alias.bindMemoryFor(memory[4][0..bytes], origin, refs);
+    if (remap_alias.copyFromInto(&remap_source)) |_| return error.AliasedCopyAccepted else |err| try check(err == error.InvalidParameterValue);
+    try check(remap_alias.csn == 0 and remap_alias.tableCount() == 0);
+}
+
 pub fn main() !void {
     const dense_bytes = try DB.backingBytesFor(dense, refs);
     const mixed_bytes = try DB.backingBytesFor(mixed, refs);
@@ -244,5 +300,6 @@ pub fn main() !void {
         try execute(database, "SELECT value FROM flags ORDER BY id");
         try check(result.row_count == 2 and result.rows[0].cells[0] == .null_value and result.rows[1].cells[0].integer == -32768);
     }
+    try remapSnapshot();
     std.debug.print("{{\"suite\":\"sql-integral-versions\",\"pass\":true,\"assertions\":{d},\"saved_bytes\":{d},\"fact_payload_bytes\":48}}\n", .{ assertions, saving });
 }
