@@ -244,12 +244,20 @@ pub const Machine = struct {
 
     // ── The bus (what the CPU reads and writes) ────────────────────────
 
+    /// A linear address on the bus: the A20 gate off masks address line
+    /// 20 (FFFF:0010 is 0:0); nothing past the RAM's end aliases into it.
+    inline fn phys(m: *const Machine, a: u32) u32 {
+        return if (m.mem.a20) a else a & ~mem_mod.MEG;
+    }
+
     pub inline fn rd8(m: *Machine, a0: u32) u8 {
-        const a = m.mem.wrap(a0);
-        if (a < 0xA0000 or a >= mem_mod.MEG) return m.mem.ram[a];
+        const a = m.phys(a0);
+        if (a < 0xA0000 or (a >= mem_mod.MEG and a < mem_mod.RAM)) return m.mem.ram[a];
         return m.rdHigh(a);
     }
     fn rdHigh(m: *Machine, a: u32) u8 {
+        // (no memory there: the bus floats high)
+        if (a >= mem_mod.RAM) return 0xFF;
         if (a < 0xC0000) return m.vga.read(a - 0xA0000);
         if (a >= 0xE0000 and a < 0xF0000) {
             if (m.xms.emsWindow(a - 0xE0000)) |r| return m.mem.ram[r];
@@ -258,14 +266,15 @@ pub const Machine = struct {
         return m.mem.ram[a];
     }
     pub inline fn wr8(m: *Machine, a0: u32, v: u8) void {
-        const a = m.mem.wrap(a0);
-        if (a < 0xA0000 or a >= mem_mod.MEG) {
+        const a = m.phys(a0);
+        if (a < 0xA0000 or (a >= mem_mod.MEG and a < mem_mod.RAM)) {
             m.mem.ram[a] = v;
             return;
         }
         m.wrHigh(a, v);
     }
     fn wrHigh(m: *Machine, a: u32, v: u8) void {
+        if (a >= mem_mod.RAM) return;
         if (a < 0xC0000) return m.vga.write(a - 0xA0000, v);
         if (a >= 0xE0000 and a < 0xF0000) {
             if (m.xms.emsWindow(a - 0xE0000)) |r| m.mem.ram[r] = v;
@@ -273,25 +282,27 @@ pub const Machine = struct {
         }
         // (the ROMs: read only; 0xC8000-0xDFFFF: nothing there)
     }
+    // (words and dwords straight from RAM in conventional and extended
+    // memory: a protected-mode game's code and data live above 1 MiB)
     pub inline fn rd16(m: *Machine, a: u32) u16 {
-        const w = m.mem.wrap(a);
-        if (w < 0x9FFFF) return std.mem.readInt(u16, m.mem.ram[w..][0..2], .little);
+        const w = m.phys(a);
+        if (w < 0x9FFFF or (w >= mem_mod.MEG and w < mem_mod.RAM - 1)) return std.mem.readInt(u16, m.mem.ram[w..][0..2], .little);
         return @as(u16, m.rd8(a)) | (@as(u16, m.rd8(a +% 1)) << 8);
     }
     pub inline fn wr16(m: *Machine, a: u32, v: u16) void {
-        const w = m.mem.wrap(a);
-        if (w < 0x9FFFF) return std.mem.writeInt(u16, m.mem.ram[w..][0..2], v, .little);
+        const w = m.phys(a);
+        if (w < 0x9FFFF or (w >= mem_mod.MEG and w < mem_mod.RAM - 1)) return std.mem.writeInt(u16, m.mem.ram[w..][0..2], v, .little);
         m.wr8(a, @truncate(v));
         m.wr8(a +% 1, @truncate(v >> 8));
     }
     pub inline fn rd32(m: *Machine, a: u32) u32 {
-        const w = m.mem.wrap(a);
-        if (w < 0x9FFFD) return std.mem.readInt(u32, m.mem.ram[w..][0..4], .little);
+        const w = m.phys(a);
+        if (w < 0x9FFFD or (w >= mem_mod.MEG and w < mem_mod.RAM - 3)) return std.mem.readInt(u32, m.mem.ram[w..][0..4], .little);
         return @as(u32, m.rd16(a)) | (@as(u32, m.rd16(a +% 2)) << 16);
     }
     pub inline fn wr32(m: *Machine, a: u32, v: u32) void {
-        const w = m.mem.wrap(a);
-        if (w < 0x9FFFD) return std.mem.writeInt(u32, m.mem.ram[w..][0..4], v, .little);
+        const w = m.phys(a);
+        if (w < 0x9FFFD or (w >= mem_mod.MEG and w < mem_mod.RAM - 3)) return std.mem.writeInt(u32, m.mem.ram[w..][0..4], v, .little);
         m.wr16(a, @truncate(v));
         m.wr16(a +% 2, @truncate(v >> 16));
     }
