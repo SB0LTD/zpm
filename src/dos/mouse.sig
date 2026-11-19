@@ -1,7 +1,9 @@
 //! A Microsoft mouse driver, int 33h (functions 00h-24h and 26h as
 //! programs of the early 1990s use them): reset and status, show/hide
-//! (the counter only: this driver does not draw the cursor yet; programs
-//! that draw their own, as most games do, are unaffected), position and
+//! and the cursor (09h's graphics masks with its hot spot, 0Ah's text
+//! cursor: `overlay` draws it over the finished picture, so it never
+//! touches video memory and a program reading the screen back sees its
+//! own pixels), position and
 //! buttons, presses and releases, ranges, the mickey ratio, motion
 //! counters, the user's event handler (0Ch/14h: queued for the machine,
 //! which calls it with the event mask in AX: `userCall`, `handlerRegs`),
@@ -49,6 +51,10 @@ const Saved = struct {
     off: u16,
 };
 
+/// The default arrow: a white arrow with a black outline.
+const DEFAULT_AND = [16]u16{ 0x3FFF, 0x1FFF, 0x0FFF, 0x07FF, 0x03FF, 0x01FF, 0x00FF, 0x007F, 0x003F, 0x001F, 0x01FF, 0x10FF, 0x30FF, 0xF87F, 0xF87F, 0xFC3F };
+const DEFAULT_XOR = [16]u16{ 0x0000, 0x4000, 0x6000, 0x7000, 0x7800, 0x7C00, 0x7E00, 0x7F00, 0x7F80, 0x7C00, 0x6C00, 0x4600, 0x0600, 0x0300, 0x0300, 0x0000 };
+
 pub const State = struct {
     /// The position in the driver's virtual screen (640 wide in most
     /// modes), the buttons (bit 0 left, 1 right, 2 middle).
@@ -86,6 +92,10 @@ pub const State = struct {
     text_type: u16 = 0,
     text_and: u16 = 0xFFFF,
     text_xor: u16 = 0x7700,
+    /// The graphics cursor (09h): 16 rows of screen (AND) and cursor
+    /// (XOR) masks, the leftmost pixel in bit 15; Microsoft's arrow.
+    and_mask: [16]u16 = DEFAULT_AND,
+    xor_mask: [16]u16 = DEFAULT_XOR,
     threshold: u16 = 64,
     sens: [3]u16 = .{ 50, 50, 50 },
     page: u16 = 0,
@@ -204,6 +214,67 @@ pub const State = struct {
     }
 };
 
+/// The cursor over the picture the VGA rendered (`out`, `stride` pixels a
+/// row, `w` x `h`, XRGB), when the program shows it: in text modes the
+/// character cell under it (0Ah's software cursor inverts its colours as
+/// the default attribute masks do; the hardware one marks its scan lines),
+/// in graphics modes the 16x16 masks at the position less the hot spot,
+/// in the mode's own pixels (the driver's virtual screen scaled to it).
+pub fn overlay(st: *const State, mem: *const Memory, out: []u32, stride: u32, w: u32, h: u32) void {
+    if (st.visible < 0 or !st.enabled or w == 0 or h == 0) return;
+    const x: i32 = st.x;
+    const y: i32 = st.y;
+    if (textMode(mem)) {
+        const cols: u32 = @max(mem.rdW(0x40, 0x4A), 1);
+        const rows: u32 = @as(u32, mem.rdB(0x40, 0x84)) + 1;
+        const cw = w / cols;
+        const ch = h / @max(rows, 1);
+        if (cw == 0 or ch == 0) return;
+        // (the virtual screen is 640 wide whatever the columns, 8 rows a cell)
+        const col: u32 = @intCast(@divTrunc(@max(x, 0) * @as(i32, @intCast(cols)), 640));
+        const row: u32 = @intCast(@divTrunc(@max(y, 0), 8));
+        if (col >= cols or row >= rows) return;
+        var first: u32 = 0;
+        var last: u32 = ch;
+        if (st.text_type == 1) {
+            // A hardware cursor: scan lines CX to DX of the cell.
+            first = @min(@as(u32, st.text_and & 0x1F) * ch / 16, ch - 1);
+            last = @min(@as(u32, st.text_xor & 0x1F) * ch / 16 + 1, ch);
+        } else if (st.text_xor & 0xFF00 == 0 and st.text_and & 0xFF00 == 0xFF00) return;
+        var yy = row * ch + first;
+        while (yy < row * ch + last and yy < h) : (yy += 1) {
+            for (out[yy * stride + col * cw ..][0..cw]) |*px| px.* ^= 0x00FF_FFFF;
+        }
+        return;
+    }
+    const mode = mem.rdB(0x40, 0x49) & 0x7F;
+    // The mode's pixels per virtual pixel: 640 virtual columns; rows as
+    // the mode has them (a mode the BIOS table doesn't know: 1:1).
+    const vw: i32 = if (mode <= 0x13) 640 else @intCast(w);
+    const vh: i32 = switch (mode) {
+        0x0F, 0x10 => 350,
+        0x11, 0x12 => 480,
+        0x04...0x06, 0x0D, 0x0E, 0x13 => 200,
+        else => @intCast(h),
+    };
+    const px0 = @divTrunc(x * @as(i32, @intCast(w)), vw) - st.hot_x;
+    const py0 = @divTrunc(y * @as(i32, @intCast(h)), vh) - st.hot_y;
+    for (0..16) |ry| {
+        const py = py0 + @as(i32, @intCast(ry));
+        if (py < 0 or py >= @as(i32, @intCast(h))) continue;
+        const am = st.and_mask[ry];
+        const xm = st.xor_mask[ry];
+        for (0..16) |rx| {
+            const pxx = px0 + @as(i32, @intCast(rx));
+            if (pxx < 0 or pxx >= @as(i32, @intCast(w))) continue;
+            const bit = @as(u16, 0x8000) >> @intCast(rx);
+            const p = &out[@as(usize, @intCast(py)) * stride + @as(usize, @intCast(pxx))];
+            if (am & bit == 0) p.* &= 0xFF00_0000;
+            if (xm & bit != 0) p.* ^= 0x00FF_FFFF;
+        }
+    }
+}
+
 fn textMode(mem: *const Memory) bool {
     return switch (mem.rdB(0x40, 0x49) & 0x7F) {
         0x00...0x03, 0x07 => true,
@@ -283,6 +354,12 @@ pub fn int33(st: *State, r: *Regs, mem: *Memory) void {
         0x09 => {
             st.hot_x = s16(r.bx());
             st.hot_y = s16(r.cx());
+            // ES:DX: 16 words of screen mask, then 16 of cursor mask.
+            const at = r.base[regs.ES] +% r.dx();
+            for (0..16) |i| {
+                st.and_mask[i] = mem.rd16(at +% @as(u32, @intCast(i * 2)));
+                st.xor_mask[i] = mem.rd16(at +% @as(u32, @intCast(32 + i * 2)));
+            }
         },
         0x0A => {
             st.text_type = r.bx();

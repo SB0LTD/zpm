@@ -124,3 +124,63 @@ test "mouse: the user handler is queued with its events" {
     call(&st, &r, 0x0024);
     try t.expectEqual(@as(u16, 0x0626), r.bx());
 }
+
+var pic: [720 * 400]u32 = undefined;
+
+test "mouse: the cursor over the picture (mode 13h's arrow, hot spot, masks; text cells)" {
+    mem.clear();
+    mem.wrB(0x40, 0x49, 0x13);
+    var st: mouse.State = .{};
+    var r = Regs{};
+    call(&st, &r, 0x0000);
+    const grey: u32 = 0x00808080;
+    @memset(pic[0 .. 320 * 200], grey);
+    // Hidden after a reset: nothing drawn.
+    mouse.overlay(&st, &mem, &pic, 320, 320, 200);
+    try t.expectEqual(grey, pic[100 * 320 + 160]);
+    call(&st, &r, 0x0001);
+    mouse.overlay(&st, &mem, &pic, 320, 320, 200);
+    // (320, 100) virtual is pixel (160, 100): the arrow's tip is outline
+    // (black), inside it white, past its edge the picture.
+    try t.expectEqual(@as(u32, 0), pic[100 * 320 + 160]);
+    try t.expectEqual(@as(u32, 0x00FFFFFF), pic[102 * 320 + 161]);
+    try t.expectEqual(grey, pic[100 * 320 + 170]);
+    // 09h: a 16x16 block of "invert" with the hot spot at its centre.
+    const at: u32 = 0x5000;
+    for (0..16) |i| {
+        mem.wr16(at + @as(u32, @intCast(i * 2)), 0xFFFF);
+        mem.wr16(at + 32 + @as(u32, @intCast(i * 2)), 0xFFFF);
+    }
+    r.setSeg(regs.ES, 0x0500);
+    r.setBx(8);
+    r.setCx(8);
+    r.setDx(0);
+    call(&st, &r, 0x0009);
+    @memset(pic[0 .. 320 * 200], grey);
+    mouse.overlay(&st, &mem, &pic, 320, 320, 200);
+    try t.expectEqual(grey ^ 0x00FFFFFF, pic[92 * 320 + 152]);
+    try t.expectEqual(grey ^ 0x00FFFFFF, pic[107 * 320 + 167]);
+    try t.expectEqual(grey, pic[108 * 320 + 168]);
+    try t.expectEqual(grey, pic[91 * 320 + 152]);
+    // Hidden again (02h): the picture as it was.
+    call(&st, &r, 0x0002);
+    @memset(pic[0 .. 320 * 200], grey);
+    mouse.overlay(&st, &mem, &pic, 320, 320, 200);
+    try t.expectEqual(grey, pic[100 * 320 + 160]);
+
+    // Text mode 3, 80x25 at 720x400: the cell under the cursor inverted.
+    mem.wrB(0x40, 0x49, 0x03);
+    mem.wrW(0x40, 0x4A, 80);
+    mem.wrB(0x40, 0x84, 24);
+    call(&st, &r, 0x0000);
+    call(&st, &r, 0x0001);
+    r.setCx(16); // column 2
+    r.setDx(24); // row 3
+    call(&st, &r, 0x0004);
+    @memset(&pic, 0);
+    mouse.overlay(&st, &mem, &pic, 720, 720, 400);
+    try t.expectEqual(@as(u32, 0x00FFFFFF), pic[(3 * 16) * 720 + 2 * 9]);
+    try t.expectEqual(@as(u32, 0x00FFFFFF), pic[(3 * 16 + 15) * 720 + 2 * 9 + 8]);
+    try t.expectEqual(@as(u32, 0), pic[(3 * 16) * 720 + 3 * 9]);
+    try t.expectEqual(@as(u32, 0), pic[(4 * 16) * 720 + 2 * 9]);
+}
