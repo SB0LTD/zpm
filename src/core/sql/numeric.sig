@@ -74,7 +74,14 @@ fn digitEstimate(bits: usize) usize {
 /// Decimal digits of a value (0 has zero digits).
 pub fn digitCount(value: u512) usize {
     if (value == 0) return 0;
-    const bits = @bitSizeOf(u512) - @as(usize, @clz(value));
+    const limbs: [8]u64 = @bitCast(value);
+    var high = limbs.len;
+    const bits = while (high != 0) {
+        high -= 1;
+        const index = if (@import("builtin").cpu.arch.endian() == .little) high else limbs.len - 1 - high;
+        const limb = limbs[index];
+        if (limb != 0) break high * 64 + 64 - @as(usize, @clz(limb));
+    } else unreachable;
     const estimate = digitEstimate(bits);
     return estimate + @as(usize, @intFromBool(value >= pow10[estimate]));
 }
