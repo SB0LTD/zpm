@@ -331,6 +331,9 @@ const O_RTAG = O_TLB + @offsetOf(pm.Tlb, "rtag");
 const O_WTAG = O_TLB + @offsetOf(pm.Tlb, "wtag");
 const O_HOFF = O_TLB + @offsetOf(pm.Tlb, "hoff");
 const C_PAGES = @offsetOf(jit.Ctx, "pages");
+const O_SEGLO = @offsetOf(Cpu, "seg_lo");
+const O_SEGRHI = @offsetOf(Cpu, "seg_rhi");
+const O_SEGWHI = @offsetOf(Cpu, "seg_whi");
 const C_WLOG = @offsetOf(jit.Ctx, "wlog");
 const C_WLOGN = @offsetOf(jit.Ctx, "wlog_n");
 const H_X87 = 1;
@@ -422,7 +425,27 @@ const E = struct {
                 }
             }
         }
-        if (with_seg) e.addSeg(m.seg);
+        if (with_seg) {
+            if (e.P and !e.flat(m.seg) and x.kind != .x87) {
+                const acc = accessOf(x);
+                e.limit(m.seg, acc.n, acc.w);
+            }
+            e.addSeg(m.seg);
+        }
+    }
+
+    /// The segment's limit for n bytes at offset r12d (a write: its write
+    /// bounds), as the interpreter's `limit` checks them: else the slow
+    /// path (the interpreter raises #GP or #SS).
+    fn limit(e: *E, s: u3, n: u8, write: bool) void {
+        const a = &e.a;
+        a.movRR(4, RAX, R12);
+        a.op(8, &.{0x8D}, RAX, .{ .m = .{ .base = RAX, .disp = @as(i32, n) - 1 } });
+        const hi: usize = @as(usize, if (write) O_SEGWHI else O_SEGRHI) + 8 * @as(usize, s);
+        a.aluRegRm(8, 7, RAX, .{ .m = cpuMem(hi) }); // cmp rax, [hi] (i64)
+        e.slow(15); // jg
+        a.aluRegRm(4, 7, R12, .{ .m = cpuMem(O_SEGLO + 4 * @as(usize, s)) });
+        e.slow(2); // jb
     }
 
     fn addSeg(e: *E, s: u3) void {
@@ -593,14 +616,16 @@ const E = struct {
         a.aluImm(4, 5, .{ .r = RBP }, n);
         if (!e.s32) a.op(4, &.{ 0x0F, 0xB7 }, RBP, .{ .r = RBP });
         a.movRR(4, R12, RBP);
+        if (e.P and !e.flat(regs_mod.SS)) e.limit(regs_mod.SS, n, true);
         e.addSeg(regs_mod.SS);
     }
     /// ebp = the stack offset in register `from` (its width), r12d = its
     /// linear address.
-    fn popAddr(e: *E, from: u3) void {
+    fn popAddr(e: *E, from: u3, n: u8) void {
         const a = &e.a;
         if (e.s32) a.movRegMem(4, RBP, grFull(from)) else a.op(4, &.{ 0x0F, 0xB7 }, RBP, .{ .m = grFull(from) });
         a.movRR(4, R12, RBP);
+        if (e.P and !e.flat(regs_mod.SS)) e.limit(regs_mod.SS, n, false);
         e.addSeg(regs_mod.SS);
     }
     /// SP = ebp (its width).
@@ -615,7 +640,7 @@ const E = struct {
     }
     /// eax = the n bytes popped (SP + n + extra).
     fn pop(e: *E, n: u8, extra: u32) void {
-        e.popAddr(regs_mod.ESP);
+        e.popAddr(regs_mod.ESP, n);
         e.rd(n, false);
         e.a.aluImm(4, 0, .{ .r = RBP }, n + extra);
         e.setSp();
@@ -703,6 +728,23 @@ const E = struct {
     }
 };
 
+const Acc = struct { n: u8, w: bool };
+
+/// The memory operand's access: its size, and whether it is written.
+fn accessOf(x: *const dec.Ins) Acc {
+    return switch (x.kind) {
+        .mov => .{ .n = x.sz, .w = x.dst == .mem },
+        .alu => .{ .n = x.sz, .w = x.dst == .mem and x.sub != 7 },
+        .test_, .imul, .push, .muldiv => .{ .n = x.sz, .w = false },
+        .incdec, .not_, .neg, .shift, .xchg => .{ .n = x.sz, .w = true },
+        .movzx, .movsx => .{ .n = x.ssz, .w = false },
+        .movsreg => .{ .n = 2, .w = true },
+        .setcc => .{ .n = 1, .w = true },
+        .jmp_ind, .call_ind => .{ .n = if (x.o32) 4 else 2, .w = false },
+        else => .{ .n = x.sz, .w = true },
+    };
+}
+
 /// eax = a register's, an immediate or memory's (r12d already the
 /// address) sz bytes (for 8/16 the low part).
 fn ldSrc(e: *E, x: *const dec.Ins, loc: dec.Loc, r: u3) void {
@@ -737,7 +779,6 @@ fn imm(a: *A, sz: u8, v: u32) void {
 fn native(e: *E, x: *const dec.Ins, need: u32) bool {
     const a = &e.a;
     const sz = x.sz;
-    if (x.mem and !e.flat(x.ea.seg) and x.kind != .lea and x.kind != .x87) return false;
     switch (x.kind) {
         .alu, .test_ => {
             const is_test = x.kind == .test_;
@@ -854,12 +895,16 @@ fn native(e: *E, x: *const dec.Ins, need: u32) bool {
                 else => return false,
             }
             const nd = need & f.tm;
-            if (nd & ~(f.hm | zm) != 0) return false;
+            // (SHL and SHR by more than 1: OF computed as the interpreter
+            // does, from CF and SF, or from the operand's sign)
+            const of_fix = (x.sub == 4 or x.sub == 5) and c != 1 and nd & OF != 0;
+            if (nd & ~(f.hm | zm | (if (of_fix) OF else 0)) != 0) return false;
             const opc: u8 = if (c == 1) (if (sz == 1) 0xD0 else 0xD1) else (if (sz == 1) 0xC0 else 0xC1);
             const digit: u4 = @intCast(x.sub);
             if (x.dst == .mem) {
                 e.ea(x, true);
                 e.rd(sz, false);
+                a.movRR(4, R8, RAX);
                 a.op(sz, &.{opc}, digit, .{ .r = RAX });
                 if (c != 1) a.b(@intCast(c));
                 const keep = nd != 0;
@@ -867,11 +912,16 @@ fn native(e: *E, x: *const dec.Ins, need: u32) bool {
                 a.movRR(4, RCX, RAX);
                 e.wr(sz);
                 if (keep) e.mat(f, RBP);
+                if (of_fix) ofFix(e, x.sub, sz);
                 return true;
             }
+            if (of_fix and x.sub == 5) a.movRegMem(sz, R8, gr(x.dreg, sz));
             a.op(sz, &.{opc}, digit, .{ .m = gr(x.dreg, sz) });
             if (c != 1) a.b(@intCast(c));
-            e.flags(f, need);
+            if (of_fix) {
+                e.mat(f, null);
+                ofFix(e, x.sub, sz);
+            } else e.flags(f, need);
             return true;
         },
         .movzx, .movsx => {
@@ -969,8 +1019,114 @@ fn native(e: *E, x: *const dec.Ins, need: u32) bool {
             return true;
         },
         .nop => return true,
+        .pushf => {
+            a.movRegMem(4, RCX, FLAGS);
+            if (sz == 4) a.aluImm(4, 4, .{ .r = RCX }, 0x00FC_FFFF);
+            e.push(sz);
+            return true;
+        },
+        .shxd => {
+            const bits: u32 = @as(u32, sz) * 8;
+            const c = x.imm;
+            if (c >= bits) return false;
+            // (the interpreter: SZP and CF of the result, AF 0, OF where
+            // the sign changed)
+            const f: Fl = .{ .hm = ARITH & ~AF & ~OF, .tm = ARITH };
+            const nd = need & f.tm;
+            const op2: u8 = if (x.sub == 0) 0xA4 else 0xAC;
+            if (x.dst == .mem) {
+                e.ea(x, true);
+                e.rd(sz, false);
+            } else a.movRegMem(sz, RAX, gr(x.dreg, sz));
+            a.movRR(4, R8, RAX);
+            a.movRegMem(sz, RCX, gr(x.sreg, sz));
+            a.op(sz, &.{ 0x0F, op2 }, RCX, .{ .r = RAX });
+            a.b(@intCast(c));
+            if (nd != 0) a.bytes(&.{ 0x9C, 0x5D });
+            a.movRR(4, R9, RAX);
+            if (x.dst == .mem) {
+                a.movRR(4, RCX, RAX);
+                e.wr(sz);
+            } else a.movMemReg(sz, gr(x.dreg, sz), RAX);
+            if (nd != 0) {
+                e.mat(f, RBP);
+                if (nd & OF != 0) {
+                    a.aluRmReg(4, 6, .{ .r = R9 }, R8); // r9 ^= r8
+                    a.op(4, &.{ 0xC1 }, 5, .{ .r = R9 });
+                    a.b(@intCast(bits - 1));
+                    a.aluImm(4, 4, .{ .r = R9 }, 1);
+                    a.op(4, &.{ 0xC1 }, 4, .{ .r = R9 });
+                    a.b(11);
+                    a.aluRmReg(4, 1, .{ .m = FLAGS }, R9);
+                }
+            }
+            return true;
+        },
+        .muldiv => {
+            if (sz == 1) return false;
+            // MUL, IMUL: the flags must be dead (the host leaves SZAP
+            // undefined); DIV, IDIV: the flags stay, and a #DE goes to
+            // the interpreter
+            if (x.sub < 6 and need & ARITH != 0) return false;
+            if (x.src == .mem) {
+                e.ea(x, true);
+                e.rd(sz, false);
+                a.movRR(4, RCX, RAX);
+            } else a.movRegMem(sz, RCX, gr(x.sreg, sz));
+            const ax = gr(regs_mod.EAX, sz);
+            const dx = gr(regs_mod.EDX, sz);
+            switch (x.sub) {
+                4, 5 => {
+                    a.movRegMem(sz, RAX, ax);
+                    a.op(sz, &.{0xF7}, @intCast(x.sub), .{ .r = RCX });
+                },
+                6 => {
+                    a.op(sz, &.{0x85}, RCX, .{ .r = RCX }); // test
+                    e.slow(CC_Z);
+                    a.movRegMem(sz, RDX, dx);
+                    a.aluRegRm(sz, 7, RDX, .{ .r = RCX }); // cmp dx, cx
+                    e.slow(3); // jae: the quotient would not fit
+                    a.movRegMem(sz, RAX, ax);
+                    a.op(sz, &.{0xF7}, 6, .{ .r = RCX });
+                },
+                else => {
+                    // IDIV through the next width up: no host #DE
+                    if (sz == 4) {
+                        a.op(8, &.{0x63}, RCX, .{ .r = RCX }); // movsxd rcx, ecx
+                        a.movRegMem(4, RAX, ax);
+                        a.movRegMem(4, RDX, dx);
+                        a.bytes(&.{ 0x48, 0xC1, 0xE2, 0x20 }); // shl rdx, 32
+                        a.aluRmReg(8, 1, .{ .r = RAX }, RDX); // or rax, rdx
+                    } else {
+                        a.op(4, &.{ 0x0F, 0xBF }, RCX, .{ .r = RCX }); // movsx ecx, cx
+                        a.op(4, &.{ 0x0F, 0xB7 }, RAX, .{ .m = ax });
+                        a.op(4, &.{ 0x0F, 0xB7 }, RDX, .{ .m = dx });
+                        a.bytes(&.{ 0xC1, 0xE2, 0x10 }); // shl edx, 16
+                        a.aluRmReg(4, 1, .{ .r = RAX }, RDX);
+                    }
+                    // (0 and -1 divisors: the interpreter's)
+                    a.op(8, &.{0x8D}, RDX, .{ .m = .{ .base = RCX, .disp = 1 } });
+                    a.aluImm(8, 7, .{ .r = RDX }, 1);
+                    e.slow(6); // jbe: rcx + 1 in {0, 1}
+                    const w: u8 = if (sz == 4) 8 else 4;
+                    if (w == 8) a.bytes(&.{ 0x48, 0x99 }) else a.b(0x99); // cqo / cdq
+                    a.op(w, &.{0xF7}, 7, .{ .r = RCX });
+                    // the quotient must fit
+                    if (sz == 4) {
+                        a.op(8, &.{0x63}, R8, .{ .r = RAX }); // movsxd r8, eax
+                        a.aluRegRm(8, 7, R8, .{ .r = RAX });
+                    } else {
+                        a.op(4, &.{ 0x0F, 0xBF }, R8, .{ .r = RAX }); // movsx r8d, ax
+                        a.aluRegRm(4, 7, R8, .{ .r = RAX });
+                    }
+                    e.slow(CC_NZ);
+                },
+            }
+            a.movMemReg(sz, ax, RAX);
+            a.movMemReg(sz, dx, RDX);
+            return true;
+        },
         .push => {
-            if (!e.flat(regs_mod.SS)) return false;
             switch (x.src) {
                 .reg => a.movRegMem(sz, RCX, gr(x.sreg, sz)),
                 .imm => a.movImm32(RCX, x.imm),
@@ -985,14 +1141,12 @@ fn native(e: *E, x: *const dec.Ins, need: u32) bool {
             return true;
         },
         .pop => {
-            if (!e.flat(regs_mod.SS)) return false;
             e.pop(sz, 0);
             a.movMemReg(sz, gr(x.dreg, sz), RAX);
             return true;
         },
         .leave => {
-            if (!e.flat(regs_mod.SS)) return false;
-            e.popAddr(regs_mod.EBP);
+            e.popAddr(regs_mod.EBP, sz);
             e.rd(sz, false);
             a.aluImm(4, 0, .{ .r = RBP }, sz);
             e.setSp();
@@ -1013,6 +1167,25 @@ fn native(e: *E, x: *const dec.Ins, need: u32) bool {
         },
         else => return false,
     }
+}
+
+/// OF after SHL (CF xor SF) or SHR (the operand's sign, in r8) by more
+/// than 1, into the guest's flags (mat left it 0).
+fn ofFix(e: *E, sub: u8, sz: u8) void {
+    const a = &e.a;
+    if (sub == 4) {
+        a.movRegMem(4, RAX, FLAGS);
+        a.movRR(4, RCX, RAX);
+        a.bytes(&.{ 0xC1, 0xE9, 0x07 }); // shr ecx, 7
+        a.aluRmReg(4, 6, .{ .r = RCX }, RAX);
+    } else {
+        a.movRR(4, RCX, R8);
+        a.op(4, &.{ 0xC1 }, 5, .{ .r = RCX }); // shr ecx, bits-1
+        a.b(sz * 8 - 1);
+    }
+    a.aluImm(4, 4, .{ .r = RCX }, 1);
+    a.bytes(&.{ 0xC1, 0xE1, 0x0B }); // shl ecx, 11
+    a.aluRmReg(4, 1, .{ .m = FLAGS }, RCX);
 }
 
 /// The interpreter for this instruction (a helper call).
@@ -1062,7 +1235,6 @@ fn branch(e: *E, x: *const dec.Ins, live_out: u32) bool {
             return true;
         },
         .call => {
-            if (!e.flat(regs_mod.SS)) return false;
             const n: u8 = if (x.o32) 4 else 2;
             a.movImm32(RCX, e.next);
             e.push(n);
@@ -1070,7 +1242,6 @@ fn branch(e: *E, x: *const dec.Ins, live_out: u32) bool {
             return true;
         },
         .ret => {
-            if (!e.flat(regs_mod.SS)) return false;
             const n: u8 = if (x.o32) 4 else 2;
             e.pop(n, x.imm);
             e.exitInd(x.o32);
@@ -1078,9 +1249,7 @@ fn branch(e: *E, x: *const dec.Ins, live_out: u32) bool {
         },
         .jmp_ind, .call_ind => {
             const n: u8 = if (x.o32) 4 else 2;
-            if (x.kind == .call_ind and !e.flat(regs_mod.SS)) return false;
             if (x.src == .mem) {
-                if (!e.flat(x.ea.seg)) return false;
                 e.ea(x, true);
                 e.rd(n, false);
             } else a.movRegMem(n, RAX, gr(x.sreg, n));
@@ -1119,7 +1288,7 @@ pub fn emitBlock(j: *Jit, b: u32, ins: []const dec.Ins, mode: u32, comptime B: t
     const n: u32 = @intCast(ins.len);
     const wrap: u32 = if (P and mode32(k.mode)) 0xFFFF_FFFF else 0xFFFF;
     var after: [jit.MAX_INS]u32 = undefined;
-    const live_out = jit.liveness(ins, &after, e.check);
+    const live_out = jit.liveness(ins, &after, e.check, j.live_out);
     // Entry: the budget (all of the block, or the dispatcher steps).
     a.bytes(&.{ 0x49, 0x81, 0xFE }); // cmp r14, imm32
     a.d(n);
@@ -1456,6 +1625,19 @@ fn x87native(e: *E, x: *const dec.Ins) bool {
                         a.movRR(4, RAX, R9);
                         if (reg == 3) x87Pop(a);
                         x87Note(e, x);
+                        return true;
+                    },
+                    5, 7 => {
+                        if (w) return false;
+                        // FLDCW, FNSTCW (control: no note)
+                        e.ea(x, true);
+                        if (reg == 5) {
+                            e.rd(2, false);
+                            a.movMemReg(2, cpuMem(F_CW), RAX);
+                        } else {
+                            a.op(4, &.{ 0x0F, 0xB7 }, RCX, .{ .m = cpuMem(F_CW) });
+                            e.wr(2);
+                        }
                         return true;
                     },
                     else => return false,

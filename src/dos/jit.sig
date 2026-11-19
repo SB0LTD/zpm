@@ -274,6 +274,13 @@ pub const Jit = struct {
     cur: u32 = 0,
     /// A bus for the dispatcher's twin checks: the raw one.
     trace: bool = false,
+    /// The flags live at the end of the block being made (its successors'
+    /// first instructions read them before writing them).
+    live_out: u32 = dec.ARITH,
+    /// Look into the blocks a block goes to for the flags they read
+    /// (off: every block leaves all of them exact, as lockstep does; the
+    /// tests that compare flags at any instruction turn it off).
+    lookahead: bool = true,
 
     // ── The code memory ────────────────────────────────────────────────
 
@@ -557,6 +564,9 @@ pub const Jit = struct {
 };
 
 pub var the: Jit = .{};
+/// (a profiling aid: count what hStep runs, by opcode)
+pub const dbg_ops = false;
+pub var hstep_ops: [512]u64 = [_]u64{0} ** 512;
 
 
 
@@ -628,8 +638,7 @@ pub fn run(c: *Cpu, bus: anytype, budget: u32) Exit {
 /// the block's end (all of them). In lockstep (`check`) anything that can
 /// fault or leave through the interpreter counts as reading them all, so
 /// the flags are exact wherever the twin may look.
-pub fn liveness(ins: []const dec.Ins, after: []u32, check: bool) u32 {
-    const live_out: u32 = dec.ARITH;
+pub fn liveness(ins: []const dec.Ins, after: []u32, check: bool, live_out: u32) u32 {
     var live = live_out;
     var i = ins.len;
     while (i > 0) {
@@ -639,7 +648,7 @@ pub fn liveness(ins: []const dec.Ins, after: []u32, check: bool) u32 {
         var rd: u32 = x.fr;
         if (check) {
             switch (x.kind) {
-                .helper, .x87, .push, .pop, .call, .ret, .leave, .call_ind, .jmp_ind => rd = dec.ARITH,
+                .helper, .x87, .push, .pop, .call, .ret, .leave, .call_ind, .jmp_ind, .muldiv, .pushf => rd = dec.ARITH,
                 else => if (x.mem) {
                     rd = dec.ARITH;
                 },
@@ -815,6 +824,30 @@ pub fn Mode(comptime B: type, comptime P: bool) type {
             k.last_eip = eip +% len -% 1;
             k.lo = @intCast(host & 0xFFF);
             k.hi = @intCast((host & 0xFFF) + len);
+            // (what the blocks it goes to read of the flags it leaves: their
+            // bytes on this page become part of what it depends on)
+            j.live_out = dec.ARITH;
+            if (!j.check and j.lookahead) {
+                const last = &ins[n - 1];
+                const end_ip = eip +% len;
+                var live: u32 = 0;
+                var lo: u32 = k.lo;
+                var hi: u32 = k.hi;
+                const succ = [2]u32{ end_ip, last.target };
+                const ns: usize = switch (last.kind) {
+                    .jcc => 2,
+                    .jmp, .call => 1,
+                    else => if (last.term) 0 else 1,
+                };
+                if (ns == 0) live = dec.ARITH;
+                for (0..ns) |si| {
+                    const t_ip = if (last.kind == .jmp or last.kind == .call) last.target else succ[si];
+                    live |= liveIn(c, host, eip, t_ip, &lo, &hi);
+                }
+                j.live_out = live;
+                k.lo = @intCast(lo);
+                k.hi = @intCast(hi);
+            }
             inline for (0..2) |i| {
                 k.dyn_lo[i] = dyn[i][0];
                 k.dyn_hi[i] = dyn[i][1];
@@ -874,6 +907,43 @@ pub fn Mode(comptime B: type, comptime P: bool) type {
                 if (x.term) break;
             }
             return n;
+        }
+
+        /// The flags the code at EIP `ip` (on the page of the block at
+        /// `host`, EIP `eip`) reads before it writes them, looking at a
+        /// few instructions; [lo, hi) grows over the bytes looked at.
+        fn liveIn(c: *Cpu, host: usize, eip: u32, ip0: u32, lo: *u32, hi: *u32) u32 {
+            const d32 = P and c.code32;
+            const wrap: u32 = if (d32) 0xFFFF_FFFF else 0xFFFF;
+            const page0 = host & ~@as(usize, 0xFFF);
+            const d: i64 = @as(i64, @intCast(host & 0xFFF)) + (@as(i64, ip0) - @as(i64, eip));
+            if (d < 0 or d >= 4096) return dec.ARITH;
+            var off: u32 = @intCast(d);
+            var ip = ip0;
+            var unknown: u32 = dec.ARITH;
+            var reads: u32 = 0;
+            var k: u32 = 0;
+            while (k < 8) : (k += 1) {
+                var avail: u64 = 4096 - off;
+                if (!d32) avail = @min(avail, 0x10000 - @as(u64, ip & 0xFFFF));
+                if (P) {
+                    const lim: u64 = @min(@as(u64, c.fetch_hi), @as(u64, c.ip_wrap));
+                    if (ip > lim) return reads | unknown;
+                    avail = @min(avail, lim - ip + 1);
+                }
+                if (avail == 0) return reads | unknown;
+                const p: [*]const u8 = @ptrFromInt(page0 + off);
+                const x = dec.decode(p, @intCast(avail), d32, ip, wrap) orelse return reads | unknown;
+                lo.* = @min(lo.*, off);
+                hi.* = @max(hi.*, off + x.len);
+                reads |= x.fr & unknown;
+                unknown &= ~@as(u32, x.fw);
+                if (unknown == 0) return reads;
+                if (x.term) return reads | unknown;
+                off += x.len;
+                ip = (ip +% x.len) & wrap;
+            }
+            return reads | unknown;
         }
 
         fn enter(j: *Jit, c: *Cpu, bus: B, b: u32, end: u64) ?Exit {
@@ -941,6 +1011,18 @@ pub fn Mode(comptime B: type, comptime P: bool) type {
             c.executed = @intCast(@as(i64, @intCast(ctx.end)) - ctx.r14 - @as(i64, a));
             const s0 = Sig.of(c);
             ctx.inval = 0;
+            if (dbg_ops) {
+                var q = c.regs.base[CS] +% eip;
+                var op = bus.rd8(if (P and c.paging) pm.translate(c, bus, q, false, c.cpl == 3) catch q else q);
+                var guard: u32 = 0;
+                while ((op == 0x66 or op == 0x67 or op == 0xF3 or op == 0xF2 or op == 0x26 or op == 0x2E or op == 0x36 or op == 0x3E or op == 0x64 or op == 0x65) and guard < 4) : (guard += 1) {
+                    q +%= 1;
+                    op = bus.rd8(if (P and c.paging) pm.translate(c, bus, q, false, c.cpl == 3) catch q else q);
+                }
+                var o2: u32 = op;
+                if (op == 0x0F) o2 = 0x100 | @as(u32, bus.rd8(if (P and c.paging) pm.translate(c, bus, q +% 1, false, c.cpl == 3) catch q else q +% 1));
+                hstep_ops[o2] += 1;
+            }
             const res = c.stepJit(modeBus(c, bus), ctx.end, false, false);
             ctx.r14 = @as(i64, @intCast(ctx.end)) - @as(i64, @intCast(c.executed)) - @as(i64, a);
             if (res) |e| {

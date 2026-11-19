@@ -22,6 +22,10 @@ var hj: TestHost = .{};
 var hi: TestHost = .{};
 
 const GDT: u32 = 0x800;
+/// The translator's look at the flags the next blocks read (with it, flags
+/// nothing reads may be stale at a block's end: compare them only where
+/// a program reads them).
+var lookahead = false;
 
 fn have() bool {
     return jit.have_backend and builtin.os.tag == .linux;
@@ -34,6 +38,10 @@ fn boot(code: []const u8) bool {
     mj.init(hj.host(), "");
     mi.init(hi.host(), "");
     if (!mj.jitEnable()) return false;
+    jit.the.lookahead = lookahead;
+    // (flags exact even where a fault would push them: the tests that
+    // compare flags at any instruction run as lockstep does)
+    jit.the.check = !lookahead;
     for ([_]*machine.Machine{ &mj, &mi }) |m| {
         @memcpy(m.mem.ram[0x10000..][0..code.len], code);
         const r = &m.cpu.regs;
@@ -198,7 +206,7 @@ const Gen = struct {
     /// operand size is 32 bits (else 16).
     fn one(g: *Gen, wide: bool) void {
         const mem = g.r().boolean();
-        const pick = g.r().uintLessThan(u8, 23);
+        const pick = g.r().uintLessThan(u8, 26);
         // operand size: 1, the default, or the other (0x66)
         const szk = g.r().uintLessThan(u8, 3);
         const byte = szk == 0;
@@ -343,6 +351,35 @@ const Gen = struct {
                 g.b(0x11);
                 g.modrm(g.any(), g.dst(), mem);
             },
+            23 => { // SHLD/SHRD r/m, r, imm
+                if (byte) return g.b(0x90);
+                g.b(0x0F);
+                g.b(if (g.r().boolean()) 0xA4 else 0xAC);
+                g.modrm(g.any(), dreg, mem);
+                g.b(g.r().uintLessThan(u8, 34));
+            },
+            24 => { // MUL IMUL DIV IDIV r/m (a divisor that faults: the
+                // interpreter's #DE, through the real-mode vector table)
+                if (byte) return g.b(0x90);
+                const sub = 4 + g.r().uintLessThan(u8, 4);
+                // (divide by a register kept non-zero: ESI | 1 forced)
+                if (sub >= 6) {
+                    g.b(0x83);
+                    g.b(0xCE); // or esi, imm8
+                    g.b(1);
+                    if (szk == 2) g.b(0x66);
+                    g.b(0xF7);
+                    g.modrm(sub, 6, false);
+                } else {
+                    g.b(0xF7);
+                    g.modrm(sub, g.any(), mem);
+                }
+            },
+            25 => { // PUSHF, then POP into a register
+                if (szk == 2) g.n -= 1;
+                g.b(0x9C);
+                g.b(0x58 | g.dst());
+            },
             22 => { // CALL to the next instruction, POP its address
                 if (szk == 2) g.n -= 1;
                 g.b(0xE8);
@@ -380,29 +417,50 @@ fn fuzz(wide: bool, seed: u64) !void {
             g.b(@truncate(rel));
             g.b(@truncate(rel >> 8));
         }
-        const ok = if (wide) flat(g.buf[0..g.n], round & 1 == 0) else boot(g.buf[0..g.n]);
-        try t.expect(ok);
         // Random registers and flags, the same on both.
         var vals: [8]u32 = undefined;
         for (&vals) |*v| v.* = g.r().int(u32);
         const fl: u32 = (g.r().int(u32) & dec.ARITH) | regs.FIXED;
-        for ([_]*machine.Machine{ &mj, &mi }) |m| {
-            const r = &m.cpu.regs;
-            for (0..8) |i| r.r[i] = vals[i];
-            if (wide) {
-                r.r[regs.ESP] = 0x9000;
-                r.r[regs.EDI] = 0x30000;
-            } else {
-                r.r[regs.ESP] = 0xFF00;
-                r.r[regs.EBX] = 0x100;
-            }
-            r.flags = fl;
-            for (0..256) |i| m.mem.ram[0x30000 + 0x100 * @as(usize, @intFromBool(!wide)) + i] = @truncate(vals[i & 7] >> @intCast(i & 24));
-        }
-        runBoth(@intCast(count * 3 + 7), 1_000_000) catch |e| {
+        try fuzzSetup(wide, round, g.buf[0..g.n], vals, fl);
+        const budget: u32 = @intCast(count * 3 + 7);
+        runBoth(budget, 1_000_000) catch |e| {
             std.debug.print("\nfuzz ({s}, seed {d}, round {d}): {x}\n", .{ if (wide) "32-bit" else "16-bit", seed, round, g.buf[0..g.n] });
+            // (the first instruction after which they differ)
+            var k: u32 = 1;
+            while (k <= budget) : (k += 1) {
+                try fuzzSetup(wide, round, g.buf[0..g.n], vals, fl);
+                _ = mi.cpu.run(&mi, k - 1);
+                const eip0 = mi.cpu.regs.eip;
+                try fuzzSetup(wide, round, g.buf[0..g.n], vals, fl);
+                _ = mj.cpu.run(&mj, k);
+                _ = mi.cpu.run(&mi, k);
+                const a = &mj.cpu.regs;
+                const b = &mi.cpu.regs;
+                if (!std.mem.eql(u32, &a.r, &b.r) or a.flags != b.flags or a.eip != b.eip) {
+                    std.debug.print("differs after instruction {d} at eip {x}: jit flags {x} interp {x}; regs jit {any} interp {any}\n", .{ k, eip0, a.flags, b.flags, a.r, b.r });
+                    break;
+                }
+            }
             return e;
         };
+    }
+}
+
+fn fuzzSetup(wide: bool, round: u32, code: []const u8, vals: [8]u32, fl: u32) !void {
+    const ok = if (wide) flat(code, round & 1 == 0) else boot(code);
+    try t.expect(ok);
+    for ([_]*machine.Machine{ &mj, &mi }) |m| {
+        const r = &m.cpu.regs;
+        for (0..8) |i| r.r[i] = vals[i];
+        if (wide) {
+            r.r[regs.ESP] = 0x9000;
+            r.r[regs.EDI] = 0x30000;
+        } else {
+            r.r[regs.ESP] = 0xFF00;
+            r.r[regs.EBX] = 0x100;
+        }
+        r.flags = fl;
+        for (0..256) |i| m.mem.ram[0x30000 + 0x100 * @as(usize, @intFromBool(!wide)) + i] = @truncate(vals[i & 7] >> @intCast(i & 24));
     }
 }
 
@@ -660,3 +718,40 @@ test "jit: the x87's templates against the FPU's code on random operands" {
     try x87Fuzz(true, 12);
     try x87Fuzz(false, 13);
 }
+
+test "jit: flags left stale for the next blocks are right wherever read (look-ahead on)" {
+    if (!have()) return;
+    lookahead = true;
+    defer lookahead = false;
+    var g = Gen{ .rng = std.Random.DefaultPrng.init(21) };
+    var round: u32 = 0;
+    while (round < 300) : (round += 1) {
+        g.n = 0;
+        const count = 3 + g.r().uintLessThan(u32, 30);
+        for (0..count) |_| {
+            g.one(true);
+            // (an observer now and then: the flags into EDI's page via PUSHF/POP)
+            if (g.r().uintLessThan(u8, 4) == 0) {
+                g.b(0x9C);
+                g.b(0x8F);
+                g.b(0x47);
+                g.b(0x7C); // pop dword [edi+7Ch]
+            }
+        }
+        g.b(0xE9);
+        g.d(@bitCast(-@as(i32, @intCast(g.n + 4))));
+        var vals: [8]u32 = undefined;
+        for (&vals) |*v| v.* = g.r().int(u32);
+        const fl: u32 = (g.r().int(u32) & dec.ARITH) | regs.FIXED;
+        try fuzzSetup(true, round, g.buf[0..g.n], vals, fl);
+        const budget: u32 = @intCast(count * 4 + 7);
+        _ = mj.cpu.run(&mj, budget);
+        _ = mi.cpu.run(&mi, budget);
+        // registers and memory exact; the flags only as observed
+        try t.expectEqualSlices(u32, &mi.cpu.regs.r, &mj.cpu.regs.r);
+        try t.expectEqual(mi.cpu.regs.eip, mj.cpu.regs.eip);
+        try t.expect(std.mem.eql(u8, mi.mem.ram[0x30000..0x31000], mj.mem.ram[0x30000..0x31000]));
+        try t.expect(std.mem.eql(u8, mi.mem.ram[0x8000..0x9000], mj.mem.ram[0x8000..0x9000]));
+    }
+}
+

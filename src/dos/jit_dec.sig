@@ -87,6 +87,12 @@ pub const Kind = enum(u8) {
     movsreg,
     /// BSWAP.
     bswap,
+    /// PUSHF(D).
+    pushf,
+    /// SHLD (sub 0) / SHRD (sub 1) dst, sreg, imm (the count, not 0).
+    shxd,
+    /// F6/F7 /4-/7 (sub): MUL IMUL DIV IDIV on src.
+    muldiv,
 };
 
 pub const Ins = struct {
@@ -534,7 +540,11 @@ pub fn decode(p: [*]const u8, n: u32, d32: bool, eip: u32, wrap: u32) ?Ins {
             ins.fr = 0;
             ins.fw = 0;
         },
-        0x9C => ins.fw = 0,
+        0x9C => {
+            ins.kind = .pushf;
+            ins.sz = vsz;
+            ins.fw = 0;
+        },
         0x9D => {
             ins.fr = 0;
             ins.term = true;
@@ -743,6 +753,12 @@ pub fn decode(p: [*]const u8, n: u32, d32: bool, eip: u32, wrap: u32) ?Ins {
                     ins.fw = 0;
                 },
             }
+            if (ins.sreg >= 4) {
+                ins.kind = .muldiv;
+                ins.sub = ins.sreg;
+                ins.src = if (ins.mem) .mem else .reg;
+                ins.sreg = ins.dreg;
+            }
         },
         0xF8, 0xF9 => {
             ins.kind = .flagop;
@@ -903,8 +919,21 @@ fn decode0F(r: *Rd, ins: *Ins, op: u16, seg: u3, a32: bool, vsz: u8) void {
             }
         },
         0xA4, 0xAC => {
+            ins.sz = vsz;
             modrm(r, ins, seg, a32);
-            _ = r.b();
+            const n = r.b() & 31;
+            if (n != 0) {
+                ins.kind = .shxd;
+                ins.sub = @intFromBool(op & 0xFF == 0xAC);
+                ins.imm = n;
+                ins.dst = if (ins.mem) .mem else .reg;
+                ins.src = .reg;
+                ins.fr = 0;
+                ins.fw = ALL;
+            } else {
+                ins.fr = 0;
+                ins.fw = 0;
+            }
         },
         0xA5, 0xAD => modrm(r, ins, seg, a32),
         0xAF => {
