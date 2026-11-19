@@ -19,8 +19,11 @@ const dos = @import("dos");
 
 var machine: dos.Machine = undefined;
 var host: dos.host_linux.LinuxHost = .{ .prefix = "[dos] " };
-var screen: [720 * 480]u32 = undefined;
-var ppm: [720 * 480 * 3 + 32]u8 = undefined;
+/// The largest picture: VESA's 1600x1200.
+const MAX_W = 1600;
+const MAX_H = 1200;
+var screen: [MAX_W * MAX_H]u32 = undefined;
+var ppm: [MAX_W * MAX_H * 3 + 32]u8 = undefined;
 
 fn out(comptime f: []const u8, args: anytype) void {
     var b: [400]u8 = undefined;
@@ -37,7 +40,7 @@ fn nowNs() u64 {
 const Key = struct { at_us: u64, codes: [16]u8, n: u8, done: bool = false };
 
 fn shot(path: []const u8) void {
-    const sz = machine.frame(&screen, 720, .{ .w = 720, .h = 480 });
+    const sz = machine.frame(&screen, MAX_W, .{ .w = MAX_W, .h = MAX_H });
     if (sz.w == 0 or sz.h == 0) {
         out("dosrun: no picture to save ({s})", .{path});
         return;
@@ -46,7 +49,7 @@ fn shot(path: []const u8) void {
     var n = head.len;
     var y: usize = 0;
     while (y < sz.h) : (y += 1) {
-        for (screen[y * 720 ..][0..sz.w]) |px| {
+        for (screen[y * MAX_W ..][0..sz.w]) |px| {
             ppm[n] = @truncate(px >> 16);
             ppm[n + 1] = @truncate(px >> 8);
             ppm[n + 2] = @truncate(px);
