@@ -23,9 +23,7 @@ jobs:
           tar -xf "$RUNNER_TEMP/$asset" -C "$RUNNER_TEMP/sdk"
           compiler=$(find "$RUNNER_TEMP/sdk" -type f -name sig -print -quit)
           standard=$(find "$RUNNER_TEMP/sdk" -type f -path '*/lib/std/std.sig' -print -quit)
-          printf 'SIG=%s
-SIG_LIB_DIR=%s
-' "$compiler" "${standard%/std/std.sig}" >> "$GITHUB_ENV"
+          printf 'SIG=%s\nSIG_LIB_DIR=%s\n' "$compiler" "${standard%/std/std.sig}" >> "$GITHUB_ENV"
       - name: Numeric boundaries and existing SQL numeric contracts
         run: |
           mkdir evidence
@@ -67,9 +65,7 @@ SIG_LIB_DIR=%s
           (root/'bin/sig').chmod(0o755)
           Path('evidence/native-toolchain.json').write_text(json.dumps(manifest,indent=2))
           with open(os.environ['GITHUB_ENV'],'a') as env:
-              env.write(f"SIG={root}/bin/sig
-SIG_LIB_DIR={root}/lib
-")
+              env.write(f"SIG={root}/bin/sig\nSIG_LIB_DIR={root}/lib\n")
           PY
       - name: Pin only reviewed ZPM numeric candidate in ephemeral product checkout
         run: |
