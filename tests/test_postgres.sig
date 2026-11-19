@@ -382,8 +382,10 @@ fn internalCharWire() !void {
         try check(u32be(row.body[2..6]) == example.output.len and equal(row.body[6..], example.output));
         try sync(&session, &db);
     }
-    try state(try bind(&session, &db, "", "internal_char", &.{"\xff"}, 0, 0), "22021");
-    try sync(&session, &db);
+    for ([_][]const u8{ "\xff", "\xc0\xaf", "\xed\xa0\x80", "\xf0\x9f", "\xf4\x90\x80\x80" }) |invalid| {
+        try state(try bind(&session, &db, "", "internal_char", &.{invalid}, 0, 0), "22021");
+        try sync(&session, &db);
+    }
     try state(try bind(&session, &db, "", "internal_char", &.{""}, 1, 1), "08P01");
     try sync(&session, &db);
     try state(try bind(&session, &db, "", "internal_char", &.{"ab"}, 1, 1), "22P03");
