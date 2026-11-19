@@ -1005,7 +1005,9 @@ pub fn window(c: *Cpu, ip: u32, lin: u32) void {
     const back = @min(off, ip);
     const start = ip - back;
     var len: u64 = 0x1000 - off + back;
-    const last: u64 = @min(c.fetch_hi, c.ip_wrap);
+    // (short of EIP's wrap: a fetch from the window never has to wrap)
+    const last: u64 = @min(c.fetch_hi, c.ip_wrap - 1);
+    if (ip > last) return;
     if (start + len - 1 > last) len = last - start + 1;
     c.tlb.fw_idx = i;
     c.tlb.fw_base = start;

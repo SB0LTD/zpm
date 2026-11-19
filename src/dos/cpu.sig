@@ -570,25 +570,28 @@ pub const Cpu = struct {
     /// page the host has the bytes of is one load (cpu_pm.sig's Tlb).
     inline fn rdL(self: *Cpu, bus: anytype, comptime T: type, a: u32) Er(@TypeOf(bus))!T {
         if (comptime !prot(@TypeOf(bus))) return rdM(bus, T, a);
-        const i = (a >> 12) & (pm.TLB_N - 1);
-        const need = pm.D_R | pm.access(self.cpl, false);
-        if (self.tlb.tag[i] == (a & 0xFFFF_F000) | 1 and self.tlb.perm[i] & need == need and
-            (T == u8 or a & 0xFFF <= 0x1000 - @sizeOf(T)))
-            return @as(*align(1) const T, @ptrFromInt(self.tlb.hoff[i] +% a)).*;
+        if (self.tlbHit(T, a, false)) |h| return @as(*align(1) const T, @ptrFromInt(h)).*;
         return pm.rdSlow(self, bus.b, T, a, self.cpl == 3);
     }
 
     inline fn wrL(self: *Cpu, bus: anytype, comptime T: type, a: u32, v: T) Er(@TypeOf(bus))!void {
         if (comptime !prot(@TypeOf(bus))) return wrM(bus, T, a, v);
-        const i = (a >> 12) & (pm.TLB_N - 1);
-        const need = pm.D_W | pm.access(self.cpl, true);
-        if (self.tlb.tag[i] == (a & 0xFFFF_F000) | 1 and self.tlb.perm[i] & need == need and
-            (T == u8 or a & 0xFFF <= 0x1000 - @sizeOf(T)))
-        {
-            @as(*align(1) T, @ptrFromInt(self.tlb.hoff[i] +% a)).* = v;
+        if (self.tlbHit(T, a, true)) |h| {
+            @as(*align(1) T, @ptrFromInt(h)).* = v;
             return;
         }
         return pm.wrSlow(self, bus.b, T, a, v, self.cpl == 3);
+    }
+
+    /// The host address of a T at linear `a` if the TLB has its page's
+    /// bytes, with the rights for this access, and all of T is on it.
+    inline fn tlbHit(self: *const Cpu, comptime T: type, a: u32, comptime write: bool) ?usize {
+        const i = (a >> 12) & (pm.TLB_N - 1);
+        const need = (if (write) pm.D_W else pm.D_R) | pm.access(self.cpl, write);
+        if (self.tlb.tag[i] == (a & 0xFFFF_F000) | 1 and self.tlb.perm[i] & need == need and
+            (T == u8 or a & 0xFFF <= 0x1000 - @sizeOf(T)))
+            return self.tlb.hoff[i] +% a;
+        return null;
     }
 
     /// Segment s's limit and rights for `n` bytes at `off`: #GP(0), or
@@ -612,7 +615,12 @@ pub const Cpu = struct {
     }
 
     /// The x87's accesses in protected mode (PmBus): a fault is noted.
-    fn stickyRd(self: *Cpu, b: anytype, comptime T: type, a: u32) T {
+    inline fn stickyRd(self: *Cpu, b: anytype, comptime T: type, a: u32) T {
+        if (self.tlbHit(T, a, false)) |h| return @as(*align(1) const T, @ptrFromInt(h)).*;
+        return self.stickyRdSlow(b, T, a);
+    }
+
+    fn stickyRdSlow(self: *Cpu, b: anytype, comptime T: type, a: u32) T {
         if (self.sticky) return 0;
         return pm.rdSlow(self, b, T, a, self.cpl == 3) catch {
             self.sticky = true;
@@ -620,7 +628,17 @@ pub const Cpu = struct {
         };
     }
 
-    fn stickyWr(self: *Cpu, b: anytype, comptime T: type, a: u32, v: T) void {
+    inline fn stickyWr(self: *Cpu, b: anytype, comptime T: type, a: u32, v: T) void {
+        if (!self.sticky) {
+            if (self.tlbHit(T, a, true)) |h| {
+                @as(*align(1) T, @ptrFromInt(h)).* = v;
+                return;
+            }
+        }
+        self.stickyWrSlow(b, T, a, v);
+    }
+
+    fn stickyWrSlow(self: *Cpu, b: anytype, comptime T: type, a: u32, v: T) void {
         if (self.sticky) return;
         pm.wrSlow(self, b, T, a, v, self.cpl == 3) catch {
             self.sticky = true;
@@ -644,7 +662,8 @@ pub const Cpu = struct {
         const n: u32 = @sizeOf(T);
         const d = ip -% self.tlb.fw_base;
         if (@as(u64, d) + n <= self.tlb.fw_len) {
-            self.regs.eip = (ip +% n) & self.ip_wrap;
+            // (no wrap to mask: the window stops short of it)
+            self.regs.eip = ip + n;
             return @as(*align(1) const T, @ptrFromInt(self.tlb.fw_host +% d)).*;
         }
         return self.fetchSlow(bus, T, ip);
