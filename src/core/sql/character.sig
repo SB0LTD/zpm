@@ -15,7 +15,7 @@
 //! PostgreSQL, up to 10485760) but every non-NULL value then raises
 //! TextCapacity (54000).
 const types = @import("types.sig");
-const std = @import("std");
+const lexer = @import("lexer.sig");
 const Error = types.Error;
 
 /// PostgreSQL MaxAttrSize: the largest declarable length.
@@ -90,8 +90,9 @@ fn clipped(bytes: []const u8, length: usize, mode: Mode) Error!usize {
 
 /// PostgreSQL character input uses UTF-8 and rejects embedded NUL.
 pub fn validateText(bytes: []const u8) Error!void {
-    if (std.mem.indexOfScalar(u8, bytes, 0) != null or !std.unicode.utf8ValidateSlice(bytes))
-        return error.CharacterNotInRepertoire;
+    var check: lexer.Utf8Check = .{};
+    for (bytes) |byte| check.feed(byte);
+    if (!check.finish()) return error.CharacterNotInRepertoire;
 }
 
 /// An internal-char cast can form one raw byte followed by bpchar padding.
