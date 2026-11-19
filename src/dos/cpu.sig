@@ -414,11 +414,16 @@ pub const Cpu = struct {
     /// CR0.PE changes (null: `run` goes on in the other).
     fn loop(self: *Cpu, bus: anytype, end: u64) ?Exit {
         const P = comptime prot(@TypeOf(bus));
-        if (P) pm.syncAll(self);
+        if (P) {
+            pm.syncAll(self);
+            pm.checkKey(self, bus.b);
+        }
         while (self.executed < end) {
             var trace = false;
             if (self.poll) {
                 if ((self.cr0 & CR0_PE != 0) != P) return null;
+                // (IN/OUT and the services can move the A20 gate)
+                if (P) pm.checkKey(self, bus.b);
                 if (self.shadow) {
                     self.shadow = false;
                 } else {
@@ -467,6 +472,7 @@ pub const Cpu = struct {
         if (comptime prot(@TypeOf(bus))) return pm.external(self, bus.b, vec);
         if (self.cr0 & CR0_PE != 0) {
             pm.syncAll(self);
+            pm.checkKey(self, bus);
             return pm.external(self, bus, vec);
         }
         const r = &self.regs;
@@ -535,17 +541,29 @@ pub const Cpu = struct {
     // ── Memory ──────────────────────────────────────────────────────────
 
     /// T at linear `a`: the bus itself in real mode; in protected mode
-    /// through paging (with CPL 3's rights at CPL 3).
+    /// through the TLB (paging, with CPL 3's rights at CPL 3): a hit on a
+    /// page the host has the bytes of is one load (cpu_pm.sig's Tlb).
     inline fn rdL(self: *Cpu, bus: anytype, comptime T: type, a: u32) Er(@TypeOf(bus))!T {
         if (comptime !prot(@TypeOf(bus))) return rdM(bus, T, a);
-        if (!self.paging) return rdM(bus.b, T, a);
-        return pm.rdPaged(self, bus.b, T, a, self.cpl == 3);
+        const i = (a >> 12) & (pm.TLB_N - 1);
+        const need = pm.D_R | pm.access(self.cpl, false);
+        if (self.tlb.tag[i] == (a & 0xFFFF_F000) | 1 and self.tlb.perm[i] & need == need and
+            (T == u8 or a & 0xFFF <= 0x1000 - @sizeOf(T)))
+            return @as(*align(1) const T, @ptrFromInt(self.tlb.hoff[i] +% a)).*;
+        return pm.rdSlow(self, bus.b, T, a, self.cpl == 3);
     }
 
     inline fn wrL(self: *Cpu, bus: anytype, comptime T: type, a: u32, v: T) Er(@TypeOf(bus))!void {
         if (comptime !prot(@TypeOf(bus))) return wrM(bus, T, a, v);
-        if (!self.paging) return wrM(bus.b, T, a, v);
-        return pm.wrPaged(self, bus.b, T, a, v, self.cpl == 3);
+        const i = (a >> 12) & (pm.TLB_N - 1);
+        const need = pm.D_W | pm.access(self.cpl, true);
+        if (self.tlb.tag[i] == (a & 0xFFFF_F000) | 1 and self.tlb.perm[i] & need == need and
+            (T == u8 or a & 0xFFF <= 0x1000 - @sizeOf(T)))
+        {
+            @as(*align(1) T, @ptrFromInt(self.tlb.hoff[i] +% a)).* = v;
+            return;
+        }
+        return pm.wrSlow(self, bus.b, T, a, v, self.cpl == 3);
     }
 
     /// Segment s's limit and rights for `n` bytes at `off`: #GP(0), or
@@ -569,18 +587,16 @@ pub const Cpu = struct {
 
     /// The x87's accesses in protected mode (PmBus): a fault is noted.
     fn stickyRd(self: *Cpu, b: anytype, comptime T: type, a: u32) T {
-        if (!self.paging) return rdM(b, T, a);
         if (self.sticky) return 0;
-        return pm.rdPaged(self, b, T, a, self.cpl == 3) catch {
+        return pm.rdSlow(self, b, T, a, self.cpl == 3) catch {
             self.sticky = true;
             return 0;
         };
     }
 
     fn stickyWr(self: *Cpu, b: anytype, comptime T: type, a: u32, v: T) void {
-        if (!self.paging) return wrM(b, T, a, v);
         if (self.sticky) return;
-        pm.wrPaged(self, b, T, a, v, self.cpl == 3) catch {
+        pm.wrSlow(self, b, T, a, v, self.cpl == 3) catch {
             self.sticky = true;
         };
     }
@@ -593,9 +609,29 @@ pub const Cpu = struct {
             self.regs.eip = (ip +% 1) & 0xFFFF;
             return bus.rd8(self.regs.base[CS] +% ip);
         }
-        if (ip > self.fetch_hi) return self.raise(13, 0);
-        self.regs.eip = (ip +% 1) & self.ip_wrap;
-        return self.rdL(bus, u8, self.regs.base[CS] +% ip);
+        return self.fetchPm(bus, u8, ip);
+    }
+
+    /// A protected-mode fetch: from the fetch window, else checked
+    /// against CS's limit, through the TLB, and the window moved there.
+    inline fn fetchPm(self: *Cpu, bus: anytype, comptime T: type, ip: u32) Exc!T {
+        const n: u32 = @sizeOf(T);
+        const d = ip -% self.tlb.fw_base;
+        if (d < self.tlb.fw_len and self.tlb.fw_len - d >= n) {
+            self.regs.eip = (ip +% n) & self.ip_wrap;
+            return @as(*align(1) const T, @ptrFromInt(self.tlb.fw_host +% d)).*;
+        }
+        return self.fetchSlow(bus, T, ip);
+    }
+
+    fn fetchSlow(self: *Cpu, bus: anytype, comptime T: type, ip: u32) Exc!T {
+        const n: u32 = @sizeOf(T);
+        if (@as(u64, ip) + (n - 1) > self.fetch_hi) return self.raise(13, 0);
+        const lin = self.regs.base[CS] +% ip;
+        const v = try self.rdL(bus, T, lin);
+        self.regs.eip = (ip +% n) & self.ip_wrap;
+        pm.window(self, ip, lin);
+        return v;
     }
 
     inline fn fetch16(self: *Cpu, bus: anytype) Er(@TypeOf(bus))!u16 {
@@ -608,9 +644,7 @@ pub const Cpu = struct {
             const lo = try self.fetch8(bus);
             return lo | (@as(u16, try self.fetch8(bus)) << 8);
         }
-        if (@as(u64, ip) + 1 > self.fetch_hi) return self.raise(13, 0);
-        self.regs.eip = (ip +% 2) & self.ip_wrap;
-        return self.rdL(bus, u16, self.regs.base[CS] +% ip);
+        return self.fetchPm(bus, u16, ip);
     }
 
     inline fn fetch32(self: *Cpu, bus: anytype) Er(@TypeOf(bus))!u32 {
@@ -623,9 +657,7 @@ pub const Cpu = struct {
             const lo = try self.fetch16(bus);
             return lo | (@as(u32, try self.fetch16(bus)) << 16);
         }
-        if (@as(u64, ip) + 3 > self.fetch_hi) return self.raise(13, 0);
-        self.regs.eip = (ip +% 4) & self.ip_wrap;
-        return self.rdL(bus, u32, self.regs.base[CS] +% ip);
+        return self.fetchPm(bus, u32, ip);
     }
 
     inline fn fetchT(self: *Cpu, bus: anytype, comptime T: type) Er(@TypeOf(bus))!T {

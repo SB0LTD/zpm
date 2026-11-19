@@ -275,6 +275,24 @@ pub const Machine = struct {
         return null;
     }
 
+    /// The host's own bytes behind the 4 KiB page at bus address `a`
+    /// (page aligned), for the CPU's fast paths (its TLB keeps them): RAM
+    /// and the frame buffer, to read and write; the ROMs' area, to read;
+    /// null where a device has to see the access. Good until `mapKey`
+    /// changes (the A20 gate moves RAM around).
+    pub fn page(m: *Machine, a0: u32, write: bool) ?[*]u8 {
+        const a = m.phys(a0);
+        if (a < 0xA0000 or (a >= mem_mod.MEG and a < mem_mod.RAM)) return m.mem.ram[a..].ptr;
+        const lo = a -% vesa.LFB_BASE;
+        if (lo < vesa.VRAM) return m.vga.svga.mem[lo..].ptr;
+        if (!write and ((a >= 0xC0000 and a < 0xE0000) or (a >= 0xF0000 and a < mem_mod.MEG))) return m.mem.ram[a..].ptr;
+        return null;
+    }
+
+    pub inline fn mapKey(m: *const Machine) u32 {
+        return @intFromBool(m.mem.a20);
+    }
+
     pub inline fn rd8(m: *Machine, a0: u32) u8 {
         const a = m.phys(a0);
         if (a < 0xA0000 or (a >= mem_mod.MEG and a < mem_mod.RAM)) return m.mem.ram[a];

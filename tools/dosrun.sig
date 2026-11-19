@@ -5,7 +5,7 @@
 //!     -Mroot=tools/dosrun.sig -Mdos=src/dos/dos.sig --name dosrun
 //!   dosrun PROGRAM.EXE [ARGS...] [--secs N] [--shot OUT.ppm] [--every S]
 //!          [--key T=CODE[,CODE...]]... [--mouse T=DX,DY,BUTTONS]...
-//!          [--ips N] [--trace] [--wav OUT.wav]
+//!          [--ips N] [--trace] [--wav OUT.wav] [--profile OUT.txt]
 //!
 //! --secs N: emulated seconds to run (default 10); --shot: the picture at
 //! the end as a PPM (--every S: also OUT-<t>.ppm every S seconds); --key
@@ -15,6 +15,9 @@
 //! emulated seconds the mouse moves by DX,DY mickeys with buttons B (bit 0
 //! left, 1 right, 2 middle). --wav: the sound (48 kHz
 //! stereo, 16-bit) into a WAV file, and its loudness in the log.
+//! --profile: the host's own profile (x86-64): every 250 us of the
+//! process's CPU time (SIGPROF) the interrupted instruction's address,
+//! one hex number a line, for addr2line -f -i on an unstripped build.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -32,6 +35,55 @@ fn out(comptime f: []const u8, args: anytype) void {
     var b: [400]u8 = undefined;
     const s = std.fmt.bufPrint(&b, f ++ "\n", args) catch return;
     _ = linux.write(2, s.ptr, s.len);
+}
+
+// The profiler: SIGPROF's interrupted RIP (ucontext: uc_flags, uc_link,
+// uc_stack (24 bytes), then mcontext's gregs[], RIP the 17th: 21st u64).
+var prof_buf: [1 << 21]u64 = undefined;
+var prof_n: usize = 0;
+
+fn onProf(sig: linux.SIG, info: *const linux.siginfo_t, ctx: ?*anyopaque) callconv(.c) void {
+    _ = sig;
+    _ = info;
+    const uc: [*]const u64 = @ptrCast(@alignCast(ctx orelse return));
+    if (prof_n < prof_buf.len) {
+        prof_buf[prof_n] = uc[21];
+        prof_n += 1;
+    }
+}
+
+fn profStart() void {
+    if (@import("builtin").cpu.arch != .x86_64) return;
+    var sa = linux.Sigaction{ .handler = .{ .sigaction = onProf }, .mask = linux.sigemptyset(), .flags = linux.SA.SIGINFO | linux.SA.RESTART };
+    _ = linux.sigaction(.PROF, &sa, null);
+    // (setitimer takes timevals: the "nsec" fields are microseconds)
+    const it = linux.itimerspec{ .it_interval = .{ .sec = 0, .nsec = 250 }, .it_value = .{ .sec = 0, .nsec = 250 } };
+    _ = linux.setitimer(@intFromEnum(linux.ITIMER.PROF), &it, null);
+}
+
+fn profSave(path: []const u8) void {
+    const it = linux.itimerspec{ .it_interval = .{ .sec = 0, .nsec = 0 }, .it_value = .{ .sec = 0, .nsec = 0 } };
+    _ = linux.setitimer(@intFromEnum(linux.ITIMER.PROF), &it, null);
+    var pb: [512]u8 = undefined;
+    if (path.len >= pb.len) return;
+    @memcpy(pb[0..path.len], path);
+    pb[path.len] = 0;
+    const r = linux.openat(linux.AT.FDCWD, @ptrCast(&pb), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o644);
+    if (@as(isize, @bitCast(r)) < 0) return;
+    const fd: i32 = @intCast(r);
+    var buf: [65536]u8 = undefined;
+    var n: usize = 0;
+    for (prof_buf[0..prof_n]) |a| {
+        const line = std.fmt.bufPrint(buf[n..], "{x}\n", .{a}) catch break;
+        n += line.len;
+        if (n > buf.len - 64) {
+            _ = linux.write(fd, &buf, n);
+            n = 0;
+        }
+    }
+    _ = linux.write(fd, &buf, n);
+    _ = linux.close(fd);
+    out("dosrun: {d} profile samples in {s}", .{ prof_n, path });
 }
 
 fn nowNs() u64 {
@@ -85,6 +137,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var ips: u32 = 25_000_000;
     var trace = false;
     var wav_path: ?[]const u8 = null;
+    var prof_path: ?[]const u8 = null;
 
     var it = init.args.iterate();
     _ = it.next();
@@ -97,6 +150,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             shot_path = it.next();
         } else if (std.mem.eql(u8, a, "--wav")) {
             wav_path = it.next();
+        } else if (std.mem.eql(u8, a, "--profile")) {
+            prof_path = it.next();
         } else if (std.mem.eql(u8, a, "--trace")) {
             trace = true;
         } else if (std.mem.eql(u8, a, "--ips")) {
@@ -172,6 +227,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         }
     }
 
+    if (prof_path != null) profStart();
     const t0 = nowNs();
     const step_us: u32 = 10_000;
     var t_us: u64 = 0;
@@ -232,6 +288,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         }
     }
     const wall = @as(f64, @floatFromInt(nowNs() - t0)) / 1e9;
+    if (prof_path) |pp| profSave(pp);
     const emu = @as(f64, @floatFromInt(t_us)) / 1e6;
     out("dosrun: {s} after {d:.2} emulated s in {d:.2} s ({d:.1}x real time), {d} M instructions", .{
         @tagName(status), emu, wall, emu / @max(wall, 1e-6), machine.cpu.executed / 1_000_000,
