@@ -71,7 +71,7 @@ const PB_DWORDS = SETUP_DWORDS + DWORDS_PER_DISPATCH * MAX_DISPATCHES + DWORDS_P
 /// Zeros after a program (the SMs' prefetch reads past its end; the
 /// emulated RTX reads to its first all-zero instruction).
 const CODE_GAP = 256;
-/// Programs' code shares heaps of CODE_HEAP_BYTES (each one buffer of the
+/// Programs' code shares heaps (each one buffer of the
 /// device's), up to CODE_HEAPS: a program a buffer of its own took a
 /// render-node buffer (2 MiB on the RTX) for a few KiB, and a Direct3D
 /// game's hundreds of programs filled the process's table (Unigine
@@ -81,6 +81,14 @@ const CODE_GAP = 256;
 /// Adapter's default value is a constant in every program that embeds it,
 /// and 128 KiB of it broke the compiler's debug info.)
 const CODE_HEAP_BYTES: u64 = 16 << 20;
+/// The first heap's bytes, each next one twice the last's up to
+/// CODE_HEAP_BYTES: a program with few shaders takes one 2 MiB unit, not
+/// 16 MiB (an emulated device's memory ran out).
+const CODE_HEAP_FIRST: u64 = 2 << 20;
+
+fn codeHeapBytes(i: usize) u64 {
+    return @min(CODE_HEAP_FIRST << @intCast(@min(i, 8)), CODE_HEAP_BYTES);
+}
 const CODE_HEAPS = 8;
 const CODE_SPANS = 512;
 const CODE_ALIGN: u64 = 256;
@@ -485,10 +493,11 @@ pub const Adapter = struct {
     /// the program is large, or the heaps are full.
     fn codeAlloc(a: *Adapter, bytes: u64) ?gpu.Buffer {
         if (bytes > CODE_HEAP_BYTES / 4) return null;
-        for (&a.code_heaps) |*h| {
+        for (&a.code_heaps, 0..) |*h, hi| {
             if (h.buf.bytes == 0) {
-                const b = alloc(a, CODE_HEAP_BYTES, .upload) orelse return null;
-                if (b.gpu & 0xff != 0 or b.cpu.len < CODE_HEAP_BYTES) {
+                const size = codeHeapBytes(hi);
+                const b = alloc(a, size, .upload) orelse return null;
+                if (b.gpu & 0xff != 0 or b.cpu.len < size) {
                     free(a, b);
                     return null;
                 }
