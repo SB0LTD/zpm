@@ -1522,7 +1522,24 @@ fn rowSecuritySetting() !void {
     try sameState();
 }
 
+fn namespaceAclProjection() !void {
+    try reset();
+    try run("CREATE ROLE inspectors");
+    try run("CREATE SCHEMA export_scope");
+    try expect("SELECT pg_typeof(nspacl)::text FROM pg_namespace WHERE nspname='export_scope'", "aclitem[]");
+    try expect("SELECT nspacl IS NULL FROM pg_namespace WHERE nspname='export_scope'", "t");
+    try expect("SELECT acldefault('n',nspowner)::text FROM pg_namespace WHERE nspname='export_scope'", "{ramsql=UC/ramsql}");
+    try run("GRANT USAGE ON SCHEMA export_scope TO inspectors");
+    try expect("SELECT nspacl::text FROM pg_namespace WHERE nspname='export_scope'", "{ramsql=UC/ramsql,inspectors=U/ramsql}");
+    try run("REVOKE USAGE ON SCHEMA export_scope FROM ramsql");
+    try expect("SELECT nspacl::text FROM pg_namespace WHERE nspname='export_scope'", "{ramsql=C/ramsql,inspectors=U/ramsql}");
+    try run("REVOKE USAGE ON SCHEMA export_scope FROM inspectors");
+    try expect("SELECT nspacl::text FROM pg_namespace WHERE nspname='export_scope'", "{ramsql=C/ramsql}");
+    try same(try query(&replica, "SELECT nspacl::text FROM pg_namespace WHERE nspname='export_scope'"), "{ramsql=C/ramsql}");
+}
+
 pub fn main() !void {
+    try namespaceAclProjection();
     try oraclePrograms();
     try namespacesAndExtensions();
     try namespaceOwners();

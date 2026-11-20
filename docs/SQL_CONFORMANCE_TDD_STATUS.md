@@ -1,5 +1,29 @@
 # SQL conformance TDD checkpoint
 
+## Stock PostgreSQL dump and restore candidate
+
+Namespace introspection now returns `pg_namespace.nspacl` as `aclitem[]`
+(OID 1034), with NULL before a custom schema ACL is materialized. The
+projection reads visible schema grants and owner privilege changes.
+`acldefault('n', owner)` provides the schema default for stock tools.
+Catalog output uses RAMSQL's actual role names. General ACL input, other
+`acldefault` object kinds and broader grant administration remain open.
+
+The parser accepts the stock table-selection predicate
+`OPERATOR(pg_catalog.=) ANY (array)` and uses the existing quantified
+comparison semantics for ANY, SOME and ALL. Single-transaction restore can
+add a single-column primary key to a table created and populated earlier in
+that transaction. The WAL records the validated keyed definition before
+the inserts. Late key creation after writes to an existing table and late
+composite keys retain their earlier restrictions.
+
+The stock-tooling CI gate runs actual PostgreSQL 16 and 18 clients against
+the pinned RAMSQL build. It checks namespace ACL values and wire metadata,
+unmodified native plain and custom imports including forced WAL reopen, and
+the reverse custom export. The stock profile currently rejects the broad
+`pg_dump` table-discovery projection. General export and bidirectional
+qualification remain open.
+
 ## Shipped RAMSQL evidence, 20 November 2026
 
 The beta.3 [prerelease](https://github.com/SB0LTD/ramsql/releases/tag/ci-v0.3.0-beta.3-run.44655295188.1) matches RAMSQL main at

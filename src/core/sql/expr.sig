@@ -1,4 +1,4 @@
-//! Expression evaluation over bound nodes (Layer 0, design §4.1).
+//! Expression evaluation over bound nodes (Layer 0, design Ã‚Â§4.1).
 //!
 //! Three-valued logic: AND/OR/NOT, IS [NOT] TRUE/FALSE/UNKNOWN/NULL, IN,
 //! BETWEEN and LIKE follow PostgreSQL's NULL rules; WHERE keeps a row only
@@ -470,7 +470,17 @@ pub fn Eval(comptime config: types.Config) type {
             return textCell(types.sqlTypeName(known));
         }
 
-        /// Discovery functions and regclass/regtype conversions (design §4.10).
+        fn aclDefault(ctx: *const Context, kind: u8, owner: u32) Error!V.Cell {
+            if (kind != 'n') return error.UnsupportedStatement;
+            const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
+            const get_name = hook.catalog_text orelse return error.UnsupportedStatement;
+            var buffer: [64]u8 = undefined;
+            const used = try get_name(hook.ptr, .role_name, owner, 0, 0, &buffer);
+            const name = if (used) |len| buffer[0..len] else @import("std").fmt.bufPrint(&buffer, "{d}", .{owner}) catch unreachable;
+            return @import("catalog_acl.sig").Acl(V).ownerOnly(name, "UC");
+        }
+
+        /// Discovery functions and regclass/regtype conversions (design Ã‚Â§4.10).
         fn catalogValue(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
             switch (n.func) {
                 .current_database => return textCell(ctx.session.database),
@@ -480,6 +490,11 @@ pub fn Eval(comptime config: types.Config) type {
             const first = try eval(ctx, n.b);
             if (first == .null_value) return .null_value;
             switch (n.func) {
+                .acldefault => {
+                    const owner = try eval(ctx, node(ctx, n.b).next);
+                    if (owner == .null_value) return .null_value;
+                    return aclDefault(ctx, first.pg_internal_char, @intCast(owner.integer));
+                },
                 .pg_table_is_visible => {
                     const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
                     const visible = hook.relation_visible orelse return error.UnsupportedStatement;
@@ -1363,7 +1378,7 @@ pub fn Eval(comptime config: types.Config) type {
                     .nextval, .currval, .setval, .lastval, .identity_next => return sequenceValue(ctx, n),
                     .current_database, .current_schema, .to_regtype, .to_regclass, .format_type, .pg_get_expr, .regclass_in, .regtype_in, .regclass_out, .regtype_out,
                     .to_regnamespace, .regnamespace_in, .regnamespace_out,
-                    .pg_table_is_visible, .pg_get_indexdef, .pg_get_constraintdef, .pg_get_triggerdef, .pg_get_statisticsobjdef_columns, .pg_relation_is_publishable, .pg_get_partkeydef => return catalogValue(ctx, n),
+                    .acldefault, .pg_table_is_visible, .pg_get_indexdef, .pg_get_constraintdef, .pg_get_triggerdef, .pg_get_statisticsobjdef_columns, .pg_relation_is_publishable, .pg_get_partkeydef => return catalogValue(ctx, n),
                     .pg_partition_ancestors, .array_subquery => return error.UnsupportedStatement,
                     .obj_description, .col_description, .shobj_description, .current_user, .session_user => return objectText(ctx, n),
                     .to_tsvector, .to_tsquery, .plainto_tsquery, .phraseto_tsquery => {

@@ -1417,6 +1417,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "pg_typeof", .func = .pg_typeof },
                 .{ .name = "pg_get_serial_sequence", .func = .pg_get_serial_sequence },
                 .{ .name = "pg_table_is_visible", .func = .pg_table_is_visible },
+                .{ .name = "acldefault", .func = .acldefault },
             };
             for (table) |entry| if (types.same(name.slice(), entry.name)) return entry.func;
             return .none;
@@ -2398,6 +2399,10 @@ pub fn Binder(comptime config: types.Config) type {
                     n.constant = false;
                 },
                 .pg_get_serial_sequence => try bindSignature(context, n, &[_]ast.Type{ .text, .text }, .text, true),
+                .acldefault => {
+                    try bindSignature(context, n, &[_]ast.Type{ .pg_internal_char, .oid }, types.arrayType(.aclitem).?, true);
+                    n.constant = false;
+                },
                 .pg_table_is_visible => {
                     try bindSignature(context, n, &[_]ast.Type{.oid}, .boolean, true);
                     n.constant = false;

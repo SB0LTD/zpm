@@ -1,4 +1,4 @@
-//! Value conversions (Layer 0, design §4.2): text input and output for every
+//! Value conversions (Layer 0, design Â§4.2): text input and output for every
 //! type, casts (explicit, assignment and implicit contexts follow
 //! PostgreSQL's pg_cast for the supported types), typmod coercion and the
 //! operators over the Q02/Q03/Q04 types. Cells are the tagged union in
@@ -692,6 +692,7 @@ pub fn Io(comptime config: types.Config) type {
                     break :blk try textCell(try jsonpath.Engine(config).canonical(input, &buffer, session.control));
                 },
                 .regtype => .{ .regtype = try types.regtypeInput(input) },
+                .aclitem => return error.UnsupportedStatement,
                 .pg_internal_char => .{ .pg_internal_char = parseInternalChar(input) },
                 .tsvector, .tsquery => blk: {
                     var out: TS.Out = .{};
@@ -909,6 +910,7 @@ pub fn Io(comptime config: types.Config) type {
                 return cast(text, .text, to, typmod, session);
             }
             const out: V.Cell = switch (to) {
+                .aclitem => return error.UnsupportedStatement,
                 .pg_internal_char => switch (cell) {
                     .integer => |value| blk: {
                         if (value < -128 or value > 127) return error.NumericValueOutOfRange;

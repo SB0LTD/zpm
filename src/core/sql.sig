@@ -924,6 +924,7 @@ pub fn Database(comptime config: Config) type {
         };
 
         pub const AlterRecord = struct {
+            fold_created_primary: bool = false,
             sources: [config.columns]u8 = @splat(0),
             fills: [config.columns]V.Cell = @splat(.null_value),
         };
@@ -1386,7 +1387,7 @@ pub fn Database(comptime config: Config) type {
                     // These catalog lookups use the serialized database hook.
                     .to_regclass,.regclass_in,.regclass_out,.pg_get_serial_sequence,.pg_table_is_visible,.pg_get_indexdef,.pg_get_constraintdef,.pg_get_triggerdef,.pg_partition_ancestors,
                     .to_regnamespace,.regnamespace_in,.regnamespace_out=>return error.UnsupportedStatement,
-                    .pg_get_statisticsobjdef_columns,.pg_relation_is_publishable,.pg_get_partkeydef=>return error.UnsupportedStatement,
+                    .pg_get_statisticsobjdef_columns,.pg_relation_is_publishable,.pg_get_partkeydef,.acldefault=>return error.UnsupportedStatement,
                     .obj_description,.col_description,.shobj_description,.current_user,.session_user=>return error.UnsupportedStatement,
                     .current_setting,.set_config,.pg_backend_pid,.pg_is_in_recovery,
                     .pg_try_advisory_lock,.pg_try_advisory_lock_shared,
@@ -5098,6 +5099,31 @@ pub fn Database(comptime config: Config) type {
 
         /// catalog_text hook: comments and role names under the statement
         /// snapshot.
+        fn namespaceAcl(self: *const Self, oid: u32, owner: u32, snapshot: Snapshot) Error!Cell {
+            const key: O.Object = .{ .kind = .schema_acl_state, .target = oid, .owner = owner };
+            if (self.catalog_objects.findKey(&key, snapshot) == null) return .null_value;
+            const owner_name = self.catalog_objects.roleName(owner, snapshot) orelse return error.UndefinedObject;
+            const Acl = @import("sql/catalog_acl.sig").Acl(V);
+            var count: u32 = 1;
+            var owner_privileges: []const u8 = "UC";
+            for (&self.catalog_objects.items) |*item| {
+                if (item.kind != .schema_acl or item.target != oid or !O.visible(item, snapshot)) continue;
+                if (item.grantee == owner) {
+                    owner_privileges = "C";
+                } else count += 1;
+            }
+            var output: Text = .{};
+            var writer = try Acl.begin(&output, count);
+            try Acl.append(&writer, owner_name, owner_privileges, owner_name);
+            for (&self.catalog_objects.items) |*item| {
+                if (item.kind != .schema_acl or item.target != oid or item.grantee == owner or !O.visible(item, snapshot)) continue;
+                const grantee = if (item.grantee == CO.public_role) "" else
+                    self.catalog_objects.roleName(item.grantee, snapshot) orelse return error.UndefinedObject;
+                try Acl.append(&writer, grantee, "U", owner_name);
+            }
+            return .{ .array = output };
+        }
+
         fn catalogText(ptr: *anyopaque, kind: value_module.CatalogText, object: u32, classoid: u32, sub: i32, out: []u8) Error!?usize {
             const self: *Self = @ptrCast(@alignCast(ptr));
             const snap = self.seq_snap;
@@ -6046,13 +6072,19 @@ pub fn Database(comptime config: Config) type {
                 .pg_roles, .pg_authid, .pg_auth_members, .pg_policy, .pg_policies, .pg_description, .pg_shdescription, .pg_foreign_data_wrapper, .pg_foreign_server, .pg_publication, .pg_publication_rel, .pg_publication_namespace, .pg_statistic_ext, .pg_extension, .pg_tables, .table_privileges => return self.catalogObjectRows(session_values, snapshot, view, sink),
                 .pg_namespace, .schemata => {
                     for (catalog_module.namespaces) |namespace| {
-                        if (view == .pg_namespace) try sink.add(&.{ intCell(namespace.oid), nameCell(namespace.name), intCell(CO.bootstrap_role) }) else try sink.add(&.{ nameCell(database), nameCell(namespace.name) });
+                        if (view == .pg_namespace) {
+                            const acl = if (namespace.oid == catalog_module.toast_namespace) .null_value else
+                                try @import("sql/catalog_acl.sig").Acl(V).ownerAndPublic(CO.bootstrap_name, "UC", "U");
+                            try sink.add(&.{ intCell(namespace.oid), nameCell(namespace.name), intCell(CO.bootstrap_role), acl });
+                        } else try sink.add(&.{ nameCell(database), nameCell(namespace.name) });
                     }
                     var schemas: [K.relation_rows]K.SchemaFound = undefined;
                     const schema_count = self.catalog.visibleSchemas(snapshot, &schemas);
                     for (schemas[0..schema_count]) |found| {
                         const schema = &self.schemas[found.slot];
-                        if (view == .pg_namespace) try sink.add(&.{ intCell(found.oid), nameCell(schema.name.slice()), intCell(schema.owner) }) else try sink.add(&.{ nameCell(database), nameCell(schema.name.slice()) });
+                        if (view == .pg_namespace) {
+                            try sink.add(&.{ intCell(found.oid), nameCell(schema.name.slice()), intCell(schema.owner), try self.namespaceAcl(found.oid, schema.owner, snapshot) });
+                        } else try sink.add(&.{ nameCell(database), nameCell(schema.name.slice()) });
                     }
                 },
                 else => for (relations[0..count]) |found| {
@@ -7109,10 +7141,18 @@ pub fn Database(comptime config: Config) type {
             if (!S.keyed(source)) for (alter.columns[0..alter.count]) |*column| {
                 late_primary = late_primary or column.primary_key;
             };
+            var fold_created_primary = false;
             if (late_primary) {
                 const tx = &self.txs[slot];
                 for (tx.writes[0..tx.write_len]) |entry| switch (entry.kind) {
-                    .insert, .update, .delete, .truncate, .refresh_rows, .create_table, .alter_table, .drop_table => {
+                    .create_table => if (entry.table == alter.table) {
+                        fold_created_primary = true;
+                    },
+                    .insert => {
+                        if (self.tables[entry.table].oid == source.oid and (!fold_created_primary or entry.table != alter.table))
+                            return error.UnsupportedStatement;
+                    },
+                    .update, .delete, .truncate, .refresh_rows, .alter_table, .drop_table => {
                         if (self.tables[entry.table].oid == source.oid) return error.UnsupportedStatement;
                     },
                     else => {},
@@ -7160,7 +7200,11 @@ pub fn Database(comptime config: Config) type {
             copy.live = true;
             copy.pending_create = true;
             source.pending_drop = true;
-            self.alters[index] = .{ .sources = alter.sources, .fills = fills };
+            self.alters[index] = .{
+                .fold_created_primary = fold_created_primary,
+                .sources = alter.sources,
+                .fills = fills,
+            };
             tx.push(.{ .kind = .alter_table, .table = @intCast(index), .old = @intCast(alter.table), .new = snap.cid }) catch unreachable;
             var changes: [K.max_changes]K.Change = undefined;
             var count = self.catalog.drop(alter.table, source.column_count, snap, tx.ref(slot), snap.cid, 0, &changes);
@@ -7181,7 +7225,7 @@ pub fn Database(comptime config: Config) type {
             };
             if (late_primary) {
                 copy.primary_index_oid = try self.takeOid();
-                copy.pending_late_primary = true;
+                copy.pending_late_primary = !fold_created_primary;
             }
             try self.remapColumnComments(slot, source.oid, alter.sources[0..alter.count], snap);
             try self.remapStatistics(slot, source.oid, alter.sources[0..alter.count], snap);
@@ -8771,8 +8815,20 @@ pub fn Database(comptime config: Config) type {
             tx.push(.{ .kind = .delete, .table = @intCast(table_index), .old = goal }) catch unreachable;
         }
 
-        /// Every write in order (no coalescing: a later op may depend on an
-        /// earlier one's key change); rolled-back slices were truncated.
+        /// A primary key added to a table created in this transaction changes
+        /// the key and metadata but leaves the preceding insert row layout
+        /// intact. Log the checked keyed definition before those insert records.
+        fn createForWal(self: *const Self, index: usize, writes: anytype) *const S.Table {
+            const source = &self.tables[index];
+            if (!source.pending_drop) return source;
+            for (writes) |entry| {
+                if (entry.kind == .alter_table and entry.old == index and self.alters[entry.table].fold_created_primary)
+                    return &self.tables[entry.table];
+            }
+            return source;
+        }
+
+        /// Encode writes and their dependencies; rolled-back slices were truncated.
         fn encodeWrites(self: *const Self, writer: *change_log.Writer, slot: u16) Error!void {
             const tx = &self.txs[slot];
             var row_scratch: S.VersionRowScratch = undefined;
@@ -8788,7 +8844,7 @@ pub fn Database(comptime config: Config) type {
                         const table = &self.tables[entry.table];
                         try C.encodeDelete(writer, table.oid, table.rows[table.versions[entry.old].rowSlot()].rowid);
                     },
-                    .create_table => try C.encodeCreate(writer, &self.tables[entry.table]),
+                    .create_table => try C.encodeCreate(writer, self.createForWal(entry.table, tx.writes[0..tx.write_len])),
                     .drop_table => try C.encodeDrop(writer, self.tables[entry.table].oid),
                     .create_sequence => try C.encodeCreateSequence(writer, &self.seqs[entry.table]),
                     .drop_sequence => try C.encodeDropSequence(writer, self.seqs[entry.table].oid),
@@ -8797,8 +8853,10 @@ pub fn Database(comptime config: Config) type {
                     .create_schema => try C.encodeCreateSchema(writer, &self.schemas[entry.table]),
                     .drop_schema => try C.encodeDropSchema(writer, self.schemas[entry.table].oid),
                     .alter_table => {
+                        const alter = &self.alters[entry.table];
+                        if (alter.fold_created_primary) continue;
                         const table = &self.tables[entry.table];
-                        try C.encodeAlter(writer, table, self.alters[entry.table].sources[0..table.column_count], self.alters[entry.table].fills[0..table.column_count]);
+                        try C.encodeAlter(writer, table, alter.sources[0..table.column_count], alter.fills[0..table.column_count]);
                     },
                     .catalog_insert, .catalog_delete => {},
                     .create_object, .drop_object => try self.encodeObject(writer, entry.kind == .create_object, @enumFromInt(entry.new), entry.table),

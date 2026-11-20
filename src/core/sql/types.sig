@@ -574,12 +574,12 @@ pub const Dialect = enum { postgres, mysql, tds };
 /// `integer32` int4 (INTEGER); the others are named after PostgreSQL.
 /// The unnamed values are array types: the element's ordinal with
 /// array_bit set (arrayData/elementData); there are no arrays of arrays.
-pub const DataType = enum(u8) { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, mysql_bigint_unsigned, pg_internal_char, _ };
+pub const DataType = enum(u8) { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, mysql_bigint_unsigned, pg_internal_char, aclitem, _ };
 
 /// Bound expression type. `unknown` is an untyped string or NULL literal
 /// that has not been resolved by context yet. Unnamed values are array
 /// types, encoded like DataType's (arrayType/elementType).
-pub const Type = enum(u8) { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, mysql_bigint_unsigned, pg_internal_char, _ };
+pub const Type = enum(u8) { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, mysql_bigint_unsigned, pg_internal_char, aclitem, _ };
 
 /// Array types set this bit over the element type's ordinal.
 pub const array_bit: u8 = 0x80;
@@ -695,6 +695,7 @@ pub fn dataTypeOf(ty: Type) DataType {
         .tsvector => .tsvector,
         .tsquery => .tsquery,
         .pg_internal_char => .pg_internal_char,
+        .aclitem => .aclitem,
         _ => if (elementType(ty)) |element| arrayData(dataTypeOf(element)).? else .text,
     };
 }
@@ -746,6 +747,7 @@ pub fn typeOfData(data_type: DataType) Type {
         .tsvector => .tsvector,
         .tsquery => .tsquery,
         .pg_internal_char => .pg_internal_char,
+        .aclitem => .aclitem,
         _ => if (elementData(data_type)) |element| arrayType(typeOfData(element)).? else .text,
     };
 }
@@ -805,6 +807,7 @@ const array_sql_names = blk: {
 
 fn baseInfo(data_type: DataType) TypeInfo {
     return switch (data_type) {
+        .aclitem => .{ .oid = 1033, .name = "aclitem", .len = 16, .category = 'U', .array = 1034, .alignment = 'd' },
         .pg_internal_char => .{ .oid = 18, .name = "char", .len = 1, .category = 'Z', .array = 1002, .alignment = 'c' },
         .boolean => .{ .oid = 16, .name = "bool", .len = 1, .category = 'B', .array = 1000, .alignment = 'c' },
         .name => .{ .oid = 19, .name = "name", .len = 64, .category = 'S', .array = 1003, .alignment = 'c' },
@@ -922,6 +925,7 @@ fn baseSqlName(data_type: DataType) []const u8 {
         .regtype => "regtype",
         .tsvector => "tsvector",
         .tsquery => "tsquery",
+        .aclitem => "aclitem",
         .pg_internal_char => "\"char\"",
         _ => "",
     };
@@ -968,6 +972,7 @@ pub fn typeInputName(data_type: DataType) []const u8 {
         .regtype => "regtypein",
         .tsvector => "tsvectorin",
         .tsquery => "tsqueryin",
+        .aclitem => "aclitemin",
         .pg_internal_char => "charin",
         _ => "array_in",
     };
@@ -1248,7 +1253,7 @@ pub fn Values(comptime config: Config) type {
             return switch (data_type) {
                 .integer, .integer32, .smallint, .oid => .integer,
                 .boolean => .boolean,
-                .text, .name, .json, .varchar, .jsonpath => .text,
+                .text, .name, .json, .varchar, .jsonpath, .aclitem => .text,
                 .real => .float4,
                 .double => .float8,
                 .numeric, .mysql_bigint_unsigned => .numeric,
