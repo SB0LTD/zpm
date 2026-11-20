@@ -6,8 +6,8 @@ Namespace introspection now returns `pg_namespace.nspacl` as `aclitem[]`
 (OID 1034), with NULL before a custom schema ACL is materialized. The
 projection reads visible schema grants and owner privilege changes.
 `acldefault('n', owner)` provides the schema default for stock tools.
-Catalog output uses RAMSQL's actual role names. General ACL input, other
-`acldefault` object kinds and broader grant administration remain open.
+Catalog output uses RAMSQL's actual role names. General ACL input and
+broader grant administration remain open.
 
 The parser accepts the stock table-selection predicate
 `OPERATOR(pg_catalog.=) ANY (array)` and uses the existing quantified
@@ -34,13 +34,25 @@ implemented. `pg_class` exposes ownership, explicit composite type OIDs,
 and visible table ACLs. Ordinary tables still lack implicit row type OIDs.
 Relations have no PostgreSQL heap pages or transaction-age bookkeeping, and
 no analyzed cardinality estimate or per-relation storage options.
+`acldefault` also handles tables, sequences and tablespaces. The catalog
+contract covers a populated wide DISTINCT result, stored-width rejection,
+and table ACL grants and revocation.
 
-Local stock PostgreSQL 16 passes relation discovery, plain and custom
-imports, and WAL reopen. Outbound `pg_dump` passes table discovery and now
-fails with `TableNotFound` in function discovery. The next query needs
-`pg_init_privs`, `pg_cast`, `pg_transform`, routine ownership and ACL
-metadata, and `acldefault('f', owner)`. Both stock directions on PostgreSQL
-16 and 18 remain the merge gate.
+CI built RAMSQL `cec3f10` against ZPM `5fe6f380` and ran the stock
+PostgreSQL 16 and 18 tools. Both lanes pass namespace ACL and relation
+discovery, and validate rows and constraints after stock plain and custom
+imports and a WAL reopen. The dump fixture uses two public tables and
+`--no-owner --no-acl`. Local Sig catalog, catalog security and core DDL
+contracts passed with 69, 1,594 and 1,192 assertions, respectively.
+
+In both lanes outbound `pg_dump` passes table discovery and fails with
+`TableNotFound` in function discovery, before it can produce an archive.
+Add a native comparison for that query covering `pg_proc.tableoid`,
+routine ownership and ACLs, `acldefault('f', owner)`, and the
+`pg_init_privs`, `pg_cast` and `pg_transform` joins and subqueries. Then
+rerun the stock archive export and native restore with row and constraint
+verification. Both directions on PostgreSQL 16 and 18 remain the merge gate.
+[Stock tooling CI](https://github.com/SB0LTD/ramsql/actions/runs/44785147029)
 
 ## Shipped RAMSQL evidence, 20 November 2026
 
