@@ -3314,16 +3314,23 @@ pub const Engine = struct {
             e.settle(dst);
             return e.cpuDo(op);
         }
-        const keep = keepOf(src.format, dst.format);
         const s0: i32 = @intCast(src.rowOf(sy));
         const d0: i32 = @intCast(dst.rowOf(dy));
         const ss: i32 = if (src.top_down) -1 else 1;
         const ds: i32 = if (dst.top_down) -1 else 1;
-        const p = [_]u32{ sx, @bitCast(s0), @bitCast(ss), src.stride, dx, @bitCast(d0), @bitCast(ds), dst.stride, w, keep, ~keep, setOf(src), src.format.bytes(), dst.format.bytes(), raster.colourBlWord(src), raster.colourBlWord(dst) };
+        // (texels wider than a word, 8 or 16 bytes, always rows: copied as
+        // that many words each, as they are: the kernel moves a word a
+        // pixel, and a float texture's copy kept its first channel alone)
+        const n: u32 = if (src.format.bytes() > 4 and src.format == dst.format) src.format.bytes() / 4 else 1;
+        const keep: u32 = if (n > 1) 0xffff_ffff else keepOf(src.format, dst.format);
+        const set: u32 = if (n > 1) 0 else setOf(src);
+        const sbpp: u32 = if (n > 1) 4 else src.format.bytes();
+        const dbpp: u32 = if (n > 1) 4 else dst.format.bytes();
+        const p = [_]u32{ sx * n, @bitCast(s0), @bitCast(ss), src.stride, dx * n, @bitCast(d0), @bitCast(ds), dst.stride, w * n, keep, ~keep, set, sbpp, dbpp, raster.colourBlWord(src), raster.colourBlWord(dst) };
         const regs = [_]Region{rowsOf(dst, dy, dy + h)};
         const checking = e.checkFirst(.copy, @as(u64, w) * h, &regs);
         if (!e.gpuUsable(src) or !e.gpuUsable(dst)) return e.cpuDo(op);
-        e.record(.copy, .{ std.math.divCeil(u32, w, GROUP) catch unreachable, h, 1 }, &.{ src, dst }, &p, op);
+        e.record(.copy, .{ std.math.divCeil(u32, w * n, GROUP) catch unreachable, h, 1 }, &.{ src, dst }, &p, op);
         if (!checking) return;
         const kept = e.checkSwap(&regs);
         e.cpuDo(op);
@@ -3421,6 +3428,11 @@ pub const Engine = struct {
             if (img.gpuWrote()) e.fromDevice(img, off, @as(usize, w) * sb);
             const s = img.buf.cpu[off..][0 .. @as(usize, w) * sb];
             const d = dst[j * dst_stride ..][0 .. @as(usize, w) * db];
+            if (sb > 4 and sb == db) {
+                // (8- and 16-byte texels: as they are)
+                @memcpy(d, s);
+                continue;
+            }
             if (sb == 4 and db == 4) {
                 // (words, as most reads are)
                 const sw = img.words()[off / 4 ..][0..w];
@@ -3818,7 +3830,11 @@ pub const Engine = struct {
                     const do_ = @as(usize, c.dst.rowOf(c.dy + jj)) * c.dst.stride + @as(usize, c.dx) * db;
                     if (c.src.gpuWrote()) e.fromDevice(&c.src, so, @as(usize, c.w) * sb);
                     if (c.dst.gpuWrote()) e.fromDevice(&c.dst, do_, @as(usize, c.w) * db);
-                    if (sb == 4 and db == 4) {
+                    if (sb > 4 and sb == db) {
+                        // (8- and 16-byte texels: the row as it is)
+                        const n = @as(usize, c.w) * sb;
+                        @memcpy(c.dst.buf.cpu[do_..][0..n], c.src.buf.cpu[so..][0..n]);
+                    } else if (sb == 4 and db == 4) {
                         const sw = c.src.words();
                         const dw = c.dst.words();
                         for (0..c.w) |i| {

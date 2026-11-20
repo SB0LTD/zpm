@@ -59,6 +59,9 @@ pub const dxbc_gen = @import("dxbc/gen.sig");
 /// Shaders Microsoft's compiler made (dxbc/fixtures.hlsl): the tests', and
 /// tools/drawbench's pipeline.
 pub const dxbc_fixtures = @import("dxbc/fixtures.sig");
+/// Compute shaders Microsoft's compiler made (dxbc/compute_fixtures.hlsl):
+/// the tests'.
+pub const dxbc_compute_fixtures = @import("dxbc/compute_fixtures.sig");
 pub const report = @import("report.sig");
 
 test {

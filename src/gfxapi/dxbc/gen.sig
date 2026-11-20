@@ -330,6 +330,33 @@ pub fn fragment(blob: []const u8, lay: Layout, k: *kir.Kernel, io: *raster.Fragm
     return true;
 }
 
+/// A declared buffer or UAV: its register (u# or t#), its kind, a
+/// structured one's stride.
+pub const Decl = struct { reg: u32, kind: enum { typed, raw, structured }, stride: u32 = 0 };
+
+/// The UAVs a shader declares (`uavs`), or its t# declared raw or
+/// structured: at most out.len, in the order declared.
+pub fn bufferDecls(blob: []const u8, uavs: bool, out: []Decl) usize {
+    const c = dxbc.Container.parse(blob) catch return 0;
+    const p = c.program() catch return 0;
+    var n: usize = 0;
+    var rd = p.reader();
+    while (rd.next() catch return n) |i| {
+        if (n == out.len) break;
+        const d: Decl = switch (i.op) {
+            .dcl_uav_typed => if (uavs) .{ .reg = i.operands[0].index[0].imm, .kind = .typed } else continue,
+            .dcl_uav_raw => if (uavs) .{ .reg = i.operands[0].index[0].imm, .kind = .raw } else continue,
+            .dcl_uav_structured => if (uavs) .{ .reg = i.operands[0].index[0].imm, .kind = .structured, .stride = i.raw[i.raw.len - 1] } else continue,
+            .dcl_resource_raw => if (!uavs) .{ .reg = i.operands[0].index[0].imm, .kind = .raw } else continue,
+            .dcl_resource_structured => if (!uavs) .{ .reg = i.operands[0].index[0].imm, .kind = .structured, .stride = i.raw[i.raw.len - 1] } else continue,
+            else => continue,
+        };
+        out[n] = d;
+        n += 1;
+    }
+    return n;
+}
+
 /// A compute shader's workgroup (dcl_thread_group), or null: not a
 /// compute shader, or none declared.
 pub fn threadGroup(blob: []const u8) ?[3]u32 {
