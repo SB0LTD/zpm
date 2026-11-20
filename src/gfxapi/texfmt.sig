@@ -12,8 +12,11 @@
 //!   sampled as GL says, never drawn into);
 //! - i32 and u32 x 1, 2, 4 (the 8- and 16-bit ones widened).
 //!
-//! Not yet: RGB10_A2, R11F_G11F_B10F, RGB9_E5, the RGB integer formats,
-//! depth32f, compressed formats.
+//! Direct3D's packed RGB10A2, R11G11B10F and RGB9E5 texels convert to f32
+//! here too (convert, packed32); its block-compressed ones decode in bc.
+//!
+//! Not yet: GL's RGB10_A2, R11F_G11F_B10F and RGB9_E5 uploads, the RGB
+//! integer formats, depth32f, compressed formats.
 
 const std = @import("std");
 const engine = @import("engine.sig");
@@ -50,6 +53,13 @@ pub const Conv = enum {
     depth16,
     depth32,
     depth24_stencil8,
+    /// packed 32-bit texels to RGBA f32: 10-bit unorm R, G, B and a
+    /// 2-bit alpha (RGB10_A2); 11- and 10-bit unsigned floats, alpha 1
+    /// (R11F_G11F_B10F); 9-bit mantissas sharing a 5-bit exponent, alpha 1
+    /// (RGB9_E5)
+    rgb10a2,
+    r11g11b10f,
+    rgb9e5,
 };
 
 const Z = texture.SWZ_ZERO;
@@ -259,6 +269,11 @@ pub fn convert(up: Upload, src: []const u8, dst: []u8, n: u32) void {
                 }
             }
         },
+        .rgb10a2, .r11g11b10f, .rgb9e5 => for (0..n) |i| {
+            const v = std.mem.readInt(u32, src[i * 4 ..][0..4], .little);
+            const px = packed32(up.conv, v);
+            for (0..4) |c| std.mem.writeInt(u32, dst[i * 16 + c * 4 ..][0..4], @bitCast(px[c]), .little);
+        },
         .int8, .uint8, .int16, .uint16 => for (0..n * ch) |j| {
             const v: u32 = switch (up.conv) {
                 .int8 => @bitCast(@as(i32, @as(i8, @bitCast(src[j])))),
@@ -280,6 +295,55 @@ fn short(conv: Conv, bits: u16) f32 {
         .unorm16, .unorm16_rgb => @as(f32, @floatFromInt(bits)) / 65535.0,
         else => @max(@as(f32, @floatFromInt(@as(i16, @bitCast(bits)))) / 32767.0, -1),
     };
+}
+
+/// A packed 32-bit texel's R, G, B, A as floats.
+pub fn packed32(conv: Conv, v: u32) [4]f32 {
+    return switch (conv) {
+        .rgb10a2 => .{
+            @as(f32, @floatFromInt(v & 0x3ff)) / 1023.0,
+            @as(f32, @floatFromInt(v >> 10 & 0x3ff)) / 1023.0,
+            @as(f32, @floatFromInt(v >> 20 & 0x3ff)) / 1023.0,
+            @as(f32, @floatFromInt(v >> 30)) / 3.0,
+        },
+        .r11g11b10f => .{ smallFloat(v & 0x7ff, 6), smallFloat(v >> 11 & 0x7ff, 6), smallFloat(v >> 22, 5), 1 },
+        else => blk: {
+            // (each mantissa times 2^(exponent - 15 - 9))
+            const scale = std.math.ldexp(@as(f32, 1), @as(i32, @intCast(v >> 27)) - 24);
+            break :blk .{
+                @as(f32, @floatFromInt(v & 0x1ff)) * scale,
+                @as(f32, @floatFromInt(v >> 9 & 0x1ff)) * scale,
+                @as(f32, @floatFromInt(v >> 18 & 0x1ff)) * scale,
+                1,
+            };
+        },
+    };
+}
+
+/// An unsigned float of a 5-bit exponent and `mbits` mantissa bits (the
+/// low bits of v): R11F_G11F_B10F's channels.
+fn smallFloat(v: u32, comptime mbits: u5) f32 {
+    const m = v & ((@as(u32, 1) << mbits) - 1);
+    const ex = v >> mbits & 0x1f;
+    const mf: f32 = @floatFromInt(m);
+    const one: f32 = @floatFromInt(@as(u32, 1) << mbits);
+    if (ex == 0) return std.math.ldexp(mf / one, -14);
+    if (ex == 31) return if (m == 0) std.math.inf(f32) else std.math.nan(f32);
+    return std.math.ldexp(1 + mf / one, @as(i32, @intCast(ex)) - 15);
+}
+
+test "texfmt: packed 32-bit formats" {
+    const a = packed32(.rgb10a2, 0x3ff | 0 << 10 | 0x200 << 20 | 3 << 30);
+    try std.testing.expectEqual(@as(f32, 1), a[0]);
+    try std.testing.expectEqual(@as(f32, 0), a[1]);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), a[2], 0.001);
+    try std.testing.expectEqual(@as(f32, 1), a[3]);
+    // 1.0 is exponent 15, mantissa 0; 2.0 exponent 16; 0.5 exponent 14
+    const f = packed32(.r11g11b10f, 15 << 6 | (16 << 6) << 11 | (14 << 5) << 22);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 0.5, 1 }, &f);
+    // RGB9_E5: mantissa 256 at exponent 16 is 256 * 2^(16-24) = 1
+    const e9 = packed32(.rgb9e5, 256 | 0 << 9 | 128 << 18 | 16 << 27);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 0, 0.5, 1 }, &e9);
 }
 
 /// A `bits`-bit unorm channel (the low bits of v) as a byte, rounded.

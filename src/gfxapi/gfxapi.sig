@@ -28,6 +28,7 @@
 //! - blocklinear: NVIDIA's block-linear layout in KIR, and its DRM format
 //!   modifiers (a video decoder's pictures sampled where they are);
 //! - texfmt: GL's texture formats as stored, and their uploads;
+//! - bc: block-compressed textures (BC1 to BC5) decoded on the CPU;
 //! - report: what the driver says of itself on the app's stderr;
 //! - libgalaxy_gl.sig and libgles.sig (the shared library's root, not
 //!   imported here): the C entry points.
@@ -51,6 +52,7 @@ pub const progbin = @import("progbin.sig");
 pub const texture = @import("texture.sig");
 pub const blocklinear = @import("blocklinear.sig");
 pub const texfmt = @import("texfmt.sig");
+pub const bc = @import("bc.sig");
 pub const glsl = @import("glsl/glsl.sig");
 pub const dxbc = @import("dxbc/dxbc.sig");
 pub const dxbc_gen = @import("dxbc/gen.sig");
@@ -70,6 +72,7 @@ test {
     _ = texture;
     _ = blocklinear;
     _ = texfmt;
+    _ = bc;
     _ = report;
     _ = x11;
     _ = glsl;
