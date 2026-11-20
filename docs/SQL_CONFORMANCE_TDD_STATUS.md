@@ -1,5 +1,21 @@
 # SQL conformance TDD checkpoint
 
+## Shipped RAMSQL evidence, 20 November 2026
+
+The beta.3 [prerelease](https://github.com/SB0LTD/ramsql/releases/tag/ci-v0.3.0-beta.3-run.44655295188.1) matches RAMSQL main at
+`ee803728`. Its [release matrix](https://github.com/SB0LTD/ramsql/actions/runs/44655295188) passed the four exact Linux
+PostgreSQL 16/18 lanes, the PostgreSQL COPY/backpressure comparison, six
+hosted package suites, and native SB0X and SB0K boots. The source-built OS
+suites exercised four process-kill boundaries and a selector rename failure
+during live checkpoint rotation. This release supports checkpointing a single
+durable PostgreSQL database with supported public base tables. Online backup,
+full catalog snapshots and physical power-loss qualification remain open.
+
+The 118-program cross-engine smoke run below retains its original revision
+and scope. It covers 106 PostgreSQL programs, six MySQL programs and six SQL
+Server programs. The separate 755-record PostgreSQL inventory, general
+stock dump/restore and application parity remain open.
+
 ## Native conformance checkpoint — 18 November 2026
 
 The unchanged 118-program smoke inventory passed against PostgreSQL 18.3,

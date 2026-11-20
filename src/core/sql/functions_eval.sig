@@ -105,7 +105,7 @@ pub fn Builtins(comptime config: types.Config, comptime E: type) type {
                     try strings.overlay(textOf(&cells[0]), placing, int32Of(&cells[2]), length, &out, control);
                 },
                 .to_hex => try strings.toHex(cells[0].integer, if (node(ctx, n.b).ty == .int8) 64 else 32, &out),
-                .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .tan, .cot, .asin, .acos, .atan, .atan2,
+                .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .sind, .cosd, .tan, .cot, .asin, .acos, .atan, .atan2,
                 .gcd, .lcm, .scale, .min_scale, .trim_scale => return mathematical(n, &cells, count, control),
                 .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .age, .age_tz, .justify_days, .justify_hours,
                 .justify_interval, .make_date, .make_timestamp, .isfinite => return temporalValue(ctx, n, &cells, count),
@@ -272,6 +272,7 @@ pub fn Builtins(comptime config: types.Config, comptime E: type) type {
                 .degrees => return checked(x / radians_per_degree, float_text.isInf(x), x == 0),
                 .radians => return checked(x * radians_per_degree, float_text.isInf(x), x == 0),
                 .sin, .cos, .tan, .cot => return trigonometric(n.func, x),
+                .sind, .cosd => return degreeTrig(n.func, x),
                 .asin, .acos => {
                     if (x != x) return .{ .float8 = x };
                     if (x < -1 or x > 1) return error.NumericValueOutOfRange;
@@ -285,6 +286,30 @@ pub fn Builtins(comptime config: types.Config, comptime E: type) type {
                 },
                 else => unreachable,
             }
+        }
+
+        fn degreeTrig(func: ast.Func, x: f64) Error!V.Cell {
+            if (x != x) return .{ .float8 = nan() };
+            if (float_text.isInf(x)) return error.NumericValueOutOfRange;
+
+            // Reduce before converting to radians. Reflect into the first
+            // quadrant and evaluate the small angle near either endpoint.
+            const cycle = @abs(@rem(x, 360.0));
+            const half_turn = if (cycle > 180) 360 - cycle else cycle;
+            const acute = if (half_turn > 90) 180 - half_turn else half_turn;
+            if (func == .cosd) {
+                if (acute == 90) return .{ .float8 = 0 };
+                const magnitude: f64 = if (acute == 60) 0.5 else if (acute > 45)
+                    @sin((90 - acute) * radians_per_degree)
+                else
+                    @cos(acute * radians_per_degree);
+                return .{ .float8 = if (half_turn > 90) -magnitude else magnitude };
+            }
+            const magnitude: f64 = if (acute == 30) 0.5 else if (acute > 45)
+                @cos((90 - acute) * radians_per_degree)
+            else
+                @sin(acute * radians_per_degree);
+            return .{ .float8 = if (float_text.signbit(x) != (cycle > 180)) -magnitude else magnitude };
         }
 
         const radians_per_degree: f64 = 0.0174532925199432957692;

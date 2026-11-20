@@ -261,7 +261,55 @@ fn exerciseMultiple() !void {
     try check(image.used == 0);
 }
 
+fn exerciseSequences(with_table: bool) !void {
+    try reset(&live, 0);
+    try reset(&restored, 1);
+    if (with_table) {
+        try live.execute("CREATE TABLE facts(id INT PRIMARY KEY, value TEXT)", &result);
+        try live.execute("INSERT INTO facts VALUES (1,'retained')", &result);
+    }
+    try live.execute("CREATE SEQUENCE allocated START 10 INCREMENT 2 CACHE 4", &result);
+    try live.execute("CREATE SEQUENCE unused START 101 INCREMENT -2 MINVALUE 0 MAXVALUE 101", &result);
+    try live.execute("CREATE SEQUENCE discarded", &result);
+    try live.execute("DROP SEQUENCE discarded", &result);
+    try live.execute("SELECT nextval('allocated')", &result);
+    try check(result.rows[0].cells[0].integer == 10);
+    const reserved = live.seqs[0].logged_value;
+    try check(reserved > 16 and live.seqs[0].logged_called);
+    const csn = live.csn;
+    var image: Image = .{};
+    var scratch: [192]u8 = undefined;
+    try DB.BaseSnapshot.write(&live, &image, &scratch);
+    try check(std.mem.eql(u8, image.bytes[0..8], "RSBASE03"));
+
+    var bad = image;
+    std.mem.writeInt(u32, bad.bytes[20..24], 0, .little);
+    if (DB.BaseSnapshot.restore(&restored, &bad, csn, &scratch, &replay)) |_| return error.EmptySequenceSectionAccepted else |err| try check(err == error.InvalidSnapshotImage);
+    try check(restored.csn == 0);
+    if (!with_table) {
+        const end = 29 + std.mem.readInt(u32, image.bytes[25..29], .little);
+        bad = image;
+        std.mem.writeInt(i64, bad.bytes[end - 9 ..][0..8], 0, .little);
+        if (DB.BaseSnapshot.restore(&restored, &bad, csn, &scratch, &replay)) |_| return error.InvalidSequenceReservationAccepted else |err| try check(err == error.InvalidChangeRecord);
+        try check(restored.csn == 0 and !restored.seqs[0].live);
+    }
+
+    try DB.BaseSnapshot.restore(&restored, &image, csn, &scratch, &replay);
+    try check(restored.csn == csn and restored.oid_counter == live.oid_counter);
+    try check(restored.seqs[0].oid == live.seqs[0].oid and restored.seqs[0].last_value == reserved);
+    if (with_table) {
+        try restored.execute("SELECT value FROM facts", &result);
+        try check(std.mem.eql(u8, result.rows[0].cells[0].text.slice(), "retained"));
+    }
+    try restored.execute("SELECT nextval('allocated')", &result);
+    try check(result.rows[0].cells[0].integer == reserved + 2);
+    try restored.execute("SELECT nextval('unused')", &result);
+    try check(result.rows[0].cells[0].integer == 101);
+}
+
 pub fn main() !void {
+    try exerciseSequences(false);
+    try exerciseSequences(true);
     try exercise(true);
     try exercise(false);
     try exerciseMultiple();

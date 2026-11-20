@@ -1,4 +1,4 @@
-//! Kind-3 change records (Layer 0, design §4.6).
+//! Kind-3 change records (Layer 0, design Â§4.6).
 //!
 //! A record is architecture-independent little-endian bytes:
 //!   header: version u16 (= 1), flags u16 (= 0), op_count u32
@@ -1702,8 +1702,11 @@ pub fn ChangeLog(comptime config: types.Config) type {
         fn validate(db: anytype, record: []const u8, scratch: *Scratch, image: anytype) Error!void {
             const base_image = @TypeOf(image) == BaseImageRecord;
             const count = try opCount(record);
+            const base_sequence = if (comptime base_image) image.op == .create_sequence else false;
             if (comptime base_image) {
-                if (count == 0 or count > config.tx_writes or (image.op != .insert and count != 1)) return error.InvalidChangeRecord;
+                const required: usize = if (base_sequence) 2 else 1;
+                if (count == 0 or count > config.tx_writes or (image.op != .insert and count != required))
+                    return error.InvalidChangeRecord;
             }
             scratch.epoch +%= 1;
             if (scratch.epoch == 0) {
@@ -1753,9 +1756,14 @@ pub fn ChangeLog(comptime config: types.Config) type {
             var reader = Reader{ .bytes = record };
             var row: V.Row = .{};
             var check_schema_owners = false;
-            for (0..count) |_| {
+            var image_sequence: SequenceDefinition = undefined;
+            for (0..count) |part| {
                 const tag = try reader.int(u8);
-                if (comptime base_image) if (tag != @intFromEnum(image.op)) return error.InvalidChangeRecord;
+                if (comptime base_image) {
+                    const required = if (base_sequence and part == 1) Op.sequence else image.op;
+                    const cached_definition = base_sequence and part == 0 and tag == @intFromEnum(Op.create_sequence_cached);
+                    if (tag != @intFromEnum(required) and !cached_definition) return error.InvalidChangeRecord;
+                }
                 switch (tag) {
                     @intFromEnum(Op.create_table) => {
                         var definition = try decodeCreate(&reader);
@@ -2005,6 +2013,10 @@ pub fn ChangeLog(comptime config: types.Config) type {
                             definition.spec.cache = try reader.int(i64);
                             if (definition.spec.cache <= 1) return error.InvalidChangeRecord;
                         }
+                        if (base_sequence) {
+                            if (definition.owner != 0 or definition.owner_column != 0) return error.InvalidChangeRecord;
+                            image_sequence = definition;
+                        }
                         if (definition.oid < first_oid or definition.oid == 0xffffffff or oidTaken(db, scratch, definition.oid, 1)) return error.ChangeRecordConflict;
                         if (relationNameTaken(scratch, definition.name.slice(), public_namespace) or
                             scratch.object_overlay.compositeRelationNameTaken(public_namespace, definition.name.slice())) return error.ChangeRecordConflict;
@@ -2025,9 +2037,13 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         scratch.seqs[index].live = false;
                     },
                     @intFromEnum(Op.sequence) => {
-                        _ = try findVSeq(scratch, try reader.int(u32));
-                        _ = try reader.int(i64);
-                        if (try reader.int(u8) > 1) return error.InvalidChangeRecord;
+                        const oid = try reader.int(u32);
+                        _ = try findVSeq(scratch, oid);
+                        const value = try reader.int(i64);
+                        const called = try reader.int(u8);
+                        if (called > 1) return error.InvalidChangeRecord;
+                        if (base_sequence and (oid != image_sequence.oid or
+                            value < image_sequence.spec.min or value > image_sequence.spec.max)) return error.InvalidChangeRecord;
                     },
                     @intFromEnum(Op.object_create) => {
                         const object = try O.decodeCreate(record, &reader.position);
@@ -2130,7 +2146,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
             if (image.csn == 0 or (db.csn != 0 and db.csn != image.csn)) return error.InvalidParameterValue;
             switch (image.op) {
                 .create_table, .insert => if (image.bank >= config.tables) return error.InvalidChangeRecord,
-                .catalog_counters, .catalog_counters_with_constraints => if (image.table_count == 0 or image.table_count > config.tables) return error.InvalidChangeRecord,
+                .create_sequence => {},
+                .catalog_counters, .catalog_counters_with_constraints => if (image.table_count > config.tables) return error.InvalidChangeRecord,
                 else => return error.InvalidChangeRecord,
             }
             return applyRecord(db, record, scratch, image);
