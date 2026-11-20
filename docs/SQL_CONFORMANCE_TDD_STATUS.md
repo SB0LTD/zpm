@@ -2,6 +2,21 @@
 
 ## Stock PostgreSQL dump and restore candidate
 
+Function discovery now reads routine owners and SQL language OIDs from the
+catalog. `acldefault('f', owner)` grants EXECUTE by default to the owner and
+PUBLIC. For supported functions and procedures, owner-authorized
+`GRANT EXECUTE` and `REVOKE EXECUTE` update the visible `pg_proc.proacl` and
+actual call permissions. The ACL and owner are versioned and survive WAL
+replay and routine replacement. Older routine records imply the bootstrap owner
+and default ACL. Grant delegation and multi-object statements remain open.
+
+`pg_init_privs` exposes the explicit bootstrap namespace ACLs.
+`pg_cast` lists the supported PostgreSQL binary-coercion entries that have no
+separate function. `pg_transform` has catalog metadata and no rows because
+language transforms cannot be installed. `pg_proc.proargtypes` stays a textual
+OID list. The native comparison exercises stock function discovery against a
+real user function and compares its default and modified routine ACLs.
+
 Namespace introspection now returns `pg_namespace.nspacl` as `aclitem[]`
 (OID 1034), with NULL before a custom schema ACL is materialized. The
 projection reads visible schema grants and owner privilege changes.

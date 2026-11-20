@@ -1756,6 +1756,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
             var reader = Reader{ .bytes = record };
             var row: V.Row = .{};
             var check_schema_owners = false;
+            var check_routine_references = false;
             var image_sequence: SequenceDefinition = undefined;
             for (0..count) |part| {
                 const tag = try reader.int(u8);
@@ -2006,6 +2007,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         const payload = try reader.take(try reader.int(u32));
                         const checks: ObjectChecks(@TypeOf(db)) = .{ .db = db, .scratch = scratch };
                         if (try RC.validateOp(&scratch.objects, tag, payload, checks)) |oid| next_oid = @max(next_oid, oid + 1);
+                        check_routine_references = true;
                     },
                     @intFromEnum(Op.create_sequence), @intFromEnum(Op.create_sequence_cached) => {
                         var definition = try decodeCreateSequence(&reader);
@@ -2060,6 +2062,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
             if (reader.position != record.len) return error.InvalidChangeRecord;
             // Objects never outlive the tables, roles and objects they name.
             try scratch.object_overlay.finish(&object_check);
+            if (check_routine_references or check_schema_owners) try RC.finishOverlay(&scratch.objects, &scratch.object_overlay);
             if (check_schema_owners) for (&scratch.schemas) |*schema| {
                 if (schema.live and !scratch.object_overlay.roleExists(schema.owner)) return error.ChangeRecordConflict;
             };

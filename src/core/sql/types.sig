@@ -202,6 +202,8 @@ pub const Config = struct {
     rules: usize = 4,
     /// Arguments per routine and CALL (more are ColumnCapacity, 54000).
     routine_args: usize = 8,
+    /// Explicit EXECUTE grantees per routine, excluding the owner and PUBLIC.
+    routine_acl_entries: u8 = 16,
     /// A routine body, trigger WHEN condition or rule qualification
     /// (decoded text); longer ones are TextCapacity (54000).
     routine_bytes: usize = 1024,

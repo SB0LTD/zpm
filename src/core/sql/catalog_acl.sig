@@ -38,6 +38,14 @@ pub fn Acl(comptime V: type) type {
             return .{ .array = out };
         }
 
+        pub fn routineDefault(owner: []const u8) types.Error!V.Cell {
+            var out: V.Text = .{};
+            var writer = try begin(&out, 2);
+            try append(&writer, "", "X", owner);
+            try append(&writer, owner, "X", owner);
+            return .{ .array = out };
+        }
+
         fn bytes(out: *V.Text, value: []const u8) types.Error!void {
             if (value.len > out.bytes.len - out.len) return error.TextCapacity;
             @memcpy(out.bytes[out.len..][0..value.len], value);

@@ -4182,6 +4182,13 @@ pub fn Database(comptime config: Config) type {
                 if (self.catalog_objects.pendingReference(oid, snap)) |other| return self.objectPark(slot, other);
                 var latest = snap;
                 latest.csn = self.csn;
+                for (&self.objects.routines) |*routine| {
+                    if (!routine.live) continue;
+                    if (routine.owner != oid and std.mem.indexOfScalar(u32, routine.acl.roles(), oid) == null) continue;
+                    if (routine.stamp.creatorOther(snap) orelse routine.stamp.deleterOther(snap)) |other| return self.objectPark(slot, other);
+                    if (routine.stamp.visible(snap) != routine.stamp.visible(latest)) return error.SerializationFailure;
+                    if (routine.stamp.visible(snap)) return error.DependentObjects;
+                }
                 for (&self.schemas) |*schema| {
                     if (!schema.live or schema.owner != oid) continue;
                     if ((schema.pending_create or schema.pending_drop) and schema.creator != slot) return self.objectPark(slot, schema.creator);
@@ -6048,6 +6055,30 @@ pub fn Database(comptime config: Config) type {
 
         fn fillViewRows(self:*const Self,session_values:*const value_module.Session,snapshot:Snapshot,pool:*A.Pool,view:catalog_module.View,sink:*X.RowSink) Error!void {
             if (view == .pg_settings) return error.UnsupportedStatement;
+            if (view == .pg_init_privs) {
+                // These fixed bootstrap ACLs have explicit catalog values.
+                const acl = try @import("sql/catalog_acl.sig").Acl(V).ownerAndPublic(CO.bootstrap_name, "UC", "U");
+                const class = catalog_module.bootstrapRelationOid(.pg_namespace).?;
+                for (catalog_module.namespaces) |namespace| {
+                    if (namespace.oid == catalog_module.toast_namespace) continue;
+                    try sink.add(&.{ intCell(namespace.oid), intCell(class), intCell(0), .{ .pg_internal_char = 'i' }, acl });
+                }
+                return;
+            }
+            if (view == .pg_cast) {
+                for (catalog_module.binary_casts) |cast| {
+                    try sink.add(&.{ intCell(cast.oid), intCell(types.typeOid(cast.source)), intCell(types.typeOid(cast.target)), intCell(0), .{ .pg_internal_char = 'i' }, .{ .pg_internal_char = 'b' } });
+                }
+                return;
+            }
+            // SQL and PL/pgSQL use the ordinary SQL representation directly.
+            // The runtime supports no language-specific transform registration.
+            if (view == .pg_transform) return;
+            if (view == .pg_language) {
+                try sink.add(&.{ intCell(catalog_module.sql_language_oid), nameCell("sql"), intCell(CO.bootstrap_role), boolCell(false), boolCell(true), intCell(0), intCell(0), intCell(0), .null_value });
+                try sink.add(&.{ intCell(catalog_module.plpgsql_language_oid), nameCell("plpgsql"), intCell(CO.bootstrap_role), boolCell(true), boolCell(true), intCell(0), intCell(0), intCell(0), .null_value });
+                return;
+            }
             if (view == .pg_tablespace) {
                 // Only the implicit database and shared catalog placements
                 // are supported. Relations use the implicit placement.
@@ -10324,6 +10355,7 @@ pub fn Database(comptime config: Config) type {
             switch (statement_value) {
                 .create_function, .create_procedure => |*definition| try self.createRoutine(slot, definition, snap),
                 .drop_function, .drop_procedure => |*drop| try self.dropRoutine(slot, drop, snap),
+                .grant_execute, .revoke_execute => |*grant| try self.grantRoutine(slot, grant, kind == .grant_execute, snap),
                 .call => |*call| try self.restartable(slot, snap, call, source),
                 .do_block => |*block| try self.restartable(slot, snap, block, source),
                 .create_trigger => |*definition| try self.createTrigger(slot, source, definition, snap),
@@ -10456,20 +10488,27 @@ pub fn Database(comptime config: Config) type {
             if (existing) |index| {
                 if (!definition.replace) return error.DuplicateFunction;
                 const old = &self.objects.routines[index];
+                if (!self.ownsRoutine(old, snap)) return error.InsufficientPrivilege;
                 if (old.kind != kind) return error.WrongObjectType;
                 if (old.return_oid != definition.return_oid or old.return_typmod != definition.return_typmod) return error.InvalidFunctionDefinition;
                 for (0..old.arg_count) |position| {
                     if (!types.same(old.arg_names[position].slice(), definition.args[position].name.slice())) return error.InvalidFunctionDefinition;
                 }
             }
+            const owner = if (existing) |old| self.objects.routines[old].owner else self.session.role;
+            if (self.catalog_objects.pendingReference(owner, snap)) |other| return self.objectPark(slot, other);
+            var latest = snap;
+            latest.csn = self.csn;
+            if (self.catalog_objects.roleName(owner, latest) == null) return error.SerializationFailure;
             if (definition.return_oid == tg.trigger_oid and (definition.language == 0 or definition.arg_count != 0)) return error.InvalidFunctionDefinition;
             if (self.sessionState().values.check_function_bodies) try self.validateRoutine(definition, snap);
             try self.reserveWrites(slot, 2);
             const index = try self.objectSlot(.routine);
             const oid = if (existing) |old| self.objects.routines[old].oid else try self.takeOid();
+            const acl: RC.ExecuteAcl = if (existing) |old| self.objects.routines[old].acl else .{};
             if (existing) |old| try self.dropObject(slot, .routine, old, snap);
             const item = &self.objects.routines[index];
-            item.* = .{ .oid = oid, .namespace = namespace, .name = definition.name, .kind = kind, .language = definition.language, .volatility = definition.volatility, .strict = definition.strict, .arg_count = definition.arg_count, .return_oid = definition.return_oid, .return_typmod = definition.return_typmod, .body = definition.body };
+            item.* = .{ .oid = oid, .namespace = namespace, .owner = owner, .acl = acl, .name = definition.name, .kind = kind, .language = definition.language, .volatility = definition.volatility, .strict = definition.strict, .arg_count = definition.arg_count, .return_oid = definition.return_oid, .return_typmod = definition.return_typmod, .body = definition.body };
             for (definition.args[0..definition.arg_count], 0..) |arg, position| {
                 item.arg_names[position] = arg.name;
                 item.arg_oids[position] = arg.oid;
@@ -10582,7 +10621,20 @@ pub fn Database(comptime config: Config) type {
         /// DROP FUNCTION / PROCEDURE: the routine with the given argument
         /// types (or the only one of that name); triggers using a function
         /// are 2BP01 unless CASCADE drops them.
-        fn dropRoutine(self: *Self, slot: u16, drop: *const R.DropRoutine, snap: Snapshot) Error!void {
+        fn ownsRoutine(self: *const Self, routine: *const RC.Routine, snap: Snapshot) bool {
+            return self.catalog_objects.superuser(self.session.role, snap) or self.catalog_objects.memberOf(self.session.role, routine.owner, true, snap);
+        }
+
+        fn canExecuteRoutine(self: *const Self, routine: *const RC.Routine, snap: Snapshot) bool {
+            if (routine.acl.public or self.catalog_objects.superuser(self.session.role, snap)) return true;
+            if (routine.acl.owner and self.catalog_objects.memberOf(self.session.role, routine.owner, true, snap)) return true;
+            for (routine.acl.roles()) |role| {
+                if (self.catalog_objects.memberOf(self.session.role, role, true, snap)) return true;
+            }
+            return false;
+        }
+
+        fn findRoutineTarget(self: *Self, slot: u16, drop: *const R.DropRoutine, snap: Snapshot) Error!?usize {
             const namespace = catalog_module.public_namespace;
             const name = drop.name.slice();
             var found: ?usize = null;
@@ -10597,12 +10649,41 @@ pub fn Database(comptime config: Config) type {
                 }
                 if (found) |index| if (self.objects.routines[index].stamp.deleterOther(snap)) |other| return self.waitObject(slot, other);
             }
-            const index = found orelse {
+            if (found) |index| {
+                if ((self.objects.routines[index].kind == 'p') != drop.procedure) return error.WrongObjectType;
+            }
+            return found;
+        }
+
+        fn grantRoutine(self: *Self, slot: u16, grant: *const R.ExecuteGrant, allow: bool, snap: Snapshot) Error!void {
+            const index = (try self.findRoutineTarget(slot, &grant.routine, snap)) orelse return error.UndefinedFunction;
+            const old = &self.objects.routines[index];
+            if (!self.ownsRoutine(old, snap)) return error.InsufficientPrivilege;
+            const role = if (grant.grantee.len == 0) CO.public_role else
+                self.catalog_objects.roleByName(grant.grantee.slice(), snap) orelse return error.UndefinedObject;
+            if (role != CO.public_role) {
+                if (self.catalog_objects.pendingReference(role, snap)) |other| return self.objectPark(slot, other);
+                var latest = snap;
+                latest.csn = self.csn;
+                if (self.catalog_objects.roleName(role, latest) == null) return error.SerializationFailure;
+            }
+            var acl = old.acl;
+            try acl.set(role, old.owner, allow);
+            try self.reserveWrites(slot, 2);
+            const next = try self.objectSlot(.routine);
+            try self.dropObject(slot, .routine, index, snap);
+            self.objects.routines[next] = old.*;
+            self.objects.routines[next].acl = acl;
+            self.createdObject(slot, .routine, next, snap);
+        }
+
+        fn dropRoutine(self: *Self, slot: u16, drop: *const R.DropRoutine, snap: Snapshot) Error!void {
+            const index = (try self.findRoutineTarget(slot, drop, snap)) orelse {
                 if (drop.if_exists) return;
                 return error.UndefinedFunction;
             };
             const routine = &self.objects.routines[index];
-            if ((routine.kind == 'p') != drop.procedure) return error.WrongObjectType;
+            if (!self.ownsRoutine(routine, snap)) return error.InsufficientPrivilege;
             for (&self.objects.triggers, 0..) |*trigger, position| {
                 if (!trigger.live or trigger.function_oid != routine.oid or !trigger.stamp.visible(snap)) continue;
                 if (!drop.cascade) return error.DependentObjects;
@@ -10677,6 +10758,7 @@ pub fn Database(comptime config: Config) type {
             const chosen = best orelse return if (function) error.WrongObjectType else error.UndefinedFunction;
             if (ambiguous) return error.AmbiguousFunction;
             const routine = &self.objects.routines[chosen];
+            if (!self.canExecuteRoutine(routine, snap)) return error.InsufficientPrivilege;
             var cells: [config.routine_args]V.Cell = undefined;
             for (args[0..call.arg_count], 0..) |arg, position| {
                 const to = typeOfOid(routine.arg_oids[position]);
@@ -10724,6 +10806,7 @@ pub fn Database(comptime config: Config) type {
             const out: *V.Cell = @ptrCast(@alignCast(out_ptr));
             if (index >= config.routines) return error.UndefinedFunction;
             const routine = &self.objects.routines[index];
+            if (!self.canExecuteRoutine(routine, self.routine_snap)) return error.InsufficientPrivilege;
             if (routine.strict) for (args[0..count]) |*cell| {
                 if (cell.* == .null_value) {
                     out.* = .null_value;
@@ -11000,6 +11083,7 @@ pub fn Database(comptime config: Config) type {
             const routine_index = function orelse return error.UndefinedFunction;
             const routine = &self.objects.routines[routine_index];
             if (routine.return_oid != tg.trigger_oid or routine.kind != 'f') return error.InvalidObjectDefinition;
+            if (!self.canExecuteRoutine(routine, snap)) return error.InsufficientPrivilege;
             const when = source[definition.when.start..definition.when.end];
             if (when.len > config.routine_bytes) return error.TextCapacity;
             if (when.len != 0) try self.validateRecordCondition(table_index, when, kind, row, true);
@@ -11312,6 +11396,23 @@ pub fn Database(comptime config: Config) type {
 
         // ---- catalogs ---------------------------------------------------------
 
+        fn routineAcl(self: *const Self, routine: *const RC.Routine, snapshot: Snapshot) Error!Cell {
+            const acl = &routine.acl;
+            if (!acl.explicit) return .null_value;
+            const owner = self.catalog_objects.roleName(routine.owner, snapshot) orelse return error.UndefinedObject;
+            const Acl = @import("sql/catalog_acl.sig").Acl(V);
+            var output: Text = .{};
+            const count = @as(u32, acl.count) + @intFromBool(acl.public) + @intFromBool(acl.owner);
+            var writer = try Acl.begin(&output, count);
+            if (acl.public) try Acl.append(&writer, "", "X", owner);
+            if (acl.owner) try Acl.append(&writer, owner, "X", owner);
+            for (acl.roles()) |role| {
+                const name = self.catalog_objects.roleName(role, snapshot) orelse return error.UndefinedObject;
+                try Acl.append(&writer, name, "X", owner);
+            }
+            return .{ .array = output };
+        }
+
         /// pg_proc, pg_trigger, pg_rewrite and pg_rules rows.
         fn objectViewRows(self: *const Self, snapshot: Snapshot, view: catalog_module.View, sink: *X.RowSink) Error!void {
             switch (view) {
@@ -11336,9 +11437,8 @@ pub fn Database(comptime config: Config) type {
                         @memcpy(argtypes[at..][0..length], digits[digits.len - length ..]);
                         at += length;
                     }
-                    const kind = [1]u8{routine.kind};
-                    const volatility = [1]u8{routine.volatility};
-                    try sink.add(&.{ intCell(routine.oid), nameCell(routine.name.slice()), intCell(routine.namespace), nameCell(&kind), nameCell(if (routine.language == 0) "sql" else "plpgsql"), nameCell(&volatility), boolCell(routine.strict), intCell(@intCast(routine.arg_count)), intCell(routine.return_oid), nameCell(argtypes[0..at]), nameCell(routine.body.slice()) });
+                    const language = if (routine.language == 0) catalog_module.sql_language_oid else catalog_module.plpgsql_language_oid;
+                    try sink.add(&.{ intCell(routine.oid), nameCell(routine.name.slice()), intCell(routine.namespace), .{ .pg_internal_char = routine.kind }, intCell(language), .{ .pg_internal_char = routine.volatility }, boolCell(routine.strict), intCell(@intCast(routine.arg_count)), intCell(routine.return_oid), nameCell(argtypes[0..at]), nameCell(routine.body.slice()), intCell(routine.owner), try self.routineAcl(routine, snapshot) });
                 },
                 .pg_trigger => for (&self.objects.triggers) |*trigger| {
                     if (!trigger.live or !trigger.stamp.visible(snapshot)) continue;

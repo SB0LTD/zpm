@@ -54,7 +54,11 @@ pub const View = enum(u8) { pg_type, pg_namespace, pg_class, pg_attribute, pg_in
     pg_proc, pg_trigger, pg_rewrite, pg_rules,
     // Catalog objects (B11 wave 3, catalog_objects.sig).
     pg_roles, pg_authid, pg_auth_members, pg_policy, pg_policies, pg_description, pg_shdescription, pg_foreign_data_wrapper, pg_foreign_server, pg_publication, pg_extension, pg_tables, table_privileges, pg_enum, pg_database, pg_am, pg_collation, pg_constraint, pg_statistic_ext,
-    pg_publication_rel, pg_publication_namespace, pg_settings, pg_depend, pg_tablespace, pg_foreign_table };
+    pg_publication_rel, pg_publication_namespace, pg_settings, pg_depend, pg_tablespace, pg_foreign_table,
+    pg_init_privs, pg_cast, pg_transform, pg_language };
+
+pub const sql_language_oid: u32 = 14;
+pub const plpgsql_language_oid: u32 = 13002;
 
 pub const DatabaseCatalogRow = struct { oid: u32, owner: u32, name: []const u8 };
 pub const DatabaseCatalogProvider = struct {
@@ -132,8 +136,23 @@ const pg_indexes_columns = [_]ViewColumn{ col("schemaname", .name), col("tablena
 const pg_views_columns = [_]ViewColumn{ col("schemaname", .name), col("viewname", .name), col("viewowner", .name), col("definition", .text) };
 const pg_matviews_columns = [_]ViewColumn{ col("schemaname", .name), col("matviewname", .name), col("matviewowner", .name), col("tablespace", .name), col("hasindexes", .boolean), col("ispopulated", .boolean), col("definition", .text) };
 const pg_inherits_columns = [_]ViewColumn{ col("inhrelid", .oid), col("inhparent", .oid), col("inhseqno", .int4), col("inhdetachpending", .boolean) };
-// pg_proc.prolang is shown as the language name (its OID is per database).
-const pg_proc_columns = [_]ViewColumn{ col("oid", .oid), col("proname", .name), col("pronamespace", .oid), col("prokind", .text), col("prolang", .name), col("provolatile", .text), col("proisstrict", .boolean), col("pronargs", .int2), col("prorettype", .oid), col("proargtypes", .text), col("prosrc", .text) };
+const pg_proc_columns = [_]ViewColumn{ col("oid", .oid), col("proname", .name), col("pronamespace", .oid), col("prokind", .pg_internal_char), col("prolang", .oid), col("provolatile", .pg_internal_char), col("proisstrict", .boolean), col("pronargs", .int2), col("prorettype", .oid), col("proargtypes", .text), col("prosrc", .text), col("proowner", .oid), col("proacl", types.arrayType(.aclitem).?) };
+const pg_init_privs_columns = [_]ViewColumn{ col("objoid", .oid), col("classoid", .oid), col("objsubid", .int4), col("privtype", .pg_internal_char), col("initprivs", types.arrayType(.aclitem).?) };
+const pg_cast_columns = [_]ViewColumn{ col("oid", .oid), col("castsource", .oid), col("casttarget", .oid), col("castfunc", .oid), col("castcontext", .pg_internal_char), col("castmethod", .pg_internal_char) };
+const pg_transform_columns = [_]ViewColumn{ col("oid", .oid), col("trftype", .oid), col("trflang", .oid), col("trffromsql", .oid), col("trftosql", .oid) };
+const pg_language_columns = [_]ViewColumn{ col("oid", .oid), col("lanname", .name), col("lanowner", .oid), col("lanispl", .boolean), col("lanpltrusted", .boolean), col("lanplcallfoid", .oid), col("laninline", .oid), col("lanvalidator", .oid), col("lanacl", types.arrayType(.aclitem).?) };
+
+/// Implemented cataloged casts that have no separately callable function.
+/// PostgreSQL bootstrap OIDs identify these shared binary-coercion paths.
+pub const binary_casts = [_]struct { oid: u32, source: types.DataType, target: types.DataType }{
+    .{ .oid = 10088, .source = .oid, .target = .regtype },
+    .{ .oid = 10089, .source = .regtype, .target = .oid },
+    .{ .oid = 10126, .source = .text, .target = .varchar },
+    .{ .oid = 10129, .source = .varchar, .target = .text },
+    .{ .oid = 10181, .source = .cidr, .target = .inet },
+    .{ .oid = 10183, .source = .bit, .target = .varbit },
+    .{ .oid = 10184, .source = .varbit, .target = .bit },
+};
 const pg_trigger_columns = [_]ViewColumn{ col("oid", .oid), col("tgrelid", .oid), col("tgname", .name), col("tgfoid", .oid), col("tgtype", .int2), col("tgenabled", .text), col("tgisinternal", .boolean), col("tgnargs", .int2), col("tgparentid", .oid) };
 const pg_rewrite_columns = [_]ViewColumn{ col("oid", .oid), col("rulename", .name), col("ev_class", .oid), col("ev_type", .text), col("ev_enabled", .text), col("is_instead", .boolean) };
 const pg_rules_columns = [_]ViewColumn{ col("schemaname", .name), col("tablename", .name), col("rulename", .name), col("definition", .text) };
@@ -196,6 +215,10 @@ pub fn viewColumns(view: View) []const ViewColumn {
         .pg_matviews => &pg_matviews_columns,
         .pg_inherits => &pg_inherits_columns,
         .pg_proc => &pg_proc_columns,
+        .pg_init_privs => &pg_init_privs_columns,
+        .pg_cast => &pg_cast_columns,
+        .pg_transform => &pg_transform_columns,
+        .pg_language => &pg_language_columns,
         .pg_trigger => &pg_trigger_columns,
         .pg_rewrite => &pg_rewrite_columns,
         .pg_rules => &pg_rules_columns,
@@ -221,7 +244,8 @@ pub fn viewColumns(view: View) []const ViewColumn {
 /// information_schema views only when qualified.
 pub fn findView(schema: ?[]const u8, name: []const u8) ?View {
     const catalog_views = [_]View{ .pg_type, .pg_enum, .pg_namespace, .pg_am, .pg_collation, .pg_class, .pg_settings, .pg_attribute, .pg_index, .pg_constraint, .pg_depend, .pg_statistic_ext, .pg_attrdef, .pg_sequence, .pg_indexes, .pg_views, .pg_matviews, .pg_inherits, .pg_proc, .pg_trigger, .pg_rewrite, .pg_rules,
-        .pg_tablespace, .pg_foreign_table, .pg_roles, .pg_authid, .pg_auth_members, .pg_policy, .pg_policies, .pg_description, .pg_shdescription, .pg_foreign_data_wrapper, .pg_foreign_server, .pg_publication, .pg_publication_rel, .pg_publication_namespace, .pg_extension, .pg_tables };
+        .pg_tablespace, .pg_foreign_table, .pg_roles, .pg_authid, .pg_auth_members, .pg_policy, .pg_policies, .pg_description, .pg_shdescription, .pg_foreign_data_wrapper, .pg_foreign_server, .pg_publication, .pg_publication_rel, .pg_publication_namespace, .pg_extension, .pg_tables,
+        .pg_init_privs, .pg_cast, .pg_transform, .pg_language };
     const information_views = [_]View{ .schemata, .tables, .columns, .table_constraints, .key_column_usage, .table_privileges };
     const qualified = schema orelse {
         for (catalog_views) |view| if (types.same(@tagName(view), name)) return view;
@@ -240,6 +264,8 @@ pub fn findView(schema: ?[]const u8, name: []const u8) ?View {
 pub const bootstrap_relations = [_]struct { view: View, oid: u32 }{
     .{ .view = .pg_type, .oid = 1247 }, .{ .view = .pg_attribute, .oid = 1249 },
     .{ .view = .pg_proc, .oid = 1255 }, .{ .view = .pg_class, .oid = 1259 },
+    .{ .view = .pg_cast, .oid = 2605 }, .{ .view = .pg_language, .oid = 2612 },
+    .{ .view = .pg_init_privs, .oid = 3394 }, .{ .view = .pg_transform, .oid = 3576 },
     .{ .view = .pg_tablespace, .oid = 1213 }, .{ .view = .pg_foreign_table, .oid = 3118 },
     .{ .view = .pg_authid, .oid = 1260 }, .{ .view = .pg_auth_members, .oid = 1261 },
     .{ .view = .pg_database, .oid = 1262 }, .{ .view = .pg_foreign_server, .oid = 1417 },
