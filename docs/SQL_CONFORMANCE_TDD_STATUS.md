@@ -2,6 +2,21 @@
 
 ## Stock PostgreSQL dump and restore candidate
 
+Type discovery now exposes `pg_type.typacl` as `aclitem[]` and
+`typisdefined` as boolean for defined built-in and user types. The types
+have no explicit ACL overrides. `acldefault('T', owner)` provides USAGE for
+PUBLIC and the owner. Shell type creation and per-type grants remain open.
+Type and relation kind fields used by the discovery query return PostgreSQL
+`"char"` values, including the range kind and a composite type's relation
+kind.
+
+`name` subscripting uses zero-based byte offsets and the 64-byte padded
+representation. Out-of-range or NULL indices yield NULL, padding yields
+zero, and fixed-length slices return an unsupported-feature error. Name
+casts clip at a UTF-8 boundary. The native comparison exercises stock
+discovery predicates on built-in types, enums, domains, composites and
+their array types, and checks byte subscripting and wire types.
+
 Function discovery now reads routine owners and SQL language OIDs from the
 catalog. `acldefault('f', owner)` grants EXECUTE by default to the owner and
 PUBLIC. For supported functions and procedures, owner-authorized

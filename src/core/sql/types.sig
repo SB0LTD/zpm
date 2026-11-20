@@ -768,6 +768,7 @@ pub fn typeOfData(data_type: DataType) Type {
 /// Static type table (pg_type subset): OID, typname, typlen, typcategory,
 /// array type OID (arrays are reported for catalog fidelity only).
 /// PostgreSQL type ABI metadata. Alignment does not describe the Cell layout.
+pub const pg_name_bytes = 64;
 pub const TypeInfo = struct { oid: u32, name: []const u8, len: i16, category: u8, array: u32, alignment: u8 = 'i' };
 
 /// Catalog identity of a projected nominal type, separate from its value
@@ -823,7 +824,7 @@ fn baseInfo(data_type: DataType) TypeInfo {
         .aclitem => .{ .oid = 1033, .name = "aclitem", .len = 16, .category = 'U', .array = 1034, .alignment = 'd' },
         .pg_internal_char => .{ .oid = 18, .name = "char", .len = 1, .category = 'Z', .array = 1002, .alignment = 'c' },
         .boolean => .{ .oid = 16, .name = "bool", .len = 1, .category = 'B', .array = 1000, .alignment = 'c' },
-        .name => .{ .oid = 19, .name = "name", .len = 64, .category = 'S', .array = 1003, .alignment = 'c' },
+        .name => .{ .oid = 19, .name = "name", .len = pg_name_bytes, .category = 'S', .array = 1003, .alignment = 'c' },
         .integer => .{ .oid = 20, .name = "int8", .len = 8, .category = 'N', .array = 1016, .alignment = 'd' },
         .smallint => .{ .oid = 21, .name = "int2", .len = 2, .category = 'N', .array = 1005, .alignment = 's' },
         .integer32 => .{ .oid = 23, .name = "int4", .len = 4, .category = 'N', .array = 1007 },

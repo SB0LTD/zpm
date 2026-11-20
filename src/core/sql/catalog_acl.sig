@@ -38,11 +38,11 @@ pub fn Acl(comptime V: type) type {
             return .{ .array = out };
         }
 
-        pub fn routineDefault(owner: []const u8) types.Error!V.Cell {
+        pub fn publicAndOwner(owner: []const u8, privileges: []const u8) types.Error!V.Cell {
             var out: V.Text = .{};
             var writer = try begin(&out, 2);
-            try append(&writer, "", "X", owner);
-            try append(&writer, owner, "X", owner);
+            try append(&writer, "", privileges, owner);
+            try append(&writer, owner, privileges, owner);
             return .{ .array = out };
         }
 

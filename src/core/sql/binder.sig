@@ -2649,13 +2649,14 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 .array_subscript => {
                     const base_ty = context.node(n.b).ty;
-                    const element = types.elementType(base_ty) orelse return error.TypeMismatch;
+                    const element = if (base_ty == .name) .pg_internal_char else types.elementType(base_ty) orelse return error.TypeMismatch;
                     // Subscripts are int4 by assignment (array subscript
                     // must have type integer: 42804).
                     try convertTail(context, n.b, .int4, .assignment);
                     const layout = array_module.Subscripts.decode(n.integer);
+                    if (base_ty == .name and layout.slice()) return error.UnsupportedStatement;
                     n.ty = if (layout.slice()) base_ty else element;
-                    n.typmod = outputTypmod(context, n.b);
+                    n.typmod = if (base_ty == .name) -1 else outputTypmod(context, n.b);
                     n.constant = listConstant(context, n.b);
                 },
                 .array_any => {

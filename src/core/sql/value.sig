@@ -584,6 +584,13 @@ pub fn Io(comptime config: types.Config) type {
             return .{ .text = text };
         }
 
+        fn clipName(bytes: []const u8) []const u8 {
+            if (bytes.len < types.pg_name_bytes) return bytes;
+            var end: usize = types.pg_name_bytes - 1;
+            while (end != 0 and bytes[end] & 0xc0 == 0x80) end -= 1;
+            return bytes[0..end];
+        }
+
         fn textCell(bytes: []const u8) Error!V.Cell {
             var text: V.Text = .{};
             try appendBytes(&text, bytes);
@@ -649,7 +656,7 @@ pub fn Io(comptime config: types.Config) type {
                     if (ty == .json) try J.validateJsonControlled(input, session.control);
                     break :blk try textCell(input);
                 },
-                .name => try textCell(input[0..@min(input.len, 63)]),
+                .name => try textCell(clipName(input)),
                 .numeric => .{ .numeric = try N.parse(input) },
                 .mysql_bigint_unsigned => try checkedUnsigned(try N.parse(input)),
                 .float4 => .{ .float4 = try float_text.parse(f32, input) },
@@ -997,11 +1004,11 @@ pub fn Io(comptime config: types.Config) type {
                 .text, .name => blk: {
                     if (cell == .text) {
                         const bytes = cell.text.slice();
-                        break :blk try textCell(if (to == .name) bytes[0..@min(bytes.len, 63)] else bytes);
+                        break :blk try textCell(if (to == .name) clipName(bytes) else bytes);
                     }
                     var buffer: [format_bytes]u8 = undefined;
                     const bytes = try format(&cell, true, session, &buffer);
-                    break :blk try textCell(if (to == .name) bytes[0..@min(bytes.len, 63)] else bytes);
+                    break :blk try textCell(if (to == .name) clipName(bytes) else bytes);
                 },
                 .json => switch (cell) {
                     .text => |*value| blk: {

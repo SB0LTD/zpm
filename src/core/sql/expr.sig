@@ -473,6 +473,7 @@ pub fn Eval(comptime config: types.Config) type {
         fn aclDefault(ctx: *const Context, kind: u8, owner: u32) Error!V.Cell {
             const privileges = switch (kind) {
                 'f' => "X",
+                'T' => "U",
                 'n' => "UC",
                 'r' => "arwdDxt",
                 's' => "rwU",
@@ -485,7 +486,7 @@ pub fn Eval(comptime config: types.Config) type {
             const used = try get_name(hook.ptr, .role_name, owner, 0, 0, &buffer);
             const name = if (used) |len| buffer[0..len] else @import("std").fmt.bufPrint(&buffer, "{d}", .{owner}) catch unreachable;
             const Acl = @import("catalog_acl.sig").Acl(V);
-            return if (kind == 'f') Acl.routineDefault(name) else Acl.ownerOnly(name, privileges);
+            return if (kind == 'f' or kind == 'T') Acl.publicAndOwner(name, privileges) else Acl.ownerOnly(name, privileges);
         }
 
         /// Discovery functions and regclass/regtype conversions (design Ã‚Â§4.10).

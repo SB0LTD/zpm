@@ -46,9 +46,9 @@ pub const toast_namespace: u32 = 99;
 
 /// System views (design §4.10): virtual relations computed at scan time from
 /// the catalog base relations, the table definitions and the static type
-/// table under the statement snapshot. Columns PostgreSQL declares as
-/// "char", regproc, int2vector, character_data or yes_or_no are text here;
-/// sql_identifier columns are name (OID 19), cardinal_number int4.
+/// table under the statement snapshot. Some legacy metadata columns use
+/// text representations. SQL identifiers use name (OID 19) and
+/// cardinal_number uses int4.
 pub const View = enum(u8) { pg_type, pg_namespace, pg_class, pg_attribute, pg_index, pg_attrdef, pg_sequence, schemata, tables, columns, table_constraints, key_column_usage, pg_indexes, pg_views, pg_matviews, pg_inherits,
     // Routines, triggers and rules (B11 wave 3).
     pg_proc, pg_trigger, pg_rewrite, pg_rules,
@@ -74,9 +74,10 @@ fn col(name: []const u8, ty: types.Type) ViewColumn {
 }
 
 const pg_type_columns = [_]ViewColumn{
-    col("oid", .oid), col("typname", .name), col("typnamespace", .oid), col("typlen", .int2), col("typtype", .text), col("typcategory", .text),
+    col("oid", .oid), col("typname", .name), col("typnamespace", .oid), col("typlen", .int2), col("typtype", .pg_internal_char), col("typcategory", .text),
     col("typarray", .oid), col("typdelim", .text), col("typinput", .text), col("typbasetype", .oid), col("typelem", .oid),
     col("typowner", .oid), col("typtypmod", .int4), col("typnotnull", .boolean), col("typrelid", .oid), col("typcollation", .oid),
+    col("typacl", types.arrayType(.aclitem).?), col("typisdefined", .boolean),
 };
 const pg_namespace_columns = [_]ViewColumn{ col("oid", .oid), col("nspname", .name), col("nspowner", .oid), col("nspacl", types.arrayType(.aclitem).?) };
 const pg_enum_columns = [_]ViewColumn{ col("oid", .oid), col("enumtypid", .oid), col("enumsortorder", .float4), col("enumlabel", .name) };
@@ -97,7 +98,7 @@ const pg_foreign_table_columns = [_]ViewColumn{
     col("ftrelid", .oid), col("ftserver", .oid), col("ftoptions", types.arrayType(.text).?),
 };
 const pg_class_columns = [_]ViewColumn{
-    col("oid", .oid), col("relname", .name), col("relnamespace", .oid), col("relkind", .text), col("relnatts", .int2),
+    col("oid", .oid), col("relname", .name), col("relnamespace", .oid), col("relkind", .pg_internal_char), col("relnatts", .int2),
     col("relchecks", .int2), col("relhasindex", .boolean), col("relhasrules", .boolean), col("relhastriggers", .boolean),
     col("relrowsecurity", .boolean), col("relforcerowsecurity", .boolean), col("relispartition", .boolean),
     col("reltablespace", .oid), col("reloftype", .oid), col("relpersistence", .text), col("relreplident", .text),

@@ -128,6 +128,18 @@ fn dumpDiscovery() !void {
     try run("DROP TABLE discoverable");
 }
 
+fn typeDiscovery() !void {
+    try expect("SELECT oid,typacl,typisdefined,typtype,typname[0] FROM pg_type WHERE oid IN (23,1007,3904) ORDER BY oid",
+        "23|NULL|t|b|i;1007|NULL|t|b|_;3904|NULL|t|r|i");
+    try expect("SELECT pg_typeof(typacl)::text,acldefault('T',typowner)::text,acldefault('t',typowner)::text FROM pg_type WHERE oid=23",
+        "aclitem[]|{=U/ramsql,ramsql=U/ramsql}|{ramsql=C/ramsql}");
+    try expect("SELECT ('abc'::name)[0],('abc'::name)[2],('abc'::name)[3]::int,('abc'::name)[63]::int,('abc'::name)[64],('abc'::name)[-1],('abc'::name)[NULL]",
+        "a|c|0|0|NULL|NULL|NULL");
+    try expect("SELECT ('é'::name)[0]::int,('é'::name)[1]::int,('abc'::name)[0][1],(NULL::name)[0]", "-61|-87|NULL|NULL");
+    try expect("SELECT length((repeat('a',62) || 'é')::name::text)", "62");
+    try rejects("SELECT ('abc'::name)[0:1]", error.UnsupportedStatement);
+}
+
 fn lifecycle() !void {
     try run("CREATE TABLE a (id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY, amount NUMERIC(10,2), at TIMESTAMPTZ(3), doc JSONB, label TEXT DEFAULT 'd', n INTEGER DEFAULT 2 + 3)");
     try expect(public_tables, "a");
@@ -259,6 +271,7 @@ fn collationMetadata() !void {
 pub fn main(init: std.process.Init) !void {
     try types();
     try dumpDiscovery();
+    try typeDiscovery();
     try lifecycle();
     try replay();
     try characterMetadata();

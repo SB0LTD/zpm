@@ -140,6 +140,16 @@ pub fn ArrayEval(comptime config: types.Config, comptime E: type) type {
                 }
             }
             if (any_null) return .null_value;
+            if (node(ctx, n.b).ty == .name) {
+                // PostgreSQL treats name as a fixed-length zero-padded byte
+                // array, with a zero-based index and a "char" result.
+                if (layout.count != 1) return .null_value;
+                const index = lower[0].?;
+                if (index < 0 or index >= types.pg_name_bytes) return .null_value;
+                const offset: usize = @intCast(index);
+                const bytes = base.text.slice();
+                return .{ .pg_internal_char = if (offset < @min(bytes.len, types.pg_name_bytes - 1)) bytes[offset] else 0 };
+            }
             const bytes = base.array.slice();
             const shape = A.shape(bytes);
             if (!layout.slice()) {
