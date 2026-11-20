@@ -47,7 +47,11 @@ pub const ENABLE_BACKWARDS_COMPATIBILITY: u32 = 1 << 12;
 pub const MAX_SRCS = 1 << 17;
 pub const MAX_LOCS = 1 << 16;
 pub const MAX_VREGS = 1 << 17;
-const MAX_CB = 16;
+/// constant buffers a shader may declare (fxc's 14 slots go to those it reads)
+const MAX_CB = 64;
+/// an implicitly placed constant buffer's slot until its real one is known
+/// (Compiler.placeCbSlots): this plus its index
+pub const CB_PROVISIONAL: u32 = 0x1000;
 const MAX_RES = 256;
 pub const MAX_ICB = 4096;
 const MAX_ELEMS = 64;
@@ -127,6 +131,8 @@ const CB = struct {
     dynamic: bool = false,
     tbuffer: bool = false,
     userpacked: bool = false,
+    /// no register(b#): its slot is provisional until the code is known
+    implicit: bool = false,
 };
 
 const Res = struct {
@@ -227,6 +233,8 @@ pub const Gen = struct {
     pk_mode: [64]u16 = [_]u16{0} ** 64,
     /// whether derivatives / sample are used (statistics)
     globals_cb: u32 = 0xffff_ffff,
+    /// the slots register(b#) names (reserved, read or not)
+    cb_explicit: u32 = 0,
 
     // ── errors ──
 
@@ -2794,11 +2802,14 @@ pub const Gen = struct {
             const sy = g.a.syms[s];
             if (sy.kind == .variable and sy.storage == .global and !g.isObjectTy(sy.ty) and sy.flags & ast.F_STATIC == 0) has_globals = true;
         }
+        g.cb_explicit = used_slots;
+        // (a buffer without a register: a provisional slot, its real one the
+        // lowest free once the code shows it read, as fxc places them:
+        // $Globals first, then by declaration; unread ones take none)
         if (has_globals) {
-            const slot = lowestFree(used_slots);
-            used_slots |= @as(u32, 1) << @intCast(slot);
+            const slot = CB_PROVISIONAL + g.ncbs;
             g.globals_cb = g.ncbs;
-            g.cbs[g.ncbs] = .{ .sym = 0, .slot = slot };
+            g.cbs[g.ncbs] = .{ .sym = 0, .slot = slot, .implicit = true };
             g.ncbs += 1;
             var off: u32 = 0;
             for (g.a.globals[0..g.a.nglobals]) |s| {
@@ -2819,13 +2830,9 @@ pub const Gen = struct {
             const sy = g.a.syms[s];
             if (sy.kind != .cbuffer) continue;
             if (g.ncbs >= MAX_CB) return g.fail("too many constant buffers", .{});
-            var slot: u32 = undefined;
-            if (sy.reg_kind == 'b') slot = sy.reg_index else {
-                slot = lowestFree(used_slots);
-                used_slots |= @as(u32, 1) << @intCast(slot);
-            }
             const ci = g.ncbs;
-            g.cbs[ci] = .{ .sym = s, .slot = slot, .tbuffer = sy.flags & ast.F_TBUFFER != 0, .userpacked = sy.reg_kind == 'b' };
+            const slot: u32 = if (sy.reg_kind == 'b') sy.reg_index else CB_PROVISIONAL + ci;
+            g.cbs[ci] = .{ .sym = s, .slot = slot, .tbuffer = sy.flags & ast.F_TBUFFER != 0, .userpacked = sy.reg_kind == 'b', .implicit = sy.reg_kind != 'b' };
             g.ncbs += 1;
             var off: u32 = 0;
             for (0..sy.nparams) |k| {
@@ -2842,7 +2849,8 @@ pub const Gen = struct {
         }
     }
 
-    fn lowestFree(used: u32) u32 {
+    /// The lowest of the 14 slots not in `used`, or 14 when none is.
+    pub fn lowestFree(used: u32) u32 {
         var k: u32 = 0;
         while (k < 14 and used & (@as(u32, 1) << @intCast(k)) != 0) k += 1;
         return k;

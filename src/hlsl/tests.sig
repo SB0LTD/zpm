@@ -84,3 +84,50 @@ test "the compiler's tables fit a DLL's static data" {
     try testing.expect(@sizeOf(hlsl.Compiler) < 64 << 20);
     std.debug.print("Compiler: {d} MiB\n", .{@sizeOf(hlsl.Compiler) >> 20});
 }
+
+/// A compiled shader's binding for `name`: its register, or null.
+fn bindOf(blob: []const u8, name: []const u8) ?u32 {
+    var r: ct.Reflection = undefined;
+    if (!r.read(ct.findChunk(blob, "RDEF").?)) return null;
+    for (r.binds[0..r.nbinds]) |b| if (std.mem.eql(u8, b.name, name)) return b.bind;
+    return null;
+}
+
+test "constant buffers take slots as fxc gives them: only those read" {
+    // (fxc 10.1: unread A and $Globals take none; B cb0, C cb1)
+    const a = try compileOk("cbuffer A { float4 a; };\n" ++
+        "cbuffer B { float4 b; };\n" ++
+        "float4 x;\n" ++
+        "cbuffer C { float4 cc; };\n" ++
+        "float4 main(float4 p : POSITION) : SV_Position { return p * b + cc; }\n", "vs_5_0");
+    try testing.expectEqual(@as(?u32, 0), bindOf(a, "B"));
+    try testing.expectEqual(@as(?u32, 1), bindOf(a, "C"));
+    try testing.expectEqual(@as(?u32, null), bindOf(a, "A"));
+    try testing.expectEqual(@as(?u32, null), bindOf(a, "$Globals"));
+    // (register(b#) stays; $Globals is placed before the cbuffers: cb1, B cb2)
+    const b = try compileOk("cbuffer A { float4 a; };\n" ++
+        "cbuffer B { float4 b; };\n" ++
+        "float4 x;\n" ++
+        "cbuffer C : register(b0) { float4 cc; };\n" ++
+        "cbuffer D : register(b3) { float4 dd; };\n" ++
+        "float4 main(float4 p : POSITION) : SV_Position { return p * b + cc + x; }\n", "vs_5_0");
+    try testing.expectEqual(@as(?u32, 0), bindOf(b, "C"));
+    try testing.expectEqual(@as(?u32, 1), bindOf(b, "$Globals"));
+    try testing.expectEqual(@as(?u32, 2), bindOf(b, "B"));
+    // (an unread register(b1) is still reserved: B cb2)
+    const c = try compileOk("cbuffer B { float4 b; };\n" ++
+        "cbuffer C : register(b0) { float4 cc; };\n" ++
+        "cbuffer D : register(b1) { float4 dd; };\n" ++
+        "float4 main(float4 p : POSITION) : SV_Position { return p * b + cc; }\n", "vs_5_0");
+    try testing.expectEqual(@as(?u32, 2), bindOf(c, "B"));
+}
+
+test "more constant buffers declared than slots, few read" {
+    var src: [8192]u8 = undefined;
+    var n: usize = 0;
+    for (0..40) |i| n += (std.fmt.bufPrint(src[n..], "cbuffer c{d} {{ float4 v{d}; }};\n", .{ i, i }) catch unreachable).len;
+    n += (std.fmt.bufPrint(src[n..], "float4 main(float4 p : POSITION) : SV_Position {{ return p * v7 + v39; }}\n", .{}) catch unreachable).len;
+    const blob = try compileOk(src[0..n], "vs_5_0");
+    try testing.expectEqual(@as(?u32, 0), bindOf(blob, "c7"));
+    try testing.expectEqual(@as(?u32, 1), bindOf(blob, "c39"));
+}

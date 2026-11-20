@@ -182,6 +182,7 @@ pub const Compiler = struct {
     fn assemble(c: *Compiler, t: gen.Target, fl: u32, ntemps: u32) ?usize {
         const g = &c.g;
         c.scanUsage();
+        if (!c.placeCbSlots()) return null;
         // the program
         var o = ir.Out{ .buf = &c.code };
         const ver: u32 = (@as(u32, @intFromEnum(t.stage)) << 16) | (@as(u32, t.major) << 4) | t.minor;
@@ -279,6 +280,31 @@ pub const Compiler = struct {
                 }
             }
         }
+    }
+
+    /// Each implicitly placed constant buffer the code reads gets its real
+    /// slot (the lowest one free, register(b#)'s reserved), and the code's
+    /// operands follow; one never read gets none. False: more than 14.
+    fn placeCbSlots(c: *Compiler) bool {
+        const g = &c.g;
+        var used_slots = g.cb_explicit;
+        for (g.cbs[0..g.ncbs]) |*b| {
+            if (!b.implicit or !b.used) continue;
+            const slot = gen.Gen.lowestFree(used_slots);
+            if (slot >= 14) {
+                c.log.err(0, "maximum cbuffer exceeded. target has 14 slots", .{});
+                return false;
+            }
+            used_slots |= @as(u32, 1) << @intCast(slot);
+            const old = b.slot;
+            b.slot = slot;
+            for (c.prog.insts[0..c.prog.n]) |*i| {
+                for (i.ops[0..i.n]) |*op| {
+                    if (op.reg == .cb and op.idx[0] == old) op.idx[0] = slot;
+                }
+            }
+        }
+        return true;
     }
 
     // ── declarations ──
