@@ -8,7 +8,8 @@ have no explicit ACL overrides. `acldefault('T', owner)` provides USAGE for
 PUBLIC and the owner. Shell type creation and per-type grants remain open.
 Type and relation kind fields used by the discovery query return PostgreSQL
 `"char"` values, including the range kind and a composite type's relation
-kind.
+kind. The subsequent language discovery query uses the same owner and
+PUBLIC USAGE defaults through `acldefault('l', owner)`.
 
 `name` subscripting uses zero-based byte offsets and the 64-byte padded
 representation. Out-of-range or NULL indices yield NULL, padding yields
@@ -16,6 +17,19 @@ zero, and fixed-length slices return an unsupported-feature error. Name
 casts clip at a UTF-8 boundary. The native comparison exercises stock
 discovery predicates on built-in types, enums, domains, composites and
 their array types, and checks byte subscripting and wire types.
+
+On RAMSQL `8ef23fe` with ZPM `60e82388`, the PostgreSQL 16 and 18 lanes
+passed the catalog comparisons and stock plain and custom imports, including
+row and constraint checks after WAL reopen. The local Sig catalog and catalog
+security suites passed 75 and 1,594 assertions, respectively.
+
+Both outbound clients passed type and language discovery and stopped at
+operator discovery with `TableNotFound`. The next native comparison should
+cover `pg_operator` relation identity, operator namespace and owner,
+unary/binary argument OIDs, and implementation function OIDs. Verify any
+published operator rows against the operators RAMSQL actually resolves.
+Both stock directions on both versions remain the merge gate.
+[PostgreSQL 16 and 18 type discovery CI](https://github.com/SB0LTD/ramsql/actions/runs/44805214919)
 
 Function discovery now reads routine owners and SQL language OIDs from the
 catalog. `acldefault('f', owner)` grants EXECUTE by default to the owner and
@@ -39,13 +53,8 @@ imports on both PostgreSQL 16 and 18. The local Sig routine contract passed
 767 assertions and replayed 156 WAL records, including ACL changes on a
 trigger function and rollback of a pending revoke.
 
-Both outbound clients now reach type discovery and fail with
-`ColumnNotFound` before creating an archive. Add a native differential check
-for the type discovery query covering `pg_type.typacl`, `typisdefined`,
-`acldefault('T', typowner)`, `name` subscripting and the relation-kind
-and array-element lookups. PostgreSQL 18 also projects `typarray` directly.
-Keep both branches unmerged until unmodified stock tooling completes both
-directions on both versions.
+That candidate reached type discovery and failed with `ColumnNotFound`
+before creating an archive.
 [PostgreSQL 16 and 18 function discovery CI](https://github.com/SB0LTD/ramsql/actions/runs/44803356629)
 
 Namespace introspection now returns `pg_namespace.nspacl` as `aclitem[]`
