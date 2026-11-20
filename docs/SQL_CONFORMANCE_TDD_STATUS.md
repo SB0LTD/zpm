@@ -20,9 +20,16 @@ composite keys retain their earlier restrictions.
 The stock-tooling CI gate runs actual PostgreSQL 16 and 18 clients against
 the pinned RAMSQL build. It checks namespace ACL values and wire metadata,
 unmodified native plain and custom imports including forced WAL reopen, and
-the reverse custom export. The stock profile currently rejects the broad
-`pg_dump` table-discovery projection. General export and bidirectional
-qualification remain open.
+the reverse custom export. Both native versions matched the namespace ACL
+values and wire type. Both passed the stock plain and custom imports,
+single-transaction restore, constraint checks and WAL reopen.
+[Stock tooling CI](https://github.com/SB0LTD/ramsql/actions/runs/44761342559)
+
+Both outbound lanes fail with `ColumnCapacity` in table discovery. A local
+build with 48 columns, eight relations and 4,096 expression nodes advances
+to `TableNotFound` on the same query. Work remains on catalog projection
+capacity, relation metadata and the tablespace and foreign-table catalogs.
+General export and bidirectional qualification remain open.
 
 ## Shipped RAMSQL evidence, 20 November 2026
 
