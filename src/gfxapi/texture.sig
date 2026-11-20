@@ -914,6 +914,80 @@ pub fn fetchArray(k: *kir.Kernel, slot: Slot, x: Arg, y: Arg, layer: ?Arg, kind:
     return finish(k, d, raw, kind);
 }
 
+/// Where a typed UAV's texel (x, y, layer: u32) is: its byte offset in
+/// the binding, and whether it is inside the view (level 0 of the
+/// descriptor: a UAV view's level; its layers or depth). Rows only (a
+/// view's image is never block linear).
+pub const Place = struct { addr: V, inside: V };
+
+pub fn texelPlace(k: *kir.Kernel, slot: Slot, x: Arg, y: Arg, layer: ?Arg) Place {
+    const d = loadDesc(k, slot);
+    var lv = levelOf(k, slot, d, k.mov(.u32, u(0)));
+    var inside = k.op2(.pand, .pred, r(k.cmp(.u32, .lt, x, r(lv.w))), r(k.cmp(.u32, .lt, y, r(lv.h))));
+    if (layer) |z| {
+        const count = descWord(k, slot, D_LAYERS);
+        inside = k.op2(.pand, .pred, r(inside), r(k.cmp(.u32, .lt, z, r(count))));
+        lv = sliceOf(k, lv, z);
+    }
+    const shift = k.op3(.bfe, .u32, r(d.fmt), u(0), u(3));
+    const addr = k.op2(.iadd, .u32, r(lv.off), r(k.op3(.imad, .u32, y, r(lv.stride), r(k.op2(.shl, .u32, x, r(shift))))));
+    // (and never past the image)
+    const last = k.op2(.shl, .u32, r(d.last), u(2));
+    inside = k.op2(.pand, .pred, r(inside), r(k.cmp(.u32, .le, r(addr), r(last))));
+    return .{ .addr = addr, .inside = inside };
+}
+
+/// A typed UAV's texel written (store_uav_typed): `vals`, the view's R, G,
+/// B, A (floats' bits, or integers), as the image keeps them: 32-bit
+/// channels (float, int, uint) word by word, as many as it has; RGBA8 and
+/// BGRA8 packed (clamped to [0, 1], rounded). Outside the view nothing is
+/// written (Direct3D drops it). Not yet: 8- and 16-bit formats of one or
+/// two channels (R8, RG8, R16, RG16): not written.
+pub fn store(k: *kir.Kernel, slot: Slot, x: Arg, y: Arg, layer: ?Arg, vals: [4]Arg) void {
+    const d = loadDesc(k, slot);
+    const pl = texelPlace(k, slot, x, y, layer);
+    const shift = k.op3(.bfe, .u32, r(d.fmt), u(0), u(3));
+    const fkind = k.op3(.bfe, .u32, r(d.fmt), u(4), u(3));
+    const channels = k.op3(.bfe, .u32, r(d.fmt), u(8), u(3));
+    const mem = kir.global(slot.b, 32);
+    k.ifp(r(pl.inside));
+    {
+        // (32-bit channels: float 1, int 2, uint 3)
+        const words = k.op2(.pand, .pred, r(k.cmp(.u32, .ne, r(fkind), u(0))), r(k.cmp(.u32, .ne, r(fkind), u(4))));
+        k.ifp(r(words));
+        for (vals, 0..) |v, c| {
+            k.ifp(r(k.cmp(.u32, .gt, r(channels), u(@intCast(c)))));
+            k.store(.u32, mem, r(k.op2(.iadd, .u32, r(pl.addr), u(@intCast(4 * c)))), asBits(k, v));
+            k.endif();
+        }
+        k.endif();
+        // (four bytes of unorm8: RGBA8, BGRA8, each channel where the
+        // swizzle says the format keeps it)
+        const rgba8 = k.op2(.pand, .pred, r(k.cmp(.u32, .eq, r(fkind), u(0))), r(k.cmp(.u32, .eq, r(shift), u(2))));
+        k.ifp(r(rgba8));
+        {
+            var word: Arg = u(0);
+            for (vals, 0..) |v, c| {
+                const fv = if (v == .reg) r(k.mov(.f32, v)) else v;
+                const clamped = k.op2(.fmin, .f32, r(k.op2(.fmax, .f32, fv, f(0))), f(1));
+                const byte = k.cvt(.f32, .u32, .rz, r(k.op2(.fadd, .f32, r(k.op2(.fmul, .f32, r(clamped), f(255))), f(0.5))));
+                const pos = k.op3(.bfe, .u32, r(d.swz), u(@intCast(3 * c)), u(3));
+                // (a channel the format does not keep (SWZ_ZERO, SWZ_ONE): dropped)
+                const kept = k.cmp(.u32, .lt, r(pos), u(4));
+                const placed = k.op2(.shl, .u32, r(byte), r(k.op2(.shl, .u32, r(k.op2(.@"and", .u32, r(pos), u(3))), u(3))));
+                word = r(k.op2(.@"or", .u32, word, r(k.sel(.u32, r(kept), r(placed), u(0)))));
+            }
+            k.store(.u32, mem, r(pl.addr), word);
+        }
+        k.endif();
+    }
+    k.endif();
+}
+
+fn asBits(k: *kir.Kernel, a: Arg) Arg {
+    return if (a == .reg) r(k.mov(.u32, a)) else a;
+}
+
 pub fn layerSize(k: *kir.Kernel, slot: Slot, lod: Arg) Arg {
     const count = descWord(k, slot, D_LAYERS);
     if (!slot.volume) return r(count);

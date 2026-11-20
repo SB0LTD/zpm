@@ -1028,6 +1028,21 @@ fn monoUs() u64 {
 
 /// A backend (gpu.compile, or gpu.compileFor with the targets an image
 /// links).
+/// A compute kernel the engine's user builds (Engine.dispatch): `build`
+/// emits it into the kernel given (false: it cannot), workgroup `group`;
+/// its GPU program is the engine's to load and let go (unloadCompute).
+pub const Compute = struct {
+    build: *const fn (ctx: ?*const anyopaque, k: *kir.Kernel) bool,
+    ctx: ?*const anyopaque = null,
+    group: [3]u32 = .{ 1, 1, 1 },
+    name: []const u8 = "compute",
+    prog: ?gpu.Program = null,
+    owner: ?*anyopaque = null,
+    /// the engine it would not compile or load for (its dispatches then
+    /// run on the CPU)
+    refused_by: ?*anyopaque = null,
+};
+
 pub const Compiler = *const fn (k: *const kir.Kernel, caps: gpu.Caps, work: *gpu.Work, out: []u8) anyerror!gpu.Binary;
 
 /// gpu.compile: every backend linked (tests, tools).
@@ -1214,6 +1229,8 @@ pub const Stats = struct {
     /// waits for the GPU.
     batches: u64 = 0,
     dispatches: u64 = 0,
+    /// compute dispatches (Engine.dispatch) recorded for the GPU
+    computes: u64 = 0,
     cpu_ops: u64 = 0,
     waits: u64 = 0,
     /// thread-instructions KIR's interpreter ran for draws on the CPU
@@ -2058,6 +2075,109 @@ pub const Engine = struct {
         e.op_cpu[i] = cpu;
         e.n_ops += 1;
         e.stats.dispatches += 1;
+    }
+
+    // ── Compute (Direct3D's compute shaders) ───────────────────────────────
+
+    /// A compute dispatch's kernel, built by the engine's user (a Direct3D
+    /// compute shader, gfxapi.dxbc_gen.compute): `build` emits it into the
+    /// kernel it is given (its bindings: 0 the uniform words, then a
+    /// dispatch's `bufs` in order), workgroup `group`. Compiled and loaded
+    /// on the GPU at its first dispatch (`unloadCompute` lets it go); on
+    /// the CPU it is built for each dispatch.
+    pub fn dispatch(e: *Engine, c: *Compute, groups: [3]u32, bufs: []const *Image, writes: u32, words: []const u32) bool {
+        if (groups[0] == 0 or groups[1] == 0 or groups[2] == 0) return true;
+        if (bufs.len + 1 > MAX_BIND) return false;
+        var uni = e.uniformsFor(words) orelse return false;
+        defer e.freeImage(&uni);
+        var all: [MAX_BIND]*Image = undefined;
+        all[0] = &uni;
+        for (bufs, 1..) |img, j| all[j] = img;
+        const bs = all[0 .. bufs.len + 1];
+        const on_gpu = blk: {
+            if (!e.onGpu() or c.refused_by == @as(?*anyopaque, e)) break :blk false;
+            for (bs) |img| {
+                if (!e.gpuUsable(img)) break :blk false;
+            }
+            break :blk e.loadCompute(c);
+        };
+        if (on_gpu) {
+            e.recordProg(&c.prog.?, groups, bs, writes << 1, &.{}, null);
+            e.stats.computes += 1;
+            return true;
+        }
+        // (on the CPU: the work before it done, every binding's bytes here)
+        e.finish();
+        var views: [MAX_BIND][]u8 = undefined;
+        for (bs, 0..) |img, j| {
+            e.fetchAll(img);
+            views[j] = img.buf.cpu;
+        }
+        var k = kir.Kernel.init(.{ .insts = &e.kir_insts, .tys = &e.kir_tys }, c.name, c.group);
+        if (!c.build(c.ctx, &k)) return false;
+        k.finish() catch |err| {
+            e.why_pipe = err;
+            report.say(.pipeline, "a compute kernel does not build ({s}): its dispatches are dropped", .{@errorName(err)});
+            return false;
+        };
+        var w = gpu.Work.init(e.cpu_work);
+        var trap: gpu.interp.Trap = .{};
+        var stats: gpu.interp.Stats = .{};
+        gpu.interp.run(.{
+            .code = k.code(),
+            .regs = k.nv,
+            .group = k.group,
+            .shared_bytes = k.shared_bytes,
+            .groups = groups,
+            .bindings = views[0..bs.len],
+            .params = &.{},
+        }, gpu.interp_caps, &w, &trap, &stats) catch |err| {
+            e.why_pipe = err;
+            e.trap = trap;
+            report.say(.pipeline, "a compute kernel stopped on the CPU ({s} at {d}): the dispatch is dropped", .{ @errorName(err), trap.pc });
+            return false;
+        };
+        for (bufs, 0..) |img, j| {
+            if (writes & (@as(u32, 1) << @intCast(j)) != 0) e.wrote(img, 0, img.buf.cpu.len);
+        }
+        return true;
+    }
+
+    /// A compute kernel compiled and loaded on the GPU (once). False: it
+    /// does not compile or load (said once; its dispatches run on the CPU).
+    fn loadCompute(e: *Engine, c: *Compute) bool {
+        if (c.owner == @as(?*anyopaque, e) and c.prog != null) return true;
+        const d = e.dev.?;
+        var k = kir.Kernel.init(.{ .insts = &e.kir_insts, .tys = &e.kir_tys }, c.name, c.group);
+        const result: anyerror!gpu.Program = blk: {
+            if (!c.build(c.ctx, &k)) break :blk error.BadProgram;
+            k.finish() catch |err| break :blk err;
+            var w = gpu.Work.init(e.work);
+            const bin = e.compiler(&k, d.caps, &w, &e.pcode) catch |err| break :blk err;
+            break :blk d.load(&bin);
+        };
+        c.prog = result catch |err| {
+            e.why_pipe = err;
+            c.refused_by = e;
+            report.say(.pipeline, "a compute kernel does not compile or load for the GPU ({s}): its dispatches run on the CPU", .{@errorName(err)});
+            return false;
+        };
+        c.prog.?.label = c.name;
+        c.owner = e;
+        return true;
+    }
+
+    /// A compute kernel's GPU program let go (after the work using it).
+    pub fn unloadCompute(e: *Engine, c: *Compute) void {
+        if (c.owner == @as(?*anyopaque, e)) if (c.prog) |*p| {
+            if (!e.lost) {
+                e.finish();
+                e.dev.?.unload(p);
+            }
+        };
+        c.prog = null;
+        c.owner = null;
+        c.refused_by = null;
     }
 
     // ── Checks (GALAXY_GL_CHECK) ───────────────────────────────────────────
