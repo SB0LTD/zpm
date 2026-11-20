@@ -3056,7 +3056,8 @@ pub fn Parser(comptime config: types.Config) type {
             }
             var star = false;
             while (true) {
-                if (out.count == config.columns) return error.ColumnCapacity;
+                if (out.count == out.targets.len) return error.ColumnCapacity;
+                if (out.count == config.columns) self.pool.complex = true;
                 var target: Ast.Target = .{};
                 if (try self.takeSymbol(.star)) {
                     target.star = true;

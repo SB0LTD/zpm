@@ -25,11 +25,22 @@ values and wire type. Both passed the stock plain and custom imports,
 single-transaction restore, constraint checks and WAL reopen.
 [Stock tooling CI](https://github.com/SB0LTD/ramsql/actions/runs/44761342559)
 
-Both outbound lanes fail with `ColumnCapacity` in table discovery. A local
-build with 48 columns, eight relations and 4,096 expression nodes advances
-to `TableNotFound` on the same query. Work remains on catalog projection
-capacity, relation metadata and the tablespace and foreign-table catalogs.
-General export and bidirectional qualification remain open.
+The candidate now sizes SELECT projections separately from stored rows.
+The default RAMSQL build allows 48 projected columns, eight stored columns
+and eight relations. Query workspace still accounts for projected cells.
+`pg_tablespace` exposes the two built-in placements. `pg_foreign_table`
+has the stock column types and stays empty until foreign tables are
+implemented. `pg_class` exposes ownership, explicit composite type OIDs,
+and visible table ACLs. Ordinary tables still lack implicit row type OIDs.
+Relations have no PostgreSQL heap pages or transaction-age bookkeeping, and
+no analyzed cardinality estimate or per-relation storage options.
+
+Local stock PostgreSQL 16 passes relation discovery, plain and custom
+imports, and WAL reopen. Outbound `pg_dump` passes table discovery and now
+fails with `TableNotFound` in function discovery. The next query needs
+`pg_init_privs`, `pg_cast`, `pg_transform`, routine ownership and ACL
+metadata, and `acldefault('f', owner)`. Both stock directions on PostgreSQL
+16 and 18 remain the merge gate.
 
 ## Shipped RAMSQL evidence, 20 November 2026
 

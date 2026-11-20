@@ -91,7 +91,7 @@ pub fn Types(comptime Result: type) type {
                 .integer => |value| switch (data_type) {
                     .smallint => try putInt(i16, out, &at, @intCast(value)),
                     .integer32 => try putInt(i32, out, &at, @intCast(value)),
-                    .oid => try putInt(u32, out, &at, @intCast(value)),
+                    .oid, .xid => try putInt(u32, out, &at, @intCast(value)),
                     else => try putInt(i64, out, &at, value),
                 },
                 .boolean => |value| try put(out, &at, &.{@intFromBool(value)}),
@@ -428,7 +428,7 @@ pub fn Types(comptime Result: type) type {
             }
             const need: usize = switch (data_type) {
                 .smallint => 2,
-                .integer32, .oid, .real, .date => 4,
+                .integer32, .oid, .xid, .real, .date => 4,
                 .integer, .double, .timestamp, .timestamptz, .time, .money, .pg_lsn, .xid8 => 8,
                 .timetz => 12,
                 .interval, .uuid => 16,
@@ -437,7 +437,7 @@ pub fn Types(comptime Result: type) type {
             if (need != 0 and bytes.len != need) return error.ProtocolViolation;
             return switch (data_type) {
                 .smallint => .{ .integer = getInt(i16, bytes) },
-                .oid => .{ .integer = getInt(u32, bytes) },
+                .oid, .xid => .{ .integer = getInt(u32, bytes) },
                 .real => .{ .float4 = @bitCast(getInt(u32, bytes)) },
                 .double => .{ .float8 = @bitCast(getInt(u64, bytes)) },
                 .date => .{ .date = getInt(i32, bytes) },

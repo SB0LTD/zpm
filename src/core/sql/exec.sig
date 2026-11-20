@@ -4336,7 +4336,7 @@ pub fn Exec(comptime config: types.Config) type {
                     const scratch_mark=self.mark();defer self.release(scratch_mark);
                     const start_offset=if(win.kind==.aggregate or win.kind==.lag or win.kind==.lead or win.kind==.first_value or win.kind==.last_value or win.kind==.nth_value) try self.frameOffset(win.start,outer) else 0;
                     const end_offset=if(win.kind==.aggregate or win.kind==.lag or win.kind==.lead or win.kind==.first_value or win.kind==.last_value or win.kind==.nth_value) try self.frameOffset(win.end,outer) else 0;
-                    var order:[2*config.columns]B.SortKey=undefined;var count:usize=0;
+                    var order:[2 * types.projectionColumns(config)]B.SortKey=undefined;var count:usize=0;
                     for(win.partition[0..win.partition_count]) |column| {order[count]=.{.column=column,.descending=false,.nulls_first=false};count+=1;}
                     for(win.order[0..win.order_count]) |key| {order[count]=key;count+=1;}
                     try self.sortRows(rows,order[0..count]);

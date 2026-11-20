@@ -135,7 +135,7 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     regexp_like, similar_to_escape,
     // Full text search (B11 text lane, text_search.sig): the first argument
     // is the regconfig name.
-    to_tsvector, to_tsquery, plainto_tsquery, phraseto_tsquery, mysql_ifnull, mysql_date_add, mysql_last_insert_id, sind, cosd, acldefault };
+    to_tsvector, to_tsquery, plainto_tsquery, phraseto_tsquery, mysql_ifnull, mysql_date_add, mysql_last_insert_id, sind, cosd, acldefault, array_remove };
 
 /// JSON_TABLE column flags (Node.integer of a json_table_column).
 pub const JsonTableColumn = struct {
@@ -210,7 +210,7 @@ pub fn immutableBuiltin(func: Func) bool {
         .extract, .date_part, .date_trunc, .age, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => true,
         .overlaps, .aggregate_pair, .normalize, .is_normalized, .mysql_date_add => true,
         .array_constructor, .array_subscript, .array_any, .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper,
-        .array_append, .array_prepend, .array_cat => true,
+        .array_append, .array_prepend, .array_cat, .array_remove => true,
         .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => true,
         .inet_host, .masklen, .inet_family, .inet_network, .broadcast, .netmask => true,
         .point_constructor, .box_constructor, .area, .center, .width, .height => true,
@@ -861,7 +861,7 @@ pub fn Ast(comptime config: types.Config) type {
         /// blocks `left` and `right` (set_op != none). ORDER BY, LIMIT and
         /// OFFSET apply to the block's result.
         pub const Select = struct {
-            targets: [config.columns]Target = undefined,
+            targets: [types.projectionColumns(config)]Target = undefined,
             count: usize = 0,
             /// The single FROM table of a simple statement.
             from: ?TableRef = null,

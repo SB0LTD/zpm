@@ -223,7 +223,7 @@ pub fn Arrays(comptime V: type) type {
                         if (value < -2147483648 or value > 2147483647) return error.IntegerOverflow;
                         try putInt(out, i32, @intCast(value));
                     },
-                    .oid => {
+                    .oid, .xid => {
                         if (value < 0 or value > 4294967295) return error.NumericValueOutOfRange;
                         try putInt(out, u32, @intCast(value));
                     },
@@ -287,7 +287,7 @@ pub fn Arrays(comptime V: type) type {
                 .integer => .{ .integer = switch (element) {
                     .smallint => getInt(i16, bytes, at),
                     .integer32 => getInt(i32, bytes, at),
-                    .oid => getInt(u32, bytes, at),
+                    .oid, .xid => getInt(u32, bytes, at),
                     else => getInt(i64, bytes, at),
                 } },
                 .boolean => blk: {

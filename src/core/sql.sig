@@ -300,6 +300,9 @@ pub fn Database(comptime config: Config) type {
         pub const Io = value_module.Io(config);
 
         pub const Result = struct {
+            pub const ResultRow = if (types.projectionColumns(config) == config.columns) Row else struct {
+                cells: [types.projectionColumns(config)]Cell = @splat(.null_value),
+            };
             /// Value I/O for codecs that only see the result type.
             pub const ValueIo = value_module.Io(config);
 
@@ -311,24 +314,24 @@ pub fn Database(comptime config: Config) type {
             command: CommandTag = .none,
             /// CREATE AS ran its source query, even if it produced zero rows.
             create_query_data: bool = false,
-            column_names: [config.columns]Name = @splat(.{}),
-            column_types: [config.columns]DataType = @splat(.integer),
+            column_names: [types.projectionColumns(config)]Name = @splat(.{}),
+            column_types: [types.projectionColumns(config)]DataType = @splat(.integer),
             /// Nullability proven by the binder for this result shape.
-            non_null_columns: std.StaticBitSet(config.columns) = .empty,
+            non_null_columns: std.StaticBitSet(types.projectionColumns(config)) = .empty,
             /// PostgreSQL atttypmod of each column (-1 when none).
-            column_typmods: [config.columns]i32 = @splat(-1),
+            column_typmods: [types.projectionColumns(config)]i32 = @splat(-1),
             /// Advanced catalog types can share the built-in value storage
             /// of a built-in type while keeping their nominal wire identity.
             has_nominal_types: bool = false,
-            nominal_types: [config.columns]types.NominalColumnType = undefined,
-            rows: if (config.external_results) []Row else [types.resultRows(config)]Row = if (config.external_results) &.{} else @splat(.{}),
+            nominal_types: [types.projectionColumns(config)]types.NominalColumnType = undefined,
+            rows: if (config.external_results) []ResultRow else [types.resultRows(config)]ResultRow = if (config.external_results) &.{} else @splat(.{}),
             pub const default_row_capacity = types.resultRows(config);
             pub const external_rows = config.external_results;
 
             pub fn storageBytesFor(rows: usize) Error!usize {
                 if (rows == 0 or rows > 0x7fffffff) return error.InvalidParameterValue;
-                const amount = @mulWithOverflow(rows, @sizeOf(Row));
-                const header = @sizeOf(Result) - (if (config.external_results) 0 else @sizeOf([types.resultRows(config)]Row));
+                const amount = @mulWithOverflow(rows, @sizeOf(ResultRow));
+                const header = @sizeOf(Result) - (if (config.external_results) 0 else @sizeOf([types.resultRows(config)]ResultRow));
                 const total = @addWithOverflow(header, amount[0]);
                 if (amount[1] != 0 or total[1] != 0) return error.InvalidParameterValue;
                 return total[0];
@@ -336,16 +339,16 @@ pub fn Database(comptime config: Config) type {
 
             pub fn rowBytes(rows: usize) Error!usize {
                 _ = try storageBytesFor(rows);
-                return rows * @sizeOf(Row);
+                return rows * @sizeOf(ResultRow);
             }
 
             pub fn bindMemory(self: *Result, bytes: []u8, rows: usize) Error!void {
                 if (comptime !config.external_results) @compileError("result binding requires external_results");
                 if (bytes.len < try rowBytes(rows)) return error.WorkspaceCapacity;
-                const values = try storageView(Row, bytes, 0, rows);
+                const values = try storageView(ResultRow, bytes, 0, rows);
                 const start = @intFromPtr(values.ptr);
                 const own = @intFromPtr(self);
-                if (start < own + @sizeOf(Result) and own < start + rows * @sizeOf(Row)) return error.InvalidParameterValue;
+                if (start < own + @sizeOf(Result) and own < start + rows * @sizeOf(ResultRow)) return error.InvalidParameterValue;
                 self.rows = values;
                 self.clear(0);
             }
@@ -727,7 +730,7 @@ pub fn Database(comptime config: Config) type {
                 var bytes: usize = 0;
                 const entry_offset = try appendLayout(&bytes, Entry, entries);
                 const key_offset = try appendLayout(&bytes, u8, key_bytes[0]);
-                const row_offset = if (config.external_results) try appendLayout(&bytes, Row, row_count[0]) else bytes;
+                const row_offset = if (config.external_results) try appendLayout(&bytes, Result.ResultRow, row_count[0]) else bytes;
                 return .{ .entries = entries, .bytes = bytes, .entry_offset = entry_offset, .key_offset = key_offset,
                     .key_bytes = key_bytes[0], .row_offset = row_offset, .row_count = row_count[0] };
             }
@@ -754,7 +757,7 @@ pub fn Database(comptime config: Config) type {
                 if (bytes.len < memory.bytes) return error.WorkspaceCapacity;
                 const entry_storage = try storageView(Entry, bytes, memory.entry_offset, memory.entries);
                 const key_storage = bytes[memory.key_offset..][0..memory.key_bytes];
-                const row_storage: []Row = if (comptime config.external_results) try storageView(Row, bytes, memory.row_offset, memory.row_count) else &.{};
+                const row_storage: []Result.ResultRow = if (comptime config.external_results) try storageView(Result.ResultRow, bytes, memory.row_offset, memory.row_count) else &.{};
                 try cache.init(db, entry_storage, key_storage, row_storage, rows_per_entry);
             }
 
@@ -776,7 +779,7 @@ pub fn Database(comptime config: Config) type {
             /// Use a stable cache pointer for its lifetime. Each slot reserves
             /// an equal part of keys and, for external results, row_storage.
             /// For inline results pass empty row_storage.
-            pub fn init(cache: *Cache, db: *const Self, entries: []Entry, keys: []u8, row_storage: []Row, rows_per_entry: usize) Error!void {
+            pub fn init(cache: *Cache, db: *const Self, entries: []Entry, keys: []u8, row_storage: []Result.ResultRow, rows_per_entry: usize) Error!void {
                 if (entries.len == 0 or keys.len < entries.len or rows_per_entry == 0) return error.InvalidParameterValue;
                 if (comptime config.external_results) {
                     if (rows_per_entry > row_storage.len / entries.len) return error.InvalidParameterValue;
@@ -896,7 +899,7 @@ pub fn Database(comptime config: Config) type {
             names: [config.columns]Name = @splat(.{}),
             types: [config.columns]DataType = @splat(.integer),
             typmods: [config.columns]i32 = @splat(-1),
-            non_null_columns: std.StaticBitSet(config.columns) = .empty,
+            non_null_columns: std.StaticBitSet(types.projectionColumns(config)) = .empty,
         };
 
         pub const Outcome = struct {
@@ -5099,6 +5102,40 @@ pub fn Database(comptime config: Config) type {
 
         /// catalog_text hook: comments and role names under the statement
         /// snapshot.
+        fn relationAcl(self: *const Self, oid: u32, snapshot: Snapshot) Error!Cell {
+            var count: u32 = 0;
+            for (&self.catalog_objects.items) |*item| {
+                if (item.kind == .acl and item.target == oid and O.visible(item, snapshot)) count += 1;
+            }
+            if (count == 0) return .null_value;
+            const Acl = @import("sql/catalog_acl.sig").Acl(V);
+            const owner = self.catalog_objects.owner(oid, snapshot);
+            const owner_name = self.catalog_objects.roleName(owner, snapshot) orelse return error.UndefinedObject;
+            var output: Text = .{};
+            var writer = try Acl.begin(&output, count + 1);
+            try Acl.append(&writer, owner_name, "arwdDxt", owner_name);
+            for (&self.catalog_objects.items) |*item| {
+                if (item.kind != .acl or item.target != oid or !O.visible(item, snapshot)) continue;
+                const grantee = if (item.grantee == CO.public_role) "" else
+                    self.catalog_objects.roleName(item.grantee, snapshot) orelse return error.UndefinedObject;
+                const grantor = self.catalog_objects.roleName(item.owner, snapshot) orelse return error.UndefinedObject;
+                var permissions: [16]u8 = undefined;
+                var used: usize = 0;
+                for ("arwdDxtm", 0..) |letter, index| {
+                    const flag = @as(u32, 1) << @as(u5, @intCast(index));
+                    if (item.flags & flag == 0) continue;
+                    permissions[used] = letter;
+                    used += 1;
+                    if (item.grant_flags & flag != 0) {
+                        permissions[used] = '*';
+                        used += 1;
+                    }
+                }
+                try Acl.append(&writer, grantee, permissions[0..used], grantor);
+            }
+            return .{ .array = output };
+        }
+
         fn namespaceAcl(self: *const Self, oid: u32, owner: u32, snapshot: Snapshot) Error!Cell {
             const key: O.Object = .{ .kind = .schema_acl_state, .target = oid, .owner = owner };
             if (self.catalog_objects.findKey(&key, snapshot) == null) return .null_value;
@@ -5870,6 +5907,9 @@ pub fn Database(comptime config: Config) type {
             partition: bool = false,
             populated: bool = true,
             partition_bound: Cell = .null_value,
+            row_type: u32 = 0,
+            owner: u32 = CO.bootstrap_role,
+            acl: Cell = .null_value,
         };
 
         fn classRow(sink: *X.RowSink, oid: u32, name: []const u8, namespace: u32, kind: u8, columns: usize, properties: ClassProperties) Error!void {
@@ -5887,6 +5927,10 @@ pub fn Database(comptime config: Config) type {
                 intCell(properties.checks), boolCell(properties.has_index), boolCell(properties.has_rule), boolCell(properties.has_trigger),
                 boolCell(properties.security & CO.rls_enabled != 0), boolCell(properties.security & CO.rls_forced != 0), boolCell(properties.partition),
                 intCell(0), intCell(0), nameCell("p"), nameCell(identity), intCell(0), intCell(access), boolCell(properties.populated), properties.partition_bound,
+                // This engine does not use pages, visibility maps or native
+                // PostgreSQL transaction IDs. It has no ANALYZE row estimate.
+                intCell(properties.row_type), intCell(properties.owner), intCell(0), .{ .float4 = -1 },
+                intCell(0), intCell(0), intCell(0), intCell(0), properties.acl, .null_value,
             });
         }
 
@@ -5897,6 +5941,8 @@ pub fn Database(comptime config: Config) type {
                 .security = self.catalog_objects.securityFlags(table.oid, snapshot),
                 .partition = table.parent != 0 and table.partition.bound != .none,
                 .populated = table.populated,
+                .owner = self.catalog_objects.owner(table.oid, snapshot),
+                .acl = try self.relationAcl(table.oid, snapshot),
             };
             if (properties.partition) properties.partition_bound = try self.partitionBoundText(table, snapshot, session_values);
             for (table.constraints[0..table.constraint_count]) |*constraint| switch (constraint.kind) {
@@ -5935,7 +5981,7 @@ pub fn Database(comptime config: Config) type {
                 if (object.kind != .composite_type or !O.visible(object, snapshot)) continue;
                 const relation = object.compositeRelationOid();
                 if (view == .pg_class) {
-                    try classRow(sink, relation, object.name.slice(), object.target, 'c', object.composite_field_count, .{});
+                    try classRow(sink, relation, object.name.slice(), object.target, 'c', object.composite_field_count, .{ .row_type = object.oid, .owner = object.owner });
                     continue;
                 }
                 var fields = object.compositeFields();
@@ -6005,6 +6051,16 @@ pub fn Database(comptime config: Config) type {
 
         fn fillViewRows(self:*const Self,session_values:*const value_module.Session,snapshot:Snapshot,pool:*A.Pool,view:catalog_module.View,sink:*X.RowSink) Error!void {
             if (view == .pg_settings) return error.UnsupportedStatement;
+            if (view == .pg_tablespace) {
+                // Only the implicit database and shared catalog placements
+                // are supported. Relations use the implicit placement.
+                try sink.add(&.{ intCell(1663), nameCell("pg_default"), intCell(CO.bootstrap_role), .null_value, .null_value });
+                try sink.add(&.{ intCell(1664), nameCell("pg_global"), intCell(CO.bootstrap_role), .null_value, .null_value });
+                return;
+            }
+            // SQL cannot install foreign tables. FDWs and foreign servers
+            // have their own catalogs and do not imply a table binding.
+            if (view == .pg_foreign_table) return;
             if (view == .pg_am) {
                 try sink.add(&.{ intCell(catalog_module.heap_access_method), nameCell("heap"), nameCell("heap_tableam_handler"), nameCell("t") });
                 try sink.add(&.{ intCell(catalog_module.btree_access_method), nameCell("btree"), nameCell("bthandler"), nameCell("i") });
@@ -6126,10 +6182,10 @@ pub fn Database(comptime config: Config) type {
                     switch (view) {
                         .pg_class => {
                             try classRow(sink, table.oid, name, table.namespace, table.relkind, table.column_count, try self.tableClass(table, snapshot, relations[0..count], session_values));
-                            if (S.keyed(table)) try classRow(sink, S.primaryIndexOid(table), pkey.slice(), table.namespace, 'i', primary_columns.len, .{});
+                            if (S.keyed(table)) try classRow(sink, S.primaryIndexOid(table), pkey.slice(), table.namespace, 'i', primary_columns.len, .{ .owner = self.catalog_objects.owner(table.oid, snapshot) });
                             for (table.indexes[0..table.index_count]) |*index| {
                                 if (index.oid == 0) continue;
-                                try classRow(sink, index.oid, index.name.slice(), table.namespace, 'i', index.key_count + index.include_count, .{});
+                                try classRow(sink, index.oid, index.name.slice(), table.namespace, 'i', index.key_count + index.include_count, .{ .owner = self.catalog_objects.owner(table.oid, snapshot) });
                             }
                         },
                         .tables => {

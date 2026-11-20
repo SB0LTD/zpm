@@ -10,7 +10,7 @@ const std = @import("std");
 const sql = @import("sql");
 // Catalog views share the query workspace with the correlated collation
 // lookup. Provision both sources and the nested join in this fixture.
-const DB = sql.Database(.{ .tables = 2, .columns = 6, .rows_per_table = 16, .name_bytes = 32, .text_bytes = 64, .nulls_first_ascending = false, .integer_bits = 32, .transactions = 4, .work_rows = 512 });
+const DB = sql.Database(.{ .tables = 2, .columns = 6, .projection_columns = 48, .rows_per_table = 16, .name_bytes = 32, .text_bytes = 64, .nulls_first_ascending = false, .integer_bits = 32, .transactions = 4, .work_rows = 512 });
 var assertions: usize = 0;
 var db: DB = .{};
 
@@ -81,7 +81,7 @@ const public_classes = "SELECT relname, relkind FROM pg_class WHERE relnamespace
 
 fn types() !void {
     try expect("SELECT oid, typname FROM pg_catalog.pg_type WHERE typname = 'int4'", "23|int4");
-    try expect("SELECT COUNT(*), MIN(typnamespace), MAX(typnamespace) FROM pg_type", "90|11|11");
+    try expect("SELECT COUNT(*), MIN(typnamespace), MAX(typnamespace) FROM pg_type", "92|11|11");
     try expect("SELECT oid, typname, typlen, typarray, typelem FROM pg_type WHERE oid IN (1033,1034) ORDER BY oid", "1033|aclitem|16|1034|0;1034|_aclitem|-1|0|1033");
     try expect("SELECT oid, typname, typlen, typarray, typelem FROM pg_type WHERE oid IN (18,1002) ORDER BY oid", "18|char|1|1002|0;1002|_char|-1|0|18");
     try expect("SELECT typname, typlen, typcategory, typarray, typinput FROM pg_type WHERE oid IN (4072, 4073) ORDER BY oid", "jsonpath|-1|U|4073|jsonpath_in;_jsonpath|-1|A|0|array_in");
@@ -97,6 +97,25 @@ fn types() !void {
     try expect("SELECT nspname FROM pg_namespace ORDER BY oid", "pg_catalog;pg_toast;public;information_schema");
     try expect("SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'public'", "public");
     try expect(public_tables, "");
+}
+
+fn dumpDiscovery() !void {
+    try expect("SELECT oid,spcname,spcowner,spcacl IS NULL,spcoptions IS NULL FROM pg_tablespace ORDER BY oid",
+        "1663|pg_default|10|t|t;1664|pg_global|10|t|t");
+    try expect("SELECT COUNT(*) FROM pg_foreign_table", "0");
+    try expect("SELECT array_remove(ARRAY[1,NULL,1,3],1), array_remove(ARRAY[1,NULL,3],NULL)", "{NULL,3}|{1,3}");
+    try expect("SELECT array_remove('[0:2]={1,2,1}'::int4[], 1)", "[0:0]={2}");
+    try rejects("SELECT array_remove(ARRAY[[1,2],[3,4]], 1)", error.UnsupportedStatement);
+    try run("CREATE TABLE discoverable(id INT)");
+    try expect("SELECT c.relname, c.relowner, c.relpages, c.reltuples, c.relallvisible, c.relallfrozen, "
+        ++ "c.relfrozenxid, c.relminmxid, c.reloptions IS NULL, c.relacl IS NULL, s.spcname IS NULL "
+        ++ "FROM pg_class c LEFT JOIN pg_tablespace s ON c.reltablespace = s.oid WHERE c.relname='discoverable'",
+        "discoverable|10|0|-1|0|0|0|0|t|t|t");
+    try expect("SELECT pg_typeof(c.relfrozenxid)::text, pg_typeof(c.relacl)::text FROM pg_class c WHERE c.relname='discoverable'",
+        "xid|aclitem[]");
+    try expect("SELECT 1,2,3,4,5,6,7,8,9,10", "1|2|3|4|5|6|7|8|9|10");
+    try rejects("CREATE TABLE still_bounded(a INT,b INT,c INT,d INT,e INT,f INT,g INT)", error.ColumnCapacity);
+    try run("DROP TABLE discoverable");
 }
 
 fn lifecycle() !void {
@@ -229,6 +248,7 @@ fn collationMetadata() !void {
 
 pub fn main(init: std.process.Init) !void {
     try types();
+    try dumpDiscovery();
     try lifecycle();
     try replay();
     try characterMetadata();

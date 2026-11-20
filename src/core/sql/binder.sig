@@ -98,7 +98,7 @@ pub fn Binder(comptime config: types.Config) type {
             count: usize = 0,
             output: bool = false,
             deleted_columns: std.StaticBitSet(config.columns) = .empty,
-            non_null_columns: std.StaticBitSet(config.columns) = .empty,
+            non_null_columns: std.StaticBitSet(types.projectionColumns(config)) = .empty,
         };
 
         /// VALUES: `rows` is the first values_row node; item p of every row
@@ -134,7 +134,7 @@ pub fn Binder(comptime config: types.Config) type {
             names: [config.columns]V.Name,
             types: [config.columns]types.DataType,
             typmods: [config.columns]i32 = @splat(-1),
-            non_null_columns: std.StaticBitSet(config.columns) = .empty,
+            non_null_columns: std.StaticBitSet(types.projectionColumns(config)) = .empty,
             has_nominal_types: bool = false,
             nominal_types: [config.columns]types.NominalColumnType = undefined,
             count: usize,
@@ -542,16 +542,16 @@ pub fn Binder(comptime config: types.Config) type {
             // arguments from CASE. Report only if this plan remains reachable.
             planned_checked:bool=false,
             planned_error:?Error=null,
-            planned_targets:[2*config.columns]?Error=@splat(null),
-            prunable:[2*config.columns]bool=@splat(false),
-            required:[2*config.columns]bool=@splat(true),
+            planned_targets:[2 * types.projectionColumns(config)]?Error=@splat(null),
+            prunable:[2 * types.projectionColumns(config)]bool=@splat(false),
+            required:[2 * types.projectionColumns(config)]bool=@splat(true),
             demanded:bool=false,
             constant_source_safe:bool=false,
-            constant_outputs:[2*config.columns]V.Cell=undefined,
-            constant_known:[2*config.columns]bool=@splat(false),
-            constant_dependencies:[2*config.columns][config.ctes]bool=@splat(@splat(false)),
+            constant_outputs:[2 * types.projectionColumns(config)]V.Cell=undefined,
+            constant_known:[2 * types.projectionColumns(config)]bool=@splat(false),
+            constant_dependencies:[2 * types.projectionColumns(config)][config.ctes]bool=@splat(@splat(false)),
             windows:[config.columns]Window=undefined,window_count:usize=0,
-            window_late:[2*config.columns]bool=.{false}**(2*config.columns),
+            window_late:[2 * types.projectionColumns(config)]bool=.{false}**(2 * types.projectionColumns(config)),
             window_origins:[config.columns]u16=.{none}**config.columns,
             set_op: ast.SetOp = .none,
             set_all: bool = false,
@@ -571,14 +571,14 @@ pub fn Binder(comptime config: types.Config) type {
             /// clauses, including definitions with no consuming WindowAgg.
             window_aggregate_count:usize=0,
             having: u16 = none,
-            targets: [2 * config.columns]u16 = undefined,
+            targets: [2 * types.projectionColumns(config)]u16 = undefined,
             count: usize = 0,
             width: usize = 0,
-            names: [config.columns]V.Name = undefined,
-            tys: [config.columns]ast.Type = undefined,
-            typmods: [config.columns]i32 = undefined,
-            non_null_columns: std.StaticBitSet(config.columns) = .empty,
-            order: [2 * config.columns]SortKey = undefined,
+            names: [types.projectionColumns(config)]V.Name = undefined,
+            tys: [types.projectionColumns(config)]ast.Type = undefined,
+            typmods: [types.projectionColumns(config)]i32 = undefined,
+            non_null_columns: std.StaticBitSet(types.projectionColumns(config)) = .empty,
+            order: [2 * types.projectionColumns(config)]SortKey = undefined,
             order_count: usize = 0,
             distinct: Distinct = .none,
             distinct_on: [config.columns]u16 = undefined,
@@ -1362,6 +1362,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "array_ndims", .func = .array_ndims },   .{ .name = "array_dims", .func = .array_dims },
                 .{ .name = "array_lower", .func = .array_lower },   .{ .name = "array_upper", .func = .array_upper },
                 .{ .name = "array_append", .func = .array_append }, .{ .name = "array_prepend", .func = .array_prepend },
+                .{ .name = "array_remove", .func = .array_remove },
                 .{ .name = "array_cat", .func = .array_cat },       .{ .name = "array_to_string", .func = .array_to_string },
                 // Range constructors and functions (B11 advanced types).
                 .{ .name = "int4range", .func = .range_constructor }, .{ .name = "int8range", .func = .range_constructor },
@@ -2325,7 +2326,7 @@ pub fn Binder(comptime config: types.Config) type {
                 // to_timestamp(text, text) or to_timestamp(double precision).
                 .to_timestamp => try bindSignature(context, n, if (count == 1) &[_]ast.Type{.float8} else &[_]ast.Type{ .text, .text }, .timestamptz, true),
                 .array_constructor, .array_subscript, .array_any, .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper,
-                .array_append, .array_prepend, .array_cat, .array_to_string => try typeArrayFunction(context, n, count),
+                .array_append, .array_prepend, .array_cat, .array_to_string, .array_remove => try typeArrayFunction(context, n, count),
                 .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => try typeRangeFunction(context, n, count),
                 .xmlparse => {
                     n.b = try convert(context, n.b, .text, -1, .implicit);
@@ -2692,12 +2693,12 @@ pub fn Binder(comptime config: types.Config) type {
                     n.ty = .int4;
                     n.constant = listConstant(context, n.b);
                 },
-                .array_append, .array_prepend, .array_cat => {
+                .array_append, .array_prepend, .array_cat, .array_remove => {
                     if (count != 2) return error.UndefinedFunction;
                     var first = n.b;
                     var second = context.node(first).next;
                     n.ty = try arrayConcatTypes(context, &first, &second, switch (n.func) {
-                        .array_append => .append,
+                        .array_append, .array_remove => .append,
                         .array_prepend => .prepend,
                         else => .cat,
                     });
@@ -6027,7 +6028,7 @@ pub fn Binder(comptime config: types.Config) type {
                         return @intCast(index);
                     };
                     if (forbid_resjunk) return error.InvalidColumnReference;
-                    if (p.width == 2 * config.columns) return error.StatementTooComplex;
+                    if (p.width == p.targets.len) return error.StatementTooComplex;
                     p.targets[p.width] = id;
                     p.width += 1;
                     return @intCast(p.width - 1);
@@ -6341,7 +6342,7 @@ pub fn Binder(comptime config: types.Config) type {
         }
 
         fn addTarget(context: *const Context, p: *Plan, id: u16, name: V.Name) Error!void {
-            if (p.count == config.columns) return error.ColumnCapacity;
+            if (p.count == p.names.len) return error.ColumnCapacity;
             p.targets[p.count] = id;
             p.names[p.count] = name;
             p.tys[p.count] = context.node(id).ty;

@@ -471,13 +471,19 @@ pub fn Eval(comptime config: types.Config) type {
         }
 
         fn aclDefault(ctx: *const Context, kind: u8, owner: u32) Error!V.Cell {
-            if (kind != 'n') return error.UnsupportedStatement;
+            const privileges = switch (kind) {
+                'n' => "UC",
+                'r' => "arwdDxt",
+                's' => "rwU",
+                't' => "C",
+                else => return error.UnsupportedStatement,
+            };
             const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
             const get_name = hook.catalog_text orelse return error.UnsupportedStatement;
             var buffer: [64]u8 = undefined;
             const used = try get_name(hook.ptr, .role_name, owner, 0, 0, &buffer);
             const name = if (used) |len| buffer[0..len] else @import("std").fmt.bufPrint(&buffer, "{d}", .{owner}) catch unreachable;
-            return @import("catalog_acl.sig").Acl(V).ownerOnly(name, "UC");
+            return @import("catalog_acl.sig").Acl(V).ownerOnly(name, privileges);
         }
 
         /// Discovery functions and regclass/regtype conversions (design Ã‚Â§4.10).
@@ -1469,7 +1475,7 @@ pub fn Eval(comptime config: types.Config) type {
                     .to_date, .to_number, .to_timestamp => return builtins.Builtins(config, @This()).call(ctx, n),
                     .normalize, .is_normalized => return builtins.Builtins(config, @This()).call(ctx, n),
                     .array_constructor, .array_subscript, .array_any, .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper,
-                    .array_append, .array_prepend, .array_cat, .array_to_string => return array_eval.ArrayEval(config, @This()).call(ctx, n),
+                    .array_append, .array_prepend, .array_cat, .array_to_string, .array_remove => return array_eval.ArrayEval(config, @This()).call(ctx, n),
                     .jsonb_set, .jsonb_set_lax, .jsonb_insert, .jsonb_delete_path, .jsonb_strip_nulls, .jsonb_pretty, .to_json, .to_jsonb, .jsonb_path_exists, .jsonb_path_match, .jsonb_path_query_array, .jsonb_path_query_first, .jsonb_exists_any, .jsonb_exists_all, .jsonb_minus_op, .jsonb_delete_path_op, .jsonb_exists_any_op, .jsonb_exists_all_op, .jsonb_path_exists_op, .jsonb_path_match_op => return json_eval.JsonEval(config, @This()).call(ctx, n),
                     .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => return range_eval.RangeEval(config, @This()).call(ctx, n),
                     .current_setting, .set_config, .pg_try_advisory_lock, .pg_try_advisory_lock_shared, .pg_try_advisory_xact_lock, .pg_try_advisory_xact_lock_shared, .pg_advisory_unlock, .pg_advisory_unlock_shared, .pg_backend_pid, .pg_is_in_recovery => return sessionFunction(ctx, n),

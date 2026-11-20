@@ -638,7 +638,7 @@ pub fn Io(comptime config: types.Config) type {
                     if (ty == .int2 and (value < -32768 or value > 32767)) return error.NumericValueOutOfRange;
                     break :blk value;
                 } },
-                .oid => .{ .integer = blk: {
+                .oid, .xid => .{ .integer = blk: {
                     const value = expr.parseInteger(input, .int8) catch |err| return if (err == error.IntegerOverflow) error.NumericValueOutOfRange else err;
                     // oidin accepts -2^31..2^32-1, negatives wrap.
                     if (value < -2147483648 or value > 4294967295) return error.NumericValueOutOfRange;
@@ -943,7 +943,7 @@ pub fn Io(comptime config: types.Config) type {
                     .bits => |*value| V.Cell{ .integer = try value.toInteger(if (to == .int4) 32 else 64) },
                     else => return error.CannotCoerce,
                 },
-                .oid => switch (cell) {
+                .oid, .xid => switch (cell) {
                     .integer => |value| V.Cell{ .integer = if (from == .int4 and value < 0) value + 4294967296 else try checkedInteger(value, .oid) },
                     .text => |*value| try parse(.oid, -1, value.slice(), session),
                     else => return error.CannotCoerce,

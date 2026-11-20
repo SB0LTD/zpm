@@ -61,6 +61,8 @@ pub const Config = struct {
     synchronized_scan_rows: usize = 16384,
     tables: usize = 4,
     columns: usize = 8,
+    /// Bounded SELECT output width. Zero matches the stored table width.
+    projection_columns: usize = 0,
     rows_per_table: usize = 128,
     name_bytes: usize = 32,
     text_bytes: usize = 128,
@@ -234,6 +236,13 @@ pub const Config = struct {
 
 pub fn workRows(comptime config: Config) usize {
     return if (config.work_rows == 0) config.rows_per_table else config.work_rows;
+}
+
+pub fn projectionColumns(comptime config: Config) usize {
+    if (config.projection_columns == 0) return config.columns;
+    if (config.projection_columns < config.columns or config.projection_columns > 255)
+        @compileError("projection_columns must cover stored columns and fit the SQL column index");
+    return config.projection_columns;
 }
 
 pub fn resultRows(comptime config: Config) usize {
@@ -574,12 +583,12 @@ pub const Dialect = enum { postgres, mysql, tds };
 /// `integer32` int4 (INTEGER); the others are named after PostgreSQL.
 /// The unnamed values are array types: the element's ordinal with
 /// array_bit set (arrayData/elementData); there are no arrays of arrays.
-pub const DataType = enum(u8) { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, mysql_bigint_unsigned, pg_internal_char, aclitem, _ };
+pub const DataType = enum(u8) { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, mysql_bigint_unsigned, pg_internal_char, aclitem, xid, _ };
 
 /// Bound expression type. `unknown` is an untyped string or NULL literal
 /// that has not been resolved by context yet. Unnamed values are array
 /// types, encoded like DataType's (arrayType/elementType).
-pub const Type = enum(u8) { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, mysql_bigint_unsigned, pg_internal_char, aclitem, _ };
+pub const Type = enum(u8) { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, mysql_bigint_unsigned, pg_internal_char, aclitem, xid, _ };
 
 /// Array types set this bit over the element type's ordinal.
 pub const array_bit: u8 = 0x80;
@@ -661,6 +670,7 @@ pub fn dataTypeOf(ty: Type) DataType {
         .text, .unknown => .text,
         .name => .name,
         .oid => .oid,
+        .xid => .xid,
         .date => .date,
         .timestamp => .timestamp,
         .timestamptz => .timestamptz,
@@ -713,6 +723,7 @@ pub fn typeOfData(data_type: DataType) Type {
         .text => .text,
         .name => .name,
         .oid => .oid,
+        .xid => .xid,
         .date => .date,
         .timestamp => .timestamp,
         .timestamptz => .timestamptz,
@@ -815,6 +826,7 @@ fn baseInfo(data_type: DataType) TypeInfo {
         .smallint => .{ .oid = 21, .name = "int2", .len = 2, .category = 'N', .array = 1005, .alignment = 's' },
         .integer32 => .{ .oid = 23, .name = "int4", .len = 4, .category = 'N', .array = 1007 },
         .text => .{ .oid = 25, .name = "text", .len = -1, .category = 'S', .array = 1009 },
+        .xid => .{ .oid = 28, .name = "xid", .len = 4, .category = 'U', .array = 1011 },
         .oid => .{ .oid = 26, .name = "oid", .len = 4, .category = 'N', .array = 1028 },
         .json => .{ .oid = 114, .name = "json", .len = -1, .category = 'U', .array = 199 },
         .real => .{ .oid = 700, .name = "float4", .len = 4, .category = 'N', .array = 1021 },
@@ -892,6 +904,7 @@ fn baseSqlName(data_type: DataType) []const u8 {
         .double => "double precision",
         .name => "name",
         .oid => "oid",
+        .xid => "xid",
         .date => "date",
         .timestamp => "timestamp without time zone",
         .timestamptz => "timestamp with time zone",
@@ -944,6 +957,7 @@ pub fn typeInputName(data_type: DataType) []const u8 {
         .double => "float8in",
         .name => "namein",
         .oid => "oidin",
+        .xid => "xidin",
         .date => "date_in",
         .timestamp => "timestamp_in",
         .timestamptz => "timestamptz_in",
@@ -1251,7 +1265,7 @@ pub fn Values(comptime config: Config) type {
 
         pub fn cellTag(data_type: DataType) CellTag {
             return switch (data_type) {
-                .integer, .integer32, .smallint, .oid => .integer,
+                .integer, .integer32, .smallint, .oid, .xid => .integer,
                 .boolean => .boolean,
                 .text, .name, .json, .varchar, .jsonpath, .aclitem => .text,
                 .real => .float4,
@@ -1500,7 +1514,7 @@ pub fn Values(comptime config: Config) type {
                 switch (column.data_type) {
                     .integer32 => if (integer < -2147483648 or integer > 2147483647) return error.IntegerOverflow,
                     .smallint => if (integer < -32768 or integer > 32767) return error.NumericValueOutOfRange,
-                    .oid => if (integer < 0 or integer > 4294967295) return error.NumericValueOutOfRange,
+                    .oid, .xid => if (integer < 0 or integer > 4294967295) return error.NumericValueOutOfRange,
                     else => {},
                 }
             }

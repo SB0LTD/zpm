@@ -54,7 +54,7 @@ pub const View = enum(u8) { pg_type, pg_namespace, pg_class, pg_attribute, pg_in
     pg_proc, pg_trigger, pg_rewrite, pg_rules,
     // Catalog objects (B11 wave 3, catalog_objects.sig).
     pg_roles, pg_authid, pg_auth_members, pg_policy, pg_policies, pg_description, pg_shdescription, pg_foreign_data_wrapper, pg_foreign_server, pg_publication, pg_extension, pg_tables, table_privileges, pg_enum, pg_database, pg_am, pg_collation, pg_constraint, pg_statistic_ext,
-    pg_publication_rel, pg_publication_namespace, pg_settings, pg_depend };
+    pg_publication_rel, pg_publication_namespace, pg_settings, pg_depend, pg_tablespace, pg_foreign_table };
 
 pub const DatabaseCatalogRow = struct { oid: u32, owner: u32, name: []const u8 };
 pub const DatabaseCatalogProvider = struct {
@@ -85,12 +85,22 @@ const pg_collation_columns = [_]ViewColumn{
     col("oid", .oid), col("collname", .name), col("collnamespace", .oid), col("collowner", .oid),
     col("collprovider", .text), col("collisdeterministic", .boolean), col("collencoding", .int4),
 };
+const pg_tablespace_columns = [_]ViewColumn{
+    col("oid", .oid), col("spcname", .name), col("spcowner", .oid),
+    col("spcacl", types.arrayType(.aclitem).?), col("spcoptions", types.arrayType(.text).?),
+};
+const pg_foreign_table_columns = [_]ViewColumn{
+    col("ftrelid", .oid), col("ftserver", .oid), col("ftoptions", types.arrayType(.text).?),
+};
 const pg_class_columns = [_]ViewColumn{
     col("oid", .oid), col("relname", .name), col("relnamespace", .oid), col("relkind", .text), col("relnatts", .int2),
     col("relchecks", .int2), col("relhasindex", .boolean), col("relhasrules", .boolean), col("relhastriggers", .boolean),
     col("relrowsecurity", .boolean), col("relforcerowsecurity", .boolean), col("relispartition", .boolean),
     col("reltablespace", .oid), col("reloftype", .oid), col("relpersistence", .text), col("relreplident", .text),
     col("reltoastrelid", .oid), col("relam", .oid), col("relispopulated", .boolean), col("relpartbound", .text),
+    col("reltype", .oid), col("relowner", .oid), col("relpages", .int4), col("reltuples", .float4),
+    col("relallvisible", .int4), col("relallfrozen", .int4), col("relfrozenxid", .xid), col("relminmxid", .xid),
+    col("relacl", types.arrayType(.aclitem).?), col("reloptions", types.arrayType(.text).?),
 };
 const pg_attribute_columns = [_]ViewColumn{ col("attrelid", .oid), col("attname", .name), col("atttypid", .oid), col("atttypmod", .int4), col("attnum", .int2), col("attnotnull", .boolean), col("attisdropped", .boolean), col("attidentity", .pg_internal_char), col("attgenerated", .pg_internal_char), col("atthasdef", .boolean), col("attcollation", .oid), col("attlen", .int2), col("attalign", .pg_internal_char) };
 const pg_index_columns = [_]ViewColumn{
@@ -166,6 +176,8 @@ pub fn viewColumns(view: View) []const ViewColumn {
         .pg_am => &pg_am_columns,
         .pg_collation => &pg_collation_columns,
         .pg_class => &pg_class_columns,
+        .pg_tablespace => &pg_tablespace_columns,
+        .pg_foreign_table => &pg_foreign_table_columns,
         .pg_settings => &pg_settings_columns,
         .pg_attribute => &pg_attribute_columns,
         .pg_index => &pg_index_columns,
@@ -209,7 +221,7 @@ pub fn viewColumns(view: View) []const ViewColumn {
 /// information_schema views only when qualified.
 pub fn findView(schema: ?[]const u8, name: []const u8) ?View {
     const catalog_views = [_]View{ .pg_type, .pg_enum, .pg_namespace, .pg_am, .pg_collation, .pg_class, .pg_settings, .pg_attribute, .pg_index, .pg_constraint, .pg_depend, .pg_statistic_ext, .pg_attrdef, .pg_sequence, .pg_indexes, .pg_views, .pg_matviews, .pg_inherits, .pg_proc, .pg_trigger, .pg_rewrite, .pg_rules,
-        .pg_roles, .pg_authid, .pg_auth_members, .pg_policy, .pg_policies, .pg_description, .pg_shdescription, .pg_foreign_data_wrapper, .pg_foreign_server, .pg_publication, .pg_publication_rel, .pg_publication_namespace, .pg_extension, .pg_tables };
+        .pg_tablespace, .pg_foreign_table, .pg_roles, .pg_authid, .pg_auth_members, .pg_policy, .pg_policies, .pg_description, .pg_shdescription, .pg_foreign_data_wrapper, .pg_foreign_server, .pg_publication, .pg_publication_rel, .pg_publication_namespace, .pg_extension, .pg_tables };
     const information_views = [_]View{ .schemata, .tables, .columns, .table_constraints, .key_column_usage, .table_privileges };
     const qualified = schema orelse {
         for (catalog_views) |view| if (types.same(@tagName(view), name)) return view;
@@ -228,6 +240,7 @@ pub fn findView(schema: ?[]const u8, name: []const u8) ?View {
 pub const bootstrap_relations = [_]struct { view: View, oid: u32 }{
     .{ .view = .pg_type, .oid = 1247 }, .{ .view = .pg_attribute, .oid = 1249 },
     .{ .view = .pg_proc, .oid = 1255 }, .{ .view = .pg_class, .oid = 1259 },
+    .{ .view = .pg_tablespace, .oid = 1213 }, .{ .view = .pg_foreign_table, .oid = 3118 },
     .{ .view = .pg_authid, .oid = 1260 }, .{ .view = .pg_auth_members, .oid = 1261 },
     .{ .view = .pg_database, .oid = 1262 }, .{ .view = .pg_foreign_server, .oid = 1417 },
     .{ .view = .pg_sequence, .oid = 2224 }, .{ .view = .pg_foreign_data_wrapper, .oid = 2328 },
