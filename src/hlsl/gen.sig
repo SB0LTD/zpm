@@ -21,6 +21,13 @@
 //!   $Globals; cbuffers and resources keep their registers (or get the
 //!   lowest free); reflection is built from what the code still reads
 //!   after dead code is gone.
+//! - **Memory.** Compute shaders' groupshared variables, structured and
+//!   byte address buffers are places in memory (Val kind .mem: a register,
+//!   an element index, a byte offset known now and one known at run time),
+//!   laid out as fxc lays them: tightly, four bytes a component. A place is
+//!   read (ld_raw, ld_structured) where an expression needs its value and
+//!   written (store_raw, store_structured) by assignments; typed UAVs
+//!   (RWTexture*, RWBuffer) are read and written a whole element at a time.
 
 const std = @import("std");
 const ast = @import("ast.sig");
@@ -29,13 +36,15 @@ const lex = @import("lex.sig");
 const pp = @import("pp.sig");
 const ct = @import("container.sig");
 const intrin = @import("intrin.sig");
+const mem = @import("mem.sig");
 
 const Ast = ast.Ast;
 const NONE = ast.NONE;
 const Reg = ir.Reg;
 const Op = ir.Op;
 
-pub const Stage = enum(u8) { pixel = 0, vertex = 1, geometry = 2 };
+/// D3D11_SHADER_VERSION_TYPE's numbering (the version token's).
+pub const Stage = enum(u8) { pixel = 0, vertex = 1, geometry = 2, compute = 5 };
 
 pub const Target = struct { stage: Stage, major: u8, minor: u8 };
 
@@ -53,6 +62,12 @@ const MAX_CB = 64;
 /// (Compiler.placeCbSlots): this plus its index
 pub const CB_PROVISIONAL: u32 = 0x1000;
 const MAX_RES = 256;
+/// an implicitly placed resource's register until its real one is known
+/// (Compiler.placeResources): this plus its index in Gen.res
+pub const RES_PROVISIONAL: u32 = 0x1000;
+/// a groupshared variable's g# until the used ones are numbered
+pub const TGSM_PROVISIONAL: u32 = 0x1000;
+const MAX_TGSM = 64;
 pub const MAX_ICB = 4096;
 const MAX_ELEMS = 64;
 const MAX_FLOW = 64;
@@ -80,7 +95,35 @@ pub const Src = struct {
     gs: bool = false,
 };
 
-pub const ValKind = enum(u8) { srcs, cb, object, none };
+pub const ValKind = enum(u8) { srcs, cb, object, none, mem };
+
+/// Where a memory place lives: groupshared memory (g#), a UAV (u#) or a
+/// shader resource (t#, read only).
+pub const MemSpace = enum(u8) { tgsm, uav, srv };
+
+/// How it is addressed: a byte address (raw), an element and a byte in it
+/// (structured), coordinates of a typed element (typed: RWTexture*,
+/// RWBuffer).
+pub const MemKind = enum(u8) { raw, structured, typed };
+
+/// A memory place's own facts (Val.m); its element index (or typed
+/// coordinates) is srcs[at], its run-time byte offset srcs[at + 1] (an
+/// immediate 0 when none), its byte offset known now Val.off.
+pub const Mem = struct {
+    space: MemSpace = .tgsm,
+    kind: MemKind = .raw,
+    /// g#, u# or t# (provisional until placed)
+    reg: u32 = 0,
+    /// structured: the element's size; typed: the TexDim
+    stride: u32 = 0,
+    /// structured: the element is chosen (srcs[at]); else the value is
+    /// the whole array of elements (a groupshared array)
+    indexed: bool = false,
+    /// a vector place's components, in dwords from the offset (0: as the
+    /// type lays them out); a swizzle or a column-major matrix's row
+    ncomp: u8 = 0,
+    comp: [4]u8 = .{ 0, 1, 2, 3 },
+};
 
 pub const Val = struct {
     ty: u32,
@@ -94,6 +137,8 @@ pub const Val = struct {
     /// objects: the resource variable and the element (arrays of them)
     sym: u32 = 0,
     elem: u32 = 0,
+    /// memory places
+    m: Mem = .{},
 };
 
 /// A row a store writes: the temp and the component each logical
@@ -110,6 +155,9 @@ pub const LVal = struct {
     dyn_idx: Src = .{},
     dyn_count: u32 = 0,
     dyn_per: u32 = 0,
+    /// a place in memory (kind .mem) or an object being indexed (kind
+    /// .object): stores and loads go there, not to temps
+    place: ?Val = null,
 };
 
 const BindKind = enum(u8) { none, regs, val, cb, object, gs_input, stream };
@@ -135,13 +183,26 @@ const CB = struct {
     implicit: bool = false,
 };
 
-const Res = struct {
+pub const Res = struct {
     sym: u32,
     elem: u32,
-    /// 't' or 's'
+    /// 't', 's' or 'u'
     kind: u8,
     slot: u32,
     used: bool = false,
+    /// RWStructuredBuffer: IncrementCounter (1) or DecrementCounter (2) used
+    counter: u2 = 0,
+};
+
+/// A groupshared variable: g#, and how it is declared (dcl_tgsm_raw with
+/// its bytes, or dcl_tgsm_structured: an array's element size and count).
+pub const Tgsm = struct {
+    sym: u32,
+    reg: u32,
+    used: bool = false,
+    structured: bool,
+    stride: u32,
+    count: u32,
 };
 
 pub const Elem = struct {
@@ -235,18 +296,41 @@ pub const Gen = struct {
     globals_cb: u32 = 0xffff_ffff,
     /// the slots register(b#) names (reserved, read or not)
     cb_explicit: u32 = 0,
+    tgsm: [MAX_TGSM]Tgsm = undefined,
+    ntgsm: u32 = 0,
+    /// pixel shaders: the render targets written (UAVs are numbered after)
+    rt_count: u32 = 0,
 
     // ── errors ──
 
     pub fn fail(g: *Gen, comptime fmt: []const u8, args: anytype) void {
+        g.failCode(3000, fmt, args);
+    }
+
+    /// An error with fxc's number for it.
+    pub fn failCode(g: *Gen, code: u32, comptime fmt: []const u8, args: anytype) void {
         if (!g.failed) {
             g.log.col = g.cur_col;
-            g.log.err(g.cur_line, fmt, args);
+            g.log.errCode(g.cur_line, code, fmt, args);
         }
         g.failed = true;
     }
 
-    fn locate(g: *Gen, n: u32) void {
+    /// The profile's name, as fxc's messages say it (cs_5_0).
+    pub fn targetName(g: *const Gen) []const u8 {
+        const S = struct {
+            var buf: [8]u8 = undefined;
+        };
+        const st: []const u8 = switch (g.target.stage) {
+            .pixel => "ps",
+            .vertex => "vs",
+            .geometry => "gs",
+            .compute => "cs",
+        };
+        return std.fmt.bufPrint(&S.buf, "{s}_{d}_{d}", .{ st, g.target.major, g.target.minor }) catch "cs_5_0";
+    }
+
+    pub fn locate(g: *Gen, n: u32) void {
         const t = g.a.nodes[n].tok;
         if (t < g.toks.len) {
             g.cur_line = g.toks[t].line();
@@ -490,6 +574,10 @@ pub const Gen = struct {
                 o.dims = 0;
                 o.comps = 1;
             },
+            .input_thread_id, .input_thread_group_id, .input_thread_id_in_group, .input_thread_id_in_group_flattened => {
+                // (registers without an index, read through a swizzle)
+                o.dims = 0;
+            },
             else => {
                 o.dims = 1;
                 o.idx = .{ s.idx, 0 };
@@ -580,6 +668,7 @@ pub const Gen = struct {
     /// The value's rows as Srcs (a constant buffer's read now).
     pub fn rows(g: *Gen, v: Val) Val {
         if (v.kind == .srcs) return v;
+        if (v.kind == .mem) return mem.read(g, v);
         if (v.kind == .cb) {
             const n = g.cbRowCount(v.ty);
             const first = g.newSrcs(n);
@@ -593,7 +682,7 @@ pub const Gen = struct {
 
     /// Rows a constant buffer value reads: a column-major matrix gives its
     /// columns.
-    fn cbRowCount(g: *const Gen, t: u32) u32 {
+    pub fn cbRowCount(g: *const Gen, t: u32) u32 {
         const x = g.a.types[t];
         return switch (x.class) {
             .matrix => if (g.effPack(x) == .row) x.rows else x.cols,
@@ -1103,6 +1192,7 @@ pub const Gen = struct {
             .static_global => {
                 g.fail("internal: static '{s}' unplaced", .{g.a.symName(sym)});
             },
+            .groupshared => return mem.tgsmPlace(g, sym),
             else => g.fail("'{s}' used before it is declared", .{g.a.symName(sym)}),
         }
         return g.immVal(g.scalarTy(.float), 0);
@@ -1194,6 +1284,9 @@ pub const Gen = struct {
             .ident => {
                 const sym = node.a;
                 const s = g.a.syms[sym];
+                // (groupshared memory and objects: their elements are places)
+                if (s.storage == .groupshared and s.kind == .variable) return .{ .ty = s.ty, .place = g.readVar(sym) };
+                if (g.isObjectTy(s.ty)) return .{ .ty = s.ty, .place = g.readVar(sym) };
                 var b = g.binds[sym];
                 if (b.kind == .val) {
                     // a never-assigned binding being written (an out argument):
@@ -1211,10 +1304,12 @@ pub const Gen = struct {
             },
             .member => {
                 const base = g.lvalue(node.a);
+                if (base.place) |pl| return mem.lmember(g, pl, g.tokText(node.tok));
                 return g.lmember(base, node.tok);
             },
             .index => {
                 const base = g.lvalue(node.a);
+                if (base.place) |pl| return mem.lindex(g, pl, node.b);
                 return g.lindex(base, node.b);
             },
             .cast => {
@@ -1420,6 +1515,7 @@ pub const Gen = struct {
     /// Stores `v` (converted to the lvalue's type).
     pub fn store(g: *Gen, l: LVal, v0: Val) void {
         if (g.failed) return;
+        if (l.place) |pl| return mem.write(g, pl, g.convert(v0, l.ty));
         const v = g.canonRows(g.convert(v0, l.ty));
         if (!l.dyn) {
             if (v.n != l.n) {
@@ -1443,6 +1539,7 @@ pub const Gen = struct {
 
     /// The current value of an lvalue.
     pub fn loadL(g: *Gen, l: LVal) Val {
+        if (l.place) |pl| return mem.read(g, pl);
         if (!l.dyn) {
             const first = g.newSrcs(l.n);
             for (0..l.n) |r| {
@@ -1469,7 +1566,16 @@ pub const Gen = struct {
 
     // ── expressions ──
 
+    /// An expression's value; a place in memory is read now.
     pub fn expr(g: *Gen, n: u32) Val {
+        const v = g.exprLazy(n);
+        if (v.kind == .mem and !g.failed) return mem.read(g, v);
+        return v;
+    }
+
+    /// An expression's value, a place in memory left unread: members and
+    /// elements of it are chosen before anything is loaded.
+    pub fn exprLazy(g: *Gen, n: u32) Val {
         if (g.failed) return .{ .ty = 0, .kind = .none };
         if (n == NONE) {
             g.fail("an expression expected", .{});
@@ -1497,8 +1603,8 @@ pub const Gen = struct {
                 const v = g.expr(node.b);
                 break :blk g.convert(v, node.a);
             },
-            .member => g.memberExpr(g.expr(node.a), node.tok),
-            .index => g.indexExpr(g.expr(node.a), node.b),
+            .member => g.memberExpr(g.exprLazy(node.a), node.tok),
+            .index => g.indexExpr(g.exprLazy(node.a), node.b),
             .init_list => blk: {
                 g.fail("an initializer list where a value was expected", .{});
                 break :blk g.immVal(g.scalarTy(.float), 0);
@@ -1548,6 +1654,7 @@ pub const Gen = struct {
 
     pub fn memberExpr(g: *Gen, v: Val, tok: u32) Val {
         const name = g.tokText(tok);
+        if (v.kind == .mem) return mem.member(g, v, name);
         const t = g.a.types[v.ty];
         if (t.class == .structure) {
             var row: u32 = 0;
@@ -1645,6 +1752,8 @@ pub const Gen = struct {
 
     pub fn indexVal(g: *Gen, v: Val, iv: Val) Val {
         const t = g.a.types[v.ty];
+        if (v.kind == .mem) return mem.index(g, v, iv);
+        if (v.kind == .object and t.class != .array) return mem.objectIndex(g, v, iv);
         const ci = g.constIndex(iv);
         switch (t.class) {
             .array => {
@@ -2744,6 +2853,11 @@ pub const Gen = struct {
         }
         g.entry = f;
         g.cur_line = g.a.syms[f].line;
+        if (g.target.stage == .compute) {
+            g.computeEntry(f);
+            if (g.failed) return false;
+        }
+        if (g.target.stage == .pixel) g.rt_count = g.renderTargets(f);
         g.placeGlobals();
         if (g.failed) return false;
         g.entryInputs(f);
@@ -2856,39 +2970,30 @@ pub const Gen = struct {
         return k;
     }
 
-    /// A resource element's register (t# or s#): its own, or the lowest
-    /// free one.
+    /// A resource element's register (t#, s# or u#): its own register(x#),
+    /// or a provisional one until the code shows which are used (fxc gives
+    /// the used ones the lowest free registers in the order declared:
+    /// Compiler.placeResources).
     pub fn resource(g: *Gen, sym: u32, elem: u32, kind: u8) u32 {
-        for (g.res[0..g.nres]) |*r| if (r.sym == sym and r.elem == elem and r.kind == kind) return r.slot;
-        const sy = g.a.syms[sym];
-        var slot: u32 = 0;
-        if (sy.reg_kind == kind) slot = sy.reg_index + elem else {
-            // (the lowest register no other resource of this kind has)
-            var free: u32 = 0;
-            while (true) : (free += 1) {
-                var taken = false;
-                for (g.a.globals[0..g.a.nglobals]) |s2| {
-                    const o = g.a.syms[s2];
-                    if (o.kind == .variable and o.reg_kind == kind) {
-                        const cnt = arrayCount(g, o.ty);
-                        if (free >= o.reg_index and free < o.reg_index + cnt) taken = true;
-                    }
-                }
-                for (g.res[0..g.nres]) |r| if (r.kind == kind and r.slot == free) {
-                    taken = true;
-                };
-                if (!taken) break;
-            }
-            slot = free;
-        }
-        if (g.nres < MAX_RES) {
-            g.res[g.nres] = .{ .sym = sym, .elem = elem, .kind = kind, .slot = slot };
-            g.nres += 1;
-        }
-        return slot;
+        return g.res[g.resEntry(sym, elem, kind) orelse return 0].slot;
     }
 
-    fn arrayCount(g: *Gen, t: u32) u32 {
+    /// The Res entry of a resource element (made on first use).
+    pub fn resEntry(g: *Gen, sym: u32, elem: u32, kind: u8) ?usize {
+        for (g.res[0..g.nres], 0..) |*r, k| if (r.sym == sym and r.elem == elem and r.kind == kind) return k;
+        if (g.nres >= MAX_RES) {
+            g.fail("too many resources", .{});
+            return null;
+        }
+        const sy = g.a.syms[sym];
+        const explicit = sy.reg_kind == kind;
+        const slot = if (explicit) sy.reg_index + elem else RES_PROVISIONAL + g.nres;
+        g.res[g.nres] = .{ .sym = sym, .elem = elem, .kind = kind, .slot = slot };
+        g.nres += 1;
+        return g.nres - 1;
+    }
+
+    pub fn arrayCount(g: *const Gen, t: u32) u32 {
         var x = g.a.types[t];
         var n: u32 = 1;
         while (x.class == .array) {
@@ -3075,6 +3180,7 @@ pub const Gen = struct {
             return g.immVal(t, 0);
         }
         const name = g.a.name(sem_off, sem_len);
+        if (g.target.stage == .compute) return g.computeInput(t, name);
         const sys = sysValue(name);
         if (sys != null and sys.? == 0xffff) {
             g.fail("unknown system value '{s}'", .{name});
@@ -3111,6 +3217,87 @@ pub const Gen = struct {
             if (info.base == .bool and sv != 9) g.srcs[first + r] = g.alu(.ine, info.n, &.{ g.srcs[first + r], imm1(0) });
         }
         return mkVal(t, first, n);
+    }
+
+    const ThreadInput = struct { s: []const u8, reg: Reg };
+    const thread_inputs = [_]ThreadInput{
+        .{ .s = "SV_DISPATCHTHREADID", .reg = .input_thread_id },
+        .{ .s = "SV_GROUPID", .reg = .input_thread_group_id },
+        .{ .s = "SV_GROUPTHREADID", .reg = .input_thread_id_in_group },
+        .{ .s = "SV_GROUPINDEX", .reg = .input_thread_id_in_group_flattened },
+    };
+
+    /// A compute shader's input: one of the thread ids (registers of
+    /// their own, no signature).
+    fn computeInput(g: *Gen, t: u32, name: []const u8) Val {
+        var up: [64]u8 = undefined;
+        const u_ = if (name.len <= up.len) std.ascii.upperString(&up, name) else name;
+        for (thread_inputs) |x| {
+            if (!std.mem.eql(u8, u_, x.s)) continue;
+            const ty_ = g.a.types[t];
+            if (ty_.class != .scalar and ty_.class != .vector) break;
+            const first = g.newSrcs(1);
+            // (SV_GroupIndex is one component; the others three)
+            const most: u8 = if (x.reg == .input_thread_id_in_group_flattened) 1 else 3;
+            g.srcs[first] = .{ .reg = x.reg, .n = @min(ty_.cols, most) };
+            if (ty_.cols > most) g.srcs[first] = broadcast(g.srcs[first], ty_.cols);
+            return mkVal(t, first, 1);
+        }
+        g.failCode(4502, "invalid {s} input semantic '{s}'", .{ g.targetName(), name });
+        return g.immVal(t, 0);
+    }
+
+    /// Pixel shaders: how many render targets the entry writes (its
+    /// SV_Target outputs' highest index + 1), where UAVs' registers start.
+    fn renderTargets(g: *Gen, f: u32) u32 {
+        const fs = g.a.syms[f];
+        var n: u32 = 0;
+        if (fs.ty != 0) n = @max(n, g.targetsOf(fs.ty, fs.sem_off, fs.sem_len, fs.sem_index));
+        for (0..fs.nparams) |k| {
+            const ps = g.a.syms[fs.params + @as(u32, @intCast(k))];
+            if (ps.flags & ast.F_OUT == 0) continue;
+            n = @max(n, g.targetsOf(ps.ty, ps.sem_off, ps.sem_len, ps.sem_index));
+        }
+        return n;
+    }
+
+    fn targetsOf(g: *Gen, t: u32, sem_off: u32, sem_len: u16, sem_index: u32) u32 {
+        const x = g.a.types[t];
+        if (x.class == .structure) {
+            var n: u32 = 0;
+            for (0..x.len) |k| {
+                const m = g.a.members[x.first + k];
+                n = @max(n, g.targetsOf(m.ty, m.sem_off, m.sem_len, m.sem_index));
+            }
+            return n;
+        }
+        if (sem_len == 0) return 0;
+        const sv = sysValue(g.a.name(sem_off, sem_len)) orelse 0;
+        if (sv != 64 and sv != 0) return 0;
+        return sem_index + g.rowsOf(t);
+    }
+
+    /// A compute entry's own rules: [numthreads(x, y, z)] of at most 1024
+    /// threads, nothing returned.
+    fn computeEntry(g: *Gen, f: u32) void {
+        const fs = g.a.syms[f];
+        const th = fs.threads;
+        if (fs.threads_tok == 0 and th[0] == 0 and th[1] == 0 and th[2] == 0) {
+            g.cur_line = 0;
+            g.cur_col = 0;
+            return g.failCode(3084, "'numthreads(X,Y,Z)' attribute expected, where 'X,Y,Z' are the dimensions of the thread group", .{});
+        }
+        // (errors about the attribute point at it)
+        if (fs.threads_tok > 0 and fs.threads_tok - 1 < g.toks.len) {
+            const tk = g.toks[fs.threads_tok - 1];
+            g.cur_line = tk.line();
+            g.cur_col = @import("parse.sig").column(g.a.pool, tk.off);
+        }
+        const prod = @as(u64, th[0]) * th[1] * th[2];
+        if (prod == 0) return g.failCode(3655, "the product of the arguments of numthreads({d},{d},{d}) must be at least 1", .{ th[0], th[1], th[2] });
+        if (prod > 1024) return g.failCode(3655, "the product of the arguments of numthreads({d},{d},{d}) must be less than or equal to 1024", .{ th[0], th[1], th[2] });
+        if (th[0] > 1024 or th[1] > 1024 or th[2] > 64) return g.failCode(3655, "numthreads({d},{d},{d}): X and Y must be at most 1024, Z at most 64", .{ th[0], th[1], th[2] });
+        if (fs.ty != 0) return g.failCode(3507, "'{s}': Compute shaders can't return values, outputs must be written in writable resources (UAVs).", .{g.a.symName(f)});
     }
 
     fn entryOutputs(g: *Gen, f: u32, ctx: FnCtx) void {
