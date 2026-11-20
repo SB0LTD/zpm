@@ -10,7 +10,7 @@ const std = @import("std");
 const sql = @import("sql");
 // Catalog views share the query workspace with the correlated collation
 // lookup. Provision both sources and the nested join in this fixture.
-const DB = sql.Database(.{ .tables = 2, .columns = 6, .projection_columns = 48, .rows_per_table = 16, .name_bytes = 32, .text_bytes = 64, .nulls_first_ascending = false, .integer_bits = 32, .transactions = 4, .work_rows = 512 });
+const DB = sql.Database(.{ .tables = 2, .columns = 6, .projection_columns = 48, .rows_per_table = 16, .name_bytes = 32, .text_bytes = 128, .nulls_first_ascending = false, .integer_bits = 32, .transactions = 4, .work_rows = 512 });
 var assertions: usize = 0;
 var db: DB = .{};
 
@@ -113,7 +113,17 @@ fn dumpDiscovery() !void {
         "discoverable|10|0|-1|0|0|0|0|t|t|t");
     try expect("SELECT pg_typeof(c.relfrozenxid)::text, pg_typeof(c.relacl)::text FROM pg_class c WHERE c.relname='discoverable'",
         "xid|aclitem[]");
+    try run("CREATE ROLE catalog_reader");
+    try run("GRANT SELECT, MAINTAIN ON discoverable TO catalog_reader WITH GRANT OPTION");
+    try expect("SELECT relacl::text FROM pg_class WHERE relname='discoverable'",
+        "{ramsql=arwdDxt/ramsql,catalog_reader=r*m*/ramsql}");
+    try run("REVOKE ALL ON discoverable FROM catalog_reader");
+    try expect("SELECT relacl IS NULL FROM pg_class WHERE relname='discoverable'", "t");
+    try run("DROP ROLE catalog_reader");
     try expect("SELECT 1,2,3,4,5,6,7,8,9,10", "1|2|3|4|5|6|7|8|9|10");
+    try run("INSERT INTO discoverable VALUES (2),(1),(1)");
+    try expect("SELECT DISTINCT 1,2,3,4,5,6,7,8,9,id FROM discoverable ORDER BY 10",
+        "1|2|3|4|5|6|7|8|9|1;1|2|3|4|5|6|7|8|9|2");
     try rejects("CREATE TABLE still_bounded(a INT,b INT,c INT,d INT,e INT,f INT,g INT)", error.ColumnCapacity);
     try run("DROP TABLE discoverable");
 }

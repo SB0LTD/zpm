@@ -5100,29 +5100,26 @@ pub fn Database(comptime config: Config) type {
             return P.parseQueryAt(workspace.expansion[0..length.*], start, length.*, &workspace.nodes);
         }
 
-        /// catalog_text hook: comments and role names under the statement
-        /// snapshot.
         fn relationAcl(self: *const Self, oid: u32, snapshot: Snapshot) Error!Cell {
+            const owner = self.catalog_objects.owner(oid, snapshot);
             var count: u32 = 0;
             for (&self.catalog_objects.items) |*item| {
-                if (item.kind == .acl and item.target == oid and O.visible(item, snapshot)) count += 1;
+                if (item.kind == .acl and item.target == oid and item.grantee != owner and O.visible(item, snapshot)) count += 1;
             }
             if (count == 0) return .null_value;
             const Acl = @import("sql/catalog_acl.sig").Acl(V);
-            const owner = self.catalog_objects.owner(oid, snapshot);
             const owner_name = self.catalog_objects.roleName(owner, snapshot) orelse return error.UndefinedObject;
             var output: Text = .{};
             var writer = try Acl.begin(&output, count + 1);
             try Acl.append(&writer, owner_name, "arwdDxt", owner_name);
             for (&self.catalog_objects.items) |*item| {
-                if (item.kind != .acl or item.target != oid or !O.visible(item, snapshot)) continue;
+                if (item.kind != .acl or item.target != oid or item.grantee == owner or !O.visible(item, snapshot)) continue;
                 const grantee = if (item.grantee == CO.public_role) "" else
                     self.catalog_objects.roleName(item.grantee, snapshot) orelse return error.UndefinedObject;
                 const grantor = self.catalog_objects.roleName(item.owner, snapshot) orelse return error.UndefinedObject;
                 var permissions: [16]u8 = undefined;
                 var used: usize = 0;
-                for ("arwdDxtm", 0..) |letter, index| {
-                    const flag = @as(u32, 1) << @as(u5, @intCast(index));
+                for ("arwdDxtm", CO.privilege_bits) |letter, flag| {
                     if (item.flags & flag == 0) continue;
                     permissions[used] = letter;
                     used += 1;
