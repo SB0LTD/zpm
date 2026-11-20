@@ -8,7 +8,9 @@ PUBLIC. For supported functions and procedures, owner-authorized
 `GRANT EXECUTE` and `REVOKE EXECUTE` update the visible `pg_proc.proacl` and
 actual call permissions. The ACL and owner are versioned and survive WAL
 replay and routine replacement. Older routine records imply the bootstrap owner
-and default ACL. Grant delegation and multi-object statements remain open.
+and default ACL. The default routine ACL admits 16 named grantees besides the
+owner and PUBLIC, and catalog output uses the configured text capacity. Grant
+delegation and multi-object statements remain open.
 
 `pg_init_privs` exposes the explicit bootstrap namespace ACLs.
 `pg_cast` lists the supported PostgreSQL binary-coercion entries that have no
@@ -16,6 +18,20 @@ separate function. `pg_transform` has catalog metadata and no rows because
 language transforms cannot be installed. `pg_proc.proargtypes` stays a textual
 OID list. The native comparison exercises stock function discovery against a
 real user function and compares its default and modified routine ACLs.
+
+RAMSQL `86626c3` with ZPM `c5f4a78c` passed function discovery and stock
+imports on both PostgreSQL 16 and 18. The local Sig routine contract passed
+767 assertions and replayed 156 WAL records, including ACL changes on a
+trigger function and rollback of a pending revoke.
+
+Both outbound clients now reach type discovery and fail with
+`ColumnNotFound` before creating an archive. Add a native differential check
+for the type discovery query covering `pg_type.typacl`, `typisdefined`,
+`acldefault('T', typowner)`, `name` subscripting and the relation-kind
+and array-element lookups. PostgreSQL 18 also projects `typarray` directly.
+Keep both branches unmerged until unmodified stock tooling completes both
+directions on both versions.
+[PostgreSQL 16 and 18 function discovery CI](https://github.com/SB0LTD/ramsql/actions/runs/44803356629)
 
 Namespace introspection now returns `pg_namespace.nspacl` as `aclitem[]`
 (OID 1034), with NULL before a custom schema ACL is materialized. The
@@ -60,13 +76,8 @@ imports and a WAL reopen. The dump fixture uses two public tables and
 `--no-owner --no-acl`. Local Sig catalog, catalog security and core DDL
 contracts passed with 69, 1,594 and 1,192 assertions, respectively.
 
-In both lanes outbound `pg_dump` passes table discovery and fails with
-`TableNotFound` in function discovery, before it can produce an archive.
-Add a native comparison for that query covering `pg_proc.tableoid`,
-routine ownership and ACLs, `acldefault('f', owner)`, and the
-`pg_init_privs`, `pg_cast` and `pg_transform` joins and subqueries. Then
-rerun the stock archive export and native restore with row and constraint
-verification. Both directions on PostgreSQL 16 and 18 remain the merge gate.
+That earlier candidate passed table discovery and failed with
+`TableNotFound` in function discovery, before it could produce an archive.
 [Stock tooling CI](https://github.com/SB0LTD/ramsql/actions/runs/44785147029)
 
 ## Shipped RAMSQL evidence, 20 November 2026

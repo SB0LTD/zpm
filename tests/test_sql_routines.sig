@@ -278,10 +278,10 @@ fn routineDiscovery() !void {
     try run("SET ROLE routine_guest");
     try expect("SELECT discover_fn(1)", "3");
     try run("RESET ROLE");
-    try run("BEGIN");
-    try run("REVOKE EXECUTE ON FUNCTION discover_fn(INT) FROM routine_guest");
-    try expect(acl, revoked);
-    try run("ROLLBACK");
+    const pending = try db.begin();
+    try statement(pending, "REVOKE EXECUTE ON FUNCTION discover_fn(INT) FROM routine_guest");
+    try same(try rows(pending, acl), revoked);
+    db.abort(pending);
     try expect(acl, "{routine_owner=X/routine_owner,routine_guest=X/routine_owner}");
     try run("DROP FUNCTION discover_fn(INT)");
     try run("DROP ROLE routine_owner");
