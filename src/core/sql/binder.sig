@@ -1339,6 +1339,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "pi", .func = .pi },                     .{ .name = "degrees", .func = .degrees },
                 .{ .name = "radians", .func = .radians },           .{ .name = "cbrt", .func = .cbrt },
                 .{ .name = "sin", .func = .sin },                   .{ .name = "cos", .func = .cos },
+                .{ .name = "sind", .func = .sind },                 .{ .name = "cosd", .func = .cosd },
                 .{ .name = "tan", .func = .tan },                   .{ .name = "cot", .func = .cot },
                 .{ .name = "asin", .func = .asin },                 .{ .name = "acos", .func = .acos },
                 .{ .name = "atan", .func = .atan },                 .{ .name = "atan2", .func = .atan2 },
@@ -2288,7 +2289,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .lower, .upper, .initcap, .char_length, .octet_length, .bit_length, .substring, .btrim, .ltrim, .rtrim, .strpos, .replace,
                 .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .concat, .concat_ws,
                 .overlay, .to_hex => try typeStringFunction(context, n, count),
-                .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => try typeMathFunction(context, n, count),
+                .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .sind, .cosd, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => try typeMathFunction(context, n, count),
                 .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => try typeTemporalFunction(context, n, count),
                 .tds_dateadd => {
                     if (context.dialect != .tds or count != 2) return error.UnsupportedStatement;
@@ -2869,7 +2870,7 @@ pub fn Binder(comptime config: types.Config) type {
                     const ty = try floatOrNumeric(context, n);
                     try bindSignature(context, n, &[_]T{ ty, ty }, ty, true);
                 },
-                .cbrt, .degrees, .radians, .sin, .cos, .tan, .cot, .asin, .acos, .atan => try bindSignature(context, n, &[_]T{.float8}, .float8, true),
+                .cbrt, .degrees, .radians, .sin, .cos, .sind, .cosd, .tan, .cot, .asin, .acos, .atan => try bindSignature(context, n, &[_]T{.float8}, .float8, true),
                 .atan2 => try bindSignature(context, n, &[_]T{ .float8, .float8 }, .float8, true),
                 .mod, .gcd, .lcm => {
                     if (count != 2) return error.UndefinedFunction;
