@@ -71,6 +71,56 @@ const PB_DWORDS = SETUP_DWORDS + DWORDS_PER_DISPATCH * MAX_DISPATCHES + DWORDS_P
 /// Zeros after a program (the SMs' prefetch reads past its end; the
 /// emulated RTX reads to its first all-zero instruction).
 const CODE_GAP = 256;
+/// Programs' code shares heaps of CODE_HEAP_BYTES (each one buffer of the
+/// device's), up to CODE_HEAPS: a program a buffer of its own took a
+/// render-node buffer (2 MiB on the RTX) for a few KiB, and a Direct3D
+/// game's hundreds of programs filled the process's table (Unigine
+/// Superposition's). A program larger than CODE_HEAP_BYTES / 4 is a buffer
+/// of its own still. Code at an address used before is safe: each run
+/// invalidates the shader caches first. (The tables stay small: the
+/// Adapter's default value is a constant in every program that embeds it,
+/// and 128 KiB of it broke the compiler's debug info.)
+const CODE_HEAP_BYTES: u64 = 16 << 20;
+const CODE_HEAPS = 8;
+const CODE_SPANS = 512;
+const CODE_ALIGN: u64 = 256;
+
+const CodeHeap = struct {
+    buf: gpu.Buffer = .{},
+    /// the programs' places: offset and size, by offset
+    spans: [CODE_SPANS][2]u32 = undefined,
+    n: u32 = 0,
+
+    /// Room for `bytes` (first fit), its offset.
+    fn take(h: *CodeHeap, bytes: u64) ?u64 {
+        if (h.n == CODE_SPANS) return null;
+        const size = std.mem.alignForward(u64, bytes, CODE_ALIGN);
+        var at: u64 = 0;
+        var i: u32 = 0;
+        while (i <= h.n) : (i += 1) {
+            const end: u64 = if (i < h.n) h.spans[i][0] else h.buf.bytes;
+            if (at <= end and end - at >= size) {
+                std.mem.copyBackwards([2]u32, h.spans[i + 1 .. h.n + 1], h.spans[i..h.n]);
+                h.spans[i] = .{ @intCast(at), @intCast(size) };
+                h.n += 1;
+                return at;
+            }
+            if (i < h.n) at = @as(u64, h.spans[i][0]) + h.spans[i][1];
+        }
+        return null;
+    }
+
+    /// The program at `off` gone; false: none is there.
+    fn give(h: *CodeHeap, off: u64) bool {
+        for (h.spans[0..h.n], 0..) |sp, i| {
+            if (sp[0] != off) continue;
+            std.mem.copyForwards([2]u32, h.spans[i .. h.n - 1], h.spans[i + 1 .. h.n]);
+            h.n -= 1;
+            return true;
+        }
+        return false;
+    }
+};
 /// clcec0.h's WAIT_FOR_IDLE.
 const WAIT_FOR_IDLE: u32 = 0x0110;
 /// Run slots in flight: a run reuses a set only after its fence.
@@ -242,6 +292,8 @@ pub const Adapter = struct {
     gpu_only: ?nv.Device = null,
     caps: gpu.Caps = undefined,
     bufs: [MAX_BUFFERS]Slot = [_]Slot{.{}} ** MAX_BUFFERS,
+    /// programs' code (load, unload)
+    code_heaps: [CODE_HEAPS]CodeHeap = [_]CodeHeap{.{}} ** CODE_HEAPS,
     /// Frees (and lookups) of a handle whose buffer had gone: refused.
     stale_frees: u32 = 0,
     sets: [SETS]Set = [_]Set{.{}} ** SETS,
@@ -413,20 +465,62 @@ pub const Adapter = struct {
         if (bin.regs == 0 or bin.regs > 255) return error.BadProgram;
         if (bin.extra[kir_sm120.EXTRA_STACK] != 0) return error.Unsupported;
         if (8 * @as(u32, bin.bindings) + 4 * @as(u32, bin.param_words) > qmd.MAX_BIG_PARAMS) return error.BadProgram;
-        const code = alloc(ctx, bin.code.len + CODE_GAP, .upload) orelse return error.OutOfMemory;
+        const bytes = bin.code.len + CODE_GAP;
+        const code = a.codeAlloc(bytes) orelse alloc(ctx, bytes, .upload) orelse return error.OutOfMemory;
         @memcpy(code.cpu[0..bin.code.len], bin.code);
         @memset(code.cpu[bin.code.len..][0..CODE_GAP], 0);
-        toDevice(ctx, code, 0, code.bytes);
+        a.codeToDevice(code);
         if (code.gpu & 0xff != 0) {
-            free(ctx, code);
+            a.codeFree(ctx, code);
             return error.BadProgram;
         }
-        _ = a;
         return .{ .bin = bin.*, .code = code };
     }
 
     fn unload(ctx: *anyopaque, p: *const gpu.Program) void {
-        free(ctx, p.code);
+        self(ctx).codeFree(ctx, p.code);
+    }
+
+    /// A program's place in a code heap (made at its first use), or null:
+    /// the program is large, or the heaps are full.
+    fn codeAlloc(a: *Adapter, bytes: u64) ?gpu.Buffer {
+        if (bytes > CODE_HEAP_BYTES / 4) return null;
+        for (&a.code_heaps) |*h| {
+            if (h.buf.bytes == 0) {
+                const b = alloc(a, CODE_HEAP_BYTES, .upload) orelse return null;
+                if (b.gpu & 0xff != 0 or b.cpu.len < CODE_HEAP_BYTES) {
+                    free(a, b);
+                    return null;
+                }
+                h.* = .{ .buf = b };
+            }
+            const at = h.take(bytes) orelse continue;
+            return .{ .gpu = h.buf.gpu + at, .cpu = h.buf.cpu[@intCast(at)..][0..@intCast(bytes)], .bytes = bytes, .handle = h.buf.handle, .kind = h.buf.kind };
+        }
+        return null;
+    }
+
+    /// The heap a program's code is in, if it is in one, and its offset.
+    fn codeHeapOf(a: *Adapter, b: gpu.Buffer) ?struct { h: *CodeHeap, off: u64 } {
+        for (&a.code_heaps) |*h| {
+            if (h.buf.bytes == 0 or h.buf.handle != b.handle) continue;
+            if (b.gpu < h.buf.gpu or b.gpu >= h.buf.gpu + h.buf.bytes) continue;
+            return .{ .h = h, .off = b.gpu - h.buf.gpu };
+        }
+        return null;
+    }
+
+    fn codeToDevice(a: *Adapter, b: gpu.Buffer) void {
+        if (a.codeHeapOf(b)) |at| return toDevice(a, at.h.buf, at.off, b.bytes);
+        toDevice(a, b, 0, b.bytes);
+    }
+
+    fn codeFree(a: *Adapter, ctx: *anyopaque, b: gpu.Buffer) void {
+        if (a.codeHeapOf(b)) |at| {
+            _ = at.h.give(at.off);
+            return;
+        }
+        free(ctx, b);
     }
 
     fn setUp(a: *Adapter, s: *Set) gpu.Error!void {
