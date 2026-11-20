@@ -112,7 +112,10 @@ pub const GUARD: f32 = 24576;
 pub const MAX_ATTRS = 16;
 /// Scalar varyings (a vec4 is four): GL ES 3.0's 15 vectors, and room.
 pub const MAX_VARYINGS = 64;
-pub const MAX_UNIFORM_WORDS = 1024;
+/// A draw's uniform words at most (128 KiB: Direct3D 11's constant buffers
+/// a draw reads, Unigine's instance buffers near 64 KiB each, and textures'
+/// descriptors).
+pub const MAX_UNIFORM_WORDS = 32768;
 /// Buffers a pipeline's shaders may read and write besides the uniform
 /// words (Vulkan's uniform and storage buffers): bound after the textures.
 pub const MAX_BUFFERS = 32;

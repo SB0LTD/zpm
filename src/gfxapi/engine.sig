@@ -948,9 +948,13 @@ pub const MAX_DOOMED = 128;
 /// Draws' uniforms (Draw.uniforms) go one after another into a host
 /// buffer of UNI_RING_BYTES (Engine.uniformsFor), in UNI_CHUNK pieces,
 /// each written again once the batches that read it are done.
-pub const UNI_RING_BYTES = 4 << 20;
-const UNI_CHUNK = 64 << 10;
+pub const UNI_RING_BYTES = 16 << 20;
+/// (a piece holds the largest draw's words: raster.MAX_UNIFORM_WORDS)
+const UNI_CHUNK = 256 << 10;
 const UNI_CHUNKS = UNI_RING_BYTES / UNI_CHUNK;
+comptime {
+    std.debug.assert(raster.MAX_UNIFORM_WORDS * 4 <= UNI_CHUNK);
+}
 /// A draw's uniforms start on this many bytes.
 const UNI_ALIGN = 256;
 /// Reads begun at once (Engine.readStart) at most.
@@ -1099,6 +1103,12 @@ pub const Config = struct {
     pool: []u8 = &.{},
     /// Backing storage for suballocating small GPU objects.
     slabs: []Slab = &.{},
+    /// Each slab's bytes, and the largest object a slab takes: GL's 2 MiB
+    /// and 256 KiB; a Direct3D program's thousands of textures want larger
+    /// (each object past them is a GPU buffer of its own, and a process
+    /// has a few hundred: node.MAX_BUFFERS).
+    slab_bytes: usize = SLAB_BYTES,
+    slab_object: usize = MAX_SLAB_OBJECT,
     /// Scratch for KIR's interpreter, which draws on the CPU (no GPU, or
     /// it is lost); none: such draws are refused.
     cpu_work: []u8 = &.{},
@@ -1219,6 +1229,8 @@ pub const Engine = struct {
     trap: gpu.interp.Trap = .{},
     pool: Pool = .{},
     slabs: []Slab = &.{},
+    slab_bytes: usize = SLAB_BYTES,
+    slab_object: usize = MAX_SLAB_OBJECT,
     progs: [N_PROGS]gpu.Program = undefined,
     code: [N_PROGS][CODE_BYTES]u8 align(16) = undefined,
     ops: [MAX_OPS]gpu.Dispatch = undefined,
@@ -1310,7 +1322,7 @@ pub const Engine = struct {
     /// The engine in place (it must stay at `e`): the kernels compiled and
     /// loaded for cfg.dev; if any fails, everything runs on the CPU.
     pub fn init(e: *Engine, cfg: Config) void {
-        e.* = .{ .pool = Pool.init(cfg.pool), .slabs = cfg.slabs, .compiler = cfg.compiler, .work = cfg.work, .cpu_work = cfg.cpu_work, .cpu_insts = cfg.cpu_kernels, .check = cfg.check };
+        e.* = .{ .pool = Pool.init(cfg.pool), .slabs = cfg.slabs, .slab_bytes = cfg.slab_bytes, .slab_object = cfg.slab_object, .compiler = cfg.compiler, .work = cfg.work, .cpu_work = cfg.cpu_work, .cpu_insts = cfg.cpu_kernels, .check = cfg.check };
         if (cfg.dev) |d| e.graphics = cfg.graphics and d.caps.graphics and d.caps.target == .sm_120;
         e.graphics_depth = cfg.graphics_depth;
         e.depth_float = e.graphics and cfg.depth_float and cfg.graphics_depth;
@@ -1399,7 +1411,7 @@ pub const Engine = struct {
         e.reap(false);
         for (0..2) |attempt| {
             if (!e.onGpu()) break;
-            if (shareable and bytes <= MAX_SLAB_OBJECT) {
+            if (shareable and bytes <= e.slab_object) {
                 if (e.allocSmall(bytes)) |b| return .{ .buf = b, .pooled = false };
             }
             if (e.dev.?.alloc(bytes, .host)) |b| {
@@ -1418,13 +1430,13 @@ pub const Engine = struct {
         const d = e.dev.?;
         for (e.slabs) |*slab| {
             if (slab.buf.cpu.len == 0) {
-                const b = d.alloc(SLAB_BYTES, .host) catch return null;
-                if (b.cpu.len < SLAB_BYTES) {
+                const b = d.alloc(e.slab_bytes, .host) catch return null;
+                if (b.cpu.len < e.slab_bytes) {
                     d.free(b);
                     return null;
                 }
                 slab.buf = b;
-                slab.pool = Pool.init(b.cpu[0..SLAB_BYTES]);
+                slab.pool = Pool.init(b.cpu[0..e.slab_bytes]);
             }
             const cpu = slab.pool.alloc(bytes) orelse continue;
             const off = @intFromPtr(cpu.ptr) - @intFromPtr(slab.buf.cpu.ptr);
