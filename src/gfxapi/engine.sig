@@ -214,6 +214,29 @@ pub const Image = struct {
     /// takes rows alone met it): never made block linear again, so no
     /// image goes back and forth between layouts.
     no_block: bool = false,
+    /// Block-compressed (bc.Kind + 1: 1 BC1, 2 BC2, 3 BC3, 4 BC4, 5 BC4
+    /// signed, 6 BC5, 7 BC5 signed; 0 none): the memory holds the 4x4
+    /// blocks themselves, each level's rows of blocks one after another
+    /// (levelStride: a row of blocks' bytes; levelRows), and the shaders
+    /// that read it decode the texel they want (texture.sig). `format` is
+    /// what a texel decodes to (RGBA8, R8, RG8, R32F, RG32F): its channels
+    /// and kind. Never drawn into, copied, filled or mipmapped by the
+    /// engine: its writer puts the blocks in place.
+    bc: u3 = 0,
+
+    /// A block-compressed image's bytes a block (8: BC1 and BC4; 16).
+    pub fn bcBlockBytes(img: *const Image) u32 {
+        return switch (img.bc) {
+            1, 4, 5 => 8,
+            else => 16,
+        };
+    }
+
+    /// Rows of memory level `l` takes: its texel rows, or a block-compressed
+    /// image's rows of blocks.
+    pub fn levelRows(img: *const Image, l: u32) u32 {
+        return if (img.bc != 0) (img.levelHeight(l) + 3) / 4 else img.levelHeight(l);
+    }
 
     /// A float depth image's stencil plane: bytes across (whole 8-bit
     /// GOBs: nvidia gl3d.stencilPitch).
@@ -229,7 +252,7 @@ pub const Image = struct {
     /// Whether the engine may draw into, copy, read back or mipmap it: a
     /// renderable format, laid out pitch linear.
     pub fn drawable(img: *const Image) bool {
-        return img.format.renderable() and img.layout.linear();
+        return img.format.renderable() and img.layout.linear() and img.bc == 0;
     }
 
     /// A colour target the GPU's draws write: rows, or block linear with
@@ -247,6 +270,7 @@ pub const Image = struct {
         return @max(img.height >> @intCast(l), 1);
     }
     pub fn levelStride(img: *const Image, l: u32) u32 {
+        if (img.bc != 0) return (img.levelWidth(l) + 3) / 4 * img.bcBlockBytes();
         return if (l == 0) img.stride else std.mem.alignForward(u32, img.levelWidth(l) * img.format.bytes(), 4);
     }
 
