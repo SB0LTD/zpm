@@ -1394,7 +1394,7 @@ pub fn Database(comptime config: Config) type {
                     switch(node.func) {
                         .nextval,.currval,.setval,.lastval,.identity_next=>return error.UnsupportedStatement,
                         // These catalog lookups use the serialized database hook.
-                        .to_regclass,.regclass_in,.regclass_out,.pg_get_serial_sequence,.pg_table_is_visible,.pg_get_indexdef,.pg_get_constraintdef,.pg_get_triggerdef,.pg_partition_ancestors,
+                        .to_regclass,.regclass_in,.regclass_out,.pg_get_serial_sequence,.pg_table_is_visible,.pg_get_indexdef,.pg_get_constraintdef,.pg_get_triggerdef,.pg_get_viewdef,.pg_partition_ancestors,
                         .to_regnamespace,.regnamespace_in,.regnamespace_out,.to_regproc=>return error.UnsupportedStatement,
                         .pg_get_statisticsobjdef_columns,.pg_relation_is_publishable,.pg_get_partkeydef,.acldefault,.current_schemas=>return error.UnsupportedStatement,
                         .obj_description,.col_description,.shobj_description,.current_user,.session_user=>return error.UnsupportedStatement,
@@ -6968,6 +6968,18 @@ pub fn Database(comptime config: Config) type {
             return null;
         }
 
+        fn postgresViewDefinition(ptr: *anyopaque, oid: u32, _: bool, out: []u8) Error!?usize {
+            const self: *const Self = @ptrCast(@alignCast(ptr));
+            const slot = self.visibleTableSlot(oid, self.seq_snap) orelse return null;
+            const view = &self.tables[slot];
+            if (view.relkind != 'v' and view.relkind != 'm') return null;
+            const source = view.query.slice();
+            if (source.len >= out.len) return error.TextCapacity;
+            @memcpy(out[0..source.len], source);
+            out[source.len] = ';';
+            return source.len + 1;
+        }
+
         fn postgresTriggerDefinition(ptr: *anyopaque, oid: u32, pretty: bool, out: []u8) Error!?usize {
             const self: *const Self = @ptrCast(@alignCast(ptr));
             const snapshot = self.seq_snap;
@@ -8951,7 +8963,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn statementHooks(self: *Self, slot: u16, snap: Snapshot) void {
-            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .relation_name = &relationName, .relation_display_name = &relationDisplayName, .catalog_text = &catalogText, .schema_path = &catalogSchemaPath, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .trigger_definition = &postgresTriggerDefinition, .statistics_columns = &postgresStatisticsColumns, .relation_publishable = &relationPublishable, .partition_key_definition = &postgresPartitionKey, .partition_ancestors = &postgresPartitionAncestors, .namespace_lookup = &postgresNamespaceLookup, .namespace_name = &postgresNamespaceName, .routine_lookup = &postgresRoutineLookup, .routine_name = &postgresRoutineName };
+            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .relation_name = &relationName, .relation_display_name = &relationDisplayName, .catalog_text = &catalogText, .schema_path = &catalogSchemaPath, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .view_definition = &postgresViewDefinition, .trigger_definition = &postgresTriggerDefinition, .statistics_columns = &postgresStatisticsColumns, .relation_publishable = &relationPublishable, .partition_key_definition = &postgresPartitionKey, .partition_ancestors = &postgresPartitionAncestors, .namespace_lookup = &postgresNamespaceLookup, .namespace_name = &postgresNamespaceName, .routine_lookup = &postgresRoutineLookup, .routine_name = &postgresRoutineName };
             self.session.sequences = &self.seq_hook;
             self.seq_slot = slot;
             self.seq_snap = snap;

@@ -1326,6 +1326,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "pg_get_indexdef", .func = .pg_get_indexdef },
                 .{ .name = "pg_get_constraintdef", .func = .pg_get_constraintdef },
                 .{ .name = "pg_get_triggerdef", .func = .pg_get_triggerdef },
+                .{ .name = "pg_get_viewdef", .func = .pg_get_viewdef },
                 .{ .name = "pg_get_statisticsobjdef_columns", .func = .pg_get_statisticsobjdef_columns },
                 .{ .name = "pg_relation_is_publishable", .func = .pg_relation_is_publishable },
                 .{ .name = "pg_get_partkeydef", .func = .pg_get_partkeydef },
@@ -2300,7 +2301,7 @@ pub fn Binder(comptime config: types.Config) type {
                     try bindSignature(context, n, signature, .text, true);
                     n.constant = false;
                 },
-                .pg_get_constraintdef, .pg_get_triggerdef => {
+                .pg_get_constraintdef, .pg_get_triggerdef, .pg_get_viewdef => {
                     if (context.dialect != .postgres) return error.UndefinedFunction;
                     const signature: []const ast.Type = if (count == 1) &.{.oid} else &.{ .oid, .boolean };
                     try bindSignature(context, n, signature, .text, true);
