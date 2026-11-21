@@ -2,6 +2,19 @@
 
 ## Stock PostgreSQL dump and restore candidate
 
+RAMSQL `d1ddbe5` with ZPM `ed00a0a1` passed all 24 stock
+tooling checks on both PostgreSQL 16 and 18. Stock plain and custom
+imports passed row, default and constraint checks after WAL reopen.
+Stock custom archives from RamSQL restored on both native servers and
+passed the same checks. The archive fixture selects two tables and uses
+`--no-owner --no-acl`. Schema ACL metadata, generated expressions,
+partition and index discovery are exercised in separate probes.
+The local Sig catalog, change-log and snapshot contracts passed
+137, 1,089 and 122 assertions. Whole-database migrations, owner and ACL
+restore, wider schema fixtures and general PostgreSQL conformance remain
+open.
+[PG16 and PG18 stock round trips](https://github.com/SB0LTD/ramsql/actions/runs/44926381895)
+
 RAMSQL `af7af9a` with ZPM `64b1a717` passed the subscription probe
 with the standalone connection alias and progressed through operator
 dependency, security-label, and database metadata discovery. The custom
