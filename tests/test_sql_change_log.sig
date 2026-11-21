@@ -693,6 +693,42 @@ fn addIdentityToColumn() !void {
     try check(try integer(&restarted, "INSERT INTO src.t(n) VALUES (13) RETURNING id") > 40);
 }
 
+fn lateCompositePrimaryKey() !void {
+    var db: DB = .{};
+    var log: Log = .{};
+    const define = try db.begin();
+    try run(&db, define, "CREATE TABLE t(shard INTEGER, id INTEGER, v INTEGER)");
+    try run(&db, define, "INSERT INTO t VALUES (1,2,3),(2,2,4)");
+    try log.commit(&db, define);
+    const add = try db.begin();
+    try run(&db, add, "ALTER TABLE t ADD CONSTRAINT t_pk PRIMARY KEY (shard,id)");
+    try log.commit(&db, add);
+
+    var recovered: DB = .{};
+    try log.replay(&recovered);
+    try check(try integer(&recovered, "SELECT sum(v) FROM t") == 7);
+    var result: DB.Result = .{};
+    if (recovered.execute("INSERT INTO t VALUES (2,2,5)", &result)) |_| {
+        return error.RestoredCompositeAcceptedDuplicate;
+    } else |err| try check(err == error.PrimaryKeyViolation);
+
+    var duplicates: DB = .{};
+    const populate = try duplicates.begin();
+    try run(&duplicates, populate, "CREATE TABLE t(shard INTEGER, id INTEGER, v INTEGER)");
+    try run(&duplicates, populate, "INSERT INTO t VALUES (1,2,3),(1,2,4)");
+    var rejected_log: Log = .{};
+    try rejected_log.commit(&duplicates, populate);
+    if (duplicates.applyChangeRecord(log.record(1), &scratch)) |_| {
+        return error.CompositeReplayAcceptedDuplicate;
+    } else |err| try check(err == error.ChangeRecordConflict);
+    if (duplicates.execute("ALTER TABLE t ADD PRIMARY KEY (shard,id)", &result)) |_| {
+        return error.CompositeAlterAcceptedDuplicate;
+    } else |err| try check(err == error.PrimaryKeyViolation);
+    try duplicates.execute("DELETE FROM t WHERE v=4", &result);
+    try duplicates.execute("ALTER TABLE t ADD CONSTRAINT t_pk PRIMARY KEY (shard,id)", &result);
+    try check(try integer(&duplicates, "SELECT sum(v) FROM t") == 3);
+}
+
 /// Replay still rejects genuine OID conflicts atomically: a used table, key
 /// index or sequence OID, an OID below first_oid or at the top, and two
 /// creates of one OID in a record. An unused OID below the counter is
@@ -1062,6 +1098,7 @@ pub fn main(init: std.process.Init) !void {
     try scopedIdentitySequences();
     try scopedStandaloneSequences();
     try addIdentityToColumn();
+    try lateCompositePrimaryKey();
     try oidConflicts();
     try keyedIndexCollision();
     try explicitPrimaryIdentity();

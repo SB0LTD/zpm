@@ -1574,6 +1574,40 @@ pub fn Storage(comptime config: types.Config) type {
             return V.compare(borrowVersionCell(table, version, column, &scratch), value) == 0;
         }
 
+        /// An exclusive DDL or replay caller may borrow an empty scalar
+        /// index bank to validate an entire primary key without query scratch.
+        pub fn validatePrimaryColumns(table: *Table, columns: []const u8, definitions: []const V.Column, snap: Snapshot, control: ?*types.ExecutionControl) types.Error!void {
+            const bank = table.key_index[0..];
+            if (columns.len == 0 or bank.len == 0 or bank.len & (bank.len - 1) != 0) return error.IndexCapacity;
+            for (bank) |entry| if (entry != 0) return error.IndexCapacity;
+            defer @memset(bank, 0);
+            var entries: usize = 0;
+            for (0..table.row_high) |row| {
+                const version = visibleAt(table, row, snap) orelse continue;
+                if (control) |execution| try execution.checkpoint();
+                if (entries >= bank.len / 2) return error.IndexCapacity;
+                var hash: u64 = 0x51ed2701a5b3c4d9;
+                for (columns) |column| {
+                    var scratch: V.Cell = undefined;
+                    const cell = borrowVersionCell(table, version, column, &scratch);
+                    if (cell.* == .null_value) return error.NotNullViolation;
+                    try V.validate(&definitions[column], cell);
+                    hash = mix(hash ^ V.hash(cell));
+                }
+                var position: usize = @intCast(hash & (bank.len - 1));
+                while (bank[position] != 0) : (position = (position + 1) & (bank.len - 1)) {
+                    if (control) |execution| try execution.checkpoint();
+                    for (columns) |column| {
+                        var scratch: V.Cell = undefined;
+                        const candidate = borrowVersionCell(table, version, column, &scratch);
+                        if (!versionCellEquals(table, bank[position] - 1, column, candidate)) break;
+                    } else return error.PrimaryKeyViolation;
+                }
+                bank[position] = version + 1;
+                entries += 1;
+            }
+        }
+
         fn keyPosition(table: *const Table, version: u32) ?usize {
             const column = table.primary_column orelse return null;
             var scratch: V.Cell = undefined;

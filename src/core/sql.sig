@@ -7721,9 +7721,8 @@ pub fn Database(comptime config: Config) type {
             if (S.anyIntegralBank(&self.tables)) return error.UnsupportedStatement;
             const source = &self.tables[alter.table];
             try checkPendingLatePrimary(source);
-            var scalar_primary = false;
-            for (alter.columns[0..alter.count]) |*column| scalar_primary = scalar_primary or column.primary_key;
-            var primary = scalar_primary;
+            var primary = false;
+            for (alter.columns[0..alter.count]) |*column| primary = primary or column.primary_key;
             for (alter.constraints[0..alter.constraint_count]) |*constraint| primary = primary or constraint.kind == .primary;
             const late_primary = primary and !S.keyed(source);
             var fold_created_primary = false;
@@ -7747,10 +7746,6 @@ pub fn Database(comptime config: Config) type {
                     },
                     else => {},
                 };
-                // Replay's standalone late-primary operation builds a
-                // scalar index over committed rows. A fresh composite key is
-                // logged as part of CREATE before its loaded rows.
-                if (!scalar_primary and !fold_created_primary) return error.UnsupportedStatement;
             }
             if (!types.same(alter.name.slice(), source.name.slice())) {
                 try self.checkRelationTypeName(slot, source.namespace, alter.name.slice(), snap);
@@ -7838,6 +7833,13 @@ pub fn Database(comptime config: Config) type {
             var checks: [config.table_constraints]u16 = @splat(ast.none);
             try B.bindFlaggedChecks(&context, index, &alter.check_constraint, &checks);
             const table = &self.tables[index];
+            if (table.primary_column == null) {
+                if (S.primaryConstraint(table)) |primary| {
+                    if (alter.check_constraint[primary]) {
+                        try S.validatePrimaryColumns(table, table.constraints[primary].keyColumns(), table.columns[0..table.column_count], snap, self.session.control);
+                    }
+                }
+            }
             var ctx = self.evalContext("");
             var row_scratch: S.VersionRowScratch = undefined;
             for (0..table.row_high) |row| {
@@ -7866,8 +7868,8 @@ pub fn Database(comptime config: Config) type {
                 }
                 for (table.constraints[0..table.constraint_count], 0..) |*constraint, position| {
                     if (!alter.check_constraint[position]) continue;
-                    const status = if (constraint.kind == .primary and table.primary_column != null)
-                        S.primaryKeyCheck(table, &cells[table.primary_column.?], @intCast(row), snap)
+                    const status = if (constraint.kind == .primary)
+                        if (table.primary_column) |column| S.primaryKeyCheck(table, &cells[column], @intCast(row), snap) else continue
                     else if (S.scannedUnique(table, constraint))
                         S.uniqueCheck(table, constraint, cells, @intCast(row), snap)
                     else
