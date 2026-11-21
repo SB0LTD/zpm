@@ -2451,6 +2451,74 @@ test "draw: a depth-only pass (no colour target, a shadow map's) goes to the RTX
     try std.testing.expectEqual(eng_rtx.stats.graphics_draws, Rtx3d.engine3d.draws);
 }
 
+test "draw: colour targets of both layouts (a block-linear target 0, targets of rows beside it: BGRA8, and RG8 or R8 in Blackwell's own GOBs; no depth test) go to the RTX's 3D engine: the rows ones made block linear in place, the compute raster's pixels" {
+    Rtx3d.engine3d = .{};
+    Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+    Rtx.dev.withEngine(&Rtx3d.engine3d);
+    eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs, .graphics = true });
+    defer eng_rtx.deinit();
+    defer eng_rtx.unloadPipeline(&mrt_pipe);
+    const e = &eng_rtx;
+    var ab = e.newBuffer(12 * 16) orelse return error.OutOfMemory;
+    defer e.freeImage(&ab);
+    const add = raster.Blend{ .dst_rgb = .{ .c = .{ 1, 1, 1, 1 } }, .dst_a = .{ .c = .{ 1, 1, 1, 1 } }, .gl = .{ g.ONE, g.ONE, g.ONE, g.ONE } };
+    const col = rgba(.{ 0.25, 0.5, 0.75, 1 });
+    const tri = [_][3]f32{ .{ 3.5, 2.25, 0 }, .{ 50.2, 9.9, 0 }, .{ 20.75, 30.1, 0 } };
+    for ([_]engine.Format{ .rg8, .r8 }) |f3| {
+        // pics[0]: the compute raster into images of rows; pics[1]: the 3D
+        // engine, target 0 block linear (an earlier depth-tested pass's)
+        var pics: [2][3][W * H * 4]u8 = undefined;
+        const b3 = f3.bytes();
+        for (0..2) |n| {
+            var t0 = e.newImage(W, H, .rgba8) orelse return error.OutOfMemory;
+            defer e.freeImage(&t0);
+            var t1 = e.newImage(W, H, .bgra8) orelse return error.OutOfMemory;
+            defer e.freeImage(&t1);
+            var t3 = e.newImage(W, H, f3) orelse return error.OutOfMemory;
+            defer e.freeImage(&t3);
+            e.fill(&t0, t0.bounds(), 0x1020_3040, 0);
+            e.fill(&t1, t1.bounds(), 0x4040_4040, 0);
+            e.fill(&t3, t3.bounds(), 0x0000_2010, 0);
+            e.compute_only = n == 0;
+            if (n == 1) {
+                try std.testing.expect(e.promote(&t0));
+                try std.testing.expect(t0.layout.block and !t1.layout.block and !t3.layout.block);
+            }
+            const promoted = e.stats.promoted;
+            const before = e.stats.graphics_draws;
+            const computed = e.stats.compute_draws;
+            var d = raster.Draw{ .pipe = &mrt_pipe, .color = &t0, .uniforms = &col, .blend = add };
+            d.targets[1] = .{ .img = &t1 };
+            d.targets[3] = .{ .img = &t3 };
+            try featDraw(e, d, &ab, &tri);
+            const q = fullQuad(0);
+            try featDraw(e, d, &ab, &q);
+            if (n == 1) {
+                if (e.stats.graphics_draws - before != 2 or e.stats.compute_draws != computed) {
+                    for (e.said_compute) |w| if (w.len != 0) std.debug.print("both layouts: on the compute kernels: {s}\n", .{w});
+                    return error.WrongRasterizer;
+                }
+                // targets 1 and 3 made block linear once, in place, in the
+                // GOBs their texels are drawn in, and kept so
+                try std.testing.expectEqual(promoted + 2, e.stats.promoted);
+                try std.testing.expect(t1.layout.block and !t1.no_block and t1.layout.swizzle == .turing2d);
+                try std.testing.expect(t3.layout.block and !t3.no_block and t3.layout.swizzle == (if (b3 == 1) gfxapi.blocklinear.Swizzle.blackwell8 else .blackwell16));
+            }
+            e.read(&t0, 0, 0, W, H, &pics[n][0], W * 4, .rgba8);
+            e.read(&t1, 0, 0, W, H, &pics[n][1], W * 4, .bgra8);
+            e.read(&t3, 0, 0, W, H, pics[n][2][0 .. W * H * b3], W * b3, f3);
+        }
+        e.compute_only = false;
+        // the same pixels within a step (the engine's float-to-unorm
+        // rounding), and target 3 written (its texels differ from the fill)
+        for (0..3) |i| {
+            const len: usize = if (i == 2) W * H * b3 else W * H * 4;
+            for (pics[0][i][0..len], pics[1][i][0..len]) |a, b| try std.testing.expect(@abs(@as(i16, a) - b) <= 1);
+        }
+        try std.testing.expect(pics[1][2][0] != 0x10);
+    }
+}
+
 /// The RTX's compiler, but a tile kernel (gl_raster...) too big for it, as
 /// a large program's is (kir_sm120's MAX_INSTS): those draws run on the CPU.
 fn noRaster(k: *const gpu.kir.Kernel, caps: gpu.Caps, work: *gpu.Work, out: []u8) anyerror!gpu.Binary {
