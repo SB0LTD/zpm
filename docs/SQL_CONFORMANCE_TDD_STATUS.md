@@ -9,6 +9,17 @@ stateless initialization and ASCII case folding. Custom templates,
 custom dictionary options and direct SQL invocation of the internal
 callbacks remain open.
 
+RAMSQL `4f7ab02` with ZPM `516ed804` passed template discovery on
+PostgreSQL 16 and 18. Both lanes matched the stock catalog projection,
+text and binary `regproc` results, callback signatures, and default
+dictionary normalization for mixed case, common words and inflections.
+Native plain and custom imports passed with row and constraint checks
+after WAL reopen. Outbound `pg_dump` passed template discovery and stopped
+with `TableNotFound` on `pg_ts_dict`. Dictionary discovery needs the
+supported dictionary's owner, namespace, template link and initialization
+options. Both stock directions on both versions remain the merge gate.
+[PostgreSQL 16 and 18 text-search template CI](https://github.com/SB0LTD/ramsql/actions/runs/44909920551)
+
 `pg_ts_parser` exposes `pg_catalog.default`, the tokenizer used by
 `pg_catalog.simple`. The startup, next-token, shutdown and token-type
 references use `regproc` and resolve through `pg_proc`. The token-type
@@ -26,11 +37,8 @@ passed stock plain and custom imports with row and constraint checks after
 WAL reopen. Local WSL could not start, so the standalone Sig catalog suite
 was not run for this revision.
 
-Outbound `pg_dump` passed parser discovery on both versions and stopped
-with `TableNotFound` on `pg_ts_template`. The next native check should
-compare the supported dictionary template's initialization and lexeme
-normalization references and verify their behavior. Both stock directions
-on both versions remain the merge gate.
+That candidate passed parser discovery on both versions and stopped
+with `TableNotFound` on `pg_ts_template`.
 [PostgreSQL 16 and 18 text-search parser CI](https://github.com/SB0LTD/ramsql/actions/runs/44906328296)
 
 `pg_opclass` and `pg_opfamily` share the registry for 26 default index
