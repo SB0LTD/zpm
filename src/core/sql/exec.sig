@@ -309,6 +309,7 @@ pub fn Exec(comptime config: types.Config) type {
                 var out: List = .{ .start = @intCast(self.work.ref_low) };
                 if (p.series == .json_table) return self.jsonTableRows(p, outer);
                 if (p.series == .partition_ancestors) return self.partitionAncestorRows(p, &ctx);
+                if (p.series == .options_to_table) return self.optionRows(p, &ctx);
                 if (p.series == .none) {
                     const at = try self.cells(p.width);
                     self.work.cells[at] = try E.eval(&ctx, p.function);
@@ -342,7 +343,7 @@ pub fn Exec(comptime config: types.Config) type {
                         const zero: V.Cell = .{ .interval = .{} };
                         direction = V.compare(&step, &zero);
                     },
-                    .none, .json_table, .partition_ancestors => unreachable,
+                    .none, .json_table, .partition_ancestors, .options_to_table => unreachable,
                 }
                 if (direction == 0) return error.InvalidParameterValue;
                 var current = args[0];
@@ -380,6 +381,27 @@ pub fn Exec(comptime config: types.Config) type {
                     const at = try self.cells(p.width);
                     self.work.cells[at] = .{ .integer = oid };
                     if (p.ordinality) self.work.cells[at + 1] = .{ .integer = @intCast(position) };
+                    try self.push(&rows, at);
+                }
+                return self.finish(p, rows);
+            }
+
+            fn optionRows(self: *Query, p: *const B.Plan, ctx: *const E.Context) Error!List {
+                var rows: List = .{ .start = @intCast(self.work.ref_low) };
+                const options = try E.eval(ctx, self.pool.nodes[p.function].b);
+                if (options == .null_value) return rows;
+                var reader = V.Arrays.Reader.init(options.array.slice());
+                var entry: V.Cell = undefined;
+                while (reader.next(&entry)) {
+                    try self.session.checkpoint();
+                    if (entry == .null_value) return error.NullValueNotAllowed;
+                    const option = entry.text.slice();
+                    const separator = @import("std").mem.indexOfScalar(u8, option, '=');
+                    const at = try self.cells(p.width);
+                    const row_cells = self.work.cells[at..][0..p.width];
+                    row_cells[0] = try E.textCell(option[0 .. separator orelse option.len]);
+                    row_cells[1] = if (separator) |index| try E.textCell(option[index + 1 ..]) else .null_value;
+                    if (p.ordinality) row_cells[2] = .{ .integer = @as(i64, rows.count) + 1 };
                     try self.push(&rows, at);
                 }
                 return self.finish(p, rows);
@@ -706,7 +728,11 @@ pub fn Exec(comptime config: types.Config) type {
             /// Items first..last joined left-deep; each later operand is one
             /// item or a parenthesized group (Source.group_end).
             fn joinRange(self: *Query, p: *const B.Plan, ctx: *E.Context, tuple_rows: *TupleRows, outer: ?*const E.Context, first: usize, last: usize) Error!Tuples {
-                var current = try self.leafTuples(p, first, try self.sourceRows(&p.sources[first], outer, false, none));
+                const source = &p.sources[first];
+                // A lateral first item can still refer to an enclosing query.
+                // Its bound levels include this SELECT's context.
+                const source_outer = if (source.lateral) ctx else outer;
+                var current = try self.leafTuples(p, first, try self.sourceRows(source, source_outer, false, none));
                 var next = first + 1;
                 while (next <= last) {
                     const end: usize = if (p.sources[next].group_end != none) p.sources[next].group_end else next;

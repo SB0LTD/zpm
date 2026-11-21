@@ -76,6 +76,7 @@ pub fn Builtins(comptime config: types.Config, comptime E: type) type {
             var out: strings.Out = .{ .bytes = &result.bytes };
             const count = argumentCount(ctx, n);
             switch (n.func) {
+                .quote_ident, .quote_literal => try strings.quoteSql(textOf(&cells[0]), n.func == .quote_ident, &out, control),
                 .lower => try strings.mapCase(textOf(&cells[0]), .lower, &out, control),
                 .upper => try strings.mapCase(textOf(&cells[0]), .upper, &out, control),
                 .initcap => try strings.mapCase(textOf(&cells[0]), .initcap, &out, control),

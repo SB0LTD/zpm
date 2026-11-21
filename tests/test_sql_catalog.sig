@@ -188,6 +188,28 @@ fn textConfigurationDiscovery() !void {
         "simple|pg_catalog|default");
 }
 
+fn foreignWrapperDiscovery() !void {
+    const options = "array_to_string(ARRAY(SELECT quote_ident(option_name) || ' ' || quote_literal(option_value) "
+        ++ "FROM pg_options_to_table(fdwoptions) ORDER BY option_name), E',\\n    ')";
+    const discovery = "SELECT tableoid,oid,fdwname,fdwowner,fdwhandler::pg_catalog.regproc,fdwvalidator::pg_catalog.regproc,"
+        ++ "fdwacl,acldefault('F',fdwowner)," ++ options ++ " AS fdwoptions FROM pg_foreign_data_wrapper";
+    try expect(discovery, "");
+    try run("CREATE FOREIGN DATA WRAPPER catalog_wrapper");
+    try expect("SELECT tableoid,fdwname,fdwhandler::pg_catalog.regproc,fdwacl IS NULL,acldefault('F',fdwowner)::text,"
+        ++ options ++ " FROM pg_foreign_data_wrapper", "2328|catalog_wrapper|-|t|{ramsql=U/ramsql}|");
+    try run("DROP FOREIGN DATA WRAPPER catalog_wrapper");
+    try expect("SELECT * FROM pg_catalog.pg_options_to_table(ARRAY['z=a=b','a=','flag']) WITH ORDINALITY",
+        "z|a=b|1;a||2;flag|NULL|3");
+    try expect("SELECT COUNT(*) FROM pg_options_to_table(NULL)", "0");
+    try expect("SELECT COUNT(*) FROM pg_options_to_table('{}'::text[])", "0");
+    try rejects("SELECT * FROM pg_options_to_table(ARRAY[NULL]::text[])", error.NullValueNotAllowed);
+    try expect("SELECT id," ++ options
+        ++ " FROM (VALUES (1, ARRAY['mixed Case=don''t','_safe=path']), (2, ARRAY['select=x'])) AS f(id,fdwoptions) ORDER BY id",
+        "1|_safe 'path',\n    \"mixed Case\" 'don''t';2|\"select\" 'x'");
+    try expect("SELECT quote_ident('A\"B'),quote_literal(E'a\\\\b'),quote_literal(42),quote_ident(NULL)",
+        "\"A\"\"B\"|E'a\\\\b'|'42'|NULL");
+}
+
 fn lifecycle() !void {
     try run("CREATE TABLE a (id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY, amount NUMERIC(10,2), at TIMESTAMPTZ(3), doc JSONB, label TEXT DEFAULT 'd', n INTEGER DEFAULT 2 + 3)");
     try expect(public_tables, "a");
@@ -333,6 +355,7 @@ pub fn main(init: std.process.Init) !void {
     try textTemplateDiscovery();
     try textDictionaryDiscovery();
     try textConfigurationDiscovery();
+    try foreignWrapperDiscovery();
     try lifecycle();
     try replay();
     try characterMetadata();

@@ -532,7 +532,7 @@ pub fn Binder(comptime config: types.Config) type {
         /// FROM (one row).
         pub const Series = enum { none, integer, numeric, timestamp,
             // JSON_TABLE (B11 json-agg lane): `function` is the table node.
-            json_table, partition_ancestors };
+            json_table, partition_ancestors, options_to_table };
 
         /// A bound query block of the general engine (design §4.9). Its
         /// materialized rows are `width` cells: the `count` visible output
@@ -1339,6 +1339,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "ascii", .func = .ascii },               .{ .name = "chr", .func = .chr },
                 .{ .name = "translate", .func = .translate },       .{ .name = "concat", .func = .concat },
                 .{ .name = "concat_ws", .func = .concat_ws },       .{ .name = "overlay", .func = .overlay },
+                .{ .name = "quote_ident", .func = .quote_ident },   .{ .name = "quote_literal", .func = .quote_literal },
                 .{ .name = "to_hex", .func = .to_hex },
                 // Mathematical functions (B11).
                 .{ .name = "power", .func = .power },               .{ .name = "pow", .func = .power },
@@ -2302,7 +2303,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .identity_next, .regclass_in, .regtype_in, .regclass_out, .regtype_out, .regnamespace_in, .regnamespace_out => unreachable,
                 .pg_partition_ancestors, .array_subquery => return error.UnsupportedStatement,
                 .lower, .upper, .initcap, .char_length, .octet_length, .bit_length, .substring, .btrim, .ltrim, .rtrim, .strpos, .replace,
-                .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .concat, .concat_ws,
+                .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .concat, .concat_ws, .quote_ident, .quote_literal,
                 .overlay, .to_hex => try typeStringFunction(context, n, count),
                 .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .sind, .cosd, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => try typeMathFunction(context, n, count),
                 .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => try typeTemporalFunction(context, n, count),
@@ -2948,7 +2949,18 @@ pub fn Binder(comptime config: types.Config) type {
         fn typeStringFunction(context: *const Context, n: *ast.Node, count: usize) Error!void {
             const T = ast.Type;
             switch (n.func) {
-                .lower, .upper, .initcap, .reverse => try bindSignature(context, n, &[_]T{.text}, .text, true),
+                .lower, .upper, .initcap, .reverse, .quote_ident => try bindSignature(context, n, &[_]T{.text}, .text, true),
+                .quote_literal => {
+                    if (count != 1) return error.UndefinedFunction;
+                    const from = argumentType(context, n, 0);
+                    if (from != .unknown and !value.stringType(from)) {
+                        n.b = try convert(context, n.b, .text, -1, .explicit);
+                        n.ty = .text;
+                        n.constant = false;
+                        return;
+                    }
+                    try bindSignature(context, n, &[_]T{.text}, .text, true);
+                },
                 // octet_length(bpchar) counts CHAR(n) padding; the others read
                 // CHAR(n) through text, which drops trailing spaces.
                 .char_length, .octet_length, .bit_length, .ascii => try bindSignature(context, n, &[_]T{if (n.func == .octet_length and count == 1 and argumentType(context, n, 0) == .bpchar) .bpchar else .text}, .int4, true),
@@ -6723,6 +6735,14 @@ pub fn Binder(comptime config: types.Config) type {
                 call.ty = .oid;
                 series = .partition_ancestors;
                 ty = .oid;
+            } else if (context.dialect == .postgres and types.same(name.slice(), "pg_options_to_table") and
+                (if (item.schema) |schema| types.same(toName(context, schema).slice(), "pg_catalog") else true))
+            {
+                if (call.star or call.distinct or call.c != none or call.order != none or call.b == none or context.node(call.b).next != none) return error.UndefinedFunction;
+                try typeExpr(context, &inner, call.b);
+                try bindSignature(context, call, &.{types.arrayType(.text).?}, .text, true);
+                series = .options_to_table;
+                ty = .text;
             } else {
                 try typeExpr(context, &inner, item.function);
                 ty = context.node(item.function).ty;
@@ -6739,17 +6759,23 @@ pub fn Binder(comptime config: types.Config) type {
             p.tys[0] = ty;
             p.typmods[0] = -1;
             p.count = 1;
-            if (item.ordinality) {
-                // A one-column configuration has no slot for the ordinality
-                // column; the comptime branch keeps index 1 out of its build.
+            if (series == .options_to_table) {
                 if (comptime p.names.len < 2) return error.ColumnCapacity;
-                if (comptime p.names.len >= 2) {
-                    p.targets[1] = try context.pool.add(.{ .kind = .null_literal, .ty = .int8, .constant = true });
-                    p.names[1] = literalName("ordinality");
-                    p.tys[1] = .int8;
-                    p.typmods[1] = -1;
-                    p.count = 2;
-                }
+                p.names[0] = literalName("option_name");
+                p.targets[1] = try context.pool.add(.{ .kind = .null_literal, .ty = .text, .constant = true });
+                p.names[1] = literalName("option_value");
+                p.tys[1] = .text;
+                p.typmods[1] = -1;
+                p.count = 2;
+            }
+            if (item.ordinality) {
+                const column = p.count;
+                if (column == p.names.len) return error.ColumnCapacity;
+                p.targets[column] = try context.pool.add(.{ .kind = .null_literal, .ty = .int8, .constant = true });
+                p.names[column] = literalName("ordinality");
+                p.tys[column] = .int8;
+                p.typmods[column] = -1;
+                p.count += 1;
             }
             p.width = p.count;
             return id;

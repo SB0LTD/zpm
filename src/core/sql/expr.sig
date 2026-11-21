@@ -372,7 +372,7 @@ pub fn Eval(comptime config: types.Config) type {
             return &base[n.column];
         }
 
-        fn textCell(bytes: []const u8) Error!V.Cell {
+        pub fn textCell(bytes: []const u8) Error!V.Cell {
             if (bytes.len > config.text_bytes) return error.TextCapacity;
             var text: V.Text = .{ .len = bytes.len };
             @memcpy(text.bytes[0..bytes.len], bytes);
@@ -478,6 +478,7 @@ pub fn Eval(comptime config: types.Config) type {
                 'r' => "arwdDxt",
                 's' => "rwU",
                 't' => "C",
+                'F', 'S' => "U",
                 else => return error.UnsupportedStatement,
             };
             const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
@@ -1451,7 +1452,7 @@ pub fn Eval(comptime config: types.Config) type {
                         return textCell(buffer[0..length]);
                     },
                     .lower, .upper, .initcap, .char_length, .octet_length, .bit_length, .substring, .btrim, .ltrim, .rtrim, .strpos, .replace,
-                    .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .concat, .concat_ws,
+                    .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .concat, .concat_ws, .quote_ident, .quote_literal,
                     .overlay, .to_hex => return builtins.Builtins(config, @This()).call(ctx, n),
                     .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .sind, .cosd, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => return builtins.Builtins(config, @This()).call(ctx, n),
                     .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => return builtins.Builtins(config, @This()).call(ctx, n),
