@@ -2,6 +2,31 @@
 
 ## Stock PostgreSQL dump and restore candidate
 
+The stock `pg_foreign_data_wrapper` query uses the allocator-free
+`pg_options_to_table(text[])` row source, SQL identifier and literal
+quoting, and the default owner-only USAGE ACL. The Sig executor preserves
+the outer row when the option function is the first FROM item in a
+correlated array subquery. The PostgreSQL codec resolves explicit SELECT
+parameter casts before probing FROM relations, so clients can bind option
+arrays for table functions and derived tables. FDW handler callbacks and
+DDL for setting wrapper options remain open. Identifier quoting uses
+PostgreSQL 18's keyword categories.
+
+The Windows Sig catalog, query-composition, catalog-security and
+PostgreSQL protocol suites passed 101, 7,467, 1,594 and 23,830
+assertions, respectively.
+
+RAMSQL `0757df8` with ZPM `aaf1faa1` passed foreign-data-wrapper
+discovery on PostgreSQL 16 and 18. Both lanes compared the stock
+projection on an empty catalog and a created wrapper, option expansion
+with text and binary results, quoting, and parameterized correlated
+subqueries. Native plain and custom imports passed with row and
+constraint checks after WAL reopen. Outbound stock `pg_dump` passed the
+wrapper query and stopped with `TableNotFound` on `pg_default_acl` before
+producing an archive. Both stock directions on both versions remain the
+merge gate.
+[PostgreSQL 16 and 18 foreign-data-wrapper CI](https://github.com/SB0LTD/ramsql/actions/runs/44918456811)
+
 `pg_ts_config` exposes the supported `pg_catalog.simple` configuration
 (OID 3748), with the bootstrap owner and a reference to the built-in
 `default` parser (OID 3722). The standalone Windows Sig catalog suite
@@ -15,9 +40,7 @@ against PostgreSQL 16 and 18 in text and binary modes. Native plain
 and custom imports passed with row and constraint checks after WAL
 reopen. Outbound `pg_dump` passed configuration discovery and then
 received `UndefinedFunction` from its `pg_foreign_data_wrapper`
-query. Qualification now needs to isolate that query's missing
-function support, including SQL quoting and `pg_options_to_table`.
-Both stock directions on both versions remain the merge gate.
+query in that earlier revision.
 [PostgreSQL 16 and 18 text-search configuration CI](https://github.com/SB0LTD/ramsql/actions/runs/44912646310)
 
 `pg_ts_dict` exposes the built-in `pg_catalog.simple` dictionary.
