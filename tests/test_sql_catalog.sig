@@ -179,6 +179,15 @@ fn textDictionaryDiscovery() !void {
         "simple|pg_catalog|simple");
 }
 
+fn textConfigurationDiscovery() !void {
+    try expect("SELECT tableoid,oid,cfgname,cfgnamespace,cfgowner,cfgparser FROM pg_ts_config",
+        "3602|3748|simple|11|10|3722");
+    try expect("SELECT c.cfgname,n.nspname,p.prsname FROM pg_catalog.pg_ts_config c "
+        ++ "JOIN pg_namespace n ON n.oid=c.cfgnamespace JOIN pg_ts_parser p ON p.oid=c.cfgparser "
+        ++ "JOIN pg_roles r ON r.oid=c.cfgowner WHERE r.oid=10",
+        "simple|pg_catalog|default");
+}
+
 fn lifecycle() !void {
     try run("CREATE TABLE a (id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY, amount NUMERIC(10,2), at TIMESTAMPTZ(3), doc JSONB, label TEXT DEFAULT 'd', n INTEGER DEFAULT 2 + 3)");
     try expect(public_tables, "a");
@@ -323,6 +332,7 @@ pub fn main(init: std.process.Init) !void {
     try textParserDiscovery();
     try textTemplateDiscovery();
     try textDictionaryDiscovery();
+    try textConfigurationDiscovery();
     try lifecycle();
     try replay();
     try characterMetadata();

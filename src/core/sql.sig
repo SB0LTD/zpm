@@ -6210,6 +6210,12 @@ pub fn Database(comptime config: Config) type {
                     intCell(CO.bootstrap_role), intCell(dictionary.template_oid), .null_value });
                 return;
             }
+            if (view == .pg_ts_config) {
+                const configuration = catalog_module.simple_configuration;
+                try sink.add(&.{ intCell(configuration.oid), nameCell(configuration.name), intCell(catalog_module.catalog_namespace),
+                    intCell(CO.bootstrap_role), intCell(configuration.parser_oid) });
+                return;
+            }
             if (view == .pg_language) {
                 try sink.add(&.{ intCell(operator_catalog.internal_language_oid), nameCell("internal"), intCell(CO.bootstrap_role), boolCell(false), boolCell(false), intCell(0), intCell(0), intCell(0), .null_value });
                 try sink.add(&.{ intCell(catalog_module.sql_language_oid), nameCell("sql"), intCell(CO.bootstrap_role), boolCell(false), boolCell(true), intCell(0), intCell(0), intCell(0), .null_value });
