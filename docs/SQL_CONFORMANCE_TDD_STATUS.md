@@ -13,7 +13,20 @@ typed operands against both PostgreSQL versions.
 
 For first-source catalog rows in eligible left-deep joins, the executor
 applies the existing early WHERE filter before reserving workspace for a
-row. The routine catalog tests retain their small workspace.
+row. The filter is limited to infallible predicates and kept out of outer
+joins. The routine catalog suite passed 767 assertions and replayed 156
+WAL records with its existing workspace.
+
+On RAMSQL `1de34ce` with ZPM `b70b3dfb`, PostgreSQL 16 and 18 both
+passed the comparison of all 427 operator signatures, implementation
+signatures and representative expression results. Both also passed stock
+plain and custom imports and row and constraint checks after WAL reopen.
+Outbound `pg_dump` reached access-method discovery on both versions and
+stopped with `UndefinedObject` on `pg_am.amhandler::pg_catalog.regproc`.
+The next check should compare the handler as a typed routine reference
+for the implemented access methods and verify its resolution through
+`pg_proc`. Both stock directions on both versions remain the merge gate.
+[PostgreSQL 16 and 18 operator discovery CI](https://github.com/SB0LTD/ramsql/actions/runs/44894008040)
 
 Type discovery now exposes `pg_type.typacl` as `aclitem[]` and
 `typisdefined` as boolean for defined built-in and user types. The types
@@ -36,12 +49,8 @@ passed the catalog comparisons and stock plain and custom imports, including
 row and constraint checks after WAL reopen. The local Sig catalog and catalog
 security suites passed 75 and 1,594 assertions, respectively.
 
-Both outbound clients passed type and language discovery and stopped at
-operator discovery with `TableNotFound`. The next native comparison should
-cover `pg_operator` relation identity, operator namespace and owner,
-unary/binary argument OIDs, and implementation function OIDs. Verify any
-published operator rows against the operators RAMSQL actually resolves.
-Both stock directions on both versions remain the merge gate.
+That candidate passed type and language discovery and stopped at operator
+discovery with `TableNotFound`.
 [PostgreSQL 16 and 18 type discovery CI](https://github.com/SB0LTD/ramsql/actions/runs/44805214919)
 
 Function discovery now reads routine owners and SQL language OIDs from the
