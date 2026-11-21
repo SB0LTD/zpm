@@ -222,6 +222,7 @@ const pg_class_columns = [_]ViewColumn{
     col("relallvisible", .int4), col("relallfrozen", .int4), col("relfrozenxid", .xid), col("relminmxid", .xid),
     col("relacl", types.arrayType(.aclitem).?), col("reloptions", types.arrayType(.text).?),
 };
+pub const pg_class_acl_column = pg_class_columns.len - 2;
 const pg_attribute_columns = [_]ViewColumn{
     col("attrelid", .oid), col("attname", .name), col("atttypid", .oid), col("atttypmod", .int4),
     col("attnum", .int2), col("attnotnull", .boolean), col("attisdropped", .boolean),

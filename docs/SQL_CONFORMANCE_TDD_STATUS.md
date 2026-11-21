@@ -2,6 +2,21 @@
 
 ## Stock PostgreSQL dump and restore candidate
 
+The full ZPM test run on `ab781b39` found five failures outside the
+qualified migration fixture. UNNEST detection now runs in SELECT target
+parsing so VALUES forms never read SELECT target nodes. Inner catalog
+joins can filter either source before retaining catalog rows, and a
+single-block query reads relation ACL arrays only when it references
+them. The composite and covering-index contracts check PostgreSQL's
+internal character type and complete `indkey` values.
+[Full ZPM run](https://github.com/SB0LTD/zpm/actions/runs/44926870713)
+
+Separate whole-database work passed all 27 stock checks on PostgreSQL
+16 and 18 at RAMSQL `f051b2e`. The fixture preserves a named schema
+owner, a reader's schema and table grants, a table comment, rows and
+defaults. The RamSQL import repeats these checks after WAL reopen.
+[Whole-database CI](https://github.com/SB0LTD/ramsql/actions/runs/44929034456)
+
 RAMSQL `d1ddbe5` with ZPM `ed00a0a1` passed all 24 stock
 tooling checks on both PostgreSQL 16 and 18. Stock plain and custom
 imports passed row, default and constraint checks after WAL reopen.

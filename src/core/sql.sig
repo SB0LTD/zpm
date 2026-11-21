@@ -6052,7 +6052,7 @@ pub fn Database(comptime config: Config) type {
             });
         }
 
-        fn tableClass(self: *const Self, table: *const S.Table, snapshot: Snapshot, relations: []const K.Found, session_values: *const value_module.Session) Error!ClassProperties {
+        fn tableClass(self: *const Self, table: *const S.Table, snapshot: Snapshot, relations: []const K.Found, session_values: *const value_module.Session, include_acl: bool) Error!ClassProperties {
             var properties: ClassProperties = .{
                 .has_index = S.keyed(table) or table.index_count != 0,
                 .has_rule = table.relkind == 'v' or table.relkind == 'm',
@@ -6060,7 +6060,7 @@ pub fn Database(comptime config: Config) type {
                 .partition = table.parent != 0 and table.partition.bound != .none,
                 .populated = table.populated,
                 .owner = self.catalog_objects.owner(table.oid, snapshot),
-                .acl = try self.relationAcl(table.oid, snapshot),
+                .acl = if (include_acl) try self.relationAcl(table.oid, snapshot) else .null_value,
             };
             if (properties.partition) properties.partition_bound = try self.partitionBoundText(table, snapshot, session_values);
             for (table.constraints[0..table.constraint_count]) |*constraint| switch (constraint.kind) {
@@ -6250,6 +6250,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn fillViewRows(self:*const Self,session_values:*const value_module.Session,snapshot:Snapshot,pool:*A.Pool,view:catalog_module.View,sink:*X.RowSink) Error!void {
+            const include_class_acl = view == .pg_class and sink.referencesColumn(catalog_module.pg_class_acl_column);
             if (view == .pg_settings) return error.UnsupportedStatement;
             // This catalog stores explicit ALTER DEFAULT PRIVILEGES entries.
             // Built-in defaults come from acldefault() and do not create rows.
@@ -6511,7 +6512,7 @@ pub fn Database(comptime config: Config) type {
                     switch (view) {
                         .pg_partitioned_table => if (table.relkind == 'p') try self.partitionCatalogRow(table, relations[0..count], sink),
                         .pg_class => {
-                            try classRow(sink, table.oid, name, table.namespace, table.relkind, table.column_count, try self.tableClass(table, snapshot, relations[0..count], session_values));
+                            try classRow(sink, table.oid, name, table.namespace, table.relkind, table.column_count, try self.tableClass(table, snapshot, relations[0..count], session_values, include_class_acl));
                             if (S.keyed(table)) try classRow(sink, S.primaryIndexOid(table), pkey.slice(), table.namespace, 'i', primary_columns.len, .{ .owner = self.catalog_objects.owner(table.oid, snapshot) });
                             for (table.indexes[0..table.index_count]) |*index| {
                                 if (index.oid == 0) continue;

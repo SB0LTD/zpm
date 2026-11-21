@@ -167,15 +167,26 @@ pub fn Exec(comptime config: types.Config) type {
             query: *Query,
             list: List,
             width: usize,
+            source_index: usize = 0,
             projection: ?*CatalogProjection = null,
-            first_filter: ?*FirstCatalogFilter = null,
+            filter: ?*CatalogFilter = null,
 
             const CatalogProjection = struct {
                 plan: *const B.Plan,
                 context: E.Context,
                 wanted: u64,
             };
-            const FirstCatalogFilter = struct { context: E.Context, predicate: u16 };
+            const CatalogFilter = struct { context: E.Context, predicate: u16 };
+
+            /// In a single bound query block, all column references are in
+            /// this pool and their relation ordinals have one meaning.
+            pub fn referencesColumn(self: *const RowSink, column: usize) bool {
+                if (self.query.plans.len != 1) return true;
+                for (self.query.pool.nodes[0..self.query.pool.len]) |node| {
+                    if (node.kind == .column and node.level == 0 and node.relation == self.source_index and node.column == column) return true;
+                }
+                return false;
+            }
 
             pub fn add(self: *RowSink, cells: []const V.Cell) Error!void {
                 try self.query.session.checkpoint();
@@ -188,9 +199,10 @@ pub fn Exec(comptime config: types.Config) type {
                     }
                     return;
                 }
-                if (self.first_filter) |filter| {
-                    filter.context.tuple[0] = cells.ptr;
-                    if (!try self.query.earlyKeep(&filter.context, filter.predicate, 0, true)) return;
+                if (self.filter) |filter| {
+                    const source = self.source_index;
+                    filter.context.tuple[source] = cells.ptr;
+                    if (!try self.query.earlyKeepWithin(&filter.context, filter.predicate, source, source, true)) return;
                 }
                 const at = try self.query.cells(self.width);
                 for (cells, 0..) |cell, index| self.query.work.cells[at + index] = cell;
@@ -494,7 +506,7 @@ pub fn Exec(comptime config: types.Config) type {
 
             // ---- FROM items and joins ----------------------------------
 
-            fn sourceRows(self: *Query, source: *const B.Source, outer: ?*const E.Context, synchronize_scan: bool, first_filter: u16) Error!List {
+            fn sourceRows(self: *Query, source: *const B.Source, outer: ?*const E.Context, synchronize_scan: bool, source_index: usize, predicate: u16) Error!List {
                 if (source.sample_method != 0) return self.sampledRows(source, outer);
                 if (source.table) |index| {
                     const table = &self.tables[index];
@@ -512,11 +524,11 @@ pub fn Exec(comptime config: types.Config) type {
                 if (source.cte != B.no_cte) return self.materializeCte(source.cte, outer);
                 if (source.view) |view| {
                     const hook = self.work.views orelse return error.UnsupportedStatement;
-                    var sink: RowSink = .{ .query = self, .list = .{ .start = @intCast(self.work.ref_low) }, .width = catalog.viewColumns(view).len };
-                    var filter: RowSink.FirstCatalogFilter = undefined;
-                    if (first_filter != none) {
-                        filter = .{ .context = self.context(outer), .predicate = first_filter };
-                        sink.first_filter = &filter;
+                    var sink: RowSink = .{ .query = self, .list = .{ .start = @intCast(self.work.ref_low) }, .width = catalog.viewColumns(view).len, .source_index = source_index };
+                    var filter: RowSink.CatalogFilter = undefined;
+                    if (predicate != none) {
+                        filter = .{ .context = self.context(outer), .predicate = predicate };
+                        sink.filter = &filter;
                     }
                     try hook.rows(hook.ptr, view, &sink);
                     return sink.list;
@@ -588,25 +600,33 @@ pub fn Exec(comptime config: types.Config) type {
             }
 
             fn availableAtStage(self: *const Query, id: u16, stage: usize, comptime require_infallible: bool) bool {
+                return self.availableWithin(id, 0, stage, require_infallible);
+            }
+
+            fn earlyKeep(self: *const Query, ctx: *E.Context, id: u16, stage: usize, comptime require_infallible: bool) Error!bool {
+                return self.earlyKeepWithin(ctx, id, 0, stage, require_infallible);
+            }
+
+            fn availableWithin(self: *const Query, id: u16, first: usize, stage: usize, comptime require_infallible: bool) bool {
                 if (id == none) return true;
                 const n = self.pool.nodes[id];
                 return switch (n.kind) {
                     .row_compare => blk: {
-                        if (n.a != none) break :blk self.availableAtStage(n.a, stage, require_infallible);
+                        if (n.a != none) break :blk self.availableWithin(n.a, first, stage, require_infallible);
                         var item = n.b;
                         while (item != none) : (item = self.pool.nodes[item].next) {
                             const pair = self.pool.nodes[item];
-                            if (!self.availableAtStage(pair.a, stage, require_infallible) or !self.availableAtStage(pair.b, stage, require_infallible)) break :blk false;
+                            if (!self.availableWithin(pair.a, first, stage, require_infallible) or !self.availableWithin(pair.b, first, stage, require_infallible)) break :blk false;
                         }
                         break :blk true;
                     },
                     .row_constructor, .row_in => blk: {
                         if (require_infallible and n.kind == .row_constructor) break :blk false;
                         var item = n.b;
-                        while (item != none) : (item = self.pool.nodes[item].next) if (!self.availableAtStage(item, stage, require_infallible)) break :blk false;
+                        while (item != none) : (item = self.pool.nodes[item].next) if (!self.availableWithin(item, first, stage, require_infallible)) break :blk false;
                         break :blk true;
                     },
-                    .column, .catalog_tableoid => n.level == 0 and n.relation <= stage,
+                    .column, .catalog_tableoid => n.level == 0 and n.relation >= first and n.relation <= stage,
                     .param => require_infallible and self.session.params != null and n.integer >= 1 and n.integer <= config.statement_parameters,
                     .null_literal, .bool_literal, .int_literal => true,
                     .text_literal => !require_infallible or n.ty == .unknown or n.ty == .text or n.ty == .name or (n.ty == .date and n.date_bound),
@@ -617,20 +637,20 @@ pub fn Exec(comptime config: types.Config) type {
                     },
                     .decimal_literal => !require_infallible,
                     .binary => switch (n.op) {
-                        .eq, .ne, .lt, .le, .gt, .ge => self.availableAtStage(n.a, stage, require_infallible) and self.availableAtStage(n.b, stage, require_infallible),
+                        .eq, .ne, .lt, .le, .gt, .ge => self.availableWithin(n.a, first, stage, require_infallible) and self.availableWithin(n.b, first, stage, require_infallible),
                         else => false,
                     },
-                    .and_op, .or_op => self.availableAtStage(n.a, stage, require_infallible) and self.availableAtStage(n.b, stage, require_infallible),
-                    .not_op, .test_op => self.availableAtStage(n.a, stage, require_infallible),
+                    .and_op, .or_op => self.availableWithin(n.a, first, stage, require_infallible) and self.availableWithin(n.b, first, stage, require_infallible),
+                    .not_op, .test_op => self.availableWithin(n.a, first, stage, require_infallible),
                     else => false,
                 };
             }
 
-            fn earlyKeep(self: *const Query, ctx: *E.Context, id: u16, stage: usize, comptime require_infallible: bool) Error!bool {
+            fn earlyKeepWithin(self: *const Query, ctx: *E.Context, id: u16, first: usize, stage: usize, comptime require_infallible: bool) Error!bool {
                 if (id == none) return true;
                 const n = self.pool.nodes[id];
-                if (n.kind == .and_op) return try self.earlyKeep(ctx, n.a, stage, require_infallible) and try self.earlyKeep(ctx, n.b, stage, require_infallible);
-                return !self.availableAtStage(id, stage, require_infallible) or (try E.truth(ctx, id)) == true;
+                if (n.kind == .and_op) return try self.earlyKeepWithin(ctx, n.a, first, stage, require_infallible) and try self.earlyKeepWithin(ctx, n.b, first, stage, require_infallible);
+                return !self.availableWithin(id, first, stage, require_infallible) or (try E.truth(ctx, id)) == true;
             }
 
             fn joinKeep(self: *const Query, ctx: *E.Context, id: u16, stage: usize, last: bool, early: bool) Error!bool {
@@ -638,10 +658,12 @@ pub fn Exec(comptime config: types.Config) type {
                 return !early or try self.earlyKeep(ctx, id, stage, false);
             }
 
-            /// First-source catalog predicates can be applied before the
-            /// scan retains a row. Keep the complete WHERE after the join.
-            fn firstCatalogPredicate(self: *const Query, p: *const B.Plan) u16 {
-                if (p.sources[0].view == null or p.where == none or
+            /// Single-source catalog predicates can be applied before an
+            /// inner join retains a row. The full WHERE still runs afterward.
+            fn catalogJoinPredicate(self: *const Query, p: *const B.Plan) u16 {
+                var has_catalog = false;
+                for (p.sources[0..p.source_count]) |source| has_catalog = has_catalog or source.view != null;
+                if (!has_catalog or p.where == none or
                     !self.availableAtStage(p.where, p.source_count - 1, true)) return none;
                 for (p.sources[1..p.source_count], 1..) |source, stage| {
                     if (source.join == .left or source.join == .right or source.join == .full or
@@ -663,12 +685,11 @@ pub fn Exec(comptime config: types.Config) type {
                 var current: Tuples = .{ .start = @intCast(self.work.ref_low), .count = 1, .width = 0 };
                 var early = self.earlyAvailable(p.where, p.source_count - 1) and self.prefixJoinsSafe(p);
                 for (p.sources[0..p.source_count]) |source| if (source.join == .left or source.join == .right or source.join == .full) { early = false; break; };
-                const catalog_predicate = self.firstCatalogPredicate(p);
+                const catalog_predicate = self.catalogJoinPredicate(p);
                 for (p.sources[0..p.source_count], 0..) |*source, stage| {
                     const last = stage + 1 == p.source_count;
                     const probing = source.probe != none and stage != 0;
-                    const first_filter = if (stage == 0) catalog_predicate else none;
-                    const rows: List = if (probing) .{} else try self.sourceRows(source, outer, synchronizedProjection(p), first_filter);
+                    const rows: List = if (probing) .{} else try self.sourceRows(source, outer, synchronizedProjection(p), stage, catalog_predicate);
                     const outer_join = source.join == .left or source.join == .full;
                     const tracks = source.join == .right or source.join == .full;
                     var matched: u32 = 0;
@@ -748,7 +769,7 @@ pub fn Exec(comptime config: types.Config) type {
                 // A lateral first item can still refer to an enclosing query.
                 // Its bound levels include this SELECT's context.
                 const source_outer = if (source.lateral) ctx else outer;
-                var current = try self.leafTuples(p, first, try self.sourceRows(source, source_outer, false, none));
+                var current = try self.leafTuples(p, first, try self.sourceRows(source, source_outer, false, first, none));
                 var next = first + 1;
                 while (next <= last) {
                     const end: usize = if (p.sources[next].group_end != none) p.sources[next].group_end else next;
@@ -815,7 +836,7 @@ pub fn Exec(comptime config: types.Config) type {
                         self.work.refs[lists + index * 2 + 1] = rows.count;
                     }
                 } else if (end == j) {
-                    right = try self.leafTuples(p, j, try self.sourceRows(source, outer, false, none));
+                    right = try self.leafTuples(p, j, try self.sourceRows(source, outer, false, j, none));
                 } else right = try self.joinRange(p, ctx, tuple_rows, outer, j, end);
                 const tracks = source.join == .right or source.join == .full;
                 if (lateral and tracks) return error.InvalidColumnReference;
