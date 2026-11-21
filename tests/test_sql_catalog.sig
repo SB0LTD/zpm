@@ -281,6 +281,16 @@ fn indexDumpDiscovery() !void {
     try run("DROP TABLE dump_index");
 }
 
+fn partitionDumpDiscovery() !void {
+    try run("CREATE TABLE dump_part (id integer, code text) PARTITION BY LIST (code)");
+    try run("CREATE TABLE dump_part_default PARTITION OF dump_part DEFAULT");
+    try expect("SELECT tableoid,partstrat,partnatts,partdefid='dump_part_default'::regclass,partattrs,"
+        ++ "partclass,partcollation,partexprs IS NULL FROM pg_partitioned_table", "3350|l|1|t|{2}|{3126}|{100}|t");
+    try run("DROP TABLE dump_part_default");
+    try expect("SELECT partdefid FROM pg_partitioned_table", "0");
+    try run("DROP TABLE dump_part");
+}
+
 fn lifecycle() !void {
     try run("CREATE TABLE a (id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY, amount NUMERIC(10,2), at TIMESTAMPTZ(3), doc JSONB, label TEXT DEFAULT 'd', n INTEGER DEFAULT 2 + 3)");
     try expect(public_tables, "a");
@@ -296,6 +306,9 @@ fn lifecycle() !void {
     try expect("SELECT column_name, column_default, is_identity, identity_generation FROM information_schema.columns WHERE table_name = 'a' ORDER BY ordinal_position",
         "id|NULL|YES|ALWAYS;amount|NULL|NO|NULL;at|NULL|NO|NULL;doc|NULL|NO|NULL;label|'d'::text|NO|NULL;n|(2 + 3)|NO|NULL");
     try expect("SELECT adnum, pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 'a'::regclass ORDER BY adnum", "5|'d'::text;6|(2 + 3)");
+    try expect("SELECT a.adnum,d.refobjsubid,d.deptype FROM pg_attrdef a JOIN pg_depend d "
+        ++ "ON d.classid=a.tableoid AND d.objid=a.oid WHERE a.adrelid='a'::regclass ORDER BY a.adnum",
+        "5|5|a;6|6|a");
     try expect("SELECT seqtypid, seqstart, seqincrement, seqmax, seqcycle FROM pg_sequence WHERE seqrelid = 'a_id_seq'::regclass", "23|1|1|2147483647|f");
     try expect("SELECT tc.constraint_name, tc.constraint_type, k.column_name FROM information_schema.table_constraints tc JOIN information_schema.key_column_usage k ON k.constraint_name = tc.constraint_name WHERE tc.table_name = 'a'", "a_pkey|PRIMARY KEY|id");
     // A second table (capacity 2), drop, recreate: no catalog exhaustion.
@@ -433,6 +446,7 @@ pub fn main(init: std.process.Init) !void {
     try eventTriggerDiscovery();
     try columnDiscovery();
     try indexDumpDiscovery();
+    try partitionDumpDiscovery();
     try lifecycle();
     try replay();
     try characterMetadata();

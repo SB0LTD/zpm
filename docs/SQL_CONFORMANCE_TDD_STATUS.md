@@ -2,6 +2,14 @@
 
 ## Stock PostgreSQL dump and restore candidate
 
+RAMSQL `0cadbf6` with ZPM `9b7446b8` passed CHECK and index
+discovery on PostgreSQL 16 and 18. Both lanes compared inherited CHECK
+locality, primary and covering indexes, and NULLS NOT DISTINCT.
+Both outbound stock dumps passed those queries and reached
+`pg_partitioned_table`, which returned `TableNotFound` during the
+enum hash-partition check.
+[PostgreSQL 16 and 18 CHECK and index CI](https://github.com/SB0LTD/ramsql/actions/runs/44924228856)
+
 `pg_attrdef` assigns catalog OIDs to column defaults and stored
 generation expressions. Current change records persist the OIDs,
 legacy records assign them during replay, and checkpoint counters

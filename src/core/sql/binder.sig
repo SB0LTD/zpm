@@ -3053,6 +3053,19 @@ pub fn Binder(comptime config: types.Config) type {
 
         /// Binds a column's DEFAULT or generation text (its own source) into
         /// the statement pool; generation expressions see the row (relation 0).
+        pub fn generatedColumnDependencies(context: *const Context, table: usize) Error![config.columns]bool {
+            const start = context.pool.len;
+            defer context.pool.len = start;
+            const id = try P.parseExpression(context.source, context.pool);
+            const scope = tableScope(context, table);
+            try typeExpr(context, &scope, id);
+            var columns: [config.columns]bool = @splat(false);
+            for (context.pool.nodes[start..context.pool.len]) |node| {
+                if (node.kind == .column and node.ty != .unknown and node.column < columns.len) columns[node.column] = true;
+            }
+            return columns;
+        }
+
         fn storedSource(table: usize, column: usize) i64 {
             return 1 + @as(i64, @intCast(table * config.columns + column));
         }

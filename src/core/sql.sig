@@ -6127,9 +6127,42 @@ pub fn Database(comptime config: Config) type {
             });
         }
 
+        fn singleCatalogArray(data_type: DataType, value: i64) Error!V.Cell {
+            var out: V.Text = .{};
+            var shape: array_module.Shape = .{ .element = data_type, .ndim = 1 };
+            shape.dims[0] = 1;
+            var writer = try V.Arrays.Writer.begin(&out, &shape);
+            try writer.append(&intCell(value));
+            return .{ .array = out };
+        }
+
+        fn partitionCatalogRow(self: *const Self, table: *const S.Table, relations: []const K.Found, sink: *X.RowSink) Error!void {
+            const strategy: u8 = switch (table.partition.strategy) {
+                .none => return,
+                .range => 'r',
+                .list => 'l',
+            };
+            const key = table.partition.key;
+            const data_type = table.columns[key].data_type;
+            const class = index_operator_catalog.lookupDefaultBtreeOid(data_type) orelse 0;
+            var default_oid: u32 = 0;
+            for (relations) |found| {
+                if (found.kind == 'S') continue;
+                const child = &self.tables[found.slot];
+                if (child.parent != table.oid or child.partition.bound != .default) continue;
+                default_oid = child.oid;
+                break;
+            }
+            try sink.add(&.{
+                intCell(table.oid), .{ .pg_internal_char = strategy }, intCell(1), intCell(default_oid),
+                try singleCatalogArray(.smallint, @as(i64, key) + 1), try singleCatalogArray(.oid, class),
+                try singleCatalogArray(.oid, collation.typeCollation(types.typeOfData(data_type))), .null_value,
+            });
+        }
+
         /// Derive only dependencies represented by visible stored definitions.
         /// No additional catalog identities or independently versioned rows are needed.
-        fn dependencyRows(self: *const Self, snapshot: Snapshot, relations: []const K.Found, sink: *X.RowSink) Error!void {
+        fn dependencyRows(self: *const Self, session_values: *const value_module.Session, snapshot: Snapshot, pool: *A.Pool, relations: []const K.Found, sink: *X.RowSink) Error!void {
             const relation = CO.class_relation;
             const namespace = CO.class_namespace;
             const constraint_class = catalog_module.constraint_catalog;
@@ -6151,6 +6184,22 @@ pub fn Database(comptime config: Config) type {
                 }
                 const table = &self.tables[found.slot];
                 try dependencyRow(sink, relation, table.oid, namespace, table.namespace, 0, 'n');
+                for (table.columns[0..table.column_count], 1..) |*column, number| {
+                    if (column.default_oid == 0) continue;
+                    const generated = column.default_kind == .generated;
+                    const kind: u8 = if (generated) 'i' else 'a';
+                    try dependencyRow(sink, catalog_module.attrdef_catalog, column.default_oid, relation, table.oid, @intCast(number), kind);
+                    if (generated) {
+                        const context: B.Context = .{ .source = column.expression.slice(), .tables = &self.tables,
+                            .catalog = &self.catalog, .snapshot = snapshot, .pool = pool, .legacy = false,
+                            .dialect = .postgres, .session = session_values, .routines = &self.objects };
+                        const referenced = try B.generatedColumnDependencies(&context, found.slot);
+                        for (referenced[0..table.column_count], 1..) |yes, field| {
+                            if (yes and field != number) try dependencyRow(sink, catalog_module.attrdef_catalog,
+                                column.default_oid, relation, table.oid, @intCast(field), 'n');
+                        }
+                    }
+                }
                 if (S.keyed(table) and table.primary_constraint_oid != 0) {
                     const primary_index = S.primaryIndexOid(table);
                     try dependencyRow(sink, relation, primary_index, constraint_class, table.primary_constraint_oid, 0, 'i');
@@ -6312,7 +6361,7 @@ pub fn Database(comptime config: Config) type {
             if (view == .pg_class or view == .pg_attribute) try self.compositeCatalogRows(view, snapshot, sink);
             switch (view) {
                 .pg_proc, .pg_trigger, .pg_rewrite, .pg_rules => return self.objectViewRows(snapshot, view, sink),
-                .pg_depend => return self.dependencyRows(snapshot, relations[0..count], sink),
+                .pg_depend => return self.dependencyRows(session_values, snapshot, pool, relations[0..count], sink),
                 .pg_type => {
                     for (catalog_module.builtin_pseudo_types) |info| {
                         try sink.add(&.{ intCell(info.oid), nameCell(info.name), intCell(catalog_module.catalog_namespace), intCell(info.bytes), .{ .pg_internal_char = 'p' }, nameCell("P"), intCell(0), nameCell(","), nameCell(info.input), intCell(0), intCell(0), intCell(CO.bootstrap_role), intCell(-1), boolCell(false), intCell(0), intCell(0), .null_value, boolCell(true), .{ .pg_internal_char = info.storage } });
@@ -6408,6 +6457,7 @@ pub fn Database(comptime config: Config) type {
                     var key_columns: [config.columns]u8 = undefined;
                     const primary_columns = primaryColumns(table, &key_columns);
                     switch (view) {
+                        .pg_partitioned_table => if (table.relkind == 'p') try self.partitionCatalogRow(table, relations[0..count], sink),
                         .pg_class => {
                             try classRow(sink, table.oid, name, table.namespace, table.relkind, table.column_count, try self.tableClass(table, snapshot, relations[0..count], session_values));
                             if (S.keyed(table)) try classRow(sink, S.primaryIndexOid(table), pkey.slice(), table.namespace, 'i', primary_columns.len, .{ .owner = self.catalog_objects.owner(table.oid, snapshot) });

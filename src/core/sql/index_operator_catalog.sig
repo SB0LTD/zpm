@@ -43,10 +43,14 @@ pub const btree_families = [_]Family{
 };
 
 pub fn defaultBtreeOid(comptime data_type: types.DataType) u32 {
+    return lookupDefaultBtreeOid(data_type) orelse unreachable;
+}
+
+pub fn lookupDefaultBtreeOid(data_type: types.DataType) ?u32 {
     for (btree_families) |family| {
         for (family.classes) |class| {
             if (class.input == data_type) return class.oid;
         }
     }
-    unreachable;
+    return null;
 }
