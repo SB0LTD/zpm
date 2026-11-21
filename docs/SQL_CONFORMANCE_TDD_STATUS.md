@@ -30,8 +30,20 @@ and supports ADD GENERATED on existing NOT NULL integer columns. The local
 Sig change-log suite passed 1,109 assertions, including rollback,
 cross-schema record rejection, and replay of preserved rows and sequence
 state. The stock archive tests exercise identity state and its use after
-restore. Standalone sequence DDL in user schemas remains open.
+restore. Separate scoped standalone sequence DDL passed 1,114 local
+change-log assertions, including qualified ALTER and DROP, CASCADE and
+replay. Local stock PG16 passed 32 checks with those sequences, keyed
+identity and stored generated columns in both directions.
 [Scoped identity CI](https://github.com/SB0LTD/ramsql/actions/runs/44958119185)
+
+The dependent-view fixture found an outbound ordering failure after
+`pg_get_viewdef` first returned the stored query. Typed `pg_rewrite`
+rows now expose each view's implicit SELECT rule and its relation
+dependencies. Local stock PG16 passed all 33 checks with that metadata,
+including a view depending on another view whose base table sorts last.
+The updated routine and rule suite passed 767 assertions and replayed
+156 records. Column aliases introduced by a CREATE VIEW column list,
+general rule deparsing and arbitrary view definitions still need coverage.
 
 RAMSQL `d1ddbe5` with ZPM `ed00a0a1` passed all 24 stock
 tooling checks on both PostgreSQL 16 and 18. Stock plain and custom

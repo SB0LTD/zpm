@@ -6976,15 +6976,57 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn postgresViewDefinition(ptr: *anyopaque, oid: u32, _: bool, out: []u8) Error!?usize {
-            const self: *const Self = @ptrCast(@alignCast(ptr));
+            const self: *Self = @ptrCast(@alignCast(ptr));
             const slot = self.visibleTableSlot(oid, self.seq_snap) orelse return null;
             const view = &self.tables[slot];
             if (view.relkind != 'v' and view.relkind != 'm') return null;
             const source = view.query.slice();
-            if (source.len >= out.len) return error.TextCapacity;
-            @memcpy(out[0..source.len], source);
-            out[source.len] = ';';
-            return source.len + 1;
+            const pool = &self.workspace.nodes;
+            const node_len = pool.len;
+            const query_len = pool.query_len;
+            const window_len = pool.window_len;
+            const complex = pool.complex;
+            defer {
+                pool.len = node_len;
+                pool.query_len = query_len;
+                pool.window_len = window_len;
+                pool.complex = complex;
+            }
+            _ = try P.parseQueryAt(source, 0, source.len, pool);
+            const blocks = pool.queries[query_len..pool.query_len];
+            var qualify: std.StaticBitSet(config.text_bytes) = .empty;
+            for (blocks) |*block| for (block.items[0..block.item_count]) |*item| {
+                if (item.schema != null or item.query != ast.none or item.function != ast.none or item.name.len == 0) continue;
+                const name = identName(source, item.name);
+                if (self.catalog.findSystemView(null, name.slice()) != null) continue;
+                // A CTE can shadow a public relation. Preserve its spelling
+                // even if a separate reference depends on that relation.
+                var cte = false;
+                for (blocks) |*other| for (other.ctes[0..other.cte_count]) |*definition| {
+                    cte = cte or types.same(identName(source, definition.name).slice(), name.slice());
+                };
+                if (cte) continue;
+                const relation = self.catalog.findIn(catalog_module.public_namespace, name.slice(), self.seq_snap) orelse continue;
+                if (relation.kind == 'S') continue;
+                const dependency = self.tables[relation.slot].oid;
+                for (view.depends[0..view.depend_count]) |oid_ref| {
+                    if (oid_ref != dependency) continue;
+                    qualify.set(item.name.span.start - @intFromBool(item.name.quoted));
+                    break;
+                }
+            };
+            var text: CatalogTextWriter = .{ .out = out };
+            var start: usize = 0;
+            var positions = qualify.iterator(.{});
+            while (positions.next()) |position| {
+                text.add(source[start..position]);
+                text.add("public.");
+                start = position;
+            }
+            text.add(source[start..]);
+            text.add("\n;");
+            if (text.shortened) return error.TextCapacity;
+            return text.len;
         }
 
         fn postgresTriggerDefinition(ptr: *anyopaque, oid: u32, pretty: bool, out: []u8) Error!?usize {
