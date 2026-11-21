@@ -81,7 +81,7 @@ const public_classes = "SELECT relname, relkind FROM pg_class WHERE relnamespace
 
 fn types() !void {
     try expect("SELECT oid, typname FROM pg_catalog.pg_type WHERE typname = 'int4'", "23|int4");
-    try expect("SELECT COUNT(*), MIN(typnamespace), MAX(typnamespace) FROM pg_type", "92|11|11");
+    try expect("SELECT COUNT(*), MIN(typnamespace), MAX(typnamespace) FROM pg_type", "97|11|11");
     try expect("SELECT oid, typname, typlen, typarray, typelem FROM pg_type WHERE oid IN (1033,1034) ORDER BY oid", "1033|aclitem|16|1034|0;1034|_aclitem|-1|0|1033");
     try expect("SELECT oid, typname, typlen, typarray, typelem FROM pg_type WHERE oid IN (18,1002) ORDER BY oid", "18|char|1|1002|0;1002|_char|-1|0|18");
     try expect("SELECT typname, typlen, typcategory, typarray, typinput FROM pg_type WHERE oid IN (4072, 4073) ORDER BY oid", "jsonpath|-1|U|4073|jsonpath_in;_jsonpath|-1|A|0|array_in");
@@ -218,6 +218,10 @@ fn replay() !void {
     try check(std.mem.eql(u8, copy[0..left.len], right));
     try check(a.row_count == 4);
     try expectOn(&replica, "SELECT column_default FROM information_schema.columns WHERE table_name = 'x'", "NULL");
+    try replicated("DROP TABLE x");
+    try replicated("CREATE TABLE am_refs (handler regproc, handlers regproc[])");
+    try replicated("INSERT INTO am_refs VALUES ('bthandler'::regproc, ARRAY['heap_tableam_handler'::regproc, 330::regproc])");
+    try expectOn(&replica, "SELECT handler::oid, handlers[1]::oid, handlers[2]::text FROM am_refs", "330|3|bthandler");
 }
 
 /// Native PostgreSQL 16 reports data_type as character_data (OID 1043).
@@ -241,6 +245,10 @@ fn relationMetadata() !void {
     try run("CREATE VIEW v AS SELECT id FROM t");
     try expect("SELECT 't'::pg_catalog.regclass::pg_catalog.text", "t");
     try expect("SELECT oid, amname, amhandler, amtype FROM pg_catalog.pg_am ORDER BY oid", "2|heap|heap_tableam_handler|t;403|btree|bthandler|i");
+    try expect("SELECT amhandler::oid,pg_typeof(amhandler)::text FROM pg_catalog.pg_am ORDER BY oid", "3|regproc;330|regproc");
+    try expect("SELECT to_regproc('pg_catalog.bthandler')::oid, '-'::regproc::text, (NULL::regproc)::oid, to_regproc('nonexistent')::oid",
+        "330|-|NULL|NULL");
+    try rejects("SELECT 'nonexistent'::regproc", error.UndefinedFunction);
     try expect("SELECT c.relname,c.relkind,c.relchecks,c.relhasindex,c.relhasrules,a.amname FROM pg_catalog.pg_class c LEFT JOIN pg_catalog.pg_am a ON c.relam=a.oid ORDER BY c.relname", "t|r|1|t|f|heap;t_amount|i|0|f|f|btree;t_pkey|i|0|f|f|btree;v|v|0|f|t|NULL");
     try expect("SELECT relname,relpersistence,relreplident,reltablespace,reloftype,reltoastrelid FROM pg_class ORDER BY relname", "t|p|d|0|0|0;t_amount|p|n|0|0|0;t_pkey|p|n|0|0|0;v|p|n|0|0|0");
     try expect("SELECT relhastriggers,relrowsecurity,relforcerowsecurity,relispartition,relispopulated FROM pg_class WHERE relname='t'", "f|f|f|f|t");

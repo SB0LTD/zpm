@@ -126,9 +126,26 @@ pub const SequenceHook = struct {
     partition_ancestors: ?*const fn (ptr: *anyopaque, oid: u32, out: []u32) Error!usize = null,
     namespace_lookup: ?*const fn (ptr: *anyopaque, name: []const u8, strict: bool) Error!?u32 = null,
     namespace_name: ?*const fn (ptr: *anyopaque, oid: u32, out: []u8) Error!?usize = null,
+    routine_lookup: ?*const fn (ptr: *anyopaque, name: []const u8, strict: bool) Error!?u32 = null,
+    routine_name: ?*const fn (ptr: *anyopaque, oid: u32, out: []u8) Error!?usize = null,
 };
 
 pub const SessionCall = enum { current_setting, set_config, advisory_lock, advisory_try_lock, advisory_unlock, advisory_unlock_all, notify, backend_pid, recovery_status };
+
+pub fn routineOid(session: *const Session, input: []const u8, strict: bool) Error!?u32 {
+    if (types.same(input, "-")) return 0;
+    if (input.len != 0) {
+        const digits_only = for (input) |byte| {
+            if (!types.digit(byte)) break false;
+        } else true;
+        if (digits_only) return @as(?u32, @import("std").fmt.parseInt(u32, input, 10) catch return error.NumericValueOutOfRange);
+    }
+    if (session.sequences) |hook| {
+        if (hook.routine_lookup) |lookup| return lookup(hook.ptr, input, strict);
+    }
+    if (strict) return error.UndefinedFunction;
+    return null;
+}
 
 /// Advisory call flags: 1 shared, 2 transaction-level, 4 two int4 keys;
 /// current_setting / set_config: 1 missing_ok / is_local.
@@ -240,12 +257,13 @@ fn extendedCast(from: Type, to: Type, context: Context) ?bool {
         if (stringType(from)) return context == .explicit;
         return false;
     }
-    if (from == .regtype or to == .regtype) {
-        // pg_cast: oid/int4 <-> regtype binary and int2/int8 -> regtype
-        // implicit; regtype -> int4/int8 by assignment; strings by I/O
+    if (from == .regtype or to == .regtype or from == .regproc or to == .regproc) {
+        // OID aliases share binary casts with oid, integer casts and string I/O.
+        const target_alias = to == .regtype or to == .regproc;
+        const source_alias = from == .regtype or from == .regproc;
+        if (from == .oid or to == .oid or (target_alias and integral(from))) return true;
+        if (source_alias and (to == .int4 or to == .int8)) return context != .implicit;
         // conversion.
-        if (from == .oid or to == .oid or (to == .regtype and integral(from))) return true;
-        if (from == .regtype and (to == .int4 or to == .int8)) return context != .implicit;
         if (stringType(to)) return context != .implicit;
         if (stringType(from)) return context == .explicit;
         return false;
@@ -544,6 +562,14 @@ pub fn Io(comptime config: types.Config) type {
                 .xml => |*value| xml.output(value.slice(), buffer),
                 // regtypeout: the type's SQL name, or the number.
                 .regtype => |oid| if (types.regtypeName(oid)) |name| copy(buffer, name) else integerText(oid, buffer),
+                .regproc => |oid| blk: {
+                    if (oid == 0) break :blk copy(buffer, "-");
+                    if (session.sequences) |hook| if (hook.routine_name) |name| {
+                        if (try name(hook.ptr, oid, buffer)) |used| break :blk buffer[0..used];
+                    };
+                    if (@import("catalog.sig").builtinRoutineName(oid)) |name| break :blk copy(buffer, name);
+                    break :blk integerText(oid, buffer);
+                },
                 // Stored as their canonical output text.
                 .tsvector, .tsquery => |*value| copy(buffer, value.slice()),
                 .pg_internal_char => |value| if (value == 0)
@@ -699,6 +725,7 @@ pub fn Io(comptime config: types.Config) type {
                     break :blk try textCell(try jsonpath.Engine(config).canonical(input, &buffer, session.control));
                 },
                 .regtype => .{ .regtype = try types.regtypeInput(input) },
+                .regproc => .{ .regproc = (try routineOid(session, input, true)) orelse return error.UndefinedFunction },
                 .aclitem => return error.UnsupportedStatement,
                 .pg_internal_char => .{ .pg_internal_char = parseInternalChar(input) },
                 .tsvector, .tsquery => blk: {
@@ -889,22 +916,26 @@ pub fn Io(comptime config: types.Config) type {
                 if (!characterType(to)) return error.CannotCoerce;
                 return cast(try textCell(cell.xml.slice()), .text, to, typmod, session);
             }
-            if (cell == .regtype and to != .regtype) {
-                // regtype -> oid/int4/int8 reads the OID; strings by output.
-                if (to == .oid or to == .int8) return .{ .integer = cell.regtype };
-                if (to == .int4) return .{ .integer = @as(i32, @bitCast(cell.regtype)) };
+            if ((cell == .regtype and to != .regtype) or (cell == .regproc and to != .regproc)) {
+                const oid = if (cell == .regtype) cell.regtype else cell.regproc;
+                if (to == .oid or to == .int8) return .{ .integer = oid };
+                if (to == .int4) return .{ .integer = @as(i32, @bitCast(oid)) };
                 if (!characterType(to)) return error.CannotCoerce;
                 var buffer: [format_bytes]u8 = undefined;
                 return cast(try textCell(try format(&cell, true, session, &buffer)), .text, to, typmod, session);
             }
-            if (to == .regtype and cell == .integer) {
-                // int8 -> regtype checks the OID range (oidin); int4 wraps.
+            if ((to == .regtype or to == .regproc) and cell == .integer) {
+                // int8 -> OID aliases checks the range; int4 wraps.
                 const value = cell.integer;
-                if (from == .int4 or from == .int2) return .{ .regtype = @bitCast(@as(i32, @intCast(value))) };
-                if (value < 0 or value > 4294967295) return error.NumericValueOutOfRange;
-                return .{ .regtype = @intCast(value) };
+                const oid: u32 = if (from == .int4 or from == .int2)
+                    @bitCast(@as(i32, @intCast(value)))
+                else if (value >= 0 and value <= 4294967295)
+                    @intCast(value)
+                else
+                    return error.NumericValueOutOfRange;
+                return if (to == .regtype) .{ .regtype = oid } else .{ .regproc = oid };
             }
-            if (to == .regtype and cell == .text) return parse(.regtype, -1, cell.text.slice(), session);
+            if ((to == .regtype or to == .regproc) and cell == .text) return parse(to, -1, cell.text.slice(), session);
             if (cell == .array and types.isArray(to)) {
                 if (from == to) return applyTypmodExplicit(cell, to, typmod);
                 return ArrayText.cast(cell.array.slice(), types.elementType(from) orelse return error.CannotCoerce, types.elementType(to).?, typmod, session);
@@ -1146,6 +1177,10 @@ pub fn Io(comptime config: types.Config) type {
                 // Integers and text are converted above.
                 .regtype => switch (cell) {
                     .regtype => cell,
+                    else => return error.CannotCoerce,
+                },
+                .regproc => switch (cell) {
+                    .regproc => cell,
                     else => return error.CannotCoerce,
                 },
                 .point, .box => switch (cell) {

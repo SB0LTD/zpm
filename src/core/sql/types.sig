@@ -585,12 +585,12 @@ pub const Dialect = enum { postgres, mysql, tds };
 /// `integer32` int4 (INTEGER); the others are named after PostgreSQL.
 /// The unnamed values are array types: the element's ordinal with
 /// array_bit set (arrayData/elementData); there are no arrays of arrays.
-pub const DataType = enum(u8) { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, mysql_bigint_unsigned, pg_internal_char, aclitem, xid, _ };
+pub const DataType = enum(u8) { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, mysql_bigint_unsigned, pg_internal_char, aclitem, xid, regproc, _ };
 
 /// Bound expression type. `unknown` is an untyped string or NULL literal
 /// that has not been resolved by context yet. Unnamed values are array
 /// types, encoded like DataType's (arrayType/elementType).
-pub const Type = enum(u8) { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, mysql_bigint_unsigned, pg_internal_char, aclitem, xid, _ };
+pub const Type = enum(u8) { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, mysql_bigint_unsigned, pg_internal_char, aclitem, xid, regproc, _ };
 
 /// Array types set this bit over the element type's ordinal.
 pub const array_bit: u8 = 0x80;
@@ -704,6 +704,7 @@ pub fn dataTypeOf(ty: Type) DataType {
         .xml => .xml,
         .jsonpath => .jsonpath,
         .regtype => .regtype,
+        .regproc => .regproc,
         .tsvector => .tsvector,
         .tsquery => .tsquery,
         .pg_internal_char => .pg_internal_char,
@@ -757,6 +758,7 @@ pub fn typeOfData(data_type: DataType) Type {
         .xml => .xml,
         .jsonpath => .jsonpath,
         .regtype => .regtype,
+        .regproc => .regproc,
         .tsvector => .tsvector,
         .tsquery => .tsquery,
         .pg_internal_char => .pg_internal_char,
@@ -867,6 +869,7 @@ fn baseInfo(data_type: DataType) TypeInfo {
         .box => .{ .oid = 603, .name = "box", .len = 32, .category = 'G', .array = 1020, .alignment = 'd' },
         .xml => .{ .oid = 142, .name = "xml", .len = -1, .category = 'U', .array = 143 },
         .jsonpath => .{ .oid = 4072, .name = "jsonpath", .len = -1, .category = 'U', .array = 4073 },
+        .regproc => .{ .oid = 24, .name = "regproc", .len = 4, .category = 'N', .array = 1008 },
         .regtype => .{ .oid = 2206, .name = "regtype", .len = 4, .category = 'N', .array = 2211 },
         .tsvector => .{ .oid = 3614, .name = "tsvector", .len = -1, .category = 'U', .array = 3643 },
         .tsquery => .{ .oid = 3615, .name = "tsquery", .len = -1, .category = 'U', .array = 3645 },
@@ -939,6 +942,7 @@ fn baseSqlName(data_type: DataType) []const u8 {
         .xml => "xml",
         .jsonpath => "jsonpath",
         .regtype => "regtype",
+        .regproc => "regproc",
         .tsvector => "tsvector",
         .tsquery => "tsquery",
         .aclitem => "aclitem",
@@ -987,6 +991,7 @@ pub fn typeInputName(data_type: DataType) []const u8 {
         .xml => "xml_in",
         .jsonpath => "jsonpath_in",
         .regtype => "regtypein",
+        .regproc => "regprocin",
         .tsvector => "tsvectorin",
         .tsquery => "tsqueryin",
         .aclitem => "aclitemin",
@@ -1188,7 +1193,7 @@ pub fn Values(comptime config: Config) type {
         /// `jsonb` holds the canonical binary (jsonb.sig) in a Text.
         /// varchar is `text`; `bpchar` (CHAR(n)) holds its padded bytes and
         /// compares/hashes without trailing spaces.
-        pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar, uuid, bytea, time, timetz, bits, money, pg_lsn, xid8, array, range, inet, macaddr, point, box, xml, regtype, tsvector, tsquery, pg_internal_char };
+        pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar, uuid, bytea, time, timetz, bits, money, pg_lsn, xid8, array, range, inet, macaddr, point, box, xml, regtype, tsvector, tsquery, pg_internal_char, regproc };
 
         pub const Cell = union(CellTag) {
             null_value: void,
@@ -1236,6 +1241,7 @@ pub fn Values(comptime config: Config) type {
             tsvector: Text,
             tsquery: Text,
             pg_internal_char: u8,
+            regproc: u32,
         };
 
         /// Range values of these cells (range.sig).
@@ -1295,6 +1301,7 @@ pub fn Values(comptime config: Config) type {
                 .box => .box,
                 .xml => .xml,
                 .regtype => .regtype,
+                .regproc => .regproc,
                 .tsvector => .tsvector,
                 .tsquery => .tsquery,
                 .pg_internal_char => .pg_internal_char,
@@ -1342,6 +1349,7 @@ pub fn Values(comptime config: Config) type {
                 .xml => |*value| bytesOrder(value.slice(), right.xml.slice()),
                 // regtype sorts with oid's operators (binary coercible).
                 .regtype => |value| order(u32, value, right.regtype),
+                .regproc => |value| order(u32, value, right.regproc),
                 // No ordering operators are offered (42883); the canonical
                 // text keeps internal order and equality consistent.
                 .tsvector => |*value| bytesOrder(value.slice(), right.tsvector.slice()),
@@ -1407,7 +1415,7 @@ pub fn Values(comptime config: Config) type {
                 .date => |days| return wordHash(@bitCast(@as(i64, days)), tag),
                 .timestamp, .timestamptz, .time, .money => |us| return wordHash(@bitCast(us), tag),
                 .pg_lsn, .xid8 => |word| return wordHash(word, tag),
-                .regtype => |oid| return wordHash(oid, tag),
+                .regtype, .regproc => |oid| return wordHash(oid, tag),
                 .array => |*items| return wordHash(Arrays.hash(items.slice()), tag),
                 .range => |*span| return wordHash(Ranges.hash(span.slice()), tag),
                 // network_cmp ignores the cidr flag; so does the hash.

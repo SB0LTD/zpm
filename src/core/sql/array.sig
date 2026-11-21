@@ -262,7 +262,7 @@ pub fn Arrays(comptime V: type) type {
                     try put(out, &value.address);
                 },
                 .macaddr => |*value| try put(out, value),
-                .regtype => |value| try putInt(out, u32, value),
+                .regtype, .regproc => |value| try putInt(out, u32, value),
                 .pg_internal_char => |value| try putInt(out, u8, value),
                 .point => |value| {
                     try putInt(out, u64, @bitCast(value.x));
@@ -301,6 +301,7 @@ pub fn Arrays(comptime V: type) type {
                 .range => .{ .range = takeText(bytes, at) },
                 .xml => .{ .xml = takeText(bytes, at) },
                 .regtype => .{ .regtype = getInt(u32, bytes, at) },
+                .regproc => .{ .regproc = getInt(u32, bytes, at) },
                 .pg_internal_char => .{ .pg_internal_char = getInt(u8, bytes, at) },
                 .tsvector => .{ .tsvector = takeText(bytes, at) },
                 .tsquery => .{ .tsquery = takeText(bytes, at) },

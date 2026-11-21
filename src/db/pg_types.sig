@@ -149,7 +149,7 @@ pub fn Types(comptime Result: type) type {
                 .macaddr => |*value| try put(out, &at, value),
                 .xml => at += try sendText(cell, session, out),
                 // regtypesend is oidsend.
-                .regtype => |value| try putInt(u32, out, &at, value),
+                .regtype, .regproc => |value| try putInt(u32, out, &at, value),
                 .pg_internal_char => |value| try put(out, &at, &.{value}),
                 // tsvectorsend / tsquerysend binary forms are not provided.
                 .tsvector, .tsquery => return error.UnsupportedBinaryType,
@@ -398,6 +398,10 @@ pub fn Types(comptime Result: type) type {
                     if (bytes.len == 0) return error.ProtocolViolation;
                     if (bytes.len > 1) return error.InvalidBinaryRepresentation;
                     return .{ .pg_internal_char = bytes[0] };
+                },
+                .regproc => {
+                    if (bytes.len != 4) return error.ProtocolViolation;
+                    return .{ .regproc = getInt(u32, bytes) };
                 },
                 .regtype => {
                     if (bytes.len != 4) return error.ProtocolViolation;

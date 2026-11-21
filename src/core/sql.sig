@@ -1386,19 +1386,22 @@ pub fn Database(comptime config: Config) type {
                     }
                 };
                 // Metadata-only Describe does not call evaluation hooks.
-                if(!describe_only) for(self.workspace.nodes.nodes[0..self.workspace.nodes.len]) |node| switch(node.func) {
-                    .nextval,.currval,.setval,.lastval,.identity_next=>return error.UnsupportedStatement,
-                    // These catalog lookups use the serialized database hook.
-                    .to_regclass,.regclass_in,.regclass_out,.pg_get_serial_sequence,.pg_table_is_visible,.pg_get_indexdef,.pg_get_constraintdef,.pg_get_triggerdef,.pg_partition_ancestors,
-                    .to_regnamespace,.regnamespace_in,.regnamespace_out=>return error.UnsupportedStatement,
-                    .pg_get_statisticsobjdef_columns,.pg_relation_is_publishable,.pg_get_partkeydef,.acldefault=>return error.UnsupportedStatement,
-                    .obj_description,.col_description,.shobj_description,.current_user,.session_user=>return error.UnsupportedStatement,
-                    .current_setting,.set_config,.pg_backend_pid,.pg_is_in_recovery,
-                    .pg_try_advisory_lock,.pg_try_advisory_lock_shared,
-                    .pg_try_advisory_xact_lock,.pg_try_advisory_xact_lock_shared,
-                    .pg_advisory_unlock,.pg_advisory_unlock_shared,
-                    .routine,.routine_param=>return error.UnsupportedStatement,
-                    else=>{},
+                if(!describe_only) for(self.workspace.nodes.nodes[0..self.workspace.nodes.len]) |node| {
+                    if (node.ty == .regproc or types.elementType(node.ty) == .regproc) return error.UnsupportedStatement;
+                    switch(node.func) {
+                        .nextval,.currval,.setval,.lastval,.identity_next=>return error.UnsupportedStatement,
+                        // These catalog lookups use the serialized database hook.
+                        .to_regclass,.regclass_in,.regclass_out,.pg_get_serial_sequence,.pg_table_is_visible,.pg_get_indexdef,.pg_get_constraintdef,.pg_get_triggerdef,.pg_partition_ancestors,
+                        .to_regnamespace,.regnamespace_in,.regnamespace_out,.to_regproc=>return error.UnsupportedStatement,
+                        .pg_get_statisticsobjdef_columns,.pg_relation_is_publishable,.pg_get_partkeydef,.acldefault=>return error.UnsupportedStatement,
+                        .obj_description,.col_description,.shobj_description,.current_user,.session_user=>return error.UnsupportedStatement,
+                        .current_setting,.set_config,.pg_backend_pid,.pg_is_in_recovery,
+                        .pg_try_advisory_lock,.pg_try_advisory_lock_shared,
+                        .pg_try_advisory_xact_lock,.pg_try_advisory_xact_lock_shared,
+                        .pg_advisory_unlock,.pg_advisory_unlock_shared,
+                        .routine,.routine_param=>return error.UnsupportedStatement,
+                        else=>{},
+                    }
                 };
                 self.prepared=switch(bound){.select=>|select| .{.simple=select},.query=>|root| .{.general=root},else=>return error.UnsupportedStatement};
                 self.database=db;self.source=source;self.effective=expanded;self.snapshot=snapshot;
@@ -5593,6 +5596,82 @@ pub fn Database(comptime config: Config) type {
             return null;
         }
 
+        fn builtinShadowsRoutine(routine: *const RC.Routine) bool {
+            for (operator_catalog.functions) |op| {
+                if (!types.same(op.function_name, routine.name.slice())) continue;
+                const args = routine.args();
+                if (op.left == 0 and args.len == 1 and args[0] == op.right) return true;
+                if (op.left != 0 and args.len == 2 and args[0] == op.left and args[1] == op.right) return true;
+            }
+            return false;
+        }
+
+        fn routineByName(self: *const Self, namespace: ?u32, name: []const u8) Error!?u32 {
+            var oid: ?u32 = null;
+            if (namespace == null or namespace.? == catalog_module.catalog_namespace) {
+                for (catalog_module.access_methods) |am| {
+                    if (!types.same(am.handler_name, name)) continue;
+                    if (oid != null) return error.AmbiguousFunction;
+                    oid = am.handler;
+                }
+                for (operator_catalog.functions) |op| {
+                    if (!types.same(op.function_name, name)) continue;
+                    if (oid != null) return error.AmbiguousFunction;
+                    oid = op.function_oid;
+                }
+            }
+            if ((namespace orelse catalog_module.public_namespace) != catalog_module.public_namespace) return oid;
+            if (namespace == null and !self.session.public_schema_on_path) return oid;
+            for (&self.objects.routines) |*routine| {
+                if (!routine.live or routine.namespace != catalog_module.public_namespace or
+                    !routine.stamp.visible(self.seq_snap) or !types.same(routine.name.slice(), name)) continue;
+                if (namespace == null and oid != null and builtinShadowsRoutine(routine)) continue;
+                if (oid != null) return error.AmbiguousFunction;
+                oid = routine.oid;
+            }
+            return oid;
+        }
+
+        fn postgresRoutineLookup(ptr: *anyopaque, raw: []const u8, strict: bool) Error!?u32 {
+            const self: *const Self = @ptrCast(@alignCast(ptr));
+            const missing: Error!?u32 = if (strict) error.UndefinedFunction else null;
+            const whitespace = " \t\r\n";
+            var namespace: ?u32 = null;
+            var name_text = raw;
+            if (regclassSeparator(raw)) |dot| {
+                name_text = raw[dot + 1 ..];
+                if (regclassSeparator(name_text) != null) return missing;
+                const schema = namespaceIdentifier(std.mem.trim(u8, raw[0..dot], whitespace)) catch return missing;
+                namespace = (try self.namespaceForUsage(self.session.role, schema.slice(), self.seq_snap)) orelse return missing;
+            }
+            const name = namespaceIdentifier(std.mem.trim(u8, name_text, whitespace)) catch return missing;
+            const oid = self.routineByName(namespace, name.slice()) catch |err| {
+                if (err == error.AmbiguousFunction and !strict) return null;
+                return err;
+            };
+            return oid orelse return missing;
+        }
+
+        fn postgresRoutineName(ptr: *anyopaque, oid: u32, out: []u8) Error!?usize {
+            const self: *const Self = @ptrCast(@alignCast(ptr));
+            var namespace: u32 = catalog_module.catalog_namespace;
+            const name = catalog_module.builtinRoutineName(oid) orelse blk: {
+                const index = self.objects.routineByOid(oid, self.seq_snap) orelse return null;
+                const routine = &self.objects.routines[index];
+                namespace = routine.namespace;
+                break :blk routine.name.slice();
+            };
+            var writer: CatalogTextWriter = .{ .out = out };
+            const visible = self.routineByName(null, name) catch null;
+            if (visible == null or visible.? != oid) {
+                writer.ident(self.namespaceName(namespace));
+                writer.add(".");
+            }
+            writer.ident(name);
+            if (writer.shortened) return error.TextCapacity;
+            return writer.len;
+        }
+
         fn writeNamespaceName(name: []const u8, out: []u8) Error!usize {
             var text: CatalogTextWriter = .{ .out = out };
             text.ident(name);
@@ -6082,7 +6161,7 @@ pub fn Database(comptime config: Config) type {
                         intCell(op.oid), nameCell(op.name), intCell(catalog_module.catalog_namespace), intCell(CO.bootstrap_role),
                         .{ .pg_internal_char = if (op.left == 0) 'l' else 'b' }, boolCell(false), boolCell(false),
                         intCell(op.left), intCell(op.right), intCell(op.result), intCell(op.commutator), intCell(op.negator),
-                        intCell(op.function_oid), intCell(0), intCell(0),
+                        .{ .regproc = op.function_oid }, .{ .regproc = 0 }, .{ .regproc = 0 },
                     });
                 }
                 return;
@@ -6104,8 +6183,9 @@ pub fn Database(comptime config: Config) type {
             // have their own catalogs and do not imply a table binding.
             if (view == .pg_foreign_table) return;
             if (view == .pg_am) {
-                try sink.add(&.{ intCell(catalog_module.heap_access_method), nameCell("heap"), nameCell("heap_tableam_handler"), nameCell("t") });
-                try sink.add(&.{ intCell(catalog_module.btree_access_method), nameCell("btree"), nameCell("bthandler"), nameCell("i") });
+                for (catalog_module.access_methods) |am| {
+                    try sink.add(&.{ intCell(am.oid), nameCell(am.name), .{ .regproc = am.handler }, .{ .pg_internal_char = am.kind } });
+                }
                 return;
             }
             if (view == .pg_collation) {
@@ -6132,6 +6212,9 @@ pub fn Database(comptime config: Config) type {
                 .pg_proc, .pg_trigger, .pg_rewrite, .pg_rules => return self.objectViewRows(snapshot, view, sink),
                 .pg_depend => return self.dependencyRows(snapshot, relations[0..count], sink),
                 .pg_type => {
+                    for (catalog_module.access_method_types) |info| {
+                        try sink.add(&.{ intCell(info.oid), nameCell(info.name), intCell(catalog_module.catalog_namespace), intCell(info.bytes), .{ .pg_internal_char = 'p' }, nameCell("P"), intCell(0), nameCell(","), nameCell(info.input), intCell(0), intCell(0), intCell(CO.bootstrap_role), intCell(-1), boolCell(false), intCell(0), intCell(0), .null_value, boolCell(true) });
+                    }
                     inline for (@typeInfo(DataType).@"enum".field_names) |field| {
                         const data_type = @field(DataType, field);
                         if (data_type == .mysql_bigint_unsigned) continue;
@@ -8519,7 +8602,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn statementHooks(self: *Self, slot: u16, snap: Snapshot) void {
-            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .relation_name = &relationName, .relation_display_name = &relationDisplayName, .catalog_text = &catalogText, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .trigger_definition = &postgresTriggerDefinition, .statistics_columns = &postgresStatisticsColumns, .relation_publishable = &relationPublishable, .partition_key_definition = &postgresPartitionKey, .partition_ancestors = &postgresPartitionAncestors, .namespace_lookup = &postgresNamespaceLookup, .namespace_name = &postgresNamespaceName };
+            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .relation_name = &relationName, .relation_display_name = &relationDisplayName, .catalog_text = &catalogText, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .trigger_definition = &postgresTriggerDefinition, .statistics_columns = &postgresStatisticsColumns, .relation_publishable = &relationPublishable, .partition_key_definition = &postgresPartitionKey, .partition_ancestors = &postgresPartitionAncestors, .namespace_lookup = &postgresNamespaceLookup, .namespace_name = &postgresNamespaceName, .routine_lookup = &postgresRoutineLookup, .routine_name = &postgresRoutineName };
             self.session.sequences = &self.seq_hook;
             self.seq_slot = slot;
             self.seq_snap = snap;
@@ -11432,6 +11515,16 @@ pub fn Database(comptime config: Config) type {
         fn objectViewRows(self: *const Self, snapshot: Snapshot, view: catalog_module.View, sink: *X.RowSink) Error!void {
             switch (view) {
                 .pg_proc => {
+                    for (catalog_module.access_methods) |am| {
+                        var args: [10]u8 = undefined;
+                        const arg_oid = std.fmt.bufPrint(&args, "{d}", .{catalog_module.internal_type_oid}) catch unreachable;
+                        try sink.add(&.{
+                            intCell(am.handler), nameCell(am.handler_name), intCell(catalog_module.catalog_namespace),
+                            .{ .pg_internal_char = 'f' }, intCell(operator_catalog.internal_language_oid), .{ .pg_internal_char = 'v' },
+                            boolCell(true), intCell(1), intCell(am.result), nameCell(arg_oid), nameCell(am.handler_name),
+                            intCell(CO.bootstrap_role), .null_value,
+                        });
+                    }
                     for (operator_catalog.functions) |op| {
                         var buffer: [24]u8 = undefined;
                         const args = if (op.left == 0)

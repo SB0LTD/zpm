@@ -85,7 +85,23 @@ const pg_database_columns = [_]ViewColumn{ col("oid", .oid), col("datname", .nam
 pub const constraint_catalog: u32 = 2606;
 pub const heap_access_method: u32 = 2;
 pub const btree_access_method: u32 = 403;
-const pg_am_columns = [_]ViewColumn{ col("oid", .oid), col("amname", .name), col("amhandler", .text), col("amtype", .text) };
+pub const access_methods = [_]struct { oid: u32, name: []const u8, kind: u8, handler: u32, handler_name: []const u8, result: u32 }{
+    .{ .oid = heap_access_method, .name = "heap", .kind = 't', .handler = 3, .handler_name = "heap_tableam_handler", .result = 269 },
+    .{ .oid = btree_access_method, .name = "btree", .kind = 'i', .handler = 330, .handler_name = "bthandler", .result = 325 },
+};
+pub const internal_type_oid: u32 = 2281;
+pub const access_method_types = [_]struct { oid: u32, name: []const u8, bytes: i16, input: []const u8 }{
+    .{ .oid = 269, .name = "table_am_handler", .bytes = 4, .input = "table_am_handler_in" },
+    .{ .oid = 325, .name = "index_am_handler", .bytes = 4, .input = "index_am_handler_in" },
+    .{ .oid = internal_type_oid, .name = "internal", .bytes = @sizeOf(usize), .input = "internal_in" },
+};
+
+pub fn builtinRoutineName(oid: u32) ?[]const u8 {
+    for (access_methods) |am| if (am.handler == oid) return am.handler_name;
+    for (@import("operator_catalog.sig").functions) |op| if (op.function_oid == oid) return op.function_name;
+    return null;
+}
+const pg_am_columns = [_]ViewColumn{ col("oid", .oid), col("amname", .name), col("amhandler", .regproc), col("amtype", .pg_internal_char) };
 const pg_collation_columns = [_]ViewColumn{
     col("oid", .oid), col("collname", .name), col("collnamespace", .oid), col("collowner", .oid),
     col("collprovider", .text), col("collisdeterministic", .boolean), col("collencoding", .int4),
@@ -146,7 +162,7 @@ const pg_operator_columns = [_]ViewColumn{
     col("oid", .oid), col("oprname", .name), col("oprnamespace", .oid), col("oprowner", .oid),
     col("oprkind", .pg_internal_char), col("oprcanmerge", .boolean), col("oprcanhash", .boolean),
     col("oprleft", .oid), col("oprright", .oid), col("oprresult", .oid), col("oprcom", .oid),
-    col("oprnegate", .oid), col("oprcode", .oid), col("oprrest", .oid), col("oprjoin", .oid),
+    col("oprnegate", .oid), col("oprcode", .regproc), col("oprrest", .regproc), col("oprjoin", .regproc),
 };
 
 /// Implemented cataloged casts that have no separately callable function.

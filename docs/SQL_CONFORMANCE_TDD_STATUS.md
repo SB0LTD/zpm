@@ -2,6 +2,19 @@
 
 ## Stock PostgreSQL dump and restore candidate
 
+`pg_am` exposes the two implemented access methods with PostgreSQL table
+and index kind codes and typed `regproc` handler references. Handler OIDs
+resolve to `pg_proc` and their argument and result pseudo-types are visible
+in `pg_type`. The same OID alias is used for operator implementation
+references. Handler entries identify built-in implementation paths. Custom
+access methods and direct invocation of PostgreSQL handlers remain open.
+
+`regproc` resolves catalog and visible public routine names, supports
+qualified and quoted names, accepts numeric OIDs, and preserves the stored
+OID through binary encode and WAL replay. Ambiguous and missing names return
+NULL through `to_regproc` and raise errors in strict casts. Routine
+dependency tracking in stored expressions and `regprocedure` remain open.
+
 `pg_operator` now exposes PostgreSQL identities for 427 concrete operator
 signatures that execute in Sig. It includes prefix and infix signatures,
 argument and result OIDs, owner and namespace, and links to internal

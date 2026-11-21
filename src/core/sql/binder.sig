@@ -819,6 +819,8 @@ pub fn Binder(comptime config: types.Config) type {
             // coercible), so an untyped literal beside it is read as an oid.
             if (context.node(a.*).ty == .regtype) a.* = try convert(context, a.*, .oid, -1, .implicit);
             if (context.node(b.*).ty == .regtype) b.* = try convert(context, b.*, .oid, -1, .implicit);
+            if (context.node(a.*).ty == .regproc) a.* = try convert(context, a.*, .oid, -1, .implicit);
+            if (context.node(b.*).ty == .regproc) b.* = try convert(context, b.*, .oid, -1, .implicit);
             const left = context.node(a.*).ty;
             const right = context.node(b.*).ty;
             if (left == .mysql_bigint_unsigned or right == .mysql_bigint_unsigned) {
@@ -1306,6 +1308,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "to_regtype", .func = .to_regtype },
                 .{ .name = "to_regclass", .func = .to_regclass },
                 .{ .name = "to_regnamespace", .func = .to_regnamespace },
+                .{ .name = "to_regproc", .func = .to_regproc },
                 .{ .name = "format_type", .func = .format_type },
                 .{ .name = "pg_get_expr", .func = .pg_get_expr },
                 .{ .name = "pg_get_indexdef", .func = .pg_get_indexdef },
@@ -2251,6 +2254,10 @@ pub fn Binder(comptime config: types.Config) type {
                     n.reg = switch (n.func) { .to_regtype => .regtype, .to_regclass => .regclass, .to_regnamespace => .regnamespace, else => unreachable };
                     n.constant = false;
                 },
+                .to_regproc => {
+                    try bindSignature(context, n, &.{.text}, .regproc, false);
+                    n.constant = false;
+                },
                 .format_type => {
                     if (count != 2) return error.UndefinedFunction;
                     const first = n.b;
@@ -3104,9 +3111,12 @@ pub fn Binder(comptime config: types.Config) type {
             const n = context.node(id);
             switch (n.kind) {
                 .function => if (!ast.immutableFunction(n.func)) return false,
+                .text_literal => if (n.ty == .regproc) return false,
                 .cast => {
                     const from = context.node(n.a).ty; const to = n.cast_type;
                     if (from != to) {
+                        if ((from == .regproc and value.characterType(to)) or
+                            (to == .regproc and value.characterType(from))) return false;
                         if (value.stringType(from) and (value.datetime(to) or to == .interval)) return false;
                         if (value.stringType(to) and (value.datetime(from) or from == .interval)) return false;
                         if ((from == .timestamptz and value.datetime(to)) or (to == .timestamptz and value.datetime(from))) return false;

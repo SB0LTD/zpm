@@ -391,6 +391,10 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     try writer.int(u8, 30);
                     try writer.int(u32, oid);
                 },
+                .regproc => |oid| {
+                    try writer.int(u8, 32);
+                    try writer.int(u32, oid);
+                },
                 .tsvector, .tsquery => |*text| {
                     try writer.int(u8, if (cell.* == .tsvector) 28 else 29);
                     try writer.int(u32, @intCast(text.len));
@@ -1151,6 +1155,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 24 => .{ .macaddr = (try reader.take(6))[0..6].* },
                 30 => .{ .regtype = try reader.int(u32) },
                 31 => .{ .pg_internal_char = try reader.int(u8) },
+                32 => .{ .regproc = try reader.int(u32) },
                 28, 29 => blk: {
                     const len = try reader.int(u32);
                     if (len > config.text_bytes) return error.ChangeRecordConflict;
