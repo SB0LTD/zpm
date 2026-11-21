@@ -224,6 +224,11 @@ fn defaultAclDiscovery() !void {
         "{=Tc/ramsql,ramsql=CTc/ramsql}|{ramsql=sA/ramsql}|{}|t|t");
 }
 
+fn conversionDiscovery() !void {
+    try expect("SELECT tableoid,oid,conname,connamespace,conowner FROM pg_conversion", "");
+    try expect("SELECT 'pg_catalog.pg_conversion'::regclass::oid, count(*) FROM pg_catalog.pg_conversion", "2607|0");
+}
+
 fn lifecycle() !void {
     try run("CREATE TABLE a (id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY, amount NUMERIC(10,2), at TIMESTAMPTZ(3), doc JSONB, label TEXT DEFAULT 'd', n INTEGER DEFAULT 2 + 3)");
     try expect(public_tables, "a");
@@ -371,6 +376,7 @@ pub fn main(init: std.process.Init) !void {
     try textConfigurationDiscovery();
     try foreignWrapperDiscovery();
     try defaultAclDiscovery();
+    try conversionDiscovery();
     try lifecycle();
     try replay();
     try characterMetadata();
