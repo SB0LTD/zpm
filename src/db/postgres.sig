@@ -1764,6 +1764,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             if (self.active_portal != null) return error.PortalBusy;
             var tokens: Tokens = .{ .source = s.source() };
             const first = try tokens.next();
+            if (keyword(first, "select") and try inferExplicitSelectCasts(s, tokens)) return;
             var table: []const u8 = "";
             if (keyword(first, "insert")) {
                 if (!keyword(try tokens.next(), "into")) return error.Syntax;
@@ -1855,6 +1856,44 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             for (s.oids[0..s.count]) |*oid| if (oid.* == 0) {
                 oid.* = 25;
             };
+        }
+
+        // A parameter explicitly cast in a SELECT can be typed without
+        // probing its FROM item as a table. In particular a set-returning
+        // function or derived table does not have a standalone relation.
+        fn inferExplicitSelectCasts(s: *Statement, scan_tokens: Tokens) !bool {
+            var tokens = scan_tokens;
+            var oids = s.oids;
+            while (true) {
+                const token = try tokens.next();
+                if (token.len == 0) break;
+                if (!parameterToken(token)) continue;
+                const index = try parameterIndex(s, token);
+                if (oids[index] != 0) continue;
+
+                var lookahead = tokens;
+                if (!equal(try lookahead.next(), "::")) return false;
+                const name = try lookahead.next();
+                if (name.len == 0) return false;
+                const start = @intFromPtr(name.ptr) - @intFromPtr(tokens.source.ptr);
+                var end = lookahead.at;
+                var suffix = try lookahead.next();
+                if (equal(suffix, ".")) {
+                    if ((try lookahead.next()).len == 0) return false;
+                    end = lookahead.at;
+                    suffix = try lookahead.next();
+                }
+                while (equal(suffix, "[")) {
+                    if (!equal(try lookahead.next(), "]")) return false;
+                    end = lookahead.at;
+                    suffix = try lookahead.next();
+                }
+                const data_type = sql.typeByName(tokens.source[start..end]) orelse return false;
+                oids[index] = T.oid(data_type);
+            }
+            for (oids[0..s.count]) |oid| if (oid == 0) return false;
+            s.oids = oids;
+            return true;
         }
         fn column(self: *Self, name: []const u8) ?usize {
             for (0..self.result.column_count) |i| if (keyword(name, self.result.column_names[i].slice())) return i;
@@ -2466,7 +2505,7 @@ const Tokens = struct {
         return self.source[token.start..token.end];
     }
 };
-fn inferOid(s: anytype, token: []const u8, oid: u32) !void {
+fn parameterIndex(s: anytype, token: []const u8) !usize {
     var n: usize = 0;
     for (token[1..]) |c| {
         if (c < '0' or c > '9') return error.Syntax;
@@ -2474,10 +2513,14 @@ fn inferOid(s: anytype, token: []const u8, oid: u32) !void {
         if (n > parameter_capacity) return error.ParameterCapacity;
     }
     if (n == 0 or n > s.count) return error.ProtocolViolation;
-    const previous = s.oids[n - 1];
+    return n - 1;
+}
+fn inferOid(s: anytype, token: []const u8, oid: u32) !void {
+    const index = try parameterIndex(s, token);
+    const previous = s.oids[index];
     const integer_conversion = (oid == 20 or oid == 23) and (previous == 20 or previous == 21 or previous == 23);
     if (previous != 0 and previous != oid and !integer_conversion) return error.TypeMismatch;
-    if (previous == 0) s.oids[n - 1] = oid;
+    if (previous == 0) s.oids[index] = oid;
 }
 fn integerText(bytes: []const u8) bool {
     if (bytes.len == 0) return false;

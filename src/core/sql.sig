@@ -140,6 +140,7 @@ pub const Interval = temporal_module.Interval;
 pub const Numeric = numeric_module.Numeric;
 pub const Type = types.Type;
 pub const typeInfo = types.typeInfo;
+pub const typeByName = types.typeByName;
 pub const typeFromOid = types.typeFromOid;
 /// Datetime helpers for codecs and callers (PostgreSQL epoch, zones).
 pub const temporal = temporal_module;
