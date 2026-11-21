@@ -190,7 +190,7 @@ pub fn Exec(comptime config: types.Config) type {
                 }
                 if (self.first_filter) |filter| {
                     filter.context.tuple[0] = cells.ptr;
-                    if (!try self.query.earlyKeep(&filter.context, filter.predicate, 0, false)) return;
+                    if (!try self.query.earlyKeep(&filter.context, filter.predicate, 0, true)) return;
                 }
                 const at = try self.query.cells(self.width);
                 for (cells, 0..) |cell, index| self.query.work.cells[at + index] = cell;
@@ -571,7 +571,12 @@ pub fn Exec(comptime config: types.Config) type {
                     .column, .catalog_tableoid => n.level == 0 and n.relation <= stage,
                     .param => require_infallible and self.session.params != null and n.integer >= 1 and n.integer <= config.statement_parameters,
                     .null_literal, .bool_literal, .int_literal => true,
-                    .text_literal => !require_infallible or n.ty == .unknown or n.ty == .text or (n.ty == .date and n.date_bound),
+                    .text_literal => !require_infallible or n.ty == .unknown or n.ty == .text or n.ty == .name or (n.ty == .date and n.date_bound),
+                    .cast => blk: {
+                        if (!require_infallible or n.ty != .oid or n.typmod >= 0) break :blk false;
+                        const operand = self.pool.nodes[n.a];
+                        break :blk operand.kind == .int_literal and operand.integer >= 0 and operand.integer <= 0xffffffff;
+                    },
                     .decimal_literal => !require_infallible,
                     .binary => switch (n.op) {
                         .eq, .ne, .lt, .le, .gt, .ge => self.availableAtStage(n.a, stage, require_infallible) and self.availableAtStage(n.b, stage, require_infallible),
@@ -595,6 +600,17 @@ pub fn Exec(comptime config: types.Config) type {
                 return !early or try self.earlyKeep(ctx, id, stage, false);
             }
 
+            /// First-source catalog predicates can be applied before the
+            /// scan retains a row. Keep the complete WHERE after the join.
+            fn firstCatalogPredicate(self: *const Query, p: *const B.Plan) u16 {
+                if (p.sources[0].view == null or p.where == none) return none;
+                for (p.sources[1..p.source_count], 1..) |source, stage| {
+                    if (source.join == .left or source.join == .right or source.join == .full or
+                        !self.availableAtStage(source.on, stage, true)) return none;
+                }
+                return p.where;
+            }
+
             /// Left-deep joins prune eligible WHERE conjuncts at their first
             /// complete tuple, before allocating the next intermediate stage.
             fn join(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!Tuples {
@@ -608,12 +624,11 @@ pub fn Exec(comptime config: types.Config) type {
                 var current: Tuples = .{ .start = @intCast(self.work.ref_low), .count = 1, .width = 0 };
                 var early = self.earlyAvailable(p.where, p.source_count - 1) and self.prefixJoinsSafe(p);
                 for (p.sources[0..p.source_count]) |source| if (source.join == .left or source.join == .right or source.join == .full) { early = false; break; };
+                const catalog_predicate = self.firstCatalogPredicate(p);
                 for (p.sources[0..p.source_count], 0..) |*source, stage| {
                     const last = stage + 1 == p.source_count;
                     const probing = source.probe != none and stage != 0;
-                    // The same first-stage WHERE predicates used by joinKeep
-                    // can discard catalog rows before they occupy workspace.
-                    const first_filter = if (stage == 0 and early) p.where else none;
+                    const first_filter = if (stage == 0) catalog_predicate else none;
                     const rows: List = if (probing) .{} else try self.sourceRows(source, outer, synchronizedProjection(p), first_filter);
                     const outer_join = source.join == .left or source.join == .full;
                     const tracks = source.join == .right or source.join == .full;
