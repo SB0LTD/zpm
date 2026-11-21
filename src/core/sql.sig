@@ -122,6 +122,7 @@ const routine_catalog = @import("sql/routine_catalog.sig");
 const routine_module = @import("sql/routine.sig");
 const CO = @import("sql/catalog_objects.sig");
 const operator_catalog = @import("sql/operator_catalog.sig");
+const index_operator_catalog = @import("sql/index_operator_catalog.sig");
 const array_module = @import("sql/array.sig");
 
 /// The canonical SQL tokenizer, also used by wire parameter binding.
@@ -6163,6 +6164,22 @@ pub fn Database(comptime config: Config) type {
                         intCell(op.left), intCell(op.right), intCell(op.result), intCell(op.commutator), intCell(op.negator),
                         .{ .regproc = op.function_oid }, .{ .regproc = 0 }, .{ .regproc = 0 },
                     });
+                }
+                return;
+            }
+            if (view == .pg_opclass or view == .pg_opfamily) {
+                const method = intCell(catalog_module.btree_access_method);
+                const namespace = intCell(catalog_module.catalog_namespace);
+                const owner = intCell(CO.bootstrap_role);
+                for (index_operator_catalog.btree_families) |family| {
+                    if (view == .pg_opfamily) {
+                        try sink.add(&.{ intCell(family.oid), method, nameCell(family.name), namespace, owner });
+                        continue;
+                    }
+                    for (family.classes) |class| {
+                        try sink.add(&.{ intCell(class.oid), method, nameCell(class.name), namespace, owner,
+                            intCell(family.oid), intCell(types.typeOid(class.input)), boolCell(true), intCell(0) });
+                    }
                 }
                 return;
             }

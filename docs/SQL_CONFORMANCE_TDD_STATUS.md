@@ -2,6 +2,16 @@
 
 ## Stock PostgreSQL dump and restore candidate
 
+`pg_opclass` and `pg_opfamily` share the registry for 26 default index
+classes across 21 families. Each row uses PostgreSQL 16 catalog OIDs and
+links to the supported `btree` method and indexed type. Qualification
+compares every row and link and exercises unique-index creation, ordered
+reads, equality, and duplicate rejection for each type. The PostgreSQL 18
+comparison matches generated class OIDs by method and name. These catalog
+entries describe supported SQL semantics. Explicit operator-class selection,
+planner use of PostgreSQL operator families, and family-member catalogs
+remain open.
+
 `pg_am` exposes the two implemented access methods with PostgreSQL table
 and index kind codes and typed `regproc` handler references. Handler OIDs
 resolve to `pg_proc` and their argument and result pseudo-types are visible

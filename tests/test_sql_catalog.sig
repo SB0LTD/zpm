@@ -140,6 +140,16 @@ fn typeDiscovery() !void {
     try rejects("SELECT ('abc'::name)[0:1]", error.UnsupportedStatement);
 }
 
+fn indexOperatorDiscovery() !void {
+    try expect("SELECT COUNT(*),COUNT(DISTINCT opcfamily) FROM pg_opclass", "26|21");
+    try expect("SELECT c.tableoid,c.oid,a.amname,t.typname,f.opfname,c.opcdefault,c.opckeytype "
+        ++ "FROM pg_opclass c JOIN pg_am a ON a.oid=c.opcmethod JOIN pg_type t ON t.oid=c.opcintype "
+        ++ "JOIN pg_opfamily f ON f.oid=c.opcfamily AND f.opfmethod=a.oid WHERE c.opcname='int4_ops'",
+        "2616|1978|btree|int4|integer_ops|t|0");
+    try expect("SELECT tableoid,oid,opfmethod,opfnamespace,opfowner FROM pg_opfamily WHERE opfname='integer_ops'",
+        "2753|1976|403|11|10");
+}
+
 fn lifecycle() !void {
     try run("CREATE TABLE a (id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY, amount NUMERIC(10,2), at TIMESTAMPTZ(3), doc JSONB, label TEXT DEFAULT 'd', n INTEGER DEFAULT 2 + 3)");
     try expect(public_tables, "a");
@@ -280,6 +290,7 @@ pub fn main(init: std.process.Init) !void {
     try types();
     try dumpDiscovery();
     try typeDiscovery();
+    try indexOperatorDiscovery();
     try lifecycle();
     try replay();
     try characterMetadata();
