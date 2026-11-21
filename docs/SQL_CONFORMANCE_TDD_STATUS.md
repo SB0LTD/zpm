@@ -2,6 +2,27 @@
 
 ## Stock PostgreSQL dump and restore candidate
 
+`pg_event_trigger` exposes the stock catalog at OID 3466, with an
+internal `"char"` firing mode and `text[]` command tags. It has no rows
+because RamSQL does not support DDL event triggers. Single-array
+`unnest` in FROM uses the input's element type and emits values in
+storage order, preserving NULL elements and supporting
+`WITH ORDINALITY`. The stock tag expression uses a correlated array
+subquery. Target-list and multi-array `unnest` remain open.
+
+RAMSQL `2294b9b` with ZPM `935daea0` passed event-trigger discovery
+on PostgreSQL 16 and 18. Both lanes matched native results for
+parameterized tag quoting, multidimensional arrays, NULLs, duplicates,
+and ordinality in text and binary formats. The standalone Windows
+Sig catalog suite passed 116 assertions. Native plain and custom
+imports passed row and constraint checks after WAL reopen. Both
+outbound dumps passed event-trigger discovery and reached the
+`pg_attribute` and `pg_type` column discovery query, which returned
+`ColumnNotFound`. That projection needs additional storage, options,
+and missing-value metadata. Both stock directions on both versions
+remain the merge gate.
+[PostgreSQL 16 and 18 event-trigger CI](https://github.com/SB0LTD/ramsql/actions/runs/44920992058)
+
 `pg_range` exposes the six built-in ranges the Sig engine supports.
 It derives subtype and B-tree operator-class references from the
 existing registries and identifies the canonicalization routines
