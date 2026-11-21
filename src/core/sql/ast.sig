@@ -974,6 +974,12 @@ pub fn Ast(comptime config: types.Config) type {
             rename_column: struct { from: Ident, to: Ident },
             set_default: struct { column: Ident, expression: Span },
             drop_default: Ident,
+            add_identity: struct {
+                column: Ident,
+                always: bool,
+                name: ?TableRef = null,
+                options: sequence.Options = .{},
+            },
             set_not_null: Ident,
             drop_not_null: Ident,
             add_constraint: ConstraintDef,

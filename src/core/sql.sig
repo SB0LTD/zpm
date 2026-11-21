@@ -7735,6 +7735,7 @@ pub fn Database(comptime config: Config) type {
             }
             try self.remapColumnComments(slot, source.oid, alter.sources[0..alter.count], snap);
             try self.remapStatistics(slot, source.oid, alter.sources[0..alter.count], snap);
+            if (alter.identity) |identity| try self.createSequence(slot, copy.namespace, identity.name, identity.spec, copy.oid, identity.column, snap);
         }
 
         /// Existing rows against the constraints ALTER TABLE added or

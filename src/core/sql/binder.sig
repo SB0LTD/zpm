@@ -303,6 +303,7 @@ pub fn Binder(comptime config: types.Config) type {
             constraint_count: usize,
             sources: [config.columns]u8,
             fills: [config.columns]u16 = @splat(none),
+            identity: ?Identity = null,
             check_not_null: [config.columns]bool = @splat(false),
             check_constraint: [config.table_constraints]bool = @splat(false),
             /// Kind, secondary indexes, view and partition definition after
@@ -8498,6 +8499,29 @@ pub fn Binder(comptime config: types.Config) type {
                     @memcpy(candidate.expression.bytes[0..text.len], text);
                     _ = try bindExpressionText(context, &candidate, null, -1);
                     column.* = candidate;
+                },
+                .add_identity => |*definition| {
+                    if (context.dialect != .postgres or alter.count != 1 or
+                        entry.parent != 0 or hasChildren(context, entry.oid)) return error.UnsupportedStatement;
+                    const position = alterColumn(&out, toName(context, definition.column).slice()) orelse return error.ColumnNotFound;
+                    const column = &out.columns[position];
+                    if (!column.not_null or column.default_kind != .none) return error.ObjectNotInPrerequisiteState;
+                    if (!integerColumn(column.data_type)) return error.TypeMismatch;
+                    for (out.columns[0..out.count]) |*other| switch (other.default_kind) {
+                        .identity_always, .identity_by_default => return error.UnsupportedStatement,
+                        else => {},
+                    };
+                    const name = if (definition.name) |reference| blk: {
+                        if (reference.schema) |schema| {
+                            if (try qualifierNamespace(context, schema) != entry.namespace) return error.InvalidTableDefinition;
+                        }
+                        break :blk toName(context, reference.name);
+                    } else try identityName(entry.name, column.name);
+                    if (indexNameTaken(context, entry.namespace, name.slice())) return error.TableExists;
+                    var options = definition.options;
+                    if (options.type_oid == 0) options.type_oid = types.typeOid(column.data_type);
+                    out.identity = .{ .column = @intCast(position), .name = name, .spec = try sequence.resolve(options) };
+                    column.default_kind = if (definition.always) .identity_always else .identity_by_default;
                 },
                 .drop_default => |ident| {
                     const position = alterColumn(&out, toName(context, ident).slice()) orelse return error.ColumnNotFound;

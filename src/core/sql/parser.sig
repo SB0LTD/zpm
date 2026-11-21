@@ -796,7 +796,27 @@ pub fn Parser(comptime config: types.Config) type {
                 } else if (try self.takeRaw("alter")) {
                     _ = try self.takeRaw("column");
                     const name = try self.identifier();
-                    if (try self.takeWord("SET")) {
+                    if (self.mode == .standard and try self.takeRaw("add")) {
+                        try self.expectWord("GENERATED");
+                        const always = try self.takeWord("ALWAYS");
+                        if (!always) {
+                            try self.expectWord("BY");
+                            try self.expectWord("DEFAULT");
+                        }
+                        try self.expectWord("AS");
+                        try self.expectWord("IDENTITY");
+                        var action: Ast.AlterAction = .{ .add_identity = .{ .column = name, .always = always } };
+                        if (try self.takeSymbol(.lparen)) {
+                            const identity = &action.add_identity;
+                            if (try self.takeWord("SEQUENCE")) {
+                                try self.expectWord("NAME");
+                                identity.name = try self.qualifiedName();
+                            }
+                            try self.sequenceOptions(&identity.options);
+                            try self.expectSymbol(.rparen);
+                        }
+                        try pushAction(&out, action);
+                    } else if (try self.takeWord("SET")) {
                         if (try self.takeWord("DEFAULT")) {
                             const start = self.tokenStart();
                             _ = try self.expression();
