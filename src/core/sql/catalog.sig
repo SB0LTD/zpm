@@ -55,7 +55,7 @@ pub const View = enum(u8) { pg_type, pg_namespace, pg_class, pg_attribute, pg_in
     // Catalog objects (B11 wave 3, catalog_objects.sig).
     pg_roles, pg_authid, pg_auth_members, pg_policy, pg_policies, pg_description, pg_shdescription, pg_foreign_data_wrapper, pg_foreign_server, pg_publication, pg_extension, pg_tables, table_privileges, pg_enum, pg_database, pg_am, pg_collation, pg_constraint, pg_statistic_ext,
     pg_publication_rel, pg_publication_namespace, pg_settings, pg_depend, pg_tablespace, pg_foreign_table,
-    pg_init_privs, pg_cast, pg_transform, pg_language, pg_operator, pg_opclass, pg_opfamily, pg_ts_parser, pg_ts_template };
+    pg_init_privs, pg_cast, pg_transform, pg_language, pg_operator, pg_opclass, pg_opfamily, pg_ts_parser, pg_ts_template, pg_ts_dict };
 
 pub const sql_language_oid: u32 = 14;
 pub const plpgsql_language_oid: u32 = 13002;
@@ -126,6 +126,12 @@ pub const simple_template = struct {
     pub const init: TextSearchCallback = .{ .oid = 3725, .name = "dsimple_init", .args = &.{internal_type_oid}, .result = internal_type_oid };
     pub const lexize: TextSearchCallback = .{ .oid = 3726, .name = "dsimple_lexize",
         .args = &.{ internal_type_oid, internal_type_oid, internal_type_oid, internal_type_oid }, .result = internal_type_oid };
+};
+
+pub const simple_dictionary = struct {
+    pub const oid: u32 = 3765;
+    pub const name = "simple";
+    pub const template_oid = simple_template.oid;
 };
 
 pub const text_search_callbacks = [_]TextSearchCallback{
@@ -211,6 +217,10 @@ const pg_ts_template_columns = [_]ViewColumn{
     col("oid", .oid), col("tmplname", .name), col("tmplnamespace", .oid),
     col("tmplinit", .regproc), col("tmpllexize", .regproc),
 };
+const pg_ts_dict_columns = [_]ViewColumn{
+    col("oid", .oid), col("dictname", .name), col("dictnamespace", .oid),
+    col("dictowner", .oid), col("dicttemplate", .oid), col("dictinitoption", .text),
+};
 
 /// Implemented cataloged casts that have no separately callable function.
 /// PostgreSQL bootstrap OIDs identify these shared binary-coercion paths.
@@ -294,6 +304,7 @@ pub fn viewColumns(view: View) []const ViewColumn {
         .pg_opfamily => &pg_opfamily_columns,
         .pg_ts_parser => &pg_ts_parser_columns,
         .pg_ts_template => &pg_ts_template_columns,
+        .pg_ts_dict => &pg_ts_dict_columns,
         .pg_trigger => &pg_trigger_columns,
         .pg_rewrite => &pg_rewrite_columns,
         .pg_rules => &pg_rules_columns,
@@ -320,7 +331,7 @@ pub fn viewColumns(view: View) []const ViewColumn {
 pub fn findView(schema: ?[]const u8, name: []const u8) ?View {
     const catalog_views = [_]View{ .pg_type, .pg_enum, .pg_namespace, .pg_am, .pg_collation, .pg_class, .pg_settings, .pg_attribute, .pg_index, .pg_constraint, .pg_depend, .pg_statistic_ext, .pg_attrdef, .pg_sequence, .pg_indexes, .pg_views, .pg_matviews, .pg_inherits, .pg_proc, .pg_trigger, .pg_rewrite, .pg_rules,
         .pg_tablespace, .pg_foreign_table, .pg_roles, .pg_authid, .pg_auth_members, .pg_policy, .pg_policies, .pg_description, .pg_shdescription, .pg_foreign_data_wrapper, .pg_foreign_server, .pg_publication, .pg_publication_rel, .pg_publication_namespace, .pg_extension, .pg_tables,
-        .pg_init_privs, .pg_cast, .pg_transform, .pg_language, .pg_operator, .pg_opclass, .pg_opfamily, .pg_ts_parser, .pg_ts_template };
+        .pg_init_privs, .pg_cast, .pg_transform, .pg_language, .pg_operator, .pg_opclass, .pg_opfamily, .pg_ts_parser, .pg_ts_template, .pg_ts_dict };
     const information_views = [_]View{ .schemata, .tables, .columns, .table_constraints, .key_column_usage, .table_privileges };
     const qualified = schema orelse {
         for (catalog_views) |view| if (types.same(@tagName(view), name)) return view;
@@ -345,6 +356,7 @@ pub const bootstrap_relations = [_]struct { view: View, oid: u32 }{
     .{ .view = .pg_opclass, .oid = 2616 }, .{ .view = .pg_opfamily, .oid = 2753 },
     .{ .view = .pg_ts_parser, .oid = 3601 },
     .{ .view = .pg_ts_template, .oid = 3764 },
+    .{ .view = .pg_ts_dict, .oid = 3600 },
     .{ .view = .pg_tablespace, .oid = 1213 }, .{ .view = .pg_foreign_table, .oid = 3118 },
     .{ .view = .pg_authid, .oid = 1260 }, .{ .view = .pg_auth_members, .oid = 1261 },
     .{ .view = .pg_database, .oid = 1262 }, .{ .view = .pg_foreign_server, .oid = 1417 },

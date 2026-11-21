@@ -170,6 +170,15 @@ fn textTemplateDiscovery() !void {
         "3725|3726");
 }
 
+fn textDictionaryDiscovery() !void {
+    try expect("SELECT tableoid,oid,dictname,dictnamespace,dictowner,dicttemplate,dictinitoption IS NULL FROM pg_ts_dict",
+        "3600|3765|simple|11|10|3727|t");
+    try expect("SELECT d.dictname,n.nspname,t.tmplname FROM pg_catalog.pg_ts_dict d "
+        ++ "JOIN pg_namespace n ON n.oid=d.dictnamespace JOIN pg_ts_template t ON t.oid=d.dicttemplate "
+        ++ "JOIN pg_roles r ON r.oid=d.dictowner WHERE r.oid=10",
+        "simple|pg_catalog|simple");
+}
+
 fn lifecycle() !void {
     try run("CREATE TABLE a (id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY, amount NUMERIC(10,2), at TIMESTAMPTZ(3), doc JSONB, label TEXT DEFAULT 'd', n INTEGER DEFAULT 2 + 3)");
     try expect(public_tables, "a");
@@ -313,6 +322,7 @@ pub fn main(init: std.process.Init) !void {
     try indexOperatorDiscovery();
     try textParserDiscovery();
     try textTemplateDiscovery();
+    try textDictionaryDiscovery();
     try lifecycle();
     try replay();
     try characterMetadata();

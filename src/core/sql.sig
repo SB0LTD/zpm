@@ -6204,6 +6204,12 @@ pub fn Database(comptime config: Config) type {
                     .{ .regproc = template.init.oid }, .{ .regproc = template.lexize.oid } });
                 return;
             }
+            if (view == .pg_ts_dict) {
+                const dictionary = catalog_module.simple_dictionary;
+                try sink.add(&.{ intCell(dictionary.oid), nameCell(dictionary.name), intCell(catalog_module.catalog_namespace),
+                    intCell(CO.bootstrap_role), intCell(dictionary.template_oid), .null_value });
+                return;
+            }
             if (view == .pg_language) {
                 try sink.add(&.{ intCell(operator_catalog.internal_language_oid), nameCell("internal"), intCell(CO.bootstrap_role), boolCell(false), boolCell(false), intCell(0), intCell(0), intCell(0), .null_value });
                 try sink.add(&.{ intCell(catalog_module.sql_language_oid), nameCell("sql"), intCell(CO.bootstrap_role), boolCell(false), boolCell(true), intCell(0), intCell(0), intCell(0), .null_value });
