@@ -11966,10 +11966,10 @@ pub fn Database(comptime config: Config) type {
                     const count = self.catalog.visibleRelations(snapshot, &visible);
                     for (visible[0..count]) |relation| {
                         if (relation.kind != 'v' and relation.kind != 'm') continue;
-                        const view = &self.tables[relation.slot];
+                        const relation_oid = self.tables[relation.slot].oid;
                         // Catalog identities are (class, OID). An explicit
                         // rule uses a different allocated OID from its view.
-                        try sink.add(&.{ intCell(view.oid), nameCell("_RETURN"), intCell(view.oid), .{ .pg_internal_char = '1' }, .{ .pg_internal_char = 'O' }, boolCell(true) });
+                        try sink.add(&.{ intCell(relation_oid), nameCell("_RETURN"), intCell(relation_oid), .{ .pg_internal_char = '1' }, .{ .pg_internal_char = 'O' }, boolCell(true) });
                     }
                 },
                 .pg_rules => for (&self.objects.rules) |*rule| {
