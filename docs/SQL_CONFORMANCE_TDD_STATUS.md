@@ -2,6 +2,23 @@
 
 ## Stock PostgreSQL dump and restore candidate
 
+`pg_conversion` exposes relation OID 2607 with PostgreSQL's encoding
+IDs, `regproc` callback column and Boolean default flag. RamSQL uses
+UTF-8 for both client and server. UTF-8 identity transfer calls no
+conversion procedure, so the catalog has zero rows. Cross-encoding
+transcoding and user-defined conversions remain open. The standalone
+Windows Sig catalog suite passed 107 assertions.
+
+RAMSQL `d921dd3` with ZPM `9c4e83bb` passed conversion discovery on
+PostgreSQL 16 and 18. Both lanes checked the stock projection, full
+column types, relation OID, multilingual UTF-8 round trips in text
+and binary formats, and rejection of LATIN1. Native plain and custom
+imports passed row and constraint checks after WAL reopen. Outbound
+`pg_dump` passed conversion discovery and stopped with `TableNotFound`
+on the `pg_range` subquery in its `pg_cast` scan. Both stock directions
+on both versions remain the merge gate.
+[PostgreSQL 16 and 18 conversion CI](https://github.com/SB0LTD/ramsql/actions/runs/44919740184)
+
 `pg_default_acl` exposes PostgreSQL's relation OID 826, with `"char"`
 object codes and `aclitem[]` for both stored grants and the baseline
 returned by the stock discovery query. Built-in privileges are
