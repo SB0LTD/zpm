@@ -45,6 +45,14 @@ The updated routine and rule suite passed 767 assertions and replayed
 156 records. Column aliases introduced by a CREATE VIEW column list,
 general rule deparsing and arbitrary view definitions still need coverage.
 
+The stock archive fixture now restores a two-column primary key after
+loading the rows of a fresh table in a single transaction. The WAL uses
+the validated keyed table definition before the row records. It preserves
+rows, duplicate and NULL rejection, and key metadata after reopen. Stock
+PG16 and PG18 CI each passed all 34 checks. Adding a composite primary key
+to an existing committed table remains unsupported.
+[Composite-key archive CI](https://github.com/SB0LTD/ramsql/actions/runs/44962030582)
+
 RAMSQL `d1ddbe5` with ZPM `ed00a0a1` passed all 24 stock
 tooling checks on both PostgreSQL 16 and 18. Stock plain and custom
 imports passed row, default and constraint checks after WAL reopen.
