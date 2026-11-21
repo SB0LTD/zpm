@@ -2,6 +2,26 @@
 
 ## Stock PostgreSQL dump and restore candidate
 
+`pg_attribute` and `pg_type` expose the column and type metadata
+used by stock `pg_dump`. Attribute and type storage policies match so
+the dump does not emit an ALTER for a storage override. Attribute
+locality reflects supported inheritance and partitions. Statistics
+targets use the advertised PostgreSQL 16 default, and compression
+and option fields have no overrides. RamSQL materializes added column
+values, so `atthasmissing` is false and `attmissingval` is a typed
+`anyarray` NULL. That pseudo-type is available for catalog output.
+
+RAMSQL `9e4bfa6` with ZPM `7a160f13` passed the column discovery
+projection against PostgreSQL 16 and 18, including inherited and
+local columns, type formatting and the missing-value result OID.
+The standalone Windows Sig catalog suite passed 118 assertions.
+Native plain and custom imports passed row and constraint checks
+after WAL reopen. Both outbound stock dumps passed column discovery
+and returned `ColumnNotFound` on the subsequent `pg_attrdef` query
+for column defaults. Both stock directions on both versions remain
+the merge gate.
+[PostgreSQL 16 and 18 column discovery CI](https://github.com/SB0LTD/ramsql/actions/runs/44921924815)
+
 `pg_event_trigger` exposes the stock catalog at OID 3466, with an
 internal `"char"` firing mode and `text[]` command tags. It has no rows
 because RamSQL does not support DDL event triggers. Single-array
