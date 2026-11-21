@@ -308,7 +308,10 @@ pub fn Gpu(comptime Host: type) type {
             self.failed = .query_pci;
             // (D3DKMT_QUERY_DEVICE_IDS: the physical adapter's index, then
             // vendor, device, subsystem vendor, subsystem, revision, bus
-            // type: 28 bytes; asked for 32, Hyper-V's host answered short)
+            // type: 28 bytes asked, as the call takes it; the host's answer
+            // after its status starts at the vendor: `pci` is vendor,
+            // device, subsystem vendor, subsystem, revision, bus type, as
+            // galaxy-turing's RTX 2080 Ti answered, 2026-11-21)
             var q: [@sizeOf(QueryAdapterInfo) + PCI_IDS_BYTES]u8 align(8) = @splat(0);
             const qh = QueryAdapterInfo{ .hdr = .{ .process = self.process, .command_type = @intFromEnum(Command.query_adapter_info) }, .query_type = QUERY_PCI_IDS, .private_data_size = PCI_IDS_BYTES };
             @memcpy(q[0..@sizeOf(QueryAdapterInfo)], std.mem.asBytes(&qh));
@@ -377,8 +380,8 @@ const Play = struct {
                 },
                 @intFromEnum(Global.create_process) => std.mem.writeInt(u32, r[0..4], 0x8000_0001, .little),
                 @intFromEnum(Command.query_adapter_info) => {
-                    std.mem.writeInt(u32, r[8..12], 0x10de, .little);
-                    std.mem.writeInt(u32, r[12..16], 0x1e07, .little);
+                    std.mem.writeInt(u32, r[4..8], 0x10de, .little);
+                    std.mem.writeInt(u32, r[8..12], 0x1e07, .little);
                     len = 36;
                 },
                 @intFromEnum(Command.create_device) => std.mem.writeInt(u32, r[0..4], 0x4000_0040, .little),
@@ -416,7 +419,7 @@ test "GPU-PV: the handshake against a played host (io space, adapter, process, P
     try testing.expectEqual(@as(u32, 6), play.step);
     try testing.expectEqual(@as(u32, 0x4000_0000), g.adapter);
     try testing.expectEqual(@as(u32, 0x8000_0001), g.process);
-    try testing.expectEqual(@as(u32, 0x1e07), g.pci[2]);
+    try testing.expectEqual(@as(u32, 0x1e07), g.pci[1]);
     try testing.expectEqual(@as(u32, 0x4000_0040), g.device);
     var b: [64]u8 = undefined;
     try testing.expectEqualStrings("NVIDIA GeForce RTX 2080 Ti", g.description(&b));
