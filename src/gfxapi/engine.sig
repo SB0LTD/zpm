@@ -2744,36 +2744,14 @@ pub const Engine = struct {
     fn loadGraphics(e: *Engine, p: *raster.Pipeline) bool {
         if (p.gfx[1] != null) return p.gfx_owner == @as(?*anyopaque, e);
         if (p.gfx_refused_by == @as(?*anyopaque, e)) return false;
-        const d = e.dev.?;
-        const gl = gpu.nvidia_gl;
-        const s = kir.Storage{ .insts = &e.kir_insts, .tys = &e.kir_tys };
         const result: anyerror!void = blk: {
+            // (the compiler's large state when the work has room: a
+            // Direct3D program's, past the State's limits)
+            const K = gpu.nvidia_device.kir_sm120;
             var w = gpu.Work.init(e.work);
-            const st = &(w.take(gpu.nvidia_device.kir_sm120.State, 1) orelse break :blk error.OutOfMemory)[0];
-            st.asm_work.sched = .{};
-            var pk = raster.pixelStage(s, p);
-            pk.finish() catch |err| break :blk err;
-            const pbin = gl.compileStage(&pk, d.caps, st, .pixel, 0, &e.pcode) catch |err| break :blk err;
-            const reads = st.io.loads;
-            const pprog = d.load(&pbin) catch |err| break :blk err;
-            st.asm_work.sched = .{};
-            var vk = raster.vertexStage(s, p, &reads);
-            vk.finish() catch |err| {
-                d.unload(&pprog);
-                break :blk err;
-            };
-            const vbin = gl.compileStage(&vk, d.caps, st, .vertex, 0, &e.pcode) catch |err| {
-                d.unload(&pprog);
-                break :blk err;
-            };
-            const vprog = d.load(&vbin) catch |err| {
-                d.unload(&pprog);
-                break :blk err;
-            };
-            p.gfx = .{ vprog, pprog };
-            p.gfx_owner = e;
-            p.gfx[0].?.label = "gl_vertex_stage";
-            p.gfx[1].?.label = "gl_pixel_stage";
+            if (w.take(K.LargeState, 1)) |large| break :blk e.loadStages(p, &large[0]);
+            const st = &(w.take(K.State, 1) orelse break :blk error.OutOfMemory)[0];
+            break :blk e.loadStages(p, st);
         };
         result catch |err| {
             e.why_pipe = err;
@@ -2782,6 +2760,37 @@ pub const Engine = struct {
             return false;
         };
         return true;
+    }
+
+    /// loadGraphics's compiles and loads, with the compiler's state `st`.
+    fn loadStages(e: *Engine, p: *raster.Pipeline, st: anytype) anyerror!void {
+        const d = e.dev.?;
+        const gl = gpu.nvidia_gl;
+        const s = kir.Storage{ .insts = &e.kir_insts, .tys = &e.kir_tys };
+        st.asm_work.sched = .{};
+        var pk = raster.pixelStage(s, p);
+        try pk.finish();
+        const pbin = try gl.compileStage(&pk, d.caps, st, .pixel, 0, &e.pcode);
+        const reads = st.io.loads;
+        const pprog = try d.load(&pbin);
+        st.asm_work.sched = .{};
+        var vk = raster.vertexStage(s, p, &reads);
+        vk.finish() catch |err| {
+            d.unload(&pprog);
+            return err;
+        };
+        const vbin = gl.compileStage(&vk, d.caps, st, .vertex, 0, &e.pcode) catch |err| {
+            d.unload(&pprog);
+            return err;
+        };
+        const vprog = d.load(&vbin) catch |err| {
+            d.unload(&pprog);
+            return err;
+        };
+        p.gfx = .{ vprog, pprog };
+        p.gfx_owner = e;
+        p.gfx[0].?.label = "gl_vertex_stage";
+        p.gfx[1].?.label = "gl_pixel_stage";
     }
 
     /// The draw on the GPU's 3D engine, or null when it is not one it takes
