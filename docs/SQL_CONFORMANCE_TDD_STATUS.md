@@ -2,6 +2,24 @@
 
 ## Stock PostgreSQL dump and restore candidate
 
+`pg_ts_dict` exposes the built-in `pg_catalog.simple` dictionary.
+Its row uses PostgreSQL dictionary OID 3765, the bootstrap owner and
+catalog namespace, and a reference to the supported `simple` template.
+The default initialization has no options, so `dictinitoption` is SQL
+NULL with type `text`. The row describes the existing stateless Sig
+dictionary. Custom dictionaries and configurable initialization remain open.
+
+RAMSQL `b9f3cde` with ZPM `ed450a4e` passed dictionary discovery on
+PostgreSQL 16 and 18. CI compared the full stock projection in text and
+binary mode and followed the owner, namespace, template and callback
+references. Native plain and custom imports passed with row and constraint
+checks after WAL reopen. The standalone Windows Sig catalog suite passed
+91 assertions. Outbound `pg_dump` passed dictionary discovery and stopped
+on the missing `pg_ts_config` catalog. The next catalog needs the
+supported configuration's owner, namespace and parser reference. Both
+stock directions on both versions remain the merge gate.
+[PostgreSQL 16 and 18 text-search dictionary CI](https://github.com/SB0LTD/ramsql/actions/runs/44910583546)
+
 `pg_ts_template` exposes the built-in `pg_catalog.simple` template with
 typed `regproc` references to `dsimple_init` and `dsimple_lexize`. Both
 references resolve through `pg_proc`. The Sig dictionary uses fixed,
