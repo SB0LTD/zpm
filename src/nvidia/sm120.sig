@@ -2818,6 +2818,58 @@ fn cTld(cx: *Cx) Error!void {
     try texOperands(cx, &TLD_DIMS);
 }
 
+/// sm_75's texture operands (NAK's encoder below sm_100): TEX's on sm_120
+/// without the uniform registers (40, 48: the bindless form's bits 40..58
+/// are nothing) and without bit 91.
+fn texOperands75(cx: *Cx, dims: []const []const u8) Error!void {
+    try cx.optPred(81, false);
+    _ = try cx.reg(64);
+    _ = try cx.reg(16);
+    const a = try cx.reg(24);
+    const b = try cx.reg(32);
+    if (a == RZ or b == RZ) return cx.refuse();
+    _ = try cx.named(61, 3, dims);
+    if (cx.enc()) {
+        if (cx.peek() != null) _ = try cx.imm(72, 4, .hex) else cx.w.put(72, 4, 0xf);
+    } else if (cx.get(72, 4) != 0xf) _ = try cx.imm(72, 4, .hex);
+}
+
+/// sm_75's TEX(.SCR).B(.LZ | .LB | .LL | .LC | .LB.LC)(.AOFFI)(.NDV)(.DC)
+/// (.NODEP) (Pfault,) Rd1, Rd0, Ra, Rb, dimension(, mask): the bindless
+/// form (0x361 with bit 59; the bound one, 0xb60 with a constant buffer's
+/// word, is not here: the renderer hands every texture as a handle). As
+/// NAK encodes it below sm_100: the level in 87..89 whole, a packed offset
+/// bit 76, .NDV bit 77 (the only derivative mode but the automatic one: no
+/// .DXY before sm_100), the depth comparison bit 78. No ptxas or nvdisasm
+/// output for it here: NAK's fields, and the names sm_120's have.
+fn cTex75(cx: *Cx) Error!void {
+    cx.put(0, 12, 0x361);
+    _ = try cx.flag(60, "SCR");
+    try cx.always("B");
+    cx.put(59, 1, 1);
+    _ = try cx.modPartsBits(&.{ 87, 88, 89 }, TEX_LODS[0..6]);
+    _ = try cx.flag(76, "AOFFI");
+    _ = try cx.flag(77, "NDV");
+    _ = try cx.flag(78, "DC");
+    _ = try cx.flag(90, "NODEP");
+    try texOperands75(cx, &TEX_DIMS);
+}
+
+/// sm_75's TLD(.SCR).B.LZ|LL(.AOFFI)(.MS)(.NODEP) ...: a texel fetched
+/// (0x367 with bit 59; NAK below sm_100: the level 1 or 3 in 87..89, .MS
+/// bit 78).
+fn cTld75(cx: *Cx) Error!void {
+    cx.put(0, 12, 0x367);
+    _ = try cx.flag(60, "SCR");
+    try cx.always("B");
+    cx.put(59, 1, 1);
+    _ = try cx.mod(87, 3, &.{ "?", "LZ", "?", "LL", "?", "?", "?", "?" });
+    _ = try cx.flag(76, "AOFFI");
+    _ = try cx.flag(78, "MS");
+    _ = try cx.flag(90, "NODEP");
+    try texOperands75(cx, &TLD_DIMS);
+}
+
 // ── The forms ───────────────────────────────────────────────────────────────
 
 const Codec = *const fn (*Cx) Error!void;
@@ -2929,13 +2981,17 @@ const FORMS = [_]Form{
     .{ .name = "ATOMG", .opcode = 0x3a9, .t = true, .codec = cAtomgCas },
     .{ .name = "ATOMS", .opcode = 0x38d, .t = true, .codec = cAtomsCas },
     .{ .name = "F2IP", .opcode = 0x043, .alu = true, .codec = cF2ip },
-    .{ .name = "ALD", .opcode = 0x321, .codec = cAld },
-    .{ .name = "AST", .opcode = 0x322, .codec = cAst },
-    .{ .name = "IPA", .opcode = 0x326, .codec = cIpa },
-    .{ .name = "PIXLD", .opcode = 0x925, .codec = cPixld },
-    .{ .name = "KILL", .opcode = 0x95b, .codec = cKill },
+    // (the graphics stages' own: NAK's encoder has one form of each for
+    // every generation, no `sm` in them)
+    .{ .name = "ALD", .opcode = 0x321, .t = true, .codec = cAld },
+    .{ .name = "AST", .opcode = 0x322, .t = true, .codec = cAst },
+    .{ .name = "IPA", .opcode = 0x326, .t = true, .codec = cIpa },
+    .{ .name = "PIXLD", .opcode = 0x925, .t = true, .codec = cPixld },
+    .{ .name = "KILL", .opcode = 0x95b, .t = true, .codec = cKill },
     .{ .name = "TEX", .opcode = 0xd61, .codec = cTex },
     .{ .name = "TLD", .opcode = 0xd67, .codec = cTld },
+    .{ .name = "TEX", .opcode = 0x361, .t_only = true, .codec = cTex75 },
+    .{ .name = "TLD", .opcode = 0x367, .t_only = true, .codec = cTld75 },
 };
 
 fn formOf(name: []const u8) ?*const Form {

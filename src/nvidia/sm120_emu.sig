@@ -1066,6 +1066,11 @@ fn compile(sm: sm120.Sm, in: *const Instr, given: ?u64, n_code: usize) Error!Op 
     if ((op.kind == .tex or op.kind == .tld) and op.refuse == .none) {
         op.uses = textureUses(&op);
         op.top = topOf(&op.uses);
+        // (on sm_75 in Turing's category, as usesOfFor puts every use)
+        if (sm == .sm_75) {
+            for (op.uses.dst[0..op.uses.n_dst]) |*d| d.cat = sched.CAT75;
+            for (op.uses.src[0..op.uses.n_src]) |*s| s.cat = sched.CAT75;
+        }
     }
     return op;
 }

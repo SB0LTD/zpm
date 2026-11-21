@@ -1311,9 +1311,13 @@ pub const Engine = struct {
     /// loaded for cfg.dev; if any fails, everything runs on the CPU.
     pub fn init(e: *Engine, cfg: Config) void {
         e.* = .{ .pool = Pool.init(cfg.pool), .slabs = cfg.slabs, .compiler = cfg.compiler, .work = cfg.work, .cpu_work = cfg.cpu_work, .cpu_insts = cfg.cpu_kernels, .check = cfg.check };
-        if (cfg.dev) |d| e.graphics = cfg.graphics and d.caps.graphics and d.caps.target == .sm_120;
-        e.graphics_depth = cfg.graphics_depth;
-        e.depth_float = e.graphics and cfg.depth_float and cfg.graphics_depth;
+        if (cfg.dev) |d| e.graphics = cfg.graphics and d.caps.graphics and (d.caps.target == .sm_120 or d.caps.target == .sm_75);
+        // (a Turing card's 3D engine keeps depth words where the compute
+        // raster cannot read them: FermiZS GOBs, not public; its depth and
+        // stencil draws stay on the compute kernels)
+        const turing = if (cfg.dev) |d| d.caps.target == .sm_75 else false;
+        e.graphics_depth = cfg.graphics_depth and !turing;
+        e.depth_float = e.graphics and cfg.depth_float and e.graphics_depth;
         e.block_targets = e.graphics and cfg.block_targets;
         if (cfg.dev) |d| e.vram_images = cfg.vram_images and d.caps.memory == .discrete and cfg.check.mem.len == 0;
         for (e.slabs) |*slab| slab.* = .{};
@@ -2614,7 +2618,7 @@ pub const Engine = struct {
         e.stats.graphics_draws += 1;
         if (!e.said_graphics) {
             e.said_graphics = true;
-            report.say(.pipeline, "draws through the GPU's 3D engine (the RTX's BLACKWELL_B: its rasterizer and blender), the compute kernels for what it does not take yet", .{});
+            report.say(.pipeline, "draws through the GPU's 3D engine (the RTX's {s}: its rasterizer and blender), the compute kernels for what it does not take yet", .{if (e.dev.?.caps.target == .sm_75) "TURING_A" else "BLACKWELL_B"});
         }
         return true;
     }

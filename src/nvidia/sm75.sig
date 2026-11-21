@@ -133,6 +133,49 @@ test "sm_75 words that differ from sm_120's, worked out from NAK's fields" {
     try expectWords("BSYNC B0", 0x0000_0000_0000_7941, 0x0380_0000);
     // NAK's barrier: the opcode and zeros.
     try expectWords("BAR.SYNC 0x0", 0x0000_0000_0000_7b1d, 0);
+    // TEX through a handle (0x361 with bit 59; sm_120's is 0xd61 with bit
+    // 91 and its uniform registers): the results' registers at 16 and 64,
+    // the coordinates' at 24, the handle's at 32, the dimension at 61 (2D:
+    // 1), all four channels at 72, no fault predicate (7 at 81).
+    try expectWords("TEX.B R2, R0, R4, R6, 2D", 0x2800_0006_0400_7361, 0x000e_0f02);
+    // (level zero: 1 in 87..89; .NODEP bit 90; two channels, no second
+    // register)
+    try expectWords("TEX.B.LZ.NODEP RZ, R0, R4, R6, 2D, 0x3", 0x2800_0006_0400_7361, 0x048e_03ff);
+    // (a bias and a clamp: 5; a packed offset bit 76, .NDV 77, the depth
+    // comparison 78)
+    try expectWords("TEX.B.LB.LC.AOFFI.NDV.DC R2, R0, R4, R6, 2D", 0x2800_0006_0400_7361, 0x028e_7f02);
+    // TLD (0x367): the level 1 (.LZ) or 3 (.LL) in 87..89, .MS bit 78.
+    try expectWords("TLD.B.LZ R2, R0, R4, R6, 2D", 0x2800_0006_0400_7367, 0x008e_0f02);
+    try expectWords("TLD.B.LL.MS R2, R0, R4, R6, 2D", 0x2800_0006_0400_7367, 0x018e_4f02);
+}
+
+test "the graphics stages' instructions on sm_75: sm_120's words (NAK has one form of each), and the texture forms each generation's own" {
+    for ([_][]const u8{ "ALD R0, a[0x2fc]", "ALD.128 R4, a[0x80]", "AST.128 a[0x70], R4", "AST.64 a[0x80], R10", "IPA.PASS R0, a[0x7c]", "IPA.CONSTANT R4, a[0x80]", "PIXLD.COVMASK R0", "KILL" }) |text| {
+        const in = try sm120.parse(text);
+        const a = try sm120.encodeFor(.sm_75, &in, 0, null);
+        const b = try sm120.encode(&in, 0, null);
+        errdefer std.debug.print("{s}\n", .{text});
+        try testing.expectEqual(b.bits, a.bits);
+        const back = try sm120.decodeFor(.sm_75, a.lo(), a.hi(), 0);
+        try testing.expectEqual(a.bits, (try sm120.encodeFor(.sm_75, &back, 0, null)).bits);
+    }
+    // a texture through a handle: the same text, another word
+    const tex = try sm120.parse("TEX.B R2, R0, R4, R6, 2D");
+    try testing.expect((try sm120.encodeFor(.sm_75, &tex, 0, null)).bits != (try sm120.encode(&tex, 0, null)).bits);
+    // sm_120's word does not decode as sm_75's, nor sm_75's as sm_120's
+    const w120 = try sm120.encode(&tex, 0, null);
+    const w75 = try sm120.encodeFor(.sm_75, &tex, 0, null);
+    try testing.expectError(error.Unknown, sm120.decodeFor(.sm_75, w120.lo(), w120.hi(), 0));
+    try testing.expectError(error.Unknown, sm120.decode(w75.lo(), w75.hi(), 0));
+    // what sm_75's texture forms have not: a uniform register for the
+    // handle, sm_120's derivative mode, the modes NAK never emits
+    for ([_][]const u8{ "TEX.B.DXY R2, R0, R4, R6, 2D", "TEX.B R2, R0, R4, R6, UR4, 2D", "TEX.B.ULB R2, R0, R4, R6, 2D", "TEX.B.UAOFFI R2, R0, R4, R6, 2D", "TLD.B.ULL R2, R0, R4, R6, 2D", "TLD.B.LZ.UMS R2, R0, R4, R6, 2D" }) |text| {
+        const in = try sm120.parse(text);
+        if (sm120.encodeFor(.sm_75, &in, 0, null)) |_| {
+            std.debug.print("sm_75 took: {s}\n", .{text});
+            return error.TestUnexpectedResult;
+        } else |_| {}
+    }
 }
 
 test "sm_75 words that are sm_120's too (NAK has one encoding for every SM)" {

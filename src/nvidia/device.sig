@@ -28,8 +28,9 @@
 //! TURING_COMPUTE_A and its way of scheduling a QMD and of reporting,
 //! reads QMD version 02_02, decodes the code as sm_75 and checks it with
 //! sm_75's timing, with Turing's SM splits for shared memory. A stream, a
-//! QMD or a kernel made for the other generation fails on either. (A
-//! Turing device has no 3D engine here: emu3d is BLACKWELL_B's.)
+//! QMD or a kernel made for the other generation fails on either; its 3D
+//! engine (with `gr3d`) is TURING_A, emu3d as Turing's (the class, the
+//! texture headers, the depth target, the methods Turing has not).
 //!
 //! Allocation-free: buffers come from memory the device owner provides, and
 //! so does the emulator's Work.
@@ -173,8 +174,9 @@ pub const EmuDevice = struct {
     /// The program in the emulator now.
     loaded: ?struct { va: u64, sum: u64, n: usize } = null,
     /// The 3D engine (the caller's storage), or none: the class is then
-    /// not on this device, as on a channel no BLACKWELL_B object was
-    /// allocated for, and binding it is a refused stream.
+    /// not on this device, as on a channel no 3D object (BLACKWELL_B, or
+    /// TURING_A on sm_75) was allocated for, and binding it is a refused
+    /// stream.
     gr3d: ?*emu3d.Engine = null,
 
     pub fn device(e: *EmuDevice) Device {
@@ -383,13 +385,14 @@ pub const EmuDevice = struct {
 
     fn method(e: *EmuDevice, subch: u3, m: u32, v: u32) anyerror!void {
         if (m == push.SET_OBJECT) {
-            // (compute, and the 3D engine where the device has one)
-            if (v != push.computeClass(e.sm) and !(v == gr.BLACKWELL_B and e.gr3d != null and e.sm == .sm_120)) return error.BadStream;
+            // (compute, and the 3D engine of the device's generation where
+            // it has one)
+            if (v != push.computeClass(e.sm) and !(v == gr.classFor(e.sm) and e.gr3d != null)) return error.BadStream;
             e.subch[subch] = v;
             return;
         }
         if (m < 0x100) return e.host(m, v);
-        if (e.subch[subch] == gr.BLACKWELL_B) {
+        if (e.subch[subch] == gr.classFor(e.sm)) {
             const g = e.gr3d orelse return error.BadStream;
             // (a draw runs its programs in the emulator: a kernel's is
             // loaded again at its next launch)

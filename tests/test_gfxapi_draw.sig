@@ -1582,6 +1582,37 @@ test "draw: the scene through the emulated RTX's 3D engine where it draws, the c
     eng_rtx.deinit();
 }
 
+var out_tu3d: Out = .{};
+
+test "draw: the scene on the emulated RTX 2080 Ti with its 3D engine (TURING_A, sm_75): colour draws through it, depth and stencil on the compute kernels, the CPU's picture" {
+    const want = try cpuOut();
+    Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+    Rtx.dev.setSm(.sm_75);
+    Rtx.dev.withEngine(&Rtx3d.engine3d);
+    eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs, .graphics = true });
+    defer eng_rtx.deinit();
+    try std.testing.expect(eng_rtx.onGpu() and eng_rtx.graphics);
+    // (a Turing card's depth words are where nothing here reads them)
+    try std.testing.expect(!eng_rtx.graphics_depth and !eng_rtx.depth_float);
+    scene(&eng_rtx, &out_tu3d) catch |e| {
+        std.debug.print("rtx 2080 ti 3D scene: {s}; the engine lost the GPU {} ({?s}), its pipeline error {?s}; the 3D engine: {s}\n", .{ @errorName(e), eng_rtx.lost, if (eng_rtx.why) |w| @errorName(w) else null, if (eng_rtx.why_pipe) |w| @errorName(w) else null, Rtx3d.engine3d.why });
+        if (Rtx.dev.lastError()) |le| {
+            var buf: [512]u8 = undefined;
+            std.debug.print("sm120_emu: {s}: {s}\n", .{ @errorName(le), Rtx.dev.explain(&buf) });
+        }
+        return e;
+    };
+    std.debug.print("TURING_A: draws {d} through it, {d} on the compute kernels; the emulated engine drew {d}, {d} pixels\n", .{ eng_rtx.stats.graphics_draws, eng_rtx.stats.compute_draws, Rtx3d.engine3d.draws, Rtx3d.engine3d.pixels });
+    for (eng_rtx.said_compute) |w| if (w.len != 0) std.debug.print("TURING_A: a draw on the compute kernels: {s}\n", .{w});
+    try std.testing.expect(eng_rtx.why_pipe == null);
+    try std.testing.expect(!eng_rtx.lost);
+    try std.testing.expect(eng_rtx.stats.graphics_draws > 0);
+    try std.testing.expect(eng_rtx.stats.compute_draws > 0);
+    try std.testing.expectEqual(eng_rtx.stats.graphics_draws, Rtx3d.engine3d.draws);
+    try std.testing.expectEqual(@as(u32, 0), apart(&want.fbo, &out_tu3d.fbo, W, 2, "fbo"));
+    try std.testing.expectEqual(@as(u32, 0), apart(&want.win, &out_tu3d.win, WW, 2, "window"));
+}
+
 /// Two triangles sharing an edge (their corners' depths apart: a sloped
 /// plane each), added (ONE, ONE) into a cleared target twice: first each
 /// on the 3D engine or on the compute kernels as `on3d` says, the depth
@@ -1719,6 +1750,31 @@ test "draw: the drawtest boot's hardware test on the emulated RTX, step 4 (edges
     try std.testing.expectEqual(@as(u32, 0), res.edge_depth_apart);
     try std.testing.expectEqual(@as(u32, 0), res.edge_equal_apart);
     // (step 5: every feature scene drawn, each the model's)
+    try std.testing.expect(!res.feature_skipped);
+    try std.testing.expectEqual(@as(u32, gpu.nvidia_draw.FEATURE_SCENES), res.feature_scenes);
+    try std.testing.expectEqual(@as(u32, 0), res.feature_apart);
+}
+
+test "draw: the drawtest's hardware test on the emulated RTX 2080 Ti (TURING_A), steps 4 and 5 too: one depth-stencil surface, the depth GOBs' probe" {
+    Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+    Rtx.dev.setSm(.sm_75);
+    Rtx.dev.withEngine(&Rtx3d.engine3d);
+    const gd = Rtx.dev.device();
+    try std.testing.expect(gd.caps.graphics and gd.caps.target == .sm_75);
+    const res = gpu.nvidia_draw.hardwareTestWith(Rtx.dev.raw.device(), gd, &HwTest.over, &HwTest.kst, &HwTest.model, &HwTest.say, &HwTest.clock, .{ .sm = .sm_75 });
+    try std.testing.expect(res.started and res.object and res.state and !res.lost);
+    try std.testing.expectEqual(@as(u32, 0), res.failed);
+    try std.testing.expect(!res.edge_skipped);
+    // (no 4e: a separate stencil plane is Blackwell's)
+    try std.testing.expectEqual(gpu.nvidia_draw.EDGE_RUNS_TURING, res.edge_scenes);
+    // (4g: the emulated engine keeps Turing's depth words as Turing2D's, the
+    // guess the card's probe tests)
+    try std.testing.expectEqual(@as(u32, gpu.nvidia_draw.EW * gpu.nvidia_draw.EH), res.z24_drawn);
+    try std.testing.expectEqual(@as(u32, gpu.nvidia_draw.EW * gpu.nvidia_draw.EH), res.z24_placed);
+    try std.testing.expectEqual(@as(u32, 0), res.edge_cover_apart);
+    try std.testing.expectEqual(@as(u32, 0), res.edge_depth_apart);
+    try std.testing.expectEqual(@as(u32, 0), res.edge_equal_apart);
+    // (5: the two-sided stencil scene's stencil in the depth's top byte)
     try std.testing.expect(!res.feature_skipped);
     try std.testing.expectEqual(@as(u32, gpu.nvidia_draw.FEATURE_SCENES), res.feature_scenes);
     try std.testing.expectEqual(@as(u32, 0), res.feature_apart);

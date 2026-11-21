@@ -42,9 +42,10 @@
 //! QMD is version 02_02 (qmd.buildFor); constant buffer 0 keeps this
 //! layout. An indirect dispatch's patch kernel is the same KIR compiled
 //! for sm_75, writing a version 02_02 QMD's words (indirectPatchKernel75).
-//! Not offered there: the 3D engine (its class and texture words are
-//! other ones, not ported). `Emu.setSm` makes the emulated card a Turing
-//! one. Nothing sm_75 has run on a card.
+//! The 3D engine (withGraphics) is TURING_A there: gl3d's Turing stream
+//! (Draw.sm), the stage programs compiled for sm_75. `Emu.setSm` makes the
+//! emulated card a Turing one (its 3D engine too). Nothing sm_75 has run
+//! on a card.
 //!
 //! Allocation-free: the adapter's state is the caller's (Adapter, Emu).
 
@@ -117,8 +118,8 @@ pub fn rtx5070(vram: u64) gpu.Caps {
 
 /// The RTX 2080 Ti's (TU102, Turing) caps, `vram` bytes of VRAM: compute
 /// kernels compiled for sm_75, stamps and indirect dispatches as on the
-/// RTX 5070. No graphics (see the header). Proven on the emulated card
-/// only.
+/// RTX 5070; graphics with withGraphics (TURING_A). Proven on the emulated
+/// card only.
 pub fn tu102(vram: u64) gpu.Caps {
     var c = rtx5070(vram);
     c.target = .sm_75;
@@ -138,11 +139,10 @@ pub fn smOf(t: gpu.Target) push.Sm {
     return if (t == .sm_75) .sm_75 else .sm_120;
 }
 
-/// The same with the 3D engine offered (Caps.graphics: a channel with a
-/// BLACKWELL_B object on it). Blackwell only: Turing's caps come back as
-/// they are.
+/// The same with the 3D engine offered (Caps.graphics: a channel with the
+/// generation's 3D object on it, BLACKWELL_B or Turing's TURING_A).
 pub fn withGraphics(c: gpu.Caps) gpu.Caps {
-    if (c.target != .sm_120) return c;
+    if (c.target != .sm_120 and c.target != .sm_75) return c;
     var x = c;
     x.graphics = true;
     x.max_graphics = MAX_GRAPHICS;
@@ -738,6 +738,7 @@ pub const Adapter = struct {
             .instances = g.instances,
             .cull = g.cull,
             .front_ccw = g.front_ccw,
+            .sm = a.sm(),
             .depth = if (g.depth) |z| .{
                 .va = z.va,
                 .stencil_va = z.stencil_va,
@@ -1120,10 +1121,20 @@ fn glPixel(k: *kir.Kernel) void {
 }
 
 test "graphics dispatches: a quad's colors carried across it by the emulated 3D engine, then blended over" {
-    const gl = @import("nvidia_gl.sig");
+    try graphicsQuad();
+}
+
+/// An emulated card of T.sm's generation with its 3D engine.
+fn freshGraphics() gpu.Device {
     T.dev.init(&T.arena, &T.view, &T.work);
+    T.dev.setSm(T.sm);
     T.dev.withEngine(&GT.engine);
-    const d = T.dev.device();
+    return T.dev.device();
+}
+
+fn graphicsQuad() !void {
+    const gl = @import("nvidia_gl.sig");
+    const d = freshGraphics();
     try testing.expect(d.caps.graphics);
     var vk = newKernel("vs", .{ 1, 1, 1 });
     glVertex(&vk);
@@ -1195,10 +1206,12 @@ test "graphics dispatches: a quad's colors carried across it by the emulated 3D 
 }
 
 test "graphics dispatches in one run: the 3D engine's state once, a draw waiting for those before only where it reads what they drew" {
+    try graphicsRun();
+}
+
+fn graphicsRun() !void {
     const gl = @import("nvidia_gl.sig");
-    T.dev.init(&T.arena, &T.view, &T.work);
-    T.dev.withEngine(&GT.engine);
-    const d = T.dev.device();
+    const d = freshGraphics();
     var vk = newKernel("vs", .{ 1, 1, 1 });
     glVertex(&vk);
     try vk.finish();
@@ -3076,13 +3089,14 @@ test "sm_75: an indirect dispatch on the emulated Turing card: its patch kernel 
     try indirectDispatch();
 }
 
-test "sm_75: Turing's forms in the text; the other generation's binary and graphics refused; a divergent collective without WARPSYNC" {
+test "sm_75: Turing's forms in the text; the other generation's binary refused; a divergent collective without WARPSYNC" {
     turing();
     defer blackwell();
     const d = freshEmu();
     try testing.expectEqual(gpu.Target.sm_75, d.caps.target);
+    // (graphics only where the card has its 3D engine: withGraphics)
     try testing.expect(d.caps.indirect and !d.caps.graphics);
-    try testing.expect(!withGraphics(d.caps).graphics);
+    try testing.expect(withGraphics(d.caps).graphics);
     try testing.expectEqual(qmd.MAX_SHARED_SM75, d.caps.shared_bytes);
     var k = newKernel("one", .{ 32, 1, 1 });
     const o = k.binding();
@@ -3147,4 +3161,13 @@ test "sm_75: Turing's forms in the text; the other generation's binary and graph
     try runBoth(emuCapsFor(.sm_75), &k2, .{ 1, 1, 1 }, &.{}, 32 * 4, &got, .{});
     const g32: []const u32 = @alignCast(std.mem.bytesAsSlice(u32, got[0 .. 32 * 4]));
     for (0..32) |i| try testing.expectEqual(X.ref[i], g32[i]);
+}
+
+test "sm_75: graphics dispatches on the emulated RTX 2080 Ti's 3D engine (TURING_A): the quad's colours, the blend, a run of draws" {
+    turing();
+    defer blackwell();
+    try graphicsQuad();
+    // (the stage programs are sm_75's, the class Turing's)
+    try testing.expectEqual(push.Sm.sm_75, T.work.sm);
+    try graphicsRun();
 }
