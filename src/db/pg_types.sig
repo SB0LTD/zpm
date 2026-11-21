@@ -237,6 +237,14 @@ pub fn Types(comptime Result: type) type {
             try put(out, at, "'");
         }
 
+        fn binaryInputText(cell: *const Cell, out: []u8) Error![]const u8 {
+            // Keep the original OID across binary input. A printed name
+            // could resolve to a different routine or be ambiguous.
+            var utc: Session = .{};
+            if (comptime @hasField(Session, "regproc_numeric_output")) utc.regproc_numeric_output = true;
+            return Io.format(cell, true, &utc, out) catch error.ProtocolViolation;
+        }
+
         /// A parameter value as a typed SQL literal.
         pub fn literal(bytes: []const u8, type_oid: u32, format: u16, out: []u8) Error!usize {
             const name = castName(type_oid) orelse return error.UnsupportedBinaryType;
@@ -254,8 +262,7 @@ pub fn Types(comptime Result: type) type {
             } else {
                 var text: [Io.format_bytes]u8 = undefined;
                 const cell = try decodeBinary(bytes, Io.typeFromOid(type_oid).?);
-                const utc: Session = .{};
-                const rendered = Io.format(&cell, true, &utc, &text) catch return error.ProtocolViolation;
+                const rendered = try binaryInputText(&cell, &text);
                 try quote(out, &at, rendered);
             }
             try put(out, &at, "::");
@@ -292,8 +299,7 @@ pub fn Types(comptime Result: type) type {
                 else => try decodeBinary(bytes, data_type),
             };
             var text: [Io.format_bytes]u8 = undefined;
-            const utc: Session = .{};
-            const rendered = Io.format(&cell, true, &utc, &text) catch return error.ProtocolViolation;
+            const rendered = try binaryInputText(&cell, &text);
             if (rendered.len > out.len) return error.BufferTooSmall;
             @memcpy(out[0..rendered.len], rendered);
             return out[0..rendered.len];

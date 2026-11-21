@@ -58,6 +58,8 @@ pub const Session = struct {
     /// Sequence functions, identity defaults and regclass lookups (set by
     /// the Database for each statement); null rejects them (0A000).
     sequences: ?*const SequenceHook = null,
+    /// Internal rendering for the PostgreSQL binary-input bridge.
+    regproc_numeric_output: bool = false,
     /// current_database(): the session's startup database.
     database: []const u8 = "postgres",
     /// The implicit catalog remains visible when a PostgreSQL session
@@ -563,6 +565,7 @@ pub fn Io(comptime config: types.Config) type {
                 // regtypeout: the type's SQL name, or the number.
                 .regtype => |oid| if (types.regtypeName(oid)) |name| copy(buffer, name) else integerText(oid, buffer),
                 .regproc => |oid| blk: {
+                    if (session.regproc_numeric_output) break :blk integerText(oid, buffer);
                     if (oid == 0) break :blk copy(buffer, "-");
                     if (session.sequences) |hook| if (hook.routine_name) |name| {
                         if (try name(hook.ptr, oid, buffer)) |used| break :blk buffer[0..used];

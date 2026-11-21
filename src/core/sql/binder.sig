@@ -781,6 +781,12 @@ pub fn Binder(comptime config: types.Config) type {
                         n.kind = .bool_literal;
                     },
                     .text, .unknown => {},
+                    .regproc => if (!context.describe_only) {
+                        // Routine names require the serialized statement's
+                        // catalog snapshot. Describe only needs the type.
+                        if (context.session.sequences == null) return error.UnsupportedStatement;
+                        _ = try Io.parse(target, -1, text.slice(), context.session);
+                    },
                     .date=>{
                         const date=try Io.parse(target,-1,text.slice(),context.session);
                         n.integer=date.date;n.date_bound=true;

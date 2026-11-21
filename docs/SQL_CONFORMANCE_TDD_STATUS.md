@@ -20,8 +20,8 @@ signatures that execute in Sig. It includes prefix and infix signatures,
 argument and result OIDs, owner and namespace, and links to internal
 implementation rows in `pg_proc`. Commutators and negators link to published
 signatures. The stock projection of `oprcode` uses OIDs. Planner estimator
-callbacks, general `regproc`, polymorphic operator metadata and operator
-DDL remain open. The CI probe compares each published signature and runs
+callbacks, polymorphic operator metadata and operator DDL remain open.
+The CI probe compares each published signature and runs
 typed operands against both PostgreSQL versions.
 
 For first-source catalog rows in eligible left-deep joins, the executor
@@ -34,11 +34,8 @@ On RAMSQL `1de34ce` with ZPM `b70b3dfb`, PostgreSQL 16 and 18 both
 passed the comparison of all 427 operator signatures, implementation
 signatures and representative expression results. Both also passed stock
 plain and custom imports and row and constraint checks after WAL reopen.
-Outbound `pg_dump` reached access-method discovery on both versions and
+That candidate reached access-method discovery on both versions and
 stopped with `UndefinedObject` on `pg_am.amhandler::pg_catalog.regproc`.
-The next check should compare the handler as a typed routine reference
-for the implemented access methods and verify its resolution through
-`pg_proc`. Both stock directions on both versions remain the merge gate.
 [PostgreSQL 16 and 18 operator discovery CI](https://github.com/SB0LTD/ramsql/actions/runs/44894008040)
 
 Type discovery now exposes `pg_type.typacl` as `aclitem[]` and

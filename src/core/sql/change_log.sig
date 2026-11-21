@@ -91,7 +91,7 @@
 //!   f64 bits u64} | 26 box {high x, high y, low x, low y as f64 bits}
 //!   | 27 xml len u32 + the stored text | 28 tsvector / 29 tsquery len u32
 //!   + canonical output text (re-read and checked on replay) | 30 regtype
-//!   OID u32 | 31 PostgreSQL internal "char" byte.
+//!   OID u32 | 31 PostgreSQL internal "char" byte | 32 regproc OID u32.
 //!    70 object_create / 71 object_drop: catalog objects (roles, grants,
 //!                     policies, comments, wrappers, servers, publications);
 //!                     layout in catalog_objects.sig (B11 wave 3)
