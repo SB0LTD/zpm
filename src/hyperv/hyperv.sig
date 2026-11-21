@@ -8,3 +8,4 @@ pub const keyboard = @import("keyboard.sig");
 pub const mouse = @import("mouse.sig");
 pub const storage = @import("storage.sig");
 pub const network = @import("network.sig");
+pub const gpu = @import("gpu.sig");

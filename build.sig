@@ -2014,6 +2014,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addTest(ctx, test_all, "test-hyperv-mouse", "src/hyperv/mouse.sig", &.{});
     _ = try addTest(ctx, test_all, "test-hyperv-storage", "src/hyperv/storage.sig", &.{});
     _ = try addTest(ctx, test_all, "test-hyperv-network", "src/hyperv/network.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-hyperv-gpu", "src/hyperv/gpu.sig", &.{});
     _ = try addTest(ctx, test_all, "test-net-ipv4", "src/net/ipv4.sig", &.{
         importEntry("net_checksum", "src/net/checksum.sig"),
     });
