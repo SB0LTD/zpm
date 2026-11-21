@@ -471,7 +471,10 @@ pub fn Eval(comptime config: types.Config) type {
         }
 
         fn aclDefault(ctx: *const Context, kind: u8, owner: u32) Error!V.Cell {
+            const Acl = @import("catalog_acl.sig").Acl(V);
             const privileges = switch (kind) {
+                'c' => return Acl.empty(),
+                'd' => "CTc",
                 'f' => "X",
                 'T', 'l' => "U",
                 'n' => "UC",
@@ -479,6 +482,8 @@ pub fn Eval(comptime config: types.Config) type {
                 's' => "rwU",
                 't' => "C",
                 'F', 'S' => "U",
+                'L' => "rw",
+                'p' => "sA",
                 else => return error.UnsupportedStatement,
             };
             const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
@@ -486,9 +491,9 @@ pub fn Eval(comptime config: types.Config) type {
             var buffer: [64]u8 = undefined;
             const used = try get_name(hook.ptr, .role_name, owner, 0, 0, &buffer);
             const name = if (used) |len| buffer[0..len] else @import("std").fmt.bufPrint(&buffer, "{d}", .{owner}) catch unreachable;
-            const Acl = @import("catalog_acl.sig").Acl(V);
             return switch (kind) {
-                'f', 'T', 'l' => Acl.publicAndOwner(name, privileges),
+                'd' => Acl.publicAndOwner(name, privileges, "Tc"),
+                'f', 'T', 'l' => Acl.publicAndOwner(name, privileges, privileges),
                 else => Acl.ownerOnly(name, privileges),
             };
         }

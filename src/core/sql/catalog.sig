@@ -55,7 +55,7 @@ pub const View = enum(u8) { pg_type, pg_namespace, pg_class, pg_attribute, pg_in
     // Catalog objects (B11 wave 3, catalog_objects.sig).
     pg_roles, pg_authid, pg_auth_members, pg_policy, pg_policies, pg_description, pg_shdescription, pg_foreign_data_wrapper, pg_foreign_server, pg_publication, pg_extension, pg_tables, table_privileges, pg_enum, pg_database, pg_am, pg_collation, pg_constraint, pg_statistic_ext,
     pg_publication_rel, pg_publication_namespace, pg_settings, pg_depend, pg_tablespace, pg_foreign_table,
-    pg_init_privs, pg_cast, pg_transform, pg_language, pg_operator, pg_opclass, pg_opfamily, pg_ts_parser, pg_ts_template, pg_ts_dict, pg_ts_config };
+    pg_init_privs, pg_cast, pg_transform, pg_language, pg_operator, pg_opclass, pg_opfamily, pg_ts_parser, pg_ts_template, pg_ts_dict, pg_ts_config, pg_default_acl };
 
 pub const sql_language_oid: u32 = 14;
 pub const plpgsql_language_oid: u32 = 13002;
@@ -198,6 +198,10 @@ const pg_matviews_columns = [_]ViewColumn{ col("schemaname", .name), col("matvie
 const pg_inherits_columns = [_]ViewColumn{ col("inhrelid", .oid), col("inhparent", .oid), col("inhseqno", .int4), col("inhdetachpending", .boolean) };
 const pg_proc_columns = [_]ViewColumn{ col("oid", .oid), col("proname", .name), col("pronamespace", .oid), col("prokind", .pg_internal_char), col("prolang", .oid), col("provolatile", .pg_internal_char), col("proisstrict", .boolean), col("pronargs", .int2), col("prorettype", .oid), col("proargtypes", .text), col("prosrc", .text), col("proowner", .oid), col("proacl", types.arrayType(.aclitem).?) };
 const pg_init_privs_columns = [_]ViewColumn{ col("objoid", .oid), col("classoid", .oid), col("objsubid", .int4), col("privtype", .pg_internal_char), col("initprivs", types.arrayType(.aclitem).?) };
+const pg_default_acl_columns = [_]ViewColumn{
+    col("oid", .oid), col("defaclrole", .oid), col("defaclnamespace", .oid),
+    col("defaclobjtype", .pg_internal_char), col("defaclacl", types.arrayType(.aclitem).?),
+};
 const pg_cast_columns = [_]ViewColumn{ col("oid", .oid), col("castsource", .oid), col("casttarget", .oid), col("castfunc", .oid), col("castcontext", .pg_internal_char), col("castmethod", .pg_internal_char) };
 const pg_transform_columns = [_]ViewColumn{ col("oid", .oid), col("trftype", .oid), col("trflang", .oid), col("trffromsql", .oid), col("trftosql", .oid) };
 const pg_language_columns = [_]ViewColumn{ col("oid", .oid), col("lanname", .name), col("lanowner", .oid), col("lanispl", .boolean), col("lanpltrusted", .boolean), col("lanplcallfoid", .oid), col("laninline", .oid), col("lanvalidator", .oid), col("lanacl", types.arrayType(.aclitem).?) };
@@ -306,6 +310,7 @@ pub fn viewColumns(view: View) []const ViewColumn {
         .pg_inherits => &pg_inherits_columns,
         .pg_proc => &pg_proc_columns,
         .pg_init_privs => &pg_init_privs_columns,
+        .pg_default_acl => &pg_default_acl_columns,
         .pg_cast => &pg_cast_columns,
         .pg_transform => &pg_transform_columns,
         .pg_language => &pg_language_columns,
@@ -342,7 +347,7 @@ pub fn viewColumns(view: View) []const ViewColumn {
 pub fn findView(schema: ?[]const u8, name: []const u8) ?View {
     const catalog_views = [_]View{ .pg_type, .pg_enum, .pg_namespace, .pg_am, .pg_collation, .pg_class, .pg_settings, .pg_attribute, .pg_index, .pg_constraint, .pg_depend, .pg_statistic_ext, .pg_attrdef, .pg_sequence, .pg_indexes, .pg_views, .pg_matviews, .pg_inherits, .pg_proc, .pg_trigger, .pg_rewrite, .pg_rules,
         .pg_tablespace, .pg_foreign_table, .pg_roles, .pg_authid, .pg_auth_members, .pg_policy, .pg_policies, .pg_description, .pg_shdescription, .pg_foreign_data_wrapper, .pg_foreign_server, .pg_publication, .pg_publication_rel, .pg_publication_namespace, .pg_extension, .pg_tables,
-        .pg_init_privs, .pg_cast, .pg_transform, .pg_language, .pg_operator, .pg_opclass, .pg_opfamily, .pg_ts_parser, .pg_ts_template, .pg_ts_dict, .pg_ts_config };
+        .pg_init_privs, .pg_cast, .pg_transform, .pg_language, .pg_operator, .pg_opclass, .pg_opfamily, .pg_ts_parser, .pg_ts_template, .pg_ts_dict, .pg_ts_config, .pg_default_acl };
     const information_views = [_]View{ .schemata, .tables, .columns, .table_constraints, .key_column_usage, .table_privileges };
     const qualified = schema orelse {
         for (catalog_views) |view| if (types.same(@tagName(view), name)) return view;
@@ -363,6 +368,7 @@ pub const bootstrap_relations = [_]struct { view: View, oid: u32 }{
     .{ .view = .pg_proc, .oid = 1255 }, .{ .view = .pg_class, .oid = 1259 },
     .{ .view = .pg_cast, .oid = 2605 }, .{ .view = .pg_language, .oid = 2612 },
     .{ .view = .pg_init_privs, .oid = 3394 }, .{ .view = .pg_transform, .oid = 3576 },
+    .{ .view = .pg_default_acl, .oid = 826 },
     .{ .view = .pg_operator, .oid = 2617 },
     .{ .view = .pg_opclass, .oid = 2616 }, .{ .view = .pg_opfamily, .oid = 2753 },
     .{ .view = .pg_ts_parser, .oid = 3601 },

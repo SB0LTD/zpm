@@ -6141,6 +6141,9 @@ pub fn Database(comptime config: Config) type {
 
         fn fillViewRows(self:*const Self,session_values:*const value_module.Session,snapshot:Snapshot,pool:*A.Pool,view:catalog_module.View,sink:*X.RowSink) Error!void {
             if (view == .pg_settings) return error.UnsupportedStatement;
+            // This catalog stores explicit ALTER DEFAULT PRIVILEGES entries.
+            // Built-in defaults come from acldefault() and do not create rows.
+            if (view == .pg_default_acl) return;
             if (view == .pg_init_privs) {
                 // These fixed bootstrap ACLs have explicit catalog values.
                 const acl = try @import("sql/catalog_acl.sig").Acl(V).ownerAndPublic(CO.bootstrap_name, "UC", "U");

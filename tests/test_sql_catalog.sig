@@ -210,6 +210,20 @@ fn foreignWrapperDiscovery() !void {
         "\"A\"\"B\"|E'a\\\\b'|'42'|NULL");
 }
 
+fn defaultAclDiscovery() !void {
+    const baseline = "CASE WHEN defaclnamespace=0 THEN acldefault("
+        ++ "CASE WHEN defaclobjtype='S' THEN 's'::\"char\" ELSE defaclobjtype END,defaclrole) ELSE '{}' END";
+    try expect("SELECT oid,tableoid,defaclrole,defaclnamespace,defaclobjtype,defaclacl,"
+        ++ baseline ++ " AS acldefault FROM pg_catalog.pg_default_acl", "");
+    try expect("SELECT 'pg_catalog.pg_default_acl'::regclass::oid", "826");
+    try expect("SELECT (" ++ baseline ++ ")::text FROM (VALUES "
+        ++ "(0::oid,'S'::\"char\",10::oid),(0::oid,'L'::\"char\",10::oid),(11::oid,'f'::\"char\",10::oid)) "
+        ++ "AS entries(defaclnamespace,defaclobjtype,defaclrole)", "{ramsql=rwU/ramsql};{ramsql=rw/ramsql};{}");
+    try expect("SELECT acldefault('d',10)::text,acldefault('p',10)::text,acldefault('c',10)::text,"
+        ++ "acldefault(NULL,10) IS NULL,acldefault('n',NULL) IS NULL",
+        "{=Tc/ramsql,ramsql=CTc/ramsql}|{ramsql=sA/ramsql}|{}|t|t");
+}
+
 fn lifecycle() !void {
     try run("CREATE TABLE a (id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY, amount NUMERIC(10,2), at TIMESTAMPTZ(3), doc JSONB, label TEXT DEFAULT 'd', n INTEGER DEFAULT 2 + 3)");
     try expect(public_tables, "a");
@@ -356,6 +370,7 @@ pub fn main(init: std.process.Init) !void {
     try textDictionaryDiscovery();
     try textConfigurationDiscovery();
     try foreignWrapperDiscovery();
+    try defaultAclDiscovery();
     try lifecycle();
     try replay();
     try characterMetadata();
