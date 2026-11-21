@@ -83,6 +83,7 @@ const pg_type_columns = [_]ViewColumn{
     col("typacl", types.arrayType(.aclitem).?), col("typisdefined", .boolean), col("typstorage", .pg_internal_char),
 };
 const pg_namespace_columns = [_]ViewColumn{ col("oid", .oid), col("nspname", .name), col("nspowner", .oid), col("nspacl", types.arrayType(.aclitem).?) };
+pub const pg_namespace_acl_column = pg_namespace_columns.len - 1;
 const pg_enum_columns = [_]ViewColumn{ col("oid", .oid), col("enumtypid", .oid), col("enumsortorder", .float4), col("enumlabel", .name) };
 pub const utf8_encoding: i64 = 6;
 pub const default_tablespace: i64 = 1663;
@@ -655,7 +656,7 @@ pub fn Catalog(comptime config: types.Config) type {
             var count: usize = 0;
             errdefer for (out[0..count]) |change| SC.reclaimVersion(self.relation(change.relation), change.version);
             const oid: i64 = seq.oid;
-            const relation_cells = [_]CV.Cell{ int(oid), text(seq.name.slice()), text("S"), int(public_namespace), int(@intCast(slot)) };
+            const relation_cells = [_]CV.Cell{ int(oid), text(seq.name.slice()), text("S"), int(seq.namespace), int(@intCast(slot)) };
             out[count] = .{ .relation = .relations, .version = try self.addVersion(.relations, sequenceRow(slot), &relation_cells, xmin, cid, csn, horizon) };
             count += 1;
             const spec = seq.spec;
@@ -792,12 +793,20 @@ pub fn Catalog(comptime config: types.Config) type {
         /// A live transaction other than the snapshot's own that has an
         /// uncommitted relation row with this name.
         pub fn creator(self: *const Self, name: []const u8, snap: storage.Snapshot) ?u16 {
+            return self.creatorIn(null, name, snap);
+        }
+
+        pub fn creatorIn(self: *const Self, namespace: ?u32, name: []const u8, snap: storage.Snapshot) ?u16 {
             const relations = self.relationConst(.relations);
             for (relations.versions[0..relations.version_high], 0..) |*version, index| {
                 if (version.rowLink() == 0 or version.xmin_csn != 0 or snap.own(version.xmin)) continue;
                 if (version.xmax.epoch != 0) continue;
                 var temporary: CV.Cell = undefined;
-                if (sameName(SC.borrowVersionCell(relations, index, 1, &temporary), name)) return version.xmin.slot;
+                if (!sameName(SC.borrowVersionCell(relations, index, 1, &temporary), name)) continue;
+                if (namespace) |requested| {
+                    if (SC.borrowVersionCell(relations, index, 3, &temporary).integer != requested) continue;
+                }
+                return version.xmin.slot;
             }
             return null;
         }

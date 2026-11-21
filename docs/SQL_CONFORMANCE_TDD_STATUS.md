@@ -20,6 +20,15 @@ existing schema ACL grantors with the change. The focused security
 contract passed 1,616 assertions and replayed 352 change records.
 [Whole-database CI](https://github.com/SB0LTD/ramsql/actions/runs/44929034456)
 
+The scoped identity candidate creates an owned sequence in the table's
+schema. Two schemas can contain the same table and derived sequence
+names with independent values and OIDs. The new WAL record validates
+the schema and owning column before applying. Older sequence records
+retain their public placement. The Sig change-log suite passed 1,099
+assertions including a cross-schema record rejection and cascade drop.
+Stock restoration of identity sequences and standalone sequence DDL
+in user schemas remain open.
+
 RAMSQL `d1ddbe5` with ZPM `ed00a0a1` passed all 24 stock
 tooling checks on both PostgreSQL 16 and 18. Stock plain and custom
 imports passed row, default and constraint checks after WAL reopen.

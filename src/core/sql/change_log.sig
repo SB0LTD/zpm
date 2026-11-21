@@ -93,6 +93,7 @@
 //!   | 27 xml len u32 + the stored text | 28 tsvector / 29 tsquery len u32
 //!   + canonical output text (re-read and checked on replay) | 30 regtype
 //!   OID u32 | 31 PostgreSQL internal "char" byte | 32 regproc OID u32.
+//!    21 create_scoped_identity_sequence: op 7 plus cache i64 and schema OID u32.
 //!    70 object_create / 71 object_drop: catalog objects (roles, grants,
 //!                     policies, comments, wrappers, servers, publications);
 //!                     layout in catalog_objects.sig (B11 wave 3)
@@ -147,7 +148,7 @@ pub const constraint_identity_format_version: u16 = 4;
 pub const primary_index_identity_format_version: u16 = 5;
 pub const default_identity_format_version: u16 = 6;
 
-pub const Op = enum(u8) { create_table = 1, drop_table = 2, insert = 3, update = 4, delete = 5, catalog_counters = 6, create_sequence = 7, drop_sequence = 8, sequence = 9, truncate = 11, alter_table = 12, create_sequence_cached = 13, alter_sequence = 14, create_schema = 15, drop_schema = 16, catalog_counters_with_constraints = 17, create_owned_schema = 18, create_private_schema = 19, catalog_counters_with_defaults = 20, create_routine = 60, drop_routine = 61, create_trigger = 62, drop_trigger = 63, create_rule = 64, drop_rule = 65, object_create = 70, object_drop = 71 };
+pub const Op = enum(u8) { create_table = 1, drop_table = 2, insert = 3, update = 4, delete = 5, catalog_counters = 6, create_sequence = 7, drop_sequence = 8, sequence = 9, truncate = 11, alter_table = 12, create_sequence_cached = 13, alter_sequence = 14, create_schema = 15, drop_schema = 16, catalog_counters_with_constraints = 17, create_owned_schema = 18, create_private_schema = 19, catalog_counters_with_defaults = 20, create_scoped_identity_sequence = 21, create_routine = 60, drop_routine = 61, create_trigger = 62, drop_trigger = 63, create_rule = 64, drop_rule = 65, object_create = 70, object_drop = 71 };
 
 fn Unsigned(comptime T: type) type {
     return switch (T) {
@@ -527,7 +528,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
         }
 
         pub fn encodeCreateSequence(writer: *Writer, seq: anytype) Error!void {
-            try writer.op(if (seq.spec.cache != 1) .create_sequence_cached else .create_sequence);
+            const scoped = seq.namespace != public_namespace;
+            try writer.op(if (scoped) .create_scoped_identity_sequence else if (seq.spec.cache != 1) .create_sequence_cached else .create_sequence);
             try writer.int(u32, seq.oid);
             try writer.name(seq.name.slice());
             try writer.int(u32, seq.spec.type_oid);
@@ -538,7 +540,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
             try writer.int(u8, @intFromBool(seq.spec.cycle));
             try writer.int(u32, seq.owner);
             try writer.int(u8, seq.owner_column);
-            if (seq.spec.cache != 1) try writer.int(i64, seq.spec.cache);
+            if (scoped or seq.spec.cache != 1) try writer.int(i64, seq.spec.cache);
+            if (scoped) try writer.int(u32, seq.namespace);
         }
 
         pub fn encodeCreateSchema(writer: *Writer, schema: anytype) Error!void {
@@ -769,7 +772,14 @@ pub fn ChangeLog(comptime config: types.Config) type {
             }
         };
 
-        const VSeq = struct { live: bool = false, oid: u32 = 0, name: V.Name = .{} };
+        const VSeq = struct {
+            live: bool = false,
+            oid: u32 = 0,
+            namespace: u32 = public_namespace,
+            name: V.Name = .{},
+            owner: u32 = 0,
+            owner_column: u8 = 0,
+        };
         const VSchema = struct { live: bool = false, oid: u32 = 0, owner: u32 = catalog_objects.bootstrap_role, private_usage: bool = false, name: V.Name = .{} };
 
         /// Caller-owned replay overlay. Bounded by 2 x rows x tables live
@@ -868,9 +878,9 @@ pub fn ChangeLog(comptime config: types.Config) type {
             };
         }
 
-        const SequenceDefinition = struct { oid: u32, name: V.Name, spec: sequence.Spec, owner: u32, owner_column: u8 };
+        const SequenceDefinition = struct { oid: u32, name: V.Name, spec: sequence.Spec, owner: u32, owner_column: u8, namespace: u32 = public_namespace };
 
-        fn decodeCreateSequence(reader: *Reader) Error!SequenceDefinition {
+        fn decodeCreateSequence(reader: *Reader, tag: u8) Error!SequenceDefinition {
             var out: SequenceDefinition = .{ .oid = try reader.int(u32), .name = .{}, .spec = .{}, .owner = 0, .owner_column = 0 };
             const seq_name = try reader.name();
             if (!validName(seq_name)) return error.InvalidChangeRecord;
@@ -886,6 +896,14 @@ pub fn ChangeLog(comptime config: types.Config) type {
             out.spec.cycle = cycle == 1;
             out.owner = try reader.int(u32);
             out.owner_column = try reader.int(u8);
+            if (tag == @intFromEnum(Op.create_sequence_cached)) {
+                out.spec.cache = try reader.int(i64);
+                if (out.spec.cache <= 1) return error.InvalidChangeRecord;
+            } else if (tag == @intFromEnum(Op.create_scoped_identity_sequence)) {
+                out.spec.cache = try reader.int(i64);
+                out.namespace = try reader.int(u32);
+                if (out.spec.cache < 1 or out.namespace < first_oid or out.owner == 0) return error.InvalidChangeRecord;
+            }
             const spec = out.spec;
             if ((spec.type_oid != 20 and spec.type_oid != 21 and spec.type_oid != 23) or spec.increment == 0 or spec.min >= spec.max or spec.start < spec.min or spec.start > spec.max)
                 return error.InvalidChangeRecord;
@@ -930,7 +948,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
         }
 
         fn sequenceNameTaken(scratch: *const Scratch, name: []const u8, namespace: u32) bool {
-            if (namespace == public_namespace) for (&scratch.seqs) |*seq| if (seq.live and types.same(seq.name.slice(), name)) return true;
+            for (&scratch.seqs) |*seq| if (seq.live and seq.namespace == namespace and types.same(seq.name.slice(), name)) return true;
             return false;
         }
 
@@ -1805,7 +1823,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 vt.constraint_ids = ConstraintIdentities.from(table.primary_constraint_oid, table.constraints[0..table.constraint_count]);
             }
             for (&scratch.seqs, &db.seqs) |*vs, *seq| {
-                vs.* = .{ .live = seq.live and !seq.pending_create and seq.dead_csn == 0, .oid = seq.oid, .name = seq.name };
+                vs.* = .{ .live = seq.live and !seq.pending_create and seq.dead_csn == 0, .oid = seq.oid, .namespace = seq.namespace,
+                    .name = seq.name, .owner = seq.owner, .owner_column = seq.owner_column };
             }
             for (&scratch.schemas, &db.schemas) |*vs, *schema| {
                 vs.* = .{ .live = schema.live and !schema.pending_create and schema.dead_csn == 0, .oid = schema.oid, .owner = schema.owner, .private_usage = schema.private_usage, .name = schema.name };
@@ -2081,29 +2100,31 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         if (try RC.validateOp(&scratch.objects, tag, payload, checks)) |oid| next_oid = @max(next_oid, oid + 1);
                         check_routine_references = true;
                     },
-                    @intFromEnum(Op.create_sequence), @intFromEnum(Op.create_sequence_cached) => {
-                        var definition = try decodeCreateSequence(&reader);
-                        if (tag == @intFromEnum(Op.create_sequence_cached)) {
-                            definition.spec.cache = try reader.int(i64);
-                            if (definition.spec.cache <= 1) return error.InvalidChangeRecord;
-                        }
+                    @intFromEnum(Op.create_sequence), @intFromEnum(Op.create_sequence_cached), @intFromEnum(Op.create_scoped_identity_sequence) => {
+                        const definition = try decodeCreateSequence(&reader, tag);
                         if (base_sequence) {
                             if (definition.owner != 0 or definition.owner_column != 0) return error.InvalidChangeRecord;
                             image_sequence = definition;
                         }
                         if (definition.oid < first_oid or definition.oid == 0xffffffff or oidTaken(db, scratch, definition.oid, 1)) return error.ChangeRecordConflict;
-                        if (relationNameTaken(scratch, definition.name.slice(), public_namespace) or
-                            scratch.object_overlay.compositeRelationNameTaken(public_namespace, definition.name.slice())) return error.ChangeRecordConflict;
+                        if (relationNameTaken(scratch, definition.name.slice(), definition.namespace) or
+                            scratch.object_overlay.compositeRelationNameTaken(definition.namespace, definition.name.slice())) return error.ChangeRecordConflict;
                         if (definition.owner != 0) {
                             const owner = try findVTable(scratch, definition.owner);
                             if (definition.owner_column >= scratch.tables[owner].column_count) return error.ChangeRecordConflict;
+                            if (tag == @intFromEnum(Op.create_scoped_identity_sequence)) {
+                                for (&scratch.seqs) |*seq| {
+                                    if (seq.live and seq.owner == definition.owner and seq.owner_column == definition.owner_column) return error.ChangeRecordConflict;
+                                }
+                            }
                         }
                         var free: ?usize = null;
                         for (&scratch.seqs, 0..) |*vs, index| if (!vs.live and free == null) {
                             free = index;
                         };
                         const index = free orelse return error.ChangeRecordConflict;
-                        scratch.seqs[index] = .{ .live = true, .oid = definition.oid, .name = definition.name };
+                        scratch.seqs[index] = .{ .live = true, .oid = definition.oid, .namespace = definition.namespace, .name = definition.name,
+                            .owner = definition.owner, .owner_column = definition.owner_column };
                         next_oid = @max(next_oid, definition.oid + 1);
                     },
                     @intFromEnum(Op.drop_sequence) => {
@@ -2132,6 +2153,16 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 }
             }
             if (reader.position != record.len) return error.InvalidChangeRecord;
+            for (&scratch.seqs) |*seq| {
+                if (!seq.live or seq.namespace == public_namespace) continue;
+                const owner = &scratch.tables[try findVTable(scratch, seq.owner)];
+                if (seq.namespace != owner.namespace or !object_check.objectSchemaLive(seq.namespace) or
+                    seq.owner_column >= owner.column_count) return error.ChangeRecordConflict;
+                switch (owner.columns[seq.owner_column].default_kind) {
+                    .identity_always, .identity_by_default => {},
+                    else => return error.ChangeRecordConflict,
+                }
+            }
             // Objects never outlive the tables, roles and objects they name.
             try scratch.object_overlay.finish(&object_check);
             if (check_routine_references or check_schema_owners) try RC.finishOverlay(&scratch.objects, &scratch.object_overlay);
@@ -2377,11 +2408,11 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         const payload = try reader.take(try reader.int(u32));
                         try db.replayObject(tag, payload, csn);
                     },
-                    @intFromEnum(Op.create_sequence), @intFromEnum(Op.create_sequence_cached) => {
-                        var definition = try decodeCreateSequence(&reader);
-                        if (tag == @intFromEnum(Op.create_sequence_cached)) definition.spec.cache = try reader.int(i64);
+                    @intFromEnum(Op.create_sequence), @intFromEnum(Op.create_sequence_cached), @intFromEnum(Op.create_scoped_identity_sequence) => {
+                        const definition = try decodeCreateSequence(&reader, tag);
                         for (&db.seqs, 0..) |*seq, index| if (!seq.live) {
                             sequence.Sequences(config).init(seq, definition.oid, definition.name, definition.spec, definition.owner, definition.owner_column);
+                            seq.namespace = definition.namespace;
                             try db.replayCreateSequence(index, csn);
                             break;
                         };

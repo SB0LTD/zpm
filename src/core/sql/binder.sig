@@ -7810,11 +7810,9 @@ pub fn Binder(comptime config: types.Config) type {
                     if (create.partition_of) |parent| return bindPartitionOf(context, create, table_name, namespace, parent);
                     if (create.inherits != null and (create.like != null or create.partition_by != .none)) return error.UnsupportedStatement;
                     var out: Create = .{ .name = table_name, .columns = @splat(.{}), .count = create.count, .namespace = namespace, .plain_definition = plain };
-                    // Owned sequences live in public: identity and SERIAL
-                    // columns stay outside other schemas (0A000).
+                    // SERIAL's default expression still resolves the unqualified sequence.
                     if (namespace != catalog.public_namespace) for (create.columns[0..create.count]) |*definition| {
-                        if (definition.serial != 0 or definition.default_kind == .identity_always or definition.default_kind == .identity_by_default or
-                            definition.default_kind == .mysql_auto_increment) return error.UnsupportedStatement;
+                        if (definition.serial != 0 or definition.default_kind == .mysql_auto_increment) return error.UnsupportedStatement;
                     };
                     for (create.columns[0..create.count], 0..) |*definition, index| {
                         var column: V.Column = .{ .name = toName(context, definition.name), .not_null = definition.not_null, .primary_key = definition.primary_key, .typmod = definition.typmod, .default_kind = definition.default_kind, .virtual = definition.virtual };
@@ -7851,7 +7849,7 @@ pub fn Binder(comptime config: types.Config) type {
                                 var options = definition.sequence;
                                 if (options.type_oid == 0) options.type_oid = types.typeOid(column.data_type);
                                 const seq_name = try identityName(table_name, column.name);
-                                if (context.catalog.find(seq_name.slice(), context.snapshot) != null) return error.TableExists;
+                                if (context.catalog.findIn(namespace, seq_name.slice(), context.snapshot) != null) return error.TableExists;
                                 out.identity = .{ .column = @intCast(index), .name = seq_name, .spec = try sequence.resolve(options) };
                             },
                             // Type-checked now; evaluated per row.

@@ -137,6 +137,7 @@ pub fn Sequences(comptime config: types.Config) type {
             creator: u16 = 0,
             dead_csn: u64 = 0,
             oid: u32 = 0,
+            namespace: u32 = 2200,
             name: V.Name = .{},
             spec: Spec = .{},
             last_value: i64 = 1,

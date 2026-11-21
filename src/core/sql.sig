@@ -3081,7 +3081,7 @@ pub fn Database(comptime config: Config) type {
                 },
                 .drop_table => |index| try self.dropTable(slot, index, false, snap),
                 .create_sequence => |*create| blk: {
-                    try self.createSequence(slot, create.name, create.spec, 0, 0, snap);
+                    try self.createSequence(slot, catalog_module.public_namespace, create.name, create.spec, 0, 0, snap);
                     break :blk 0;
                 },
                 .drop_sequence => |index| blk: {
@@ -5431,19 +5431,20 @@ pub fn Database(comptime config: Config) type {
         // ---- sequences (design §4.11) ---------------------------------------
 
         /// CREATE SEQUENCE, or an identity column's owned sequence.
-        fn createSequence(self: *Self, slot: u16, name: Name, spec: sequence_module.Spec, owner: u32, owner_column: u8, snap: Snapshot) Error!void {
+        fn createSequence(self: *Self, slot: u16, namespace: u32, name: Name, spec: sequence_module.Spec, owner: u32, owner_column: u8, snap: Snapshot) Error!void {
             const tx = &self.txs[slot];
-            if (self.catalog.creator(name.slice(), snap)) |other| {
+            if (self.catalog.creatorIn(namespace, name.slice(), snap)) |other| {
                 var waits: L.Set = .{};
                 waits.add(other);
                 tx.fresh = tx.write_len == tx.subs[tx.sub_len - 1].write_start;
                 return self.park(slot, waits);
             }
-            if (self.catalog.find(name.slice(), snap) != null) return error.TableExists;
-            if (self.catalog_objects.pendingCompositeRelationName(catalog_module.public_namespace, name.slice(), snap)) |other| return self.objectPark(slot, other);
             var latest = snap;
             latest.csn = self.csn;
-            if (self.catalog_objects.byName(.composite_type, catalog_module.public_namespace, name.slice(), latest) != null) return error.TableExists;
+            latest.cid +%= 1;
+            if (self.catalog.findIn(namespace, name.slice(), latest) != null) return error.TableExists;
+            if (self.catalog_objects.pendingCompositeRelationName(namespace, name.slice(), snap)) |other| return self.objectPark(slot, other);
+            if (self.catalog_objects.byName(.composite_type, namespace, name.slice(), latest) != null) return error.TableExists;
             try self.reserveWrites(slot, 3);
             var destination: ?usize = null;
             for (0..2) |attempt| {
@@ -5458,6 +5459,7 @@ pub fn Database(comptime config: Config) type {
             if (self.oid_counter >= 0xffffffff - change_log.first_oid) return error.TableCapacity;
             const seq = &self.seqs[index];
             Q.init(seq, change_log.first_oid + self.oid_counter, name, spec, owner, owner_column);
+            seq.namespace = namespace;
             seq.pending_create = true;
             seq.creator = slot;
             self.oid_counter += 1;
@@ -5806,7 +5808,7 @@ pub fn Database(comptime config: Config) type {
             for (relations[0..count]) |found| {
                 if (found.kind == 'S') {
                     const seq = &self.seqs[found.slot];
-                    if (seq.oid == oid) return .{ .name = seq.name.slice(), .namespace = catalog_module.public_namespace };
+                    if (seq.oid == oid) return .{ .name = seq.name.slice(), .namespace = seq.namespace };
                     continue;
                 }
                 const table = &self.tables[found.slot];
@@ -5908,7 +5910,7 @@ pub fn Database(comptime config: Config) type {
                 if (seq.pending_create and seq.creator != self.seq_slot) continue;
                 if (seq.pending_drop and seq.creator == self.seq_slot) continue;
                 var at: usize = 0;
-                for ([_][]const u8{ "public", seq.name.slice() }, 0..) |part, index| {
+                for ([_][]const u8{ self.namespaceName(seq.namespace), seq.name.slice() }, 0..) |part, index| {
                     if (2 * part.len + 3 > out.len - at) return error.NameCapacity;
                     if (index != 0) {
                         out[at] = '.';
@@ -6262,7 +6264,7 @@ pub fn Database(comptime config: Config) type {
             for (relations) |found| {
                 if (found.kind == 'S') {
                     const seq = &self.seqs[found.slot];
-                    try dependencyRow(sink, relation, seq.oid, namespace, catalog_module.public_namespace, 0, 'n');
+                    try dependencyRow(sink, relation, seq.oid, namespace, seq.namespace, 0, 'n');
                     if (seq.owner == 0) continue;
                     const slot = self.visibleTableSlot(seq.owner, snapshot) orelse continue;
                     const owner = &self.tables[slot];
@@ -6526,9 +6528,10 @@ pub fn Database(comptime config: Config) type {
                 },
                 .pg_roles, .pg_authid, .pg_auth_members, .pg_policy, .pg_policies, .pg_description, .pg_shdescription, .pg_foreign_data_wrapper, .pg_foreign_server, .pg_publication, .pg_publication_rel, .pg_publication_namespace, .pg_statistic_ext, .pg_extension, .pg_tables, .table_privileges => return self.catalogObjectRows(session_values, snapshot, view, sink),
                 .pg_namespace, .schemata => {
+                    const include_acl = view == .pg_namespace and sink.referencesColumn(catalog_module.pg_namespace_acl_column);
                     for (catalog_module.namespaces) |namespace| {
                         if (view == .pg_namespace) {
-                            const acl = if (namespace.oid == catalog_module.toast_namespace) .null_value else
+                            const acl = if (!include_acl or namespace.oid == catalog_module.toast_namespace) .null_value else
                                 try @import("sql/catalog_acl.sig").Acl(V).ownerAndPublic(CO.bootstrap_name, "UC", "U");
                             try sink.add(&.{ intCell(namespace.oid), nameCell(namespace.name), intCell(CO.bootstrap_role), acl });
                         } else try sink.add(&.{ nameCell(database), nameCell(namespace.name) });
@@ -6539,7 +6542,8 @@ pub fn Database(comptime config: Config) type {
                         const schema = &self.schemas[found.slot];
                         if (view == .pg_namespace) {
                             const owner = self.schemaOwner(schema, snapshot);
-                            try sink.add(&.{ intCell(found.oid), nameCell(schema.name.slice()), intCell(owner), try self.namespaceAcl(found.oid, owner, snapshot) });
+                            try sink.add(&.{ intCell(found.oid), nameCell(schema.name.slice()), intCell(owner),
+                                if (include_acl) try self.namespaceAcl(found.oid, owner, snapshot) else .null_value });
                         } else try sink.add(&.{ nameCell(database), nameCell(schema.name.slice()) });
                     }
                 },
@@ -6547,7 +6551,8 @@ pub fn Database(comptime config: Config) type {
                     if (found.kind == 'S') {
                         const seq = &self.seqs[found.slot];
                         switch (view) {
-                            .pg_class => try classRow(sink, seq.oid, seq.name.slice(), catalog_module.public_namespace, 'S', 3, .{}),
+                            .pg_class => try classRow(sink, seq.oid, seq.name.slice(), seq.namespace, 'S', 3,
+                                .{ .owner = if (seq.owner == 0) CO.bootstrap_role else self.catalog_objects.owner(seq.owner, snapshot) }),
                             .pg_sequence => try sink.add(&.{ intCell(seq.oid), intCell(seq.spec.type_oid), intCell(seq.spec.start), intCell(seq.spec.increment), intCell(seq.spec.max), intCell(seq.spec.min), intCell(seq.spec.cache), boolCell(seq.spec.cycle) }),
                             else => {},
                         }
@@ -7414,8 +7419,8 @@ pub fn Database(comptime config: Config) type {
                 var ownership: O.Object = .{ .kind = .relation, .target = table.oid, .owner = creator };
                 _ = try self.objectInsert(slot, &ownership, false, snap);
             }
-            if (create.identity) |identity| try self.createSequence(slot, identity.name, identity.spec, table.oid, identity.column, snap);
-            for (create.serials[0..create.serial_count]) |serial| try self.createSequence(slot, serial.name, serial.spec, table.oid, serial.column, snap);
+            if (create.identity) |identity| try self.createSequence(slot, table.namespace, identity.name, identity.spec, table.oid, identity.column, snap);
+            for (create.serials[0..create.serial_count]) |serial| try self.createSequence(slot, table.namespace, serial.name, serial.spec, table.oid, serial.column, snap);
             const generated_context = self.bindContext("", .standard, snap);
             try B.validateGenerated(&generated_context, index);
             try B.validateConstraints(&generated_context, index);
