@@ -7721,10 +7721,11 @@ pub fn Database(comptime config: Config) type {
             if (S.anyIntegralBank(&self.tables)) return error.UnsupportedStatement;
             const source = &self.tables[alter.table];
             try checkPendingLatePrimary(source);
-            var late_primary = false;
-            if (!S.keyed(source)) for (alter.columns[0..alter.count]) |*column| {
-                late_primary = late_primary or column.primary_key;
-            };
+            var scalar_primary = false;
+            for (alter.columns[0..alter.count]) |*column| scalar_primary = scalar_primary or column.primary_key;
+            var primary = scalar_primary;
+            for (alter.constraints[0..alter.constraint_count]) |*constraint| primary = primary or constraint.kind == .primary;
+            const late_primary = primary and !S.keyed(source);
             var fold_created_primary = false;
             if (late_primary) {
                 const tx = &self.txs[slot];
@@ -7746,6 +7747,10 @@ pub fn Database(comptime config: Config) type {
                     },
                     else => {},
                 };
+                // Replay's standalone late-primary operation builds a
+                // scalar index over committed rows. A fresh composite key is
+                // logged as part of CREATE before its loaded rows.
+                if (!scalar_primary and !fold_created_primary) return error.UnsupportedStatement;
             }
             if (!types.same(alter.name.slice(), source.name.slice())) {
                 try self.checkRelationTypeName(slot, source.namespace, alter.name.slice(), snap);

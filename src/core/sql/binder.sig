@@ -8544,7 +8544,7 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 .add_constraint => |*definition| {
                     if (definition.kind == .primary) {
-                        if (context.dialect != .postgres or alter.count != 1 or definition.column_count != 1 or
+                        if (context.dialect != .postgres or alter.count != 1 or
                             entry.parent != 0 or hasChildren(context, entry.oid)) return error.UnsupportedStatement;
                         if (definition.name) |ident| if (indexNameTaken(context, entry.namespace, toName(context, ident).slice())) return error.TableExists;
                         for (out.columns[0..out.count]) |*column| if (column.primary_key) return error.InvalidTableDefinition;
