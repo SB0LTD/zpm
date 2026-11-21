@@ -6261,6 +6261,8 @@ pub fn Database(comptime config: Config) type {
             if (view == .pg_event_trigger) return;
             // Publication metadata does not create logical replication subscriptions.
             if (view == .pg_subscription) return;
+            // bytea values are stored inline and do not create OID-addressed large objects.
+            if (view == .pg_largeobject or view == .pg_largeobject_metadata) return;
             // There are no security label providers or persistent role/database settings.
             if (view == .pg_seclabel or view == .pg_shseclabel or view == .pg_seclabels or view == .pg_db_role_setting) return;
             // Index comparisons use the store's typed comparator, with no

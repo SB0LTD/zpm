@@ -100,6 +100,9 @@ fn types() !void {
 }
 
 fn dumpDiscovery() !void {
+    try expect("SELECT 'pg_catalog.pg_largeobject_metadata'::regclass::oid,'pg_catalog.pg_largeobject'::regclass::oid", "2995|2613");
+    try expect("SELECT oid,lomowner,lomacl,acldefault('L',lomowner) FROM pg_largeobject_metadata", "");
+    try expect("SELECT loid,pageno,data FROM pg_largeobject", "");
     try expect("SELECT pg_encoding_to_char(6), pg_encoding_to_char(41), pg_encoding_to_char(-1), pg_encoding_to_char(NULL)", "UTF8|SHIFT_JIS_2004||NULL");
     try expect("SELECT current_schemas(false), current_schemas(true)", "{public}|{pg_catalog,public}");
     try run("SET search_path TO public, pg_catalog");
