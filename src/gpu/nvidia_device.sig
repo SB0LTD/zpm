@@ -761,6 +761,7 @@ pub const Adapter = struct {
             .target = .{ .va = g.va, .width = g.width, .height = g.height, .pitch = g.stride },
             .format = formatOf(g.format),
             .color_gobs = g.gobs_log2,
+            .color_off = g.color_off,
             .index = if (g.index) |ix| .{ .va = ix.va, .bytes = ix.bytes, .size = ix.size, .first = ix.first, .restart = ix.restart } else null,
             .more = more: {
                 var m: [7]?gl3d.More = @splat(null);

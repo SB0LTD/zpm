@@ -2794,7 +2794,7 @@ pub const Engine = struct {
         // on the compute kernels, each depth buffer on one path)
         const zimg = d.depth orelse d.stencil;
         if (zimg) |z| {
-            if (!d.color.layout.block) {
+            if (!d.color_off and !d.color.layout.block) {
                 e.stats.compute_draws += 1;
                 e.sayCompute("a depth or stencil image beside a colour image of rows (the 3D engine draws depth only into block-linear colour: RT_LINEAR_WITH_ZETA)");
                 return null;
@@ -2810,7 +2810,7 @@ pub const Engine = struct {
                 return null;
             }
         }
-        if (d.color.layout.block and (d.color.layout.swizzle != .turing2d or d.color.format.bytes() != 4)) {
+        if (!d.color_off and d.color.layout.block and (d.color.layout.swizzle != .turing2d or d.color.format.bytes() != 4)) {
             e.stats.compute_draws += 1;
             e.sayCompute("a block-linear colour image of 8- or 16-bit texels (Blackwell's GOBs for them: not given to the 3D engine yet)");
             return null;
@@ -2836,9 +2836,11 @@ pub const Engine = struct {
         for (bs[0..nb]) |img| {
             if (!e.gpuUsable(img)) return null;
         }
+        // (a depth-only pass: `t` the image naming the draw's size, the depth
+        // image itself where the caller gave it; no colour written)
         const t = d.color;
         if (!e.gpuUsable(t)) return null;
-        if (t.buf.gpu % 128 != 0 or t.stride % 128 != 0) {
+        if (!d.color_off and (t.buf.gpu % 128 != 0 or t.stride % 128 != 0)) {
             e.stats.compute_draws += 1;
             e.sayCompute("a target whose address or rows are not on 128 bytes");
             return null;
@@ -2913,13 +2915,14 @@ pub const Engine = struct {
                 .back_stencil = if (d.stencil != null) stencilOf(d.stencil_back) else null,
             } else null,
             .vertex = &p.gfx[0].?,
-            .va = t.buf.gpu,
-            .width = t.width,
-            .height = t.height,
-            .stride = t.stride,
-            .format = targetFormatOf(t.format),
-            .mask = maskOf(t.format, d.keep),
-            .blend = if (d.blend) |b| blendOf(b) else null,
+            .va = if (d.color_off) 0 else t.buf.gpu,
+            .width = if (d.color_off) zimg.?.width else t.width,
+            .height = if (d.color_off) zimg.?.height else t.height,
+            .stride = if (d.color_off) 0 else t.stride,
+            .format = if (d.color_off) .rgba8 else targetFormatOf(t.format),
+            .mask = if (d.color_off) 0 else maskOf(t.format, d.keep),
+            .color_off = d.color_off,
+            .blend = if (d.color_off) null else if (d.blend) |b| blendOf(b) else null,
             .scale = .{ d.half[0], if (flip) -d.half[1] else d.half[1], d.depth_scale },
             .offset = .{ d.center[0], if (flip) H - d.center[1] else d.center[1], d.depth_bias },
             .scissor = if (flip) .{ rc.x0, t.height - rc.y1, rc.x1, t.height - rc.y0 } else .{ rc.x0, rc.y0, rc.x1, rc.y1 },

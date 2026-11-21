@@ -341,6 +341,10 @@ pub const Graphics = struct {
     gobs_log2: ?u3 = null,
     /// The channels written (bit 0 red .. bit 3 alpha).
     mask: u4 = 0xf,
+    /// No colour target: a depth-only pass (`depth` set, `more` none).
+    /// `va`, `stride` and `format` are not read; `width` and `height`
+    /// are the depth target's.
+    color_off: bool = false,
     blend: ?GraphicsBlend = null,
     /// window = clip / w * scale + offset: x, y in pixels from the target's
     /// first row, depth; GL's clip volume (-w <= z <= w).
