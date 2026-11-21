@@ -18,6 +18,15 @@
 //! GPU runs every entry the ring has gained. `wait` polls the progress
 //! fence.
 //!
+//! With Windows' hardware-accelerated GPU scheduling off (`Gpu.legacy`, from
+//! the adapter's WDDM 2.7 caps), NVIDIA's driver makes no hardware queues:
+//! a channel is a legacy context, each submission one submit_command whose
+//! private data holds the GPFIFO entries (the caller's pushbuffers, then
+//! the channel's own fence release), Windows' scheduler running them in
+//! order; the fence is a word in the channel's ring memory that `wait`
+//! polls. (Traced on an RTX 2080 Ti with NVIDIA's driver 576.28: nv.sig's
+//! legacy builders.)
+//!
 //! # Memory
 //!
 //! System memory is the caller's (page-aligned, a multiple of 64 KiB, shared
@@ -64,6 +73,9 @@ const GPFIFO_BYTES = GPFIFO_ENTRIES * 8;
 const FENCE_PB_OFFSET = 1 << 20;
 /// Each entry's own fence pushbuffer: 16 dwords.
 const FENCE_PB_BYTES = 64;
+/// A legacy channel's fence word (Gpu.legacy), in its ring memory (which
+/// holds no GPFIFO then).
+const LEGACY_FENCE_OFFSET = 0;
 /// The host's NON_STALL_INTERRUPT (clc96f.h).
 const NON_STALL_INTERRUPT: u32 = 0x0020;
 
@@ -83,6 +95,9 @@ pub const Options = struct {
     name: []const u8 = "zpm",
     /// Which NVIDIA adapter (when there are several).
     index: u32 = 0,
+    /// Legacy contexts (true) or hardware queues (false) whatever the
+    /// host's caps say; null: as they say.
+    legacy: ?bool = null,
 };
 
 /// A context's private data at most (NVIDIA's video contexts' are 3569
@@ -132,6 +147,9 @@ pub const Gpu = struct {
     paging_fence: *volatile u64 = undefined,
     va_next: u64 = VA_BASE,
     alloc_data: [nv.ALLOCATION_BYTES]u8 = undefined,
+    /// Windows does not schedule this GPU's work in hardware: channels are
+    /// legacy contexts fed by submit_command (see the top of this file).
+    legacy: bool = false,
 
     /// Opens the NVIDIA GPU: adapter, device, paging queue, VA_BASE's range.
     pub fn open(g: *Gpu, opts: Options) Error!void {
@@ -141,6 +159,7 @@ pub const Gpu = struct {
         g.fd = @intCast(fd);
         errdefer g.close();
         try g.findAdapter(opts.index);
+        g.legacy = opts.legacy orelse !g.hardwareScheduling();
 
         var dev = kmt.CreateDevice{ .adapter = g.adapter };
         _ = try kmt.call(g.fd, .create_device, &dev);
@@ -157,6 +176,16 @@ pub const Gpu = struct {
     pub fn reserve(g: *Gpu, base: u64, bytes: u64) Error!void {
         var rv = kmt.ReserveGpuVa{ .adapter = g.adapter, .base = base, .size = bytes };
         _ = try kmt.call(g.fd, .reserve_gpu_va, &rv);
+    }
+
+    /// Whether Windows schedules the GPU's work in hardware (WDDM 2.7's
+    /// caps, KMTQAITYPE_WDDM_2_7_CAPS: HwSchEnabled). A host that does not
+    /// answer is taken to (the hardware queues zpm learned first).
+    fn hardwareScheduling(g: *Gpu) bool {
+        var caps: u32 = 0;
+        var q = kmt.QueryAdapterInfo{ .adapter = g.adapter, .type = kmt.QUERY_WDDM_2_7_CAPS, .data = @intFromPtr(&caps), .size = 4 };
+        _ = kmt.call(g.fd, .query_adapter_info, &q) catch return true;
+        return caps & kmt.CAPS_HW_SCHEDULING_ON != 0;
     }
 
     /// The adapters dxgkrnl offers; the `index`-th NVIDIA one is kept, the
@@ -215,7 +244,10 @@ pub const Gpu = struct {
     /// VA_BASE's range).
     fn create(g: *Gpu, memory: nv.Memory, sysmem: ?[]u8, bytes: u64, at: ?u64) Error!Region {
         if (bytes == 0 or bytes % nv.ALLOCATION_UNIT != 0) return error.BadMemory;
-        nv.allocation(&g.alloc_data, memory, bytes);
+        // (a legacy channel's ring memory holds no GPFIFO the GPU reads:
+        // plain system memory, as NVIDIA's driver 576 allocates it)
+        nv.allocation(&g.alloc_data, if (g.legacy and memory == .ring) .system else memory, bytes);
+        if (g.legacy) nv.legacyAllocation(&g.alloc_data);
         return g.createAs(sysmem, bytes, at);
     }
 
@@ -349,12 +381,14 @@ pub const Channel = struct {
     ctx_data: [MAX_CONTEXT_BYTES]u8 = undefined,
     queue_data: [nv.QUEUE_BYTES]u8 = undefined,
     submit_data: [nv.SUBMIT_BYTES]u8 = undefined,
+    legacy_data: [nv.LEGACY_SUBMIT_MAX]u8 = undefined,
 
     /// A channel on `g`: a context on `opts.engine`, the ring in
     /// `ring_memory` (RING_BYTES, page-aligned) and its hardware queue.
     pub fn open(c: *Channel, g: *Gpu, ring_memory: []align(4096) u8, opts: ChannelOptions) Error!void {
         c.* = .{ .gpu = g, .notify = opts.notify };
         errdefer c.close();
+        if (g.legacy) return c.openLegacy(g, ring_memory, opts);
         var ctx_len: u32 = nv.CONTEXT_BYTES;
         if (opts.context_data) |cd| {
             if (cd.len > MAX_CONTEXT_BYTES) return error.BadMemory;
@@ -388,6 +422,81 @@ pub const Channel = struct {
         c.fence = c.progress.*;
     }
 
+    /// A legacy channel (Gpu.legacy): the context with no hardware queue,
+    /// the ring memory mapped (its fence word and fence pushbuffers).
+    fn openLegacy(c: *Channel, g: *Gpu, ring_memory: []align(4096) u8, opts: ChannelOptions) Error!void {
+        var ctx_len: u32 = nv.LEGACY_CONTEXT_BYTES;
+        if (opts.context_data) |cd| {
+            if (cd.len > MAX_CONTEXT_BYTES) return error.BadMemory;
+            @memcpy(c.ctx_data[0..cd.len], cd);
+            ctx_len = @intCast(cd.len);
+        } else nv.legacyContext(c.ctx_data[0..nv.LEGACY_CONTEXT_BYTES], opts.name, opts.client);
+        var cc = kmt.CreateContextVirtual{
+            .device = g.device,
+            .node_ordinal = opts.node orelse @intFromEnum(opts.engine),
+            .flags = if (opts.context_flags != 0) opts.context_flags else kmt.CONTEXT_DISABLE_GPU_TIMEOUT,
+            .priv = @intFromPtr(&c.ctx_data),
+            .priv_size = ctx_len,
+            .client_hint = opts.client,
+        };
+        _ = try kmt.call(g.fd, .create_context_virtual, &cc);
+        c.context = cc.context;
+        c.ring = try g.map(ring_memory[0..RING_BYTES], .ring, null);
+        const p: *volatile u64 = @ptrCast(@alignCast(c.ring.cpu.ptr + LEGACY_FENCE_OFFSET));
+        p.* = 0;
+        c.progress = p;
+        c.progress_gpu = c.ring.va + LEGACY_FENCE_OFFSET;
+        c.fence = 0;
+    }
+
+    /// A legacy channel's submission: each pushbuffer, then the fence's,
+    /// one submit_command each, in order on the context. (One entry a
+    /// call, as NVIDIA's driver sends nearly all of them: of two entries in
+    /// one call the GPU ran the first only, 2026-11-21 on the RTX 2080 Ti;
+    /// its own calls of several carry a table of them not yet understood.)
+    fn submitLegacy(c: *Channel, pbs: []const Push) Error!u64 {
+        c.put += 1;
+        const f = c.put;
+        c.fence = f;
+        fullFence();
+        for (pbs) |p| try c.sendLegacy(push.gpEntry(p.va, p.dwords));
+        const off = FENCE_PB_OFFSET + (f % GPFIFO_ENTRIES) * FENCE_PB_BYTES;
+        const pb: [*]volatile u32 = @ptrCast(@alignCast(c.ring.cpu.ptr + off));
+        pb[0] = push.header(0, push.SEM_ADDR_LO, 5);
+        pb[1] = @truncate(c.progress_gpu);
+        pb[2] = @truncate(c.progress_gpu >> 32);
+        pb[3] = @truncate(f);
+        pb[4] = @truncate(f >> 32);
+        pb[5] = push.SEM_OPERATION_RELEASE | push.SEM_RELEASE_WFI | push.SEM_PAYLOAD_64BIT;
+        var n: u32 = 6;
+        if (c.notify != 0) {
+            pb[n] = push.header(0, push.SEM_ADDR_LO, 5);
+            pb[n + 1] = @truncate(c.notify);
+            pb[n + 2] = @truncate(c.notify >> 32);
+            pb[n + 3] = @truncate(f);
+            pb[n + 4] = 0;
+            pb[n + 5] = push.SEM_OPERATION_RELEASE;
+            n += 6;
+        }
+        fullFence();
+        try c.sendLegacy(push.gpEntry(c.ring.va + off, n));
+        return f;
+    }
+
+    /// One GPFIFO entry to the legacy context.
+    fn sendLegacy(c: *Channel, e: u64) Error!void {
+        const len = nv.legacySubmit(&c.legacy_data, &.{e});
+        var s = kmt.SubmitCommand{
+            .command_buffer = nv.LEGACY_COMMAND_BUFFER,
+            .command_length = len,
+            .broadcast_context_count = 1,
+            .priv = @intFromPtr(&c.legacy_data),
+            .priv_size = len,
+        };
+        s.broadcast_context[0] = c.context;
+        _ = try kmt.call(c.gpu.fd, .submit_command, &s);
+    }
+
     fn entry(c: *Channel, e: u64) void {
         const ring: [*]volatile u64 = @ptrCast(@alignCast(c.ring.cpu.ptr));
         ring[@intCast(c.put % GPFIFO_ENTRIES)] = e;
@@ -403,6 +512,7 @@ pub const Channel = struct {
 
     /// Runs the pushbuffers in order, as one submission; its fence.
     pub fn submitMany(c: *Channel, pbs: []const Push) Error!u64 {
+        if (c.gpu.legacy) return c.submitLegacy(pbs);
         // (the fence is the ring's write count after this submission, as
         // NVIDIA's driver numbers it)
         const f = c.put + pbs.len + 1;
@@ -447,6 +557,8 @@ pub const Channel = struct {
 
     /// The doorbell for everything written so far (again).
     pub fn ringAgain(c: *Channel) Error!void {
+        // (a legacy channel has no doorbell: Windows' scheduler has its work)
+        if (c.gpu.legacy) return;
         nv.submit(&c.submit_data, c.put % GPFIFO_ENTRIES);
         var s = kmt.SubmitToHwQueue{
             .queue = c.queue,

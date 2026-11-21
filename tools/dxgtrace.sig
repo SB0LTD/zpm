@@ -119,6 +119,7 @@ export fn ioctl(fd: c_int, req: c_ulong, arg: usize) callconv(.c) c_int {
     record(1, nr, my, arg, a[0..size], 0);
     follow(3, nr, my, a[0..size], 0);
     if (nr == SUBMIT_COMMAND) submitted(nr, my, a, 0, 8);
+    if (nr == SUBMIT_COMMAND) legacyEntries(nr, my, a);
     if (nr == UNLOCK2) unlocking(my, a);
     if (nr == SUBMIT_TO_HW_QUEUE) submitted(nr, my, a, 16, 24);
     lock.store(0, .release);
@@ -475,6 +476,44 @@ fn submitted(nr: u8, my: u32, a: [*]const u8, va_off: usize, len_off: usize) voi
     var b: [96]u8 = undefined;
     const t = std.fmt.bufPrint(&b, "command buffer 0x{x} ({d} bytes) not in a locked allocation", .{ va, len }) catch return;
     record(6, nr, my, va, t, 0);
+}
+
+/// Where a legacy context's GPFIFO entries are in NVIDIA's private data
+/// for submit_command (after its 0x354-byte head): a context with no
+/// hardware queue (Windows' hardware-accelerated GPU scheduling off; NVIDIA's
+/// driver 576.28 on an RTX 2080 Ti) is fed so, its command buffer argument
+/// a dummy 1.
+const LEGACY_ENTRIES = 0x354;
+
+/// Each GPFIFO entry in a submit_command's private data: the pushbuffer it
+/// names, read through the allocation it lies in (kind 5, as `submitted`).
+fn legacyEntries(nr: u8, my: u32, a: [*]const u8) void {
+    const arg = a[0..300];
+    const p = rd64(arg, 288);
+    const len = rd32(arg, 296);
+    if (p == 0 or len <= LEGACY_ENTRIES or len > 64 << 10) return;
+    const m: [*]const u8 = @ptrFromInt(p);
+    const d = m[0..len];
+    if (rd32(d, 0) != 0x4e56_4441 or rd32(d, 12) != LEGACY_ENTRIES) return;
+    var off: usize = LEGACY_ENTRIES;
+    while (off + 8 <= len) : (off += 8) {
+        const e0 = rd32(d, off);
+        const e1 = rd32(d, off + 4);
+        const va = @as(u64, e0 & 0xffff_fffc) | (@as(u64, e1 & 0xff) << 32);
+        const dwords: u64 = (e1 >> 10) & 0x1f_ffff;
+        if (va == 0 or dwords == 0) continue;
+        for (allocs[0..allocs_n]) |al| {
+            if (al.gpu == 0 or al.cpu == 0 or va < al.gpu or va >= al.gpu + al.bytes) continue;
+            const n = @min(dwords * 4, al.gpu + al.bytes - va, MAX_BLOB);
+            const q: [*]const u8 = @ptrFromInt(al.cpu + (va - al.gpu));
+            record(5, nr, my, va, q[0..@intCast(n)], 0);
+            break;
+        } else {
+            var b: [96]u8 = undefined;
+            const t = std.fmt.bufPrint(&b, "GPFIFO entry 0x{x} ({d} dwords) not in a mapped allocation", .{ va, dwords }) catch continue;
+            record(6, nr, my, va, t, 0);
+        }
+    }
 }
 
 fn isDxg(fd: c_int) bool {

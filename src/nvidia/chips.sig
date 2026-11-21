@@ -224,6 +224,22 @@ pub fn byName(name: []const u8) ?*const Chip {
     return null;
 }
 
+/// The shader model of an NVIDIA GPU known only by its PCI device id (a
+/// GPU reached through a host's driver: WSL's /dev/dxg, a forwarded one):
+/// Turing's (TU102 0x1e0x, TU104 0x1e8x, TU106 0x1f0x, TU117 0x1f8x-0x1fbx,
+/// TU116 0x218x-0x21bx) run sm_75, any other sm_120 (the Blackwell cards
+/// zpm drives).
+pub fn smOfPci(device: u32) Sm {
+    const is_turing = (device >= 0x1e00 and device < 0x2000) or (device >= 0x2180 and device < 0x2200);
+    return if (is_turing) .sm_75 else .sm_120;
+}
+
+test "a GPU's shader model by its PCI id: the RTX 2080 Ti's sm_75, the RTX 5070 Laptop's sm_120" {
+    try testing.expectEqual(Sm.sm_75, smOfPci(0x1e07));
+    try testing.expectEqual(Sm.sm_75, smOfPci(0x2182));
+    try testing.expectEqual(Sm.sm_120, smOfPci(0x2d58));
+}
+
 /// What a chipset number Galaxy does not drive is, for the log (the other
 /// families nouveau's table has, by their range).
 pub fn familyName(chipset: u32) []const u8 {

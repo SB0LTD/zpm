@@ -153,6 +153,63 @@ var over3d: gpu.nvidia_draw.Over = undefined;
 var kst: gpu.nvidia_device.kir_sm120.State = undefined;
 var model: gpu.draw.Reference = undefined;
 
+/// `nodes`: what the host says of the GPU's nodes (dxgkrnl's node metadata,
+/// KMTQAITYPE_NODEMETADATA: each node's engine type and NVIDIA's name for
+/// it), its driver's version and whether Windows schedules its work in
+/// hardware (WDDM 2.7's caps): which node a context goes on, and whether
+/// it gets hardware queues or is fed by submit_command.
+fn nodes() void {
+    g.open(.{ .name = "zpm-dxgtest" }) catch |e| {
+        out("dxgtest: open: {s} (call {x}, status {d})\n", .{ @errorName(e), dxg.kmt.last_nr, dxg.kmt.last_status });
+        linux.exit(1);
+    };
+    out("GPU {x}:{x}\n", .{ g.ids.vendor, g.ids.device });
+    var ver: u64 = 0;
+    var qv = dxg.kmt.QueryAdapterInfo{ .adapter = g.adapter, .type = 49, .data = @intFromPtr(&ver), .size = 8 };
+    if (dxg.kmt.call(g.fd, .query_adapter_info, &qv)) |_| {
+        out("driver {d}.{d}.{d}.{d}\n", .{ ver >> 48, (ver >> 32) & 0xffff, (ver >> 16) & 0xffff, ver & 0xffff });
+    } else |_| out("driver version: not answered ({d})\n", .{dxg.kmt.last_status});
+    for ([_]u32{ 70, 71, 74, 76 }) |t| {
+        var caps: u32 = 0;
+        var qc = dxg.kmt.QueryAdapterInfo{ .adapter = g.adapter, .type = t, .data = @intFromPtr(&caps), .size = 4 };
+        if (dxg.kmt.call(g.fd, .query_adapter_info, &qc)) |_| {
+            out("query {d}: 0x{x}\n", .{ t, caps });
+        } else |_| out("query {d}: not answered ({d})\n", .{ t, dxg.kmt.last_status });
+    }
+    const Meta = extern struct {
+        index: u32,
+        engine: u32 = 0,
+        name: [32]u16 = [_]u16{0} ** 32,
+        flags: u32 = 0,
+        gpummu: u8 = 0,
+        iommu: u8 = 0,
+        // (room for the largest answer size tried)
+        pad: [18]u8 = @splat(0),
+    };
+    const kinds = [_][]const u8{ "other", "3D", "video decode", "video encode", "video processing", "scene assembly", "copy", "overlay", "crypto" };
+    var n: u32 = 0;
+    while (n < 32) : (n += 1) {
+        var m = Meta{ .index = n };
+        // (KMTQAITYPE_NODEMETADATA is 24 to dxgkrnl; the answer's size as
+        // the host has it: tried in turn)
+        const ok = for ([_]u32{ 80, 76, 78, 84, 88 }) |size| {
+            m = .{ .index = n };
+            var q = dxg.kmt.QueryAdapterInfo{ .adapter = g.adapter, .type = 24, .data = @intFromPtr(&m), .size = size };
+            if (dxg.kmt.call(g.fd, .query_adapter_info, &q)) |_| break true else |_| {}
+        } else false;
+        if (!ok) break;
+        var name: [32]u8 = undefined;
+        var len: usize = 0;
+        for (m.name) |c| {
+            if (c == 0) break;
+            name[len] = if (c < 128) @intCast(c) else '?';
+            len += 1;
+        }
+        out("node {d}: {s} ({d}) \"{s}\" flags {x} gpummu {d}\n", .{ n, if (m.engine < kinds.len) kinds[m.engine] else "?", m.engine, name[0..len], m.flags, m.gpummu });
+    }
+    out("{d} nodes\n", .{n});
+}
+
 pub fn main(init: std.process.Init) void {
     const argv = init.minimal.args.vector;
     const ring = mapMemory(dxg.gpu.RING_BYTES);
@@ -174,6 +231,7 @@ pub fn main(init: std.process.Init) void {
             linux.exit(2);
         }
     }
+    if (argv.len > 1 and std.mem.eql(u8, std.mem.span(argv[1]), "nodes")) return nodes();
     openAll(ring, client);
     out("open: {x}:{x} (adapter {x}), device {x}, context {x}, queue {x}, ring 0x{x}, progress at 0x{x} = {d} ({d} us)\n", .{
         g.ids.vendor, g.ids.device, g.adapter, g.device, ch.context, ch.queue, ch.ring.va, ch.progress_gpu, ch.progress.*, nowUs() - t0,
@@ -306,39 +364,13 @@ pub fn main(init: std.process.Init) void {
         g.close();
         linux.exit(if (done) 0 else 3);
     }
-    // ("nodes": each of the adapter's nodes, KMTQAITYPE_NODEMETADATA:
-    // its engine type, DXGK_ENGINE_TYPE: 1 3D, 2 video decode, 3 video
-    // encode, 4 video processing, 6 copy; and its name)
-    if (std.mem.eql(u8, mode, "nodes")) {
-        var ni: u32 = 0;
-        while (ni < 16) : (ni += 1) {
-            var md: [96]u8 = @splat(0);
-            var ok = false;
-            for ([_]u32{ 76, 78, 80, 84, 88 }) |size| {
-                @memset(&md, 0);
-                std.mem.writeInt(u32, md[0..4], ni, .little);
-                var q = dxg.kmt.QueryAdapterInfo{ .adapter = g.adapter, .type = 24, .data = @intFromPtr(&md), .size = size };
-                if (dxg.kmt.call(g.fd, .query_adapter_info, &q)) |_| {
-                    ok = true;
-                    break;
-                } else |e| out("node {d}, {d} bytes: {s} (status {d})\n", .{ ni, size, @errorName(e), dxg.kmt.last_status });
-            }
-            if (!ok) break;
-            var name: [32]u8 = undefined;
-            for (&name, 0..) |*c, k| c.* = md[8 + 2 * k];
-            const end = std.mem.indexOfScalar(u8, &name, 0) orelse name.len;
-            out("node {d}: engine type {d}, '{s}', flags 0x{x}\n", .{ ni, std.mem.readInt(u32, md[4..8], .little), name[0..end], std.mem.readInt(u32, md[72..76], .little) });
-        }
-        ch.close();
-        g.close();
-        return;
-    }
     if (std.mem.eql(u8, mode, "draw")) {
         // 4. the 3D engine (the rasteriser), step by step, each pass's
         // pixels compared with the CPU reference's
         const arena = mapMemory(256 << 20);
         dev.init(&g, &ch, arena);
-        const d = gpu.nvidia_device.over(&adapter, dev.device(), null, gpu.nvidia_device.withGraphics(gpu.nvidia_device.rtx5070(arena.len)));
+        const sm = nvidia.chips.smOfPci(g.ids.device);
+        const d = gpu.nvidia_device.over(&adapter, dev.device(), null, gpu.nvidia_device.withGraphics(gpu.nvidia_device.capsFor(sm, arena.len)));
         model = .{ .mem = mapMemory(64 << 20) };
         // ("draw edges": step 4 too, the graphics dispatches through the
         // GPU-neutral adapter)
@@ -348,7 +380,7 @@ pub fn main(init: std.process.Init) void {
             linux.exit(2);
         }
         const t4 = nowUs();
-        const h = gpu.nvidia_draw.hardwareTest(dev.device(), if (edges) d else null, &over3d, &kst, &model, logLine, nowUs);
+        const h = gpu.nvidia_draw.hardwareTestWith(dev.device(), if (edges) d else null, &over3d, &kst, &model, logLine, nowUs, .{ .sm = sm });
         out("4. 3D engine: started {}, object {}, state {}, {d} passed, {d} failed, lost {}, {d} Mpx/s ({d} ms)\n", .{ h.started, h.object, h.state, h.passed, h.failed, h.lost, h.mpx_per_s, (nowUs() - t4) / 1000 });
         if (h.lost or h.failed != 0) if (g.fault()) |pf| out("   the device: execution state {d}, page fault at 0x{x} (stage {d}, flags 0x{x}, code 0x{x})\n", .{ pf.execution, pf.va, pf.stage, pf.flags, pf.code });
         ch.close();
@@ -363,7 +395,7 @@ pub fn main(init: std.process.Init) void {
     // 3. zpm's GPU self-test over DxgDevice
     const arena = mapMemory(256 << 20);
     dev.init(&g, &ch, arena);
-    const d = gpu.nvidia_device.over(&adapter, dev.device(), null, gpu.nvidia_device.rtx5070(arena.len));
+    const d = gpu.nvidia_device.over(&adapter, dev.device(), null, gpu.nvidia_device.capsFor(nvidia.chips.smOfPci(g.ids.device), arena.len));
     const t3 = nowUs();
     const res = gpu.selftest.runAll(d, &work, logLine, 2_000_000);
     out("3. self-test: {d} passed, {d} failed, {d} skipped ({d} ms)\n", .{ res.passed, res.failed, res.skipped, (nowUs() - t3) / 1000 });
