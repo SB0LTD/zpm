@@ -11,6 +11,21 @@ headline generation is unavailable. The callback rows are metadata for
 internal routines. Parser registration and direct SQL invocation of
 callbacks remain open.
 
+RAMSQL `de05533` with ZPM `3fe43949` passed parser discovery on
+PostgreSQL 16 and 18. Both lanes compared the stock projection, typed
+references and callback signatures, and matched native `to_tsvector`
+output for hyphenated words, URLs, markup, email and numbers. Both also
+passed stock plain and custom imports with row and constraint checks after
+WAL reopen. Local WSL could not start, so the standalone Sig catalog suite
+was not run for this revision.
+
+Outbound `pg_dump` passed parser discovery on both versions and stopped
+with `TableNotFound` on `pg_ts_template`. The next native check should
+compare the supported dictionary template's initialization and lexeme
+normalization references and verify their behavior. Both stock directions
+on both versions remain the merge gate.
+[PostgreSQL 16 and 18 text-search parser CI](https://github.com/SB0LTD/ramsql/actions/runs/44906328296)
+
 `pg_opclass` and `pg_opfamily` share the registry for 26 default index
 classes across 21 families. Each row uses PostgreSQL 16 catalog OIDs and
 links to the supported `btree` method and indexed type. Qualification
@@ -26,11 +41,8 @@ qualification on PostgreSQL 16 and 18. Both lanes passed stock plain and
 custom imports with row and constraint checks after WAL reopen. The local
 Sig catalog suite passed 82 assertions.
 
-Both outbound dumps passed operator-class discovery and stopped with
-`TableNotFound` on `pg_ts_parser`. The next native check should cover the
-parser used by the supported `simple` configuration and its typed callback
-references, with coverage tied to the tokenizer's actual behavior. Both
-stock directions on both versions remain the merge gate.
+That candidate passed operator-class discovery and stopped with
+`TableNotFound` on `pg_ts_parser`.
 [PostgreSQL 16 and 18 operator-class discovery CI](https://github.com/SB0LTD/ramsql/actions/runs/44899082739)
 
 `pg_am` exposes the two implemented access methods with PostgreSQL table
