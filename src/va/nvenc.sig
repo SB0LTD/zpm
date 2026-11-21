@@ -67,6 +67,9 @@ const nvdec = @import("nvdec.sig");
 /// NVCFB7_VIDEO_ENCODER: GB20x's encoder class as NVIDIA's open kernel
 /// module lists it (clcfb7.h); its methods ASSUMED NVC9B7's.
 pub const CLASS: u32 = 0xcfb7;
+/// NVC4B7_VIDEO_ENCODER: TU102's NVENC (nouveau's rm/tu1xx.c). Its
+/// methods ASSUMED NVC9B7's, as the header above says of Turing's.
+pub const CLASS_TURING: u32 = 0xc4b7;
 /// SET_OBJECT's ENGINE field, as the decoder's (nvdec.sig).
 pub const SET_OBJECT_ENGINE_SW: u32 = nvdec.SET_OBJECT_ENGINE_SW;
 
@@ -145,6 +148,9 @@ pub const ENC_ERROR_H264_BAD_MAGIC: u32 = 0x3000_0004;
 /// 6, as every generation's NV_NVENC_DRV_MAGIC_VALUE (Ada's 0xc9b70006).
 /// GB206's is ASSUMED to follow (GALAXY_VA_NVENC_MAGIC overrides it).
 pub const MAGIC: u32 = (CLASS << 16) | 0x0006;
+/// TU102's, by the same rule: 0xc4b70006, ASSUMED (Turing's nvenc_drv.h
+/// revision is not public; the status says BAD_MAGIC when it differs).
+pub const MAGIC_TURING: u32 = (CLASS_TURING << 16) | 0x0006;
 /// The watchdog's timeout, the decoder's (nvdec.GPTIMER_TIMEOUT).
 pub const GPTIMER_TIMEOUT: u32 = nvdec.GPTIMER_TIMEOUT;
 

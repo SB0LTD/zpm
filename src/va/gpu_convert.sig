@@ -153,7 +153,9 @@ pub const TIMEOUT_US: u64 = 2_000_000;
 /// The RTX's converter over `Sys`'s render node (gfxapi node.Linux in the
 /// shared library).
 pub fn Gpu(comptime Sys: type) type {
-    const NodeGpu = gfxapi.node.Gpu(Sys, &.{.sm_120});
+    // (the RTX 5070's and the RTX 2080 Ti's: the kernel compiled for the
+    // card the node is)
+    const NodeGpu = gfxapi.node.Gpu(Sys, &.{ .sm_120, .sm_75 });
     return struct {
         const Self = @This();
         pub const wants_fds = true;
@@ -325,6 +327,20 @@ test "gpu_convert: the KIR kernel compiled to sm_120 on the emulated RTX against
         if (Rtx.dev.lastError()) |le| {
             var buf: [512]u8 = undefined;
             std.debug.print("sm120_emu: {s}: {s}\n", .{ @errorName(le), Rtx.dev.explain(&buf) });
+        }
+        return e;
+    };
+}
+
+test "gpu_convert: the KIR kernel compiled to sm_75 on the emulated RTX 2080 Ti against tiling.sig, both ways" {
+    Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+    Rtx.dev.setSm(.sm_75);
+    const dev = Rtx.dev.device();
+    try testing.expectEqual(gpu.Target.sm_75, dev.caps.target);
+    checkOn(dev, &test_scratch, gpu.compile) catch |e| {
+        if (Rtx.dev.lastError()) |le| {
+            var buf: [512]u8 = undefined;
+            std.debug.print("sm120_emu (sm_75): {s}: {s}\n", .{ @errorName(le), Rtx.dev.explain(&buf) });
         }
         return e;
     };

@@ -52,6 +52,12 @@
 //! driver's (nvenc.H264_*_OFF, MD/Q/ME controls), unbooted; each
 //! picture's status words are said (encode.reportLine).
 //!
+//! The RTX 2080 Ti (TU102, Turing): driver.sig's Turing path (NVC4B0,
+//! NVC4B7, Turing2D's GOBs, no AV1, no Blackwell additions), and the
+//! converter's and the VP8/VP9 encoders' kernels compiled for sm_75. Proven
+//! against the fake node and the emulated RTX 2080 Ti only; its encoder's
+//! setup magic ASSUMED 0xc4b70006.
+//!
 //! Untested until a boot on the PC — everything that touches the real
 //! decoder: that GB206's NVCFB0 takes Ada's methods and Ada's
 //! nvdec_h264_pic_s (THE main risk: nvdec.sig), that NVDEC writes the
@@ -119,11 +125,11 @@ fn stop(msg: []const u8, ra: ?usize) noreturn {
 const Conv = if (builtin.is_test) @import("convert.sig").Cpu else @import("vpx_gpu.sig").WithVpx(
     @import("enc_rgb.sig").WithRgb(
         @import("gpu_convert.sig").Gpu(@import("gfxapi").node.Linux),
-        @import("gfxapi").node.Gpu(@import("gfxapi").node.Linux, &.{.sm_120}),
+        @import("gfxapi").node.Gpu(@import("gfxapi").node.Linux, &.{ .sm_120, .sm_75 }),
         @import("convert.sig").Say,
         @import("convert.sig").Done,
     ),
-    @import("gfxapi").node.Gpu(@import("gfxapi").node.Linux, &.{.sm_120}),
+    @import("gfxapi").node.Gpu(@import("gfxapi").node.Linux, &.{ .sm_120, .sm_75 }),
     @import("convert.sig").Say,
 );
 const D = driver.DriverWith(node.Linux, Conv);

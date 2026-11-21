@@ -93,6 +93,18 @@
 //! - **SyncSurface** on the input, or **SyncBuffer** on the coded buffer,
 //!   waits for the encode.
 //!
+//! **Turing** (the RTX 2080 Ti, node.CHIP_TU102): the same driver with
+//! TU102's decoder and encoder classes (NVC4B0, NVC4B7) bound where each
+//! pushbuffer binds its class, every picture in Turing2D's GOBs
+//! (tiling.Gob.turing: NIL's TuringColor2D for every colour format below
+//! Blackwell, exported with sector layout 1), no Blackwell additions (the
+//! decoder's buffer at 0x4dc and its setup fields: codec.Blackwell.off).
+//! What Turing's engines have not is not offered: AV1, decode (NVDEC
+//! gained it with Ampere) and encode (NVENC with Ada). H.264, HEVC Main
+//! and Main10, VP8 and VP9 profiles 0 and 2 decode; H.264 and HEVC Main
+//! encode (the encoder's setup magic ASSUMED 0xc4b70006). Proven against
+//! the fake node only.
+//!
 //! Allocation-free: fixed tables, the kernel's buffers, the reserved pool.
 //! Not thread-safe by itself: libgalaxy_va holds a lock around each call.
 
@@ -544,6 +556,30 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
         errors: u32 = 0,
         /// the video channel's loss said (once)
         told_lost: bool = false,
+        /// the node's GPU is the RTX 2080 Ti (TU102, Turing)
+        turing: bool = false,
+
+        /// The chip's decoder class, bound as each pushbuffer starts.
+        fn decoderClass(d: *const Self) u32 {
+            return (if (d.turing) nvdec.CLASS_TURING else nvdec.CLASS) | nvdec.SET_OBJECT_ENGINE_SW;
+        }
+
+        fn encoderClass(d: *const Self) u32 {
+            return (if (d.turing) nvenc.CLASS_TURING else nvenc.CLASS) | nvenc.SET_OBJECT_ENGINE_SW;
+        }
+
+        /// A pushbuffer the codecs made (each starts with SET_OBJECT of
+        /// Blackwell's class) bound to the chip's class instead.
+        fn bindChip(d: *const Self, push: []u32, class: u32) void {
+            if (!d.turing or push.len < 2) return;
+            std.debug.assert(push[0] == nvdec.header(0, nvdec.SET_OBJECT, 1));
+            push[1] = class;
+        }
+
+        /// Whether `profile` decodes on this GPU (Turing's NVDEC has no AV1).
+        pub fn decodes(d: *const Self, profile: va.Profile) bool {
+            return supported(profile) and !(d.turing and codecOf(profile) == .av1);
+        }
 
         // ── Saying things ───────────────────────────────────────────────
 
@@ -584,9 +620,19 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 d.say("the render node does not answer G_INFO: no VA-API", .{});
                 return va.ERROR_UNIMPLEMENTED;
             };
-            if (i.version != node.G_VERSION or i.chip != node.CHIP_GB206) {
+            if (i.version != node.G_VERSION or (i.chip != node.CHIP_GB206 and i.chip != node.CHIP_TU102)) {
                 d.say("GPU {x} (node version {d}) has no decoder this driver knows: no VA-API", .{ i.chip, i.version });
                 return va.ERROR_UNIMPLEMENTED;
+            }
+            if (i.chip == node.CHIP_TU102) {
+                // (Turing: its classes, Turing2D's GOBs, no Blackwell
+                // additions, whatever the environment asked)
+                d.turing = true;
+                d.opts.gob = .turing;
+                d.opts.hevc_blackwell = .off;
+                d.opts.vp9_blackwell = .off;
+                d.opts.av1_blackwell = .off;
+                d.debug("the RTX 2080 Ti (TU102): NVC4B0 and NVC4B7, Turing2D's GOBs, no AV1", .{});
             }
             if (i.lost) {
                 d.say("the GPU is lost: no VA-API", .{});
@@ -611,7 +657,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             defer d.node.free(&b);
             const w = words(b.cpu, 0, 4);
             w[0] = nvenc.header(0, nvenc.SET_OBJECT, 1);
-            w[1] = nvenc.CLASS | nvenc.SET_OBJECT_ENGINE_SW;
+            w[1] = d.encoderClass();
             w[2] = nvenc.header(0, nvenc.NOP, 1);
             w[3] = 0;
             const f = d.node.esubmit(b, 0, 4) catch |e| {
@@ -635,7 +681,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             defer d.node.free(&b);
             const w = words(b.cpu, 0, 4);
             w[0] = nvdec.header(0, nvdec.SET_OBJECT, 1);
-            w[1] = nvdec.CLASS | nvdec.SET_OBJECT_ENGINE_SW;
+            w[1] = d.decoderClass();
             w[2] = nvdec.header(0, nvdec.NOP, 1);
             w[3] = 0;
             const f = d.node.vsubmit(b, 0, 4) catch |e| {
@@ -679,21 +725,28 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
 
         // ── Configs ─────────────────────────────────────────────────────
 
-        pub fn queryConfigProfiles(_: *Self, list: [*]va.Profile, n: *i32) va.Status {
-            for (PROFILES, 0..) |p, i| list[i] = p;
-            n.* = PROFILES.len;
+        pub fn queryConfigProfiles(d: *Self, list: [*]va.Profile, n: *i32) va.Status {
+            var k: usize = 0;
+            for (PROFILES) |p| {
+                if (!d.decodes(p)) continue;
+                list[k] = p;
+                k += 1;
+            }
+            n.* = @intCast(k);
             return va.SUCCESS;
         }
 
-        /// Whether `profile` encodes here (and the encoder is there).
+        /// Whether `profile` encodes here (and the encoder is there; no AV1
+        /// on Turing's NVENC).
         pub fn encodes(d: *const Self, profile: va.Profile) bool {
             // (VP8 and VP9: the kernels' encoder, not NVENC's)
             if (enc_vpx.supported(profile) != null) return d.opts.encode and d.opts.vpx_encode;
-            return d.has_encoder and encode.supported(profile) != null;
+            const kind = encode.supported(profile) orelse return false;
+            return d.has_encoder and !(d.turing and kind == .av1);
         }
 
         pub fn queryConfigEntrypoints(d: *Self, profile: va.Profile, list: [*]va.Entrypoint, n: *i32) va.Status {
-            if (!supported(profile)) {
+            if (!d.decodes(profile)) {
                 n.* = 0;
                 return va.ERROR_UNSUPPORTED_PROFILE;
             }
@@ -707,7 +760,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
         }
 
         pub fn getConfigAttributes(d: *Self, profile: va.Profile, ep: va.Entrypoint, attribs: []va.ConfigAttrib) va.Status {
-            if (!supported(profile)) return va.ERROR_UNSUPPORTED_PROFILE;
+            if (!d.decodes(profile)) return va.ERROR_UNSUPPORTED_PROFILE;
             if (ep == ve.ENTRYPOINT_ENC_SLICE and d.encodes(profile)) {
                 for (attribs) |*a| a.value = encodeAttribute(profile, a.type);
                 // (HEVC: the driver's own parameter sets unless "apppps":
@@ -738,7 +791,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
         }
 
         pub fn createConfig(d: *Self, profile: va.Profile, ep: va.Entrypoint, attribs: []const va.ConfigAttrib, out: *u32) va.Status {
-            if (!supported(profile)) return va.ERROR_UNSUPPORTED_PROFILE;
+            if (!d.decodes(profile)) return va.ERROR_UNSUPPORTED_PROFILE;
             const enc = ep == ve.ENTRYPOINT_ENC_SLICE and d.encodes(profile);
             if (ep != va.ENTRYPOINT_VLD and !enc) return va.ERROR_UNSUPPORTED_ENTRYPOINT;
             var rc_mode: u32 = ve.RC_CQP;
@@ -1852,6 +1905,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 if (!nvdec.addressable(a.luma[k]) or !nvdec.addressable(a.chroma[k])) return va.ERROR_INVALID_SURFACE;
             }
             const n = nvdec.h264Push(words(frame.ptr, PUSH_OFF, nvdec.PUSH_DWORDS), a);
+            d.bindChip(words(frame.ptr, PUSH_OFF, n), d.decoderClass());
             const fence = d.node.vsubmit(c.work, @intCast(f * FRAME_BYTES + PUSH_OFF), @intCast(n)) catch |e| {
                 if (e == error.Lost) {
                     d.loseSurface(si);
@@ -1908,6 +1962,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 return st;
             }
             std.debug.assert(e.dwords <= PUSH_DWORDS_MAX);
+            d.bindChip(slot.push[0..e.dwords], d.decoderClass());
             const fence = d.node.vsubmit(c.work, @intCast(f * FRAME_BYTES + PUSH_OFF), @intCast(e.dwords)) catch |err| {
                 if (err == error.Lost) {
                     d.loseSurface(si);
@@ -2071,7 +2126,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                     .sizes = c.enc_scratch,
                 },
                 .picture_index = c.decodes,
-                .magic = d.opts.nvenc_magic orelse nvenc.MAGIC,
+                .magic = d.opts.nvenc_magic orelse if (d.turing) nvenc.MAGIC_TURING else nvenc.MAGIC,
                 .try_ = d.opts.nvenc_try,
             }, &out);
             if (st != va.SUCCESS) {
@@ -2104,6 +2159,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                     d.say("dump {s} {d} methods {d}: {s}", .{ @tagName(c.enc.kind), c.decodes, at / 2, encode.pushLine(&mline, all[at..@min(all.len, at + 20)]) });
                 }
             }
+            d.bindChip(words(frame.ptr, ENC_PUSH_OFF, out.dwords), d.encoderClass());
             const fence = d.node.esubmit(c.work, @intCast(f * ENC_FRAME_BYTES + ENC_PUSH_OFF), @intCast(out.dwords)) catch |e| {
                 d.say("an encode was not submitted ({s})", .{@errorName(e)});
                 return if (e == error.NoEncoder) va.ERROR_UNIMPLEMENTED else va.ERROR_OPERATION_FAILED;

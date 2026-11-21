@@ -279,6 +279,49 @@ test "driver: profiles, entrypoints, attributes, and Firefox's probe" {
     try testing.expectEqual(va.ERROR_UNSUPPORTED_RT_FORMAT, d.createConfig(va.PROFILE_H264_HIGH, va.ENTRYPOINT_VLD, &.{.{ .type = va.ATTRIB_RT_FORMAT, .value = va.RT_FORMAT_YUV420_10 }}, &cfg));
 }
 
+test "driver on Turing (TU102): NVC4B0 bound in a decode's pushbuffer, no AV1, Turing2D's GOBs, no Blackwell additions, NVC4B7 and its magic" {
+    var k = Fake{ .chip = node.CHIP_TU102, .decoder = fakeDecode };
+    seen = .{};
+    var d: TestDriver = .{ .node = .{ .sys = &k } };
+    // (the environment's Blackwell variants are overridden: Turing has none)
+    try testing.expectEqual(va.SUCCESS, d.init(3, .{ .hevc_blackwell = .full, .av1_blackwell = .buffer }));
+    defer d.terminate();
+    try testing.expect(d.turing);
+    try testing.expectEqual(tiling.Gob.turing, d.opts.gob);
+    try testing.expectEqual(@as(@TypeOf(d.opts.hevc_blackwell), .off), d.opts.hevc_blackwell);
+    try testing.expectEqual(@as(@TypeOf(d.opts.av1_blackwell), .off), d.opts.av1_blackwell);
+    // (the init's probe was submitted: its buffer is gone, its class the
+    // same word as a picture's below)
+    try testing.expectEqual(@as(u32, 1), k.n_submits);
+    // AV1: no decode (NVDEC has it from Ampere), no encode (NVENC from Ada)
+    var profiles: [12]va.Profile = undefined;
+    var n: i32 = 0;
+    try testing.expectEqual(va.SUCCESS, d.queryConfigProfiles(&profiles, &n));
+    try testing.expectEqualSlices(va.Profile, &.{ 13, 6, 7, 17, 18, 14, 19, 21 }, profiles[0..@intCast(n)]);
+    var eps: [4]va.Entrypoint = undefined;
+    var m: i32 = 0;
+    try testing.expectEqual(va.ERROR_UNSUPPORTED_PROFILE, d.queryConfigEntrypoints(va.PROFILE_AV1_PROFILE_0, &eps, &m));
+    var cfg: u32 = 0;
+    try testing.expectEqual(va.ERROR_UNSUPPORTED_PROFILE, d.createConfig(va.PROFILE_AV1_PROFILE_0, va.ENTRYPOINT_VLD, &.{}, &cfg));
+    try testing.expect(!d.encodes(va.PROFILE_AV1_PROFILE_0) and d.encodes(va.PROFILE_H264_MAIN) and d.encodes(va.PROFILE_HEVC_MAIN));
+    // an H.264 picture: its pushbuffer starts with NVC4B0, the rest as on
+    // Blackwell
+    try testing.expectEqual(va.SUCCESS, d.createConfig(va.PROFILE_H264_HIGH, va.ENTRYPOINT_VLD, &.{}, &cfg));
+    var surfaces: [3]u32 = undefined;
+    const nv12 = [_]va.SurfaceAttrib{driver.intAttrib(va.SURFACE_ATTRIB_PIXEL_FORMAT, va.SURFACE_ATTRIB_SETTABLE, va.FOURCC_NV12)};
+    try testing.expectEqual(va.SUCCESS, d.createSurfaces(va.RT_FORMAT_YUV420, 40, 24, &surfaces, &nv12));
+    var ctx: u32 = 0;
+    try testing.expectEqual(va.SUCCESS, d.createContext(cfg, 40, 24, &ctx));
+    const p0 = testPic(surfaces[0], 0);
+    try decodeOne(&d, ctx, &p0, surfaces[0]);
+    const push = k.push(k.submits[1]);
+    try testing.expectEqual(nvdec.header(0, nvdec.SET_OBJECT, 1), push[0]);
+    try testing.expectEqual(nvdec.CLASS_TURING | nvdec.SET_OBJECT_ENGINE_SW, push[1]);
+    try testing.expectEqual(nvdec.APPLICATION_ID_H264, seen.methods[nvdec.SET_APPLICATION_ID >> 2]);
+    // the encoder's: Turing's class, the magic by the same rule (ASSUMED)
+    try testing.expectEqual(@as(u32, 0xc4b7_0006), nvenc.MAGIC_TURING);
+}
+
 test "driver: init refuses another GPU and a GPU without a decoder" {
     var k = Fake{ .chip = 0x4303_0c00 };
     var d: TestDriver = .{ .node = .{ .sys = &k } };
