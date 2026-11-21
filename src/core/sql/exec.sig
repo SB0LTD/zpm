@@ -310,6 +310,7 @@ pub fn Exec(comptime config: types.Config) type {
                 if (p.series == .json_table) return self.jsonTableRows(p, outer);
                 if (p.series == .partition_ancestors) return self.partitionAncestorRows(p, &ctx);
                 if (p.series == .options_to_table) return self.optionRows(p, &ctx);
+                if (p.series == .unnest) return self.unnestRows(p, &ctx);
                 if (p.series == .none) {
                     const at = try self.cells(p.width);
                     self.work.cells[at] = try E.eval(&ctx, p.function);
@@ -343,7 +344,7 @@ pub fn Exec(comptime config: types.Config) type {
                         const zero: V.Cell = .{ .interval = .{} };
                         direction = V.compare(&step, &zero);
                     },
-                    .none, .json_table, .partition_ancestors, .options_to_table => unreachable,
+                    .none, .json_table, .partition_ancestors, .options_to_table, .unnest => unreachable,
                 }
                 if (direction == 0) return error.InvalidParameterValue;
                 var current = args[0];
@@ -402,6 +403,21 @@ pub fn Exec(comptime config: types.Config) type {
                     row_cells[0] = try E.textCell(option[0 .. separator orelse option.len]);
                     row_cells[1] = if (separator) |index| try E.textCell(option[index + 1 ..]) else .null_value;
                     if (p.ordinality) row_cells[2] = .{ .integer = @as(i64, rows.count) + 1 };
+                    try self.push(&rows, at);
+                }
+                return self.finish(p, rows);
+            }
+
+            fn unnestRows(self: *Query, p: *const B.Plan, ctx: *const E.Context) Error!List {
+                var rows: List = .{ .start = @intCast(self.work.ref_low) };
+                const array_value = try E.eval(ctx, self.pool.nodes[p.function].b);
+                if (array_value == .null_value) return rows;
+                var reader = V.Arrays.Reader.init(array_value.array.slice());
+                var element: V.Cell = undefined;
+                while (reader.next(&element)) {
+                    const at = try self.cells(p.width);
+                    self.work.cells[at] = element;
+                    if (p.ordinality) self.work.cells[at + 1] = .{ .integer = @as(i64, rows.count) + 1 };
                     try self.push(&rows, at);
                 }
                 return self.finish(p, rows);

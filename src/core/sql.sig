@@ -6147,6 +6147,8 @@ pub fn Database(comptime config: Config) type {
             // UTF-8 is the only client and server encoding. Identity
             // transfer does not invoke a catalog conversion procedure.
             if (view == .pg_conversion) return;
+            // Relation triggers and DDL event triggers have separate catalogs.
+            if (view == .pg_event_trigger) return;
             if (view == .pg_range) {
                 for (catalog_module.ranges) |range| {
                     // Supported subtypes have no collation and no subdiff callback.

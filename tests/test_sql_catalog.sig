@@ -241,6 +241,20 @@ fn rangeDiscovery() !void {
         ++ "WHERE c.castsource=r.rngtypid AND c.casttarget=r.rngmultitypid)", "3904|4532");
 }
 
+fn eventTriggerDiscovery() !void {
+    const tags = "array_to_string(ARRAY(SELECT quote_literal(x) FROM unnest(evttags) AS t(x)), ', ')";
+    try expect("SELECT e.tableoid,e.oid,evtname,evtenabled,evtevent,evtowner,"
+        ++ tags ++ " AS evttags,e.evtfoid::regproc AS evtfname FROM pg_event_trigger e ORDER BY e.oid", "");
+    try expect("SELECT 'pg_catalog.pg_event_trigger'::regclass::oid", "3466");
+    try expect("SELECT id," ++ tags ++ " FROM (VALUES (1,ARRAY['DROP TABLE','CREATE TABLE']),"
+        ++ "(2,ARRAY['b''c',NULL]),(3,NULL::text[])) AS e(id,evttags) ORDER BY id",
+        "1|'DROP TABLE', 'CREATE TABLE';2|'b''c';3|");
+    try expect("SELECT * FROM pg_catalog.unnest('[0:1][4:5]={{1,NULL},{3,4}}'::int[]) WITH ORDINALITY",
+        "1|1;NULL|2;3|3;4|4");
+    try expect("SELECT COUNT(*) FROM unnest(ARRAY[]::int[])", "0");
+    try rejects("SELECT * FROM unnest(123)", error.UndefinedFunction);
+}
+
 fn lifecycle() !void {
     try run("CREATE TABLE a (id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY, amount NUMERIC(10,2), at TIMESTAMPTZ(3), doc JSONB, label TEXT DEFAULT 'd', n INTEGER DEFAULT 2 + 3)");
     try expect(public_tables, "a");
@@ -390,6 +404,7 @@ pub fn main(init: std.process.Init) !void {
     try defaultAclDiscovery();
     try conversionDiscovery();
     try rangeDiscovery();
+    try eventTriggerDiscovery();
     try lifecycle();
     try replay();
     try characterMetadata();

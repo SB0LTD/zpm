@@ -532,7 +532,7 @@ pub fn Binder(comptime config: types.Config) type {
         /// FROM (one row).
         pub const Series = enum { none, integer, numeric, timestamp,
             // JSON_TABLE (B11 json-agg lane): `function` is the table node.
-            json_table, partition_ancestors, options_to_table };
+            json_table, partition_ancestors, options_to_table, unnest };
 
         /// A bound query block of the general engine (design §4.9). Its
         /// materialized rows are `width` cells: the `count` visible output
@@ -6743,6 +6743,15 @@ pub fn Binder(comptime config: types.Config) type {
                 try bindSignature(context, call, &.{types.arrayType(.text).?}, .text, true);
                 series = .options_to_table;
                 ty = .text;
+            } else if (context.dialect == .postgres and types.same(name.slice(), "unnest") and
+                (if (item.schema) |schema| types.same(toName(context, schema).slice(), "pg_catalog") else true))
+            {
+                if (call.star or call.distinct or call.c != none or call.order != none or call.b == none or context.node(call.b).next != none) return error.UndefinedFunction;
+                try typeExpr(context, &inner, call.b);
+                const argument = context.node(call.b).ty;
+                if (argument == .unknown) return error.AmbiguousFunction;
+                ty = types.elementType(argument) orelse return error.UndefinedFunction;
+                series = .unnest;
             } else {
                 try typeExpr(context, &inner, item.function);
                 ty = context.node(item.function).ty;

@@ -55,7 +55,7 @@ pub const View = enum(u8) { pg_type, pg_namespace, pg_class, pg_attribute, pg_in
     // Catalog objects (B11 wave 3, catalog_objects.sig).
     pg_roles, pg_authid, pg_auth_members, pg_policy, pg_policies, pg_description, pg_shdescription, pg_foreign_data_wrapper, pg_foreign_server, pg_publication, pg_extension, pg_tables, table_privileges, pg_enum, pg_database, pg_am, pg_collation, pg_constraint, pg_statistic_ext,
     pg_publication_rel, pg_publication_namespace, pg_settings, pg_depend, pg_tablespace, pg_foreign_table,
-    pg_init_privs, pg_cast, pg_transform, pg_language, pg_operator, pg_opclass, pg_opfamily, pg_ts_parser, pg_ts_template, pg_ts_dict, pg_ts_config, pg_default_acl, pg_conversion, pg_range };
+    pg_init_privs, pg_cast, pg_transform, pg_language, pg_operator, pg_opclass, pg_opfamily, pg_ts_parser, pg_ts_template, pg_ts_dict, pg_ts_config, pg_default_acl, pg_conversion, pg_range, pg_event_trigger };
 
 pub const sql_language_oid: u32 = 14;
 pub const plpgsql_language_oid: u32 = 13002;
@@ -244,6 +244,10 @@ const pg_range_columns = [_]ViewColumn{
     col("rngtypid", .oid), col("rngsubtype", .oid), col("rngmultitypid", .oid),
     col("rngcollation", .oid), col("rngsubopc", .oid), col("rngcanonical", .regproc), col("rngsubdiff", .regproc),
 };
+const pg_event_trigger_columns = [_]ViewColumn{
+    col("oid", .oid), col("evtname", .name), col("evtevent", .name), col("evtowner", .oid),
+    col("evtfoid", .oid), col("evtenabled", .pg_internal_char), col("evttags", types.arrayType(.text).?),
+};
 const pg_cast_columns = [_]ViewColumn{ col("oid", .oid), col("castsource", .oid), col("casttarget", .oid), col("castfunc", .oid), col("castcontext", .pg_internal_char), col("castmethod", .pg_internal_char) };
 const pg_transform_columns = [_]ViewColumn{ col("oid", .oid), col("trftype", .oid), col("trflang", .oid), col("trffromsql", .oid), col("trftosql", .oid) };
 const pg_language_columns = [_]ViewColumn{ col("oid", .oid), col("lanname", .name), col("lanowner", .oid), col("lanispl", .boolean), col("lanpltrusted", .boolean), col("lanplcallfoid", .oid), col("laninline", .oid), col("lanvalidator", .oid), col("lanacl", types.arrayType(.aclitem).?) };
@@ -355,6 +359,7 @@ pub fn viewColumns(view: View) []const ViewColumn {
         .pg_default_acl => &pg_default_acl_columns,
         .pg_conversion => &pg_conversion_columns,
         .pg_range => &pg_range_columns,
+        .pg_event_trigger => &pg_event_trigger_columns,
         .pg_cast => &pg_cast_columns,
         .pg_transform => &pg_transform_columns,
         .pg_language => &pg_language_columns,
@@ -391,7 +396,7 @@ pub fn viewColumns(view: View) []const ViewColumn {
 pub fn findView(schema: ?[]const u8, name: []const u8) ?View {
     const catalog_views = [_]View{ .pg_type, .pg_enum, .pg_namespace, .pg_am, .pg_collation, .pg_class, .pg_settings, .pg_attribute, .pg_index, .pg_constraint, .pg_depend, .pg_statistic_ext, .pg_attrdef, .pg_sequence, .pg_indexes, .pg_views, .pg_matviews, .pg_inherits, .pg_proc, .pg_trigger, .pg_rewrite, .pg_rules,
         .pg_tablespace, .pg_foreign_table, .pg_roles, .pg_authid, .pg_auth_members, .pg_policy, .pg_policies, .pg_description, .pg_shdescription, .pg_foreign_data_wrapper, .pg_foreign_server, .pg_publication, .pg_publication_rel, .pg_publication_namespace, .pg_extension, .pg_tables,
-        .pg_init_privs, .pg_cast, .pg_transform, .pg_language, .pg_operator, .pg_opclass, .pg_opfamily, .pg_ts_parser, .pg_ts_template, .pg_ts_dict, .pg_ts_config, .pg_default_acl, .pg_conversion, .pg_range };
+        .pg_init_privs, .pg_cast, .pg_transform, .pg_language, .pg_operator, .pg_opclass, .pg_opfamily, .pg_ts_parser, .pg_ts_template, .pg_ts_dict, .pg_ts_config, .pg_default_acl, .pg_conversion, .pg_range, .pg_event_trigger };
     const information_views = [_]View{ .schemata, .tables, .columns, .table_constraints, .key_column_usage, .table_privileges };
     const qualified = schema orelse {
         for (catalog_views) |view| if (types.same(@tagName(view), name)) return view;
@@ -415,6 +420,7 @@ pub const bootstrap_relations = [_]struct { view: View, oid: u32 }{
     .{ .view = .pg_default_acl, .oid = 826 },
     .{ .view = .pg_conversion, .oid = 2607 },
     .{ .view = .pg_range, .oid = 3541 },
+    .{ .view = .pg_event_trigger, .oid = 3466 },
     .{ .view = .pg_operator, .oid = 2617 },
     .{ .view = .pg_opclass, .oid = 2616 }, .{ .view = .pg_opfamily, .oid = 2753 },
     .{ .view = .pg_ts_parser, .oid = 3601 },
