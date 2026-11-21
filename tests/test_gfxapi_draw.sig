@@ -506,6 +506,29 @@ test "draw: the scene on EmuDevice gives the CPU's bytes" {
     eng_emu.deinit();
 }
 
+test "draw: the scene on EmuDevice with its draws' records in a small scratch ring gives the CPU's bytes" {
+    const want = try cpuOut();
+    var caps = gpu.interp_caps;
+    caps.coherent = false;
+    emu = gpu.EmuDevice.init(caps, &emu_mem, &emu_work);
+    emu.shadow = &emu_shadow;
+    // (two pieces of 1 MiB, every draw's records in it: the ring comes
+    // round within the scene)
+    eng_emu.init(.{ .dev = emu.device(), .work = &compile_mem, .cpu_work = &cpu_work, .scratch_ring = 2 << 20, .scratch_min = 0 });
+    try std.testing.expect(eng_emu.onGpu());
+    try scene(&eng_emu, &out_emu);
+    try std.testing.expect(eng_emu.why_pipe == null);
+    try std.testing.expect(!eng_emu.lost);
+    try check(&out_emu);
+    try std.testing.expectEqualSlices(u8, &want.fbo, &out_emu.fbo);
+    try std.testing.expectEqualSlices(u8, &want.win, &out_emu.win);
+    // the records came from the ring, every draw's
+    try std.testing.expectEqual(@as(usize, 2 << 20), eng_emu.scratch_ring.cpu.len);
+    try std.testing.expect(eng_emu.stats.scratch_bytes > 0);
+    try std.testing.expect(eng_emu.stats.dispatches >= 3 * 9);
+    eng_emu.deinit();
+}
+
 var a_arena: [32 << 20]u8 align(4096) = undefined;
 var a_view: [32 << 20]u8 align(4096) = undefined;
 var a_emu: adreno.device.EmuDevice = undefined;
@@ -2629,16 +2652,18 @@ fn binScene(eng: *engine.Engine, out: *BinOut) !void {
 
 var bins_pool: [8 << 20]u8 align(64) = undefined;
 var eng_bins: engine.Engine = undefined;
-/// on the CPU: unbinned, binned, binned with lists of 24 at most
-var bins_cpu: [3]BinOut = .{ .{}, .{}, .{} };
+/// on the CPU: unbinned, binned, binned with lists of 24 at most, binned
+/// in 4 bins at most (each 128 pixels a side, not raster.BIN's 64)
+var bins_cpu: [4]BinOut = .{ .{}, .{}, .{}, .{} };
 var bins_done = false;
 
-fn binsCpu() !*const [3]BinOut {
+fn binsCpu() !*const [4]BinOut {
     if (!bins_done) {
         for (&bins_cpu, 0..) |*o, m| {
             eng_bins.init(.{ .pool = &bins_pool, .cpu_work = &cpu_work });
             eng_bins.binning = m != 0;
             if (m == 2) eng_bins.bin_cap = 24;
+            if (m == 3) eng_bins.max_bins = 4;
             try binScene(&eng_bins, o);
             if (eng_bins.why_pipe) |e| std.debug.print("cpu bins: {s} at pc {d}\n", .{ @errorName(e), eng_bins.trap.pc });
             eng_bins.deinit();
@@ -2662,10 +2687,11 @@ fn checkBins(o: *const BinOut) !void {
     try std.testing.expect(drawn > BW * BH / 4 and bare > BW * BH / 10);
 }
 
-test "draw: bins: binned, unbinned, and lists that run over give the same bytes on the CPU" {
+test "draw: bins: binned, unbinned, lists that run over and larger bins give the same bytes on the CPU" {
     const o = try binsCpu();
     try std.testing.expectEqualSlices(u8, &o[0].fbo, &o[1].fbo);
     try std.testing.expectEqualSlices(u8, &o[0].fbo, &o[2].fbo);
+    try std.testing.expectEqualSlices(u8, &o[0].fbo, &o[3].fbo);
     try checkBins(&o[0]);
 }
 
@@ -2685,6 +2711,16 @@ test "draw: bins on EmuDevice (lists that run over) give the CPU's bytes" {
     try std.testing.expectEqualSlices(u8, &want[0].fbo, &out.fbo);
     // (four dispatches a binned draw)
     try std.testing.expect(eng_emu.stats.dispatches >= 4 * 3);
+    eng_emu.deinit();
+    // bins of 128 pixels (4 at most), on the GPU
+    emu = gpu.EmuDevice.init(caps, &emu_mem, &emu_work);
+    emu.shadow = &emu_shadow;
+    eng_emu.init(.{ .dev = emu.device(), .work = &compile_mem, .cpu_work = &cpu_work });
+    eng_emu.max_bins = 4;
+    var big: BinOut = .{};
+    try binScene(&eng_emu, &big);
+    try std.testing.expect(eng_emu.why_pipe == null and !eng_emu.lost);
+    try std.testing.expectEqualSlices(u8, &want[0].fbo, &big.fbo);
     eng_emu.deinit();
 }
 

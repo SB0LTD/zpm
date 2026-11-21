@@ -970,10 +970,10 @@ fn floatTo24(bits: u32) u32 {
 pub const MAX_OPS = 256;
 pub const MAX_DOOMED = 128;
 /// The bytes freed buffers may hold while their batches run (doomed): past
-/// it, the open batch is run and waited for and they go. A game loading
-/// (Unigine Superposition) freed its staged uploads' images, 32 to 256 MiB
-/// each, faster than batches finished: 106 of them held gigabytes of a VM
-/// guest's RAM, and the game's own allocations ran out.
+/// it, the open batch is run and waited for and they go. Each draw on the
+/// compute kernels freed its vertex and triangle records so (now in the
+/// scratch ring): a game loading (Unigine Superposition) left gigabytes of
+/// them, in a VM's guest RAM, and its own allocations ran out.
 pub const DOOMED_BYTES: u64 = 256 << 20;
 /// Draws' uniforms (Draw.uniforms) go one after another into a host
 /// buffer of UNI_RING_BYTES (Engine.uniformsFor), in UNI_CHUNK pieces,
@@ -987,6 +987,19 @@ comptime {
 }
 /// A draw's uniforms start on this many bytes.
 const UNI_ALIGN = 256;
+/// A draw's vertex and triangle records (on the compute kernels) go one
+/// after another into a host buffer of SCRATCH_RING_BYTES
+/// (Engine.scratchFor), in SCRATCH_CHUNK pieces, each used again once the
+/// batches that used it are done. Each was a buffer made and freed per
+/// draw, and freed buffers wait for their batch (doomed): a game's
+/// thousands of draws a second held gigabytes so, or, bounded, waited for
+/// the GPU every few draws (Unigine Superposition's loading screen, 1.5 s
+/// of every 2). Records up to the slab object size stay slab memory (used
+/// again once freed); those past half the ring are a buffer of their own.
+pub const SCRATCH_RING_BYTES = 64 << 20;
+const SCRATCH_CHUNK = 1 << 20;
+const SCRATCH_CHUNKS = SCRATCH_RING_BYTES / SCRATCH_CHUNK;
+const SCRATCH_ALIGN = 256;
 /// Reads begun at once (Engine.readStart) at most.
 pub const READ_SLOTS = 4;
 const RING = 64;
@@ -1154,6 +1167,13 @@ pub const Config = struct {
     /// has a few hundred: node.MAX_BUFFERS).
     slab_bytes: usize = SLAB_BYTES,
     slab_object: usize = MAX_SLAB_OBJECT,
+    /// The scratch ring's bytes (draws' records: Engine.scratchFor), a
+    /// whole number of SCRATCH_CHUNK up to SCRATCH_RING_BYTES; 0: none.
+    scratch_ring: usize = SCRATCH_RING_BYTES,
+    /// Records of more bytes than this go to the scratch ring (null:
+    /// slab_object's; smaller ones are slab memory, used again as soon as
+    /// freed).
+    scratch_min: ?usize = null,
     /// Scratch for KIR's interpreter, which draws on the CPU (no GPU, or
     /// it is lost); none: such draws are refused.
     cpu_work: []u8 = &.{},
@@ -1265,7 +1285,41 @@ pub const Stats = struct {
     /// Times the freed buffers waiting for the GPU passed DOOMED_BYTES
     /// and the open batch was run and waited for.
     doomed_waits: u64 = 0,
+    /// The CPU's waits for the GPU by why (WaitWhy): how many, and their
+    /// microseconds.
+    wait_n: [WAIT_WHYS]u32 = @splat(0),
+    wait_why_us: [WAIT_WHYS]u64 = @splat(0),
+    /// A pipeline's kernel variants made (buildFor, compiled and loaded),
+    /// and the microseconds that took.
+    variants: u32 = 0,
+    variant_us: u64 = 0,
+    /// Bytes of draws' records placed in the scratch ring.
+    scratch_bytes: u64 = 0,
 };
+
+/// Why the CPU waited for the GPU (Stats.wait_n): set by the caller of a
+/// wait, `other` when none did.
+pub const WaitWhy = enum(u8) {
+    other,
+    /// the uniform ring came round to a piece a batch in flight reads
+    uniforms,
+    /// the CPU touched an image a batch in flight uses (write, read, copy
+    /// on the CPU, a fill, a host view)
+    settle,
+    /// a pipeline's table of kernel variants full: the oldest let go
+    evict,
+    /// freed buffers past DOOMED_BYTES
+    doomed,
+    /// work done on the CPU (a compute kernel, a draw)
+    cpu,
+    /// a program or pipeline let go
+    unload,
+    /// a read-back's mark
+    read,
+    /// the scratch ring came round to a piece a batch in flight uses
+    scratch,
+};
+pub const WAIT_WHYS = @typeInfo(WaitWhy).@"enum".field_names.len;
 
 pub const Engine = struct {
     dev: ?gpu.Device = null,
@@ -1281,6 +1335,10 @@ pub const Engine = struct {
     slabs: []Slab = &.{},
     slab_bytes: usize = SLAB_BYTES,
     slab_object: usize = MAX_SLAB_OBJECT,
+    /// The scratch ring's size (Config.scratch_ring; 0: none), and the
+    /// records it takes (more bytes than scratch_min).
+    scratch_len: usize = SCRATCH_RING_BYTES,
+    scratch_min: usize = MAX_SLAB_OBJECT,
     progs: [N_PROGS]gpu.Program = undefined,
     code: [N_PROGS][CODE_BYTES]u8 align(16) = undefined,
     ops: [MAX_OPS]gpu.Dispatch = undefined,
@@ -1345,6 +1403,8 @@ pub const Engine = struct {
     doomed_bytes: u64 = 0,
     doom_waiting: bool = false,
     doomed_budget: u64 = DOOMED_BYTES,
+    /// Why the next wait waits (Stats.wait_n), taken by it.
+    wait_why: WaitWhy = .other,
     /// The draws' uniforms (uniformsFor): the ring, where the next goes,
     /// and the last batch that read each piece of it. A draw's uniforms
     /// were a buffer made and freed each draw: the GPU was asked whether
@@ -1353,12 +1413,19 @@ pub const Engine = struct {
     uni_ring: gpu.Buffer = .{},
     uni_at: usize = 0,
     uni_chunk: [UNI_CHUNKS]u64 = @splat(0),
+    /// The draws' records (scratchFor): the ring, where the next go, and
+    /// the last batch that used each piece of it.
+    scratch_ring: gpu.Buffer = .{},
+    scratch_at: usize = 0,
+    scratch_chunk: [SCRATCH_CHUNKS]u64 = @splat(0),
     /// Reads' rows (readStart), kept between reads.
     read_slots: [READ_SLOTS]ReadSlot = @splat(.{}),
     stats: Stats = .{},
     /// Triangles a bin's list holds at most (raster.BIN_CAP; tests lower
     /// it to make lists run over).
     bin_cap: u32 = raster.BIN_CAP,
+    /// Bins a draw has at most (raster.MAX_BINS; a test lowers it).
+    max_bins: u32 = raster.MAX_BINS,
     /// Off: no draw is binned (every tile goes through every triangle).
     binning: bool = true,
     check: Check = .{},
@@ -1377,7 +1444,7 @@ pub const Engine = struct {
     /// The engine in place (it must stay at `e`): the kernels compiled and
     /// loaded for cfg.dev; if any fails, everything runs on the CPU.
     pub fn init(e: *Engine, cfg: Config) void {
-        e.* = .{ .pool = Pool.init(cfg.pool), .slabs = cfg.slabs, .slab_bytes = cfg.slab_bytes, .slab_object = cfg.slab_object, .compiler = cfg.compiler, .work = cfg.work, .cpu_work = cfg.cpu_work, .cpu_insts = cfg.cpu_kernels, .check = cfg.check };
+        e.* = .{ .pool = Pool.init(cfg.pool), .slabs = cfg.slabs, .slab_bytes = cfg.slab_bytes, .slab_object = cfg.slab_object, .scratch_len = @min(cfg.scratch_ring / SCRATCH_CHUNK * SCRATCH_CHUNK, SCRATCH_RING_BYTES), .scratch_min = cfg.scratch_min orelse cfg.slab_object, .compiler = cfg.compiler, .work = cfg.work, .cpu_work = cfg.cpu_work, .cpu_insts = cfg.cpu_kernels, .check = cfg.check };
         if (cfg.dev) |d| e.graphics = cfg.graphics and d.caps.graphics and d.caps.target == .sm_120;
         e.graphics_depth = cfg.graphics_depth;
         e.depth_float = e.graphics and cfg.depth_float and cfg.graphics_depth;
@@ -1426,6 +1493,8 @@ pub const Engine = struct {
         if (e.dev) |d| {
             if (e.uni_ring.cpu.len != 0) d.free(e.uni_ring);
             e.uni_ring = .{};
+            if (e.scratch_ring.cpu.len != 0) d.free(e.scratch_ring);
+            e.scratch_ring = .{};
             for (&e.read_slots) |*sl| {
                 if (sl.buf.cpu.len != 0) d.free(sl.buf);
                 sl.* = .{};
@@ -1474,6 +1543,7 @@ pub const Engine = struct {
                 e.dev.?.free(b);
             } else |_| {}
             if (attempt != 0 or e.n_doomed == 0) break;
+            e.wait_why = .doomed;
             e.finish();
         }
         const s = e.pool.alloc(bytes) orelse return null;
@@ -1531,6 +1601,7 @@ pub const Engine = struct {
             e.doom_waiting = true;
             defer e.doom_waiting = false;
             e.stats.doomed_waits += 1;
+            e.wait_why = .doomed;
             e.finish();
         }
     }
@@ -1865,6 +1936,62 @@ pub const Engine = struct {
         return uni;
     }
 
+    /// `bytes` of a draw's records for the GPU to write and read in the
+    /// open batch (their contents whatever was there): past scratch_min, a
+    /// place in the scratch ring (not the engine's to free: freeImage only
+    /// forgets it); else, or with no GPU, no memory for the ring or more
+    /// than half the ring, a buffer of its own (slab memory when small).
+    fn scratchFor(e: *Engine, bytes: usize) ?Image {
+        const n = @max(std.mem.alignForward(usize, bytes, 4), 16);
+        if (e.onGpu() and n > e.scratch_min and n <= e.scratch_len / 2) if (e.scratchRing(n)) |at| {
+            const ring = e.scratch_ring;
+            return .{ .buf = .{ .gpu = ring.gpu + at, .cpu = ring.cpu[at..][0..n], .bytes = n, .handle = ring.handle, .kind = ring.kind } };
+        };
+        return e.newBuffer(bytes);
+    }
+
+    /// Room for `bytes` in the scratch ring (made at its first use), as
+    /// uniRing's in the uniform ring.
+    fn scratchRing(e: *Engine, bytes: usize) ?usize {
+        const len = e.scratch_len;
+        if (e.scratch_ring.cpu.len == 0) {
+            const b = e.dev.?.alloc(len, .host) catch {
+                // (no memory for it: none from now on)
+                e.scratch_len = 0;
+                return null;
+            };
+            if (b.cpu.len < len or b.gpu == 0) {
+                e.dev.?.free(b);
+                e.scratch_len = 0;
+                return null;
+            }
+            e.scratch_ring = b;
+            e.scratch_at = 0;
+            e.scratch_chunk = @splat(0);
+        }
+        var at = std.mem.alignForward(usize, e.scratch_at, SCRATCH_ALIGN);
+        if (at + bytes > len) at = 0;
+        const first = at / SCRATCH_CHUNK;
+        const last = (at + bytes - 1) / SCRATCH_CHUNK;
+        // (the piece the last records went into: the open batch's already)
+        const now = if (e.scratch_at == 0 or at == 0) SCRATCH_CHUNKS else (e.scratch_at - 1) / SCRATCH_CHUNK;
+        for (first..last + 1) |c| {
+            if (c != now) {
+                const b = e.scratch_chunk[c];
+                if (b == e.batch) e.flush();
+                if (b != 0 and b > e.done_upto) {
+                    e.wait_why = .scratch;
+                    e.waitBatch(b);
+                }
+                if (!e.onGpu()) return null;
+            }
+            e.scratch_chunk[c] = e.batch;
+        }
+        e.scratch_at = at + bytes;
+        e.stats.scratch_bytes += bytes;
+        return at;
+    }
+
     /// Room for `bytes` in the uniform ring (made at its first use): their
     /// offset, the pieces they are in free of batches in flight (waited
     /// for: a lap of the ring is thousands of draws) and now the open
@@ -1893,7 +2020,10 @@ pub const Engine = struct {
                 // (the open batch itself a lap ago: one batch went round
                 // the whole ring)
                 if (b == e.batch) e.flush();
-                if (b != 0 and b > e.done_upto) e.waitBatch(b);
+                if (b != 0 and b > e.done_upto) {
+                    e.wait_why = .uniforms;
+                    e.waitBatch(b);
+                }
                 if (!e.onGpu()) return null;
             }
             e.uni_chunk[c] = e.batch;
@@ -2007,13 +2137,20 @@ pub const Engine = struct {
     /// (the GPU called lost only with `lose_on_timeout`; a fence's client
     /// wait may simply give up).
     fn waitBatchFor(e: *Engine, b: u64, timeout_us: u64, lose_on_timeout: bool) bool {
+        const why = @intFromEnum(e.wait_why);
+        e.wait_why = .other;
         if (b == 0 or !e.onGpu()) return true;
         if (b >= e.batch) e.flush();
         if (!e.onGpu() or b <= e.done_upto) return true;
         const upto = if (e.ran - b >= RING) e.ran else b;
         e.stats.waits += 1;
+        e.stats.wait_n[why] += 1;
         const began = report.nowUs();
-        defer e.stats.wait_us += report.nowUs() -| began;
+        defer {
+            const took = report.nowUs() -| began;
+            e.stats.wait_us += took;
+            e.stats.wait_why_us[why] += took;
+        }
         const fence = e.fences[upto % RING];
         e.dev.?.wait(fence, timeout_us) catch |err| {
             if (err == error.Timeout and !lose_on_timeout) return false;
@@ -2069,7 +2206,10 @@ pub const Engine = struct {
     /// The CPU may touch img: no batch in flight uses it.
     fn settle(e: *Engine, img: *Image) void {
         const l = img.lastBatch();
-        if (l > e.done_upto) e.waitBatch(l);
+        if (l > e.done_upto) {
+            e.wait_why = .settle;
+            e.waitBatch(l);
+        }
     }
 
     fn gpuUsable(e: *const Engine, img: *const Image) bool {
@@ -2133,6 +2273,7 @@ pub const Engine = struct {
             return true;
         }
         // (on the CPU: the work before it done, every binding's bytes here)
+        e.wait_why = .cpu;
         e.finish();
         var views: [MAX_BIND][]u8 = undefined;
         for (bs, 0..) |img, j| {
@@ -2197,6 +2338,7 @@ pub const Engine = struct {
     pub fn unloadCompute(e: *Engine, c: *Compute) void {
         if (c.owner == @as(?*anyopaque, e)) if (c.prog) |*p| {
             if (!e.lost) {
+                e.wait_why = .unload;
                 e.finish();
                 e.dev.?.unload(p);
             }
@@ -2428,6 +2570,7 @@ pub const Engine = struct {
         for (p.refused_key[0..p.n_refused]) |x| {
             if (x == key) return null;
         }
+        const built_at = report.nowUs();
         var k = e.buildFor(st, p, v, kind);
         const result: anyerror!gpu.Program = blk: {
             k.finish() catch |err| break :blk err;
@@ -2435,6 +2578,8 @@ pub const Engine = struct {
             const bin = e.compiler(&k, e.dev.?.caps, &w, &e.pcode) catch |err| break :blk err;
             break :blk e.dev.?.load(&bin);
         };
+        e.stats.variants += 1;
+        e.stats.variant_us += report.nowUs() -| built_at;
         const prog = result catch |err| {
             e.why_pipe = err;
             if (p.n_refused < raster.Pipeline.MAX_MORE) {
@@ -2447,6 +2592,7 @@ pub const Engine = struct {
         var slot: usize = p.n_more;
         if (slot == raster.Pipeline.MAX_MORE) {
             // (full: the oldest goes, once no batch runs it)
+            e.wait_why = .evict;
             e.finish();
             slot = p.evict;
             p.evict = @intCast((slot + 1) % raster.Pipeline.MAX_MORE);
@@ -2539,6 +2685,7 @@ pub const Engine = struct {
 
     pub fn unloadPipeline(e: *Engine, p: *raster.Pipeline) void {
         if (p.gfx_owner == @as(?*anyopaque, e)) {
+            e.wait_why = .unload;
             e.finish();
             for (&p.gfx) |*q| {
                 if (q.*) |*prog| {
@@ -2551,6 +2698,7 @@ pub const Engine = struct {
         if (p.gfx_refused_by == @as(?*anyopaque, e)) p.gfx_refused_by = null;
         e.forgetCpu(p);
         if (p.owner != @as(?*anyopaque, e)) return;
+        e.wait_why = .unload;
         e.finish();
         for (&p.progs) |*q| {
             if (q.*) |*prog| {
@@ -2866,12 +3014,12 @@ pub const Engine = struct {
         const v = d.variant();
         const kind = d.setupKind();
         // (and primitive restart's word, zeroed)
-        var verts = e.newBuffer(@as(usize, d.instances) * d.count * p.vstride * 4 + 4) orelse return false;
+        var verts = e.scratchFor(@as(usize, d.instances) * d.count * p.vstride * 4 + 4) orelse return false;
         defer e.freeImage(&verts);
         if (raster.restartFlag(d) != raster.RESTART_NONE) e.writeBytes(&verts, d.restartWord(), &.{ 0, 0, 0, 0 });
         // (the primitive records, then the bins' lists)
-        const bins: raster.Bins = if (e.binning) raster.binsOf(d, e.bin_cap) else .{};
-        var tris = e.newBuffer((@as(usize, d.instances) * nrec * p.sstride + bins.words()) * 4) orelse return false;
+        const bins: raster.Bins = if (e.binning) raster.binsOf(d, e.bin_cap, e.max_bins) else .{};
+        var tris = e.scratchFor((@as(usize, d.instances) * nrec * p.sstride + bins.words()) * 4) orelse return false;
         defer e.freeImage(&tris);
         var uni = e.uniformsFor(d.uniforms) orelse return false;
         defer e.freeImage(&uni);
@@ -3559,6 +3707,7 @@ pub const Engine = struct {
     pub fn readFinish(e: *Engine, rb: *Readback, dst: []u8, dst_stride: usize) bool {
         if (!rb.pending()) return false;
         defer e.readCancel(rb);
+        e.wait_why = .read;
         e.waitBatch(rb.mark);
         if (e.lost) return false;
         const rows = &rb.rows;
@@ -3711,6 +3860,7 @@ pub const Engine = struct {
         t.shadow_old = false;
         e.recordWords(v, 0, img.host, 0, img.host.cpu.len);
         t.last = e.batch;
+        e.wait_why = .read;
         e.finish();
     }
 
