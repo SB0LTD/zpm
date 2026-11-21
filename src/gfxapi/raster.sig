@@ -897,16 +897,24 @@ pub fn stageWhyNot(d: *const Draw) ?[]const u8 {
         if (d.depth == null and !sten.depth_float) return "a stencil test with no float depth image (its stencil plane)";
     }
     if (d.index != null and (d.index_size == 0 or d.index_offset % d.index_size != 0)) return "an element array offset not on its indices' size";
-    if (d.color_off or d.samples() != 1) return "no colour target, or multisampling";
-    for (d.targets[1..]) |tt| {
-        const t = tt orelse continue;
-        if (!t.img.gpuDrawable()) return "a colour target the engine does not draw into";
-        if (t.img.width != d.color.width or t.img.height != d.color.height or t.img.top_down != d.color.top_down or t.img.samples != 1) return "colour targets of different sizes or orientations";
+    // (no colour target: a depth-only pass, the depth alone drawn; colour
+    // targets past the first with target 0 off are not yet)
+    if (d.color_off) {
+        if ((d.depth orelse d.stencil) == null) return "no colour target and no depth target";
+        for (d.targets[1..]) |tt| if (tt != null) return "colour targets past the first, target 0 off";
+    }
+    if (d.samples() != 1) return "multisampling";
+    if (!d.color_off) {
+        for (d.targets[1..]) |tt| {
+            const t = tt orelse continue;
+            if (!t.img.gpuDrawable()) return "a colour target the engine does not draw into";
+            if (t.img.width != d.color.width or t.img.height != d.color.height or t.img.top_down != d.color.top_down or t.img.samples != 1) return "colour targets of different sizes or orientations";
+        }
     }
     if (d.query != null) return "an occlusion query";
     if (d.alpha_to_coverage or d.sample_mask & 1 == 0) return "alpha to coverage or a sample mask";
     if (d.bias_factor != 0 or d.bias_units != 0) return "depth bias";
-    if (!d.color.gpuDrawable()) return "a target the engine does not draw into";
+    if (!d.color_off and !d.color.gpuDrawable()) return "a target the engine does not draw into";
     if (d.blend) |b| {
         if (b.gl[0] == 0xffff) return "a blend not given as GL's factors";
     }

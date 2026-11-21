@@ -2381,6 +2381,76 @@ fn slopedPasses(e: *engine.Engine, img: *engine.Image, depth: *engine.Image, ab:
     }
 }
 
+/// The sloped shape's LESS pass alone (slopedPasses' first) into the float
+/// depth image `depth`, with `img` its colour target, or with no colour
+/// target (a depth-only pass: `img` untouched); on the 3D engine.
+fn depthPass(e: *engine.Engine, img: *engine.Image, depth: *engine.Image, ab: *engine.Image, pts: [4][2]f32, colour: bool) !void {
+    e.fill(img, img.bounds(), 0, 0);
+    e.fillDepth(depth, depth.bounds(), 1.0, 0, 0xff);
+    var verts: [6][4]f32 = undefined;
+    const tris = [2][3]usize{ .{ 0, 1, 2 }, .{ 0, 2, 3 } };
+    const zs = [4]f32{ -0.3, 0.2117, 0.7, 0.0931 };
+    for (tris, 0..) |t, n| {
+        for (t, 0..) |c, j| verts[n * 3 + j] = .{ nx(pts[c][0], W), nx(pts[c][1], H), zs[c], 1 };
+    }
+    e.writeBytes(ab, 0, std.mem.sliceAsBytes(&verts));
+    const quarter = [_]u32{ @bitCast(@as(f32, 0.25)), 0, 0, 0 };
+    const before = e.stats.graphics_draws;
+    const computed = e.stats.compute_draws;
+    // (with no colour target the draw's size is the depth image's, as GL
+    // and Direct3D give it)
+    var d = raster.Draw{ .pipe = &solid, .color = if (colour) img else depth, .color_off = !colour, .depth = depth, .depth_test = true, .depth_write = true, .depth_func = 0b001, .rect = .{ .x0 = 0, .y0 = 0, .x1 = W, .y1 = H }, .count = 6, .center = .{ W / 2, H / 2 }, .half = .{ W / 2, H / 2 }, .uniforms = &quarter };
+    d.attrs[0] = .{ .buf = ab, .stride = 16, .comps = 4 };
+    if (!e.draw(&d)) return error.NotDrawn;
+    e.finish();
+    if (e.lost or e.why_pipe != null) return error.EngineLost;
+    if (e.stats.graphics_draws - before != 1 or e.stats.compute_draws != computed) {
+        for (e.said_compute) |w| if (w.len != 0) std.debug.print("depth pass: on the compute kernels: {s}\n", .{w});
+        return error.WrongRasterizer;
+    }
+}
+
+test "draw: a depth-only pass (no colour target, a shadow map's) goes to the RTX's 3D engine: the depths of the same pass with colour, exactly, and no colour written" {
+    Rtx3d.engine3d = .{};
+    Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+    Rtx.dev.withEngine(&Rtx3d.engine3d);
+    eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs, .graphics = true });
+    defer eng_rtx.deinit();
+    defer eng_rtx.unloadPipeline(&solid);
+    const e = &eng_rtx;
+    var img = e.newBlockImage(W, H, .rgba8) orelse return error.OutOfMemory;
+    defer e.freeImage(&img);
+    var zd: [2]engine.Image = undefined;
+    for (&zd) |*z| z.* = e.newImageSamples(W, H, .d24s8, 1) orelse return error.OutOfMemory;
+    defer for (&zd) |*z| e.freeImage(z);
+    var ab = e.newBuffer(6 * 16) orelse return error.OutOfMemory;
+    defer e.freeImage(&ab);
+    const shape = [4][2]f32{ .{ 5.37, 3.11 }, .{ 58.93, 6.71 }, .{ 52.18, 29.42 }, .{ 9.66, 26.05 } };
+    var words: [2][W * H]u32 = undefined;
+    var pic: [W * H * 4]u8 = undefined;
+    const one: u32 = @bitCast(@as(f32, 1.0));
+    for ([_]bool{ false, true }) |top_down| {
+        img.top_down = top_down;
+        for (&zd) |*z| z.top_down = top_down;
+        for (0..2) |n| {
+            depthPass(e, &img, &zd[n], &ab, shape, n == 0) catch |err| {
+                std.debug.print("depth-only pass (top down {}, colour {}): {s}; the 3D engine: {s}\n", .{ top_down, n == 0, @errorName(err), Rtx3d.engine3d.why });
+                return err;
+            };
+            e.readDepthBits(&zd[n], 0, 0, W, H, &words[n], null);
+        }
+        // the same depths, bit for bit, and some written
+        var covered: u32 = 0;
+        for (0..W * H) |px_at| covered += @intFromBool(words[1][px_at] != one);
+        try std.testing.expect(covered > 100);
+        try std.testing.expectEqualSlices(u32, &words[0], &words[1]);
+        // the depth-only pass wrote no colour (the image was cleared to 0)
+        e.read(&img, 0, 0, W, H, &pic, W * 4, .rgba8);
+        for (pic) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+    }
+    try std.testing.expectEqual(eng_rtx.stats.graphics_draws, Rtx3d.engine3d.draws);
+}
+
 test "draw: the compute raster's float depth is the 3D engine's within 3 ulps (pc-full4's spread), over the same pixels; each path's EQUAL pass meets its own LESS pass's depths" {
     Rtx3d.engine3d = .{};
     Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
