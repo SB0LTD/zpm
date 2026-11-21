@@ -55,7 +55,7 @@ pub const View = enum(u8) { pg_type, pg_namespace, pg_class, pg_attribute, pg_in
     // Catalog objects (B11 wave 3, catalog_objects.sig).
     pg_roles, pg_authid, pg_auth_members, pg_policy, pg_policies, pg_description, pg_shdescription, pg_foreign_data_wrapper, pg_foreign_server, pg_publication, pg_extension, pg_tables, table_privileges, pg_enum, pg_database, pg_am, pg_collation, pg_constraint, pg_statistic_ext,
     pg_publication_rel, pg_publication_namespace, pg_settings, pg_depend, pg_tablespace, pg_foreign_table,
-    pg_init_privs, pg_cast, pg_transform, pg_language, pg_operator, pg_opclass, pg_opfamily, pg_ts_parser };
+    pg_init_privs, pg_cast, pg_transform, pg_language, pg_operator, pg_opclass, pg_opfamily, pg_ts_parser, pg_ts_template };
 
 pub const sql_language_oid: u32 = 14;
 pub const plpgsql_language_oid: u32 = 13002;
@@ -99,23 +99,38 @@ pub const builtin_pseudo_types = [_]struct { oid: u32, name: []const u8, bytes: 
 
 pub fn builtinRoutineName(oid: u32) ?[]const u8 {
     for (access_methods) |am| if (am.handler == oid) return am.handler_name;
-    for (text_parser.callbacks) |callback| if (callback.oid == oid) return callback.name;
+    for (text_search_callbacks) |callback| if (callback.oid == oid) return callback.name;
     for (@import("operator_catalog.sig").functions) |op| if (op.function_oid == oid) return op.function_name;
     return null;
 }
+
+const TextSearchCallback = struct { oid: u32, name: []const u8, args: []const u32, result: u32 };
 
 /// Catalog identities of the tokenizer used by the simple configuration.
 /// Parser.init and Parser.next own startup and tokenization. End releases
 /// caller-owned state and tokenKind supplies the lexical descriptors.
 pub const text_parser = struct {
-    const Callback = struct { oid: u32, name: []const u8, args: []const u32, result: u32 };
     pub const oid: u32 = 3722;
     pub const name = "default";
-    pub const start: Callback = .{ .oid = 3717, .name = "prsd_start", .args = &.{ internal_type_oid, 23 }, .result = internal_type_oid };
-    pub const next: Callback = .{ .oid = 3718, .name = "prsd_nexttoken", .args = &.{ internal_type_oid, internal_type_oid, internal_type_oid }, .result = internal_type_oid };
-    pub const end: Callback = .{ .oid = 3719, .name = "prsd_end", .args = &.{internal_type_oid}, .result = 2278 };
-    pub const lex_type: Callback = .{ .oid = 3721, .name = "prsd_lextype", .args = &.{internal_type_oid}, .result = internal_type_oid };
-    pub const callbacks = [_]Callback{ start, next, end, lex_type };
+    pub const start: TextSearchCallback = .{ .oid = 3717, .name = "prsd_start", .args = &.{ internal_type_oid, 23 }, .result = internal_type_oid };
+    pub const next: TextSearchCallback = .{ .oid = 3718, .name = "prsd_nexttoken", .args = &.{ internal_type_oid, internal_type_oid, internal_type_oid }, .result = internal_type_oid };
+    pub const end: TextSearchCallback = .{ .oid = 3719, .name = "prsd_end", .args = &.{internal_type_oid}, .result = 2278 };
+    pub const lex_type: TextSearchCallback = .{ .oid = 3721, .name = "prsd_lextype", .args = &.{internal_type_oid}, .result = internal_type_oid };
+};
+
+/// The built-in dictionary uses stateless default initialization and
+/// the ASCII folding in text_search.sig. Its options are fixed.
+pub const simple_template = struct {
+    pub const oid: u32 = 3727;
+    pub const name = "simple";
+    pub const init: TextSearchCallback = .{ .oid = 3725, .name = "dsimple_init", .args = &.{internal_type_oid}, .result = internal_type_oid };
+    pub const lexize: TextSearchCallback = .{ .oid = 3726, .name = "dsimple_lexize",
+        .args = &.{ internal_type_oid, internal_type_oid, internal_type_oid, internal_type_oid }, .result = internal_type_oid };
+};
+
+pub const text_search_callbacks = [_]TextSearchCallback{
+    text_parser.start, text_parser.next, text_parser.end, text_parser.lex_type,
+    simple_template.init, simple_template.lexize,
 };
 const pg_am_columns = [_]ViewColumn{ col("oid", .oid), col("amname", .name), col("amhandler", .regproc), col("amtype", .pg_internal_char) };
 const pg_collation_columns = [_]ViewColumn{
@@ -191,6 +206,10 @@ const pg_ts_parser_columns = [_]ViewColumn{
     col("oid", .oid), col("prsname", .name), col("prsnamespace", .oid),
     col("prsstart", .regproc), col("prstoken", .regproc), col("prsend", .regproc),
     col("prsheadline", .regproc), col("prslextype", .regproc),
+};
+const pg_ts_template_columns = [_]ViewColumn{
+    col("oid", .oid), col("tmplname", .name), col("tmplnamespace", .oid),
+    col("tmplinit", .regproc), col("tmpllexize", .regproc),
 };
 
 /// Implemented cataloged casts that have no separately callable function.
@@ -274,6 +293,7 @@ pub fn viewColumns(view: View) []const ViewColumn {
         .pg_opclass => &pg_opclass_columns,
         .pg_opfamily => &pg_opfamily_columns,
         .pg_ts_parser => &pg_ts_parser_columns,
+        .pg_ts_template => &pg_ts_template_columns,
         .pg_trigger => &pg_trigger_columns,
         .pg_rewrite => &pg_rewrite_columns,
         .pg_rules => &pg_rules_columns,
@@ -300,7 +320,7 @@ pub fn viewColumns(view: View) []const ViewColumn {
 pub fn findView(schema: ?[]const u8, name: []const u8) ?View {
     const catalog_views = [_]View{ .pg_type, .pg_enum, .pg_namespace, .pg_am, .pg_collation, .pg_class, .pg_settings, .pg_attribute, .pg_index, .pg_constraint, .pg_depend, .pg_statistic_ext, .pg_attrdef, .pg_sequence, .pg_indexes, .pg_views, .pg_matviews, .pg_inherits, .pg_proc, .pg_trigger, .pg_rewrite, .pg_rules,
         .pg_tablespace, .pg_foreign_table, .pg_roles, .pg_authid, .pg_auth_members, .pg_policy, .pg_policies, .pg_description, .pg_shdescription, .pg_foreign_data_wrapper, .pg_foreign_server, .pg_publication, .pg_publication_rel, .pg_publication_namespace, .pg_extension, .pg_tables,
-        .pg_init_privs, .pg_cast, .pg_transform, .pg_language, .pg_operator, .pg_opclass, .pg_opfamily, .pg_ts_parser };
+        .pg_init_privs, .pg_cast, .pg_transform, .pg_language, .pg_operator, .pg_opclass, .pg_opfamily, .pg_ts_parser, .pg_ts_template };
     const information_views = [_]View{ .schemata, .tables, .columns, .table_constraints, .key_column_usage, .table_privileges };
     const qualified = schema orelse {
         for (catalog_views) |view| if (types.same(@tagName(view), name)) return view;
@@ -324,6 +344,7 @@ pub const bootstrap_relations = [_]struct { view: View, oid: u32 }{
     .{ .view = .pg_operator, .oid = 2617 },
     .{ .view = .pg_opclass, .oid = 2616 }, .{ .view = .pg_opfamily, .oid = 2753 },
     .{ .view = .pg_ts_parser, .oid = 3601 },
+    .{ .view = .pg_ts_template, .oid = 3764 },
     .{ .view = .pg_tablespace, .oid = 1213 }, .{ .view = .pg_foreign_table, .oid = 3118 },
     .{ .view = .pg_authid, .oid = 1260 }, .{ .view = .pg_auth_members, .oid = 1261 },
     .{ .view = .pg_database, .oid = 1262 }, .{ .view = .pg_foreign_server, .oid = 1417 },

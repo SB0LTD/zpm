@@ -5615,7 +5615,7 @@ pub fn Database(comptime config: Config) type {
                     if (oid != null) return error.AmbiguousFunction;
                     oid = am.handler;
                 }
-                for (catalog_module.text_parser.callbacks) |callback| {
+                for (catalog_module.text_search_callbacks) |callback| {
                     if (!types.same(callback.name, name)) continue;
                     if (oid != null) return error.AmbiguousFunction;
                     oid = callback.oid;
@@ -6196,6 +6196,12 @@ pub fn Database(comptime config: Config) type {
                     .{ .regproc = parser.start.oid }, .{ .regproc = parser.next.oid }, .{ .regproc = parser.end.oid },
                     .{ .regproc = 0 }, .{ .regproc = parser.lex_type.oid },
                 });
+                return;
+            }
+            if (view == .pg_ts_template) {
+                const template = catalog_module.simple_template;
+                try sink.add(&.{ intCell(template.oid), nameCell(template.name), intCell(catalog_module.catalog_namespace),
+                    .{ .regproc = template.init.oid }, .{ .regproc = template.lexize.oid } });
                 return;
             }
             if (view == .pg_language) {
@@ -11547,8 +11553,8 @@ pub fn Database(comptime config: Config) type {
         fn objectViewRows(self: *const Self, snapshot: Snapshot, view: catalog_module.View, sink: *X.RowSink) Error!void {
             switch (view) {
                 .pg_proc => {
-                    for (catalog_module.text_parser.callbacks) |callback| {
-                        var buffer: [33]u8 = undefined;
+                    for (catalog_module.text_search_callbacks) |callback| {
+                        var buffer: [43]u8 = undefined;
                         var argtypes: CatalogTextWriter = .{ .out = &buffer };
                         for (callback.args, 0..) |oid, index| {
                             if (index != 0) argtypes.add(" ");

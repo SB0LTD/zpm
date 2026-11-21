@@ -1394,8 +1394,8 @@ pub fn TextSearch(comptime text_bytes: usize, comptime depth_limit: usize) type 
             try writeVector(&vector, out, max_positions_per_lexeme);
         }
 
-        /// Folds ASCII letters (the simple dictionary under C ctype).
-        fn lowerInto(word: []const u8, buffer: []u8) []const u8 {
+        /// Lexizes one token with the built-in simple dictionary under C ctype.
+        fn simpleLexize(word: []const u8, buffer: []u8) []const u8 {
             for (word, 0..) |byte, index| buffer[index] = if (byte >= 'A' and byte <= 'Z') byte + 32 else byte;
             return buffer[0..word.len];
         }
@@ -1411,7 +1411,7 @@ pub fn TextSearch(comptime text_bytes: usize, comptime depth_limit: usize) type 
                 if (!simpleIndexes(token.kind)) continue;
                 if (token.bytes.len >= max_word) continue;
                 position += 1;
-                const lexeme = lowerInto(token.bytes, &buffer);
+                const lexeme = simpleLexize(token.bytes, &buffer);
                 const entry = try vector.add(lexeme);
                 // Positions beyond 16383 are recorded as 16383.
                 try vector.addPosition(entry, @intCast(@min(position, max_position)));

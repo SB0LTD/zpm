@@ -161,6 +161,15 @@ fn textParserDiscovery() !void {
     try expect("SELECT typname,typtype FROM pg_type WHERE oid=2278", "void|p");
 }
 
+fn textTemplateDiscovery() !void {
+    try expect("SELECT tableoid,oid,tmplname,tmplnamespace,tmplinit::oid,tmpllexize::oid FROM pg_ts_template",
+        "3764|3727|simple|11|3725|3726");
+    try expect("SELECT tmplinit,tmpllexize,pg_typeof(tmpllexize)::text FROM pg_catalog.pg_ts_template",
+        "dsimple_init|dsimple_lexize|regproc");
+    try expect("SELECT to_regproc('pg_catalog.dsimple_init')::oid,to_regproc('dsimple_lexize')::oid",
+        "3725|3726");
+}
+
 fn lifecycle() !void {
     try run("CREATE TABLE a (id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY, amount NUMERIC(10,2), at TIMESTAMPTZ(3), doc JSONB, label TEXT DEFAULT 'd', n INTEGER DEFAULT 2 + 3)");
     try expect(public_tables, "a");
@@ -303,6 +312,7 @@ pub fn main(init: std.process.Init) !void {
     try typeDiscovery();
     try indexOperatorDiscovery();
     try textParserDiscovery();
+    try textTemplateDiscovery();
     try lifecycle();
     try replay();
     try characterMetadata();

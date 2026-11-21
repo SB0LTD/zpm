@@ -2,6 +2,13 @@
 
 ## Stock PostgreSQL dump and restore candidate
 
+`pg_ts_template` exposes the built-in `pg_catalog.simple` template with
+typed `regproc` references to `dsimple_init` and `dsimple_lexize`. Both
+references resolve through `pg_proc`. The Sig dictionary uses fixed,
+stateless initialization and ASCII case folding. Custom templates,
+custom dictionary options and direct SQL invocation of the internal
+callbacks remain open.
+
 `pg_ts_parser` exposes `pg_catalog.default`, the tokenizer used by
 `pg_catalog.simple`. The startup, next-token, shutdown and token-type
 references use `regproc` and resolve through `pg_proc`. The token-type
