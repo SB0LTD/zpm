@@ -2,6 +2,16 @@
 
 ## Stock PostgreSQL dump and restore candidate
 
+RAMSQL `af7af9a` with ZPM `64b1a717` passed the subscription probe
+with the standalone connection alias and progressed through operator
+dependency, security-label, and database metadata discovery. The custom
+archive stopped at the first target-list `unnest(setconfig)` query.
+The new executor expands one typed top-level UNNEST target after
+filtering, using the same array reader as FROM UNNEST. The contract covers
+null arrays, empty arrays, null elements, filters, ordering and row counts.
+General set-returning expressions and multiple set targets remain open.
+[PostgreSQL 16 and 18 archive metadata CI](https://github.com/SB0LTD/ramsql/actions/runs/44925969411)
+
 RAMSQL `ea70fda` with ZPM `a6f6cfe0` completed the stock
 subscription query on PostgreSQL 16 and 18. The dedicated metadata
 probe found that the standalone database row used the canonical name

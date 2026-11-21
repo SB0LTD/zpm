@@ -2509,6 +2509,16 @@ pub fn Parser(comptime config: types.Config) type {
             const top = try self.query();
             try self.finish();
             const block = &self.pool.queries[top];
+            if (self.mode == .standard and self.tokens.dialect == .postgres) {
+                for (block.targets[0..block.count]) |target| {
+                    if (target.star) continue;
+                    const node = &self.pool.nodes[target.expr];
+                    if (node.kind != .function) continue;
+                    var buf: [64]u8 = undefined;
+                    const name = identText(self.source, node.name, &buf) orelse continue;
+                    if (types.same(name, "unnest")) self.pool.complex = true;
+                }
+            }
             if (!self.pool.complex and block.set_op == .none) return .{ .select = top };
             if (block.lock.strength != .none) return error.UnsupportedStatement;
             return .{ .query = top };

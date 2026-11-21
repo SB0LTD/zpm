@@ -572,6 +572,8 @@ pub fn Binder(comptime config: types.Config) type {
             window_aggregate_count:usize=0,
             having: u16 = none,
             targets: [2 * types.projectionColumns(config)]u16 = undefined,
+            /// One top-level set-returning UNNEST target, expanded after WHERE.
+            unnest_column: u16 = none,
             count: usize = 0,
             width: usize = 0,
             names: [types.projectionColumns(config)]V.Name = undefined,
@@ -6671,6 +6673,19 @@ pub fn Binder(comptime config: types.Config) type {
             return if (call.qualifier.span.len == 0) null else call.qualifier;
         }
 
+        fn unnestName(context: *const Context, name: ast.Ident, schema: ?ast.Ident) bool {
+            if (context.dialect != .postgres or !types.same(toName(context, name).slice(), "unnest")) return false;
+            return if (schema) |namespace| types.same(toName(context, namespace).slice(), "pg_catalog") else true;
+        }
+
+        fn bindUnnestArgument(context: *const Context, scope: *const Scope, call: *ast.Node) Error!ast.Type {
+            if (call.star or call.distinct or call.c != none or call.order != none or call.b == none or context.node(call.b).next != none) return error.UndefinedFunction;
+            try typeExpr(context, scope, call.b);
+            const argument = context.node(call.b).ty;
+            if (argument == .unknown) return error.AmbiguousFunction;
+            return types.elementType(argument) orelse error.UndefinedFunction;
+        }
+
         fn replacePartitionAncestorTarget(context: *const Context, expression: u16, function: u16, column: u16) Error!u16 {
             if (expression == function) return column;
             var cast = context.node(expression).*;
@@ -6763,14 +6778,8 @@ pub fn Binder(comptime config: types.Config) type {
                 try bindSignature(context, call, &.{types.arrayType(.text).?}, .text, true);
                 series = .options_to_table;
                 ty = .text;
-            } else if (context.dialect == .postgres and types.same(name.slice(), "unnest") and
-                (if (item.schema) |schema| types.same(toName(context, schema).slice(), "pg_catalog") else true))
-            {
-                if (call.star or call.distinct or call.c != none or call.order != none or call.b == none or context.node(call.b).next != none) return error.UndefinedFunction;
-                try typeExpr(context, &inner, call.b);
-                const argument = context.node(call.b).ty;
-                if (argument == .unknown) return error.AmbiguousFunction;
-                ty = types.elementType(argument) orelse return error.UndefinedFunction;
+            } else if (unnestName(context, item.name, item.schema)) {
+                ty = try bindUnnestArgument(context, &inner, call);
                 series = .unnest;
             } else {
                 try typeExpr(context, &inner, item.function);
@@ -7047,7 +7056,15 @@ pub fn Binder(comptime config: types.Config) type {
                     try expandStar(context, &scope, q, p, target);
                     continue;
                 }
-                if (branch) try typeExpr(context, &scope, target.expr) else try valueExpr(context, &scope, target.expr);
+                const call = context.node(target.expr);
+                if (call.kind == .function and unnestName(context, call.name, functionSchema(call))) {
+                    if (p.unnest_column != none or q.lock.strength != .none) return error.UnsupportedStatement;
+                    scope.windows = false;
+                    const element = try bindUnnestArgument(context, &scope, call);
+                    scope.windows = true;
+                    call.ty = element;
+                    p.unnest_column = @intCast(p.count);
+                } else if (branch) try typeExpr(context, &scope, target.expr) else try valueExpr(context, &scope, target.expr);
                 const name = if (target.alias) |alias| toName(context, alias) else targetName(context, target.expr);
                 try addTarget(context, p, target.expr, name);
             }
@@ -7103,6 +7120,7 @@ pub fn Binder(comptime config: types.Config) type {
             }
             p.rollup=q.rollup;
             p.grouped = q.rollup or p.key_count != 0 or saw or p.having != none or p.grouping_sets != none;
+            if (p.grouped and p.unnest_column != none) return error.UnsupportedStatement;
             if (p.grouped) {
                 window_def=q.window_defs;
                 while(window_def!=none) : (window_def=context.pool.windows[window_def].next) {
@@ -7169,6 +7187,7 @@ pub fn Binder(comptime config: types.Config) type {
             bindTies(q, p, order[0..order_count]);
             p.constant_source_safe=!q.distinct and q.order_count==0 and !q.limit_present and !q.offset_present;
             try lowerWindows(context,id);
+            if (p.window_count != 0 and p.unnest_column != none) return error.UnsupportedStatement;
             if (context.dialect == .tds and !p.grouped and p.window_count == 0) {
                 var direct: [config.relations]?Int4Source = @splat(null);
                 for (p.sources[0..p.source_count], 0..) |operand, index| {
@@ -7522,7 +7541,7 @@ pub fn Binder(comptime config: types.Config) type {
             var conservative=bound.*!=.query;
             for(plans.items[0..plans.len]) |*p| conservative=conservative or p.correlated;
             // B11 composition plans keep every output (no demand pruning).
-            for(plans.items[0..plans.len]) |*p| conservative=conservative or p.values!=none or p.general_join or p.limit_expr!=none or p.offset_expr!=none or p.with_ties or p.grouping_sets!=none or p.function!=none or (p.source_count!=0 and p.sources[0].sample_method!=0);
+            for(plans.items[0..plans.len]) |*p| conservative=conservative or p.values!=none or p.general_join or p.limit_expr!=none or p.offset_expr!=none or p.with_ties or p.grouping_sets!=none or p.function!=none or p.unnest_column!=none or (p.source_count!=0 and p.sources[0].sample_method!=0);
             for(plans.ctes[0..plans.cte_len]) |*def| conservative=conservative or def.search or def.cycle or def.dml!=no_dml;
             for(plans.items[0..plans.len]) |*p| {p.demanded=conservative;p.required=@splat(conservative);p.aggregate_required=@splat(conservative);}
             if(conservative) return;

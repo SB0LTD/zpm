@@ -110,6 +110,12 @@ fn dumpDiscovery() !void {
     try expect("SELECT amproc FROM pg_amproc WHERE amprocfamily=1976", "");
     try expect("SELECT label,provider,classoid,objoid,objsubid FROM pg_seclabels ORDER BY classoid,objoid,objsubid", "");
     try expect("SELECT setdatabase,setrole,unnest(setconfig) FROM pg_db_role_setting", "");
+    try expect("SELECT v.id, pg_catalog.unnest(v.a) AS item FROM "
+        ++ "(VALUES (1,ARRAY[3,NULL,2]), (2,ARRAY[]::integer[]), (3,NULL::integer[]), (4,ARRAY[7])) v(id,a) "
+        ++ "WHERE v.id < 4 ORDER BY item NULLS LAST", "1|2;1|3;1|NULL");
+    try expect("SELECT unnest(ARRAY[9,8,7]) AS item OFFSET 1 LIMIT 1", "8");
+    try expect("SELECT count(*) FROM (SELECT unnest(ARRAY[8,9]) AS item) v", "2");
+    try expect("SELECT unnest(ARRAY[8,9]) WHERE false", "");
     try expect("SELECT 'pg_catalog.pg_subscription'::regclass::oid", "6100");
     try expect("SELECT COUNT(*) FROM pg_subscription WHERE subdbid = 5::oid", "0");
     try expect("SELECT oid,subname,subowner,subskiplsn,subpublications,suborigin FROM pg_catalog.pg_subscription", "");

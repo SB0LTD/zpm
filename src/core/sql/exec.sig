@@ -881,9 +881,31 @@ pub fn Exec(comptime config: types.Config) type {
                 for (0..tuples.count) |index| {
                     if (lazy and out.count >= wanted) break;
                     self.setTuple(p, &ctx, &tuple_rows, tuples, index);
-                    try self.projectRow(p, &ctx, &out);
+                    if (p.unnest_column == none) {
+                        try self.projectRow(p, &ctx, &out);
+                    } else {
+                        try self.projectUnnest(p, &ctx, &out, if (lazy) wanted else 0xffffffffffffffff);
+                    }
                 }
                 return out;
+            }
+
+            fn projectUnnest(self: *Query, p: *const B.Plan, ctx: *const E.Context, out: *List, wanted: u64) Error!void {
+                const call = self.pool.nodes[p.targets[p.unnest_column]];
+                const array_value = try E.eval(ctx, call.b);
+                if (array_value == .null_value) return;
+                var reader = V.Arrays.Reader.init(array_value.array.slice());
+                var element: V.Cell = undefined;
+                while (out.count < wanted and reader.next(&element)) {
+                    try self.session.checkpoint();
+                    const at = try self.cells(p.width);
+                    for (p.targets[0..p.width], 0..) |id, column| {
+                        self.work.cells[at + column] = if (!p.required[column]) .null_value
+                            else if (column == p.unnest_column) element
+                            else try E.eval(ctx, id);
+                    }
+                    try self.push(out, at);
+                }
             }
 
             /// Keep the selected cells of simple catalog scans. The candidate
@@ -4508,6 +4530,10 @@ pub fn Exec(comptime config: types.Config) type {
             }
 
             fn core(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!List {
+                if (p.unnest_column != none) {
+                    const tuples = try self.join(p, outer);
+                    return self.finish(p, try self.project(p, tuples, outer));
+                }
                 if(p.window_count!=0) return self.windowCore(p,outer);
                 if (p.grouping_sets != none) return self.groupingSets(p, outer);
                 if(p.rollup) {
