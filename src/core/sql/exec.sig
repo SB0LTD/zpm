@@ -603,7 +603,8 @@ pub fn Exec(comptime config: types.Config) type {
             /// First-source catalog predicates can be applied before the
             /// scan retains a row. Keep the complete WHERE after the join.
             fn firstCatalogPredicate(self: *const Query, p: *const B.Plan) u16 {
-                if (p.sources[0].view == null or p.where == none) return none;
+                if (p.sources[0].view == null or p.where == none or
+                    !self.availableAtStage(p.where, p.source_count - 1, true)) return none;
                 for (p.sources[1..p.source_count], 1..) |source, stage| {
                     if (source.join == .left or source.join == .right or source.join == .full or
                         !self.availableAtStage(source.on, stage, true)) return none;
