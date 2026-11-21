@@ -11,6 +11,10 @@
 //!   (gfxapi/dxbc) on the CPU engine with the same inputs (vertices,
 //!   constant buffers, a texture), every pixel compared (rgba8, two steps of
 //!   tolerance for fxc's own approximations). Bytes need not match.
+//! - **compute shaders** (cs_5_0) have no signatures and the front end
+//!   runs no compute yet: their reflection is compared, their declarations'
+//!   opcodes in order, and both programs dispatched by Direct3D 11 on WARP
+//!   with the same buffers, every UAV's contents after compared.
 //!
 //! Microsoft's compiler is Windows' own d3dcompiler_47.dll, loaded at run
 //! time: elsewhere this test is skipped. It is never part of anything zpm
@@ -96,6 +100,15 @@ const corpus = [_]Case{
     .{ .name = "vs_angle_points", .src = @embedFile("hlsl/vs_angle_points.hlsl") },
     .{ .name = "vs_angle_structs", .src = @embedFile("hlsl/vs_angle_structs.hlsl") },
     .{ .name = "vs_angle_textured", .src = @embedFile("hlsl/vs_angle_textured.hlsl") },
+    // compute shaders (cs_5_0) and UAVs in a pixel shader (ps_5_0 only)
+    .{ .name = "cs_typed", .src = @embedFile("hlsl/cs_typed.hlsl") },
+    .{ .name = "cs_structured", .src = @embedFile("hlsl/cs_structured.hlsl") },
+    .{ .name = "cs_atomics", .src = @embedFile("hlsl/cs_atomics.hlsl") },
+    .{ .name = "cs_groupshared", .src = @embedFile("hlsl/cs_groupshared.hlsl") },
+    .{ .name = "cs_append", .src = @embedFile("hlsl/cs_append.hlsl") },
+    .{ .name = "cs_flow", .src = @embedFile("hlsl/cs_flow.hlsl") },
+    .{ .name = "cs_tiled", .src = @embedFile("hlsl/cs_tiled.hlsl") },
+    .{ .name = "ps5_uav", .src = @embedFile("hlsl/ps5_uav.hlsl") },
 };
 
 // ── Microsoft's compiler (Windows only) ────────────────────────────────────
@@ -151,7 +164,7 @@ fn vtFn(obj: *anyopaque, index: usize) *const anyopaque {
 
 /// Whether every device takes the blob as a shader of its stage
 /// (ID3D11Device::CreateVertexShader 12, CreateGeometryShader 13,
-/// CreatePixelShader 15).
+/// CreatePixelShader 15, CreateComputeShader 18).
 fn d3dAccepts(blob: []const u8, stage: dxbc.Stage, name: []const u8) bool {
     var ok = true;
     for (d3d_devs, 0..) |d, k| {
@@ -159,6 +172,7 @@ fn d3dAccepts(blob: []const u8, stage: dxbc.Stage, name: []const u8) bool {
         const slot: usize = switch (stage) {
             .vertex => 12,
             .geometry => 13,
+            .compute => 18,
             else => 15,
         };
         const f: CreateShaderFn = @ptrCast(vtFn(dev, slot));
@@ -238,6 +252,14 @@ const Tally = struct {
     /// Direct3D 11's runtime and drivers took our blob (or refused it)
     d3d_accepted: u32 = 0,
     d3d_refused: u32 = 0,
+    /// compute shaders: the declarations' opcodes in fxc's order (or not)
+    decl_same: u32 = 0,
+    decl_diff: u32 = 0,
+    /// compute shaders dispatched on WARP: every UAV the same after (or not)
+    cs_same: u32 = 0,
+    cs_diff: u32 = 0,
+    cs_failed: u32 = 0,
+    cs_bytes: u64 = 0,
 };
 
 var tally = Tally{};
@@ -929,6 +951,79 @@ fn compareWarp(name: []const u8, ms: []const u8, ours: []const u8, stage: dxbc.S
     if (same) tally.warp_same += 1 else tally.warp_diff += 1;
 }
 
+// ── compute shaders ────────────────────────────────────────────────────────
+
+/// The declarations' opcodes of a program, in order.
+fn declOps(blob: []const u8, out: []u16) usize {
+    const code = ct.findChunk(blob, "SHEX") orelse ct.findChunk(blob, "SHDR") orelse return 0;
+    const toks: []align(1) const u32 = @as([*]align(1) const u32, @ptrCast(code.ptr))[0 .. code.len / 4];
+    var at: usize = 2;
+    var n: usize = 0;
+    while (at < toks.len and n < out.len) {
+        const op: u16 = @intCast(toks[at] & 0x7ff);
+        var len = (toks[at] >> 24) & 0x7f;
+        if (op == 53 and at + 1 < toks.len) len = toks[at + 1];
+        if (len == 0) break;
+        const dcl = (op >= 88 and op <= 106) or op == 143 or (op >= 155 and op <= 162) or op == 53;
+        if (!dcl) break;
+        out[n] = op;
+        n += 1;
+        at += len;
+    }
+    return n;
+}
+
+/// Whether both programs declare the same things in the same order (their
+/// opcodes: fxc's order of declarations).
+fn declSame(name: []const u8, ms: []const u8, ours: []const u8) bool {
+    var a: [256]u16 = undefined;
+    var b: [256]u16 = undefined;
+    const na = declOps(ms, &a);
+    const nb = declOps(ours, &b);
+    if (std.mem.eql(u16, a[0..na], b[0..nb])) return true;
+    std.debug.print("  {s}: declarations differ: Microsoft's {any}, ours {any}\n", .{ name, a[0..na], b[0..nb] });
+    return false;
+}
+
+var cs_ms: [256 * 1024]u8 = undefined;
+var cs_ours: [256 * 1024]u8 = undefined;
+
+/// Both compute programs dispatched on WARP with the same buffers: every
+/// UAV's bytes after the same (floats within a part in 10^5).
+fn compareCompute(name: []const u8, ms: []const u8, ours: []const u8, ms_refl: *const ct.Reflection) void {
+    if (!warp.device()) return;
+    var uni: [UNI_WORDS]u32 = [_]u32{0} ** UNI_WORDS;
+    const st = stageCbs(ms_refl, &uni);
+    const na = warp.dispatch(.{ .blob = ms, .cbs = st.cbs }, &cs_ms) catch |e| {
+        tally.cs_failed += 1;
+        std.debug.print("  {s}: WARP did not run Microsoft's compute shader: {s}\n", .{ name, @errorName(e) });
+        return;
+    };
+    const nb = warp.dispatch(.{ .blob = ours, .cbs = st.cbs }, &cs_ours) catch |e| {
+        tally.cs_failed += 1;
+        std.debug.print("  {s}: WARP did not run our compute shader: {s}\n", .{ name, @errorName(e) });
+        return;
+    };
+    tally.cs_bytes += na;
+    var bad: usize = 0;
+    var first: usize = 0;
+    var k: usize = 0;
+    while (k + 4 <= @min(na, nb)) : (k += 4) {
+        const x = std.mem.readInt(u32, cs_ms[k..][0..4], .little);
+        const y = std.mem.readInt(u32, cs_ours[k..][0..4], .little);
+        if (x == y) continue;
+        const fx: f32 = @bitCast(x);
+        const fy: f32 = @bitCast(y);
+        if (std.math.isFinite(fx) and @abs(fx - fy) <= @abs(fx) * 1e-5) continue;
+        if (bad == 0) first = k;
+        bad += 1;
+    }
+    if (na != nb or bad > 0) {
+        tally.cs_diff += 1;
+        std.debug.print("  {s}: UAVs differ after the dispatch: {d} words (of {d} bytes, ours {d}); first at byte {d}: Microsoft's 0x{x}, ours 0x{x}\n", .{ name, bad, na, nb, first, std.mem.readInt(u32, cs_ms[first..][0..4], .little), std.mem.readInt(u32, cs_ours[first..][0..4], .little) });
+    } else tally.cs_same += 1;
+}
+
 fn warpFail(name: []const u8, e: anyerror) void {
     tally.warp_failed += 1;
     std.debug.print("  {s}: WARP did not draw: {s}" ++ "\n", .{ name, @errorName(e) });
@@ -980,6 +1075,13 @@ fn runCase(c: Case, target: []const u8) void {
     }
     // (refl_ms holds Microsoft's reflection now)
     var keep: ct.Reflection = refl_ms;
+    if (stage == .compute) {
+        // (no pixels: gfxapi/dxbc runs no compute shaders yet; their UAVs
+        // after a dispatch on WARP instead)
+        if (declSame(label, ms, r.blob)) tally.decl_same += 1 else tally.decl_diff += 1;
+        compareCompute(label, ms, r.blob, &keep);
+        return;
+    }
     fe_drawn = false;
     compareDraw(label, ms, r.blob, stage, &keep);
     compareWarp(label, ms, r.blob, stage, &keep);
@@ -990,6 +1092,15 @@ test "the HLSL compiler against Microsoft's: signatures, reflection, pixels" {
     tally = .{};
     d3dDevices();
     for (corpus) |c| {
+        // (compute shaders and UAVs: Shader Model 5 only)
+        if (std.mem.startsWith(u8, c.name, "cs_")) {
+            runCase(c, "cs_5_0");
+            continue;
+        }
+        if (std.mem.startsWith(u8, c.name, "ps5_")) {
+            runCase(c, "ps_5_0");
+            continue;
+        }
         const gs = std.mem.startsWith(u8, c.name, "gs_");
         const v4 = if (std.mem.startsWith(u8, c.name, "vs_")) "vs_4_0" else if (gs) "gs_4_0" else "ps_4_0";
         const v5 = if (std.mem.startsWith(u8, c.name, "vs_")) "vs_5_0" else if (gs) "gs_5_0" else "ps_5_0";
@@ -1005,8 +1116,9 @@ test "the HLSL compiler against Microsoft's: signatures, reflection, pixels" {
         \\  WARP (Direct3D 11's own rasterizer): {d} same, {d} different ({d} pixels drawn), {d} not drawn
         \\  gfxapi/dxbc against WARP, our pixel shaders: {d} same, {d} different
         \\  Direct3D 11 (hardware and WARP): {d} of our shaders accepted, {d} refused
+        \\  compute: declarations {d} same, {d} different; dispatched on WARP {d} same, {d} different ({d} UAV bytes), {d} not run
         \\
-    , .{ tally.cases, tally.ms_refused, tally.ours_failed, tally.sig_same, tally.sig_diff, tally.refl_same, tally.refl_diff, tally.draw_same, tally.draw_diff, tally.pixels, tally.draw_skipped, tally.draw_ours_refused, tally.warp_same, tally.warp_diff, tally.warp_pixels, tally.warp_failed, tally.fe_warp_same, tally.fe_warp_diff, tally.d3d_accepted, tally.d3d_refused });
+    , .{ tally.cases, tally.ms_refused, tally.ours_failed, tally.sig_same, tally.sig_diff, tally.refl_same, tally.refl_diff, tally.draw_same, tally.draw_diff, tally.pixels, tally.draw_skipped, tally.draw_ours_refused, tally.warp_same, tally.warp_diff, tally.warp_pixels, tally.warp_failed, tally.fe_warp_same, tally.fe_warp_diff, tally.d3d_accepted, tally.d3d_refused, tally.decl_same, tally.decl_diff, tally.cs_same, tally.cs_diff, tally.cs_bytes, tally.cs_failed });
     try std.testing.expectEqual(@as(u32, 0), tally.ours_failed);
     try std.testing.expectEqual(@as(u32, 0), tally.sig_diff);
     try std.testing.expectEqual(@as(u32, 0), tally.refl_diff);
@@ -1016,5 +1128,8 @@ test "the HLSL compiler against Microsoft's: signatures, reflection, pixels" {
     try std.testing.expectEqual(@as(u32, 0), tally.warp_diff);
     try std.testing.expectEqual(@as(u32, 0), tally.warp_failed);
     try std.testing.expectEqual(@as(u32, 0), tally.fe_warp_diff);
+    try std.testing.expectEqual(@as(u32, 0), tally.decl_diff);
+    try std.testing.expectEqual(@as(u32, 0), tally.cs_diff);
+    try std.testing.expectEqual(@as(u32, 0), tally.cs_failed);
     if (d3d_devs[0] != null or d3d_devs[1] != null) try std.testing.expect(checksum_refused);
 }

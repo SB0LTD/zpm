@@ -214,6 +214,29 @@ pub const Image = struct {
     /// takes rows alone met it): never made block linear again, so no
     /// image goes back and forth between layouts.
     no_block: bool = false,
+    /// Block-compressed (bc.Kind + 1: 1 BC1, 2 BC2, 3 BC3, 4 BC4, 5 BC4
+    /// signed, 6 BC5, 7 BC5 signed; 0 none): the memory holds the 4x4
+    /// blocks themselves, each level's rows of blocks one after another
+    /// (levelStride: a row of blocks' bytes; levelRows), and the shaders
+    /// that read it decode the texel they want (texture.sig). `format` is
+    /// what a texel decodes to (RGBA8, R8, RG8, R32F, RG32F): its channels
+    /// and kind. Never drawn into, copied, filled or mipmapped by the
+    /// engine: its writer puts the blocks in place.
+    bc: u3 = 0,
+
+    /// A block-compressed image's bytes a block (8: BC1 and BC4; 16).
+    pub fn bcBlockBytes(img: *const Image) u32 {
+        return switch (img.bc) {
+            1, 4, 5 => 8,
+            else => 16,
+        };
+    }
+
+    /// Rows of memory level `l` takes: its texel rows, or a block-compressed
+    /// image's rows of blocks.
+    pub fn levelRows(img: *const Image, l: u32) u32 {
+        return if (img.bc != 0) (img.levelHeight(l) + 3) / 4 else img.levelHeight(l);
+    }
 
     /// A float depth image's stencil plane: bytes across (whole 8-bit
     /// GOBs: nvidia gl3d.stencilPitch).
@@ -229,7 +252,7 @@ pub const Image = struct {
     /// Whether the engine may draw into, copy, read back or mipmap it: a
     /// renderable format, laid out pitch linear.
     pub fn drawable(img: *const Image) bool {
-        return img.format.renderable() and img.layout.linear();
+        return img.format.renderable() and img.layout.linear() and img.bc == 0;
     }
 
     /// A colour target the GPU's draws write: rows, or block linear with
@@ -247,6 +270,7 @@ pub const Image = struct {
         return @max(img.height >> @intCast(l), 1);
     }
     pub fn levelStride(img: *const Image, l: u32) u32 {
+        if (img.bc != 0) return (img.levelWidth(l) + 3) / 4 * img.bcBlockBytes();
         return if (l == 0) img.stride else std.mem.alignForward(u32, img.levelWidth(l) * img.format.bytes(), 4);
     }
 
@@ -945,14 +969,37 @@ fn floatTo24(bits: u32) u32 {
 
 pub const MAX_OPS = 256;
 pub const MAX_DOOMED = 128;
+/// The bytes freed buffers may hold while their batches run (doomed): past
+/// it, the open batch is run and waited for and they go. Each draw on the
+/// compute kernels freed its vertex and triangle records so (now in the
+/// scratch ring): a game loading (Unigine Superposition) left gigabytes of
+/// them, in a VM's guest RAM, and its own allocations ran out.
+pub const DOOMED_BYTES: u64 = 256 << 20;
 /// Draws' uniforms (Draw.uniforms) go one after another into a host
 /// buffer of UNI_RING_BYTES (Engine.uniformsFor), in UNI_CHUNK pieces,
 /// each written again once the batches that read it are done.
-pub const UNI_RING_BYTES = 4 << 20;
-const UNI_CHUNK = 64 << 10;
+pub const UNI_RING_BYTES = 16 << 20;
+/// (a piece holds the largest draw's words: raster.MAX_UNIFORM_WORDS)
+const UNI_CHUNK = 256 << 10;
 const UNI_CHUNKS = UNI_RING_BYTES / UNI_CHUNK;
+comptime {
+    std.debug.assert(raster.MAX_UNIFORM_WORDS * 4 <= UNI_CHUNK);
+}
 /// A draw's uniforms start on this many bytes.
 const UNI_ALIGN = 256;
+/// A draw's vertex and triangle records (on the compute kernels) go one
+/// after another into a host buffer of SCRATCH_RING_BYTES
+/// (Engine.scratchFor), in SCRATCH_CHUNK pieces, each used again once the
+/// batches that used it are done. Each was a buffer made and freed per
+/// draw, and freed buffers wait for their batch (doomed): a game's
+/// thousands of draws a second held gigabytes so, or, bounded, waited for
+/// the GPU every few draws (Unigine Superposition's loading screen, 1.5 s
+/// of every 2). Records up to the slab object size stay slab memory (used
+/// again once freed); those past half the ring are a buffer of their own.
+pub const SCRATCH_RING_BYTES = 64 << 20;
+const SCRATCH_CHUNK = 1 << 20;
+const SCRATCH_CHUNKS = SCRATCH_RING_BYTES / SCRATCH_CHUNK;
+const SCRATCH_ALIGN = 256;
 /// Reads begun at once (Engine.readStart) at most.
 pub const READ_SLOTS = 4;
 const RING = 64;
@@ -1000,6 +1047,21 @@ fn monoUs() u64 {
 
 /// A backend (gpu.compile, or gpu.compileFor with the targets an image
 /// links).
+/// A compute kernel the engine's user builds (Engine.dispatch): `build`
+/// emits it into the kernel given (false: it cannot), workgroup `group`;
+/// its GPU program is the engine's to load and let go (unloadCompute).
+pub const Compute = struct {
+    build: *const fn (ctx: ?*const anyopaque, k: *kir.Kernel) bool,
+    ctx: ?*const anyopaque = null,
+    group: [3]u32 = .{ 1, 1, 1 },
+    name: []const u8 = "compute",
+    prog: ?gpu.Program = null,
+    owner: ?*anyopaque = null,
+    /// the engine it would not compile or load for (its dispatches then
+    /// run on the CPU)
+    refused_by: ?*anyopaque = null,
+};
+
 pub const Compiler = *const fn (k: *const kir.Kernel, caps: gpu.Caps, work: *gpu.Work, out: []u8) anyerror!gpu.Binary;
 
 /// gpu.compile: every backend linked (tests, tools).
@@ -1099,6 +1161,19 @@ pub const Config = struct {
     pool: []u8 = &.{},
     /// Backing storage for suballocating small GPU objects.
     slabs: []Slab = &.{},
+    /// Each slab's bytes, and the largest object a slab takes: GL's 2 MiB
+    /// and 256 KiB; a Direct3D program's thousands of textures want larger
+    /// (each object past them is a GPU buffer of its own, and a process
+    /// has a few hundred: node.MAX_BUFFERS).
+    slab_bytes: usize = SLAB_BYTES,
+    slab_object: usize = MAX_SLAB_OBJECT,
+    /// The scratch ring's bytes (draws' records: Engine.scratchFor), a
+    /// whole number of SCRATCH_CHUNK up to SCRATCH_RING_BYTES; 0: none.
+    scratch_ring: usize = SCRATCH_RING_BYTES,
+    /// Records of more bytes than this go to the scratch ring (null:
+    /// slab_object's; smaller ones are slab memory, used again as soon as
+    /// freed).
+    scratch_min: ?usize = null,
     /// Scratch for KIR's interpreter, which draws on the CPU (no GPU, or
     /// it is lost); none: such draws are refused.
     cpu_work: []u8 = &.{},
@@ -1180,6 +1255,8 @@ pub const Stats = struct {
     /// waits for the GPU.
     batches: u64 = 0,
     dispatches: u64 = 0,
+    /// compute dispatches (Engine.dispatch) recorded for the GPU
+    computes: u64 = 0,
     cpu_ops: u64 = 0,
     waits: u64 = 0,
     /// thread-instructions KIR's interpreter ran for draws on the CPU
@@ -1205,7 +1282,44 @@ pub const Stats = struct {
     /// Copies between images' VRAM and their shadows (gfx_words), bytes.
     vram_copies: u64 = 0,
     vram_bytes: u64 = 0,
+    /// Times the freed buffers waiting for the GPU passed DOOMED_BYTES
+    /// and the open batch was run and waited for.
+    doomed_waits: u64 = 0,
+    /// The CPU's waits for the GPU by why (WaitWhy): how many, and their
+    /// microseconds.
+    wait_n: [WAIT_WHYS]u32 = @splat(0),
+    wait_why_us: [WAIT_WHYS]u64 = @splat(0),
+    /// A pipeline's kernel variants made (buildFor, compiled and loaded),
+    /// and the microseconds that took.
+    variants: u32 = 0,
+    variant_us: u64 = 0,
+    /// Bytes of draws' records placed in the scratch ring.
+    scratch_bytes: u64 = 0,
 };
+
+/// Why the CPU waited for the GPU (Stats.wait_n): set by the caller of a
+/// wait, `other` when none did.
+pub const WaitWhy = enum(u8) {
+    other,
+    /// the uniform ring came round to a piece a batch in flight reads
+    uniforms,
+    /// the CPU touched an image a batch in flight uses (write, read, copy
+    /// on the CPU, a fill, a host view)
+    settle,
+    /// a pipeline's table of kernel variants full: the oldest let go
+    evict,
+    /// freed buffers past DOOMED_BYTES
+    doomed,
+    /// work done on the CPU (a compute kernel, a draw)
+    cpu,
+    /// a program or pipeline let go
+    unload,
+    /// a read-back's mark
+    read,
+    /// the scratch ring came round to a piece a batch in flight uses
+    scratch,
+};
+pub const WAIT_WHYS = @typeInfo(WaitWhy).@"enum".field_names.len;
 
 pub const Engine = struct {
     dev: ?gpu.Device = null,
@@ -1219,6 +1333,12 @@ pub const Engine = struct {
     trap: gpu.interp.Trap = .{},
     pool: Pool = .{},
     slabs: []Slab = &.{},
+    slab_bytes: usize = SLAB_BYTES,
+    slab_object: usize = MAX_SLAB_OBJECT,
+    /// The scratch ring's size (Config.scratch_ring; 0: none), and the
+    /// records it takes (more bytes than scratch_min).
+    scratch_len: usize = SCRATCH_RING_BYTES,
+    scratch_min: usize = MAX_SLAB_OBJECT,
     progs: [N_PROGS]gpu.Program = undefined,
     code: [N_PROGS][CODE_BYTES]u8 align(16) = undefined,
     ops: [MAX_OPS]gpu.Dispatch = undefined,
@@ -1248,6 +1368,8 @@ pub const Engine = struct {
     vram_count: u32 = 0,
     said_graphics: bool = false,
     said_compute: [8][]const u8 = @splat(""),
+    /// The draws each of said_compute's reasons sent to the compute kernels.
+    compute_why_n: [8]u32 = @splat(0),
     said_promote: bool = false,
     said_rows: [8][]const u8 = @splat(""),
     compiler: Compiler = compileAny,
@@ -1278,6 +1400,13 @@ pub const Engine = struct {
     sums: [RING]BatchSum = undefined,
     doomed: [MAX_DOOMED]Doomed = undefined,
     n_doomed: usize = 0,
+    /// The doomed buffers' bytes (DOOMED_BYTES), and whether freeBytes is
+    /// waiting for them already (a free inside that wait waits no more).
+    doomed_bytes: u64 = 0,
+    doom_waiting: bool = false,
+    doomed_budget: u64 = DOOMED_BYTES,
+    /// Why the next wait waits (Stats.wait_n), taken by it.
+    wait_why: WaitWhy = .other,
     /// The draws' uniforms (uniformsFor): the ring, where the next goes,
     /// and the last batch that read each piece of it. A draw's uniforms
     /// were a buffer made and freed each draw: the GPU was asked whether
@@ -1286,12 +1415,19 @@ pub const Engine = struct {
     uni_ring: gpu.Buffer = .{},
     uni_at: usize = 0,
     uni_chunk: [UNI_CHUNKS]u64 = @splat(0),
+    /// The draws' records (scratchFor): the ring, where the next go, and
+    /// the last batch that used each piece of it.
+    scratch_ring: gpu.Buffer = .{},
+    scratch_at: usize = 0,
+    scratch_chunk: [SCRATCH_CHUNKS]u64 = @splat(0),
     /// Reads' rows (readStart), kept between reads.
     read_slots: [READ_SLOTS]ReadSlot = @splat(.{}),
     stats: Stats = .{},
     /// Triangles a bin's list holds at most (raster.BIN_CAP; tests lower
     /// it to make lists run over).
     bin_cap: u32 = raster.BIN_CAP,
+    /// Bins a draw has at most (raster.MAX_BINS; a test lowers it).
+    max_bins: u32 = raster.MAX_BINS,
     /// Off: no draw is binned (every tile goes through every triangle).
     binning: bool = true,
     check: Check = .{},
@@ -1310,7 +1446,7 @@ pub const Engine = struct {
     /// The engine in place (it must stay at `e`): the kernels compiled and
     /// loaded for cfg.dev; if any fails, everything runs on the CPU.
     pub fn init(e: *Engine, cfg: Config) void {
-        e.* = .{ .pool = Pool.init(cfg.pool), .slabs = cfg.slabs, .compiler = cfg.compiler, .work = cfg.work, .cpu_work = cfg.cpu_work, .cpu_insts = cfg.cpu_kernels, .check = cfg.check };
+        e.* = .{ .pool = Pool.init(cfg.pool), .slabs = cfg.slabs, .slab_bytes = cfg.slab_bytes, .slab_object = cfg.slab_object, .scratch_len = @min(cfg.scratch_ring / SCRATCH_CHUNK * SCRATCH_CHUNK, SCRATCH_RING_BYTES), .scratch_min = cfg.scratch_min orelse cfg.slab_object, .compiler = cfg.compiler, .work = cfg.work, .cpu_work = cfg.cpu_work, .cpu_insts = cfg.cpu_kernels, .check = cfg.check };
         if (cfg.dev) |d| e.graphics = cfg.graphics and d.caps.graphics and d.caps.target == .sm_120;
         e.graphics_depth = cfg.graphics_depth;
         e.depth_float = e.graphics and cfg.depth_float and cfg.graphics_depth;
@@ -1359,6 +1495,8 @@ pub const Engine = struct {
         if (e.dev) |d| {
             if (e.uni_ring.cpu.len != 0) d.free(e.uni_ring);
             e.uni_ring = .{};
+            if (e.scratch_ring.cpu.len != 0) d.free(e.scratch_ring);
+            e.scratch_ring = .{};
             for (&e.read_slots) |*sl| {
                 if (sl.buf.cpu.len != 0) d.free(sl.buf);
                 sl.* = .{};
@@ -1399,7 +1537,7 @@ pub const Engine = struct {
         e.reap(false);
         for (0..2) |attempt| {
             if (!e.onGpu()) break;
-            if (shareable and bytes <= MAX_SLAB_OBJECT) {
+            if (shareable and bytes <= e.slab_object) {
                 if (e.allocSmall(bytes)) |b| return .{ .buf = b, .pooled = false };
             }
             if (e.dev.?.alloc(bytes, .host)) |b| {
@@ -1407,6 +1545,7 @@ pub const Engine = struct {
                 e.dev.?.free(b);
             } else |_| {}
             if (attempt != 0 or e.n_doomed == 0) break;
+            e.wait_why = .doomed;
             e.finish();
         }
         const s = e.pool.alloc(bytes) orelse return null;
@@ -1418,13 +1557,13 @@ pub const Engine = struct {
         const d = e.dev.?;
         for (e.slabs) |*slab| {
             if (slab.buf.cpu.len == 0) {
-                const b = d.alloc(SLAB_BYTES, .host) catch return null;
-                if (b.cpu.len < SLAB_BYTES) {
+                const b = d.alloc(e.slab_bytes, .host) catch return null;
+                if (b.cpu.len < e.slab_bytes) {
                     d.free(b);
                     return null;
                 }
                 slab.buf = b;
-                slab.pool = Pool.init(b.cpu[0..SLAB_BYTES]);
+                slab.pool = Pool.init(b.cpu[0..e.slab_bytes]);
             }
             const cpu = slab.pool.alloc(bytes) orelse continue;
             const off = @intFromPtr(cpu.ptr) - @intFromPtr(slab.buf.cpu.ptr);
@@ -1459,6 +1598,18 @@ pub const Engine = struct {
         }
         e.doomed[e.n_doomed] = .{ .buf = b, .batch = last };
         e.n_doomed += 1;
+        e.doomed_bytes += doomedSize(b);
+        if (e.doomed_bytes > e.doomed_budget and !e.doom_waiting) {
+            e.doom_waiting = true;
+            defer e.doom_waiting = false;
+            e.stats.doomed_waits += 1;
+            e.wait_why = .doomed;
+            e.finish();
+        }
+    }
+
+    fn doomedSize(b: gpu.Buffer) u64 {
+        return @max(b.bytes, b.cpu.len);
     }
 
     /// Buffers whose batches are done are freed (all of them with `all`).
@@ -1470,6 +1621,7 @@ pub const Engine = struct {
             const x = e.doomed[i];
             if (all or e.lost or x.batch <= e.done_upto) {
                 if (e.dev) |d| e.freeGpu(d, x.buf);
+                e.doomed_bytes -|= doomedSize(x.buf);
                 e.n_doomed -= 1;
                 e.doomed[i] = e.doomed[e.n_doomed];
             } else i += 1;
@@ -1786,6 +1938,62 @@ pub const Engine = struct {
         return uni;
     }
 
+    /// `bytes` of a draw's records for the GPU to write and read in the
+    /// open batch (their contents whatever was there): past scratch_min, a
+    /// place in the scratch ring (not the engine's to free: freeImage only
+    /// forgets it); else, or with no GPU, no memory for the ring or more
+    /// than half the ring, a buffer of its own (slab memory when small).
+    fn scratchFor(e: *Engine, bytes: usize) ?Image {
+        const n = @max(std.mem.alignForward(usize, bytes, 4), 16);
+        if (e.onGpu() and n > e.scratch_min and n <= e.scratch_len / 2) if (e.scratchRing(n)) |at| {
+            const ring = e.scratch_ring;
+            return .{ .buf = .{ .gpu = ring.gpu + at, .cpu = ring.cpu[at..][0..n], .bytes = n, .handle = ring.handle, .kind = ring.kind } };
+        };
+        return e.newBuffer(bytes);
+    }
+
+    /// Room for `bytes` in the scratch ring (made at its first use), as
+    /// uniRing's in the uniform ring.
+    fn scratchRing(e: *Engine, bytes: usize) ?usize {
+        const len = e.scratch_len;
+        if (e.scratch_ring.cpu.len == 0) {
+            const b = e.dev.?.alloc(len, .host) catch {
+                // (no memory for it: none from now on)
+                e.scratch_len = 0;
+                return null;
+            };
+            if (b.cpu.len < len or b.gpu == 0) {
+                e.dev.?.free(b);
+                e.scratch_len = 0;
+                return null;
+            }
+            e.scratch_ring = b;
+            e.scratch_at = 0;
+            e.scratch_chunk = @splat(0);
+        }
+        var at = std.mem.alignForward(usize, e.scratch_at, SCRATCH_ALIGN);
+        if (at + bytes > len) at = 0;
+        const first = at / SCRATCH_CHUNK;
+        const last = (at + bytes - 1) / SCRATCH_CHUNK;
+        // (the piece the last records went into: the open batch's already)
+        const now = if (e.scratch_at == 0 or at == 0) SCRATCH_CHUNKS else (e.scratch_at - 1) / SCRATCH_CHUNK;
+        for (first..last + 1) |c| {
+            if (c != now) {
+                const b = e.scratch_chunk[c];
+                if (b == e.batch) e.flush();
+                if (b != 0 and b > e.done_upto) {
+                    e.wait_why = .scratch;
+                    e.waitBatch(b);
+                }
+                if (!e.onGpu()) return null;
+            }
+            e.scratch_chunk[c] = e.batch;
+        }
+        e.scratch_at = at + bytes;
+        e.stats.scratch_bytes += bytes;
+        return at;
+    }
+
     /// Room for `bytes` in the uniform ring (made at its first use): their
     /// offset, the pieces they are in free of batches in flight (waited
     /// for: a lap of the ring is thousands of draws) and now the open
@@ -1814,7 +2022,10 @@ pub const Engine = struct {
                 // (the open batch itself a lap ago: one batch went round
                 // the whole ring)
                 if (b == e.batch) e.flush();
-                if (b != 0 and b > e.done_upto) e.waitBatch(b);
+                if (b != 0 and b > e.done_upto) {
+                    e.wait_why = .uniforms;
+                    e.waitBatch(b);
+                }
                 if (!e.onGpu()) return null;
             }
             e.uni_chunk[c] = e.batch;
@@ -1928,13 +2139,20 @@ pub const Engine = struct {
     /// (the GPU called lost only with `lose_on_timeout`; a fence's client
     /// wait may simply give up).
     fn waitBatchFor(e: *Engine, b: u64, timeout_us: u64, lose_on_timeout: bool) bool {
+        const why = @intFromEnum(e.wait_why);
+        e.wait_why = .other;
         if (b == 0 or !e.onGpu()) return true;
         if (b >= e.batch) e.flush();
         if (!e.onGpu() or b <= e.done_upto) return true;
         const upto = if (e.ran - b >= RING) e.ran else b;
         e.stats.waits += 1;
+        e.stats.wait_n[why] += 1;
         const began = report.nowUs();
-        defer e.stats.wait_us += report.nowUs() -| began;
+        defer {
+            const took = report.nowUs() -| began;
+            e.stats.wait_us += took;
+            e.stats.wait_why_us[why] += took;
+        }
         const fence = e.fences[upto % RING];
         e.dev.?.wait(fence, timeout_us) catch |err| {
             if (err == error.Timeout and !lose_on_timeout) return false;
@@ -1990,7 +2208,10 @@ pub const Engine = struct {
     /// The CPU may touch img: no batch in flight uses it.
     fn settle(e: *Engine, img: *Image) void {
         const l = img.lastBatch();
-        if (l > e.done_upto) e.waitBatch(l);
+        if (l > e.done_upto) {
+            e.wait_why = .settle;
+            e.waitBatch(l);
+        }
     }
 
     fn gpuUsable(e: *const Engine, img: *const Image) bool {
@@ -2022,6 +2243,111 @@ pub const Engine = struct {
         e.op_cpu[i] = cpu;
         e.n_ops += 1;
         e.stats.dispatches += 1;
+    }
+
+    // ── Compute (Direct3D's compute shaders) ───────────────────────────────
+
+    /// A compute dispatch's kernel, built by the engine's user (a Direct3D
+    /// compute shader, gfxapi.dxbc_gen.compute): `build` emits it into the
+    /// kernel it is given (its bindings: 0 the uniform words, then a
+    /// dispatch's `bufs` in order), workgroup `group`. Compiled and loaded
+    /// on the GPU at its first dispatch (`unloadCompute` lets it go); on
+    /// the CPU it is built for each dispatch.
+    pub fn dispatch(e: *Engine, c: *Compute, groups: [3]u32, bufs: []const *Image, writes: u32, words: []const u32) bool {
+        if (groups[0] == 0 or groups[1] == 0 or groups[2] == 0) return true;
+        if (bufs.len + 1 > MAX_BIND) return false;
+        var uni = e.uniformsFor(words) orelse return false;
+        defer e.freeImage(&uni);
+        var all: [MAX_BIND]*Image = undefined;
+        all[0] = &uni;
+        for (bufs, 1..) |img, j| all[j] = img;
+        const bs = all[0 .. bufs.len + 1];
+        const on_gpu = blk: {
+            if (!e.onGpu() or c.refused_by == @as(?*anyopaque, e)) break :blk false;
+            for (bs) |img| {
+                if (!e.gpuUsable(img)) break :blk false;
+            }
+            break :blk e.loadCompute(c);
+        };
+        if (on_gpu) {
+            e.recordProg(&c.prog.?, groups, bs, writes << 1, &.{}, null);
+            e.stats.computes += 1;
+            return true;
+        }
+        // (on the CPU: the work before it done, every binding's bytes here)
+        e.wait_why = .cpu;
+        e.finish();
+        var views: [MAX_BIND][]u8 = undefined;
+        for (bs, 0..) |img, j| {
+            e.fetchAll(img);
+            views[j] = img.buf.cpu;
+        }
+        var k = kir.Kernel.init(.{ .insts = &e.kir_insts, .tys = &e.kir_tys }, c.name, c.group);
+        if (!c.build(c.ctx, &k)) return false;
+        k.finish() catch |err| {
+            e.why_pipe = err;
+            report.say(.pipeline, "a compute kernel does not build ({s}): its dispatches are dropped", .{@errorName(err)});
+            return false;
+        };
+        var w = gpu.Work.init(e.cpu_work);
+        var trap: gpu.interp.Trap = .{};
+        var stats: gpu.interp.Stats = .{};
+        gpu.interp.run(.{
+            .code = k.code(),
+            .regs = k.nv,
+            .group = k.group,
+            .shared_bytes = k.shared_bytes,
+            .groups = groups,
+            .bindings = views[0..bs.len],
+            .params = &.{},
+        }, gpu.interp_caps, &w, &trap, &stats) catch |err| {
+            e.why_pipe = err;
+            e.trap = trap;
+            report.say(.pipeline, "a compute kernel stopped on the CPU ({s} at {d}): the dispatch is dropped", .{ @errorName(err), trap.pc });
+            return false;
+        };
+        for (bufs, 0..) |img, j| {
+            if (writes & (@as(u32, 1) << @intCast(j)) != 0) e.wrote(img, 0, img.buf.cpu.len);
+        }
+        return true;
+    }
+
+    /// A compute kernel compiled and loaded on the GPU (once). False: it
+    /// does not compile or load (said once; its dispatches run on the CPU).
+    fn loadCompute(e: *Engine, c: *Compute) bool {
+        if (c.owner == @as(?*anyopaque, e) and c.prog != null) return true;
+        const d = e.dev.?;
+        var k = kir.Kernel.init(.{ .insts = &e.kir_insts, .tys = &e.kir_tys }, c.name, c.group);
+        const result: anyerror!gpu.Program = blk: {
+            if (!c.build(c.ctx, &k)) break :blk error.BadProgram;
+            k.finish() catch |err| break :blk err;
+            var w = gpu.Work.init(e.work);
+            const bin = e.compiler(&k, d.caps, &w, &e.pcode) catch |err| break :blk err;
+            break :blk d.load(&bin);
+        };
+        c.prog = result catch |err| {
+            e.why_pipe = err;
+            c.refused_by = e;
+            report.say(.pipeline, "a compute kernel does not compile or load for the GPU ({s}): its dispatches run on the CPU", .{@errorName(err)});
+            return false;
+        };
+        c.prog.?.label = c.name;
+        c.owner = e;
+        return true;
+    }
+
+    /// A compute kernel's GPU program let go (after the work using it).
+    pub fn unloadCompute(e: *Engine, c: *Compute) void {
+        if (c.owner == @as(?*anyopaque, e)) if (c.prog) |*p| {
+            if (!e.lost) {
+                e.wait_why = .unload;
+                e.finish();
+                e.dev.?.unload(p);
+            }
+        };
+        c.prog = null;
+        c.owner = null;
+        c.refused_by = null;
     }
 
     // ── Checks (GALAXY_GL_CHECK) ───────────────────────────────────────────
@@ -2246,6 +2572,7 @@ pub const Engine = struct {
         for (p.refused_key[0..p.n_refused]) |x| {
             if (x == key) return null;
         }
+        const built_at = report.nowUs();
         var k = e.buildFor(st, p, v, kind);
         const result: anyerror!gpu.Program = blk: {
             k.finish() catch |err| break :blk err;
@@ -2253,6 +2580,8 @@ pub const Engine = struct {
             const bin = e.compiler(&k, e.dev.?.caps, &w, &e.pcode) catch |err| break :blk err;
             break :blk e.dev.?.load(&bin);
         };
+        e.stats.variants += 1;
+        e.stats.variant_us += report.nowUs() -| built_at;
         const prog = result catch |err| {
             e.why_pipe = err;
             if (p.n_refused < raster.Pipeline.MAX_MORE) {
@@ -2265,6 +2594,7 @@ pub const Engine = struct {
         var slot: usize = p.n_more;
         if (slot == raster.Pipeline.MAX_MORE) {
             // (full: the oldest goes, once no batch runs it)
+            e.wait_why = .evict;
             e.finish();
             slot = p.evict;
             p.evict = @intCast((slot + 1) % raster.Pipeline.MAX_MORE);
@@ -2357,6 +2687,7 @@ pub const Engine = struct {
 
     pub fn unloadPipeline(e: *Engine, p: *raster.Pipeline) void {
         if (p.gfx_owner == @as(?*anyopaque, e)) {
+            e.wait_why = .unload;
             e.finish();
             for (&p.gfx) |*q| {
                 if (q.*) |*prog| {
@@ -2369,6 +2700,7 @@ pub const Engine = struct {
         if (p.gfx_refused_by == @as(?*anyopaque, e)) p.gfx_refused_by = null;
         e.forgetCpu(p);
         if (p.owner != @as(?*anyopaque, e)) return;
+        e.wait_why = .unload;
         e.finish();
         for (&p.progs) |*q| {
             if (q.*) |*prog| {
@@ -2622,10 +2954,14 @@ pub const Engine = struct {
     /// Why a draw went to the compute kernels while the 3D engine was on:
     /// said once a reason.
     fn sayCompute(e: *Engine, why: []const u8) void {
-        for (&e.said_compute) |*s| {
-            if (s.len != 0 and s.ptr == why.ptr) return;
+        for (&e.said_compute, 0..) |*s, i| {
+            if (s.len != 0 and s.ptr == why.ptr) {
+                e.compute_why_n[i] +%= 1;
+                return;
+            }
             if (s.len == 0) {
                 s.* = why;
+                e.compute_why_n[i] = 1;
                 report.say(.pipeline, "a draw on the compute kernels, not the 3D engine: {s}", .{why});
                 return;
             }
@@ -2684,12 +3020,12 @@ pub const Engine = struct {
         const v = d.variant();
         const kind = d.setupKind();
         // (and primitive restart's word, zeroed)
-        var verts = e.newBuffer(@as(usize, d.instances) * d.count * p.vstride * 4 + 4) orelse return false;
+        var verts = e.scratchFor(@as(usize, d.instances) * d.count * p.vstride * 4 + 4) orelse return false;
         defer e.freeImage(&verts);
         if (raster.restartFlag(d) != raster.RESTART_NONE) e.writeBytes(&verts, d.restartWord(), &.{ 0, 0, 0, 0 });
         // (the primitive records, then the bins' lists)
-        const bins: raster.Bins = if (e.binning) raster.binsOf(d, e.bin_cap) else .{};
-        var tris = e.newBuffer((@as(usize, d.instances) * nrec * p.sstride + bins.words()) * 4) orelse return false;
+        const bins: raster.Bins = if (e.binning) raster.binsOf(d, e.bin_cap, e.max_bins) else .{};
+        var tris = e.scratchFor((@as(usize, d.instances) * nrec * p.sstride + bins.words()) * 4) orelse return false;
         defer e.freeImage(&tris);
         var uni = e.uniformsFor(d.uniforms) orelse return false;
         defer e.freeImage(&uni);
@@ -3158,16 +3494,23 @@ pub const Engine = struct {
             e.settle(dst);
             return e.cpuDo(op);
         }
-        const keep = keepOf(src.format, dst.format);
         const s0: i32 = @intCast(src.rowOf(sy));
         const d0: i32 = @intCast(dst.rowOf(dy));
         const ss: i32 = if (src.top_down) -1 else 1;
         const ds: i32 = if (dst.top_down) -1 else 1;
-        const p = [_]u32{ sx, @bitCast(s0), @bitCast(ss), src.stride, dx, @bitCast(d0), @bitCast(ds), dst.stride, w, keep, ~keep, setOf(src), src.format.bytes(), dst.format.bytes(), raster.colourBlWord(src), raster.colourBlWord(dst) };
+        // (texels wider than a word, 8 or 16 bytes, always rows: copied as
+        // that many words each, as they are: the kernel moves a word a
+        // pixel, and a float texture's copy kept its first channel alone)
+        const n: u32 = if (src.format.bytes() > 4 and src.format == dst.format) src.format.bytes() / 4 else 1;
+        const keep: u32 = if (n > 1) 0xffff_ffff else keepOf(src.format, dst.format);
+        const set: u32 = if (n > 1) 0 else setOf(src);
+        const sbpp: u32 = if (n > 1) 4 else src.format.bytes();
+        const dbpp: u32 = if (n > 1) 4 else dst.format.bytes();
+        const p = [_]u32{ sx * n, @bitCast(s0), @bitCast(ss), src.stride, dx * n, @bitCast(d0), @bitCast(ds), dst.stride, w * n, keep, ~keep, set, sbpp, dbpp, raster.colourBlWord(src), raster.colourBlWord(dst) };
         const regs = [_]Region{rowsOf(dst, dy, dy + h)};
         const checking = e.checkFirst(.copy, @as(u64, w) * h, &regs);
         if (!e.gpuUsable(src) or !e.gpuUsable(dst)) return e.cpuDo(op);
-        e.record(.copy, .{ std.math.divCeil(u32, w, GROUP) catch unreachable, h, 1 }, &.{ src, dst }, &p, op);
+        e.record(.copy, .{ std.math.divCeil(u32, w * n, GROUP) catch unreachable, h, 1 }, &.{ src, dst }, &p, op);
         if (!checking) return;
         const kept = e.checkSwap(&regs);
         e.cpuDo(op);
@@ -3265,6 +3608,11 @@ pub const Engine = struct {
             if (img.gpuWrote()) e.fromDevice(img, off, @as(usize, w) * sb);
             const s = img.buf.cpu[off..][0 .. @as(usize, w) * sb];
             const d = dst[j * dst_stride ..][0 .. @as(usize, w) * db];
+            if (sb > 4 and sb == db) {
+                // (8- and 16-byte texels: as they are)
+                @memcpy(d, s);
+                continue;
+            }
             if (sb == 4 and db == 4) {
                 // (words, as most reads are)
                 const sw = img.words()[off / 4 ..][0..w];
@@ -3365,6 +3713,7 @@ pub const Engine = struct {
     pub fn readFinish(e: *Engine, rb: *Readback, dst: []u8, dst_stride: usize) bool {
         if (!rb.pending()) return false;
         defer e.readCancel(rb);
+        e.wait_why = .read;
         e.waitBatch(rb.mark);
         if (e.lost) return false;
         const rows = &rb.rows;
@@ -3517,6 +3866,7 @@ pub const Engine = struct {
         t.shadow_old = false;
         e.recordWords(v, 0, img.host, 0, img.host.cpu.len);
         t.last = e.batch;
+        e.wait_why = .read;
         e.finish();
     }
 
@@ -3662,7 +4012,11 @@ pub const Engine = struct {
                     const do_ = @as(usize, c.dst.rowOf(c.dy + jj)) * c.dst.stride + @as(usize, c.dx) * db;
                     if (c.src.gpuWrote()) e.fromDevice(&c.src, so, @as(usize, c.w) * sb);
                     if (c.dst.gpuWrote()) e.fromDevice(&c.dst, do_, @as(usize, c.w) * db);
-                    if (sb == 4 and db == 4) {
+                    if (sb > 4 and sb == db) {
+                        // (8- and 16-byte texels: the row as it is)
+                        const n = @as(usize, c.w) * sb;
+                        @memcpy(c.dst.buf.cpu[do_..][0..n], c.src.buf.cpu[so..][0..n]);
+                    } else if (sb == 4 and db == 4) {
                         const sw = c.src.words();
                         const dw = c.dst.words();
                         for (0..c.w) |i| {

@@ -63,12 +63,14 @@ pub const DESC_WORDS = D_BORDER + 4;
 // bytes a channel), its channels (8..10), sRGB (12), a texture there (13)
 // ... block linear (15: the image's memory is NVIDIA's block-linear
 // layout, D_STRIDE its pitch; its swizzle at 16..17, log2 of its blocks'
-// height in GOBs at 18..20: blocklinear.sig)
+// height in GOBs at 18..20: blocklinear.sig), block-compressed (22..24:
+// engine.Image.bc, the BC kind + 1; D_STRIDE a row of blocks' bytes)
 const F_WIDE: u32 = 1 << 6;
 const F_SRGB: u32 = 1 << 12;
 const F_VALID: u32 = 1 << 13;
 const F_DEPTH: u32 = 1 << 14;
 const F_BLOCK: u32 = 1 << 15;
+const F_BC_SHIFT = 22;
 // D_SWZ: 3 bits a channel: 0..3 one of the texel's, 4 zero, 5 one
 pub const SWZ_ZERO = 4;
 pub const SWZ_ONE = 5;
@@ -138,7 +140,7 @@ pub fn descriptor(s: State, out: *[DESC_WORDS]u32) void {
     out[D_H] = img.height;
     out[D_STRIDE] = img.stride;
     out[D_FMT] = std.math.log2_int(u32, fmt.bytes()) | @as(u32, @intFromEnum(fmt.kind())) << 4 | fmt.channels() << 8 |
-        F_VALID | (if (s.srgb) F_SRGB else 0) | (if (fmt == .d24s8) F_DEPTH else 0);
+        F_VALID | (if (s.srgb) F_SRGB else 0) | (if (fmt == .d24s8) F_DEPTH else 0) | @as(u32, img.bc) << F_BC_SHIFT;
     if (img.layout.block) {
         out[D_FMT] |= F_BLOCK | @as(u32, @intFromEnum(img.layout.swizzle)) << 16 | @as(u32, img.layout.gobs_log2) << 18;
     }
@@ -190,8 +192,10 @@ fn loadDesc(k: *kir.Kernel, s: Slot) D {
     return .{ .w = descWord(k, s, D_W), .h = descWord(k, s, D_H), .stride = descWord(k, s, D_STRIDE), .fmt = descWord(k, s, D_FMT), .swz = descWord(k, s, D_SWZ), .mode = descWord(k, s, D_MODE), .last = descWord(k, s, D_LAST) };
 }
 
-/// A level's place: its byte offset, size and row stride.
-const Lvl = struct { off: V, w: V, h: V, stride: V };
+/// A level's place: its byte offset, size and row stride, and the rows
+/// of memory a layer of it takes (its height; a block-compressed level's
+/// rows of blocks).
+const Lvl = struct { off: V, w: V, h: V, stride: V, rows: V };
 
 /// Level `l` (u32) of the texture.
 fn levelOf(k: *kir.Kernel, s: Slot, d: D, l: V) Lvl {
@@ -203,7 +207,13 @@ fn levelOf(k: *kir.Kernel, s: Slot, d: D, l: V) Lvl {
     var m = kir.global(s.uni, 32);
     m.imm = @intCast((s.word + D_AT) * 4);
     const off = k.load(.u32, m, r(k.op2(.shl, .u32, r(l), u(2))));
-    return .{ .off = off, .w = w, .h = h, .stride = k.sel(.u32, r(is0), r(d.stride), r(packed_stride)) };
+    // (block-compressed: a row of blocks, 8 or 16 bytes each)
+    const bck = k.op3(.bfe, .u32, r(d.fmt), u(F_BC_SHIFT), u(3));
+    const block_stride = k.op2(.shl, .u32, r(k.op2(.shr, .u32, r(k.op2(.iadd, .u32, r(w), u(3))), u(2))), r(bcBlockShift(k, bck)));
+    const stride = k.sel(.u32, r(is0), r(d.stride), r(packed_stride));
+    const is_bc = k.cmp(.u32, .ne, r(bck), u(0));
+    const rows = k.sel(.u32, r(is_bc), r(k.op2(.shr, .u32, r(k.op2(.iadd, .u32, r(h), u(3))), u(2))), r(h));
+    return .{ .off = off, .w = w, .h = h, .stride = k.sel(.u32, r(is_bc), r(block_stride), r(stride)), .rows = rows };
 }
 
 fn one(kind: Kind) Arg {
@@ -219,8 +229,10 @@ fn ty(kind: Kind) kir.Ty {
 }
 
 /// Texel (x, y) (u32, inside the level) as its channels (missing ones 0,
-/// 0, 0, 1), sRGB decoded, before the swizzle.
-fn texel(k: *kir.Kernel, b: u8, d: D, lv: Lvl, x: Arg, y: Arg, kind: Kind) [4]Arg {
+/// 0, 0, 1), sRGB decoded, before the swizzle. `with_bc`: a
+/// block-compressed image's texel decoded here too (else the caller
+/// decodes it: sampleLevel, its four taps in one loop).
+fn texel(k: *kir.Kernel, b: u8, d: D, lv: Lvl, x: Arg, y: Arg, kind: Kind, with_bc: bool) [4]Arg {
     const shift = k.op3(.bfe, .u32, r(d.fmt), u(0), u(3));
     const xb = k.op2(.shl, .u32, x, r(shift));
     // pitch linear, or (a video decoder's picture, imported with NVIDIA's
@@ -278,7 +290,136 @@ fn texel(k: *kir.Kernel, b: u8, d: D, lv: Lvl, x: Arg, y: Arg, kind: Kind) [4]Ar
         const have = k.cmp(.u32, .gt, r(channels), u(@intCast(c)));
         o.* = r(k.sel(.f32, r(have), r(v), if (c == 3) f(1) else f(0)));
     }
-    return out;
+    if (!with_bc) return out;
+    // (a block-compressed image: the texel decoded from its block, a
+    // branch on the descriptor as the layouts' are)
+    const bck = k.op3(.bfe, .u32, r(d.fmt), u(F_BC_SHIFT), u(3));
+    var regs: [4]V = undefined;
+    for (&regs, out) |*g, o| {
+        g.* = k.reg(.f32);
+        k.set(g.*, .mov, o, no, no);
+    }
+    k.ifp(r(k.cmp(.u32, .ne, r(bck), u(0))));
+    {
+        const v = bcTexel(k, b, d, lv, x, y, bck, srgb);
+        for (regs, v) |g, val| k.set(g, .mov, r(val), no, no);
+    }
+    k.endif();
+    var res: [4]Arg = undefined;
+    for (&res, regs) |*o, g| o.* = r(g);
+    return res;
+}
+
+/// log2 of a block's bytes for BC kind + 1 `bck` (3: BC1 and BC4; 4).
+fn bcBlockShift(k: *kir.Kernel, bck: V) V {
+    const is8 = k.op2(.por, .pred, r(k.cmp(.u32, .eq, r(bck), u(1))), r(k.cmp(.u32, .lt, r(k.op2(.isub, .u32, r(bck), u(4))), u(2))));
+    return k.sel(.u32, r(is8), u(3), u(4));
+}
+
+/// x / d for the divisors BC's palettes take (3, 5, 7), as
+/// (x * ceil(2^20 / d)) >> 20: exact for every x they meet (x < 1800).
+fn divBy(k: *kir.Kernel, x: Arg, m: Arg) V {
+    return k.op2(.shr, .u32, r(k.op2(.imul, .u32, x, m)), u(20));
+}
+const DIV3: u32 = 349526;
+const DIV5: u32 = 209716;
+const DIV7: u32 = 149797;
+
+/// A 5- or 6-bit channel to 8 bits (its top bits repeated).
+fn expand(k: *kir.Kernel, v: V, bits: u32) V {
+    return k.op2(.@"or", .u32, r(k.op2(.shl, .u32, r(v), u(8 - bits))), r(k.op2(.shr, .u32, r(v), u(2 * bits - 8))));
+}
+
+/// Texel `ti` (0..15) of an alpha block in words wa, wb (BC3's alpha, BC4,
+/// BC5's channels): its value, 0..255, or -127..127 where `sgn` (BC4 and
+/// BC5 signed; -128 reads as -127), as an i32. The Direct3D 11 spec's
+/// palette: eight values, or six and the two ends (0 and 255, or -127
+/// and 127), each rounded toward zero as bc.sig's decoder does.
+fn alphaBlock(k: *kir.Kernel, wa: V, wb: V, ti: V, sgn: V) V {
+    const lo127 = kir.i(-127);
+    const s0 = k.op2(.imax, .i32, r(k.op3(.bfe, .i32, r(wa), u(0), u(8))), lo127);
+    const s1 = k.op2(.imax, .i32, r(k.op3(.bfe, .i32, r(wa), u(8), u(8))), lo127);
+    const a0 = k.sel(.i32, r(sgn), r(s0), r(k.op3(.bfe, .u32, r(wa), u(0), u(8))));
+    const a1 = k.sel(.i32, r(sgn), r(s1), r(k.op3(.bfe, .u32, r(wa), u(8), u(8))));
+    // (its 3-bit index at bit 16 + 3 ti of the 64 bits, perhaps across both words)
+    const p = k.op3(.imad, .u32, r(ti), u(3), u(16));
+    const pl = k.op2(.imin, .u32, r(p), u(31));
+    const vlo = k.op2(.@"or", .u32, r(k.op2(.shr, .u32, r(wa), r(pl))), r(k.op2(.shl, .u32, r(wb), r(k.op2(.isub, .u32, u(32), r(pl))))));
+    const vhi = k.op2(.shr, .u32, r(wb), r(k.op2(.isub, .u32, r(k.op2(.imax, .u32, r(p), u(32))), u(32))));
+    const idx = k.op2(.@"and", .u32, r(k.sel(.u32, r(k.cmp(.u32, .lt, r(p), u(32))), r(vlo), r(vhi))), u(7));
+    const gt = k.cmp(.i32, .gt, r(a0), r(a1));
+    const m = k.sel(.u32, r(gt), u(7), u(5));
+    const t = k.op2(.isub, .u32, r(idx), u(1));
+    const n = k.op2(.iadd, .i32, r(k.op2(.imul, .i32, r(k.op2(.isub, .u32, r(m), r(t))), r(a0))), r(k.op2(.imul, .i32, r(t), r(a1))));
+    const q = divBy(k, r(k.op1(.iabs, .i32, r(n))), r(k.sel(.u32, r(gt), u(DIV7), u(DIV5))));
+    const qs = k.sel(.i32, r(k.cmp(.i32, .lt, r(n), kir.i(0))), r(k.op1(.ineg, .i32, r(q))), r(q));
+    const ends = k.op2(.pand, .pred, r(k.op1(.pnot, .pred, r(gt))), r(k.cmp(.u32, .ge, r(idx), u(6))));
+    const lo = k.sel(.i32, r(sgn), lo127, kir.i(0));
+    const hi = k.sel(.i32, r(sgn), kir.i(127), kir.i(255));
+    var v = k.sel(.i32, r(ends), r(k.sel(.i32, r(k.cmp(.u32, .eq, r(idx), u(6))), r(lo), r(hi))), r(qs));
+    v = k.sel(.i32, r(k.cmp(.u32, .eq, r(idx), u(1))), r(a1), r(v));
+    return k.sel(.i32, r(k.cmp(.u32, .eq, r(idx), u(0))), r(a0), r(v));
+}
+
+/// Texel (x, y) of a block-compressed level (bck: BC kind + 1) as R, G, B,
+/// A floats: BC1 to BC3's colours (and sRGB's decode where `srgb`), BC4's
+/// and BC5's channels (B 0, A 1), the same values bc.sig's decoder gives
+/// (its bytes times 1/255; a signed channel's value times 1/127).
+fn bcTexel(k: *kir.Kernel, b: u8, d: D, lv: Lvl, x: Arg, y: Arg, bck: V, srgb: V) [4]V {
+    const bx = k.op2(.shr, .u32, x, u(2));
+    const by = k.op2(.shr, .u32, y, u(2));
+    const addr = k.op2(.iadd, .u32, r(lv.off), r(k.op3(.imad, .u32, r(by), r(lv.stride), r(k.op2(.shl, .u32, r(bx), r(bcBlockShift(k, bck)))))));
+    const w0 = k.op2(.shr, .u32, r(addr), u(2));
+    var w: [4]V = undefined;
+    for (&w, 0..) |*wi, n| {
+        const at = k.op2(.imin, .u32, r(k.op2(.iadd, .u32, r(w0), u(@intCast(n)))), r(d.last));
+        wi.* = k.load(.u32, kir.global(b, 32), r(k.op2(.shl, .u32, r(at), u(2))));
+    }
+    const ti = k.op3(.imad, .u32, r(k.op2(.@"and", .u32, y, u(3))), u(4), r(k.op2(.@"and", .u32, x, u(3))));
+    // colours: BC1's block, BC2's and BC3's second half (always four)
+    const bc1 = k.cmp(.u32, .eq, r(bck), u(1));
+    const cw = k.sel(.u32, r(bc1), r(w[0]), r(w[2]));
+    const iw = k.sel(.u32, r(bc1), r(w[1]), r(w[3]));
+    const c0 = k.op2(.@"and", .u32, r(cw), u(0xffff));
+    const c1 = k.op2(.shr, .u32, r(cw), u(16));
+    const four = k.op2(.por, .pred, r(k.cmp(.u32, .gt, r(c0), r(c1))), r(k.op1(.pnot, .pred, r(bc1))));
+    const idx = k.op3(.bfe, .u32, r(iw), r(k.op2(.shl, .u32, r(ti), u(1))), u(2));
+    const fields = [3][2]u32{ .{ 11, 5 }, .{ 5, 6 }, .{ 0, 5 } };
+    var col: [3]V = undefined;
+    for (&col, fields) |*c, fl| {
+        const e0 = expand(k, k.op3(.bfe, .u32, r(c0), u(fl[0]), u(fl[1])), fl[1]);
+        const e1 = expand(k, k.op3(.bfe, .u32, r(c1), u(fl[0]), u(fl[1])), fl[1]);
+        const p2 = k.sel(.u32, r(four), r(divBy(k, r(k.op3(.imad, .u32, r(e0), u(2), r(e1))), u(DIV3))), r(k.op2(.shr, .u32, r(k.op2(.iadd, .u32, r(e0), r(e1))), u(1))));
+        const p3 = k.sel(.u32, r(four), r(divBy(k, r(k.op3(.imad, .u32, r(e1), u(2), r(e0))), u(DIV3))), u(0));
+        var v = k.sel(.u32, r(k.cmp(.u32, .eq, r(idx), u(2))), r(p2), r(p3));
+        v = k.sel(.u32, r(k.cmp(.u32, .eq, r(idx), u(1))), r(e1), r(v));
+        c.* = k.sel(.u32, r(k.cmp(.u32, .eq, r(idx), u(0))), r(e0), r(v));
+    }
+    // alphas: BC1's (0 for its transparent black), BC2's four bits, the
+    // alpha blocks (BC3's alpha, BC4's and BC5's channels)
+    const a_bc1 = k.sel(.u32, r(k.op2(.pand, .pred, r(k.op1(.pnot, .pred, r(four))), r(k.cmp(.u32, .eq, r(idx), u(3))))), u(0), u(255));
+    const nib_w = k.sel(.u32, r(k.cmp(.u32, .lt, r(ti), u(8))), r(w[0]), r(w[1]));
+    const a_bc2 = k.op2(.imul, .u32, r(k.op3(.bfe, .u32, r(nib_w), r(k.op2(.shl, .u32, r(k.op2(.@"and", .u32, r(ti), u(7))), u(2))), u(4))), u(17));
+    const sgn = k.op2(.por, .pred, r(k.cmp(.u32, .eq, r(bck), u(5))), r(k.cmp(.u32, .eq, r(bck), u(7))));
+    const ab01 = alphaBlock(k, w[0], w[1], ti, sgn);
+    const ab23 = alphaBlock(k, w[2], w[3], ti, sgn);
+    var a = k.sel(.u32, r(k.cmp(.u32, .eq, r(bck), u(2))), r(a_bc2), r(ab01));
+    a = k.sel(.u32, r(bc1), r(a_bc1), r(a));
+    const scale = k.sel(.f32, r(sgn), f(1.0 / 127.0), f(1.0 / 255.0));
+    const colour = k.cmp(.u32, .le, r(bck), u(3));
+    const bc5 = k.cmp(.u32, .ge, r(bck), u(6));
+    const unit = f(1.0 / 255.0);
+    var colf: [3]V = undefined;
+    for (&colf, col) |*o, c| o.* = srgbToLinear(k, k.op2(.fmul, .f32, r(k.cvt(.u32, .f32, .rne, r(c))), unit), srgb);
+    const ch01 = k.op2(.fmul, .f32, r(k.cvt(.i32, .f32, .rne, r(ab01))), r(scale));
+    const ch23 = k.op2(.fmul, .f32, r(k.cvt(.i32, .f32, .rne, r(ab23))), r(scale));
+    const af = k.op2(.fmul, .f32, r(k.cvt(.u32, .f32, .rne, r(a))), unit);
+    return .{
+        k.sel(.f32, r(colour), r(colf[0]), r(ch01)),
+        k.sel(.f32, r(colour), r(colf[1]), r(k.sel(.f32, r(bc5), r(ch23), f(0)))),
+        k.sel(.f32, r(colour), r(colf[2]), f(0)),
+        k.sel(.f32, r(colour), r(af), f(1)),
+    };
 }
 
 fn unpackDepth(k: *kir.Kernel, word: V) V {
@@ -286,8 +427,8 @@ fn unpackDepth(k: *kir.Kernel, word: V) V {
     return k.op2(.fmul, .f32, r(k.cvt(.u32, .f32, .rne, r(bits))), f(1.0 / 16777215.0));
 }
 
-fn filteredTexel(k: *kir.Kernel, slot: Slot, d: D, lv: Lvl, x: Arg, y: Arg, kind: Kind) [4]Arg {
-    const reference = slot.shadow orelse return texel(k, slot.b, d, lv, x, y, kind);
+fn filteredTexel(k: *kir.Kernel, slot: Slot, d: D, lv: Lvl, x: Arg, y: Arg, kind: Kind, with_bc: bool) [4]Arg {
+    const reference = slot.shadow orelse return texel(k, slot.b, d, lv, x, y, kind, with_bc);
     const row = k.op3(.imad, .u32, y, r(lv.stride), r(lv.off));
     const at = k.op3(.imad, .u32, x, u(4), r(row));
     const limit = k.op2(.shl, .u32, r(d.last), u(2));
@@ -565,7 +706,7 @@ fn cubeTap(k: *kir.Kernel, slot: Slot, d: D, lv: Lvl, face: Arg, x: V, y: V, lin
         k.set(selected, .mov, projected.face, no, no);
         k.endif();
     }
-    return filteredTexel(k, slot, d, sliceOf(k, lv, r(selected)), r(ix), r(iy), kind);
+    return filteredTexel(k, slot, d, sliceOf(k, lv, r(selected)), r(ix), r(iy), kind, true);
 }
 
 fn sampleLayerLevel(k: *kir.Kernel, slot: Slot, d: D, level: V, layer: ?Arg, s: Arg, t: Arg, linear: V, kind: Kind, off: [2]i32) [4]Arg {
@@ -628,7 +769,7 @@ fn sampleLevel(k: *kir.Kernel, slot: Slot, d: D, lv: Lvl, s: Arg, t: Arg, linear
     }.i;
     const xa = idx(k, wrap(k, x0, wf, ws));
     const ya = idx(k, wrap(k, y0, hf, wt));
-    const t00 = if (cube_face) |face| cubeTap(k, slot, d, lv, face, x0, y0, linear, kind) else filteredTexel(k, slot, d, lv, xa, ya, kind);
+    const t00 = if (cube_face) |face| cubeTap(k, slot, d, lv, face, x0, y0, linear, kind) else filteredTexel(k, slot, d, lv, xa, ya, kind, kind != .float);
     if (kind != .float) {
         if (cube_face != null) return t00;
         const out_x = outside(k, x0, wf, ws);
@@ -639,10 +780,47 @@ fn sampleLevel(k: *kir.Kernel, slot: Slot, d: D, lv: Lvl, s: Arg, t: Arg, linear
     const y1 = k.op2(.fadd, .f32, r(y0), f(1));
     const xb = idx(k, wrap(k, x1, wf, ws));
     const yb = idx(k, wrap(k, y1, hf, wt));
-    const t10 = if (cube_face) |face| cubeTap(k, slot, d, lv, face, x1, y0, linear, kind) else filteredTexel(k, slot, d, lv, xb, ya, kind);
-    const t01 = if (cube_face) |face| cubeTap(k, slot, d, lv, face, x0, y1, linear, kind) else filteredTexel(k, slot, d, lv, xa, yb, kind);
-    var t11 = if (cube_face) |face| cubeTap(k, slot, d, lv, face, x1, y1, linear, kind) else filteredTexel(k, slot, d, lv, xb, yb, kind);
-    var t00b = t00;
+    var t10 = if (cube_face) |face| cubeTap(k, slot, d, lv, face, x1, y0, linear, kind) else filteredTexel(k, slot, d, lv, xb, ya, kind, false);
+    var t01 = if (cube_face) |face| cubeTap(k, slot, d, lv, face, x0, y1, linear, kind) else filteredTexel(k, slot, d, lv, xa, yb, kind, false);
+    var t11 = if (cube_face) |face| cubeTap(k, slot, d, lv, face, x1, y1, linear, kind) else filteredTexel(k, slot, d, lv, xb, yb, kind, false);
+    var t00m = t00;
+    if (cube_face == null and slot.shadow == null) {
+        // (a block-compressed image: the four taps decoded in one loop, one
+        // decoder's code in the program, not four: Unigine's shaders, a
+        // decoder a tap, passed the GPU compiler's size)
+        var taps: [4][4]V = undefined;
+        const from = [4][4]Arg{ t00, t10, t01, t11 };
+        for (&taps, from) |*tp, src| for (tp, src) |*g, v| {
+            g.* = k.reg(.f32);
+            k.set(g.*, .mov, v, no, no);
+        };
+        const bck = k.op3(.bfe, .u32, r(d.fmt), u(F_BC_SHIFT), u(3));
+        const srgb = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(d.fmt), u(F_SRGB))), u(0));
+        k.ifp(r(k.cmp(.u32, .ne, r(bck), u(0))));
+        {
+            const n = k.reg(.u32);
+            k.set(n, .mov, u(0), no, no);
+            k.loop();
+            {
+                const tx_ = k.sel(.u32, r(k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(n), u(1))), u(0))), xb, xa);
+                const ty_n = k.sel(.u32, r(k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(n), u(2))), u(0))), yb, ya);
+                const v = bcTexel(k, slot.b, d, lv, r(tx_), r(ty_n), bck, srgb);
+                for (taps, 0..) |tp, ti| {
+                    const here = k.cmp(.u32, .eq, r(n), u(@intCast(ti)));
+                    for (tp, v) |g, val| k.set(g, .sel, r(val), r(g), r(here));
+                }
+                k.set(n, .iadd, r(n), u(1), no);
+                k.brk(r(k.cmp(.u32, .ge, r(n), u(4))));
+            }
+            k.endloop();
+        }
+        k.endif();
+        for (&t00m, taps[0]) |*o, g| o.* = r(g);
+        for (&t10, taps[1]) |*o, g| o.* = r(g);
+        for (&t01, taps[2]) |*o, g| o.* = r(g);
+        for (&t11, taps[3]) |*o, g| o.* = r(g);
+    }
+    var t00b = t00m;
     var t10b = t10;
     var t01b = t01;
     if (cube_face == null) {
@@ -653,7 +831,7 @@ fn sampleLevel(k: *kir.Kernel, slot: Slot, d: D, lv: Lvl, s: Arg, t: Arg, linear
         const out_y0 = outside(k, y0, hf, wt);
         const out_y1 = outside(k, y1, hf, wt);
         const bc = borderColor(k, slot);
-        t00b = withBorder(k, t00, bc, k.op2(.por, .pred, r(out_x0), r(out_y0)), kind);
+        t00b = withBorder(k, t00m, bc, k.op2(.por, .pred, r(out_x0), r(out_y0)), kind);
         t10b = withBorder(k, t10, bc, k.op2(.por, .pred, r(out_x1), r(out_y0)), kind);
         t01b = withBorder(k, t01, bc, k.op2(.por, .pred, r(out_x0), r(out_y1)), kind);
         t11 = withBorder(k, t11, bc, k.op2(.por, .pred, r(out_x1), r(out_y1)), kind);
@@ -715,7 +893,7 @@ pub fn fetch(k: *kir.Kernel, slot: Slot, x: Arg, y: Arg, kind: Kind, off: [2]i32
 fn sliceOf(k: *kir.Kernel, level: Lvl, layer: ?Arg) Lvl {
     const z = layer orelse return level;
     var lv = level;
-    const pitch = k.op2(.imul, .u32, r(lv.h), r(lv.stride));
+    const pitch = k.op2(.imul, .u32, r(lv.rows), r(lv.stride));
     lv.off = k.op3(.imad, .u32, z, r(pitch), r(lv.off));
     return lv;
 }
@@ -732,8 +910,82 @@ pub fn fetchArray(k: *kir.Kernel, slot: Slot, x: Arg, y: Arg, layer: ?Arg, kind:
     const level = levelAt(k, slot, lod);
     const z = if (layer) |a| cl(k, a, slot.offset_z, depthAt(k, slot, level)) else null;
     const lv = sliceOf(k, levelOf(k, slot, d, level), z);
-    const raw = texel(k, slot.b, d, lv, cl(k, x, off[0], lv.w), cl(k, y, off[1], lv.h), kind);
+    const raw = texel(k, slot.b, d, lv, cl(k, x, off[0], lv.w), cl(k, y, off[1], lv.h), kind, true);
     return finish(k, d, raw, kind);
+}
+
+/// Where a typed UAV's texel (x, y, layer: u32) is: its byte offset in
+/// the binding, and whether it is inside the view (level 0 of the
+/// descriptor: a UAV view's level; its layers or depth). Rows only (a
+/// view's image is never block linear).
+pub const Place = struct { addr: V, inside: V };
+
+pub fn texelPlace(k: *kir.Kernel, slot: Slot, x: Arg, y: Arg, layer: ?Arg) Place {
+    const d = loadDesc(k, slot);
+    var lv = levelOf(k, slot, d, k.mov(.u32, u(0)));
+    var inside = k.op2(.pand, .pred, r(k.cmp(.u32, .lt, x, r(lv.w))), r(k.cmp(.u32, .lt, y, r(lv.h))));
+    if (layer) |z| {
+        const count = descWord(k, slot, D_LAYERS);
+        inside = k.op2(.pand, .pred, r(inside), r(k.cmp(.u32, .lt, z, r(count))));
+        lv = sliceOf(k, lv, z);
+    }
+    const shift = k.op3(.bfe, .u32, r(d.fmt), u(0), u(3));
+    const addr = k.op2(.iadd, .u32, r(lv.off), r(k.op3(.imad, .u32, y, r(lv.stride), r(k.op2(.shl, .u32, x, r(shift))))));
+    // (and never past the image)
+    const last = k.op2(.shl, .u32, r(d.last), u(2));
+    inside = k.op2(.pand, .pred, r(inside), r(k.cmp(.u32, .le, r(addr), r(last))));
+    return .{ .addr = addr, .inside = inside };
+}
+
+/// A typed UAV's texel written (store_uav_typed): `vals`, the view's R, G,
+/// B, A (floats' bits, or integers), as the image keeps them: 32-bit
+/// channels (float, int, uint) word by word, as many as it has; RGBA8 and
+/// BGRA8 packed (clamped to [0, 1], rounded). Outside the view nothing is
+/// written (Direct3D drops it). Not yet: 8- and 16-bit formats of one or
+/// two channels (R8, RG8, R16, RG16): not written.
+pub fn store(k: *kir.Kernel, slot: Slot, x: Arg, y: Arg, layer: ?Arg, vals: [4]Arg) void {
+    const d = loadDesc(k, slot);
+    const pl = texelPlace(k, slot, x, y, layer);
+    const shift = k.op3(.bfe, .u32, r(d.fmt), u(0), u(3));
+    const fkind = k.op3(.bfe, .u32, r(d.fmt), u(4), u(3));
+    const channels = k.op3(.bfe, .u32, r(d.fmt), u(8), u(3));
+    const mem = kir.global(slot.b, 32);
+    k.ifp(r(pl.inside));
+    {
+        // (32-bit channels: float 1, int 2, uint 3)
+        const words = k.op2(.pand, .pred, r(k.cmp(.u32, .ne, r(fkind), u(0))), r(k.cmp(.u32, .ne, r(fkind), u(4))));
+        k.ifp(r(words));
+        for (vals, 0..) |v, c| {
+            k.ifp(r(k.cmp(.u32, .gt, r(channels), u(@intCast(c)))));
+            k.store(.u32, mem, r(k.op2(.iadd, .u32, r(pl.addr), u(@intCast(4 * c)))), asBits(k, v));
+            k.endif();
+        }
+        k.endif();
+        // (four bytes of unorm8: RGBA8, BGRA8, each channel where the
+        // swizzle says the format keeps it)
+        const rgba8 = k.op2(.pand, .pred, r(k.cmp(.u32, .eq, r(fkind), u(0))), r(k.cmp(.u32, .eq, r(shift), u(2))));
+        k.ifp(r(rgba8));
+        {
+            var word: Arg = u(0);
+            for (vals, 0..) |v, c| {
+                const fv = if (v == .reg) r(k.mov(.f32, v)) else v;
+                const clamped = k.op2(.fmin, .f32, r(k.op2(.fmax, .f32, fv, f(0))), f(1));
+                const byte = k.cvt(.f32, .u32, .rz, r(k.op2(.fadd, .f32, r(k.op2(.fmul, .f32, r(clamped), f(255))), f(0.5))));
+                const pos = k.op3(.bfe, .u32, r(d.swz), u(@intCast(3 * c)), u(3));
+                // (a channel the format does not keep (SWZ_ZERO, SWZ_ONE): dropped)
+                const kept = k.cmp(.u32, .lt, r(pos), u(4));
+                const placed = k.op2(.shl, .u32, r(byte), r(k.op2(.shl, .u32, r(k.op2(.@"and", .u32, r(pos), u(3))), u(3))));
+                word = r(k.op2(.@"or", .u32, word, r(k.sel(.u32, r(kept), r(placed), u(0)))));
+            }
+            k.store(.u32, mem, r(pl.addr), word);
+        }
+        k.endif();
+    }
+    k.endif();
+}
+
+fn asBits(k: *kir.Kernel, a: Arg) Arg {
+    return if (a == .reg) r(k.mov(.u32, a)) else a;
 }
 
 pub fn layerSize(k: *kir.Kernel, slot: Slot, lod: Arg) Arg {
@@ -783,4 +1035,118 @@ test "texture: a descriptor's words" {
     try std.testing.expectEqual(@as(u32, 15), w[D_LAST]);
     descriptor(.{}, &w);
     try std.testing.expectEqual(@as(u32, 0), w[D_FMT]);
+}
+
+test "texture: block-compressed texels read as bc.sig decodes them (every kind, three levels)" {
+    const bc = @import("bc.sig");
+    const interp = gpu.interp;
+    const kinds = [_]bc.Kind{ .bc1, .bc2, .bc3, .bc4u, .bc4s, .bc5u, .bc5s };
+    const fmts = [_]engine.Format{ .rgba8, .rgba8, .rgba8, .r8, .r32f, .rg8, .rg32f };
+    const S = struct {
+        // level 0 (8x8: 2x2 blocks), level 1 (4x4: one), level 2 (2x2: one)
+        var mem: [6 * 16]u8 align(16) = undefined;
+        var uni: [DESC_WORDS]u32 = undefined;
+        var out: [128 * 4]f32 = undefined;
+        var insts: [8192]kir.Inst = undefined;
+        var tys: [8192]kir.Ty = undefined;
+        var work: [4 << 20]u8 align(64) = undefined;
+    };
+    var rng = std.Random.DefaultPrng.init(0xbc15);
+    for (kinds, fmts, 1..) |kind, fmt, code| {
+        rng.random().bytes(&S.mem);
+        const bb = kind.blockBytes();
+        var img = engine.Image{ .buf = .{ .cpu = &S.mem, .bytes = S.mem.len }, .width = 8, .height = 8, .stride = 2 * bb, .format = fmt, .levels = 3, .bc = @intCast(code) };
+        img.level_at[1] = 4 * bb;
+        img.level_at[2] = 5 * bb;
+        descriptor(.{ .img = &img, .last = 2 }, &S.uni);
+        var k = kir.Kernel.init(.{ .insts = &S.insts, .tys = &S.tys }, "bc", .{ 128, 1, 1 });
+        const bt = k.binding();
+        const bu = k.binding();
+        const bo = k.binding();
+        const ix = k.tid(0);
+        // (lanes 0..63 level 0, 64..79 level 1, 80..83 level 2)
+        const in1 = k.cmp(.u32, .ge, r(ix), u(64));
+        const in2 = k.cmp(.u32, .ge, r(ix), u(80));
+        const j = k.sel(.u32, r(in2), r(k.op2(.isub, .u32, r(ix), u(80))), r(k.sel(.u32, r(in1), r(k.op2(.isub, .u32, r(ix), u(64))), r(ix))));
+        const wlog = k.sel(.u32, r(in2), u(1), r(k.sel(.u32, r(in1), u(2), u(3))));
+        const x = k.op2(.@"and", .u32, r(j), r(k.op2(.isub, .u32, r(k.op2(.shl, .u32, u(1), r(wlog))), u(1))));
+        const y = k.op2(.shr, .u32, r(j), r(wlog));
+        const lod = k.sel(.u32, r(in2), u(2), r(k.sel(.u32, r(in1), u(1), u(0))));
+        const v = fetch(&k, .{ .b = bt, .uni = bu, .word = 0 }, r(x), r(y), .float, .{ 0, 0 }, r(lod));
+        for (v, 0..) |c, n| k.store(.f32, kir.global(bo, 32), r(k.op3(.imad, .u32, r(ix), u(16), u(@intCast(4 * n)))), c);
+        try k.finish();
+        var w = gpu.Work.init(&S.work);
+        var trap: interp.Trap = .{};
+        _ = try interp.runKernel(&k, gpu.interp_caps, .{ 1, 1, 1 }, &.{ &S.mem, std.mem.sliceAsBytes(&S.uni), std.mem.sliceAsBytes(&S.out) }, &.{}, &w, &trap);
+        const levels = [_][3]u32{ .{ 0, 8, 0 }, .{ 4 * bb, 4, 64 }, .{ 5 * bb, 2, 80 } };
+        const tb = kind.texelBytes();
+        for (levels) |lv| {
+            const nb = bc.blocks(lv[1]);
+            const span = @min(4, lv[1]);
+            for (0..nb) |by| for (0..nb) |bx| {
+                var px: [4 * 4 * 8]u8 = undefined;
+                bc.decode(kind, S.mem[lv[0] + (by * nb + bx) * bb ..][0..bb], &px, 4 * tb, span, span);
+                for (0..span) |ty_| for (0..span) |tx| {
+                    const t = px[(ty_ * 4 + tx) * tb ..];
+                    var want = [4]f32{ 0, 0, 0, 1 };
+                    switch (kind) {
+                        .bc1, .bc2, .bc3 => for (&want, 0..) |*o, c| {
+                            o.* = @as(f32, @floatFromInt(t[c])) * (1.0 / 255.0);
+                        },
+                        .bc4u, .bc5u => for (0..tb) |c| {
+                            want[c] = @as(f32, @floatFromInt(t[c])) * (1.0 / 255.0);
+                        },
+                        .bc4s, .bc5s => for (0..tb / 4) |c| {
+                            want[c] = @bitCast(std.mem.readInt(u32, t[4 * c ..][0..4], .little));
+                        },
+                    }
+                    const lane = lv[2] + (by * 4 + ty_) * lv[1] + bx * 4 + tx;
+                    const got = S.out[lane * 4 ..][0..4];
+                    for (want, got) |a, g| {
+                        if (@abs(a - g) > 1e-6) {
+                            std.debug.print("{s} level width {d} texel ({d}, {d}): want {any} got {any}\n", .{ @tagName(kind), lv[1], bx * 4 + tx, by * 4 + ty_, want, got.* });
+                            return error.TestExpectedEqual;
+                        }
+                    }
+                };
+            };
+        }
+        // Sampled, bilinear, between four texels of level 0 (repeat): their
+        // mean, every tap of sampleLevel's decoding loop in it.
+        const fetched = S.out;
+        descriptor(.{ .img = &img, .last = 2, .linear = true, .min_linear = true }, &S.uni);
+        var ks = kir.Kernel.init(.{ .insts = &S.insts, .tys = &S.tys }, "bc-sampled", .{ 64, 1, 1 });
+        const st = ks.binding();
+        const su = ks.binding();
+        const so = ks.binding();
+        const sx = ks.tid(0);
+        const fx = ks.cvt(.u32, .f32, .rne, r(ks.op2(.@"and", .u32, r(sx), u(7))));
+        const fy = ks.cvt(.u32, .f32, .rne, r(ks.op2(.shr, .u32, r(sx), u(3))));
+        // ((x + 1) / 8: halfway between texels x and x + 1)
+        const ss = ks.op2(.fmul, .f32, r(ks.op2(.fadd, .f32, r(fx), f(1))), f(0.125));
+        const tt = ks.op2(.fmul, .f32, r(ks.op2(.fadd, .f32, r(fy), f(1))), f(0.125));
+        const sv = sample(&ks, .{ .b = st, .uni = su, .word = 0 }, r(ss), r(tt), .float, .{ 0, 0 }, .base);
+        for (sv, 0..) |c, n| ks.store(.f32, kir.global(so, 32), r(ks.op3(.imad, .u32, r(sx), u(16), u(@intCast(4 * n)))), c);
+        try ks.finish();
+        var ws = gpu.Work.init(&S.work);
+        var strap: interp.Trap = .{};
+        _ = try interp.runKernel(&ks, gpu.interp_caps, .{ 1, 1, 1 }, &.{ &S.mem, std.mem.sliceAsBytes(&S.uni), std.mem.sliceAsBytes(&S.out) }, &.{}, &ws, &strap);
+        for (0..8) |yy| for (0..8) |xx| {
+            const at = struct {
+                fn t(o: *const [128 * 4]f32, x_: usize, y_: usize, c: usize) f32 {
+                    return o[((y_ % 8) * 8 + x_ % 8) * 4 + c];
+                }
+            }.t;
+            for (0..4) |c| {
+                const top = at(&fetched, xx, yy, c) * 0.5 + at(&fetched, xx + 1, yy, c) * 0.5;
+                const bot = at(&fetched, xx, yy + 1, c) * 0.5 + at(&fetched, xx + 1, yy + 1, c) * 0.5;
+                const want = top * 0.5 + bot * 0.5;
+                const got = S.out[(yy * 8 + xx) * 4 + c];
+                if (@abs(want - got) > 1e-6) {
+                    std.debug.print("{s} sampled between ({d}, {d}) channel {d}: want {d} got {d}\n", .{ @tagName(kind), xx, yy, c, want, got });
+                    return error.TestExpectedEqual;
+                }
+            }
+        };
+    }
 }

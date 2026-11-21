@@ -1,7 +1,9 @@
 //! @zpm/hlsl intrin — HLSL's intrinsic functions and the methods of its
 //! objects (textures' Sample, SampleLevel, SampleBias, SampleGrad,
 //! SampleCmp, SampleCmpLevelZero, Load, GetDimensions, Gather; streams'
-//! Append and RestartStrip), as DXBC instructions. The ones DXBC has no
+//! Append and RestartStrip; UAVs' and buffers' Load, Store, GetDimensions,
+//! Interlocked*, counters, Append and Consume), as DXBC instructions;
+//! Interlocked* and the memory barriers. The ones DXBC has no
 //! instruction for (atan, asin, acos, pow, fmod, smoothstep, ...) are the
 //! sequences fxc writes, with its approximations' constants.
 
@@ -9,6 +11,7 @@ const std = @import("std");
 const ast = @import("ast.sig");
 const ir = @import("ir.sig");
 const gen = @import("gen.sig");
+const mem = @import("mem.sig");
 
 const Gen = gen.Gen;
 const Val = gen.Val;
@@ -60,6 +63,7 @@ pub fn call(g: *Gen, n: u32) Val {
     }
     // out arguments first need their places
     if (eq(name, "sincos")) return sincosCall(g, argn[0..argc]);
+    if (atomicOf(name, "Interlocked")) |what| return interlockedCall(g, n, name, what, argn[0..argc]);
     if (eq(name, "modf")) return modfCall(g, argn[0..argc]);
     var args: [MAX_ARGS]Val = undefined;
     for (argn[0..argc], 0..) |a, k| {
@@ -607,7 +611,7 @@ fn intrinsic(g: *Gen, name: []const u8, args: []const Val) Val {
     if (eq(name, "ddx") or eq(name, "ddy") or eq(name, "ddx_coarse") or eq(name, "ddy_coarse") or eq(name, "ddx_fine") or eq(name, "ddy_fine") or eq(name, "fwidth")) {
         if (!need(g, name, args, 1)) return none(g);
         if (g.target.stage != .pixel) {
-            g.fail("{s} is for pixel shaders", .{name});
+            g.failCode(4532, "cannot map expression to {s} instruction set", .{g.targetName()});
             return none(g);
         }
         const t = floatTy(g, args[0].ty);
@@ -690,6 +694,7 @@ fn intrinsic(g: *Gen, name: []const u8, args: []const Val) Val {
         if (!need(g, name, args, 2)) return none(g);
         return mul(g, args[0], args[1]);
     }
+    if (barrierFlags(name)) |fl| return barrier(g, name, fl, args.len);
     if (eq(name, "noise")) {
         g.fail("noise is not supported in Shader Model 4", .{});
         return none(g);
@@ -928,6 +933,13 @@ pub fn method(g: *Gen, n: u32) Val {
     }
     const t = g.ty(obj.ty);
     if (t.class == .stream) return streamMethod(g, name, argn[0..argc]);
+    if (t.class == .sbuffer) return bufferMethod(g, obj, name, argn[0..argc]);
+    if (t.class == .rwtexture) {
+        if (eq(name, "GetDimensions")) return getDimensions(g, obj, argn[0..argc]);
+        if (eq(name, "Load") and argc == 1) return mem.objectIndex(g, obj, g.expr(argn[0]));
+        g.fail("'{s}': no such method", .{name});
+        return none(g);
+    }
     if (t.class != .texture) {
         g.fail("'{s}': no such method", .{name});
         return none(g);
@@ -1008,7 +1020,8 @@ fn textureOp(g: *Gen, obj: Val, name: []const u8, args: []const Val) Val {
     var i = ir.Inst{ .op = .sample, .n = 0 };
     const v = g.vreg();
     var outn: u8 = el.n;
-    if (eq(name, "Sample") or eq(name, "SampleBias") or eq(name, "SampleLevel") or eq(name, "SampleGrad") or eq(name, "SampleCmp") or eq(name, "SampleCmpLevelZero") or eq(name, "Gather")) {
+    const gather_comp: ?u2 = if (eq(name, "Gather") or eq(name, "GatherRed")) 0 else if (eq(name, "GatherGreen")) 1 else if (eq(name, "GatherBlue")) 2 else if (eq(name, "GatherAlpha")) 3 else null;
+    if (eq(name, "Sample") or eq(name, "SampleBias") or eq(name, "SampleLevel") or eq(name, "SampleGrad") or eq(name, "SampleCmp") or eq(name, "SampleCmpLevelZero") or gather_comp != null) {
         if (args.len < 2) {
             g.fail("'{s}': too few arguments", .{name});
             return none(g);
@@ -1017,11 +1030,12 @@ fn textureOp(g: *Gen, obj: Val, name: []const u8, args: []const Val) Val {
         const coord = floatArg(g, args[1], cc.c);
         var next: usize = 2;
         const cmp = eq(name, "SampleCmp") or eq(name, "SampleCmpLevelZero");
+        // (implicit derivatives: pixel shaders only)
+        if ((eq(name, "Sample") or eq(name, "SampleBias") or eq(name, "SampleCmp")) and g.target.stage != .pixel) {
+            g.failCode(4532, "cannot map expression to {s} instruction set", .{g.targetName()});
+            return none(g);
+        }
         if (eq(name, "Sample")) {
-            if (g.target.stage != .pixel) {
-                g.fail("Sample needs derivatives: use SampleLevel outside pixel shaders", .{});
-                return none(g);
-            }
             i.op = .sample;
         } else if (eq(name, "SampleBias")) i.op = .sample_b else if (eq(name, "SampleLevel")) i.op = .sample_l else if (eq(name, "SampleGrad")) i.op = .sample_d else if (eq(name, "SampleCmp")) i.op = .sample_c else if (eq(name, "SampleCmpLevelZero")) i.op = .sample_c_lz else i.op = .gather4;
         if (cmp) outn = 1;
@@ -1033,7 +1047,8 @@ fn textureOp(g: *Gen, obj: Val, name: []const u8, args: []const Val) Val {
         i.ops[2] = ro;
         i.ops[3] = samplerOpnd(sreg);
         if (i.op == .gather4) {
-            i.ops[3] = .{ .reg = .sampler, .comps = 4, .mode = .select1, .swz = .{ 0, 0, 0, 0 }, .dims = 1, .idx = .{ sreg, 0 } };
+            const gc = gather_comp orelse 0;
+            i.ops[3] = .{ .reg = .sampler, .comps = 4, .mode = .select1, .swz = .{ gc, 0, 0, 0 }, .dims = 1, .idx = .{ sreg, 0 } };
         }
         i.n = 4;
         switch (i.op) {
@@ -1109,10 +1124,66 @@ fn textureOp(g: *Gen, obj: Val, name: []const u8, args: []const Val) Val {
     return none(g);
 }
 
+/// `tex[i]`: Load at mip 0 (or sample 0 of a multisampled texture).
+pub fn textureIndex(g: *Gen, obj: Val, iv: Val) Val {
+    const t = g.ty(obj.ty);
+    const dim: ast.TexDim = @enumFromInt(t.dim);
+    const cc = coordCount(dim);
+    if (dim == .buffer) return textureOp(g, obj, "Load", &.{iv});
+    if (dim == .tex2dms or dim == .tex2dmsarray) return textureOp(g, obj, "Load", &.{ iv, g.immVal(g.scalarTy(.int), 0) });
+    const a = intArg(g, iv, cc.c);
+    var sc: [4]Src = undefined;
+    for (0..cc.c) |k| sc[k] = component(a, @intCast(k));
+    sc[cc.c] = imm1(0);
+    const at = scalarOf(g, g.a.vector(.int, cc.c + 1), g.pack(sc[0 .. cc.c + 1]));
+    return textureOp(g, obj, "Load", &.{at});
+}
+
+/// A buffer's or typed UAV's GetDimensions: bufinfo (element count) or
+/// resinfo without levels (an RWTexture's width, height, depth or
+/// elements).
+fn uavDimensions(g: *Gen, obj: Val, argn: []const u32) Val {
+    const t = g.ty(obj.ty);
+    const dim: ast.TexDim = @enumFromInt(t.dim);
+    const kind: u8 = if (t.class == .rwtexture) 'u' else 't';
+    if (dim == .buffer) {
+        if (argn.len != 1) {
+            g.fail("GetDimensions: wrong number of arguments", .{});
+            return none(g);
+        }
+        const l = g.lvalue(argn[0]);
+        if (g.failed) return none(g);
+        g.store(l, scalarOf(g, g.scalarTy(.uint), mem.bufinfo(g, obj, kind)));
+        return .{ .ty = 0, .kind = .none };
+    }
+    const comps: []const u2 = switch (dim) {
+        .tex1d => &.{0},
+        .tex1darray, .tex2d => &.{ 0, 1 },
+        else => &.{ 0, 1, 2 },
+    };
+    if (argn.len != comps.len) {
+        g.fail("GetDimensions: wrong number of arguments", .{});
+        return none(g);
+    }
+    var lv: [3]gen.LVal = undefined;
+    for (argn, 0..) |a, k| lv[k] = g.lvalue(a);
+    if (g.failed) return none(g);
+    const fl = g.baseOf(lv[0].ty) == .float;
+    const v = g.vreg();
+    var i = ir.Inst{ .op = .resinfo, .n = 3, .ctl = if (fl) 0 else 2 };
+    i.ops[0] = Gen.dstOpnd(v, .{ 0, 1, 2, 3 }, 4);
+    i.ops[1] = .{ .reg = .imm32, .comps = 1, .imm = .{ 0, 0, 0, 0 } };
+    i.ops[2] = .{ .reg = .uav, .comps = 4, .mode = .swizzle, .idx = .{ g.resource(obj.sym, obj.elem, kind), 0 } };
+    g.emit(i);
+    for (comps, 0..) |c, k| g.store(lv[k], scalarOf(g, g.scalarTy(if (fl) .float else .uint), component(Gen.tempSrc(v, 4), c)));
+    return .{ .ty = 0, .kind = .none };
+}
+
 /// GetDimensions([mip,] out width[, out height][, out depth/elements], out levels).
 fn getDimensions(g: *Gen, obj: Val, argn: []const u32) Val {
     const t = g.ty(obj.ty);
     const dim: ast.TexDim = @enumFromInt(t.dim);
+    if (t.class == .rwtexture or dim == .buffer) return uavDimensions(g, obj, argn);
     const treg = texReg(g, obj);
     // which outputs this dimension has (resinfo: x w, y h, z d/elements, w levels)
     const comps: []const u2 = switch (dim) {
@@ -1159,6 +1230,175 @@ fn getDimensions(g: *Gen, obj: Val, argn: []const u32) Val {
         g.store(lv[k], sv);
     }
     return .{ .ty = 0, .kind = .none };
+}
+
+// ── memory: atomics, barriers, buffers ─────────────────────────────────────
+
+/// Interlocked<Op> / <prefix><Op>: which atomic (null: not one).
+fn atomicOf(name: []const u8, prefix: []const u8) ?mem.Atomic {
+    if (!std.mem.startsWith(u8, name, prefix)) return null;
+    const op = name[prefix.len..];
+    const Pair = struct { s: []const u8, a: mem.Atomic };
+    const ops = [_]Pair{
+        .{ .s = "Add", .a = .add },                         .{ .s = "Min", .a = .min },        .{ .s = "Max", .a = .max },
+        .{ .s = "And", .a = .@"and" },                      .{ .s = "Or", .a = .@"or" },       .{ .s = "Xor", .a = .xor },
+        .{ .s = "Exchange", .a = .exchange },               .{ .s = "CompareExchange", .a = .cmp_exchange },
+        .{ .s = "CompareStore", .a = .cmp_store },
+    };
+    for (ops) |p| if (eq(op, p.s)) return p.a;
+    return null;
+}
+
+/// The operands an atomic takes after its destination: values, and
+/// whether the original value comes back.
+fn atomicArgs(what: mem.Atomic, n: usize) ?struct { values: u8, want: bool } {
+    return switch (what) {
+        .cmp_exchange => if (n == 3) .{ .values = 2, .want = true } else null,
+        .cmp_store => if (n == 2) .{ .values = 2, .want = false } else null,
+        .exchange => if (n == 2) .{ .values = 1, .want = true } else null,
+        else => if (n == 1 or n == 2) .{ .values = 1, .want = n == 2 } else null,
+    };
+}
+
+/// An atomic on place `pl` with the argument nodes after its address.
+fn atomicOn(g: *Gen, pl: Val, what: mem.Atomic, name: []const u8, rest: []const u32) Val {
+    const shape = atomicArgs(what, rest.len) orelse {
+        g.fail("'{s}': wrong number of arguments", .{name});
+        return none(g);
+    };
+    // (the values as the destination's type)
+    const vt = if (g.a.isNumeric(pl.ty)) g.a.scalar(g.baseOf(pl.ty)) else g.scalarTy(.uint);
+    var vals: [2]Src = undefined;
+    for (0..shape.values) |k| {
+        const v = g.convert(g.expr(rest[k]), vt);
+        if (g.failed) return none(g);
+        vals[k] = g.plain(g.srcs[g.rows(v).at]);
+    }
+    var out: ?gen.LVal = null;
+    if (shape.want) out = g.lvalue(rest[shape.values]);
+    if (g.failed) return none(g);
+    const r = mem.atomic(g, pl, what, vals[0], if (shape.values == 2) vals[1] else null, shape.want);
+    if (out) |l| {
+        if (r) |s| g.store(l, scalarOf(g, vt, s));
+    }
+    return .{ .ty = 0, .kind = .none };
+}
+
+fn interlockedCall(g: *Gen, n: u32, name: []const u8, what: mem.Atomic, argn: []const u32) Val {
+    if (argn.len < 2) {
+        g.fail("'{s}': wrong number of arguments", .{name});
+        return none(g);
+    }
+    const l = g.lvalue(argn[0]);
+    if (g.failed) return none(g);
+    // (fxc's errors point at the call)
+    g.locate(n);
+    const pl = l.place orelse {
+        g.failCode(3549, "interlocked targets must be groupshared or UAV elements", .{});
+        return none(g);
+    };
+    if (!mem.atomicTarget(g, pl, what)) return none(g);
+    return atomicOn(g, pl, what, name, argn[1..]);
+}
+
+/// A barrier's sync flags (null: not a barrier).
+fn barrierFlags(name: []const u8) ?u16 {
+    const Pair = struct { s: []const u8, f: u16 };
+    const all = [_]Pair{
+        .{ .s = "GroupMemoryBarrier", .f = ir.SYNC_TGSM },
+        .{ .s = "GroupMemoryBarrierWithGroupSync", .f = ir.SYNC_TGSM | ir.SYNC_THREADS },
+        .{ .s = "DeviceMemoryBarrier", .f = ir.SYNC_UAV_GLOBAL },
+        .{ .s = "DeviceMemoryBarrierWithGroupSync", .f = ir.SYNC_UAV_GLOBAL | ir.SYNC_THREADS },
+        .{ .s = "AllMemoryBarrier", .f = ir.SYNC_UAV_GLOBAL | ir.SYNC_TGSM },
+        .{ .s = "AllMemoryBarrierWithGroupSync", .f = ir.SYNC_UAV_GLOBAL | ir.SYNC_TGSM | ir.SYNC_THREADS },
+    };
+    for (all) |p| if (eq(name, p.s)) return p.f;
+    return null;
+}
+
+/// A memory barrier: sync with its flags. Pixel shaders have UAVs but no
+/// thread group: DeviceMemoryBarrier only. (fxc drops a barrier with no
+/// memory of its kinds touched both before and after it: Compiler does.)
+fn barrier(g: *Gen, name: []const u8, fl: u16, nargs: usize) Val {
+    if (nargs != 0) {
+        g.fail("'{s}' takes no arguments", .{name});
+        return none(g);
+    }
+    const ok = g.target.stage == .compute or (g.target.stage == .pixel and g.target.major >= 5 and fl == ir.SYNC_UAV_GLOBAL);
+    if (!ok) {
+        g.failCode(3664, "{s} does not support thread synchronization operations", .{g.targetName()});
+        return none(g);
+    }
+    g.emit(.{ .op = .sync, .ndst = 0, .ctl = fl });
+    return .{ .ty = 0, .kind = .none };
+}
+
+/// Structured, byte address, append and consume buffers' methods.
+fn bufferMethod(g: *Gen, obj: Val, name: []const u8, argn: []const u32) Val {
+    const t = g.ty(obj.ty);
+    const k: ast.BufKind = @enumFromInt(t.dim);
+    const rw = ast.bufWritable(k);
+    const kind: u8 = if (rw) 'u' else 't';
+    const uint_t = g.scalarTy(.uint);
+    if (eq(name, "GetDimensions")) {
+        const structured = ast.bufStructured(k);
+        if (argn.len != @as(usize, if (structured) 2 else 1)) {
+            g.fail("GetDimensions: wrong number of arguments", .{});
+            return none(g);
+        }
+        const l0 = g.lvalue(argn[0]);
+        const l1 = if (structured) g.lvalue(argn[1]) else l0;
+        if (g.failed) return none(g);
+        g.store(l0, scalarOf(g, uint_t, mem.bufinfo(g, obj, kind)));
+        if (structured) g.store(l1, scalarOf(g, uint_t, imm1(mem.size(g, t.elem))));
+        return .{ .ty = 0, .kind = .none };
+    }
+    switch (k) {
+        .structured, .rw_structured => {
+            if (eq(name, "Load") and argn.len == 1) return g.rows(mem.objectIndex(g, obj, g.expr(argn[0])));
+            if (k == .rw_structured and (eq(name, "IncrementCounter") or eq(name, "DecrementCounter")) and argn.len == 0) {
+                return scalarOf(g, uint_t, mem.counter(g, obj, eq(name, "IncrementCounter"), true));
+            }
+        },
+        .append => if (eq(name, "Append") and argn.len == 1) {
+            const v = g.convert(g.expr(argn[0]), t.elem);
+            if (g.failed) return none(g);
+            const ix = mem.counter(g, obj, true, false);
+            mem.write(g, mem.uavElement(g, obj, ix), v);
+            return .{ .ty = 0, .kind = .none };
+        },
+        .consume => if (eq(name, "Consume") and argn.len == 0) {
+            const ix = mem.counter(g, obj, false, false);
+            return mem.read(g, mem.uavElement(g, obj, ix));
+        },
+        .byte_address, .rw_byte_address => {
+            const loads = [_][]const u8{ "Load", "Load2", "Load3", "Load4" };
+            const stores = [_][]const u8{ "Store", "Store2", "Store3", "Store4" };
+            for (loads, 1..) |s, n| if (eq(name, s) and argn.len == 1) {
+                const addr = g.indexSrc(g.expr(argn[0]));
+                return mem.read(g, mem.rawPlace(g, obj, addr, g.a.vector(.uint, @intCast(n))));
+            };
+            for (stores, 1..) |s, n| if (rw and eq(name, s) and argn.len == 2) {
+                const addr = g.indexSrc(g.expr(argn[0]));
+                const vt = g.a.vector(.uint, @intCast(n));
+                const v = g.convert(g.expr(argn[1]), vt);
+                if (g.failed) return none(g);
+                mem.write(g, mem.rawPlace(g, obj, addr, vt), v);
+                return .{ .ty = 0, .kind = .none };
+            };
+            if (atomicOf(name, "Interlocked")) |what| {
+                if (!rw or argn.len < 2) {
+                    g.fail("'{s}': no such method here", .{name});
+                    return none(g);
+                }
+                const addr = g.indexSrc(g.expr(argn[0]));
+                if (g.failed) return none(g);
+                return atomicOn(g, mem.rawPlace(g, obj, addr, uint_t), what, name, argn[1..]);
+            }
+        },
+    }
+    g.fail("'{s}': no such method", .{name});
+    return none(g);
 }
 
 fn streamMethod(g: *Gen, name: []const u8, argn: []const u32) Val {

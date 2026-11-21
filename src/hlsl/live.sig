@@ -236,6 +236,6 @@ pub const Live = struct {
 fn sideEffectFree(op: Op) bool {
     return switch (op) {
         .@"break", .breakc, .case, .@"continue", .continuec, .cut, .default, .discard, .@"else", .emit, .endif, .endloop, .endswitch, .@"if", .loop, .ret, .retc, .@"switch", .emit_stream, .cut_stream, .nop => false,
-        else => true,
+        else => !ir.memoryEffect(op),
     };
 }
