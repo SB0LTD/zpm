@@ -2,6 +2,26 @@
 
 ## Stock PostgreSQL dump and restore candidate
 
+`pg_default_acl` exposes PostgreSQL's relation OID 826, with `"char"`
+object codes and `aclitem[]` for both stored grants and the baseline
+returned by the stock discovery query. Built-in privileges are
+computed by `acldefault`. The catalog is empty because RamSQL has no
+`ALTER DEFAULT PRIVILEGES` entries. The sequence catalog code
+`S` is converted to `s` by the stock query. Table defaults follow the
+server's advertised PostgreSQL 16 baseline. PostgreSQL 17 and 18 also
+include `MAINTAIN`. The standalone Windows Sig catalog suite passed 105
+assertions, including both arms of the stock ACL expression.
+
+RAMSQL `65c5725` with ZPM `d94845a9` passed default ACL discovery
+on PostgreSQL 16 and 18. Both lanes checked the stock projection's
+type OIDs, the sequence-code translation, schema-local empty ACLs,
+the built-in privilege lists and NULL arguments. Native plain and
+custom imports passed row and constraint checks after WAL reopen.
+Outbound stock `pg_dump` passed default ACL discovery and stopped
+with `TableNotFound` on `pg_conversion`, before creating an archive.
+Both stock directions on both versions remain the merge gate.
+[PostgreSQL 16 and 18 default ACL CI](https://github.com/SB0LTD/ramsql/actions/runs/44919209003)
+
 The stock `pg_foreign_data_wrapper` query uses the allocator-free
 `pg_options_to_table(text[])` row source, SQL identifier and literal
 quoting, and the default owner-only USAGE ACL. The Sig executor preserves
