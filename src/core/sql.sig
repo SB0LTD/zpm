@@ -7651,7 +7651,7 @@ pub fn Database(comptime config: Config) type {
             if (late_primary) {
                 const tx = &self.txs[slot];
                 for (tx.writes[0..tx.write_len]) |entry| switch (entry.kind) {
-                    .create_table => if (entry.table == alter.table) {
+                    .create_table => if (self.tables[entry.table].oid == source.oid) {
                         fold_created_primary = true;
                     },
                     .insert => {
