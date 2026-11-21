@@ -15,6 +15,20 @@ OID through binary encode and WAL replay. Ambiguous and missing names return
 NULL through `to_regproc` and raise errors in strict casts. Routine
 dependency tracking in stored expressions and `regprocedure` remain open.
 
+RAMSQL `459011f` with ZPM `b4415a17` passed access-method and handler
+comparisons on PostgreSQL 16 and 18. Both lanes verified bound routine
+names and binary OIDs through an overloaded name, and passed stock plain
+and custom imports with row and constraint checks after WAL reopen. The
+local Sig catalog suite passed 79 assertions, including scalar and array
+`regproc` replay.
+
+Both outbound dumps passed access-method discovery and failed with
+`TableNotFound` on `pg_opclass`. The next native check should identify
+classes for the supported index semantics and verify the links to the
+access method, indexed type and operator family. Both stock directions on
+both versions remain the merge gate.
+[PostgreSQL 16 and 18 access-method discovery CI](https://github.com/SB0LTD/ramsql/actions/runs/44897386171)
+
 `pg_operator` now exposes PostgreSQL identities for 427 concrete operator
 signatures that execute in Sig. It includes prefix and infix signatures,
 argument and result OIDs, owner and namespace, and links to internal
