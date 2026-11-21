@@ -989,7 +989,7 @@ pub fn Database(comptime config: Config) type {
                 // query still reads user rows at an older transaction CSN.
                 var authority = snap;
                 authority.csn = self.csn;
-                if (self.catalog_objects.schemaUsage(role, namespace, schema.owner, authority)) return;
+                if (self.catalog_objects.schemaUsage(role, namespace, self.schemaOwner(schema, authority), authority)) return;
                 return error.InsufficientPrivilege;
             }
         }
@@ -1003,7 +1003,7 @@ pub fn Database(comptime config: Config) type {
             for (&self.schemas) |*schema| {
                 if (!schema.live or schema.oid != namespace) continue;
                 if (schema.dead_csn != 0) return error.UndefinedSchema;
-                if (schema.private_usage and self.catalog_objects.memberOf(role, schema.owner, true, authority)) return;
+                if (schema.private_usage and self.catalog_objects.memberOf(role, self.schemaOwner(schema, authority), true, authority)) return;
                 break;
             }
             return error.InsufficientPrivilege;
@@ -3639,9 +3639,15 @@ pub fn Database(comptime config: Config) type {
         fn ownsNamespace(self: *const Self, oid: u32, snap: Snapshot) bool {
             if (self.privilegedRole(snap)) return true;
             for (&self.schemas) |*schema| {
-                if (schema.live and schema.oid == oid) return self.catalog_objects.memberOf(self.session.role, schema.owner, true, snap);
+                if (schema.live and schema.oid == oid) return self.catalog_objects.memberOf(self.session.role, self.schemaOwner(schema, snap), true, snap);
             }
             return false;
+        }
+
+        fn schemaOwner(self: *const Self, schema: *const Schema, snap: Snapshot) u32 {
+            const key: O.Object = .{ .kind = .schema_owner, .target = schema.oid };
+            const index = self.catalog_objects.findKey(&key, snap) orelse return schema.owner;
+            return self.catalog_objects.items[index].owner;
         }
 
         // ---- catalog objects (B11 wave 3, catalog_objects.sig) --------------
@@ -3730,7 +3736,7 @@ pub fn Database(comptime config: Config) type {
         /// transaction's uncommitted object naming it is waited for.
         fn objectDependent(o: *const O.Object, oid: u32) bool {
             return switch (o.kind) {
-                .acl, .schema_acl, .schema_acl_state, .relation, .policy => o.target == oid,
+                .acl, .schema_acl, .schema_acl_state, .schema_owner, .relation, .policy => o.target == oid,
                 .statistics => o.target == oid or o.grantee == oid,
                 .publication_table, .publication_schema => o.grantee == oid,
                 .comment => o.target == oid,
@@ -3744,7 +3750,7 @@ pub fn Database(comptime config: Config) type {
             latest.csn = self.csn;
             var count: usize = 0;
             for (&self.catalog_objects.items) |*o| {
-                if ((o.kind == .statistics or o.kind == .schema_acl or o.kind == .schema_acl_state or CO.publicationMembership(o.kind)) and objectDependent(o, oid) and O.visible(o, latest) != O.visible(o, snap)) return error.SerializationFailure;
+                if ((o.kind == .statistics or o.kind == .schema_acl or o.kind == .schema_acl_state or o.kind == .schema_owner or CO.publicationMembership(o.kind)) and objectDependent(o, oid) and O.visible(o, latest) != O.visible(o, snap)) return error.SerializationFailure;
                 if (!O.visible(o, snap) or o.xmax.epoch != 0) continue;
                 if (objectDependent(o, oid)) count += 1;
                 // Comments on the table's policies go with them.
@@ -3904,6 +3910,10 @@ pub fn Database(comptime config: Config) type {
                 .table_security => |*security| blk: {
                     try self.tableSecurity(slot, source, security, snap);
                     break :blk .alter_table;
+                },
+                .alter_schema_owner => |change| blk: {
+                    try self.alterSchemaOwner(slot, source, change.name, change.owner, snap);
+                    break :blk .alter_schema;
                 },
                 .comment => |*comment| blk: {
                     try self.commentOn(slot, source, comment, snap);
@@ -4198,12 +4208,15 @@ pub fn Database(comptime config: Config) type {
                     if (routine.stamp.visible(snap)) return error.DependentObjects;
                 }
                 for (&self.schemas) |*schema| {
-                    if (!schema.live or schema.owner != oid) continue;
+                    if (!schema.live) continue;
+                    const owned_then = self.schemaOwner(schema, snap) == oid;
+                    const owned_latest = self.schemaOwner(schema, latest) == oid;
+                    if (!owned_then and !owned_latest) continue;
                     if ((schema.pending_create or schema.pending_drop) and schema.creator != slot) return self.objectPark(slot, schema.creator);
                     const old = self.catalog.findSchema(schema.name.slice(), snap);
                     const now = self.catalog.findSchema(schema.name.slice(), latest);
-                    const owned_before = old != null and old.?.oid == schema.oid;
-                    const owned_now = now != null and now.?.oid == schema.oid;
+                    const owned_before = owned_then and old != null and old.?.oid == schema.oid;
+                    const owned_now = owned_latest and now != null and now.?.oid == schema.oid;
                     if (owned_before != owned_now) return error.SerializationFailure;
                     if (owned_before) return error.DependentObjects;
                 }
@@ -4392,15 +4405,16 @@ pub fn Database(comptime config: Config) type {
             }
             // The first authorized GRANT or REVOKE materializes the ACL,
             // even if its effective privileges are exactly the default.
-            var state: O.Object = .{ .kind = .schema_acl_state, .target = schema.oid, .owner = schema.owner };
+            const owner = self.schemaOwner(schema, latest);
+            var state: O.Object = .{ .kind = .schema_acl_state, .target = schema.oid, .owner = owner };
             const first_acl = self.catalog_objects.findKey(&state, latest) == null;
             try self.reserveWrites(slot, 2 * count + @intFromBool(first_acl));
             if (first_acl) _ = try self.objectInsert(slot, &state, false, snap);
             for (grantees[0..count]) |role| {
-                var acl: O.Object = .{ .kind = .schema_acl, .target = schema.oid, .grantee = role, .owner = schema.owner };
+                var acl: O.Object = .{ .kind = .schema_acl, .target = schema.oid, .grantee = role, .owner = owner };
                 const before = self.catalog_objects.findKey(&acl, latest);
                 const old: ?u32 = if (before) |index| self.catalog_objects.items[index].flags else null;
-                const next: ?u32 = if (role == schema.owner)
+                const next: ?u32 = if (role == owner)
                     (if (revoke) 0 else null)
                 else
                     (if (revoke) null else CO.priv_schema_usage);
@@ -4410,6 +4424,59 @@ pub fn Database(comptime config: Config) type {
                     acl.flags = flags;
                     _ = try self.objectInsert(slot, &acl, false, snap);
                 }
+            }
+        }
+
+        fn alterSchemaOwner(self: *Self, slot: u16, source: []const u8, ident: CO.Ident, grantee: CO.Grantee, snap: Snapshot) Error!void {
+            const name = objectName(source, ident);
+            const visible = self.catalog.findSchema(name.slice(), snap) orelse return error.UndefinedSchema;
+            const schema = &self.schemas[visible.slot];
+            if (!schema.private_usage) return error.UnsupportedStatement;
+            if (schema.pending_drop and schema.creator != slot) return self.objectPark(slot, schema.creator);
+            if (self.catalog_objects.pendingReference(schema.oid, snap)) |other| return self.objectPark(slot, other);
+            var latest = snap;
+            latest.csn = self.csn;
+            const current = self.catalog.findSchema(name.slice(), latest) orelse return error.SerializationFailure;
+            if (current.oid != visible.oid) return error.SerializationFailure;
+            const old_owner = self.schemaOwner(schema, latest);
+            if (self.schemaOwner(schema, snap) != old_owner) return error.SerializationFailure;
+            if (!self.ownsNamespace(schema.oid, latest)) return error.InsufficientPrivilege;
+            const new_owner = try self.objectRole(source, grantee, latest);
+            if (self.catalog_objects.pendingReference(new_owner, snap)) |other| return self.objectPark(slot, other);
+            if (new_owner == old_owner) return;
+            // The database layer exposes no database-level CREATE grants yet.
+            if (!self.privilegedRole(latest)) return error.InsufficientPrivilege;
+
+            var owner_entry: O.Object = .{ .kind = .schema_owner, .target = schema.oid, .owner = new_owner };
+            const previous = self.catalog_objects.findKey(&owner_entry, latest);
+            var acl_count: usize = 0;
+            var owner_revoked = false;
+            var new_owner_usage = false;
+            for (&self.catalog_objects.items) |*item| {
+                if (item.target != schema.oid or !O.visible(item, latest)) continue;
+                if (item.kind == .schema_acl_state) acl_count += 1;
+                if (item.kind != .schema_acl) continue;
+                acl_count += 1;
+                owner_revoked = owner_revoked or (item.grantee == old_owner and item.flags == 0);
+                new_owner_usage = new_owner_usage or (item.grantee == new_owner and item.flags != 0);
+            }
+            try self.reserveWrites(slot, 1 + @as(usize, @intFromBool(previous != null)) + 2 * acl_count);
+            if (previous) |index| self.objectDelete(slot, index, latest);
+            _ = try self.objectInsert(slot, &owner_entry, false, latest);
+            for (&self.catalog_objects.items, 0..) |*item, index| {
+                if (item.target != schema.oid or !O.visible(item, latest)) continue;
+                if (item.kind != .schema_acl and item.kind != .schema_acl_state) continue;
+                var updated = item.*;
+                self.objectDelete(slot, index, latest);
+                if (updated.kind == .schema_acl) {
+                    if (updated.grantee == new_owner) continue;
+                    if (updated.grantee == old_owner) {
+                        if (!owner_revoked or new_owner_usage) continue;
+                        updated.grantee = new_owner;
+                    }
+                }
+                updated.owner = new_owner;
+                _ = try self.objectInsert(slot, &updated, false, latest);
             }
         }
 
@@ -6105,14 +6172,14 @@ pub fn Database(comptime config: Config) type {
         fn attributeRow(sink: *X.RowSink, relation: i64, name: []const u8, data_type: DataType, typmod: i32, ordinal: i64, metadata: AttributeMetadata) Error!void {
             const info = types.typeInfo(data_type);
             // Stock tools see the default settings. RamSQL materializes
-            // added columns and has no TOAST or per-column FDW overrides.
+            // added columns and has no TOAST, column ACLs or per-column FDW overrides.
             try sink.add(&.{
                 intCell(relation), nameCell(name), intCell(info.oid), intCell(typmod), intCell(ordinal),
                 boolCell(metadata.not_null), boolCell(false), .{ .pg_internal_char = metadata.identity },
                 .{ .pg_internal_char = metadata.generated }, boolCell(metadata.has_expression),
                 intCell(collation.typeCollation(types.typeOfData(data_type))), intCell(info.len),
                 .{ .pg_internal_char = info.alignment }, intCell(-1), .{ .pg_internal_char = types.typeStorage(data_type) },
-                boolCell(metadata.local), .null_value, .null_value, .{ .pg_internal_char = 0 }, boolCell(false), .null_value,
+                boolCell(metadata.local), .null_value, .null_value, .{ .pg_internal_char = 0 }, boolCell(false), .null_value, .null_value,
             });
         }
 
@@ -6262,6 +6329,8 @@ pub fn Database(comptime config: Config) type {
             if (view == .pg_event_trigger) return;
             // Publication metadata does not create logical replication subscriptions.
             if (view == .pg_subscription) return;
+            // bytea values are stored inline and do not create OID-addressed large objects.
+            if (view == .pg_largeobject or view == .pg_largeobject_metadata) return;
             // There are no security label providers or persistent role/database settings.
             if (view == .pg_seclabel or view == .pg_shseclabel or view == .pg_seclabels or view == .pg_db_role_setting) return;
             // Index comparisons use the store's typed comparator, with no
@@ -6469,7 +6538,8 @@ pub fn Database(comptime config: Config) type {
                     for (schemas[0..schema_count]) |found| {
                         const schema = &self.schemas[found.slot];
                         if (view == .pg_namespace) {
-                            try sink.add(&.{ intCell(found.oid), nameCell(schema.name.slice()), intCell(schema.owner), try self.namespaceAcl(found.oid, schema.owner, snapshot) });
+                            const owner = self.schemaOwner(schema, snapshot);
+                            try sink.add(&.{ intCell(found.oid), nameCell(schema.name.slice()), intCell(owner), try self.namespaceAcl(found.oid, owner, snapshot) });
                         } else try sink.add(&.{ nameCell(database), nameCell(schema.name.slice()) });
                     }
                 },

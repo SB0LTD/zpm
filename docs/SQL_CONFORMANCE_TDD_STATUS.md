@@ -15,6 +15,9 @@ Separate whole-database work passed all 27 stock checks on PostgreSQL
 16 and 18 at RAMSQL `f051b2e`. The fixture preserves a named schema
 owner, a reader's schema and table grants, a table comment, rows and
 defaults. The RamSQL import repeats these checks after WAL reopen.
+ZPM persists schema owner changes as catalog versions and rewrites
+existing schema ACL grantors with the change. The focused security
+contract passed 1,616 assertions and replayed 352 change records.
 [Whole-database CI](https://github.com/SB0LTD/ramsql/actions/runs/44929034456)
 
 RAMSQL `d1ddbe5` with ZPM `ed00a0a1` passed all 24 stock

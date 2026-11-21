@@ -1538,8 +1538,51 @@ fn namespaceAclProjection() !void {
     try same(try query(&replica, "SELECT nspacl::text FROM pg_namespace WHERE nspname='export_scope'"), "{ramsql=C/ramsql}");
 }
 
+fn namespaceOwnerTransfer() !void {
+    try reset();
+    try run("CREATE ROLE first_owner");
+    try run("CREATE ROLE final_owner");
+    try run("CREATE ROLE archive_reader");
+    try run("CREATE SCHEMA owned_archive");
+    const ownership = "SELECT rolname,nspacl::text FROM pg_namespace JOIN pg_roles ON nspowner=pg_roles.oid WHERE nspname='owned_archive'";
+    try run("ALTER SCHEMA owned_archive OWNER TO ramsql");
+    const created = db.catalog.findSchema("owned_archive", .{ .csn = db.csn }) orelse return error.NamespaceMissing;
+    try check(db.catalog_objects.findKey(&.{ .kind = .schema_owner, .target = created.oid }, .{ .csn = db.csn }) == null);
+    try expect(ownership, "ramsql|NULL");
+    try rejects("ALTER SCHEMA owned_archive OWNER TO no_such_role", error.UndefinedObject, ownership, "ramsql|NULL");
+
+    const pending = try db.begin();
+    try statement(pending, "ALTER SCHEMA owned_archive OWNER TO first_owner");
+    try same(try rows(pending, ownership), "first_owner|NULL");
+    try expect(ownership, "ramsql|NULL");
+    db.abort(pending);
+    try expect(ownership, "ramsql|NULL");
+
+    try run("ALTER SCHEMA owned_archive OWNER TO first_owner");
+    try run("GRANT USAGE ON SCHEMA owned_archive TO archive_reader");
+    try run("REVOKE USAGE ON SCHEMA owned_archive FROM first_owner");
+    try rejects("DROP ROLE first_owner", error.DependentObjects, ownership, "first_owner|{first_owner=C/first_owner,archive_reader=U/first_owner}");
+    try run("ALTER SCHEMA owned_archive OWNER TO final_owner");
+    try expect(ownership, "final_owner|{final_owner=C/final_owner,archive_reader=U/final_owner}");
+    try same(try query(&replica, ownership), "final_owner|{final_owner=C/final_owner,archive_reader=U/final_owner}");
+    try run("DROP ROLE first_owner");
+    try run("GRANT USAGE ON SCHEMA owned_archive TO final_owner");
+    try expect(ownership, "final_owner|{final_owner=UC/final_owner,archive_reader=U/final_owner}");
+    try as("final_owner");
+    try run("CREATE TABLE owned_archive.owner_table (id int)");
+    try run("DROP TABLE owned_archive.owner_table");
+    try as("ramsql");
+    var invalid: [256]u8 = undefined;
+    const owner_tail = [_]u8{ 10, 0, 0, 0 } ++ [_]u8{0} ** 14;
+    try replayFails(objectRecord(&invalid, 70, 18, 0, 99999, 0, 0, &owner_tail), error.ChangeRecordConflict);
+    try run("DROP SCHEMA owned_archive");
+    try run("DROP ROLE final_owner");
+    try same(try query(&replica, ownership), "");
+}
+
 pub fn main() !void {
     try namespaceAclProjection();
+    try namespaceOwnerTransfer();
     try oraclePrograms();
     try namespacesAndExtensions();
     try namespaceOwners();

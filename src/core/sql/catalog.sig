@@ -56,7 +56,7 @@ pub const View = enum(u8) { pg_type, pg_namespace, pg_class, pg_attribute, pg_in
     pg_roles, pg_authid, pg_auth_members, pg_policy, pg_policies, pg_description, pg_shdescription, pg_foreign_data_wrapper, pg_foreign_server, pg_publication, pg_extension, pg_tables, table_privileges, pg_enum, pg_database, pg_am, pg_collation, pg_constraint, pg_statistic_ext,
     pg_publication_rel, pg_publication_namespace, pg_settings, pg_depend, pg_tablespace, pg_foreign_table,
     pg_init_privs, pg_cast, pg_transform, pg_language, pg_operator, pg_opclass, pg_opfamily, pg_ts_parser, pg_ts_template, pg_ts_dict, pg_ts_config, pg_default_acl, pg_conversion, pg_range, pg_event_trigger, pg_partitioned_table, pg_subscription,
-    pg_seclabel, pg_shseclabel, pg_seclabels, pg_db_role_setting, pg_amop, pg_amproc };
+    pg_seclabel, pg_shseclabel, pg_seclabels, pg_db_role_setting, pg_amop, pg_amproc, pg_largeobject, pg_largeobject_metadata };
 
 pub const sql_language_oid: u32 = 14;
 pub const plpgsql_language_oid: u32 = 13002;
@@ -231,6 +231,7 @@ const pg_attribute_columns = [_]ViewColumn{
     col("attstattarget", .int2), col("attstorage", .pg_internal_char), col("attislocal", .boolean),
     col("attoptions", types.arrayType(.text).?), col("attfdwoptions", types.arrayType(.text).?),
     col("attcompression", .pg_internal_char), col("atthasmissing", .boolean), col("attmissingval", types.catalog_anyarray),
+    col("attacl", types.arrayType(.aclitem).?),
 };
 const pg_index_columns = [_]ViewColumn{
     col("indexrelid", .oid), col("indrelid", .oid), col("indisprimary", .boolean), col("indisunique", .boolean), col("indkey", .text),
@@ -350,6 +351,10 @@ const pg_seclabels_columns = [_]ViewColumn{
     col("objnamespace", .oid), col("objname", .text), col("provider", .text), col("label", .text),
 };
 const pg_db_role_setting_columns = [_]ViewColumn{ col("setdatabase", .oid), col("setrole", .oid), col("setconfig", text_array) };
+const pg_largeobject_columns = [_]ViewColumn{ col("loid", .oid), col("pageno", .int4), col("data", .bytea) };
+const pg_largeobject_metadata_columns = [_]ViewColumn{
+    col("oid", .oid), col("lomowner", .oid), col("lomacl", types.arrayType(.aclitem).?),
+};
 const pg_subscription_columns = [_]ViewColumn{
     col("oid", .oid), col("subdbid", .oid), col("subskiplsn", .pg_lsn), col("subname", .name),
     col("subowner", .oid), col("subenabled", .boolean), col("subbinary", .boolean),
@@ -425,6 +430,8 @@ pub fn viewColumns(view: View) []const ViewColumn {
         .pg_db_role_setting => &pg_db_role_setting_columns,
         .pg_amop => &pg_amop_columns,
         .pg_amproc => &pg_amproc_columns,
+        .pg_largeobject => &pg_largeobject_columns,
+        .pg_largeobject_metadata => &pg_largeobject_metadata_columns,
         .pg_cast => &pg_cast_columns,
         .pg_transform => &pg_transform_columns,
         .pg_language => &pg_language_columns,
@@ -462,7 +469,7 @@ pub fn findView(schema: ?[]const u8, name: []const u8) ?View {
     const catalog_views = [_]View{ .pg_type, .pg_enum, .pg_namespace, .pg_am, .pg_collation, .pg_class, .pg_settings, .pg_attribute, .pg_index, .pg_constraint, .pg_depend, .pg_statistic_ext, .pg_attrdef, .pg_sequence, .pg_indexes, .pg_views, .pg_matviews, .pg_inherits, .pg_proc, .pg_trigger, .pg_rewrite, .pg_rules,
         .pg_tablespace, .pg_foreign_table, .pg_roles, .pg_authid, .pg_auth_members, .pg_policy, .pg_policies, .pg_description, .pg_shdescription, .pg_foreign_data_wrapper, .pg_foreign_server, .pg_publication, .pg_publication_rel, .pg_publication_namespace, .pg_extension, .pg_tables,
         .pg_init_privs, .pg_cast, .pg_transform, .pg_language, .pg_operator, .pg_opclass, .pg_opfamily, .pg_ts_parser, .pg_ts_template, .pg_ts_dict, .pg_ts_config, .pg_default_acl, .pg_conversion, .pg_range, .pg_event_trigger, .pg_partitioned_table, .pg_subscription,
-        .pg_seclabel, .pg_shseclabel, .pg_seclabels, .pg_db_role_setting, .pg_amop, .pg_amproc };
+        .pg_seclabel, .pg_shseclabel, .pg_seclabels, .pg_db_role_setting, .pg_amop, .pg_amproc, .pg_largeobject, .pg_largeobject_metadata };
     const information_views = [_]View{ .schemata, .tables, .columns, .table_constraints, .key_column_usage, .table_privileges };
     const qualified = schema orelse {
         for (catalog_views) |view| if (types.same(@tagName(view), name)) return view;
@@ -493,6 +500,7 @@ pub const bootstrap_relations = [_]struct { view: View, oid: u32 }{
     .{ .view = .pg_shseclabel, .oid = 3592 },
     .{ .view = .pg_db_role_setting, .oid = 2964 },
     .{ .view = .pg_amop, .oid = 2602 }, .{ .view = .pg_amproc, .oid = 2603 },
+    .{ .view = .pg_largeobject, .oid = 2613 }, .{ .view = .pg_largeobject_metadata, .oid = 2995 },
     .{ .view = .pg_operator, .oid = 2617 },
     .{ .view = .pg_opclass, .oid = 2616 }, .{ .view = .pg_opfamily, .oid = 2753 },
     .{ .view = .pg_ts_parser, .oid = 3601 },
