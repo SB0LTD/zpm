@@ -9,8 +9,20 @@ compares every row and link and exercises unique-index creation, ordered
 reads, equality, and duplicate rejection for each type. The PostgreSQL 18
 comparison matches generated class OIDs by method and name. These catalog
 entries describe supported SQL semantics. Explicit operator-class selection,
-planner use of PostgreSQL operator families, and family-member catalogs
-remain open.
+per-index `pg_index.indclass`, planner use of PostgreSQL operator families,
+and family-member catalogs remain open.
+
+RAMSQL `6a737d3` with ZPM `14a11b7c` passed operator-class and family
+qualification on PostgreSQL 16 and 18. Both lanes passed stock plain and
+custom imports with row and constraint checks after WAL reopen. The local
+Sig catalog suite passed 82 assertions.
+
+Both outbound dumps passed operator-class discovery and stopped with
+`TableNotFound` on `pg_ts_parser`. The next native check should cover the
+parser used by the supported `simple` configuration and its typed callback
+references, with coverage tied to the tokenizer's actual behavior. Both
+stock directions on both versions remain the merge gate.
+[PostgreSQL 16 and 18 operator-class discovery CI](https://github.com/SB0LTD/ramsql/actions/runs/44899082739)
 
 `pg_am` exposes the two implemented access methods with PostgreSQL table
 and index kind codes and typed `regproc` handler references. Handler OIDs
@@ -32,11 +44,8 @@ and custom imports with row and constraint checks after WAL reopen. The
 local Sig catalog suite passed 79 assertions, including scalar and array
 `regproc` replay.
 
-Both outbound dumps passed access-method discovery and failed with
-`TableNotFound` on `pg_opclass`. The next native check should identify
-classes for the supported index semantics and verify the links to the
-access method, indexed type and operator family. Both stock directions on
-both versions remain the merge gate.
+That candidate passed access-method discovery and failed with
+`TableNotFound` on `pg_opclass`.
 [PostgreSQL 16 and 18 access-method discovery CI](https://github.com/SB0LTD/ramsql/actions/runs/44897386171)
 
 `pg_operator` now exposes PostgreSQL identities for 427 concrete operator
