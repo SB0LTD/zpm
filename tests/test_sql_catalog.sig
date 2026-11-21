@@ -81,7 +81,7 @@ const public_classes = "SELECT relname, relkind FROM pg_class WHERE relnamespace
 
 fn types() !void {
     try expect("SELECT oid, typname FROM pg_catalog.pg_type WHERE typname = 'int4'", "23|int4");
-    try expect("SELECT COUNT(*), MIN(typnamespace), MAX(typnamespace) FROM pg_type", "97|11|11");
+    try expect("SELECT COUNT(*), MIN(typnamespace), MAX(typnamespace) FROM pg_type", "98|11|11");
     try expect("SELECT oid, typname, typlen, typarray, typelem FROM pg_type WHERE oid IN (1033,1034) ORDER BY oid", "1033|aclitem|16|1034|0;1034|_aclitem|-1|0|1033");
     try expect("SELECT oid, typname, typlen, typarray, typelem FROM pg_type WHERE oid IN (18,1002) ORDER BY oid", "18|char|1|1002|0;1002|_char|-1|0|18");
     try expect("SELECT typname, typlen, typcategory, typarray, typinput FROM pg_type WHERE oid IN (4072, 4073) ORDER BY oid", "jsonpath|-1|U|4073|jsonpath_in;_jsonpath|-1|A|0|array_in");
@@ -148,6 +148,17 @@ fn indexOperatorDiscovery() !void {
         "2616|1978|btree|int4|integer_ops|t|0");
     try expect("SELECT tableoid,oid,opfmethod,opfnamespace,opfowner FROM pg_opfamily WHERE opfname='integer_ops'",
         "2753|1976|403|11|10");
+}
+
+fn textParserDiscovery() !void {
+    try expect("SELECT tableoid,oid,prsname,prsnamespace,prsstart::oid,prstoken::oid,"
+        ++ "prsend::oid,prsheadline::oid,prslextype::oid FROM pg_catalog.pg_ts_parser",
+        "3601|3722|default|11|3717|3718|3719|0|3721");
+    try expect("SELECT prsstart,prstoken,prsend,prsheadline,prslextype FROM pg_ts_parser",
+        "prsd_start|prsd_nexttoken|prsd_end|-|prsd_lextype");
+    try expect("SELECT to_regproc('pg_catalog.prsd_end')::oid,pg_typeof(prslextype)::text FROM pg_ts_parser",
+        "3719|regproc");
+    try expect("SELECT typname,typtype FROM pg_type WHERE oid=2278", "void|p");
 }
 
 fn lifecycle() !void {
@@ -291,6 +302,7 @@ pub fn main(init: std.process.Init) !void {
     try dumpDiscovery();
     try typeDiscovery();
     try indexOperatorDiscovery();
+    try textParserDiscovery();
     try lifecycle();
     try replay();
     try characterMetadata();

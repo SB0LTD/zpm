@@ -2,6 +2,15 @@
 
 ## Stock PostgreSQL dump and restore candidate
 
+`pg_ts_parser` exposes `pg_catalog.default`, the tokenizer used by
+`pg_catalog.simple`. The startup, next-token, shutdown and token-type
+references use `regproc` and resolve through `pg_proc`. The token-type
+descriptors use the IDs emitted by the Sig tokenizer and drive the
+`simple` dictionary's filtering. The headline reference is zero because
+headline generation is unavailable. The callback rows are metadata for
+internal routines. Parser registration and direct SQL invocation of
+callbacks remain open.
+
 `pg_opclass` and `pg_opfamily` share the registry for 26 default index
 classes across 21 families. Each row uses PostgreSQL 16 catalog OIDs and
 links to the supported `btree` method and indexed type. Qualification

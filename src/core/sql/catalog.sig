@@ -55,7 +55,7 @@ pub const View = enum(u8) { pg_type, pg_namespace, pg_class, pg_attribute, pg_in
     // Catalog objects (B11 wave 3, catalog_objects.sig).
     pg_roles, pg_authid, pg_auth_members, pg_policy, pg_policies, pg_description, pg_shdescription, pg_foreign_data_wrapper, pg_foreign_server, pg_publication, pg_extension, pg_tables, table_privileges, pg_enum, pg_database, pg_am, pg_collation, pg_constraint, pg_statistic_ext,
     pg_publication_rel, pg_publication_namespace, pg_settings, pg_depend, pg_tablespace, pg_foreign_table,
-    pg_init_privs, pg_cast, pg_transform, pg_language, pg_operator, pg_opclass, pg_opfamily };
+    pg_init_privs, pg_cast, pg_transform, pg_language, pg_operator, pg_opclass, pg_opfamily, pg_ts_parser };
 
 pub const sql_language_oid: u32 = 14;
 pub const plpgsql_language_oid: u32 = 13002;
@@ -90,17 +90,33 @@ pub const access_methods = [_]struct { oid: u32, name: []const u8, kind: u8, han
     .{ .oid = btree_access_method, .name = "btree", .kind = 'i', .handler = 330, .handler_name = "bthandler", .result = 325 },
 };
 pub const internal_type_oid: u32 = 2281;
-pub const access_method_types = [_]struct { oid: u32, name: []const u8, bytes: i16, input: []const u8 }{
+pub const builtin_pseudo_types = [_]struct { oid: u32, name: []const u8, bytes: i16, input: []const u8 }{
     .{ .oid = 269, .name = "table_am_handler", .bytes = 4, .input = "table_am_handler_in" },
     .{ .oid = 325, .name = "index_am_handler", .bytes = 4, .input = "index_am_handler_in" },
     .{ .oid = internal_type_oid, .name = "internal", .bytes = @sizeOf(usize), .input = "internal_in" },
+    .{ .oid = 2278, .name = "void", .bytes = 4, .input = "void_in" },
 };
 
 pub fn builtinRoutineName(oid: u32) ?[]const u8 {
     for (access_methods) |am| if (am.handler == oid) return am.handler_name;
+    for (text_parser.callbacks) |callback| if (callback.oid == oid) return callback.name;
     for (@import("operator_catalog.sig").functions) |op| if (op.function_oid == oid) return op.function_name;
     return null;
 }
+
+/// Catalog identities of the tokenizer used by the simple configuration.
+/// Parser.init and Parser.next own startup and tokenization. End releases
+/// caller-owned state and tokenKind supplies the lexical descriptors.
+pub const text_parser = struct {
+    const Callback = struct { oid: u32, name: []const u8, args: []const u32, result: u32 };
+    pub const oid: u32 = 3722;
+    pub const name = "default";
+    pub const start: Callback = .{ .oid = 3717, .name = "prsd_start", .args = &.{ internal_type_oid, 23 }, .result = internal_type_oid };
+    pub const next: Callback = .{ .oid = 3718, .name = "prsd_nexttoken", .args = &.{ internal_type_oid, internal_type_oid, internal_type_oid }, .result = internal_type_oid };
+    pub const end: Callback = .{ .oid = 3719, .name = "prsd_end", .args = &.{internal_type_oid}, .result = 2278 };
+    pub const lex_type: Callback = .{ .oid = 3721, .name = "prsd_lextype", .args = &.{internal_type_oid}, .result = internal_type_oid };
+    pub const callbacks = [_]Callback{ start, next, end, lex_type };
+};
 const pg_am_columns = [_]ViewColumn{ col("oid", .oid), col("amname", .name), col("amhandler", .regproc), col("amtype", .pg_internal_char) };
 const pg_collation_columns = [_]ViewColumn{
     col("oid", .oid), col("collname", .name), col("collnamespace", .oid), col("collowner", .oid),
@@ -170,6 +186,11 @@ const pg_opclass_columns = [_]ViewColumn{
 };
 const pg_opfamily_columns = [_]ViewColumn{
     col("oid", .oid), col("opfmethod", .oid), col("opfname", .name), col("opfnamespace", .oid), col("opfowner", .oid),
+};
+const pg_ts_parser_columns = [_]ViewColumn{
+    col("oid", .oid), col("prsname", .name), col("prsnamespace", .oid),
+    col("prsstart", .regproc), col("prstoken", .regproc), col("prsend", .regproc),
+    col("prsheadline", .regproc), col("prslextype", .regproc),
 };
 
 /// Implemented cataloged casts that have no separately callable function.
@@ -252,6 +273,7 @@ pub fn viewColumns(view: View) []const ViewColumn {
         .pg_operator => &pg_operator_columns,
         .pg_opclass => &pg_opclass_columns,
         .pg_opfamily => &pg_opfamily_columns,
+        .pg_ts_parser => &pg_ts_parser_columns,
         .pg_trigger => &pg_trigger_columns,
         .pg_rewrite => &pg_rewrite_columns,
         .pg_rules => &pg_rules_columns,
@@ -278,7 +300,7 @@ pub fn viewColumns(view: View) []const ViewColumn {
 pub fn findView(schema: ?[]const u8, name: []const u8) ?View {
     const catalog_views = [_]View{ .pg_type, .pg_enum, .pg_namespace, .pg_am, .pg_collation, .pg_class, .pg_settings, .pg_attribute, .pg_index, .pg_constraint, .pg_depend, .pg_statistic_ext, .pg_attrdef, .pg_sequence, .pg_indexes, .pg_views, .pg_matviews, .pg_inherits, .pg_proc, .pg_trigger, .pg_rewrite, .pg_rules,
         .pg_tablespace, .pg_foreign_table, .pg_roles, .pg_authid, .pg_auth_members, .pg_policy, .pg_policies, .pg_description, .pg_shdescription, .pg_foreign_data_wrapper, .pg_foreign_server, .pg_publication, .pg_publication_rel, .pg_publication_namespace, .pg_extension, .pg_tables,
-        .pg_init_privs, .pg_cast, .pg_transform, .pg_language, .pg_operator, .pg_opclass, .pg_opfamily };
+        .pg_init_privs, .pg_cast, .pg_transform, .pg_language, .pg_operator, .pg_opclass, .pg_opfamily, .pg_ts_parser };
     const information_views = [_]View{ .schemata, .tables, .columns, .table_constraints, .key_column_usage, .table_privileges };
     const qualified = schema orelse {
         for (catalog_views) |view| if (types.same(@tagName(view), name)) return view;
@@ -301,6 +323,7 @@ pub const bootstrap_relations = [_]struct { view: View, oid: u32 }{
     .{ .view = .pg_init_privs, .oid = 3394 }, .{ .view = .pg_transform, .oid = 3576 },
     .{ .view = .pg_operator, .oid = 2617 },
     .{ .view = .pg_opclass, .oid = 2616 }, .{ .view = .pg_opfamily, .oid = 2753 },
+    .{ .view = .pg_ts_parser, .oid = 3601 },
     .{ .view = .pg_tablespace, .oid = 1213 }, .{ .view = .pg_foreign_table, .oid = 3118 },
     .{ .view = .pg_authid, .oid = 1260 }, .{ .view = .pg_auth_members, .oid = 1261 },
     .{ .view = .pg_database, .oid = 1262 }, .{ .view = .pg_foreign_server, .oid = 1417 },

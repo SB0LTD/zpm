@@ -5615,6 +5615,11 @@ pub fn Database(comptime config: Config) type {
                     if (oid != null) return error.AmbiguousFunction;
                     oid = am.handler;
                 }
+                for (catalog_module.text_parser.callbacks) |callback| {
+                    if (!types.same(callback.name, name)) continue;
+                    if (oid != null) return error.AmbiguousFunction;
+                    oid = callback.oid;
+                }
                 for (operator_catalog.functions) |op| {
                     if (!types.same(op.function_name, name)) continue;
                     if (oid != null) return error.AmbiguousFunction;
@@ -6183,6 +6188,16 @@ pub fn Database(comptime config: Config) type {
                 }
                 return;
             }
+            if (view == .pg_ts_parser) {
+                const parser = catalog_module.text_parser;
+                // Headline generation is unavailable, so it has no callback.
+                try sink.add(&.{
+                    intCell(parser.oid), nameCell(parser.name), intCell(catalog_module.catalog_namespace),
+                    .{ .regproc = parser.start.oid }, .{ .regproc = parser.next.oid }, .{ .regproc = parser.end.oid },
+                    .{ .regproc = 0 }, .{ .regproc = parser.lex_type.oid },
+                });
+                return;
+            }
             if (view == .pg_language) {
                 try sink.add(&.{ intCell(operator_catalog.internal_language_oid), nameCell("internal"), intCell(CO.bootstrap_role), boolCell(false), boolCell(false), intCell(0), intCell(0), intCell(0), .null_value });
                 try sink.add(&.{ intCell(catalog_module.sql_language_oid), nameCell("sql"), intCell(CO.bootstrap_role), boolCell(false), boolCell(true), intCell(0), intCell(0), intCell(0), .null_value });
@@ -6229,7 +6244,7 @@ pub fn Database(comptime config: Config) type {
                 .pg_proc, .pg_trigger, .pg_rewrite, .pg_rules => return self.objectViewRows(snapshot, view, sink),
                 .pg_depend => return self.dependencyRows(snapshot, relations[0..count], sink),
                 .pg_type => {
-                    for (catalog_module.access_method_types) |info| {
+                    for (catalog_module.builtin_pseudo_types) |info| {
                         try sink.add(&.{ intCell(info.oid), nameCell(info.name), intCell(catalog_module.catalog_namespace), intCell(info.bytes), .{ .pg_internal_char = 'p' }, nameCell("P"), intCell(0), nameCell(","), nameCell(info.input), intCell(0), intCell(0), intCell(CO.bootstrap_role), intCell(-1), boolCell(false), intCell(0), intCell(0), .null_value, boolCell(true) });
                     }
                     inline for (@typeInfo(DataType).@"enum".field_names) |field| {
@@ -11532,6 +11547,21 @@ pub fn Database(comptime config: Config) type {
         fn objectViewRows(self: *const Self, snapshot: Snapshot, view: catalog_module.View, sink: *X.RowSink) Error!void {
             switch (view) {
                 .pg_proc => {
+                    for (catalog_module.text_parser.callbacks) |callback| {
+                        var buffer: [33]u8 = undefined;
+                        var argtypes: CatalogTextWriter = .{ .out = &buffer };
+                        for (callback.args, 0..) |oid, index| {
+                            if (index != 0) argtypes.add(" ");
+                            var digits: [10]u8 = undefined;
+                            argtypes.add(std.fmt.bufPrint(&digits, "{d}", .{oid}) catch unreachable);
+                        }
+                        try sink.add(&.{
+                            intCell(callback.oid), nameCell(callback.name), intCell(catalog_module.catalog_namespace),
+                            .{ .pg_internal_char = 'f' }, intCell(operator_catalog.internal_language_oid), .{ .pg_internal_char = 'i' },
+                            boolCell(true), intCell(@intCast(callback.args.len)), intCell(callback.result), nameCell(argtypes.slice()),
+                            nameCell(callback.name), intCell(CO.bootstrap_role), .null_value,
+                        });
+                    }
                     for (catalog_module.access_methods) |am| {
                         var args: [10]u8 = undefined;
                         const arg_oid = std.fmt.bufPrint(&args, "{d}", .{catalog_module.internal_type_oid}) catch unreachable;

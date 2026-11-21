@@ -24,10 +24,42 @@ const Error = types.Error;
 
 // ---- default parser ----------------------------------------------------------
 
-/// Token types (wparser_def.c): 12 blank, 13 tag, 14 protocol and 23
-/// entity are not indexed by `simple`.
+/// Token descriptors use the numeric IDs emitted by the default parser.
+pub const TokenKind = struct { alias: []const u8, description: []const u8, indexed: bool = true };
+
+pub const token_kinds = [_]TokenKind{
+    .{ .alias = "asciiword", .description = "Word, all ASCII" },
+    .{ .alias = "word", .description = "Word, all letters" },
+    .{ .alias = "numword", .description = "Word, letters and digits" },
+    .{ .alias = "email", .description = "Email address" },
+    .{ .alias = "url", .description = "URL" },
+    .{ .alias = "host", .description = "Host" },
+    .{ .alias = "sfloat", .description = "Scientific notation" },
+    .{ .alias = "version", .description = "Version number" },
+    .{ .alias = "hword_numpart", .description = "Hyphenated word part, letters and digits" },
+    .{ .alias = "hword_part", .description = "Hyphenated word part, all letters" },
+    .{ .alias = "hword_asciipart", .description = "Hyphenated word part, all ASCII" },
+    .{ .alias = "blank", .description = "Space symbols", .indexed = false },
+    .{ .alias = "tag", .description = "XML tag", .indexed = false },
+    .{ .alias = "protocol", .description = "Protocol head", .indexed = false },
+    .{ .alias = "numhword", .description = "Hyphenated word, letters and digits" },
+    .{ .alias = "asciihword", .description = "Hyphenated word, all ASCII" },
+    .{ .alias = "hword", .description = "Hyphenated word, all letters" },
+    .{ .alias = "url_path", .description = "URL path" },
+    .{ .alias = "file", .description = "File or path name" },
+    .{ .alias = "float", .description = "Decimal notation" },
+    .{ .alias = "int", .description = "Signed integer" },
+    .{ .alias = "uint", .description = "Unsigned integer" },
+    .{ .alias = "entity", .description = "XML entity", .indexed = false },
+};
+
+pub fn tokenKind(id: u8) ?*const TokenKind {
+    if (id == 0 or id > token_kinds.len) return null;
+    return &token_kinds[id - 1];
+}
+
 pub fn simpleIndexes(kind: u8) bool {
-    return kind >= 1 and kind <= 22 and kind != 12 and kind != 13 and kind != 14;
+    return if (tokenKind(kind)) |descriptor| descriptor.indexed else false;
 }
 
 const Test = enum(u8) { always, eof, eq, alnum, alpha, asclet, digit, notalnum, space, special, stophost, ignore, host, url_path, urlchar, xdigit };
