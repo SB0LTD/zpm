@@ -168,12 +168,14 @@ pub fn Exec(comptime config: types.Config) type {
             list: List,
             width: usize,
             projection: ?*CatalogProjection = null,
+            first_filter: ?*FirstCatalogFilter = null,
 
             const CatalogProjection = struct {
                 plan: *const B.Plan,
                 context: E.Context,
                 wanted: u64,
             };
+            const FirstCatalogFilter = struct { context: E.Context, predicate: u16 };
 
             pub fn add(self: *RowSink, cells: []const V.Cell) Error!void {
                 try self.query.session.checkpoint();
@@ -185,6 +187,10 @@ pub fn Exec(comptime config: types.Config) type {
                         try self.query.projectRow(projection.plan, &projection.context, &self.list);
                     }
                     return;
+                }
+                if (self.first_filter) |filter| {
+                    filter.context.tuple[0] = cells.ptr;
+                    if (!try self.query.earlyKeep(&filter.context, filter.predicate, 0, false)) return;
                 }
                 const at = try self.query.cells(self.width);
                 for (cells, 0..) |cell, index| self.query.work.cells[at + index] = cell;
@@ -450,7 +456,7 @@ pub fn Exec(comptime config: types.Config) type {
 
             // ---- FROM items and joins ----------------------------------
 
-            fn sourceRows(self: *Query, source: *const B.Source, outer: ?*const E.Context, synchronize_scan: bool) Error!List {
+            fn sourceRows(self: *Query, source: *const B.Source, outer: ?*const E.Context, synchronize_scan: bool, first_filter: u16) Error!List {
                 if (source.sample_method != 0) return self.sampledRows(source, outer);
                 if (source.table) |index| {
                     const table = &self.tables[index];
@@ -469,6 +475,11 @@ pub fn Exec(comptime config: types.Config) type {
                 if (source.view) |view| {
                     const hook = self.work.views orelse return error.UnsupportedStatement;
                     var sink: RowSink = .{ .query = self, .list = .{ .start = @intCast(self.work.ref_low) }, .width = catalog.viewColumns(view).len };
+                    var filter: RowSink.FirstCatalogFilter = undefined;
+                    if (first_filter != none) {
+                        filter = .{ .context = self.context(outer), .predicate = first_filter };
+                        sink.first_filter = &filter;
+                    }
                     try hook.rows(hook.ptr, view, &sink);
                     return sink.list;
                 }
@@ -600,7 +611,10 @@ pub fn Exec(comptime config: types.Config) type {
                 for (p.sources[0..p.source_count], 0..) |*source, stage| {
                     const last = stage + 1 == p.source_count;
                     const probing = source.probe != none and stage != 0;
-                    const rows: List = if (probing) .{} else try self.sourceRows(source, outer, synchronizedProjection(p));
+                    // The same first-stage WHERE predicates used by joinKeep
+                    // can discard catalog rows before they occupy workspace.
+                    const first_filter = if (stage == 0 and early) p.where else none;
+                    const rows: List = if (probing) .{} else try self.sourceRows(source, outer, synchronizedProjection(p), first_filter);
                     const outer_join = source.join == .left or source.join == .full;
                     const tracks = source.join == .right or source.join == .full;
                     var matched: u32 = 0;
@@ -676,7 +690,7 @@ pub fn Exec(comptime config: types.Config) type {
             /// Items first..last joined left-deep; each later operand is one
             /// item or a parenthesized group (Source.group_end).
             fn joinRange(self: *Query, p: *const B.Plan, ctx: *E.Context, tuple_rows: *TupleRows, outer: ?*const E.Context, first: usize, last: usize) Error!Tuples {
-                var current = try self.leafTuples(p, first, try self.sourceRows(&p.sources[first], outer, false));
+                var current = try self.leafTuples(p, first, try self.sourceRows(&p.sources[first], outer, false, none));
                 var next = first + 1;
                 while (next <= last) {
                     const end: usize = if (p.sources[next].group_end != none) p.sources[next].group_end else next;
@@ -743,7 +757,7 @@ pub fn Exec(comptime config: types.Config) type {
                         self.work.refs[lists + index * 2 + 1] = rows.count;
                     }
                 } else if (end == j) {
-                    right = try self.leafTuples(p, j, try self.sourceRows(source, outer, false));
+                    right = try self.leafTuples(p, j, try self.sourceRows(source, outer, false, none));
                 } else right = try self.joinRange(p, ctx, tuple_rows, outer, j, end);
                 const tracks = source.join == .right or source.join == .full;
                 if (lateral and tracks) return error.InvalidColumnReference;

@@ -2,6 +2,19 @@
 
 ## Stock PostgreSQL dump and restore candidate
 
+`pg_operator` now exposes PostgreSQL identities for 427 concrete operator
+signatures that execute in Sig. It includes prefix and infix signatures,
+argument and result OIDs, owner and namespace, and links to internal
+implementation rows in `pg_proc`. Commutators and negators link to published
+signatures. The stock projection of `oprcode` uses OIDs. Planner estimator
+callbacks, general `regproc`, polymorphic operator metadata and operator
+DDL remain open. The CI probe compares each published signature and runs
+typed operands against both PostgreSQL versions.
+
+For first-source catalog rows in eligible left-deep joins, the executor
+applies the existing early WHERE filter before reserving workspace for a
+row. The routine catalog tests retain their small workspace.
+
 Type discovery now exposes `pg_type.typacl` as `aclitem[]` and
 `typisdefined` as boolean for defined built-in and user types. The types
 have no explicit ACL overrides. `acldefault('T', owner)` provides USAGE for

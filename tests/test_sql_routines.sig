@@ -239,7 +239,7 @@ fn reset() void {
     replica = .{};
 }
 
-const proc_probe = "SELECT oid, proname, prokind, prolang, provolatile, proisstrict, pronargs, prorettype, proargtypes FROM pg_proc ORDER BY oid";
+const proc_probe = "SELECT oid, proname, prokind, prolang, provolatile, proisstrict, pronargs, prorettype, proargtypes FROM pg_proc WHERE pronamespace=2200 ORDER BY oid";
 const trigger_probe = "SELECT oid, tgrelid, tgname, tgfoid, tgtype, tgenabled, tgnargs FROM pg_trigger ORDER BY oid";
 const rule_probe = "SELECT r.oid, r.rulename, r.ev_type, r.is_instead, p.definition FROM pg_rewrite r JOIN pg_rules p ON p.rulename = r.rulename ORDER BY r.oid";
 

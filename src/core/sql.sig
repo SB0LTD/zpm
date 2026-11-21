@@ -121,6 +121,7 @@ const ssi_module = @import("sql/ssi.sig");
 const routine_catalog = @import("sql/routine_catalog.sig");
 const routine_module = @import("sql/routine.sig");
 const CO = @import("sql/catalog_objects.sig");
+const operator_catalog = @import("sql/operator_catalog.sig");
 const array_module = @import("sql/array.sig");
 
 /// The canonical SQL tokenizer, also used by wire parameter binding.
@@ -6073,7 +6074,21 @@ pub fn Database(comptime config: Config) type {
             // SQL and PL/pgSQL use the ordinary SQL representation directly.
             // The runtime supports no language-specific transform registration.
             if (view == .pg_transform) return;
+            if (view == .pg_operator) {
+                for (operator_catalog.operators) |op| {
+                    // Commutators and negators link to supported signatures.
+                    // Native planner estimator hooks are not part of this engine.
+                    try sink.add(&.{
+                        intCell(op.oid), nameCell(op.name), intCell(catalog_module.catalog_namespace), intCell(CO.bootstrap_role),
+                        .{ .pg_internal_char = if (op.left == 0) 'l' else 'b' }, boolCell(false), boolCell(false),
+                        intCell(op.left), intCell(op.right), intCell(op.result), intCell(op.commutator), intCell(op.negator),
+                        intCell(op.function_oid), intCell(0), intCell(0),
+                    });
+                }
+                return;
+            }
             if (view == .pg_language) {
+                try sink.add(&.{ intCell(operator_catalog.internal_language_oid), nameCell("internal"), intCell(CO.bootstrap_role), boolCell(false), boolCell(false), intCell(0), intCell(0), intCell(0), .null_value });
                 try sink.add(&.{ intCell(catalog_module.sql_language_oid), nameCell("sql"), intCell(CO.bootstrap_role), boolCell(false), boolCell(true), intCell(0), intCell(0), intCell(0), .null_value });
                 try sink.add(&.{ intCell(catalog_module.plpgsql_language_oid), nameCell("plpgsql"), intCell(CO.bootstrap_role), boolCell(true), boolCell(true), intCell(0), intCell(0), intCell(0), .null_value });
                 return;
@@ -11416,29 +11431,44 @@ pub fn Database(comptime config: Config) type {
         /// pg_proc, pg_trigger, pg_rewrite and pg_rules rows.
         fn objectViewRows(self: *const Self, snapshot: Snapshot, view: catalog_module.View, sink: *X.RowSink) Error!void {
             switch (view) {
-                .pg_proc => for (&self.objects.routines) |*routine| {
-                    if (!routine.live or !routine.stamp.visible(snapshot)) continue;
-                    var argtypes: [12 * config.routine_args]u8 = undefined;
-                    var at: usize = 0;
-                    for (routine.args(), 0..) |oid, position| {
-                        if (position != 0) {
-                            argtypes[at] = ' ';
-                            at += 1;
-                        }
-                        var digits: [10]u8 = undefined;
-                        var length: usize = 0;
-                        var rest = oid;
-                        while (true) {
-                            digits[digits.len - 1 - length] = @intCast('0' + rest % 10);
-                            length += 1;
-                            rest /= 10;
-                            if (rest == 0) break;
-                        }
-                        @memcpy(argtypes[at..][0..length], digits[digits.len - length ..]);
-                        at += length;
+                .pg_proc => {
+                    for (operator_catalog.functions) |op| {
+                        var buffer: [24]u8 = undefined;
+                        const args = if (op.left == 0)
+                            std.fmt.bufPrint(&buffer, "{d}", .{op.right}) catch unreachable
+                        else
+                            std.fmt.bufPrint(&buffer, "{d} {d}", .{ op.left, op.right }) catch unreachable;
+                        try sink.add(&.{
+                            intCell(op.function_oid), nameCell(op.function_name), intCell(catalog_module.catalog_namespace),
+                            .{ .pg_internal_char = 'f' }, intCell(operator_catalog.internal_language_oid), .{ .pg_internal_char = op.volatility },
+                            boolCell(op.strict), intCell(if (op.left == 0) 1 else 2), intCell(op.result), nameCell(args),
+                            nameCell(op.function_name), intCell(CO.bootstrap_role), .null_value,
+                        });
                     }
-                    const language = if (routine.language == 0) catalog_module.sql_language_oid else catalog_module.plpgsql_language_oid;
-                    try sink.add(&.{ intCell(routine.oid), nameCell(routine.name.slice()), intCell(routine.namespace), .{ .pg_internal_char = routine.kind }, intCell(language), .{ .pg_internal_char = routine.volatility }, boolCell(routine.strict), intCell(@intCast(routine.arg_count)), intCell(routine.return_oid), nameCell(argtypes[0..at]), nameCell(routine.body.slice()), intCell(routine.owner), try self.routineAcl(routine, snapshot) });
+                    for (&self.objects.routines) |*routine| {
+                        if (!routine.live or !routine.stamp.visible(snapshot)) continue;
+                        var argtypes: [12 * config.routine_args]u8 = undefined;
+                        var at: usize = 0;
+                        for (routine.args(), 0..) |oid, position| {
+                            if (position != 0) {
+                                argtypes[at] = ' ';
+                                at += 1;
+                            }
+                            var digits: [10]u8 = undefined;
+                            var length: usize = 0;
+                            var rest = oid;
+                            while (true) {
+                                digits[digits.len - 1 - length] = @intCast('0' + rest % 10);
+                                length += 1;
+                                rest /= 10;
+                                if (rest == 0) break;
+                            }
+                            @memcpy(argtypes[at..][0..length], digits[digits.len - length ..]);
+                            at += length;
+                        }
+                        const language = if (routine.language == 0) catalog_module.sql_language_oid else catalog_module.plpgsql_language_oid;
+                        try sink.add(&.{ intCell(routine.oid), nameCell(routine.name.slice()), intCell(routine.namespace), .{ .pg_internal_char = routine.kind }, intCell(language), .{ .pg_internal_char = routine.volatility }, boolCell(routine.strict), intCell(@intCast(routine.arg_count)), intCell(routine.return_oid), nameCell(argtypes[0..at]), nameCell(routine.body.slice()), intCell(routine.owner), try self.routineAcl(routine, snapshot) });
+                    }
                 },
                 .pg_trigger => for (&self.objects.triggers) |*trigger| {
                     if (!trigger.live or !trigger.stamp.visible(snapshot)) continue;
