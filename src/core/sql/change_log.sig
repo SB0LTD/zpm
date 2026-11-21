@@ -2136,7 +2136,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
             try scratch.object_overlay.finish(&object_check);
             if (check_routine_references or check_schema_owners) try RC.finishOverlay(&scratch.objects, &scratch.object_overlay);
             if (check_schema_owners) for (&scratch.schemas) |*schema| {
-                if (schema.live and !scratch.object_overlay.roleExists(schema.owner)) return error.ChangeRecordConflict;
+                if (schema.live and !scratch.object_overlay.roleExists(scratch.object_overlay.schemaOwner(schema.oid, schema.owner))) return error.ChangeRecordConflict;
             };
         }
 

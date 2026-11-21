@@ -2,6 +2,17 @@
 
 ## Stock PostgreSQL dump and restore candidate
 
+The whole-database follow-up tests archives with ownership and ACL
+restoration enabled. A stock PostgreSQL 16 probe found two gaps:
+export queries the large-object catalogs even when there are zero rows,
+and restore emits `ALTER SCHEMA ... OWNER TO`. The follow-up adds
+typed discovery for databases without large objects and MVCC schema
+ownership transfer for user schemas. The existing ACL entries move
+to the new grantor, and WAL replay validates the schema and role
+references. Database-level CREATE grants, objects addressed by
+PostgreSQL's large-object API, and identity sequences in non-public
+schemas remain separate conformance work.
+
 RAMSQL `d1ddbe5` with ZPM `ed00a0a1` passed all 24 stock
 tooling checks on both PostgreSQL 16 and 18. Stock plain and custom
 imports passed row, default and constraint checks after WAL reopen.
