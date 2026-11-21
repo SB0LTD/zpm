@@ -126,6 +126,7 @@ const EINTR = 4;
 const EIO = 5;
 const ENODEV = 19;
 const EINVAL = 22;
+const ENOMEM = 12;
 const ETIMEDOUT = 110;
 
 const PAGE: usize = 4096;
@@ -162,6 +163,8 @@ pub fn Node(comptime Sys: type) type {
         /// VRAM from then on. The last G_ALLOC's answer.
         no_gpu_only: bool = false,
         last_alloc: i64 = 0,
+        /// Buffers asked for again in smaller pieces (allocIn).
+        smaller_pieces: u32 = 0,
         /// Which GPU answered (open: G_INFO's chip).
         kind: Kind = .adreno,
         dma_import: bool = false,
@@ -407,10 +410,29 @@ pub fn Node(comptime Sys: type) type {
         const Made = struct { va: u64, cpu: []u8, handle: u32 };
 
         /// A buffer of `size` bytes with G_ALLOC's `flags`, in pieces when
-        /// it is larger than one.
+        /// it is larger than one. A piece the kernel had no memory for is
+        /// asked for again in smaller pieces, halved down to a unit while
+        /// the buffer still fits in MAX_PIECES of them: a VM's GPU buffers
+        /// are each a run of the guest's RAM (nv_fwd), and a guest whose
+        /// RAM a game's gigabytes came and went through had gigabytes free
+        /// and no run of 64 MiB (Unigine Superposition's textures).
         fn allocIn(g: *Self, size: usize, flags: u32) ?Made {
             // (whole units: the RTX's pieces must start on 2 MiB)
-            const piece = std.mem.alignForward(usize, @max(g.piece, g.unit), g.unit);
+            var piece = std.mem.alignForward(usize, @max(g.piece, g.unit), g.unit);
+            while (true) {
+                if (g.allocPieces(size, flags, piece)) |m| return m;
+                if (g.last_alloc != -ENOMEM or g.lost or g.fd < 0 or size == 0) return null;
+                const len = std.mem.alignForward(usize, size, g.unit);
+                const was = @min(piece, len);
+                const half = std.mem.alignForward(usize, was / 2, g.unit);
+                if (half < g.unit or half >= was or (len + half - 1) / half > MAX_PIECES) return null;
+                g.smaller_pieces +|= 1;
+                piece = half;
+            }
+        }
+
+        /// allocIn in pieces of `piece` bytes (whole units).
+        fn allocPieces(g: *Self, size: usize, flags: u32, piece: usize) ?Made {
             if (g.fd < 0 or g.lost or size == 0 or size > MAX_PIECES * piece) return null;
             const idx = g.freeEntry() orelse {
                 report.say(.egl_error, "render-node buffer table is full allocating {d} bytes", .{size});
@@ -946,6 +968,8 @@ pub const Fake = struct {
     slow: bool = false,
     /// The G_ALLOC that fails (counting from 1; 0: none).
     fail_alloc: u32 = 0,
+    /// G_ALLOCs larger than this fail, ENOMEM (0: none do).
+    max_alloc: u64 = 0,
     allocs: u32 = 0,
     pieces: [256]Buffer = [_]Buffer{.{}} ** 256,
     live: u32 = 0,
@@ -992,6 +1016,7 @@ pub const Fake = struct {
             G_ALLOC => {
                 k.allocs += 1;
                 if (k.allocs == k.fail_alloc) return -12;
+                if (k.max_alloc != 0 and rd64(a, 0) > k.max_alloc) return -12;
                 const at = rd64(a, 16);
                 if (at != 0 and at != k.emu.va_base + k.next()) return -EINVAL;
                 const b = k.emu.device().alloc(rd64(a, 0)) catch return -12;
@@ -1200,6 +1225,32 @@ test "node: native fences: the Adreno's always; the RTX's when the kernel makes 
     try std.testing.expect(!g.lost);
     try std.testing.expectEqual(@as(i64, -EINVAL), g.fenceFd());
     g.close();
+}
+
+test "node: a piece the kernel has no memory for is asked for again in smaller pieces" {
+    var k: Fake = undefined;
+    var g = testNode(&k);
+    _ = try g.open();
+    g.piece = 64 * PAGE;
+    const d = g.device();
+    // (no G_ALLOC over 16 pages: a buffer of 40 pages, halved to pieces of 10)
+    k.max_alloc = 16 * PAGE;
+    const b = try d.alloc(40 * PAGE);
+    try std.testing.expectEqual(@as(usize, 40 * PAGE), b.cpu.len);
+    const e = g.entryOf(b.handle).?;
+    try std.testing.expectEqual(@as(usize, 4), e.n);
+    try std.testing.expect(g.smaller_pieces >= 2);
+    // the GPU sees the CPU's bytes at the buffer's addresses, across pieces
+    @memset(b.cpu, 0);
+    b.cpu[20 * PAGE] = 9;
+    d.toDevice(b, 0, b.cpu.len);
+    try std.testing.expectEqual(@as(u8, 9), test_gpu_view[@intFromPtr(b.cpu.ptr) - @intFromPtr(&test_arena) + 20 * PAGE]);
+    d.free(b);
+    try std.testing.expectEqual(@as(u32, 0), k.live);
+    // none small enough within MAX_PIECES (a page each): refused
+    k.max_alloc = PAGE / 2;
+    try std.testing.expectError(error.OutOfMemory, d.alloc(2 * PAGE));
+    try std.testing.expectEqual(@as(u32, 0), k.live);
 }
 
 test "node: buffers, an import, an export, a hang, no GPU" {

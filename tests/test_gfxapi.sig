@@ -351,6 +351,24 @@ test "gfxapi: a buffer a batch still uses is freed after it; a lost GPU's batch 
     eng_f.finish();
     try std.testing.expectEqual(frees + 1, Flaky.frees);
     try std.testing.expectEqual(@as(usize, 0), eng_f.n_doomed);
+    // past the bytes freed buffers may hold while batches run, the open
+    // batch is run and waited for, and they all go
+    {
+        var c1 = eng_f.newImage(16, 4, .rgba8).?;
+        var c2 = eng_f.newImage(16, 4, .rgba8).?;
+        const one = @max(c1.buf.bytes, c1.buf.cpu.len);
+        eng_f.doomed_budget = 2 * one - 1;
+        defer eng_f.doomed_budget = engine.DOOMED_BYTES;
+        eng_f.fill(&c1, c1.bounds(), 0x2222_2222, 0);
+        eng_f.fill(&c2, c2.bounds(), 0x3333_3333, 0);
+        const waits = eng_f.stats.doomed_waits;
+        eng_f.freeImage(&c1);
+        try std.testing.expectEqual(@as(usize, 1), eng_f.n_doomed);
+        eng_f.freeImage(&c2);
+        try std.testing.expectEqual(@as(usize, 0), eng_f.n_doomed);
+        try std.testing.expectEqual(@as(u64, 0), eng_f.doomed_bytes);
+        try std.testing.expectEqual(waits + 1, eng_f.stats.doomed_waits);
+    }
     // the GPU hangs: the batch is done again on the CPU, and the engine stays there
     objs.init();
     ctx.init(&eng_f, &objs);

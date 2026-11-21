@@ -969,6 +969,12 @@ fn floatTo24(bits: u32) u32 {
 
 pub const MAX_OPS = 256;
 pub const MAX_DOOMED = 128;
+/// The bytes freed buffers may hold while their batches run (doomed): past
+/// it, the open batch is run and waited for and they go. A game loading
+/// (Unigine Superposition) freed its staged uploads' images, 32 to 256 MiB
+/// each, faster than batches finished: 106 of them held gigabytes of a VM
+/// guest's RAM, and the game's own allocations ran out.
+pub const DOOMED_BYTES: u64 = 256 << 20;
 /// Draws' uniforms (Draw.uniforms) go one after another into a host
 /// buffer of UNI_RING_BYTES (Engine.uniformsFor), in UNI_CHUNK pieces,
 /// each written again once the batches that read it are done.
@@ -1256,6 +1262,9 @@ pub const Stats = struct {
     /// Copies between images' VRAM and their shadows (gfx_words), bytes.
     vram_copies: u64 = 0,
     vram_bytes: u64 = 0,
+    /// Times the freed buffers waiting for the GPU passed DOOMED_BYTES
+    /// and the open batch was run and waited for.
+    doomed_waits: u64 = 0,
 };
 
 pub const Engine = struct {
@@ -1331,6 +1340,11 @@ pub const Engine = struct {
     sums: [RING]BatchSum = undefined,
     doomed: [MAX_DOOMED]Doomed = undefined,
     n_doomed: usize = 0,
+    /// The doomed buffers' bytes (DOOMED_BYTES), and whether freeBytes is
+    /// waiting for them already (a free inside that wait waits no more).
+    doomed_bytes: u64 = 0,
+    doom_waiting: bool = false,
+    doomed_budget: u64 = DOOMED_BYTES,
     /// The draws' uniforms (uniformsFor): the ring, where the next goes,
     /// and the last batch that read each piece of it. A draw's uniforms
     /// were a buffer made and freed each draw: the GPU was asked whether
@@ -1512,6 +1526,17 @@ pub const Engine = struct {
         }
         e.doomed[e.n_doomed] = .{ .buf = b, .batch = last };
         e.n_doomed += 1;
+        e.doomed_bytes += doomedSize(b);
+        if (e.doomed_bytes > e.doomed_budget and !e.doom_waiting) {
+            e.doom_waiting = true;
+            defer e.doom_waiting = false;
+            e.stats.doomed_waits += 1;
+            e.finish();
+        }
+    }
+
+    fn doomedSize(b: gpu.Buffer) u64 {
+        return @max(b.bytes, b.cpu.len);
     }
 
     /// Buffers whose batches are done are freed (all of them with `all`).
@@ -1523,6 +1548,7 @@ pub const Engine = struct {
             const x = e.doomed[i];
             if (all or e.lost or x.batch <= e.done_upto) {
                 if (e.dev) |d| e.freeGpu(d, x.buf);
+                e.doomed_bytes -|= doomedSize(x.buf);
                 e.n_doomed -= 1;
                 e.doomed[i] = e.doomed[e.n_doomed];
             } else i += 1;
