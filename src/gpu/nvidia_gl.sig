@@ -64,8 +64,8 @@ pub fn ioMem(io: u8, at: u32, flat: bool) kir.Mem {
 /// `k` as stage `stage`'s program (`io`: the binding it reads and writes
 /// its attribute words through) into `out`: the header, then the code,
 /// the Binary's code being both (the 3D engine is given the header's
-/// address). `st` is the compiler's State.
-pub fn compileStage(k: *const kir.Kernel, caps: device.Caps, st: *kir_sm120.State, stage: Stage, io: u8, out: []u8) kir_sm120.Error!device.Binary {
+/// address). `st` is the compiler's State (or LargeState).
+pub fn compileStage(k: *const kir.Kernel, caps: device.Caps, st: anytype, stage: Stage, io: u8, out: []u8) kir_sm120.Error!device.Binary {
     if (stage == .compute or out.len < sph.BYTES) return error.Unsupported;
     var bin = try kir_sm120.compileIn(k, caps, st, out[sph.BYTES..], .{ .stage = stage, .stage_io = io });
     const head = header(stage, &st.io);

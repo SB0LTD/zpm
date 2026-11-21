@@ -104,14 +104,19 @@ fn classify(raw: []const u8) Error!Line {
 /// A label: the instruction it is before.
 const Label = struct { name: []const u8, before: u32 };
 
-pub const Work = struct {
-    instrs: [MAX_INSTRS]sm120.Instr = undefined,
-    slots: [MAX_INSTRS]sched.Slot = undefined,
-    /// Each instruction's byte address (after the schedule's NOPs).
-    at: [MAX_INSTRS + 1]u64 = undefined,
-    labels: [MAX_LABELS]Label = undefined,
-    sched: sched.Work = .{},
-};
+/// The assembler's storage for up to `n` instructions (Work: MAX_INSTRS;
+/// a larger one for larger programs: kir_sm120's LARGE).
+pub fn WorkOf(comptime n: usize) type {
+    return struct {
+        instrs: [n]sm120.Instr = undefined,
+        slots: [n]sched.Slot = undefined,
+        /// Each instruction's byte address (after the schedule's NOPs).
+        at: [n + 1]u64 = undefined,
+        labels: [@max(MAX_LABELS, n / 8)]Label = undefined,
+        sched: sched.WorkOf(n) = .{},
+    };
+}
+pub const Work = WorkOf(MAX_INSTRS);
 
 fn nop(stall: u4) sm120.Word {
     var w = sm120.Word.of(NOP_LO, NOP_HI);
@@ -121,7 +126,7 @@ fn nop(stall: u4) sm120.Word {
 
 /// `text`'s kernel into `out` (two u64 an instruction, the count rounded up
 /// to 8).
-pub fn assemble(text: []const u8, out: []u64, work: *Work) Error!Kernel {
+pub fn assemble(text: []const u8, out: []u64, work: anytype) Error!Kernel {
     const labels = &work.labels;
     var n_labels: usize = 0;
     var k = Kernel{ .code = out[0..0], .count = 0, .registers = 0 };
@@ -139,12 +144,12 @@ pub fn assemble(text: []const u8, out: []u64, work: *Work) Error!Kernel {
                 for (labels[0..n_labels]) |l| {
                     if (std.mem.eql(u8, l.name, name)) return error.DuplicateLabel;
                 }
-                if (n_labels == MAX_LABELS) return error.TooManyLabels;
+                if (n_labels == labels.len) return error.TooManyLabels;
                 labels[n_labels] = .{ .name = name, .before = @intCast(n) };
                 n_labels += 1;
             },
             .instr => |t| {
-                if (n == MAX_INSTRS) return error.TooManyInstructions;
+                if (n == work.instrs.len) return error.TooManyInstructions;
                 work.instrs[n] = try sm120.parse(t);
                 if (t[0] == '[') with += 1;
                 n += 1;
