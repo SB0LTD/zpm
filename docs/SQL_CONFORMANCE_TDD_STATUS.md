@@ -2,6 +2,24 @@
 
 ## Stock PostgreSQL dump and restore candidate
 
+`pg_ts_config` exposes the supported `pg_catalog.simple` configuration
+(OID 3748), with the bootstrap owner and a reference to the built-in
+`default` parser (OID 3722). The standalone Windows Sig catalog suite
+passed 93 assertions, including the stock projection and joins to the
+namespace, owner and parser catalogs. The row describes the existing
+Sig text-search configuration. Custom configurations and Snowball
+configurations remain open.
+
+RAMSQL `10930e2` with ZPM `ec6015d3` passed configuration discovery
+against PostgreSQL 16 and 18 in text and binary modes. Native plain
+and custom imports passed with row and constraint checks after WAL
+reopen. Outbound `pg_dump` passed configuration discovery and then
+received `UndefinedFunction` from its `pg_foreign_data_wrapper`
+query. Qualification now needs to isolate that query's missing
+function support, including SQL quoting and `pg_options_to_table`.
+Both stock directions on both versions remain the merge gate.
+[PostgreSQL 16 and 18 text-search configuration CI](https://github.com/SB0LTD/ramsql/actions/runs/44912646310)
+
 `pg_ts_dict` exposes the built-in `pg_catalog.simple` dictionary.
 Its row uses PostgreSQL dictionary OID 3765, the bootstrap owner and
 catalog namespace, and a reference to the supported `simple` template.
