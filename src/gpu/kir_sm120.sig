@@ -105,6 +105,12 @@ const sm120_asm = nvidia.sm120_asm;
 /// KIR instructions after expansion, and virtual registers (KIR's and the
 /// backend's own).
 pub const MAX_INSTS = 16384;
+/// Why the last compile was TooBig (which limit), for the caller to say.
+pub var too_big_why: []const u8 = "";
+fn tooBig(why: []const u8) error{TooBig} {
+    too_big_why = why;
+    return error.TooBig;
+}
 pub const MAX_VREGS = 16384;
 /// Machine instructions and labels before the text.
 pub const MAX_MI = 20480;
@@ -421,7 +427,7 @@ pub const EXTRA_MI_VREGS = 5;
 pub fn compile(k: *const kir.Kernel, caps: device.Caps, work: *device.Work, out: []u8) Error!device.Binary {
     const mark = work.mark();
     defer work.release(mark);
-    const st = &(work.take(State, 1) orelse return error.TooBig)[0];
+    const st = &(work.take(State, 1) orelse return tooBig("no work memory for the compiler's state"))[0];
     st.asm_work.sched = .{};
     return compileIn(k, caps, st, out, .{});
 }
@@ -523,7 +529,7 @@ const Ctx = struct {
     fn expand(c: *Ctx) Error!void {
         const k = c.k;
         if (k.err) |e| return e;
-        if (k.n > MAX_INSTS or k.nv > MAX_VREGS) return error.TooBig;
+        if (k.n > MAX_INSTS or k.nv > MAX_VREGS) return tooBig("more than MAX_INSTS instructions or MAX_VREGS values");
         var x = kir.Kernel.init(.{ .insts = &c.w.insts, .tys = &c.w.tys }, k.name, k.group);
         x.shared_bytes = k.shared_bytes;
         x.bindings = k.bindings;
@@ -577,7 +583,7 @@ const Ctx = struct {
             }
             switch (in.op) {
                 .@"if", .loop => {
-                    if (sp == stack.len) return error.TooBig;
+                    if (sp == stack.len) return tooBig("a control stack past its room");
                     stack[sp] = @intCast(idx);
                     else_at[sp] = null;
                     sp += 1;
@@ -881,7 +887,7 @@ const Ctx = struct {
 
     fn putG(c: *Ctx, m: MI, guarded: bool) Error!void {
         const w = c.w;
-        if (w.n_mi >= MAX_MI) return error.TooBig;
+        if (w.n_mi >= MAX_MI) return tooBig("more than MAX_MI machine instructions");
         var x = m;
         if (guarded and x.kind == .inst and c.guard != .none and x.guard == .none) x.guard = c.guard;
         w.mi[w.n_mi] = x;
@@ -1045,7 +1051,7 @@ const Ctx = struct {
             if (w.folded[idx]) continue;
             switch (in.op) {
                 .@"if" => {
-                    if (sp == regions.len) return error.TooBig;
+                    if (sp == regions.len) return tooBig("regions past their room");
                     regions[sp] = try c.openIf(idx, in);
                     sp += 1;
                 },
@@ -1058,7 +1064,7 @@ const Ctx = struct {
                     try c.closeIf(&regions[sp]);
                 },
                 .loop => {
-                    if (sp == regions.len) return error.TooBig;
+                    if (sp == regions.len) return tooBig("regions past their room");
                     regions[sp] = try c.openLoop(idx);
                     sp += 1;
                 },
@@ -1223,7 +1229,7 @@ const Ctx = struct {
         r.l_end = c.label();
         r.l_else = if (r.has_else) c.label() else r.l_end;
         if (w.diverge[idx] and !w.exits[idx] and c.nobar == 0) {
-            if (c.depth >= MAX_DEPTH) return error.TooBig;
+            if (c.depth >= MAX_DEPTH) return tooBig("nesting past MAX_DEPTH");
             r.bssy = c.depth;
             c.depth += 1;
             w.stats.bssy += 1;
@@ -1286,7 +1292,7 @@ const Ctx = struct {
         r.l_cont = c.label();
         r.l_end = c.label();
         if (w.diverge[idx] and c.nobar == 0) {
-            if (c.depth >= MAX_DEPTH) return error.TooBig;
+            if (c.depth >= MAX_DEPTH) return tooBig("nesting past MAX_DEPTH");
             r.bssy = c.depth;
             c.depth += 1;
             w.stats.bssy += 1;
@@ -1312,7 +1318,7 @@ const Ctx = struct {
         // Switches and inlined returns use a loop with an unconditional
         // exit. With no back edge their temporaries are not loop-carried.
         if (!r.single_pass) {
-            if (w.n_loops == MAX_LOOPS) return error.TooBig;
+            if (w.n_loops == MAX_LOOPS) return tooBig("more than MAX_LOOPS loops");
             w.loops[w.n_loops] = .{ r.top_at, @intCast(w.n_mi - 1) };
             w.n_loops += 1;
         }
@@ -1590,7 +1596,7 @@ const Ctx = struct {
         var bar: ?u8 = null;
         if (c.guard != .none) return error.Unsupported;
         if (!c.uniformArg(in.a) and c.nobar == 0) {
-            if (c.depth >= MAX_DEPTH) return error.TooBig;
+            if (c.depth >= MAX_DEPTH) return tooBig("nesting past MAX_DEPTH");
             bar = c.depth;
             c.depth += 1;
             c.w.stats.bssy += 1;
@@ -2862,7 +2868,7 @@ const Ctx = struct {
                 t.str("\n");
             }
         }
-        if (t.full) return error.TooBig;
+        if (t.full) return tooBig("a table full");
         return w.text[0..t.len];
     }
 

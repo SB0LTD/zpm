@@ -29,7 +29,17 @@ pub const Reg = enum(u8) {
     output_depth = 12,
     null = 13,
     stream = 16,
+    /// Shader Model 5's unordered access views (u#) and thread group
+    /// shared memory (g#)
+    uav = 30,
+    tgsm = 31,
+    /// compute shaders' thread ids: vThreadID, vThreadGroupID,
+    /// vThreadIDInGroup, vThreadIDInGroupFlattened
+    input_thread_id = 32,
+    input_thread_group_id = 33,
+    input_thread_id_in_group = 34,
     input_coverage_mask = 35,
+    input_thread_id_in_group_flattened = 36,
     _,
 };
 
@@ -166,8 +176,66 @@ pub const Op = enum(u16) {
     bfrev = 141,
     swapc = 142,
     dcl_stream = 143,
+    bufinfo = 121,
+    // Shader Model 5's compute declarations and memory operations
+    dcl_thread_group = 155,
+    dcl_uav_typed = 156,
+    dcl_uav_raw = 157,
+    dcl_uav_structured = 158,
+    dcl_tgsm_raw = 159,
+    dcl_tgsm_structured = 160,
+    dcl_resource_raw = 161,
+    dcl_resource_structured = 162,
+    ld_uav_typed = 163,
+    store_uav_typed = 164,
+    ld_raw = 165,
+    store_raw = 166,
+    ld_structured = 167,
+    store_structured = 168,
+    atomic_and = 169,
+    atomic_or = 170,
+    atomic_xor = 171,
+    atomic_cmp_store = 172,
+    atomic_iadd = 173,
+    atomic_imax = 174,
+    atomic_imin = 175,
+    atomic_umax = 176,
+    atomic_umin = 177,
+    imm_atomic_alloc = 178,
+    imm_atomic_consume = 179,
+    imm_atomic_iadd = 180,
+    imm_atomic_and = 181,
+    imm_atomic_or = 182,
+    imm_atomic_xor = 183,
+    imm_atomic_exch = 184,
+    imm_atomic_cmp_exch = 185,
+    imm_atomic_imax = 186,
+    imm_atomic_imin = 187,
+    imm_atomic_umax = 188,
+    imm_atomic_umin = 189,
+    sync = 190,
     _,
 };
+
+/// Whether an op writes memory (UAVs, shared memory) or orders it: never
+/// dropped, even when its temp result is unread.
+pub fn memoryEffect(op: Op) bool {
+    const n = @intFromEnum(op);
+    return op == .store_uav_typed or op == .store_raw or op == .store_structured or (n >= 169 and n <= 190);
+}
+
+/// sync's controls (bits 11-14 of its token)
+pub const SYNC_THREADS: u16 = 1;
+pub const SYNC_TGSM: u16 = 2;
+pub const SYNC_UAV_GROUP: u16 = 4;
+pub const SYNC_UAV_GLOBAL: u16 = 8;
+
+/// Shader Model 5's resource dimensions past the textures' (extended
+/// tokens and declarations)
+pub const DIM_RAW: u8 = 11;
+pub const DIM_STRUCTURED: u8 = 12;
+/// a return type token of four "mixed" (raw and structured buffers)
+pub const RET_MIXED: u16 = 0x6666;
 
 pub const Rel = struct {
     on: bool = false,
@@ -215,6 +283,8 @@ pub const Inst = struct {
     /// Shader Model 5's resource dimension and return type (extended tokens)
     res_dim: u8 = 0,
     res_ret: u16 = 0,
+    /// structured buffers' element size (the resource dimension token's)
+    res_stride: u16 = 0,
 };
 
 pub const CTL_SAT: u16 = 1 << 2; // (bit 13 of the token)
@@ -251,7 +321,7 @@ pub const Program = struct {
 fn sideEffect(op: Op) bool {
     return switch (op) {
         .@"break", .breakc, .case, .@"continue", .continuec, .cut, .default, .discard, .@"else", .emit, .endif, .endloop, .endswitch, .@"if", .loop, .ret, .retc, .@"switch", .emit_stream, .cut_stream, .nop => true,
-        else => false,
+        else => memoryEffect(op),
     };
 }
 
@@ -560,7 +630,7 @@ pub fn encodeInst(o: *Out, i: *const Inst) void {
         o.put(e);
     }
     if (i.res_dim != 0) {
-        o.put(2 | (@as(u32, i.res_dim) << 6) | 0x8000_0000);
+        o.put(2 | (@as(u32, i.res_dim) << 6) | (@as(u32, i.res_stride & 0xfff) << 11) | 0x8000_0000);
         o.put(3 | (@as(u32, i.res_ret) << 6));
     }
     for (i.ops[0..i.n]) |x| encodeOperand(o, x);

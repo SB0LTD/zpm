@@ -75,7 +75,36 @@ fn listing(blob: []const u8, w: *W) (Error || W.Error)!void {
 
 fn isDcl(op: ir.Op) bool {
     const n = @intFromEnum(op);
-    return (n >= 88 and n <= 106) or n == 143 or op == .customdata;
+    return (n >= 88 and n <= 106) or n == 143 or (n >= 155 and n <= 162) or op == .customdata;
+}
+
+fn dimName(dim: u32) []const u8 {
+    return switch (dim) {
+        1 => "buffer",
+        2 => "texture1d",
+        3 => "texture2d",
+        4 => "texture2dms",
+        5 => "texture3d",
+        6 => "texturecube",
+        7 => "texture1darray",
+        8 => "texture2darray",
+        9 => "texture2dmsarray",
+        10 => "texturecubearray",
+        else => "unknown",
+    };
+}
+
+fn retList(w: *W, rt: u32) W.Error!void {
+    try w.writeAll("(");
+    for (0..4) |c| try w.print("{s}{s}", .{ if (c > 0) "," else "", switch ((rt >> @intCast(c * 4)) & 0xf) {
+        1 => "unorm",
+        2 => "snorm",
+        3 => "sint",
+        4 => "uint",
+        5 => "float",
+        else => "mixed",
+    } });
+    try w.writeAll(") ");
 }
 
 fn sigComment(w: *W, title: []const u8, d: []const u8, streams: bool, output: bool) W.Error!void {
@@ -180,7 +209,9 @@ fn inst(w: *W, t: []align(1) const u32, op: ir.Op) (Error || W.Error)!void {
     }
     switch (op) {
         .dcl_temps => return w.print("dcl_temps {d}\n", .{if (t.len > 1) t[1] else 0}),
-        .dcl_global_flags => return w.print("dcl_globalFlags{s}\n", .{if (ctl & 1 != 0) " refactoringAllowed" else ""}),
+        .dcl_global_flags => return w.print("dcl_globalFlags{s}{s}\n", .{ if (ctl & 1 != 0) " refactoringAllowed" else "", if (ctl & 4 != 0) " | forceEarlyDepthStencil" else "" }),
+        .dcl_thread_group => return w.print("dcl_thread_group {d}, {d}, {d}\n", .{ if (t.len > 3) t[1] else 0, if (t.len > 3) t[2] else 0, if (t.len > 3) t[3] else 0 }),
+        .sync => return w.print("sync{s}{s}{s}{s}\n", .{ if (ctl & 8 != 0) "_uglobal" else "", if (ctl & 4 != 0) "_ugroup" else "", if (ctl & 2 != 0) "_g" else "", if (ctl & 1 != 0) "_t" else "" }),
         .dcl_max_output_vertex_count => return w.print("dcl_maxout {d}\n", .{if (t.len > 1) t[1] else 0}),
         .dcl_gs_input_primitive => return w.print("dcl_inputprimitive {s}\n", .{switch (ctl & 0x3f) {
             1 => "point",
@@ -200,35 +231,12 @@ fn inst(w: *W, t: []align(1) const u32, op: ir.Op) (Error || W.Error)!void {
     }
     // the mnemonic
     switch (op) {
-        .dcl_resource => {
-            const dim = ctl & 0x1f;
-            try w.print("dcl_resource_{s} ", .{switch (dim) {
-                1 => "buffer",
-                2 => "texture1d",
-                3 => "texture2d",
-                4 => "texture2dms",
-                5 => "texture3d",
-                6 => "texturecube",
-                7 => "texture1darray",
-                8 => "texture2darray",
-                9 => "texture2dmsarray",
-                10 => "texturecubearray",
-                else => "unknown",
-            }});
-            if (t.len >= 2) {
-                const rt = t[t.len - 1];
-                try w.writeAll("(");
-                for (0..4) |c| try w.print("{s}{s}", .{ if (c > 0) "," else "", switch ((rt >> @intCast(c * 4)) & 0xf) {
-                    1 => "unorm",
-                    2 => "snorm",
-                    3 => "sint",
-                    4 => "uint",
-                    5 => "float",
-                    else => "mixed",
-                } });
-                try w.writeAll(") ");
-            }
+        .dcl_resource, .dcl_uav_typed => {
+            const typed = op == .dcl_uav_typed;
+            try w.print("{s}{s}{s} ", .{ if (typed) "dcl_uav_typed_" else "dcl_resource_", dimName(ctl & 0x1f), if (typed and ctl & 0x20 != 0) "_glc" else "" });
+            if (t.len >= 2) try retList(w, t[t.len - 1]);
         },
+        .dcl_uav_raw, .dcl_uav_structured => try w.print("{s}{s}{s} ", .{ @tagName(op), if (ctl & 0x20 != 0) "_glc" else "", if (ctl & 0x1000 != 0) "_opc" else "" }),
         .dcl_input_ps, .dcl_input_ps_siv, .dcl_input_ps_sgv => {
             try w.print("{s} {s} ", .{ names.of(op), switch (ctl & 0xf) {
                 1 => "constant",
@@ -273,6 +281,8 @@ fn inst(w: *W, t: []align(1) const u32, op: ir.Op) (Error || W.Error)!void {
         p = try operand(w, t, p, floatImm(op));
     }
     switch (op) {
+        .dcl_uav_structured, .dcl_resource_structured, .dcl_tgsm_raw => if (t.len > p) try w.print(", {d}", .{t[p]}),
+        .dcl_tgsm_structured => if (t.len > p + 1) try w.print(", {d}, {d}", .{ t[p], t[p + 1] }),
         .dcl_constant_buffer => try w.writeAll(if (ctl & 1 != 0) ", dynamicIndexed" else ", immediateIndexed"),
         .dcl_sampler => try w.writeAll(if (ctl & 0xf == 1) ", mode_comparison" else ", mode_default"),
         .dcl_input_siv, .dcl_input_sgv, .dcl_input_ps_siv, .dcl_input_ps_sgv, .dcl_output_siv, .dcl_output_sgv => if (t.len > p) try w.print(", {s}", .{switch (t[p]) {
@@ -341,12 +351,18 @@ fn operand(w: *W, t: []align(1) const u32, p0: usize, fl: bool) (Error || W.Erro
             .output_depth => "oDepth",
             .null => "null",
             .input_coverage_mask => "vCoverage",
+            .uav => "u",
+            .tgsm => "g",
+            .input_thread_id => "vThreadID",
+            .input_thread_group_id => "vThreadGroupID",
+            .input_thread_id_in_group => "vThreadIDInGroup",
+            .input_thread_id_in_group_flattened => "vThreadIDInGroupFlattened",
             else => "?",
         };
         try w.writeAll(prefix);
         for (0..dims) |d| {
             const repr = (tok >> @intCast(22 + d * 3)) & 7;
-            const bracket = !(d == 0 and (reg == .temp or reg == .output or reg == .sampler or reg == .resource or reg == .cb or reg == .indexable_temp or (reg == .input and dims == 1)));
+            const bracket = !(d == 0 and (reg == .temp or reg == .output or reg == .sampler or reg == .resource or reg == .cb or reg == .indexable_temp or reg == .uav or reg == .tgsm or (reg == .input and dims == 1)));
             if (bracket) try w.writeAll("[");
             var imm: u32 = 0;
             if (repr == 0 or repr == 3) {

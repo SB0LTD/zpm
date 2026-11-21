@@ -36,6 +36,17 @@
 //!   a loop, where some pixels of a quad may not run, derivatives are 0
 //!   (as GLSL's are). Multisampled textures and cube arrays: not yet.
 //!
+//! - **Compute** (`compute`): a compute shader as a KIR kernel of its own
+//!   (its workgroup `threadGroup`'s): vThreadID and the other thread ids;
+//!   typed UAVs read and written through texture.sig (a UAV's descriptor
+//!   is a texture's: its level, its format); raw and structured buffers
+//!   (UAVs, t#, groupshared g#) as words at byte offsets, bounds-checked
+//!   (past the end: reads 0, writes and atomics dropped, as Direct3D
+//!   does); atomics (global and groupshared); sync's group barrier; and a
+//!   return anywhere. Not yet: append and consume buffers' counters
+//!   (imm_atomic_alloc, imm_atomic_consume), UAVs of 8- and 16-bit one- or
+//!   two-channel formats written.
+//!
 //! Allocation-free: its tables are the Gen's, on the caller's stack.
 
 const std = @import("std");
@@ -84,7 +95,25 @@ pub const Layout = struct {
     texture: *const fn (?*const anyopaque, u32, u32) ?u32 = noTexture,
     /// where the slots' descriptors start in the uniform binding
     desc_base: u32 = 0,
+    /// u#: its memory's binding, and its descriptor's first word in the
+    /// uniform binding: a typed UAV's a texture descriptor
+    /// (texture.DESC_WORDS, level 0 the view's level; a typed buffer is a
+    /// 1D texture of its elements), a raw or structured one's two words:
+    /// its bytes and its stride (null: none bound: reads 0, writes dropped)
+    uav: *const fn (?*const anyopaque, u32) ?Mem = noMem,
+    /// t# declared raw or structured (ByteAddressBuffer,
+    /// StructuredBuffer): its memory's binding and its bytes and stride
+    /// words (a typed buffer, Buffer<T>, is a texture slot: `texture`)
+    tbuffer: *const fn (?*const anyopaque, u32) ?Mem = noMem,
 };
+
+/// A buffer's or a typed UAV's memory: its binding, and its descriptor's
+/// first word in the uniform binding.
+pub const Mem = struct { b: u8, word: u32 };
+
+fn noMem(_: ?*const anyopaque, _: u32) ?Mem {
+    return null;
+}
 
 fn attrSame(_: ?*const anyopaque, reg: u32) ?u32 {
     return if (reg < raster.MAX_ATTRS) reg else null;
@@ -301,6 +330,58 @@ pub fn fragment(blob: []const u8, lay: Layout, k: *kir.Kernel, io: *raster.Fragm
     return true;
 }
 
+/// A declared buffer or UAV: its register (u# or t#), its kind, a
+/// structured one's stride.
+pub const Decl = struct { reg: u32, kind: enum { typed, raw, structured }, stride: u32 = 0 };
+
+/// The UAVs a shader declares (`uavs`), or its t# declared raw or
+/// structured: at most out.len, in the order declared.
+pub fn bufferDecls(blob: []const u8, uavs: bool, out: []Decl) usize {
+    const c = dxbc.Container.parse(blob) catch return 0;
+    const p = c.program() catch return 0;
+    var n: usize = 0;
+    var rd = p.reader();
+    while (rd.next() catch return n) |i| {
+        if (n == out.len) break;
+        const d: Decl = switch (i.op) {
+            .dcl_uav_typed => if (uavs) .{ .reg = i.operands[0].index[0].imm, .kind = .typed } else continue,
+            .dcl_uav_raw => if (uavs) .{ .reg = i.operands[0].index[0].imm, .kind = .raw } else continue,
+            .dcl_uav_structured => if (uavs) .{ .reg = i.operands[0].index[0].imm, .kind = .structured, .stride = i.raw[i.raw.len - 1] } else continue,
+            .dcl_resource_raw => if (!uavs) .{ .reg = i.operands[0].index[0].imm, .kind = .raw } else continue,
+            .dcl_resource_structured => if (!uavs) .{ .reg = i.operands[0].index[0].imm, .kind = .structured, .stride = i.raw[i.raw.len - 1] } else continue,
+            else => continue,
+        };
+        out[n] = d;
+        n += 1;
+    }
+    return n;
+}
+
+/// A compute shader's workgroup (dcl_thread_group), or null: not a
+/// compute shader, or none declared.
+pub fn threadGroup(blob: []const u8) ?[3]u32 {
+    const c = dxbc.Container.parse(blob) catch return null;
+    const p = c.program() catch return null;
+    if (p.stage != .compute) return null;
+    var rd = p.reader();
+    while (rd.next() catch return null) |i| {
+        if (i.op == .dcl_thread_group and i.raw.len >= 4) return .{ i.raw[1], i.raw[2], i.raw[3] };
+    }
+    return null;
+}
+
+/// The compute shader `blob` as kernel k's code (k made with the
+/// shader's threadGroup()); its bindings are `uni` (the uniform words:
+/// constant buffers, descriptors), the texture slots from `texb`, and
+/// whatever `lay.uav` and `lay.tbuffer` name. False (with `log`) when it
+/// can't be generated.
+pub fn compute(blob: []const u8, lay: Layout, k: *kir.Kernel, uni: u8, texb: u8, log: *Log) bool {
+    var g: Gen = undefined;
+    if (!g.begin(blob, lay, k, log, .compute, uni, texb)) return false;
+    g.run();
+    return !g.failed;
+}
+
 // ── The generator ──────────────────────────────────────────────────────────
 
 const Gen = struct {
@@ -334,6 +415,16 @@ const Gen = struct {
     /// if and loop nesting: derivatives only at 0
     depth: u32,
     failed: bool,
+    /// a compute shader's: each u#'s and t#'s kind (Buf), a typed one's
+    /// dimension and what it returns, a structured one's stride; each
+    /// g#'s place in shared memory
+    uav_buf: [MAX_UAVS]Buf,
+    uav_dim: [MAX_UAVS]u8,
+    uav_kind: [MAX_UAVS]texture.Kind,
+    uav_stride: [MAX_UAVS]u32,
+    res_buf: [128]Buf,
+    res_stride: [128]u32,
+    tgsm: [MAX_TGSM]Tgsm,
 
     fn begin(g: *Gen, blob: []const u8, lay: Layout, k: *kir.Kernel, log: *Log, want: dxbc.Stage, uni: u8, texb: u8) bool {
         g.* = .{
@@ -358,6 +449,13 @@ const Gen = struct {
             .quads = false,
             .depth = 0,
             .failed = false,
+            .uav_buf = [_]Buf{.none} ** MAX_UAVS,
+            .uav_dim = [_]u8{0} ** MAX_UAVS,
+            .uav_kind = [_]texture.Kind{.float} ** MAX_UAVS,
+            .uav_stride = [_]u32{0} ** MAX_UAVS,
+            .res_buf = [_]Buf{.none} ** 128,
+            .res_stride = [_]u32{0} ** 128,
+            .tgsm = [_]Tgsm{.{}} ** MAX_TGSM,
         };
         for (&g.outs) |*o| o.* = .{ .none, .none, .none, .none };
         for (&g.ins) |*i| i.* = .{ u(0), u(0), u(0), u(0x3f80_0000) };
@@ -431,11 +529,12 @@ const Gen = struct {
             },
             .dcl_indexable_temp => _ = g.fail("indexable temps (x#[]) not yet", .{}),
             .dcl_resource => {
-                // (bits 11-15: the dimension: 2 1D, 3 2D, 5 3D, 6 cube,
-                // 7 1D array, 8 2D array; then a return type per component)
+                // (bits 11-15: the dimension: 1 a buffer, 2 1D, 3 2D, 5 3D,
+                // 6 cube, 7 1D array, 8 2D array; then a return type per
+                // component)
                 const dim = (i.raw[0] >> 11) & 0x1f;
                 switch (dim) {
-                    2, 3, 5, 6, 7, 8 => {},
+                    1, 2, 3, 5, 6, 7, 8 => {},
                     else => {
                         _ = g.fail("a resource of dimension {d} (buffers, multisampled textures and cube arrays not yet)", .{dim});
                         return;
@@ -450,7 +549,53 @@ const Gen = struct {
                     else => .float,
                 };
             },
-            else => {}, // constant buffers, samplers, global flags: nothing to emit
+            .dcl_uav_typed => {
+                const n = i.operands[0].index[0].imm;
+                if (n >= MAX_UAVS) return;
+                const dim = (i.raw[0] >> 11) & 0x1f;
+                switch (dim) {
+                    1, 2, 3, 5, 7, 8 => {},
+                    else => {
+                        _ = g.fail("a UAV of dimension {d}", .{dim});
+                        return;
+                    },
+                }
+                g.uav_buf[n] = .typed;
+                g.uav_dim[n] = @intCast(dim);
+                g.uav_kind[n] = switch (i.raw[i.raw.len - 1] & 0xf) {
+                    3 => .int,
+                    4 => .uint,
+                    else => .float,
+                };
+            },
+            .dcl_uav_raw, .dcl_uav_structured => {
+                const n = i.operands[0].index[0].imm;
+                if (n >= MAX_UAVS) return;
+                g.uav_buf[n] = if (i.op == .dcl_uav_raw) .raw else .structured;
+                if (i.op == .dcl_uav_structured) g.uav_stride[n] = i.raw[i.raw.len - 1];
+            },
+            .dcl_resource_raw, .dcl_resource_structured => {
+                const n = i.operands[0].index[0].imm;
+                if (n >= g.res_buf.len) return;
+                g.res_buf[n] = if (i.op == .dcl_resource_raw) .raw else .structured;
+                if (i.op == .dcl_resource_structured) g.res_stride[n] = i.raw[i.raw.len - 1];
+            },
+            .dcl_tgsm_raw, .dcl_tgsm_structured => {
+                const n = i.operands[0].index[0].imm;
+                if (n >= MAX_TGSM) {
+                    _ = g.fail("groupshared g{d}", .{n});
+                    return;
+                }
+                const structured = i.op == .dcl_tgsm_structured;
+                const stride: u32 = if (structured) i.raw[i.raw.len - 2] else 4;
+                const bytes: u32 = if (structured) stride * i.raw[i.raw.len - 1] else i.raw[i.raw.len - 1];
+                if (bytes == 0 or bytes > 32768) {
+                    _ = g.fail("{d} bytes of groupshared memory", .{bytes});
+                    return;
+                }
+                g.tgsm[n] = .{ .base = k.sharedAlloc(bytes, 16), .bytes = bytes, .stride = stride, .structured = structured };
+            },
+            else => {}, // constant buffers, samplers, global flags, the thread group: nothing to emit
         }
     }
 
@@ -463,8 +608,9 @@ const Gen = struct {
         };
         switch (o.reg) {
             .input => {},
+            // (a compute shader's thread ids: read where they are used)
+            .input_thread_id, .input_thread_group_id, .input_thread_id_in_group, .input_thread_id_in_group_flattened => return,
             else => {
-                // (vThreadID and the like: compute and other stages)
                 _ = g.fail("input register {s}", .{@tagName(o.reg)});
                 return;
             },
@@ -531,6 +677,7 @@ const Gen = struct {
                 }
                 return g.ins[n][sc];
             },
+            .input_thread_id, .input_thread_group_id, .input_thread_id_in_group, .input_thread_id_in_group_flattened => return g.threadId(o.reg, sc),
             .immediate32 => return u(if (o.comps == 1) o.imm[0] else o.imm[c]),
             .constant_buffer => return g.cbuf(o, sc),
             .immediate_constant_buffer => return g.icbRead(o, sc),
@@ -681,7 +828,8 @@ const Gen = struct {
         const k = g.k;
         const op = i.op;
         const n = @intFromEnum(op);
-        if (op == .customdata or (n >= @intFromEnum(dxbc.Op.dcl_resource) and n <= @intFromEnum(dxbc.Op.dcl_global_flags)) or op == .dcl_thread_group) return g.declare(i);
+        if (op == .customdata or (n >= @intFromEnum(dxbc.Op.dcl_resource) and n <= @intFromEnum(dxbc.Op.dcl_global_flags)) or
+            (n >= @intFromEnum(dxbc.Op.dcl_thread_group) and n <= @intFromEnum(dxbc.Op.dcl_resource_structured))) return g.declare(i);
         const sat = i.saturate;
         switch (op) {
             .nop, .label => {},
@@ -804,7 +952,9 @@ const Gen = struct {
                 if (g.discard != .none) k.set(g.discard, .por, r(g.discard), p, no);
             },
             .ret => if (g.depth != 0) {
-                _ = g.fail("a return inside flow (an early return) not yet", .{});
+                // (a compute shader's lanes leave where they return; the
+                // other stages' outputs are taken at the end)
+                if (g.stage == .compute) k.ret() else _ = g.fail("a return inside flow (an early return) not yet", .{});
             },
             .deriv_rtx, .deriv_rty, .deriv_rtx_coarse, .deriv_rtx_fine, .deriv_rty_coarse, .deriv_rty_fine => {
                 const up = op == .deriv_rty or op == .deriv_rty_coarse or op == .deriv_rty_fine;
@@ -819,6 +969,15 @@ const Gen = struct {
             .sample, .sample_l, .sample_b, .sample_d, .sample_c, .sample_c_lz => g.sample(i),
             .ld => g.ld(i),
             .resinfo => g.resinfo(i),
+            .ld_uav_typed => g.ldUav(i),
+            .store_uav_typed => g.storeUav(i),
+            .ld_raw, .ld_structured => g.ldBuf(i),
+            .store_raw, .store_structured => g.storeBuf(i),
+            .bufinfo => g.bufinfo(i),
+            .atomic_and, .atomic_or, .atomic_xor, .atomic_cmp_store, .atomic_iadd, .atomic_imax, .atomic_imin, .atomic_umax, .atomic_umin, .imm_atomic_iadd, .imm_atomic_and, .imm_atomic_or, .imm_atomic_xor, .imm_atomic_exch, .imm_atomic_cmp_exch, .imm_atomic_imax, .imm_atomic_imin, .imm_atomic_umax, .imm_atomic_umin => g.atomic(i),
+            // (D3D11_SB_SYNC_THREADS_IN_GROUP: a barrier; the memory fences
+            // alone are the order a lane's own accesses have already)
+            .sync => if (i.raw[0] & 0x800 != 0) k.barrier(),
             else => _ = g.fail("instruction {s} not yet", .{@tagName(op)}),
         }
     }
@@ -1071,13 +1230,14 @@ const Gen = struct {
         const dim = g.dimOf(res);
         const a = &i.operands[1];
         const x = g.isrc(a, 0, .u32);
-        const y = if (dim == 2 or dim == 7) u(0) else g.isrc(a, 1, .u32);
+        const y = if (dim == 1 or dim == 2 or dim == 7) u(0) else g.isrc(a, 1, .u32);
         const layer: ?Arg = switch (dim) {
             7 => g.isrc(a, 1, .u32),
             5, 8 => g.isrc(a, 2, .u32),
             else => null,
         };
-        const lvl = g.isrc(a, 3, .u32);
+        // (a buffer has no levels: its coordinate is x alone)
+        const lvl = if (dim == 1) u(0) else g.isrc(a, 3, .u32);
         g.writeTexel(d, res, texture.fetchArray(k, slot, x, y, layer, g.kindOf(res), .{ i.offset[0], i.offset[1] }, lvl));
     }
 
@@ -1111,7 +1271,266 @@ const Gen = struct {
         }
         g.writeTexel(d, res, t);
     }
+
+    // ── Compute ──
+
+    /// A thread id's component: vThreadID (the group's id times its size,
+    /// plus the thread's place in it), vThreadGroupID, vThreadIDInGroup,
+    /// vThreadIDInGroupFlattened.
+    fn threadId(g: *Gen, reg: dxbc.Reg, c: u2) Arg {
+        const k = g.k;
+        if (g.stage != .compute) {
+            _ = g.fail("a thread id outside a compute shader", .{});
+            return u(0);
+        }
+        const dim: u2 = @min(c, 2);
+        return switch (reg) {
+            .input_thread_group_id => r(k.gid(dim)),
+            .input_thread_id_in_group => r(k.tid(dim)),
+            .input_thread_id => r(k.op3(.imad, .u32, r(k.gid(dim)), u(k.group[dim]), r(k.tid(dim)))),
+            else => blk: {
+                // ((z * height + y) * width + x)
+                const zy = k.op3(.imad, .u32, r(k.tid(2)), u(k.group[1]), r(k.tid(1)));
+                break :blk r(k.op3(.imad, .u32, r(zy), u(k.group[0]), r(k.tid(0))));
+            },
+        };
+    }
+
+    /// A raw or structured buffer's memory: a UAV's, a t#'s, or
+    /// groupshared g#'s: where it is, its bytes and its stride.
+    const Place = struct { mem: kir.Mem, base: Arg, bytes: Arg, stride: Arg };
+
+    fn bufPlace(g: *Gen, o: *const dxbc.Operand) ?Place {
+        const k = g.k;
+        const n = o.index[0].imm;
+        switch (o.reg) {
+            .unordered_access_view => {
+                if (n >= MAX_UAVS or g.uav_buf[n] == .typed) return g.failNull("u{d} read or written as a buffer", .{n});
+                const m = g.lay.uav(g.lay.ctx, n) orelse return null;
+                return .{ .mem = kir.global(m.b, 32), .base = u(0), .bytes = r(raster.uniform(k, .u32, g.uni, m.word)), .stride = if (g.uav_stride[n] != 0) u(g.uav_stride[n]) else r(raster.uniform(k, .u32, g.uni, m.word + 1)) };
+            },
+            .resource => {
+                if (n >= g.res_buf.len or g.res_buf[n] == .none) return g.failNull("t{d} read as a buffer, not declared one", .{n});
+                const m = g.lay.tbuffer(g.lay.ctx, n) orelse return null;
+                return .{ .mem = kir.global(m.b, 32), .base = u(0), .bytes = r(raster.uniform(k, .u32, g.uni, m.word)), .stride = if (g.res_stride[n] != 0) u(g.res_stride[n]) else r(raster.uniform(k, .u32, g.uni, m.word + 1)) };
+            },
+            .thread_group_shared_memory => {
+                if (n >= MAX_TGSM or g.tgsm[n].bytes == 0) return g.failNull("g{d} not declared", .{n});
+                const t = g.tgsm[n];
+                return .{ .mem = kir.shared(32), .base = u(t.base), .bytes = u(t.bytes), .stride = u(t.stride) };
+            },
+            else => return g.failNull("a buffer access of {s}", .{@tagName(o.reg)}),
+        }
+    }
+
+    fn failNull(g: *Gen, comptime fmt: []const u8, args: anytype) ?Place {
+        _ = g.fail(fmt, args);
+        return null;
+    }
+
+    /// The byte offset an instruction addresses: a raw buffer's operand
+    /// .x; a structured one's element (.x) times the stride, plus the
+    /// offset in it (the next operand's .x).
+    fn bufAddr(g: *Gen, pl: Place, structured: bool, a: *const dxbc.Operand, b: ?*const dxbc.Operand) V {
+        const k = g.k;
+        if (!structured) return k.mov(.u32, g.isrc(a, 0, .u32));
+        const off = if (b) |x| g.isrc(x, 0, .u32) else g.isrc(a, 1, .u32);
+        return k.op3(.imad, .u32, g.isrc(a, 0, .u32), pl.stride, off);
+    }
+
+    /// The word at byte `at` + 4 * w (past the end: 0).
+    fn loadWord(g: *Gen, pl: Place, at: V, w: u32) V {
+        const k = g.k;
+        const off = k.op2(.iadd, .u32, r(at), u(4 * w));
+        const inside = k.cmp(.u32, .lt, r(off), r(k.op2(.isub, .u32, r(k.op2(.imax, .u32, pl.bytes, u(4))), u(3))));
+        const clamped = k.op2(.imin, .u32, r(off), r(k.op2(.isub, .u32, r(k.op2(.imax, .u32, pl.bytes, u(4))), u(4))));
+        const v = k.load(.u32, pl.mem, r(k.op2(.iadd, .u32, pl.base, r(clamped))));
+        return k.sel(.u32, r(inside), r(v), u(0));
+    }
+
+    /// ld_raw and ld_structured: words from the address on, the source's
+    /// swizzle choosing which go where.
+    fn ldBuf(g: *Gen, i: *const dxbc.Inst) void {
+        const structured = i.op == .ld_structured;
+        const d = &i.operands[0];
+        const src = &i.operands[if (structured) 3 else 2];
+        const pl = g.bufPlace(src) orelse {
+            g.write(d, .{ u(0), u(0), u(0), u(0) }, false);
+            return;
+        };
+        const at = g.bufAddr(pl, structured, &i.operands[1], if (structured) &i.operands[2] else null);
+        var words: [4]?V = .{ null, null, null, null };
+        var vals: [4]?Arg = .{ null, null, null, null };
+        for (0..4) |c_| {
+            const c: u2 = @intCast(c_);
+            if (!masked(d, c)) continue;
+            const w = src.swizzle[c];
+            if (words[w] == null) words[w] = g.loadWord(pl, at, w);
+            vals[c] = r(words[w].?);
+        }
+        g.write(d, vals, false);
+    }
+
+    /// store_raw and store_structured: the destination's components, x up,
+    /// to consecutive words (past the end: dropped).
+    fn storeBuf(g: *Gen, i: *const dxbc.Inst) void {
+        const k = g.k;
+        const structured = i.op == .store_structured;
+        const d = &i.operands[0];
+        const pl = g.bufPlace(d) orelse return;
+        const at = g.bufAddr(pl, structured, &i.operands[1], if (structured) &i.operands[2] else null);
+        const v = &i.operands[if (structured) 3 else 2];
+        for (0..4) |c_| {
+            const c: u2 = @intCast(c_);
+            if (d.mask & (@as(u4, 1) << c) == 0) continue;
+            const off = k.op2(.iadd, .u32, r(at), u(4 * @as(u32, c)));
+            k.ifp(r(k.cmp(.u32, .lt, r(k.op2(.iadd, .u32, r(off), u(3))), pl.bytes)));
+            k.store(.u32, pl.mem, r(k.op2(.iadd, .u32, pl.base, r(off))), g.bits(v, c));
+            k.endif();
+        }
+    }
+
+    /// A typed UAV's texture slot (its descriptor in the uniform words).
+    fn uavSlot(g: *Gen, o: *const dxbc.Operand) ?texture.Slot {
+        const n = o.index[0].imm;
+        if (o.reg != .unordered_access_view or n >= MAX_UAVS or g.uav_buf[n] != .typed) {
+            _ = g.fail("a typed UAV access of {s} {d}", .{ @tagName(o.reg), n });
+            return null;
+        }
+        const m = g.lay.uav(g.lay.ctx, n) orelse return null;
+        return .{ .b = m.b, .uni = g.uni, .word = m.word, .volume = g.uav_dim[n] == 5 };
+    }
+
+    /// A typed UAV's coordinates: x, y and a layer (or a 3D one's depth),
+    /// by its dimension (a buffer and 1D: x; a 1D array's layer at y).
+    fn uavCoords(g: *Gen, n: u32, a: *const dxbc.Operand) struct { x: Arg, y: Arg, layer: ?Arg } {
+        const dim = g.uav_dim[n];
+        const x = g.isrc(a, 0, .u32);
+        return switch (dim) {
+            1, 2 => .{ .x = x, .y = u(0), .layer = null },
+            7 => .{ .x = x, .y = u(0), .layer = g.isrc(a, 1, .u32) },
+            5, 8 => .{ .x = x, .y = g.isrc(a, 1, .u32), .layer = g.isrc(a, 2, .u32) },
+            else => .{ .x = x, .y = g.isrc(a, 1, .u32), .layer = null },
+        };
+    }
+
+    fn ldUav(g: *Gen, i: *const dxbc.Inst) void {
+        const d = &i.operands[0];
+        const res = &i.operands[2];
+        const slot = g.uavSlot(res) orelse {
+            g.writeTexel(d, res, .{ u(0), u(0), u(0), u(0) });
+            return;
+        };
+        const n = res.index[0].imm;
+        const cd = g.uavCoords(n, &i.operands[1]);
+        g.writeTexel(d, res, texture.fetchArray(g.k, slot, cd.x, cd.y, cd.layer, g.uav_kind[n], .{ 0, 0 }, u(0)));
+    }
+
+    fn storeUav(g: *Gen, i: *const dxbc.Inst) void {
+        const d = &i.operands[0];
+        const slot = g.uavSlot(d) orelse return;
+        const cd = g.uavCoords(d.index[0].imm, &i.operands[1]);
+        const v = &i.operands[2];
+        texture.store(g.k, slot, cd.x, cd.y, cd.layer, .{ g.bits(v, 0), g.bits(v, 1), g.bits(v, 2), g.bits(v, 3) });
+    }
+
+    /// bufinfo: a structured buffer's elements, a raw one's bytes, a typed
+    /// buffer's elements (its texture's width), in every component.
+    fn bufinfo(g: *Gen, i: *const dxbc.Inst) void {
+        const k = g.k;
+        const d = &i.operands[0];
+        const res = &i.operands[1];
+        const n = res.index[0].imm;
+        const typed = (res.reg == .unordered_access_view and n < MAX_UAVS and g.uav_buf[n] == .typed) or
+            (res.reg == .resource and n < g.res_buf.len and g.res_buf[n] == .none);
+        var v: Arg = u(0);
+        if (typed) {
+            const slot = if (res.reg == .resource) g.slotOf(res, null) else g.uavSlot(res);
+            if (slot) |sl| v = asU32(k, texture.size(k, sl, u(0))[0]);
+        } else if (g.bufPlace(res)) |pl| {
+            const structured = if (res.reg == .resource) g.res_buf[n] == .structured else g.uav_buf[n] == .structured;
+            v = if (structured) r(g.udivmod(pl.bytes, pl.stride)[0]) else pl.bytes;
+        }
+        g.write(d, .{ v, v, v, v }, false);
+    }
+
+    /// atomic_* (no result) and imm_atomic_* (the old value to its first
+    /// operand): on a raw or structured buffer (a UAV's, groupshared), or a
+    /// typed UAV's 32-bit texel; past the end: nothing, the result 0.
+    fn atomic(g: *Gen, i: *const dxbc.Inst) void {
+        const k = g.k;
+        const imm = @intFromEnum(i.op) >= @intFromEnum(dxbc.Op.imm_atomic_iadd);
+        const ops = i.operands[0..i.n];
+        const target = &ops[if (imm) 1 else 0];
+        const addr = &ops[if (imm) 2 else 1];
+        const val = &ops[if (imm) 3 else 2];
+        const cmp_ = i.op == .atomic_cmp_store or i.op == .imm_atomic_cmp_exch;
+        // (the place: its memory, a byte offset, whether inside)
+        var mem: kir.Mem = undefined;
+        var off: V = undefined;
+        var inside: V = undefined;
+        const n = target.index[0].imm;
+        const typed = target.reg == .unordered_access_view and n < MAX_UAVS and g.uav_buf[n] == .typed;
+        if (typed) {
+            const slot = g.uavSlot(target) orelse return;
+            const cd = g.uavCoords(n, addr);
+            const pl = texture.texelPlace(k, slot, cd.x, cd.y, cd.layer);
+            mem = kir.global(slot.b, 32);
+            off = pl.addr;
+            inside = pl.inside;
+        } else {
+            const pl = g.bufPlace(target) orelse return;
+            const structured = if (target.reg == .thread_group_shared_memory) g.tgsm[n].structured else g.uav_buf[n] == .structured;
+            const at = if (structured) k.op3(.imad, .u32, g.isrc(addr, 0, .u32), pl.stride, g.isrc(addr, 1, .u32)) else k.mov(.u32, g.isrc(addr, 0, .u32));
+            mem = pl.mem;
+            off = k.op2(.iadd, .u32, pl.base, r(at));
+            inside = k.cmp(.u32, .lt, r(k.op2(.iadd, .u32, r(at), u(3))), pl.bytes);
+        }
+        const result = k.reg(.u32);
+        k.set(result, .mov, u(0), no, no);
+        k.ifp(r(inside));
+        {
+            const a = g.isrc(val, 0, .u32);
+            const old: V = if (cmp_)
+                // (compare: the operand before the value; store where equal)
+                k.cas(.u32, mem, r(off), a, g.isrc(&ops[if (imm) 4 else 3], 0, .u32))
+            else blk: {
+                const kind: kir.Atom = switch (i.op) {
+                    .atomic_iadd, .imm_atomic_iadd => .add,
+                    .atomic_and, .imm_atomic_and => .@"and",
+                    .atomic_or, .imm_atomic_or => .@"or",
+                    .atomic_xor, .imm_atomic_xor => .xor,
+                    .imm_atomic_exch => .xchg,
+                    .atomic_imax, .imm_atomic_imax, .atomic_umax, .imm_atomic_umax => .max,
+                    else => .min,
+                };
+                const signed = switch (i.op) {
+                    .atomic_imax, .imm_atomic_imax, .atomic_imin, .imm_atomic_imin => true,
+                    else => false,
+                };
+                break :blk if (signed) k.mov(.u32, r(k.atomic(.i32, kind, mem, r(off), r(k.mov(.i32, a))))) else k.atomic(.u32, kind, mem, r(off), a);
+            };
+            k.set(result, .mov, r(old), no, no);
+        }
+        k.endif();
+        if (imm) {
+            const d = &ops[0];
+            g.write(d, .{ r(result), r(result), r(result), r(result) }, false);
+        }
+    }
 };
+
+const MAX_UAVS = 64;
+const MAX_TGSM = 32;
+
+/// A u#'s or t#'s kind as declared: none, a typed UAV, a raw or a
+/// structured buffer.
+const Buf = enum(u2) { none, typed, raw, structured };
+
+/// Groupshared g#: its first byte in shared memory, its bytes, its stride
+/// (a raw one's 4), and whether it was declared structured (its addresses
+/// an element and an offset).
+const Tgsm = struct { base: u32 = 0, bytes: u32 = 0, stride: u32 = 0, structured: bool = false };
 
 fn asU32(k: *kir.Kernel, a: Arg) Arg {
     return if (a == .reg) r(k.mov(.u32, a)) else a;
@@ -1163,4 +1582,5 @@ pub const Pair = struct {
 
 test {
     _ = @import("draw_test.sig");
+    _ = @import("compute_test.sig");
 }
