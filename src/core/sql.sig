@@ -1395,7 +1395,7 @@ pub fn Database(comptime config: Config) type {
                         // These catalog lookups use the serialized database hook.
                         .to_regclass,.regclass_in,.regclass_out,.pg_get_serial_sequence,.pg_table_is_visible,.pg_get_indexdef,.pg_get_constraintdef,.pg_get_triggerdef,.pg_partition_ancestors,
                         .to_regnamespace,.regnamespace_in,.regnamespace_out,.to_regproc=>return error.UnsupportedStatement,
-                        .pg_get_statisticsobjdef_columns,.pg_relation_is_publishable,.pg_get_partkeydef,.acldefault=>return error.UnsupportedStatement,
+                        .pg_get_statisticsobjdef_columns,.pg_relation_is_publishable,.pg_get_partkeydef,.acldefault,.current_schemas=>return error.UnsupportedStatement,
                         .obj_description,.col_description,.shobj_description,.current_user,.session_user=>return error.UnsupportedStatement,
                         .current_setting,.set_config,.pg_backend_pid,.pg_is_in_recovery,
                         .pg_try_advisory_lock,.pg_try_advisory_lock_shared,
@@ -5186,6 +5186,32 @@ pub fn Database(comptime config: Config) type {
             return text.len;
         }
 
+        fn catalogSchemaPath(ptr: *anyopaque, implicit: bool, names: *[2][]const u8) usize {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            const path = self.sessionState().values.search_path.slice();
+            var items = std.mem.splitSequence(u8, path, ", ");
+            var count: usize = 0;
+            var catalog_seen = false;
+            var public_seen = false;
+            while (items.next()) |item| {
+                if (types.same(item, "pg_catalog") and !catalog_seen) {
+                    names[count] = "pg_catalog";
+                    count += 1;
+                    catalog_seen = true;
+                } else if (types.same(item, "public") and !public_seen) {
+                    names[count] = "public";
+                    count += 1;
+                    public_seen = true;
+                }
+            }
+            if (implicit and !catalog_seen) {
+                if (count != 0) names[1] = names[0];
+                names[0] = "pg_catalog";
+                count += 1;
+            }
+            return count;
+        }
+
         /// Rows of the catalog-object system views.
         fn catalogObjectRows(self: *const Self, session_values: *const value_module.Session, snapshot: Snapshot, view: catalog_module.View, sink: *X.RowSink) Error!void {
             const database = session_values.database;
@@ -6235,6 +6261,21 @@ pub fn Database(comptime config: Config) type {
             if (view == .pg_event_trigger) return;
             // Publication metadata does not create logical replication subscriptions.
             if (view == .pg_subscription) return;
+            // There are no security label providers or persistent role/database settings.
+            if (view == .pg_seclabel or view == .pg_shseclabel or view == .pg_seclabels or view == .pg_db_role_setting) return;
+            // Index comparisons use the store's typed comparator, with no
+            // separately registered support-procedure routines.
+            if (view == .pg_amproc) return;
+            if (view == .pg_amop) {
+                for (index_operator_catalog.btree_strategies) |entry| {
+                    try sink.add(&.{
+                        intCell(entry.oid), intCell(entry.family), intCell(entry.left), intCell(entry.right),
+                        intCell(entry.number), .{ .pg_internal_char = 's' }, intCell(entry.operator),
+                        intCell(catalog_module.btree_access_method), intCell(0),
+                    });
+                }
+                return;
+            }
             if (view == .pg_range) {
                 for (catalog_module.ranges) |range| {
                     // Supported subtypes have no collation and no subdiff callback.
@@ -6353,7 +6394,16 @@ pub fn Database(comptime config: Config) type {
                 const provider = self.catalog.databases orelse return error.TableNotFound;
                 for (0..provider.capacity) |index| {
                     const entry = provider.row(provider.context, index) orelse continue;
-                    try sink.add(&.{ intCell(entry.oid), nameCell(entry.name), intCell(entry.owner) });
+                    const name = if (provider.use_session_database_name) session_values.database else entry.name;
+                    // The engine uses UTF-8, bytewise ordering and the default tablespace.
+                    // Rows do not have PostgreSQL physical transaction freeze horizons.
+                    try sink.add(&.{
+                        intCell(entry.oid), try objectTextCell(name), intCell(entry.owner), intCell(catalog_module.utf8_encoding),
+                        .{ .pg_internal_char = 'c' }, boolCell(false), boolCell(true),
+                        intCell(-1), intCell(0), intCell(0), intCell(catalog_module.default_tablespace),
+                        nameCell("C"), nameCell("C"), .null_value, .null_value,
+                        .null_value, .null_value, .null_value,
+                    });
                 }
                 return;
             }
@@ -8788,7 +8838,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn statementHooks(self: *Self, slot: u16, snap: Snapshot) void {
-            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .relation_name = &relationName, .relation_display_name = &relationDisplayName, .catalog_text = &catalogText, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .trigger_definition = &postgresTriggerDefinition, .statistics_columns = &postgresStatisticsColumns, .relation_publishable = &relationPublishable, .partition_key_definition = &postgresPartitionKey, .partition_ancestors = &postgresPartitionAncestors, .namespace_lookup = &postgresNamespaceLookup, .namespace_name = &postgresNamespaceName, .routine_lookup = &postgresRoutineLookup, .routine_name = &postgresRoutineName };
+            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .relation_name = &relationName, .relation_display_name = &relationDisplayName, .catalog_text = &catalogText, .schema_path = &catalogSchemaPath, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .trigger_definition = &postgresTriggerDefinition, .statistics_columns = &postgresStatisticsColumns, .relation_publishable = &relationPublishable, .partition_key_definition = &postgresPartitionKey, .partition_ancestors = &postgresPartitionAncestors, .namespace_lookup = &postgresNamespaceLookup, .namespace_name = &postgresNamespaceName, .routine_lookup = &postgresRoutineLookup, .routine_name = &postgresRoutineName };
             self.session.sequences = &self.seq_hook;
             self.seq_slot = slot;
             self.seq_snap = snap;

@@ -100,6 +100,16 @@ fn types() !void {
 }
 
 fn dumpDiscovery() !void {
+    try expect("SELECT pg_encoding_to_char(6), pg_encoding_to_char(41), pg_encoding_to_char(-1), pg_encoding_to_char(NULL)", "UTF8|SHIFT_JIS_2004||NULL");
+    try expect("SELECT current_schemas(false), current_schemas(true)", "{public}|{pg_catalog,public}");
+    try run("SET search_path TO public, pg_catalog");
+    try expect("SELECT current_schemas(false), current_schemas(true)", "{public,pg_catalog}|{public,pg_catalog}");
+    try run("SET search_path TO DEFAULT");
+    try expect("SELECT tableoid, amopstrategy, amopopr FROM pg_amop WHERE amopfamily=1976 AND amoplefttype=23 AND amoprighttype=23 ORDER BY amopstrategy",
+        "2602|1|97;2602|2|523;2602|3|96;2602|4|525;2602|5|521");
+    try expect("SELECT amproc FROM pg_amproc WHERE amprocfamily=1976", "");
+    try expect("SELECT label,provider,classoid,objoid,objsubid FROM pg_seclabels ORDER BY classoid,objoid,objsubid", "");
+    try expect("SELECT setdatabase,setrole,unnest(setconfig) FROM pg_db_role_setting", "");
     try expect("SELECT 'pg_catalog.pg_subscription'::regclass::oid", "6100");
     try expect("SELECT COUNT(*) FROM pg_subscription WHERE subdbid = 5::oid", "0");
     try expect("SELECT oid,subname,subowner,subskiplsn,subpublications,suborigin FROM pg_catalog.pg_subscription", "");

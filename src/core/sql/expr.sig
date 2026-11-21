@@ -499,6 +499,32 @@ pub fn Eval(comptime config: types.Config) type {
         }
 
         /// Discovery functions and regclass/regtype conversions (design Ã‚Â§4.10).
+        fn currentSchemas(ctx: *const Context, implicit: bool) Error!V.Cell {
+            const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
+            const read = hook.schema_path orelse return error.UnsupportedStatement;
+            var names: [2][]const u8 = undefined;
+            const count = read(hook.ptr, implicit, &names);
+            var result: V.Text = .{};
+            var writer = try V.Arrays.Writer.begin(&result, &.{
+                .element = .name, .ndim = if (count == 0) 0 else 1,
+                .dims = .{ @intCast(count), 0, 0, 0, 0, 0 },
+            });
+            for (names[0..count]) |name| {
+                const cell = try textCell(name);
+                try writer.append(&cell);
+            }
+            return .{ .array = result };
+        }
+
+        // PostgreSQL encoding IDs describe names independently of conversion support.
+        const encoding_names = [_][]const u8{
+            "SQL_ASCII", "EUC_JP", "EUC_CN", "EUC_KR", "EUC_TW", "EUC_JIS_2004", "UTF8", "MULE_INTERNAL",
+            "LATIN1", "LATIN2", "LATIN3", "LATIN4", "LATIN5", "LATIN6", "LATIN7", "LATIN8", "LATIN9", "LATIN10",
+            "WIN1256", "WIN1258", "WIN866", "WIN874", "KOI8R", "WIN1251", "WIN1252",
+            "ISO_8859_5", "ISO_8859_6", "ISO_8859_7", "ISO_8859_8", "WIN1250",
+            "WIN1253", "WIN1254", "WIN1255", "WIN1257", "KOI8U", "SJIS", "BIG5", "GBK", "UHC", "GB18030", "JOHAB", "SHIFT_JIS_2004",
+        };
+
         fn catalogValue(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
             switch (n.func) {
                 .current_database => return textCell(ctx.session.database),
@@ -508,6 +534,11 @@ pub fn Eval(comptime config: types.Config) type {
             const first = try eval(ctx, n.b);
             if (first == .null_value) return .null_value;
             switch (n.func) {
+                .current_schemas => return currentSchemas(ctx, first.boolean),
+                .pg_encoding_to_char => {
+                    const id = first.integer;
+                    return textCell(if (id >= 0 and id < encoding_names.len) encoding_names[@intCast(id)] else "");
+                },
                 .acldefault => {
                     const owner = try eval(ctx, node(ctx, n.b).next);
                     if (owner == .null_value) return .null_value;
@@ -1398,7 +1429,7 @@ pub fn Eval(comptime config: types.Config) type {
                         return .{ .text = text };
                     },
                     .nextval, .currval, .setval, .lastval, .identity_next => return sequenceValue(ctx, n),
-                    .current_database, .current_schema, .to_regtype, .to_regclass, .to_regproc, .format_type, .pg_get_expr, .regclass_in, .regtype_in, .regclass_out, .regtype_out,
+                    .current_database, .current_schema, .current_schemas, .pg_encoding_to_char, .to_regtype, .to_regclass, .to_regproc, .format_type, .pg_get_expr, .regclass_in, .regtype_in, .regclass_out, .regtype_out,
                     .to_regnamespace, .regnamespace_in, .regnamespace_out,
                     .acldefault, .pg_table_is_visible, .pg_get_indexdef, .pg_get_constraintdef, .pg_get_triggerdef, .pg_get_statisticsobjdef_columns, .pg_relation_is_publishable, .pg_get_partkeydef => return catalogValue(ctx, n),
                     .pg_partition_ancestors, .array_subquery => return error.UnsupportedStatement,

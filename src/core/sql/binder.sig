@@ -1310,6 +1310,8 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "setval", .func = .setval },
                 .{ .name = "lastval", .func = .lastval },
                 .{ .name = "current_database", .func = .current_database },
+                .{ .name = "current_schemas", .func = .current_schemas },
+                .{ .name = "pg_encoding_to_char", .func = .pg_encoding_to_char },
                 .{ .name = "current_schema", .func = .current_schema },
                 .{ .name = "to_regtype", .func = .to_regtype },
                 .{ .name = "to_regclass", .func = .to_regclass },
@@ -2252,6 +2254,11 @@ pub fn Binder(comptime config: types.Config) type {
                     if (count != 0) return error.UndefinedFunction;
                     n.ty = .name;
                 },
+                .current_schemas => {
+                    try bindSignature(context, n, &.{.boolean}, types.arrayType(.name).?, true);
+                    n.constant = false;
+                },
+                .pg_encoding_to_char => try bindSignature(context, n, &.{.int4}, .name, true),
                 .to_regtype, .to_regclass, .to_regnamespace => {
                     if (count != 1) return error.UndefinedFunction;
                     const ty = context.node(n.b).ty;

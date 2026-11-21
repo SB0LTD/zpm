@@ -3,6 +3,7 @@
 //! Stock tooling qualification verifies the catalog links and exercises each
 //! class through CREATE UNIQUE INDEX, ordered reads and duplicate rejection.
 const types = @import("types.sig");
+const operator_catalog = @import("operator_catalog.sig");
 
 const Class = struct { oid: u32, name: []const u8, input: types.DataType };
 const Family = struct { oid: u32, name: []const u8, classes: []const Class };
@@ -45,6 +46,42 @@ pub const btree_families = [_]Family{
 pub fn defaultBtreeOid(comptime data_type: types.DataType) u32 {
     return lookupDefaultBtreeOid(data_type) orelse unreachable;
 }
+
+const Strategy = struct { oid: u32, family: u32, left: u32, right: u32, number: u16, operator: u32 };
+const Strategies = struct {
+    items: [operator_catalog.operators.len]Strategy = undefined,
+    len: usize = 0,
+};
+
+fn btreeStrategies() Strategies {
+    @setEvalBranchQuota(100000);
+    var result: Strategies = .{};
+    for (operator_catalog.operators) |op| {
+        const number: u16 = if (types.same(op.name, "<")) 1 else if (types.same(op.name, "<=")) 2
+            else if (types.same(op.name, "=")) 3 else if (types.same(op.name, ">=")) 4
+            else if (types.same(op.name, ">")) 5 else continue;
+        if (op.result != 16) continue;
+        for (btree_families) |family| {
+            var left = false;
+            var right = false;
+            for (family.classes) |class| {
+                const oid = types.typeOid(class.input);
+                left = left or oid == op.left;
+                right = right or oid == op.right;
+            }
+            if (!left or !right) continue;
+            // Built-in strategy rows have engine-local identities. Each
+            // exposed operator belongs to at most one of these families.
+            result.items[result.len] = .{ .oid = op.oid, .family = family.oid, .left = op.left, .right = op.right, .number = number, .operator = op.oid };
+            result.len += 1;
+            break;
+        }
+    }
+    return result;
+}
+
+const strategies = btreeStrategies();
+pub const btree_strategies = strategies.items[0..strategies.len];
 
 pub fn lookupDefaultBtreeOid(data_type: types.DataType) ?u32 {
     for (btree_families) |family| {

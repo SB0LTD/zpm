@@ -2,6 +2,18 @@
 
 ## Stock PostgreSQL dump and restore candidate
 
+RAMSQL `ea70fda` with ZPM `a6f6cfe0` completed the stock
+subscription query on PostgreSQL 16 and 18. The dedicated metadata
+probe found that the standalone database row used the canonical name
+even when a connection supplied an alias. The stock dumps then failed
+when reading `pg_amop` and `pg_amproc` as part of dependency
+discovery. The follow-up exposes built-in B-tree strategies and the
+typed support-procedure catalog. ZPM uses its typed comparator directly.
+The follow-up also covers database and search-path metadata for custom
+archives. Logical subscriptions and security label providers remain
+outside the supported SQL surface.
+[PostgreSQL 16 and 18 subscription CI](https://github.com/SB0LTD/ramsql/actions/runs/44925395409)
+
 RAMSQL `c175b9f` with ZPM `c8b764ab` passed range and list
 partition discovery, default-child removal, and restored defaults on
 PostgreSQL 16 and 18. Both stock outbound dumps advanced to the

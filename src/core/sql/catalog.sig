@@ -55,7 +55,8 @@ pub const View = enum(u8) { pg_type, pg_namespace, pg_class, pg_attribute, pg_in
     // Catalog objects (B11 wave 3, catalog_objects.sig).
     pg_roles, pg_authid, pg_auth_members, pg_policy, pg_policies, pg_description, pg_shdescription, pg_foreign_data_wrapper, pg_foreign_server, pg_publication, pg_extension, pg_tables, table_privileges, pg_enum, pg_database, pg_am, pg_collation, pg_constraint, pg_statistic_ext,
     pg_publication_rel, pg_publication_namespace, pg_settings, pg_depend, pg_tablespace, pg_foreign_table,
-    pg_init_privs, pg_cast, pg_transform, pg_language, pg_operator, pg_opclass, pg_opfamily, pg_ts_parser, pg_ts_template, pg_ts_dict, pg_ts_config, pg_default_acl, pg_conversion, pg_range, pg_event_trigger, pg_partitioned_table, pg_subscription };
+    pg_init_privs, pg_cast, pg_transform, pg_language, pg_operator, pg_opclass, pg_opfamily, pg_ts_parser, pg_ts_template, pg_ts_dict, pg_ts_config, pg_default_acl, pg_conversion, pg_range, pg_event_trigger, pg_partitioned_table, pg_subscription,
+    pg_seclabel, pg_shseclabel, pg_seclabels, pg_db_role_setting, pg_amop, pg_amproc };
 
 pub const sql_language_oid: u32 = 14;
 pub const plpgsql_language_oid: u32 = 13002;
@@ -65,6 +66,8 @@ pub const DatabaseCatalogProvider = struct {
     context: ?*const anyopaque = null,
     capacity: usize,
     row: *const fn (?*const anyopaque, usize) ?DatabaseCatalogRow,
+    /// A single-store listener may admit aliases for its only database.
+    use_session_database_name: bool = false,
 };
 
 pub const ViewColumn = struct { name: []const u8, ty: types.Type };
@@ -81,7 +84,15 @@ const pg_type_columns = [_]ViewColumn{
 };
 const pg_namespace_columns = [_]ViewColumn{ col("oid", .oid), col("nspname", .name), col("nspowner", .oid), col("nspacl", types.arrayType(.aclitem).?) };
 const pg_enum_columns = [_]ViewColumn{ col("oid", .oid), col("enumtypid", .oid), col("enumsortorder", .float4), col("enumlabel", .name) };
-const pg_database_columns = [_]ViewColumn{ col("oid", .oid), col("datname", .name), col("datdba", .oid) };
+pub const utf8_encoding: i64 = 6;
+pub const default_tablespace: i64 = 1663;
+const pg_database_columns = [_]ViewColumn{
+    col("oid", .oid), col("datname", .name), col("datdba", .oid), col("encoding", .int4),
+    col("datlocprovider", .pg_internal_char), col("datistemplate", .boolean), col("datallowconn", .boolean),
+    col("datconnlimit", .int4), col("datfrozenxid", .xid), col("datminmxid", .xid), col("dattablespace", .oid),
+    col("datcollate", .text), col("datctype", .text), col("daticulocale", .text), col("datlocale", .text),
+    col("daticurules", .text), col("datcollversion", .text), col("datacl", types.arrayType(.aclitem).?),
+};
 pub const constraint_catalog: u32 = 2606;
 pub const attrdef_catalog: u32 = 2604;
 pub const heap_access_method: u32 = 2;
@@ -181,6 +192,15 @@ pub const ranges = [_]RangeEntry{
     rangeEntry(.int8range, 4536, int8range_canonical.oid),
 };
 const pg_am_columns = [_]ViewColumn{ col("oid", .oid), col("amname", .name), col("amhandler", .regproc), col("amtype", .pg_internal_char) };
+const pg_amop_columns = [_]ViewColumn{
+    col("oid", .oid), col("amopfamily", .oid), col("amoplefttype", .oid), col("amoprighttype", .oid),
+    col("amopstrategy", .int2), col("amoppurpose", .pg_internal_char), col("amopopr", .oid),
+    col("amopmethod", .oid), col("amopsortfamily", .oid),
+};
+const pg_amproc_columns = [_]ViewColumn{
+    col("oid", .oid), col("amprocfamily", .oid), col("amproclefttype", .oid), col("amprocrighttype", .oid),
+    col("amprocnum", .int2), col("amproc", .regproc),
+};
 const pg_collation_columns = [_]ViewColumn{
     col("oid", .oid), col("collname", .name), col("collnamespace", .oid), col("collowner", .oid),
     col("collprovider", .text), col("collisdeterministic", .boolean), col("collencoding", .int4),
@@ -318,6 +338,17 @@ const key_column_usage_columns = [_]ViewColumn{ col("constraint_catalog", .name)
 const oid_array = types.arrayType(.oid).?;
 const name_array = types.arrayType(.name).?;
 const text_array = types.arrayType(.text).?;
+const pg_seclabel_columns = [_]ViewColumn{
+    col("objoid", .oid), col("classoid", .oid), col("objsubid", .int4), col("provider", .text), col("label", .text),
+};
+const pg_shseclabel_columns = [_]ViewColumn{
+    col("objoid", .oid), col("classoid", .oid), col("provider", .text), col("label", .text),
+};
+const pg_seclabels_columns = [_]ViewColumn{
+    col("objoid", .oid), col("classoid", .oid), col("objsubid", .int4), col("objtype", .text),
+    col("objnamespace", .oid), col("objname", .text), col("provider", .text), col("label", .text),
+};
+const pg_db_role_setting_columns = [_]ViewColumn{ col("setdatabase", .oid), col("setrole", .oid), col("setconfig", text_array) };
 const pg_subscription_columns = [_]ViewColumn{
     col("oid", .oid), col("subdbid", .oid), col("subskiplsn", .pg_lsn), col("subname", .name),
     col("subowner", .oid), col("subenabled", .boolean), col("subbinary", .boolean),
@@ -387,6 +418,12 @@ pub fn viewColumns(view: View) []const ViewColumn {
         .pg_event_trigger => &pg_event_trigger_columns,
         .pg_partitioned_table => &pg_partitioned_table_columns,
         .pg_subscription => &pg_subscription_columns,
+        .pg_seclabel => &pg_seclabel_columns,
+        .pg_shseclabel => &pg_shseclabel_columns,
+        .pg_seclabels => &pg_seclabels_columns,
+        .pg_db_role_setting => &pg_db_role_setting_columns,
+        .pg_amop => &pg_amop_columns,
+        .pg_amproc => &pg_amproc_columns,
         .pg_cast => &pg_cast_columns,
         .pg_transform => &pg_transform_columns,
         .pg_language => &pg_language_columns,
@@ -423,7 +460,8 @@ pub fn viewColumns(view: View) []const ViewColumn {
 pub fn findView(schema: ?[]const u8, name: []const u8) ?View {
     const catalog_views = [_]View{ .pg_type, .pg_enum, .pg_namespace, .pg_am, .pg_collation, .pg_class, .pg_settings, .pg_attribute, .pg_index, .pg_constraint, .pg_depend, .pg_statistic_ext, .pg_attrdef, .pg_sequence, .pg_indexes, .pg_views, .pg_matviews, .pg_inherits, .pg_proc, .pg_trigger, .pg_rewrite, .pg_rules,
         .pg_tablespace, .pg_foreign_table, .pg_roles, .pg_authid, .pg_auth_members, .pg_policy, .pg_policies, .pg_description, .pg_shdescription, .pg_foreign_data_wrapper, .pg_foreign_server, .pg_publication, .pg_publication_rel, .pg_publication_namespace, .pg_extension, .pg_tables,
-        .pg_init_privs, .pg_cast, .pg_transform, .pg_language, .pg_operator, .pg_opclass, .pg_opfamily, .pg_ts_parser, .pg_ts_template, .pg_ts_dict, .pg_ts_config, .pg_default_acl, .pg_conversion, .pg_range, .pg_event_trigger, .pg_partitioned_table, .pg_subscription };
+        .pg_init_privs, .pg_cast, .pg_transform, .pg_language, .pg_operator, .pg_opclass, .pg_opfamily, .pg_ts_parser, .pg_ts_template, .pg_ts_dict, .pg_ts_config, .pg_default_acl, .pg_conversion, .pg_range, .pg_event_trigger, .pg_partitioned_table, .pg_subscription,
+        .pg_seclabel, .pg_shseclabel, .pg_seclabels, .pg_db_role_setting, .pg_amop, .pg_amproc };
     const information_views = [_]View{ .schemata, .tables, .columns, .table_constraints, .key_column_usage, .table_privileges };
     const qualified = schema orelse {
         for (catalog_views) |view| if (types.same(@tagName(view), name)) return view;
@@ -450,6 +488,10 @@ pub const bootstrap_relations = [_]struct { view: View, oid: u32 }{
     .{ .view = .pg_event_trigger, .oid = 3466 },
     .{ .view = .pg_partitioned_table, .oid = 3350 },
     .{ .view = .pg_subscription, .oid = 6100 },
+    .{ .view = .pg_seclabel, .oid = 3596 },
+    .{ .view = .pg_shseclabel, .oid = 3592 },
+    .{ .view = .pg_db_role_setting, .oid = 2964 },
+    .{ .view = .pg_amop, .oid = 2602 }, .{ .view = .pg_amproc, .oid = 2603 },
     .{ .view = .pg_operator, .oid = 2617 },
     .{ .view = .pg_opclass, .oid = 2616 }, .{ .view = .pg_opfamily, .oid = 2753 },
     .{ .view = .pg_ts_parser, .oid = 3601 },
