@@ -931,6 +931,7 @@ pub fn Database(comptime config: Config) type {
 
         pub const AlterRecord = struct {
             fold_created_primary: bool = false,
+            adds_identity: bool = false,
             sources: [config.columns]u8 = @splat(0),
             fills: [config.columns]V.Cell = @splat(.null_value),
         };
@@ -7657,7 +7658,12 @@ pub fn Database(comptime config: Config) type {
                         if (self.tables[entry.table].oid == source.oid and (!fold_created_primary or entry.table != alter.table))
                             return error.UnsupportedStatement;
                     },
-                    .update, .delete, .truncate, .refresh_rows, .alter_table, .drop_table => {
+                    .alter_table => {
+                        if (self.tables[entry.table].oid == source.oid and
+                            (!fold_created_primary or entry.table != alter.table or !self.alters[entry.table].adds_identity))
+                            return error.UnsupportedStatement;
+                    },
+                    .update, .delete, .truncate, .refresh_rows, .drop_table => {
                         if (self.tables[entry.table].oid == source.oid) return error.UnsupportedStatement;
                     },
                     else => {},
@@ -7708,6 +7714,7 @@ pub fn Database(comptime config: Config) type {
             source.pending_drop = true;
             self.alters[index] = .{
                 .fold_created_primary = fold_created_primary,
+                .adds_identity = alter.identity != null,
                 .sources = alter.sources,
                 .fills = fills,
             };
@@ -9328,9 +9335,13 @@ pub fn Database(comptime config: Config) type {
         fn createForWal(self: *const Self, index: usize, writes: anytype) *const S.Table {
             const source = &self.tables[index];
             if (!source.pending_drop) return source;
+            var previous = index;
             for (writes) |entry| {
-                if (entry.kind == .alter_table and entry.old == index and self.alters[entry.table].fold_created_primary)
-                    return &self.tables[entry.table];
+                if (entry.kind != .alter_table or entry.old != previous) continue;
+                const change = &self.alters[entry.table];
+                if (change.fold_created_primary) return &self.tables[entry.table];
+                if (!change.adds_identity) break;
+                previous = entry.table;
             }
             return source;
         }
@@ -9363,6 +9374,9 @@ pub fn Database(comptime config: Config) type {
                         const alter = &self.alters[entry.table];
                         if (alter.fold_created_primary) continue;
                         const table = &self.tables[entry.table];
+                        // The fresh CREATE record already carries the identity
+                        // definition when a later primary key folded into it.
+                        if (alter.adds_identity and self.createForWal(entry.table, tx.writes[0..tx.write_len]) != table) continue;
                         try C.encodeAlter(writer, table, alter.sources[0..table.column_count], alter.fills[0..table.column_count]);
                     },
                     .catalog_insert, .catalog_delete => {},
