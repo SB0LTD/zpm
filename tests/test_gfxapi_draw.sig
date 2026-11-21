@@ -2451,6 +2451,73 @@ test "draw: a depth-only pass (no colour target, a shadow map's) goes to the RTX
     try std.testing.expectEqual(eng_rtx.stats.graphics_draws, Rtx3d.engine3d.draws);
 }
 
+/// The RTX's compiler, but a tile kernel (gl_raster...) too big for it, as
+/// a large program's is (kir_sm120's MAX_INSTS): those draws run on the CPU.
+fn noRaster(k: *const gpu.kir.Kernel, caps: gpu.Caps, work: *gpu.Work, out: []u8) anyerror!gpu.Binary {
+    if (std.mem.startsWith(u8, k.name, "gl_raster")) return error.TooBig;
+    return engine.compileAny(k, caps, work, out);
+}
+
+test "draw: draws whose tile kernel is too big for the GPU run on the CPU and leave a block-linear target block linear: the CPU's kernels take its layout" {
+    Rtx3d.engine3d = .{};
+    Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+    Rtx.dev.withEngine(&Rtx3d.engine3d);
+    eng_rtx.init(.{ .dev = Rtx.dev.device(), .compiler = noRaster, .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs, .graphics = true });
+    defer eng_rtx.deinit();
+    defer eng_rtx.unloadPipeline(&solid);
+    const e = &eng_rtx;
+    var img = e.newImage(W, H, .rgba8) orelse return error.OutOfMemory;
+    defer e.freeImage(&img);
+    try std.testing.expect(e.promote(&img));
+    try std.testing.expect(img.layout.block);
+    var zd = e.newImageSamples(W, H, .d24s8, 1) orelse return error.OutOfMemory;
+    defer e.freeImage(&zd);
+    var ab = e.newBuffer(6 * 16) orelse return error.OutOfMemory;
+    defer e.freeImage(&ab);
+    const shape = [4][2]f32{ .{ 5.37, 3.11 }, .{ 58.93, 6.71 }, .{ 52.18, 29.42 }, .{ 9.66, 26.05 } };
+    const cpu_before = e.stats.cpu_draws;
+    // slopedPasses' two passes (LESS writing the depth, then EQUAL), each
+    // on the CPU: its tile kernel refused (why_pipe says so; the GPU kept)
+    e.fill(&img, img.bounds(), 0, 0);
+    e.fillDepth(&zd, zd.bounds(), 1.0, 0, 0xff);
+    var verts: [6][4]f32 = undefined;
+    const tris = [2][3]usize{ .{ 0, 1, 2 }, .{ 0, 2, 3 } };
+    const zs = [4]f32{ -0.3, 0.2117, 0.7, 0.0931 };
+    for (tris, 0..) |t, n| {
+        for (t, 0..) |c, j| verts[n * 3 + j] = .{ nx(shape[c][0], W), nx(shape[c][1], H), zs[c], 1 };
+    }
+    e.writeBytes(&ab, 0, std.mem.sliceAsBytes(&verts));
+    const quarter = [_]u32{ @bitCast(@as(f32, 0.25)), 0, 0, 0 };
+    const add = raster.Blend{ .dst_rgb = .{ .c = .{ 1, 1, 1, 1 } }, .dst_a = .{ .c = .{ 1, 1, 1, 1 } }, .gl = .{ g.ONE, g.ONE, g.ONE, g.ONE } };
+    // (off the 3D engine: the compute raster's path, whose tile kernel
+    // the compiler refuses)
+    e.compute_only = true;
+    for (0..2) |pass| {
+        var d = raster.Draw{ .pipe = &solid, .color = &img, .depth = &zd, .depth_test = true, .depth_write = pass == 0, .depth_func = if (pass == 0) 0b001 else 0b010, .rect = .{ .x0 = 0, .y0 = 0, .x1 = W, .y1 = H }, .count = 6, .center = .{ W / 2, H / 2 }, .half = .{ W / 2, H / 2 }, .uniforms = &quarter, .blend = add };
+        d.attrs[0] = .{ .buf = &ab, .stride = 16, .comps = 4 };
+        try std.testing.expect(e.draw(&d));
+        e.finish();
+    }
+    try std.testing.expect(e.stats.cpu_draws >= cpu_before + 2);
+    try std.testing.expect(!e.lost);
+    // still block linear: the CPU ran the same kernels, in its layout
+    try std.testing.expect(img.layout.block);
+    try std.testing.expect(!img.no_block);
+    // every pixel the LESS pass wrote met by the EQUAL pass
+    var words: [W * H]u32 = undefined;
+    var pic: [W * H * 4]u8 = undefined;
+    e.readDepthBits(&zd, 0, 0, W, H, &words, null);
+    e.read(&img, 0, 0, W, H, &pic, W * 4, .rgba8);
+    const one: u32 = @bitCast(@as(f32, 1.0));
+    var covered: u32 = 0;
+    for (0..W * H) |p| {
+        if (words[p] == one) continue;
+        covered += 1;
+        try std.testing.expectEqual(@as(u32, 2), hits(pic[p * 4]));
+    }
+    try std.testing.expect(covered > 100);
+}
+
 test "draw: the compute raster's float depth is the 3D engine's within 3 ulps (pc-full4's spread), over the same pixels; each path's EQUAL pass meets its own LESS pass's depths" {
     Rtx3d.engine3d = .{};
     Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);

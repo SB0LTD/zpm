@@ -900,8 +900,11 @@ pub fn stageWhyNot(d: *const Draw) ?[]const u8 {
     // (no colour target: a depth-only pass, the depth alone drawn; colour
     // targets past the first with target 0 off are not yet)
     if (d.color_off) {
-        if ((d.depth orelse d.stencil) == null) return "no colour target and no depth target";
-        for (d.targets[1..]) |tt| if (tt != null) return "colour targets past the first, target 0 off";
+        var others = false;
+        for (d.targets[1..]) |tt| others = others or tt != null;
+        if ((d.depth orelse d.stencil) == null)
+            return if (others) "colour target 0 unbound, others bound, no depth image" else "no colour target and no depth target (the draw's size from an image that is neither)";
+        if (others) return "colour targets past the first, target 0 off, beside a depth image";
     }
     if (d.samples() != 1) return "multisampling";
     if (!d.color_off) {

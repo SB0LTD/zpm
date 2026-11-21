@@ -1367,9 +1367,9 @@ pub const Engine = struct {
     /// Images in VRAM now, and their bytes (stats).
     vram_count: u32 = 0,
     said_graphics: bool = false,
-    said_compute: [8][]const u8 = @splat(""),
+    said_compute: [16][]const u8 = @splat(""),
     /// The draws each of said_compute's reasons sent to the compute kernels.
-    compute_why_n: [8]u32 = @splat(0),
+    compute_why_n: [16]u32 = @splat(0),
     said_promote: bool = false,
     said_rows: [8][]const u8 = @splat(""),
     compiler: Compiler = compileAny,
@@ -1704,9 +1704,23 @@ pub const Engine = struct {
     /// it: exported images stay rows), one level, one sample, and never
     /// moved back to rows before.
     pub fn promotable(e: *const Engine, img: *const Image) bool {
-        return e.block_targets and e.onGpu() and img.live() and img.format.bytes() == 4 and img.format.renderable() and
-            img.layout.linear() and !img.no_block and img.own and img.share == null and img.levels == 1 and
-            img.samples == 1 and !img.pooled and !img.depth_float;
+        return e.promoteWhyNot(img) == null;
+    }
+
+    /// Why a colour image is not one promote makes block linear (each the
+    /// whole reason a depth-tested draw into it stays on the compute
+    /// kernels: sayCompute), or null.
+    pub fn promoteWhyNot(e: *const Engine, img: *const Image) ?[]const u8 {
+        const pre = "a depth or stencil image beside a colour image of rows (RT_LINEAR_WITH_ZETA), kept rows: ";
+        if (!e.block_targets or !e.onGpu()) return pre ++ "block-linear targets off (GALAXY_GL_BLOCK=0, or no GPU)";
+        if (!img.live() or !img.own or img.share != null) return pre ++ "an image the engine does not own alone (shared, imported, or a view)";
+        if (img.format.bytes() != 4 or !img.format.renderable()) return pre ++ "texels of other than 4 bytes (RGBA16F and RGBA32F are 16, R16 2)";
+        if (img.no_block) return pre ++ "moved back to rows for good (an op that takes rows alone was done on it)";
+        if (img.levels != 1) return pre ++ "an image with mipmap levels";
+        if (img.samples != 1) return pre ++ "multisampled";
+        if (img.pooled) return pre ++ "in the pool (not GPU memory of its own)";
+        if (img.depth_float or !img.layout.linear()) return pre ++ "a depth image, or already another layout";
+        return null;
     }
 
     /// A GL render target made block linear in place (Turing2D's GOBs, as
@@ -2796,7 +2810,7 @@ pub const Engine = struct {
         if (zimg) |z| {
             if (!d.color_off and !d.color.layout.block) {
                 e.stats.compute_draws += 1;
-                e.sayCompute("a depth or stencil image beside a colour image of rows (the 3D engine draws depth only into block-linear colour: RT_LINEAR_WITH_ZETA)");
+                e.sayCompute(e.promoteWhyNot(d.color) orelse "a depth or stencil image beside a colour image of rows (the 3D engine draws depth only into block-linear colour: RT_LINEAR_WITH_ZETA)");
                 return null;
             }
             if (!z.depth_float) {
@@ -3207,8 +3221,15 @@ pub const Engine = struct {
     }
 
     /// img for the CPU: no batch in flight uses it, the GPU's writes fetched.
+    /// Not hostView: the CPU runs the same kernels the GPU does, which
+    /// read and write either layout, so a block-linear render target stays
+    /// block linear. (Through hostView, a draw on the CPU, a program too big
+    /// for the GPU's compiler, moved its target to rows for good, and every
+    /// later depth-tested draw into it went to the compute kernels: Unigine
+    /// Superposition's loading, 4,400 draws in a few minutes.)
     fn fetchAll(e: *Engine, img: *Image) void {
-        _ = e.hostView(img, 0, img.buf.cpu.len);
+        e.settle(img);
+        if (img.gpuWrote()) e.fromDevice(img, 0, img.buf.cpu.len);
     }
 
     fn runCpu(e: *Engine, st: Stage, p: *const raster.Pipeline, groups: [3]u32, views: []const []u8, params: []const u32) bool {
