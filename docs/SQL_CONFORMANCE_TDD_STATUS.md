@@ -2,6 +2,15 @@
 
 ## Stock PostgreSQL dump and restore candidate
 
+RAMSQL `c175b9f` with ZPM `c8b764ab` passed range and list
+partition discovery, default-child removal, and restored defaults on
+PostgreSQL 16 and 18. Both stock outbound dumps advanced to the
+logical subscription count, which returned `TableNotFound`. The new
+typed `pg_subscription` catalog is empty because the engine has no
+logical subscriptions. The standalone server supplies its own database
+row to the existing `pg_database` provider interface.
+[PostgreSQL 16 and 18 partition CI](https://github.com/SB0LTD/ramsql/actions/runs/44924845762)
+
 RAMSQL `0cadbf6` with ZPM `9b7446b8` passed CHECK and index
 discovery on PostgreSQL 16 and 18. Both lanes compared inherited CHECK
 locality, primary and covering indexes, and NULLS NOT DISTINCT.

@@ -6233,6 +6233,8 @@ pub fn Database(comptime config: Config) type {
             if (view == .pg_conversion) return;
             // Relation triggers and DDL event triggers have separate catalogs.
             if (view == .pg_event_trigger) return;
+            // Publication metadata does not create logical replication subscriptions.
+            if (view == .pg_subscription) return;
             if (view == .pg_range) {
                 for (catalog_module.ranges) |range| {
                     // Supported subtypes have no collation and no subdiff callback.

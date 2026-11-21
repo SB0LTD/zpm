@@ -100,6 +100,9 @@ fn types() !void {
 }
 
 fn dumpDiscovery() !void {
+    try expect("SELECT 'pg_catalog.pg_subscription'::regclass::oid", "6100");
+    try expect("SELECT COUNT(*) FROM pg_subscription WHERE subdbid = 5::oid", "0");
+    try expect("SELECT oid,subname,subowner,subskiplsn,subpublications,suborigin FROM pg_catalog.pg_subscription", "");
     try expect("SELECT oid,spcname,spcowner,spcacl IS NULL,spcoptions IS NULL FROM pg_tablespace ORDER BY oid",
         "1663|pg_default|10|t|t;1664|pg_global|10|t|t");
     try expect("SELECT COUNT(*) FROM pg_foreign_table", "0");
