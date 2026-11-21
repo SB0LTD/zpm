@@ -292,6 +292,7 @@ pub const Op = enum(u11) {
     gather4 = 109,
     sample_pos = 110,
     sample_info = 111,
+    bufinfo = 121,
     deriv_rtx_coarse = 122,
     deriv_rtx_fine = 123,
     deriv_rty_coarse = 124,
@@ -314,6 +315,42 @@ pub const Op = enum(u11) {
     bfrev = 141,
     swapc = 142,
     dcl_thread_group = 155,
+    // Shader Model 5's compute declarations and instructions
+    dcl_uav_typed = 156,
+    dcl_uav_raw = 157,
+    dcl_uav_structured = 158,
+    dcl_tgsm_raw = 159,
+    dcl_tgsm_structured = 160,
+    dcl_resource_raw = 161,
+    dcl_resource_structured = 162,
+    ld_uav_typed = 163,
+    store_uav_typed = 164,
+    ld_raw = 165,
+    store_raw = 166,
+    ld_structured = 167,
+    store_structured = 168,
+    atomic_and = 169,
+    atomic_or = 170,
+    atomic_xor = 171,
+    atomic_cmp_store = 172,
+    atomic_iadd = 173,
+    atomic_imax = 174,
+    atomic_imin = 175,
+    atomic_umax = 176,
+    atomic_umin = 177,
+    imm_atomic_alloc = 178,
+    imm_atomic_consume = 179,
+    imm_atomic_iadd = 180,
+    imm_atomic_and = 181,
+    imm_atomic_or = 182,
+    imm_atomic_xor = 183,
+    imm_atomic_exch = 184,
+    imm_atomic_cmp_exch = 185,
+    imm_atomic_imax = 186,
+    imm_atomic_imin = 187,
+    imm_atomic_umax = 188,
+    imm_atomic_umin = 189,
+    sync = 190,
     _,
 };
 
@@ -478,7 +515,7 @@ fn sx4(v: u32) i8 {
 /// Declarations whose tokens are not operands at all.
 fn hasOperands(op: Op) bool {
     return switch (op) {
-        .dcl_temps, .dcl_global_flags, .dcl_indexable_temp, .dcl_gs_output_primitive_topology, .dcl_gs_input_primitive, .dcl_max_output_vertex_count, .dcl_thread_group, .nop => false,
+        .dcl_temps, .dcl_global_flags, .dcl_indexable_temp, .dcl_gs_output_primitive_topology, .dcl_gs_input_primitive, .dcl_max_output_vertex_count, .dcl_thread_group, .sync, .nop => false,
         else => true,
     };
 }
@@ -487,7 +524,8 @@ fn hasOperands(op: Op) bool {
 /// resource's return types, an input's system value, ...).
 fn declTail(op: Op) bool {
     const n = @intFromEnum(op);
-    return n >= @intFromEnum(Op.dcl_resource) and n <= @intFromEnum(Op.dcl_global_flags);
+    return (n >= @intFromEnum(Op.dcl_resource) and n <= @intFromEnum(Op.dcl_global_flags)) or
+        (n >= @intFromEnum(Op.dcl_uav_typed) and n <= @intFromEnum(Op.dcl_resource_structured));
 }
 
 fn operand(raw: []align(1) const u32, p: *usize) Error!Operand {

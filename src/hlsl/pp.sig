@@ -43,21 +43,30 @@ pub const Log = struct {
     col: u32 = 0,
 
     pub fn err(l: *Log, line: u32, comptime fmt: []const u8, args: anytype) void {
+        l.errCode(line, 3000, fmt, args);
+    }
+
+    /// An error with fxc's own number for it (X3000 is its generic one).
+    pub fn errCode(l: *Log, line: u32, code: u32, comptime fmt: []const u8, args: anytype) void {
         l.errors += 1;
-        l.put(line, "error", fmt, args);
+        l.put(line, "error", code, fmt, args);
     }
 
     pub fn warn(l: *Log, line: u32, comptime fmt: []const u8, args: anytype) void {
-        l.put(line, "warning", fmt, args);
+        l.put(line, "warning", 3000, fmt, args);
     }
 
-    fn put(l: *Log, line: u32, what: []const u8, comptime fmt: []const u8, args: anytype) void {
+    pub fn warnCode(l: *Log, line: u32, code: u32, comptime fmt: []const u8, args: anytype) void {
+        l.put(line, "warning", code, fmt, args);
+    }
+
+    fn put(l: *Log, line: u32, what: []const u8, code: u32, comptime fmt: []const u8, args: anytype) void {
         if (l.len >= l.buf.len) return;
         const name = if (l.file_name.len > 0) l.file_name else "hlsl";
         const head = (if (l.col > 0)
-            std.fmt.bufPrint(l.buf[l.len..], "{s}({d},{d}): {s} X3000: ", .{ name, line, l.col, what })
+            std.fmt.bufPrint(l.buf[l.len..], "{s}({d},{d}): {s} X{d}: ", .{ name, line, l.col, what, code })
         else
-            std.fmt.bufPrint(l.buf[l.len..], "{s}({d}): {s} X3000: ", .{ name, line, what })) catch {
+            std.fmt.bufPrint(l.buf[l.len..], "{s}({d}): {s} X{d}: ", .{ name, line, what, code })) catch {
             l.len = l.buf.len;
             return;
         };

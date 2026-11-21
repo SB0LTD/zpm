@@ -351,6 +351,24 @@ test "gfxapi: a buffer a batch still uses is freed after it; a lost GPU's batch 
     eng_f.finish();
     try std.testing.expectEqual(frees + 1, Flaky.frees);
     try std.testing.expectEqual(@as(usize, 0), eng_f.n_doomed);
+    // past the bytes freed buffers may hold while batches run, the open
+    // batch is run and waited for, and they all go
+    {
+        var c1 = eng_f.newImage(16, 4, .rgba8).?;
+        var c2 = eng_f.newImage(16, 4, .rgba8).?;
+        const one = @max(c1.buf.bytes, c1.buf.cpu.len);
+        eng_f.doomed_budget = 2 * one - 1;
+        defer eng_f.doomed_budget = engine.DOOMED_BYTES;
+        eng_f.fill(&c1, c1.bounds(), 0x2222_2222, 0);
+        eng_f.fill(&c2, c2.bounds(), 0x3333_3333, 0);
+        const waits = eng_f.stats.doomed_waits;
+        eng_f.freeImage(&c1);
+        try std.testing.expectEqual(@as(usize, 1), eng_f.n_doomed);
+        eng_f.freeImage(&c2);
+        try std.testing.expectEqual(@as(usize, 0), eng_f.n_doomed);
+        try std.testing.expectEqual(@as(u64, 0), eng_f.doomed_bytes);
+        try std.testing.expectEqual(waits + 1, eng_f.stats.doomed_waits);
+    }
     // the GPU hangs: the batch is done again on the CPU, and the engine stays there
     objs.init();
     ctx.init(&eng_f, &objs);
@@ -431,4 +449,87 @@ test "gfxapi: a GPU lost with batches in flight says their kernels: names, code 
     try std.testing.expect(std.mem.indexOf(u8, line, want) != null);
     eng_l.freeImage(&a);
     eng_l.freeImage(&b);
+}
+
+// ── Wide texels and compute dispatches on the GPU ─────────────────────────
+
+var cpu_work_c: [4 << 20]u8 align(64) = undefined;
+var pool_c: [1 << 20]u8 align(64) = undefined;
+var eng_c: engine.Engine = undefined;
+
+/// cs_raw (compute_fixtures.hlsl): four words a thread read from binding
+/// t0, reversed, its id added, written to u0; the bytes of t0 at word 1024.
+const RawCs = struct {
+    fn build(_: ?*const anyopaque, k: *gpu.kir.Kernel) bool {
+        for (0..3) |_| _ = k.binding();
+        var log: gfxapi.dxbc_gen.Log = .{};
+        const lay = gfxapi.dxbc_gen.Layout{ .varying = noVary, .cbuffer = noCb, .uav = uav, .tbuffer = tbuf };
+        return gfxapi.dxbc_gen.compute(&gfxapi.dxbc_compute_fixtures.cs_raw, lay, k, 0, 1, &log);
+    }
+    fn noVary(_: ?*const anyopaque, _: []const u8, _: u32) ?u32 {
+        return null;
+    }
+    fn noCb(_: ?*const anyopaque, _: u32) ?gfxapi.dxbc_gen.CBuffer {
+        return null;
+    }
+    fn tbuf(_: ?*const anyopaque, n: u32) ?gfxapi.dxbc_gen.Mem {
+        return if (n == 0) .{ .b = 1, .word = 0 } else null;
+    }
+    fn uav(_: ?*const anyopaque, n: u32) ?gfxapi.dxbc_gen.Mem {
+        return if (n == 0) .{ .b = 2, .word = 2 } else null;
+    }
+};
+
+/// An RGBA32F texture copied by the engine (all four channels, not the
+/// first alone), then cs_raw dispatched: the bytes `eng` gives.
+fn wideAndCompute(eng: *engine.Engine, tex_out: []u8, raw_out: []u8) !void {
+    var a = eng.newImage(8, 4, .rgba32f) orelse return error.OutOfMemory;
+    defer eng.freeImage(&a);
+    var b = eng.newImage(8, 4, .rgba32f) orelse return error.OutOfMemory;
+    defer eng.freeImage(&b);
+    var texels: [8 * 4 * 16]u8 = undefined;
+    for (&texels, 0..) |*x, i| x.* = pattern(i);
+    eng.write(&a, 0, 0, 8, 4, &texels, 8 * 16, .rgba32f);
+    eng.copy(&a, 0, 0, &b, 0, 0, 8, 4);
+    eng.read(&b, 0, 0, 8, 4, tex_out, 8 * 16, .rgba32f);
+    // the compute shader: 32 threads, t0 512 bytes, u0 4100
+    var in = eng.newBuffer(512) orelse return error.OutOfMemory;
+    defer eng.freeImage(&in);
+    var out = eng.newBuffer(4100) orelse return error.OutOfMemory;
+    defer eng.freeImage(&out);
+    var words: [128]u32 = undefined;
+    for (&words, 0..) |*w, i| w.* = @intCast(i * 3 + 1);
+    eng.writeBytes(&in, 0, std.mem.sliceAsBytes(&words));
+    var cs = engine.Compute{ .build = RawCs.build, .group = gfxapi.dxbc_gen.threadGroup(&gfxapi.dxbc_compute_fixtures.cs_raw).? };
+    const uni = [4]u32{ 512, 4, 4100, 4 };
+    try std.testing.expect(eng.dispatch(&cs, .{ 1, 1, 1 }, &.{ &in, &out }, 0b10, &uni));
+    eng.readBytes(&out, 0, raw_out);
+    if (eng.onGpu()) eng.unloadCompute(&cs);
+}
+
+test "gfxapi: a float texture copied whole, and a compute dispatch, on the GPU as on the CPU" {
+    var tex_cpu: [8 * 4 * 16]u8 = undefined;
+    var raw_cpu: [4100]u8 = undefined;
+    eng_c.init(.{ .pool = &pool_c, .cpu_work = &cpu_work_c });
+    try wideAndCompute(&eng_c, &tex_cpu, &raw_cpu);
+    eng_c.deinit();
+    // (the CPU's: the texture's every byte, the shader's words)
+    for (tex_cpu, 0..) |x, i| try std.testing.expectEqual(pattern(i), x);
+    for (0..32) |t| for (0..4) |c| {
+        const want: u32 = @intCast((t * 4 + 3 - c) * 3 + 1 + t);
+        try std.testing.expectEqual(want, std.mem.readInt(u32, raw_cpu[(t * 4 + c) * 4 ..][0..4], .little));
+    };
+    try std.testing.expectEqual(@as(u32, 512), std.mem.readInt(u32, raw_cpu[4096..][0..4], .little));
+    // on EmuDevice: the same bytes, the copy and the dispatch on the GPU
+    var tex_emu: [8 * 4 * 16]u8 = undefined;
+    var raw_emu: [4100]u8 = undefined;
+    emu = gpu.EmuDevice.init(emuCaps(), &emu_mem, &emu_work);
+    emu.shadow = &emu_shadow;
+    eng_emu.init(.{ .dev = emu.device(), .work = &compile_mem, .cpu_work = &cpu_work_c });
+    try std.testing.expect(eng_emu.onGpu());
+    try wideAndCompute(&eng_emu, &tex_emu, &raw_emu);
+    try std.testing.expectEqual(@as(u64, 1), eng_emu.stats.computes);
+    try std.testing.expectEqualSlices(u8, &tex_cpu, &tex_emu);
+    try std.testing.expectEqualSlices(u8, &raw_cpu, &raw_emu);
+    eng_emu.deinit();
 }

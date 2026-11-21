@@ -262,6 +262,11 @@ pub const Draw = struct {
     color_gobs: ?u3 = null,
     /// The channels written: bit 0 red .. bit 3 alpha.
     mask: u4 = 0xf,
+    /// No colour target: a depth-only pass (a shadow map's). Target 0 goes
+    /// off (format 0, block linear: RT_LINEAR_WITH_ZETA holds for an off
+    /// target too, as NVK sends them), `target` only the surface's size
+    /// (the depth target's), and no `more`.
+    color_off: bool = false,
     blend: ?Blend = null,
     /// window = clip / w * scale + offset (x, y in pixels from the
     /// target's top row, depth).
@@ -355,6 +360,15 @@ pub fn targetWords(va: u64, pitch: u32, height: u32, f: Format, gobs: ?u3) [9]u3
 /// Why the engine would refuse `d` (a class error: GSP-RM recovers the
 /// channel, Xid 69), or null. Checked before a draw is sent.
 pub fn whyNot(d: *const Draw) ?[]const u8 {
+    if (d.color_off) {
+        if (d.depth == null) return "no colour target and no depth target: nothing to draw into";
+        for (d.more) |m| if (m != null) return "colour targets past the first with target 0 off";
+        const z = d.depth.?;
+        if (z.gobs_log2 > 5 or z.va % 512 != 0 or z.width == 0 or z.height == 0) return "a depth target not on a GOB, with no size, or its blocks over 32 GOBs high";
+        if (z.stencil != null and z.stencil_va == null) return "a stencil test with no stencil plane (Blackwell keeps stencil apart from depth: STENCIL_IS_SEPARATE)";
+        if (z.stencil_va) |sva| if (sva % 512 != 0) return "a stencil plane not on a GOB";
+        return null;
+    }
     if (d.depth != null and d.color_gobs == null)
         return "a depth target beside colour targets of rows of bytes (LAYOUT_PITCH): the engine's data error RT_LINEAR_WITH_ZETA (Xid 69)";
     if (d.target.va % 128 != 0 or d.target.pitch % 128 != 0 or d.target.pitch == 0 or d.target.height == 0)
@@ -442,10 +456,14 @@ fn emitDraw(p: *Push, d: *const Draw, whole: bool) void {
     }
     gr.target(p, .{ .va = d.target.va, .width = d.target.width, .height = d.target.height, .pitch = d.target.pitch, .format = .bgra8 });
     // the target's own format (and layout, when block linear), its channels
-    if (d.color_gobs) |n| {
+    if (d.color_off) {
+        // (off: format 0, block linear, nothing written; the depth alone)
+        many(p, gr.SET_COLOR_TARGET_A, &.{ 0, 0, 64, 0, 0, 0, 1, 0, 0 });
+        many(p, gr.SET_CT_WRITE, &.{0});
+    } else if (d.color_gobs) |n| {
         many(p, gr.SET_COLOR_TARGET_A, &targetWords(d.target.va, d.target.pitch, d.target.height, d.format, n));
     } else many(p, gr.SET_COLOR_TARGET_A + 16, &.{targetFormat(d.format)});
-    many(p, gr.SET_CT_WRITE, &.{ctWrite(d.mask)});
+    if (!d.color_off) many(p, gr.SET_CT_WRITE, &.{ctWrite(d.mask)});
     // the other colour targets (the pixel program's outputs 1 .. 7): each
     // its memory, format, channels and blend; CT_SELECT counts to the last
     var count: u32 = 1;

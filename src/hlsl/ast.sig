@@ -21,6 +21,17 @@ pub const Class = enum(u8) { void, scalar, vector, matrix, structure, array, tex
 /// D3D_SRV_DIMENSION's numbering (reflection's).
 pub const TexDim = enum(u8) { unknown = 0, buffer = 1, tex1d = 2, tex1darray = 3, tex2d = 4, tex2darray = 5, tex2dms = 6, tex2dmsarray = 7, tex3d = 8, cube = 9, cubearray = 10 };
 
+/// Buffers that are not textures (class sbuffer): which one (Type.dim).
+pub const BufKind = enum(u8) { structured, rw_structured, byte_address, rw_byte_address, append, consume };
+
+pub fn bufWritable(k: BufKind) bool {
+    return k != .structured and k != .byte_address;
+}
+
+pub fn bufStructured(k: BufKind) bool {
+    return k != .byte_address and k != .rw_byte_address;
+}
+
 pub const Pack = enum(u8) { default, row, column };
 
 pub const StreamKind = enum(u8) { point, line, triangle };
@@ -32,13 +43,16 @@ pub const Type = struct {
     cols: u8 = 1,
     /// matrices: their packing (row_major, column_major or the default)
     pack: Pack = .default,
-    /// textures: TexDim; samplers: 1 for SamplerComparisonState; streams: StreamKind
+    /// textures and rwtextures: TexDim; samplers: 1 for
+    /// SamplerComparisonState; streams: StreamKind; sbuffers: BufKind
     dim: u8 = 0,
-    /// arrays: the element; textures: the return type; streams: the vertex
+    /// arrays: the element; textures: the return type; streams: the
+    /// vertex; structured buffers: the element (byte address buffers: 0)
     elem: u32 = 0,
     /// arrays: the length; structs: the member count; tex2dms: samples
     len: u32 = 0,
-    /// structs: the first member (Ast.members)
+    /// structs: the first member (Ast.members); textures and rwtextures:
+    /// 1 when their elements are unorm, 2 snorm
     first: u32 = 0,
     /// structs: the name (pool offset and length)
     name_off: u32 = 0,
@@ -99,6 +113,13 @@ pub const F_DEFINED: u32 = 1 << 21;
 /// a variable some code assigns to (or passes as out/inout)
 pub const F_ASSIGNED: u32 = 1 << 22;
 pub const F_INLINE: u32 = 1 << 23;
+/// a UAV every thread group sees the writes of (dcl_uav_*_glc)
+pub const F_GLOBALLYCOHERENT: u32 = 1 << 24;
+/// a texture's or UAV's element type said unorm or snorm
+pub const F_UNORM: u32 = 1 << 25;
+pub const F_SNORM: u32 = 1 << 26;
+/// a pixel shader's [earlydepthstencil]
+pub const F_EARLY_DEPTH: u32 = 1 << 27;
 pub const INTERP = F_NOINTERP | F_LINEAR | F_CENTROID | F_NOPERSP | F_SAMPLE;
 pub const GS_PRIM = F_GS_POINT | F_GS_LINE | F_GS_TRIANGLE | F_GS_LINEADJ | F_GS_TRIADJ;
 
@@ -132,6 +153,10 @@ pub const Sym = struct {
     prev: u32 = NONE,
     /// functions: [maxvertexcount(n)]
     max_vertex: u32 = 0,
+    /// functions: [numthreads(x, y, z)] (0: none)
+    threads: [3]u32 = .{ 0, 0, 0 },
+    /// functions: where [numthreads] was written (a token)
+    threads_tok: u32 = 0,
     line: u32 = 0,
 };
 
@@ -304,7 +329,7 @@ pub const Ast = struct {
         var i: u32 = 0;
         while (i < a.ntypes) : (i += 1) {
             const x = a.types[i];
-            if (x.class == t.class and x.class != .structure and x.base == t.base and x.rows == t.rows and x.cols == t.cols and x.pack == t.pack and x.dim == t.dim and x.elem == t.elem and x.len == t.len) return i;
+            if (x.class == t.class and x.class != .structure and x.base == t.base and x.rows == t.rows and x.cols == t.cols and x.pack == t.pack and x.dim == t.dim and x.elem == t.elem and x.len == t.len and x.first == t.first) return i;
         }
         if (a.ntypes >= MAX_TYPES) return 0;
         a.types[a.ntypes] = t;

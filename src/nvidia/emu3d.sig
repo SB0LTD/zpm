@@ -286,9 +286,16 @@ pub const Engine = struct {
         for ([_]u32{ 0, 2, 3, 4 }) |j| try g.need(g.reg(gr.SET_PIPELINE_SHADER + 64 * j) & 1 == 0, "a stage other than the vertex and the pixel one is on: not modelled");
     }
 
-    /// Color target 0: rows of bytes, where memory is.
-    fn target(g: *Engine) error{BadStream}!Target {
-        return try g.targetAt(0) orelse g.refuse("color target 0 is off (format 0)");
+    /// Color target 0: rows of bytes, where memory is; null when it is off
+    /// (format 0) beside a depth target: a depth-only pass (NVK sends one
+    /// so: every colour target off, block linear).
+    fn target(g: *Engine) error{BadStream}!?Target {
+        if (try g.targetAt(0)) |t| return t;
+        if (g.reg(gr.SET_ZT_SELECT) == 1) {
+            try g.need(g.reg(gr.SET_COLOR_TARGET_A + 20) != gr.TARGET_MEMORY_PITCH, "RT_LINEAR_WITH_ZETA: colour target 0 off but of rows of bytes (LAYOUT_PITCH) beside a depth target");
+            return null;
+        }
+        return g.refuse("color target 0 is off (format 0), and no depth target");
     }
 
     /// Color target `i` (null: off, its format 0): rows of bytes, where
@@ -348,11 +355,13 @@ pub const Engine = struct {
     /// target beside a depth target is the class's data error
     /// RT_LINEAR_WITH_ZETA: the Legion's RTX lost its channel to it (Xid
     /// 69, pc-all's drawtest step 4).
-    fn layoutsAgree(g: *Engine, t: Target) error{BadStream}!void {
-        try g.need(g.reg(gr.SET_ZT_SELECT) == 0 or t.gobs != null, "RT_LINEAR_WITH_ZETA: a depth target beside a color target of rows of bytes (LAYOUT_PITCH); the RTX refuses the draw (class error, Xid 69)");
+    fn layoutsAgree(g: *Engine, t_in: ?Target) error{BadStream}!void {
+        // (target 0 off: a depth-only pass, the others block linear too)
+        const block = if (t_in) |t| t.gobs != null else true;
+        try g.need(g.reg(gr.SET_ZT_SELECT) == 0 or block, "RT_LINEAR_WITH_ZETA: a depth target beside a color target of rows of bytes (LAYOUT_PITCH); the RTX refuses the draw (class error, Xid 69)");
         for (1..g.reg(gr.SET_CT_SELECT) & 0xf) |ti| {
             const x = (try g.targetAt(@intCast(ti))) orelse continue;
-            try g.need((x.gobs == null) == (t.gobs == null), "color targets of both layouts in one draw (rows of bytes and block linear)");
+            try g.need((x.gobs == null) == !block, "color targets of both layouts in one draw (rows of bytes and block linear)");
         }
     }
 
@@ -548,8 +557,13 @@ pub const Engine = struct {
         const instances = g.reg(gr.SET_DRAW_CONTROL_A + 4);
         const ib: ?IndexBuffer = if (indexed) try g.indexBuffer(first, count) else null;
         try g.need(g.reg(gr.SET_DA_PRIMITIVE_RESTART) <= 1, "SET_DA_PRIMITIVE_RESTART neither on nor off");
-        const t = try g.target();
-        try g.layoutsAgree(t);
+        const t0 = try g.target();
+        try g.layoutsAgree(t0);
+        // (a depth-only pass: the depth target's size where target 0's)
+        const t: Target = t0 orelse blk: {
+            const z = (try g.depthTarget()).?;
+            break :blk .{ .bytes = &.{}, .pitch = 0, .width = z.width, .height = z.height, .format = .rgba8, .gobs = z.gobs };
+        };
         const clip = g.clipOf(t);
         var stats = emu.Stats{};
         defer {
@@ -564,7 +578,7 @@ pub const Engine = struct {
         // vertex one stores.
         const vgroup = try g.program(gr.STAGE_VERTEX, .vertex, &g.vhead, &g.vcode, &g.vn);
         const pgroup = try g.program(gr.STAGE_PIXEL, .pixel, &g.phead, &g.pcode, &g.pn);
-        try g.need(g.phead[18] & 0xf != 0, "the pixel program does not write target 0");
+        try g.need(g.phead[18] & 0xf != 0 or t0 == null, "the pixel program does not write target 0");
         for (GENERIC..GENERIC_END) |word| {
             const read = sph.interpOf(&g.phead, @intCast((word - GENERIC) / 4), @intCast((word - GENERIC) % 4)) != .unused;
             const was = sph.bit(&g.vhead, 400 + @as(u32, @intCast(word)));
@@ -882,6 +896,7 @@ pub const Engine = struct {
 
     /// The queued pixels' threads run, and their colors written.
     fn shade(g: *Engine, t: Target, cb: [qmd.CBUFS][]const u8, stats: *emu.Stats) anyerror!void {
+        _ = t; // (each target read from the state: target 0 may be off)
         const n = g.queued;
         g.queued = 0;
         if (n == 0) return;
@@ -902,7 +917,8 @@ pub const Engine = struct {
             const base = 4 * targets;
             targets += 1;
             if (i >= g.reg(gr.SET_CT_SELECT) & 0xf) continue;
-            const tt = (if (i == 0) t else try g.targetAt(i)) orelse continue;
+            // (target 0 off: a depth-only pass, its output dropped)
+            const tt = (try g.targetAt(i)) orelse continue;
             const ct = g.reg(gr.SET_CT_WRITE + 4 * i);
             const mask: u4 = @intCast((ct & 1) | ((ct >> 4) & 1) << 1 | ((ct >> 8) & 1) << 2 | ((ct >> 12) & 1) << 3);
             outs[n_out] = .{ .t = tt, .bl = try g.blendAt(i), .mask = mask, .reg = base };
