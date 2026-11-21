@@ -230,6 +230,7 @@ const pg_attribute_columns = [_]ViewColumn{
     col("attstattarget", .int2), col("attstorage", .pg_internal_char), col("attislocal", .boolean),
     col("attoptions", types.arrayType(.text).?), col("attfdwoptions", types.arrayType(.text).?),
     col("attcompression", .pg_internal_char), col("atthasmissing", .boolean), col("attmissingval", types.catalog_anyarray),
+    col("attacl", types.arrayType(.aclitem).?),
 };
 const pg_index_columns = [_]ViewColumn{
     col("indexrelid", .oid), col("indrelid", .oid), col("indisprimary", .boolean), col("indisunique", .boolean), col("indkey", .text),

@@ -6172,14 +6172,14 @@ pub fn Database(comptime config: Config) type {
         fn attributeRow(sink: *X.RowSink, relation: i64, name: []const u8, data_type: DataType, typmod: i32, ordinal: i64, metadata: AttributeMetadata) Error!void {
             const info = types.typeInfo(data_type);
             // Stock tools see the default settings. RamSQL materializes
-            // added columns and has no TOAST or per-column FDW overrides.
+            // added columns and has no TOAST, column ACLs or per-column FDW overrides.
             try sink.add(&.{
                 intCell(relation), nameCell(name), intCell(info.oid), intCell(typmod), intCell(ordinal),
                 boolCell(metadata.not_null), boolCell(false), .{ .pg_internal_char = metadata.identity },
                 .{ .pg_internal_char = metadata.generated }, boolCell(metadata.has_expression),
                 intCell(collation.typeCollation(types.typeOfData(data_type))), intCell(info.len),
                 .{ .pg_internal_char = info.alignment }, intCell(-1), .{ .pg_internal_char = types.typeStorage(data_type) },
-                boolCell(metadata.local), .null_value, .null_value, .{ .pg_internal_char = 0 }, boolCell(false), .null_value,
+                boolCell(metadata.local), .null_value, .null_value, .{ .pg_internal_char = 0 }, boolCell(false), .null_value, .null_value,
             });
         }
 

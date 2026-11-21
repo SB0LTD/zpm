@@ -13,6 +13,13 @@ references. Database-level CREATE grants, objects addressed by
 PostgreSQL's large-object API, and identity sequences in non-public
 schemas remain separate conformance work.
 
+The local PostgreSQL 16 stock run at RAMSQL `1253dc6` passed 26 of 27
+checks. Its whole-database import verified owners, ACLs, comments and
+reader access after WAL reopen. Unfiltered export without ACLs also
+passed. Export with ACLs enabled stopped at the missing
+`pg_attribute.attacl` column. The next candidate exposes the typed
+NULL column for relations that have no column-level grants.
+
 RAMSQL `d1ddbe5` with ZPM `ed00a0a1` passed all 24 stock
 tooling checks on both PostgreSQL 16 and 18. Stock plain and custom
 imports passed row, default and constraint checks after WAL reopen.
