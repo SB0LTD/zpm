@@ -255,12 +255,30 @@ pub const Image = struct {
         return img.format.renderable() and img.layout.linear() and img.bc == 0;
     }
 
-    /// A colour target the GPU's draws write: rows, or block linear with
-    /// 32-bit texels in Turing2D's GOBs (Engine.newBlockImage: the compute
+    /// A colour target the GPU's draws write: rows, or block linear in
+    /// its texels' GOBs (blockFits: Engine.newBlockImage's; the compute
     /// raster and the RTX's 3D engine both draw into it). GL's other paths
     /// (copies, blits, completeness) still take `drawable`, rows alone.
     pub fn gpuDrawable(img: *const Image) bool {
-        return img.format.renderable() and (img.layout.linear() or (img.layout.swizzle == .turing2d and img.format.bytes() == 4));
+        if (!img.format.renderable()) return false;
+        if (img.layout.linear()) return true;
+        // (8- and 16-bit texels: the engine's own images alone, promoted;
+        // an imported plane in those GOBs (a video picture's) is sampled)
+        if (img.format.bytes() != 4 and (img.share != null or !img.own)) return false;
+        return img.blockFits();
+    }
+
+    /// Block linear in the GOBs Blackwell's 3D engine draws its texels in
+    /// (Engine.blockSwizzle): 32-bit in Turing2D's, 8-bit in Blackwell8's,
+    /// 16-bit in Blackwell16's (the S8 stencil plane's, NVDEC's planes').
+    pub fn blockFits(img: *const Image) bool {
+        if (!img.layout.block) return false;
+        return switch (img.format.bytes()) {
+            4 => img.layout.swizzle == .turing2d,
+            2 => img.layout.swizzle == .blackwell16,
+            1 => img.layout.swizzle == .blackwell8,
+            else => false,
+        };
     }
 
     pub fn levelWidth(img: *const Image, l: u32) u32 {
@@ -540,6 +558,18 @@ fn fillKernel(s: kir.Storage, masked: bool) kir.Kernel {
 fn layoutAt(k: *kir.Kernel, blw: kir.V, stride: kir.V, xb: kir.V, row: kir.V) kir.V {
     const linear = k.op3(.imad, .u32, r(row), r(stride), r(xb));
     const gobs = k.op2(.isub, .u32, r(k.op2(.imax, .u32, r(k.op2(.@"and", .u32, r(blw), u(0xff))), u(1))), u(1));
+    // (the GOBs' swizzle from bit 8: Turing2D's, Blackwell8's, Blackwell16's)
+    const swz = k.op2(.shr, .u32, r(blw), u(8));
+    const at = blocklinear.address(k, r(stride), r(gobs), r(swz), r(xb), r(row));
+    return k.sel(.u32, r(k.cmp(.u32, .ne, r(blw), u(0))), r(at), r(linear));
+}
+
+/// layoutAt for Turing2D's GOBs alone (the blit kernel's: its five
+/// addresses in the three swizzles' code passed its code room on the
+/// emulated devices; blit takes no other block-linear layout).
+fn layoutAtTuring(k: *kir.Kernel, blw: kir.V, stride: kir.V, xb: kir.V, row: kir.V) kir.V {
+    const linear = k.op3(.imad, .u32, r(row), r(stride), r(xb));
+    const gobs = k.op2(.isub, .u32, r(k.op2(.imax, .u32, r(k.op2(.@"and", .u32, r(blw), u(0xff))), u(1))), u(1));
     const by = k.op2(.shr, .u32, r(row), r(k.op2(.iadd, .u32, r(gobs), u(3))));
     const block = k.op3(.imad, .u32, r(by), r(k.op2(.shr, .u32, r(stride), u(6))), r(k.op2(.shr, .u32, r(xb), u(6))));
     const gob = k.op2(.@"and", .u32, r(k.op2(.shr, .u32, r(row), u(3))), r(k.op2(.isub, .u32, r(k.op2(.shl, .u32, u(1), r(gobs))), u(1))));
@@ -553,9 +583,9 @@ fn layoutAt(k: *kir.Kernel, blw: kir.V, stride: kir.V, xb: kir.V, row: kir.V) ki
     return k.sel(.u32, r(k.cmp(.u32, .ne, r(blw), u(0))), r(k.op2(.iadd, .u32, r(base), r(t))), r(linear));
 }
 
-/// Whether the copy and blit kernels take img's layout (layoutAt): rows,
-/// or Turing2D's GOBs.
-fn kernelLayout(img: *const Image) bool {
+/// Whether the blit kernel takes img's layout (layoutAtTuring): rows, or
+/// Turing2D's GOBs.
+fn blitLayout(img: *const Image) bool {
     return !img.layout.block or img.layout.swizzle == .turing2d;
 }
 
@@ -675,7 +705,7 @@ fn blitKernel(s: kir.Storage) kir.Kernel {
         const texel = struct {
             fn f_(kk: *kir.Kernel, b: u8, ix: kir.V, iy: kir.V, bpp: kir.V, stride: kir.V, td: kir.V, hh: kir.V, resolve: bool) kir.V {
                 const row = kk.sel(.i32, r(td), r(kk.op2(.isub, .i32, r(kk.op2(.isub, .i32, r(hh), kir.i(1))), r(iy))), r(iy));
-                const off = layoutAt(kk, kk.param(.u32, B_SBL), stride, kk.op2(.imul, .u32, r(ix), r(kk.param(.u32, B_SPIX))), row);
+                const off = layoutAtTuring(kk, kk.param(.u32, B_SBL), stride, kk.op2(.imul, .u32, r(ix), r(kk.param(.u32, B_SPIX))), row);
                 var v = if (resolve) resolved(kk, b, bpp, off) else pixelLoad(kk, b, bpp, off);
                 v = kk.sel(.u32, r(kk.cmp(.u32, .ne, r(kk.param(.u32, B_SSWAP)), u(0))), r(swapRBk(kk, v)), r(v));
                 return kk.op2(.@"or", .u32, r(v), r(kk.param(.u32, B_SET)));
@@ -751,7 +781,7 @@ fn blitKernel(s: kir.Storage) kir.Kernel {
         {
             const dbpp = k.param(.u32, B_DBPP);
             const drow = k.op3(.imad, .i32, r(k.gid(1)), r(k.param(.i32, B_DSTEP)), r(k.param(.i32, B_DROW)));
-            const doff = layoutAt(&k, k.param(.u32, B_DBL), k.param(.u32, B_DSTRIDE), k.op2(.imul, .u32, r(x), r(dbpp)), drow);
+            const doff = layoutAtTuring(&k, k.param(.u32, B_DBL), k.param(.u32, B_DSTRIDE), k.op2(.imul, .u32, r(x), r(dbpp)), drow);
             var v = k.sel(.u32, r(k.cmp(.u32, .ne, r(k.param(.u32, B_DSWAP)), u(0))), r(swapRBk(&k, out)), r(out));
             const wmask = k.param(.u32, B_WMASK);
             const partial = k.cmp(.u32, .ne, r(wmask), u(0xffff_ffff));
@@ -1687,15 +1717,31 @@ pub const Engine = struct {
     /// Not for an image an outside reader takes as rows (a window's, a
     /// dma-buf's without a block-linear modifier).
     pub fn newBlockImage(e: *Engine, width: u32, height: u32, format: Format) ?Image {
-        if (width == 0 or height == 0 or format.bytes() != 4 or !format.renderable()) return null;
+        if (width == 0 or height == 0 or !format.renderable()) return null;
+        const swizzle = e.blockSwizzle(format) orelse return null;
         // (rows on 128 bytes and the image on a page, as the 3D engine's
         // targets must be: whole GOBs, a GOB's 512 bytes aligned)
-        const pitch = std.mem.alignForward(u32, width * 4, 128);
+        const pitch = std.mem.alignForward(u32, width * format.bytes(), 128);
         var gobs: u3 = 0;
         while (gobs < 4 and (@as(u32, 8) << gobs) < height) gobs += 1;
         const bytes = blocklinear.planeBytes(pitch, height, gobs);
         const m = e.allocBytes(@intCast(bytes), false) orelse return null;
-        return .{ .buf = m.buf, .width = width, .height = height, .stride = pitch, .format = format, .own = true, .pooled = m.pooled, .layout = .{ .block = true, .swizzle = .turing2d, .gobs_log2 = gobs } };
+        return .{ .buf = m.buf, .width = width, .height = height, .stride = pitch, .format = format, .own = true, .pooled = m.pooled, .layout = .{ .block = true, .swizzle = swizzle, .gobs_log2 = gobs } };
+    }
+
+    /// The GOBs a block-linear colour image of `format` is in, as the GPU's
+    /// 3D engine draws it (Image.blockFits): 32-bit texels in Turing2D's;
+    /// on Blackwell (sm_120) 8- and 16-bit texels in Blackwell8's and
+    /// Blackwell16's, as its stencil plane (s8Layout) and NVDEC's planes;
+    /// null: none here (another GPU's 8- and 16-bit texels).
+    pub fn blockSwizzle(e: *const Engine, format: Format) ?blocklinear.Swizzle {
+        const blackwell = e.dev != null and e.dev.?.caps.target == .sm_120;
+        return switch (format.bytes()) {
+            4 => .turing2d,
+            2 => if (blackwell) .blackwell16 else null,
+            1 => if (blackwell) .blackwell8 else null,
+            else => null,
+        };
     }
 
     /// Whether `img` is a GL colour image promote() would move: the 3D
@@ -1704,17 +1750,16 @@ pub const Engine = struct {
     /// it: exported images stay rows), one level, one sample, and never
     /// moved back to rows before.
     pub fn promotable(e: *const Engine, img: *const Image) bool {
-        return e.promoteWhyNot(img) == null;
+        return e.promoteWhyNot(img, "") == null;
     }
 
-    /// Why a colour image is not one promote makes block linear (each the
-    /// whole reason a depth-tested draw into it stays on the compute
-    /// kernels: sayCompute), or null.
-    pub fn promoteWhyNot(e: *const Engine, img: *const Image) ?[]const u8 {
-        const pre = "a depth or stencil image beside a colour image of rows (RT_LINEAR_WITH_ZETA), kept rows: ";
+    /// Why a colour image is not one promote makes block linear, after
+    /// `pre` (the draw's whole reason to stay on the compute kernels, for
+    /// sayCompute: a constant string a reason), or null.
+    pub fn promoteWhyNot(e: *const Engine, img: *const Image, comptime pre: []const u8) ?[]const u8 {
         if (!e.block_targets or !e.onGpu()) return pre ++ "block-linear targets off (GALAXY_GL_BLOCK=0, or no GPU)";
         if (!img.live() or !img.own or img.share != null) return pre ++ "an image the engine does not own alone (shared, imported, or a view)";
-        if (img.format.bytes() != 4 or !img.format.renderable()) return pre ++ "texels of other than 4 bytes (RGBA16F and RGBA32F are 16, R16 2)";
+        if (!img.format.renderable() or e.blockSwizzle(img.format) == null) return pre ++ "a format with no block-linear GOBs here (only RGBA8, BGRA8, and on Blackwell R8 and RG8)";
         if (img.no_block) return pre ++ "moved back to rows for good (an op that takes rows alone was done on it)";
         if (img.levels != 1) return pre ++ "an image with mipmap levels";
         if (img.samples != 1) return pre ++ "multisampled";
@@ -2807,6 +2852,16 @@ pub const Engine = struct {
             e.sayCompute(why);
             return null;
         }
+        // (colour targets of both layouts: the 3D engine takes one layout a
+        // draw (gobs_log2 is the draw's), so the ones in rows are made block
+        // linear, once each and in place, as a depth-tested draw's are
+        // (galaxy-pe's and GL's promote): a pass with no depth test into a
+        // target an earlier depth-tested pass made block linear, beside one
+        // it did not (Unigine's, thousands a frame))
+        if (!e.oneLayout(d)) {
+            e.stats.compute_draws += 1;
+            return null;
+        }
         // (the engine refuses a depth target beside a colour target of rows
         // of bytes: its data error RT_LINEAR_WITH_ZETA, the channel lost to
         // Xid 69: the Legion's drawtest, pc-all. A depth or stencil draw
@@ -2819,7 +2874,7 @@ pub const Engine = struct {
         if (zimg) |z| {
             if (!d.color_off and !d.color.layout.block) {
                 e.stats.compute_draws += 1;
-                e.sayCompute(e.promoteWhyNot(d.color) orelse "a depth or stencil image beside a colour image of rows (the 3D engine draws depth only into block-linear colour: RT_LINEAR_WITH_ZETA)");
+                e.sayCompute(e.promoteWhyNot(d.color, "a depth or stencil image beside a colour image of rows (RT_LINEAR_WITH_ZETA), kept rows: ") orelse "a depth or stencil image beside a colour image of rows (the 3D engine draws depth only into block-linear colour: RT_LINEAR_WITH_ZETA)");
                 return null;
             }
             if (!z.depth_float) {
@@ -2833,9 +2888,9 @@ pub const Engine = struct {
                 return null;
             }
         }
-        if (!d.color_off and d.color.layout.block and (d.color.layout.swizzle != .turing2d or d.color.format.bytes() != 4)) {
+        if (!d.color_off and d.color.layout.block and !d.color.blockFits()) {
             e.stats.compute_draws += 1;
-            e.sayCompute("a block-linear colour image of 8- or 16-bit texels (Blackwell's GOBs for them: not given to the 3D engine yet)");
+            e.sayCompute("a block-linear colour image in GOBs other than those the 3D engine draws its texels in (Image.blockFits)");
             return null;
         }
         const p = @constCast(d.pipe);
@@ -2900,9 +2955,15 @@ pub const Engine = struct {
                 e.sayCompute("a target whose address or rows are not on 128 bytes");
                 return null;
             }
-            if (x.img.layout.block != t.layout.block or (x.img.layout.block and x.img.format.bytes() != 4)) {
+            if (x.img.layout.block != t.layout.block or (x.img.layout.block and !x.img.blockFits())) {
                 e.stats.compute_draws += 1;
                 e.sayCompute("colour targets of both layouts (rows and block linear) in one draw");
+                return null;
+            }
+            // (one block height for all the targets: the draw's gobs_log2)
+            if (x.img.layout.block and x.img.layout.gobs_log2 != t.layout.gobs_log2) {
+                e.stats.compute_draws += 1;
+                e.sayCompute("block-linear colour targets of different block heights (images of different heights) in one draw");
                 return null;
             }
             more[j] = .{ .va = x.img.buf.gpu, .stride = x.img.stride, .format = targetFormatOf(x.img.format), .mask = maskOf(x.img.format, x.keep), .blend = x.blend };
@@ -2974,6 +3035,30 @@ pub const Engine = struct {
             e.said_graphics = true;
             report.say(.pipeline, "draws through the GPU's 3D engine (the RTX's BLACKWELL_B: its rasterizer and blender), the compute kernels for what it does not take yet", .{});
         }
+        return true;
+    }
+
+    /// Whether the draw's colour targets are of one layout, the ones in
+    /// rows made block linear (promote) where another is block linear;
+    /// false (said: the reason a rows image stays rows) when one cannot be.
+    fn oneLayout(e: *Engine, d: *const raster.Draw) bool {
+        if (d.color_off) return true;
+        var block = d.color.layout.block;
+        var rows = !d.color.layout.block;
+        for (d.targets[1..]) |tt| if (tt) |x| {
+            if (x.img.layout.block) block = true else rows = true;
+        };
+        if (!block or !rows) return true;
+        const pre = "colour targets of both layouts (rows and block linear) in one draw, one kept rows: ";
+        if (!d.color.layout.block and !e.promote(d.color)) {
+            e.sayCompute(e.promoteWhyNot(d.color, pre) orelse pre ++ "no GPU memory to move it");
+            return false;
+        }
+        for (d.targets[1..]) |tt| if (tt) |x| {
+            if (x.img.layout.block or e.promote(x.img)) continue;
+            e.sayCompute(e.promoteWhyNot(x.img, pre) orelse pre ++ "no GPU memory to move it");
+            return false;
+        };
         return true;
     }
 
@@ -3346,8 +3431,12 @@ pub const Engine = struct {
         // (a block-linear colour image: its pixels where its GOBs put them,
         // B_SBL / B_DBL; a block-linear depth image (the 3D engine's, a
         // float one's S8 plane): not blitted yet)
-        if ((src.layout.block and !src.format.renderable()) or (dst.layout.block and !dst.format.renderable()) or src.depth_float or dst.depth_float or !kernelLayout(src) or !kernelLayout(dst)) {
+        if ((src.layout.block and !src.format.renderable()) or (dst.layout.block and !dst.format.renderable()) or src.depth_float or dst.depth_float) {
             report.say(.pipeline, "a blit of a block-linear depth image (the 3D engine's): not done", .{});
+            return false;
+        }
+        if (!blitLayout(src) or !blitLayout(dst)) {
+            report.say(.pipeline, "a blit of a block-linear image of 8- or 16-bit texels (Blackwell's GOBs): not done", .{});
             return false;
         }
         const color = src.format.renderable() and dst.format.renderable();
@@ -3522,7 +3611,7 @@ pub const Engine = struct {
         fs.samples = 1;
         fd.samples = 1;
         const op = CpuOp{ .copy = .{ .src = fs, .sx = sx, .sy = sy, .dst = fd, .dx = dx, .dy = dy, .w = w, .h = h } };
-        if (!e.gpuUsable(src) or !e.gpuUsable(dst) or !kernelLayout(src) or !kernelLayout(dst)) {
+        if (!e.gpuUsable(src) or !e.gpuUsable(dst)) {
             e.settle(src);
             e.settle(dst);
             return e.cpuDo(op);
@@ -3716,7 +3805,7 @@ pub const Engine = struct {
     /// format the GPU's copy does not take: read it with `read`.
     pub fn readStart(e: *Engine, img: *Image, x: u32, y: u32, w: u32, h: u32, want: Format, rb: *Readback) bool {
         rb.* = .{};
-        if (w == 0 or h == 0 or !e.onGpu() or !e.gpuUsable(img) or !kernelLayout(img)) return false;
+        if (w == 0 or h == 0 or !e.onGpu() or !e.gpuUsable(img)) return false;
         if (!img.format.isColor() or !want.isColor() or img.depth_float or img.samples != 1) return false;
         if (x + w > img.width or y + h > img.height) return false;
         // (rows of host memory the engine keeps: never VRAM)
@@ -3804,7 +3893,7 @@ pub const Engine = struct {
     /// the CPU takes its bytes as rows (hostView's callers: GL's texture
     /// re-specification, CopyImageSubData's CPU form, ...).
     fn rowsForCpu(e: *Engine, img: *Image) void {
-        if (img.layout.block and img.format.renderable() and img.format.bytes() == 4 and img.share == null and !img.depth_float)
+        if (img.layout.block and img.format.renderable() and img.share == null and !img.depth_float)
             _ = e.toRows(img, "the CPU took its bytes as rows (a texture re-specified or copied by the CPU)");
     }
 
