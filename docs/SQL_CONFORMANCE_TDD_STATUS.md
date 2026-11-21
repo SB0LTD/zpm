@@ -2,6 +2,26 @@
 
 ## Stock PostgreSQL dump and restore candidate
 
+`pg_range` exposes the six built-in ranges the Sig engine supports.
+It derives subtype and B-tree operator-class references from the
+existing registries and identifies the canonicalization routines
+used for discrete integer and date ranges. PostgreSQL's companion
+multirange OIDs let the stock `pg_cast` filter identify generated
+casts. Multirange values and casts, subtype-distance callbacks,
+direct SQL calls to canonicalization callbacks, and custom ranges
+remain open.
+
+RAMSQL `c6b7c51` with ZPM `393f4b0b` passed range discovery on
+PostgreSQL 16 and 18. Both lanes compared range values and catalog
+metadata in text and binary formats, resolved the three canonical
+callbacks, and verified the stock cast filter. The standalone
+Windows Sig catalog suite passed 110 assertions. Native plain and
+custom imports passed row and constraint checks after WAL reopen.
+Both outbound dumps passed the cast scan and reached the
+`pg_event_trigger` discovery query, which returned `TableNotFound`.
+Both stock directions on both versions remain the merge gate.
+[PostgreSQL 16 and 18 range discovery CI](https://github.com/SB0LTD/ramsql/actions/runs/44920438148)
+
 `pg_conversion` exposes relation OID 2607 with PostgreSQL's encoding
 IDs, `regproc` callback column and Boolean default flag. RamSQL uses
 UTF-8 for both client and server. UTF-8 identity transfer calls no
