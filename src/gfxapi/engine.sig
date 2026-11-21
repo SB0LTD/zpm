@@ -1368,6 +1368,8 @@ pub const Engine = struct {
     vram_count: u32 = 0,
     said_graphics: bool = false,
     said_compute: [8][]const u8 = @splat(""),
+    /// The draws each of said_compute's reasons sent to the compute kernels.
+    compute_why_n: [8]u32 = @splat(0),
     said_promote: bool = false,
     said_rows: [8][]const u8 = @splat(""),
     compiler: Compiler = compileAny,
@@ -2952,10 +2954,14 @@ pub const Engine = struct {
     /// Why a draw went to the compute kernels while the 3D engine was on:
     /// said once a reason.
     fn sayCompute(e: *Engine, why: []const u8) void {
-        for (&e.said_compute) |*s| {
-            if (s.len != 0 and s.ptr == why.ptr) return;
+        for (&e.said_compute, 0..) |*s, i| {
+            if (s.len != 0 and s.ptr == why.ptr) {
+                e.compute_why_n[i] +%= 1;
+                return;
+            }
             if (s.len == 0) {
                 s.* = why;
+                e.compute_why_n[i] = 1;
                 report.say(.pipeline, "a draw on the compute kernels, not the 3D engine: {s}", .{why});
                 return;
             }
