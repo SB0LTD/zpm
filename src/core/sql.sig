@@ -6425,11 +6425,10 @@ pub fn Database(comptime config: Config) type {
                             try sink.add(&.{ nameCell(database), nameCell(schema_name), nameCell(name), nameCell(table_type) });
                         },
                         .pg_index => {
-                            var key: [4 * config.columns]u8 = undefined;
-                            if (S.keyed(table)) try sink.add(&.{ intCell(S.primaryIndexOid(table)), intCell(oid), boolCell(true), boolCell(true), nameCell(indexKey(primary_columns, &key)), boolCell(true), boolCell(false), boolCell(false) });
+                            if (S.keyed(table)) try indexCatalogRow(sink, S.primaryIndexOid(table), oid, primary_columns, null);
                             for (table.indexes[0..table.index_count]) |*index| {
                                 if (index.oid == 0) continue;
-                                try sink.add(&.{ intCell(index.oid), intCell(oid), boolCell(false), boolCell(index.unique), nameCell(indexKey(index.keyColumns(), &key)), boolCell(true), boolCell(false), boolCell(false) });
+                                try indexCatalogRow(sink, index.oid, oid, index.keyColumns(), index);
                             }
                         },
                         .pg_constraint => {
@@ -6656,7 +6655,18 @@ pub fn Database(comptime config: Config) type {
                 nameCell(if (foreign) |item| foreignActionCode(item.on_update) else " "),
                 nameCell(if (foreign) |item| foreignActionCode(item.on_delete) else " "),
                 nameCell(if (foreign != null) "s" else " "), boolCell(false),
+                boolCell(kind != .check or self.checkConstraintIsLocal(table, name, snapshot)),
             });
+        }
+
+        fn checkConstraintIsLocal(self: *const Self, table: *const S.Table, name: []const u8, snapshot: Snapshot) bool {
+            if (table.parent == 0) return true;
+            const slot = self.visibleTableSlot(table.parent, snapshot) orelse return true;
+            const parent = &self.tables[slot];
+            for (parent.constraints[0..parent.constraint_count]) |*constraint| {
+                if (constraint.kind == .check and types.same(constraint.name.slice(), name)) return false;
+            }
+            return true;
         }
 
         fn sameIndexKeys(expected: []const u8, actual: []const u8) bool {
@@ -6971,20 +6981,35 @@ pub fn Database(comptime config: Config) type {
             return out[0..keys.len];
         }
 
-        /// pg_index.indkey text: 1-based column numbers separated by spaces.
-        fn indexKey(columns: []const u8, out: *[4 * config.columns]u8) []const u8 {
-            var at: usize = 0;
-            for (columns, 0..) |column, position| {
-                if (position != 0) {
-                    out[at] = ' ';
-                    at += 1;
+        fn indexCatalogRow(sink: *X.RowSink, oid: u32, table: i64, keys: []const u8, index: ?*const S.Index) Error!void {
+            const included = if (index) |item| item.includes[0..item.include_count] else &.{};
+            var key_buffer: [8 * config.columns]u8 = undefined;
+            var key: CatalogTextWriter = .{ .out = &key_buffer };
+            for ([_][]const u8{ keys, included }) |columns| {
+                for (columns) |column| {
+                    if (key.slice().len != 0) key.add(" ");
+                    var digits: [4]u8 = undefined;
+                    key.add(formatUnsigned(if (column == S.expression_key) 0 else @as(usize, column) + 1, &digits));
                 }
-                var digits: [4]u8 = undefined;
-                const text = formatUnsigned(if (column == S.expression_key) 0 else @as(usize, column) + 1, &digits);
-                @memcpy(out[at..][0..text.len], text);
-                at += text.len;
             }
-            return out[0..at];
+            var expressions: V.Text = .{};
+            var source = if (index) |item| item.expressions.slice() else &.{};
+            if (source.len != 0) {
+                var text: CatalogTextWriter = .{ .out = &expressions.bytes };
+                while (source.len != 0) {
+                    if (text.slice().len != 0) text.add(", ");
+                    text.add(takeIndexExpression(&source));
+                }
+                if (text.shortened) return error.TextCapacity;
+                expressions.len = text.slice().len;
+            }
+            try sink.add(&.{
+                intCell(oid), intCell(table), boolCell(index == null), boolCell(if (index) |item| item.unique else true),
+                try E.textCell(key.slice()), boolCell(true), boolCell(false), boolCell(false), boolCell(true),
+                intCell(@intCast(keys.len)), intCell(@intCast(keys.len + included.len)),
+                boolCell(if (index) |item| item.nulls_not_distinct else false),
+                if (expressions.len == 0) .null_value else .{ .text = expressions },
+            });
         }
 
         fn formatUnsigned(value: usize, out: []u8) []const u8 {

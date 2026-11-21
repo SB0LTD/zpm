@@ -2,6 +2,22 @@
 
 ## Stock PostgreSQL dump and restore candidate
 
+`pg_attrdef` assigns catalog OIDs to column defaults and stored
+generation expressions. Current change records persist the OIDs,
+legacy records assign them during replay, and checkpoint counters
+preserve the high-water mark after a default is dropped. The Sig
+change-log and base-snapshot suites passed 1,089 and 122 assertions.
+The `adbin` representation remains SQL expression text for
+`pg_get_expr`.
+
+RAMSQL `26d1089` with ZPM `ed5493c7` passed default-expression
+discovery on PostgreSQL 16 and 18, including generated values and
+identity preservation after a column rename. Both lanes passed native
+plain and custom imports. Outbound stock `pg_dump` passed default
+discovery and reached the CHECK constraint projection, which reported
+`ColumnNotFound` for its `conislocal` query.
+[PostgreSQL 16 and 18 default-expression CI](https://github.com/SB0LTD/ramsql/actions/runs/44923741114)
+
 `pg_attribute` and `pg_type` expose the column and type metadata
 used by stock `pg_dump`. Attribute and type storage policies match so
 the dump does not emit an ALTER for a storage override. Attribute

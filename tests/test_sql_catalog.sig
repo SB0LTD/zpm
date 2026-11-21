@@ -256,7 +256,7 @@ fn eventTriggerDiscovery() !void {
 }
 
 fn columnDiscovery() !void {
-    try run("CREATE TABLE attr_parent (id integer NOT NULL, amount numeric(10,2))");
+    try run("CREATE TABLE attr_parent (id integer NOT NULL, amount numeric(10,2), CONSTRAINT parent_check CHECK (id > 0))");
     try run("CREATE TABLE attr_child (label text DEFAULT 'x') INHERITS (attr_parent)");
     try expect("SELECT a.attname,a.attstattarget,a.attstorage,t.typstorage,a.attislocal,a.atthasmissing,"
         ++ "pg_typeof(a.attmissingval)::text,a.attmissingval IS NULL,a.attoptions IS NULL,a.attfdwoptions IS NULL "
@@ -265,8 +265,20 @@ fn columnDiscovery() !void {
         "id|-1|p|p|f|f|anyarray|t|t|t;amount|-1|m|m|f|f|anyarray|t|t|t;label|-1|x|x|t|f|anyarray|t|t|t");
     try expect("SELECT attname,CASE WHEN atthasmissing AND NOT attisdropped THEN attmissingval ELSE NULL END IS NULL "
         ++ "FROM pg_attribute WHERE attrelid='attr_child'::regclass ORDER BY attnum", "id|t;amount|t;label|t");
+    try expect("SELECT conname,conislocal,convalidated FROM pg_constraint WHERE conrelid='attr_child'::regclass AND contype='c'",
+        "parent_check|f|t");
     try run("DROP TABLE attr_child");
     try run("DROP TABLE attr_parent");
+}
+
+fn indexDumpDiscovery() !void {
+    try run("CREATE TABLE dump_index (id integer PRIMARY KEY, lookup integer, detail text)");
+    try run("CREATE UNIQUE INDEX dump_index_lookup ON dump_index (lookup) INCLUDE (detail) NULLS NOT DISTINCT");
+    try expect("SELECT c.relname,i.indkey,i.indisvalid,i.indisready,i.indnkeyatts,i.indnatts,i.indnullsnotdistinct,"
+        ++ "i.indexprs IS NULL FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid "
+        ++ "WHERE i.indrelid='dump_index'::regclass ORDER BY i.indisprimary DESC",
+        "dump_index_pkey|1|t|t|1|1|f|t;dump_index_lookup|2 3|t|t|1|2|t|t");
+    try run("DROP TABLE dump_index");
 }
 
 fn lifecycle() !void {
@@ -420,6 +432,7 @@ pub fn main(init: std.process.Init) !void {
     try rangeDiscovery();
     try eventTriggerDiscovery();
     try columnDiscovery();
+    try indexDumpDiscovery();
     try lifecycle();
     try replay();
     try characterMetadata();

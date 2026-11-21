@@ -213,13 +213,15 @@ const pg_attribute_columns = [_]ViewColumn{
 const pg_index_columns = [_]ViewColumn{
     col("indexrelid", .oid), col("indrelid", .oid), col("indisprimary", .boolean), col("indisunique", .boolean), col("indkey", .text),
     col("indisvalid", .boolean), col("indisclustered", .boolean), col("indisreplident", .boolean),
+    col("indisready", .boolean), col("indnkeyatts", .int2), col("indnatts", .int2),
+    col("indnullsnotdistinct", .boolean), col("indexprs", .text),
 };
 const pg_constraint_columns = [_]ViewColumn{
     col("oid", .oid), col("conname", .name), col("connamespace", .oid), col("contype", .text),
     col("condeferrable", .boolean), col("condeferred", .boolean), col("conenforced", .boolean), col("convalidated", .boolean),
     col("conrelid", .oid), col("contypid", .oid), col("conindid", .oid), col("conparentid", .oid),
     col("confrelid", .oid), col("confupdtype", .text), col("confdeltype", .text), col("confmatchtype", .text),
-    col("conperiod", .boolean),
+    col("conperiod", .boolean), col("conislocal", .boolean),
 };
 const pg_depend_columns = [_]ViewColumn{
     col("classid", .oid), col("objid", .oid), col("objsubid", .int4),
