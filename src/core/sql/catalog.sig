@@ -335,7 +335,8 @@ pub const binary_casts = [_]struct { oid: u32, source: types.DataType, target: t
     .{ .oid = 10184, .source = .varbit, .target = .bit },
 };
 const pg_trigger_columns = [_]ViewColumn{ col("oid", .oid), col("tgrelid", .oid), col("tgname", .name), col("tgfoid", .oid), col("tgtype", .int2), col("tgenabled", .text), col("tgisinternal", .boolean), col("tgnargs", .int2), col("tgparentid", .oid) };
-const pg_rewrite_columns = [_]ViewColumn{ col("oid", .oid), col("rulename", .name), col("ev_class", .oid), col("ev_type", .text), col("ev_enabled", .text), col("is_instead", .boolean) };
+pub const rewrite_catalog: u32 = 2618;
+const pg_rewrite_columns = [_]ViewColumn{ col("oid", .oid), col("rulename", .name), col("ev_class", .oid), col("ev_type", .pg_internal_char), col("ev_enabled", .pg_internal_char), col("is_instead", .boolean) };
 const pg_rules_columns = [_]ViewColumn{ col("schemaname", .name), col("tablename", .name), col("rulename", .name), col("definition", .text) };
 const key_column_usage_columns = [_]ViewColumn{ col("constraint_catalog", .name), col("constraint_schema", .name), col("constraint_name", .name), col("table_catalog", .name), col("table_schema", .name), col("table_name", .name), col("column_name", .name), col("ordinal_position", .int4) };
 
@@ -518,7 +519,7 @@ pub const bootstrap_relations = [_]struct { view: View, oid: u32 }{
     .{ .view = .pg_attrdef, .oid = attrdef_catalog }, .{ .view = .pg_constraint, .oid = constraint_catalog },
     .{ .view = .pg_depend, .oid = 2608 }, .{ .view = .pg_description, .oid = 2609 }, .{ .view = .pg_index, .oid = 2610 },
     .{ .view = .pg_inherits, .oid = 2611 }, .{ .view = .pg_namespace, .oid = 2615 },
-    .{ .view = .pg_rewrite, .oid = 2618 }, .{ .view = .pg_trigger, .oid = 2620 },
+    .{ .view = .pg_rewrite, .oid = rewrite_catalog }, .{ .view = .pg_trigger, .oid = 2620 },
     .{ .view = .pg_extension, .oid = 3079 }, .{ .view = .pg_policy, .oid = 3256 },
     .{ .view = .pg_statistic_ext, .oid = 3381 }, .{ .view = .pg_enum, .oid = 3501 },
     .{ .view = .pg_collation, .oid = 3456 }, .{ .view = .pg_publication, .oid = 6104 },

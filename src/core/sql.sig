@@ -6313,6 +6313,13 @@ pub fn Database(comptime config: Config) type {
                 }
                 const table = &self.tables[found.slot];
                 try dependencyRow(sink, relation, table.oid, namespace, table.namespace, 0, 'n');
+                if (table.relkind == 'v' or table.relkind == 'm') {
+                    const rewrite = catalog_module.rewrite_catalog;
+                    try dependencyRow(sink, rewrite, table.oid, relation, table.oid, 0, 'i');
+                    for (table.depends[0..table.depend_count]) |referenced| {
+                        if (referenced != table.oid) try dependencyRow(sink, rewrite, table.oid, relation, referenced, 0, 'n');
+                    }
+                }
                 for (table.columns[0..table.column_count], 1..) |*column, number| {
                     if (column.default_oid == 0) continue;
                     const generated = column.default_kind == .generated;
@@ -11950,10 +11957,20 @@ pub fn Database(comptime config: Config) type {
                     if (!trigger.live or !trigger.stamp.visible(snapshot)) continue;
                     try sink.add(&.{ intCell(trigger.oid), intCell(trigger.table_oid), nameCell(trigger.name.slice()), intCell(trigger.function_oid), intCell(trigger.tgtype), nameCell("O"), boolCell(false), intCell(@intCast(trigger.nargs)), intCell(0) });
                 },
-                .pg_rewrite => for (&self.objects.rules) |*rule| {
-                    if (!rule.live or !rule.stamp.visible(snapshot)) continue;
-                    const event = [1]u8{rule.event};
-                    try sink.add(&.{ intCell(rule.oid), nameCell(rule.name.slice()), intCell(rule.table_oid), nameCell(&event), nameCell("O"), boolCell(rule.instead) });
+                .pg_rewrite => {
+                    for (&self.objects.rules) |*rule| {
+                        if (!rule.live or !rule.stamp.visible(snapshot)) continue;
+                        try sink.add(&.{ intCell(rule.oid), nameCell(rule.name.slice()), intCell(rule.table_oid), .{ .pg_internal_char = rule.event }, .{ .pg_internal_char = 'O' }, boolCell(rule.instead) });
+                    }
+                    var visible: [K.relation_rows]K.Found = undefined;
+                    const count = self.catalog.visibleRelations(snapshot, &visible);
+                    for (visible[0..count]) |relation| {
+                        if (relation.kind != 'v' and relation.kind != 'm') continue;
+                        const view = &self.tables[relation.slot];
+                        // Catalog identities are (class, OID). An explicit
+                        // rule uses a different allocated OID from its view.
+                        try sink.add(&.{ intCell(view.oid), nameCell("_RETURN"), intCell(view.oid), .{ .pg_internal_char = '1' }, .{ .pg_internal_char = 'O' }, boolCell(true) });
+                    }
                 },
                 .pg_rules => for (&self.objects.rules) |*rule| {
                     if (!rule.live or !rule.stamp.visible(snapshot)) continue;
