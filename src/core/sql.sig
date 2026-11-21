@@ -1384,7 +1384,7 @@ pub fn Database(comptime config: Config) type {
                 // Describe only needs the static relation schema.
                 if (!describe_only) for (self.workspace.plans.items[0..self.workspace.plans.len]) |*block| {
                     for (block.sources[0..block.source_count]) |*item| {
-                        if (item.view == .pg_settings) return error.UnsupportedStatement;
+                        if (item.view == .pg_settings or item.sequence != null) return error.UnsupportedStatement;
                     }
                 };
                 // Metadata-only Describe does not call evaluation hooks.
@@ -5159,7 +5159,12 @@ pub fn Database(comptime config: Config) type {
         /// the view owner's rights, the bootstrap superuser). Returns the
         /// derived query replacing it under row security, or none.
         fn secureItem(db: *const Self, workspace: *Workspace, length: *usize, source: []const u8, role: u32, row_security: bool, found: K.Found, snap: Snapshot) Error!u16 {
-            if (found.kind == 'S') return error.InsufficientPrivilege;
+            if (found.kind == 'S') {
+                const seq = &db.seqs[found.slot];
+                const owner = if (seq.owner == 0) CO.bootstrap_role else db.catalog_objects.owner(seq.owner, snap);
+                if (!db.catalog_objects.memberOf(role, owner, true, snap)) return error.InsufficientPrivilege;
+                return ast.none;
+            }
             const table = &db.tables[found.slot];
             if (!db.catalog_objects.tablePrivileges(role, table.oid, CO.priv_select, snap)) return error.InsufficientPrivilege;
             if (table.relkind != 'r' and table.relkind != 'p') return ast.none;
@@ -6318,9 +6323,16 @@ pub fn Database(comptime config: Config) type {
             }
         }
 
+        fn sequenceRows(ptr: *anyopaque, slot: usize, sink: *X.RowSink) Error!void {
+            const self: *const Self = @ptrCast(@alignCast(ptr));
+            const seq = &self.seqs[slot];
+            try sink.add(&.{ intCell(seq.last_value), intCell(seq.log_cnt), boolCell(seq.is_called) });
+        }
+
         fn fillViewRows(self:*const Self,session_values:*const value_module.Session,snapshot:Snapshot,pool:*A.Pool,view:catalog_module.View,sink:*X.RowSink) Error!void {
             const include_class_acl = view == .pg_class and sink.referencesColumn(catalog_module.pg_class_acl_column);
             if (view == .pg_settings) return error.UnsupportedStatement;
+            if (view == .sequence_state) return error.UnsupportedStatement;
             // This catalog stores explicit ALTER DEFAULT PRIVILEGES entries.
             // Built-in defaults come from acldefault() and do not create rows.
             if (view == .pg_default_acl) return;
@@ -8918,7 +8930,7 @@ pub fn Database(comptime config: Config) type {
             self.session.sequences = &self.seq_hook;
             self.seq_slot = slot;
             self.seq_snap = snap;
-            self.workspace.query.views = .{ .ptr = self, .rows = &viewRows };
+            self.workspace.query.views = .{ .ptr = self, .rows = &viewRows, .sequence_rows = &sequenceRows };
             self.session_hook = .{ .ptr = self, .call = &sessionCall };
             self.session.engine = &self.session_hook;
             self.routine_hook = .{ .ptr = self, .call = &routineHookCall };

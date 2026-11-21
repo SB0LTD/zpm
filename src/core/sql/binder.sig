@@ -493,6 +493,7 @@ pub fn Binder(comptime config: types.Config) type {
         pub const Source = struct {
             table: ?usize = null,
             view: ?catalog.View = null,
+            sequence: ?usize = null,
             plan: u16 = none,
             cte: u8 = no_cte,
             join: ast.JoinKind = .first,
@@ -4446,15 +4447,18 @@ pub fn Binder(comptime config: types.Config) type {
                 (context.stored_source_start != 0 and ident.span.start >= context.stored_source_start);
         }
 
-        /// A user table, optionally schema-qualified (public by default,
-        /// as the default search_path).
-        pub fn resolveQualified(context: *const Context, schema: ?ast.Ident, name: ast.Ident) Error!usize {
+        fn resolveRelation(context: *const Context, schema: ?ast.Ident, name: ast.Ident) Error!K.Found {
             // PostgreSQL reports a relation in a missing schema as 42P01.
             const namespace = if (schema != null) qualifierNamespace(context, schema) catch |err| {
                 return if (err == error.UndefinedSchema) error.TableNotFound else err;
             } else if (publicLookup(context, name)) catalog.public_namespace else return error.TableNotFound;
             const wanted = toName(context, name);
-            const found = context.catalog.findIn(namespace, wanted.slice(), context.snapshot) orelse return error.TableNotFound;
+            return context.catalog.findIn(namespace, wanted.slice(), context.snapshot) orelse return error.TableNotFound;
+        }
+
+        /// A user table, optionally schema-qualified.
+        pub fn resolveQualified(context: *const Context, schema: ?ast.Ident, name: ast.Ident) Error!usize {
+            const found = try resolveRelation(context, schema, name);
             if (found.kind == 'S') return error.TableNotFound;
             return found.slot;
         }
@@ -6887,7 +6891,7 @@ pub fn Binder(comptime config: types.Config) type {
             scope.rels[0] = rel.*;
             scope.rel_count = 1;
             const p = &plans.items[id];
-            p.sources[0] = .{ .table = source.table, .view = source.view, .plan = source.plan, .cte = source.cte };
+            p.sources[0] = .{ .table = source.table, .view = source.view, .sequence = source.sequence, .plan = source.plan, .cte = source.cte };
             p.source_count = 1;
             for (0..relationWidth(context, rel)) |column| {
                 const node = try columnNode(context, &scope, 0, column);
@@ -7012,10 +7016,19 @@ pub fn Binder(comptime config: types.Config) type {
                     rel.name = literalName(@tagName(view));
                     source.view = view;
                 } else {
-                    const table = try readableTable(context, try resolveQualified(context, item.schema, item.name));
-                    rel.table = table;
-                    rel.name = context.tables[table].name;
-                    source.table = table;
+                    const found = try resolveRelation(context, item.schema, item.name);
+                    if (found.kind == 'S') {
+                        if (context.dialect != .postgres) return error.TableNotFound;
+                        rel.view = .sequence_state;
+                        rel.name = toName(context, item.name);
+                        source.view = .sequence_state;
+                        source.sequence = found.slot;
+                    } else {
+                        const table = try readableTable(context, found.slot);
+                        rel.table = table;
+                        rel.name = context.tables[table].name;
+                        source.table = table;
+                    }
                 }
                 if (item.alias) |alias| rel.name = toName(context, alias);
                 if (item.sample_method != 0) {
@@ -7984,7 +7997,16 @@ pub fn Binder(comptime config: types.Config) type {
                         try resolveUnknown(context, root);
                         return .{ .query = root };
                     };
-                    return .{ .select = try bindSelect(context, q) };
+                    const selected = bindSelect(context, q) catch |err| {
+                        if (err != error.TableNotFound or context.dialect != .postgres) return err;
+                        const ref = q.from orelse return err;
+                        if ((try resolveRelation(context, ref.schema, ref.name)).kind != 'S') return err;
+                        if (context.plans == null or q.lock.strength != .none) return error.UnsupportedStatement;
+                        const root = try bindPlan(context, index, null, null, false);
+                        try resolveUnknown(context, root);
+                        return .{ .query = root };
+                    };
+                    return .{ .select = selected };
                 },
                 .query => |index| {
                     const plans = context.plans orelse return error.UnsupportedStatement;

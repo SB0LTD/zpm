@@ -56,7 +56,7 @@ pub const View = enum(u8) { pg_type, pg_namespace, pg_class, pg_attribute, pg_in
     pg_roles, pg_authid, pg_auth_members, pg_policy, pg_policies, pg_description, pg_shdescription, pg_foreign_data_wrapper, pg_foreign_server, pg_publication, pg_extension, pg_tables, table_privileges, pg_enum, pg_database, pg_am, pg_collation, pg_constraint, pg_statistic_ext,
     pg_publication_rel, pg_publication_namespace, pg_settings, pg_depend, pg_tablespace, pg_foreign_table,
     pg_init_privs, pg_cast, pg_transform, pg_language, pg_operator, pg_opclass, pg_opfamily, pg_ts_parser, pg_ts_template, pg_ts_dict, pg_ts_config, pg_default_acl, pg_conversion, pg_range, pg_event_trigger, pg_partitioned_table, pg_subscription,
-    pg_seclabel, pg_shseclabel, pg_seclabels, pg_db_role_setting, pg_amop, pg_amproc, pg_largeobject, pg_largeobject_metadata };
+    pg_seclabel, pg_shseclabel, pg_seclabels, pg_db_role_setting, pg_amop, pg_amproc, pg_largeobject, pg_largeobject_metadata, sequence_state };
 
 pub const sql_language_oid: u32 = 14;
 pub const plpgsql_language_oid: u32 = 13002;
@@ -257,6 +257,7 @@ const pg_statistic_ext_columns = [_]ViewColumn{
 };
 const pg_attrdef_columns = [_]ViewColumn{ col("adrelid", .oid), col("adnum", .int2), col("adbin", .text), col("oid", .oid) };
 const pg_sequence_columns = [_]ViewColumn{ col("seqrelid", .oid), col("seqtypid", .oid), col("seqstart", .int8), col("seqincrement", .int8), col("seqmax", .int8), col("seqmin", .int8), col("seqcache", .int8), col("seqcycle", .boolean) };
+const sequence_state_columns = [_]ViewColumn{ col("last_value", .int8), col("log_cnt", .int8), col("is_called", .boolean) };
 const schemata_columns = [_]ViewColumn{ col("catalog_name", .name), col("schema_name", .name) };
 const tables_columns = [_]ViewColumn{ col("table_catalog", .name), col("table_schema", .name), col("table_name", .name), col("table_type", .text) };
 const columns_columns = [_]ViewColumn{ col("table_catalog", .name), col("table_schema", .name), col("table_name", .name), col("column_name", .name), col("ordinal_position", .int4), col("column_default", .text), col("is_nullable", .text), col("data_type", .varchar), col("character_maximum_length", .int4), col("numeric_precision", .int4), col("numeric_precision_radix", .int4), col("numeric_scale", .int4), col("datetime_precision", .int4), col("is_identity", .text), col("identity_generation", .text), col("is_generated", .text), col("generation_expression", .text) };
@@ -408,6 +409,7 @@ pub fn viewColumns(view: View) []const ViewColumn {
         .pg_statistic_ext => &pg_statistic_ext_columns,
         .pg_attrdef => &pg_attrdef_columns,
         .pg_sequence => &pg_sequence_columns,
+        .sequence_state => &sequence_state_columns,
         .schemata => &schemata_columns,
         .tables => &tables_columns,
         .columns => &columns_columns,
