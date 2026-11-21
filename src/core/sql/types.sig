@@ -1284,6 +1284,8 @@ pub fn Values(comptime config: Config) type {
             primary_key: bool = false,
             /// DEFAULT, identity (owned sequence) or GENERATED ... STORED.
             default_kind: DefaultKind = .none,
+            /// Catalog identity for a DEFAULT or generation expression.
+            default_oid: u32 = 0,
             /// Source text of the DEFAULT or generation expression.
             expression: Text = .{},
             /// GENERATED ALWAYS AS (expr) VIRTUAL (default_kind generated):

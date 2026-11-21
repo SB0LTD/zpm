@@ -126,7 +126,7 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
                 try appendPart(sink, .create_sequence, scratch[0..try state.finish()]);
             };
             var counters = try change_log.Writer.init(scratch, 0);
-            try C.encodeCounters(&counters, change_log.first_oid + db.oid_counter, db.next_constraint_oid, &db.tables);
+            try C.encodeCounters(&counters, change_log.first_oid + db.oid_counter, db.next_constraint_oid, db.next_default_oid, &db.tables);
             try appendPart(sink, .catalog_counters, scratch[0..try counters.finish()]);
         }
 
@@ -183,7 +183,7 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
         /// provides the expected SQL CSN independently of the WAL sequence.
         pub fn restore(db: *Database, file: anytype, expected_csn: u64, scratch: []u8, replay: *C.Scratch) !void {
             try checkCatalog(db);
-            if (db.csn != 0 or db.oid_counter != 0 or db.next_constraint_oid != change_log.first_oid) return error.SnapshotUnsupportedState;
+            if (db.csn != 0 or db.oid_counter != 0 or db.next_constraint_oid != change_log.first_oid or db.next_default_oid != change_log.first_oid) return error.SnapshotUnsupportedState;
             for (&db.tables) |*table| if (table.live) return error.SnapshotUnsupportedState;
             for (&db.seqs) |*seq| if (seq.live) return error.SnapshotUnsupportedState;
             if (comptime config.external_storage) if (db.workspace.query.refs.len == 0) return error.InvalidParameterValue;
@@ -224,7 +224,11 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
             }
             const counters = try readPart(file, &offset, length, scratch, .catalog_counters);
             if (offset != length or try file.length() != length) return error.InvalidSnapshotImage;
-            const counter_op: change_log.Op = if (counters.len > 8 and counters[8] == @intFromEnum(change_log.Op.catalog_counters_with_constraints)) .catalog_counters_with_constraints else .catalog_counters;
+            const counter_op: change_log.Op = if (counters.len <= 8) .catalog_counters else switch (counters[8]) {
+                @intFromEnum(change_log.Op.catalog_counters_with_constraints) => .catalog_counters_with_constraints,
+                @intFromEnum(change_log.Op.catalog_counters_with_defaults) => .catalog_counters_with_defaults,
+                else => .catalog_counters,
+            };
             return C.applyBaseImageRecord(db, counters, replay, .{ .csn = csn, .op = counter_op, .table_count = table_count });
         }
     };

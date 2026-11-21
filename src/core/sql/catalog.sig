@@ -229,7 +229,7 @@ const pg_statistic_ext_columns = [_]ViewColumn{
     col("oid", .oid), col("stxrelid", .oid), col("stxname", .name), col("stxnamespace", .oid),
     col("stxowner", .oid), col("stxstattarget", .int2), col("stxkeys", .text), col("stxkind", text_array), col("stxexprs", .text),
 };
-const pg_attrdef_columns = [_]ViewColumn{ col("adrelid", .oid), col("adnum", .int2), col("adbin", .text) };
+const pg_attrdef_columns = [_]ViewColumn{ col("adrelid", .oid), col("adnum", .int2), col("adbin", .text), col("oid", .oid) };
 const pg_sequence_columns = [_]ViewColumn{ col("seqrelid", .oid), col("seqtypid", .oid), col("seqstart", .int8), col("seqincrement", .int8), col("seqmax", .int8), col("seqmin", .int8), col("seqcache", .int8), col("seqcycle", .boolean) };
 const schemata_columns = [_]ViewColumn{ col("catalog_name", .name), col("schema_name", .name) };
 const tables_columns = [_]ViewColumn{ col("table_catalog", .name), col("table_schema", .name), col("table_name", .name), col("table_type", .text) };

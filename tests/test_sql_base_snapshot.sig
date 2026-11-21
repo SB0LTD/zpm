@@ -69,7 +69,7 @@ fn reset(db: *DB, i: usize) !void {
 fn exercise(integral: bool) !void {
     try reset(&live, 0);
     try reset(&restored, 1);
-    try live.execute("CREATE TABLE old (id INT)", &result);
+    try live.execute("CREATE TABLE old (id INT DEFAULT 1)", &result);
     try live.execute("DROP TABLE old", &result);
     try live.execute(if (integral)
         "CREATE TABLE ledger (id INT PRIMARY KEY, amount BIGINT, detail DATE)"
@@ -106,6 +106,7 @@ fn exercise(integral: bool) !void {
     try DB.BaseSnapshot.restore(&restored, &image, csn, &scratch, &replay);
     try check(restored.csn == csn and restored.oid_counter == live.oid_counter);
     try check(restored.next_constraint_oid == live.next_constraint_oid);
+    try check(restored.next_default_oid == live.next_default_oid);
     try check(restored.tables[bank].primary_constraint_oid == live.tables[bank].primary_constraint_oid);
     try check(restored.tables[bank].primary_index_oid == live.tables[bank].primary_index_oid);
     try check(restored.tables[bank].oid == live.tables[bank].oid and restored.tables[bank].next_rowid == 7);

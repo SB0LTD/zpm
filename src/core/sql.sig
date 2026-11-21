@@ -1792,6 +1792,7 @@ pub fn Database(comptime config: Config) type {
         oid_counter: u32 = 0,
         /// Constraint OIDs have their own catalog namespace.
         next_constraint_oid: u32 = change_log.first_oid,
+        next_default_oid: u32 = change_log.first_oid,
         /// Global commit sequence number, advanced only at publish.
         csn: u64 = 0,
         /// Command id used by change-record replay.
@@ -2219,6 +2220,7 @@ pub fn Database(comptime config: Config) type {
             if (self == source) return;
             self.oid_counter = source.oid_counter;
             self.next_constraint_oid = source.next_constraint_oid;
+            self.next_default_oid = source.next_default_oid;
             self.csn = source.csn;
             self.cid = source.cid;
             self.epoch = source.epoch;
@@ -6520,7 +6522,7 @@ pub fn Database(comptime config: Config) type {
                                     });
                                 },
                                 .pg_attrdef => if (has_expression) {
-                                    try sink.add(&.{ intCell(oid), intCell(attnum), expressionTextWithPool(pool,column) });
+                                    try sink.add(&.{ intCell(oid), intCell(attnum), expressionTextWithPool(pool,column), intCell(column.default_oid) });
                                 },
                                 .columns => {
                                     const numeric = numericPrecision(column);
@@ -7197,6 +7199,7 @@ pub fn Database(comptime config: Config) type {
             S.setConstraints(table, create.constraints[0..create.constraint_count]);
             S.setExtras(table, &create.extras);
             try self.assignConstraintOids(table, null);
+            try C.assignDefaultOids(table.columns[0..table.column_count], &.{}, &.{}, &self.next_default_oid);
             // A foreign key to the table itself takes its OID now.
             for (table.constraints[0..table.constraint_count]) |*constraint| {
                 if (constraint.kind == .foreign and constraint.ref_oid == 0) constraint.ref_oid = table.oid;
@@ -7483,6 +7486,7 @@ pub fn Database(comptime config: Config) type {
             S.setExtras(copy, &alter.extras);
             if (S.keyed(copy)) copy.primary_index_oid = source.primary_index_oid;
             try self.assignConstraintOids(copy, source);
+            try C.assignDefaultOids(copy.columns[0..copy.column_count], source.columns[0..source.column_count], alter.sources[0..alter.count], &self.next_default_oid);
             S.copyRelayout(copy, source, alter.sources[0..alter.count], fills[0..alter.count]);
             copy.live = true;
             copy.pending_create = true;
@@ -12026,7 +12030,7 @@ pub fn Database(comptime config: Config) type {
         /// Appends catalog OID counters and every live table's next row ID.
         pub fn encodeCatalogCounters(self: *const Self, record: []u8, used: *usize) Error!void {
             var writer = try change_log.Writer.init(record, used.*);
-            try C.encodeCounters(&writer, change_log.first_oid + self.oid_counter, self.next_constraint_oid, &self.tables);
+            try C.encodeCounters(&writer, change_log.first_oid + self.oid_counter, self.next_constraint_oid, self.next_default_oid, &self.tables);
             used.* = try writer.finish();
         }
 
