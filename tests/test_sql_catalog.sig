@@ -81,7 +81,7 @@ const public_classes = "SELECT relname, relkind FROM pg_class WHERE relnamespace
 
 fn types() !void {
     try expect("SELECT oid, typname FROM pg_catalog.pg_type WHERE typname = 'int4'", "23|int4");
-    try expect("SELECT COUNT(*), MIN(typnamespace), MAX(typnamespace) FROM pg_type", "98|11|11");
+    try expect("SELECT COUNT(*), MIN(typnamespace), MAX(typnamespace) FROM pg_type", "99|11|11");
     try expect("SELECT oid, typname, typlen, typarray, typelem FROM pg_type WHERE oid IN (1033,1034) ORDER BY oid", "1033|aclitem|16|1034|0;1034|_aclitem|-1|0|1033");
     try expect("SELECT oid, typname, typlen, typarray, typelem FROM pg_type WHERE oid IN (18,1002) ORDER BY oid", "18|char|1|1002|0;1002|_char|-1|0|18");
     try expect("SELECT typname, typlen, typcategory, typarray, typinput FROM pg_type WHERE oid IN (4072, 4073) ORDER BY oid", "jsonpath|-1|U|4073|jsonpath_in;_jsonpath|-1|A|0|array_in");
@@ -255,6 +255,20 @@ fn eventTriggerDiscovery() !void {
     try rejects("SELECT * FROM unnest(123)", error.UndefinedFunction);
 }
 
+fn columnDiscovery() !void {
+    try run("CREATE TABLE attr_parent (id integer NOT NULL, amount numeric(10,2))");
+    try run("CREATE TABLE attr_child (label text DEFAULT 'x') INHERITS (attr_parent)");
+    try expect("SELECT a.attname,a.attstattarget,a.attstorage,t.typstorage,a.attislocal,a.atthasmissing,"
+        ++ "pg_typeof(a.attmissingval)::text,a.attmissingval IS NULL,a.attoptions IS NULL,a.attfdwoptions IS NULL "
+        ++ "FROM pg_attribute a JOIN pg_type t ON a.atttypid=t.oid "
+        ++ "WHERE a.attrelid='attr_child'::regclass ORDER BY a.attnum",
+        "id|-1|p|p|f|f|anyarray|t|t|t;amount|-1|m|m|f|f|anyarray|t|t|t;label|-1|x|x|t|f|anyarray|t|t|t");
+    try expect("SELECT attname,CASE WHEN atthasmissing AND NOT attisdropped THEN attmissingval ELSE NULL END IS NULL "
+        ++ "FROM pg_attribute WHERE attrelid='attr_child'::regclass ORDER BY attnum", "id|t;amount|t;label|t");
+    try run("DROP TABLE attr_child");
+    try run("DROP TABLE attr_parent");
+}
+
 fn lifecycle() !void {
     try run("CREATE TABLE a (id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY, amount NUMERIC(10,2), at TIMESTAMPTZ(3), doc JSONB, label TEXT DEFAULT 'd', n INTEGER DEFAULT 2 + 3)");
     try expect(public_tables, "a");
@@ -405,6 +419,7 @@ pub fn main(init: std.process.Init) !void {
     try conversionDiscovery();
     try rangeDiscovery();
     try eventTriggerDiscovery();
+    try columnDiscovery();
     try lifecycle();
     try replay();
     try characterMetadata();

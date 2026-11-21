@@ -6066,6 +6066,41 @@ pub fn Database(comptime config: Config) type {
             return properties;
         }
 
+        const AttributeMetadata = struct {
+            not_null: bool = false,
+            identity: u8 = 0,
+            generated: u8 = 0,
+            has_expression: bool = false,
+            local: bool = true,
+        };
+
+        fn attributeRow(sink: *X.RowSink, relation: i64, name: []const u8, data_type: DataType, typmod: i32, ordinal: i64, metadata: AttributeMetadata) Error!void {
+            const info = types.typeInfo(data_type);
+            // Stock tools see the default settings. RamSQL materializes
+            // added columns and has no TOAST or per-column FDW overrides.
+            try sink.add(&.{
+                intCell(relation), nameCell(name), intCell(info.oid), intCell(typmod), intCell(ordinal),
+                boolCell(metadata.not_null), boolCell(false), .{ .pg_internal_char = metadata.identity },
+                .{ .pg_internal_char = metadata.generated }, boolCell(metadata.has_expression),
+                intCell(collation.typeCollation(types.typeOfData(data_type))), intCell(info.len),
+                .{ .pg_internal_char = info.alignment }, intCell(-1), .{ .pg_internal_char = types.typeStorage(data_type) },
+                boolCell(metadata.local), .null_value, .null_value, .{ .pg_internal_char = 0 }, boolCell(false), .null_value,
+            });
+        }
+
+        fn attributeIsLocal(self: *const Self, table: *const S.Table, name: []const u8, snapshot: Snapshot) bool {
+            if (table.parent == 0) return true;
+            if (table.partition.bound != .none) return false;
+            const parent_index = self.visibleTableSlot(table.parent, snapshot) orelse return true;
+            const parent = &self.tables[parent_index];
+            // INHERITS copies the parent's columns and forbids a local
+            // column of the same name.
+            for (parent.columns[0..parent.column_count]) |*column| {
+                if (types.same(column.name.slice(), name)) return false;
+            }
+            return true;
+        }
+
         fn compositeCatalogRows(self: *const Self, view: catalog_module.View, snapshot: Snapshot, sink: *X.RowSink) Error!void {
             for (&self.catalog_objects.items) |*object| {
                 if (object.kind != .composite_type or !O.visible(object, snapshot)) continue;
@@ -6078,9 +6113,7 @@ pub fn Database(comptime config: Config) type {
                 var ordinal: i64 = 1;
                 while (fields.next()) |field| : (ordinal += 1) {
                     const data_type = types.typeFromOid(field.oid) orelse return error.UndefinedObject;
-                    const info = types.typeInfo(data_type);
-                    const collation_oid = collation.typeCollation(types.typeOfData(data_type));
-                    try sink.add(&.{ intCell(relation), nameCell(field.name), intCell(field.oid), intCell(field.typmod), intCell(ordinal), boolCell(false), boolCell(false), .{ .pg_internal_char = 0 }, .{ .pg_internal_char = 0 }, boolCell(false), intCell(collation_oid), intCell(info.len), .{ .pg_internal_char = info.alignment } });
+                    try attributeRow(sink, relation, field.name, data_type, field.typmod, ordinal, .{});
                 }
             }
         }
@@ -6280,7 +6313,7 @@ pub fn Database(comptime config: Config) type {
                 .pg_depend => return self.dependencyRows(snapshot, relations[0..count], sink),
                 .pg_type => {
                     for (catalog_module.builtin_pseudo_types) |info| {
-                        try sink.add(&.{ intCell(info.oid), nameCell(info.name), intCell(catalog_module.catalog_namespace), intCell(info.bytes), .{ .pg_internal_char = 'p' }, nameCell("P"), intCell(0), nameCell(","), nameCell(info.input), intCell(0), intCell(0), intCell(CO.bootstrap_role), intCell(-1), boolCell(false), intCell(0), intCell(0), .null_value, boolCell(true) });
+                        try sink.add(&.{ intCell(info.oid), nameCell(info.name), intCell(catalog_module.catalog_namespace), intCell(info.bytes), .{ .pg_internal_char = 'p' }, nameCell("P"), intCell(0), nameCell(","), nameCell(info.input), intCell(0), intCell(0), intCell(CO.bootstrap_role), intCell(-1), boolCell(false), intCell(0), intCell(0), .null_value, boolCell(true), .{ .pg_internal_char = info.storage } });
                     }
                     inline for (@typeInfo(DataType).@"enum".field_names) |field| {
                         const data_type = @field(DataType, field);
@@ -6289,10 +6322,10 @@ pub fn Database(comptime config: Config) type {
                         const category: [1]u8 = .{info.category};
                         const type_collation = intCell(collation.typeCollation(types.typeOfData(data_type)));
                         const kind: u8 = if (types.rangeSubtype(types.typeOfData(data_type)) != null) 'r' else 'b';
-                        try sink.add(&.{ intCell(info.oid), nameCell(info.name), intCell(catalog_module.catalog_namespace), intCell(info.len), .{ .pg_internal_char = kind }, nameCell(&category), intCell(info.array), nameCell(","), nameCell(types.typeInputName(data_type)), intCell(0), intCell(0), intCell(CO.bootstrap_role), intCell(-1), boolCell(false), intCell(0), type_collation, .null_value, boolCell(true) });
+                        try sink.add(&.{ intCell(info.oid), nameCell(info.name), intCell(catalog_module.catalog_namespace), intCell(info.len), .{ .pg_internal_char = kind }, nameCell(&category), intCell(info.array), nameCell(","), nameCell(types.typeInputName(data_type)), intCell(0), intCell(0), intCell(CO.bootstrap_role), intCell(-1), boolCell(false), intCell(0), type_collation, .null_value, boolCell(true), .{ .pg_internal_char = types.typeStorage(data_type) } });
                         if (types.arrayData(data_type)) |array_type| {
                             const array_info = types.typeInfo(array_type);
-                            try sink.add(&.{ intCell(array_info.oid), nameCell(array_info.name), intCell(catalog_module.catalog_namespace), intCell(array_info.len), .{ .pg_internal_char = 'b' }, nameCell("A"), intCell(0), nameCell(","), nameCell(types.typeInputName(array_type)), intCell(0), intCell(info.oid), intCell(CO.bootstrap_role), intCell(-1), boolCell(false), intCell(0), type_collation, .null_value, boolCell(true) });
+                            try sink.add(&.{ intCell(array_info.oid), nameCell(array_info.name), intCell(catalog_module.catalog_namespace), intCell(array_info.len), .{ .pg_internal_char = 'b' }, nameCell("A"), intCell(0), nameCell(","), nameCell(types.typeInputName(array_type)), intCell(0), intCell(info.oid), intCell(CO.bootstrap_role), intCell(-1), boolCell(false), intCell(0), type_collation, .null_value, boolCell(true), .{ .pg_internal_char = types.typeStorage(array_type) } });
                         }
                     }
                     for (&self.catalog_objects.items) |*object| {
@@ -6301,13 +6334,13 @@ pub fn Database(comptime config: Config) type {
                         switch (object.kind) {
                             .domain => {
                                 const info = types.typeInfo(types.dataTypeOf(object.domain.base));
-                                try sink.add(&.{ intCell(object.oid), nameCell(object.name.slice()), intCell(object.target), intCell(info.len), .{ .pg_internal_char = 'd' }, nameCell("N"), intCell(object.oid + 1), nameCell(","), nameCell("domain_in"), intCell(info.oid), intCell(0), intCell(object.owner), intCell(-1), boolCell(object.domain.not_null), intCell(0), type_collation, .null_value, boolCell(true) });
+                                try sink.add(&.{ intCell(object.oid), nameCell(object.name.slice()), intCell(object.target), intCell(info.len), .{ .pg_internal_char = 'd' }, nameCell("N"), intCell(object.oid + 1), nameCell(","), nameCell("domain_in"), intCell(info.oid), intCell(0), intCell(object.owner), intCell(-1), boolCell(object.domain.not_null), intCell(0), type_collation, .null_value, boolCell(true), .{ .pg_internal_char = types.typeStorage(types.dataTypeOf(object.domain.base)) } });
                             },
-                            .enum_type => try sink.add(&.{ intCell(object.oid), nameCell(object.name.slice()), intCell(object.target), intCell(4), .{ .pg_internal_char = 'e' }, nameCell("E"), intCell(object.oid + 1), nameCell(","), nameCell("enum_in"), intCell(0), intCell(0), intCell(object.owner), intCell(-1), boolCell(false), intCell(0), type_collation, .null_value, boolCell(true) }),
-                            .composite_type => try sink.add(&.{ intCell(object.oid), nameCell(object.name.slice()), intCell(object.target), intCell(-1), .{ .pg_internal_char = 'c' }, nameCell("C"), intCell(object.oid + 1), nameCell(","), nameCell("record_in"), intCell(0), intCell(0), intCell(object.owner), intCell(-1), boolCell(false), intCell(object.compositeRelationOid()), type_collation, .null_value, boolCell(true) }),
+                            .enum_type => try sink.add(&.{ intCell(object.oid), nameCell(object.name.slice()), intCell(object.target), intCell(4), .{ .pg_internal_char = 'e' }, nameCell("E"), intCell(object.oid + 1), nameCell(","), nameCell("enum_in"), intCell(0), intCell(0), intCell(object.owner), intCell(-1), boolCell(false), intCell(0), type_collation, .null_value, boolCell(true), .{ .pg_internal_char = 'p' } }),
+                            .composite_type => try sink.add(&.{ intCell(object.oid), nameCell(object.name.slice()), intCell(object.target), intCell(-1), .{ .pg_internal_char = 'c' }, nameCell("C"), intCell(object.oid + 1), nameCell(","), nameCell("record_in"), intCell(0), intCell(0), intCell(object.owner), intCell(-1), boolCell(false), intCell(object.compositeRelationOid()), type_collation, .null_value, boolCell(true), .{ .pg_internal_char = 'x' } }),
                             else => unreachable,
                         }
-                        try sink.add(&.{ intCell(object.oid + 1), nameCell(object.arrayName()), intCell(object.target), intCell(-1), .{ .pg_internal_char = 'b' }, nameCell("A"), intCell(0), nameCell(","), nameCell("array_in"), intCell(0), intCell(object.oid), intCell(object.owner), intCell(-1), boolCell(false), intCell(0), type_collation, .null_value, boolCell(true) });
+                        try sink.add(&.{ intCell(object.oid + 1), nameCell(object.arrayName()), intCell(object.target), intCell(-1), .{ .pg_internal_char = 'b' }, nameCell("A"), intCell(0), nameCell(","), nameCell("array_in"), intCell(0), intCell(object.oid), intCell(object.owner), intCell(-1), boolCell(false), intCell(0), type_collation, .null_value, boolCell(true), .{ .pg_internal_char = 'x' } });
                     }
                 },
                 .pg_enum => for (&self.catalog_objects.items) |*object| {
@@ -6478,8 +6511,13 @@ pub fn Database(comptime config: Config) type {
                             const has_expression = kind == .default or kind == .generated;
                             switch (view) {
                                 .pg_attribute => {
-                                    const info = types.typeInfo(column.data_type);
-                                    try sink.add(&.{ intCell(oid), nameCell(column.name.slice()), intCell(info.oid), intCell(column.typmod), intCell(attnum), boolCell(column.not_null), boolCell(false), .{ .pg_internal_char = identity }, .{ .pg_internal_char = if (kind != .generated) 0 else if (column.virtual) 'v' else 's' }, boolCell(has_expression), intCell(collation.typeCollation(types.typeOfData(column.data_type))), intCell(info.len), .{ .pg_internal_char = info.alignment } });
+                                    try attributeRow(sink, oid, column.name.slice(), column.data_type, column.typmod, attnum, .{
+                                        .not_null = column.not_null,
+                                        .identity = identity,
+                                        .generated = if (kind != .generated) 0 else if (column.virtual) 'v' else 's',
+                                        .has_expression = has_expression,
+                                        .local = self.attributeIsLocal(table, column.name.slice(), snapshot),
+                                    });
                                 },
                                 .pg_attrdef => if (has_expression) {
                                     try sink.add(&.{ intCell(oid), intCell(attnum), expressionTextWithPool(pool,column) });

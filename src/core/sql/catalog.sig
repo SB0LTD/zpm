@@ -77,7 +77,7 @@ const pg_type_columns = [_]ViewColumn{
     col("oid", .oid), col("typname", .name), col("typnamespace", .oid), col("typlen", .int2), col("typtype", .pg_internal_char), col("typcategory", .text),
     col("typarray", .oid), col("typdelim", .text), col("typinput", .text), col("typbasetype", .oid), col("typelem", .oid),
     col("typowner", .oid), col("typtypmod", .int4), col("typnotnull", .boolean), col("typrelid", .oid), col("typcollation", .oid),
-    col("typacl", types.arrayType(.aclitem).?), col("typisdefined", .boolean),
+    col("typacl", types.arrayType(.aclitem).?), col("typisdefined", .boolean), col("typstorage", .pg_internal_char),
 };
 const pg_namespace_columns = [_]ViewColumn{ col("oid", .oid), col("nspname", .name), col("nspowner", .oid), col("nspacl", types.arrayType(.aclitem).?) };
 const pg_enum_columns = [_]ViewColumn{ col("oid", .oid), col("enumtypid", .oid), col("enumsortorder", .float4), col("enumlabel", .name) };
@@ -90,10 +90,11 @@ pub const access_methods = [_]struct { oid: u32, name: []const u8, kind: u8, han
     .{ .oid = btree_access_method, .name = "btree", .kind = 'i', .handler = 330, .handler_name = "bthandler", .result = 325 },
 };
 pub const internal_type_oid: u32 = 2281;
-pub const builtin_pseudo_types = [_]struct { oid: u32, name: []const u8, bytes: i16, input: []const u8 }{
+pub const builtin_pseudo_types = [_]struct { oid: u32, name: []const u8, bytes: i16, input: []const u8, storage: u8 = 'p' }{
     .{ .oid = 269, .name = "table_am_handler", .bytes = 4, .input = "table_am_handler_in" },
     .{ .oid = 325, .name = "index_am_handler", .bytes = 4, .input = "index_am_handler_in" },
     .{ .oid = internal_type_oid, .name = "internal", .bytes = @sizeOf(usize), .input = "internal_in" },
+    .{ .oid = types.catalog_anyarray_oid, .name = "anyarray", .bytes = -1, .input = "anyarray_in", .storage = 'x' },
     .{ .oid = 2278, .name = "void", .bytes = 4, .input = "void_in" },
 };
 
@@ -200,7 +201,15 @@ const pg_class_columns = [_]ViewColumn{
     col("relallvisible", .int4), col("relallfrozen", .int4), col("relfrozenxid", .xid), col("relminmxid", .xid),
     col("relacl", types.arrayType(.aclitem).?), col("reloptions", types.arrayType(.text).?),
 };
-const pg_attribute_columns = [_]ViewColumn{ col("attrelid", .oid), col("attname", .name), col("atttypid", .oid), col("atttypmod", .int4), col("attnum", .int2), col("attnotnull", .boolean), col("attisdropped", .boolean), col("attidentity", .pg_internal_char), col("attgenerated", .pg_internal_char), col("atthasdef", .boolean), col("attcollation", .oid), col("attlen", .int2), col("attalign", .pg_internal_char) };
+const pg_attribute_columns = [_]ViewColumn{
+    col("attrelid", .oid), col("attname", .name), col("atttypid", .oid), col("atttypmod", .int4),
+    col("attnum", .int2), col("attnotnull", .boolean), col("attisdropped", .boolean),
+    col("attidentity", .pg_internal_char), col("attgenerated", .pg_internal_char), col("atthasdef", .boolean),
+    col("attcollation", .oid), col("attlen", .int2), col("attalign", .pg_internal_char),
+    col("attstattarget", .int2), col("attstorage", .pg_internal_char), col("attislocal", .boolean),
+    col("attoptions", types.arrayType(.text).?), col("attfdwoptions", types.arrayType(.text).?),
+    col("attcompression", .pg_internal_char), col("atthasmissing", .boolean), col("attmissingval", types.catalog_anyarray),
+};
 const pg_index_columns = [_]ViewColumn{
     col("indexrelid", .oid), col("indrelid", .oid), col("indisprimary", .boolean), col("indisunique", .boolean), col("indkey", .text),
     col("indisvalid", .boolean), col("indisclustered", .boolean), col("indisreplident", .boolean),

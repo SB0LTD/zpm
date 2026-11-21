@@ -597,6 +597,12 @@ pub const array_bit: u8 = 0x80;
 const data_type_count = @typeInfo(DataType).@"enum".field_names.len;
 const type_count = @typeInfo(Type).@"enum".field_names.len;
 
+// NULL-only catalog output for pg_attribute.attmissingval. Keep this
+// pseudo-type out of the concrete type registry and the array encodings.
+pub const catalog_anyarray: Type = @enumFromInt(127);
+const catalog_anyarray_data: DataType = @enumFromInt(127);
+pub const catalog_anyarray_oid: u32 = 2277;
+
 /// The array type of a named element type (null for an array).
 pub fn arrayData(element: DataType) ?DataType {
     const raw = @intFromEnum(element);
@@ -661,6 +667,7 @@ pub fn isRange(ty: Type) bool {
 
 pub fn dataTypeOf(ty: Type) DataType {
     return switch (ty) {
+        catalog_anyarray => catalog_anyarray_data,
         .int2 => .smallint,
         .int4 => .integer32,
         .int8 => .integer,
@@ -715,6 +722,7 @@ pub fn dataTypeOf(ty: Type) DataType {
 
 pub fn typeOfData(data_type: DataType) Type {
     return switch (data_type) {
+        catalog_anyarray_data => catalog_anyarray,
         .smallint => .int2,
         .integer32 => .int4,
         .integer => .int8,
@@ -823,6 +831,7 @@ const array_sql_names = blk: {
 
 fn baseInfo(data_type: DataType) TypeInfo {
     return switch (data_type) {
+        catalog_anyarray_data => .{ .oid = catalog_anyarray_oid, .name = "anyarray", .len = -1, .category = 'P', .array = 0, .alignment = 'd' },
         .aclitem => .{ .oid = 1033, .name = "aclitem", .len = 16, .category = 'U', .array = 1034, .alignment = 'd' },
         .pg_internal_char => .{ .oid = 18, .name = "char", .len = 1, .category = 'Z', .array = 1002, .alignment = 'c' },
         .boolean => .{ .oid = 16, .name = "bool", .len = 1, .category = 'B', .array = 1000, .alignment = 'c' },
@@ -880,6 +889,15 @@ fn baseInfo(data_type: DataType) TypeInfo {
 /// PostgreSQL type OIDs carried by change records and descriptions.
 pub fn typeOid(data_type: DataType) u32 {
     return typeInfo(data_type).oid;
+}
+
+/// PostgreSQL's default storage policy for catalog output.
+pub fn typeStorage(data_type: DataType) u8 {
+    return switch (data_type) {
+        .numeric, .mysql_bigint_unsigned, .cidr, .inet => 'm',
+        .tsquery => 'p',
+        else => if (typeInfo(data_type).len < 0) 'x' else 'p',
+    };
 }
 
 /// BIGINT UNSIGNED deliberately reuses the exact Numeric cell format.
@@ -1086,6 +1104,7 @@ pub fn regtypeName(oid: u32) ?[]const u8 {
         0 => return "-",
         705 => return "unknown",
         2205 => return "regclass",
+        catalog_anyarray_oid => return "anyarray",
         4089 => return "regnamespace",
         else => {},
     }
@@ -1108,6 +1127,7 @@ pub fn regtypeInput(input: []const u8) error{ UndefinedObject, NumericValueOutOf
     if (input.len == 1 and input[0] == '-') return 0;
     if (keyword(input, "unknown")) return 705;
     if (keyword(input, "regclass")) return 2205;
+    if (keyword(input, "anyarray")) return catalog_anyarray_oid;
     if (keyword(input, "regnamespace")) return 4089;
     const data_type = typeByName(input) orelse return error.UndefinedObject;
     return typeOid(data_type);
