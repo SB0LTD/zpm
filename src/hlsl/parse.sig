@@ -198,27 +198,54 @@ pub const Parser = struct {
         if (p.curIs("technique") or p.curIs("technique10") or p.curIs("technique11")) return p.skipBlock();
         // function attributes
         var max_vertex: u32 = 0;
+        var threads: [3]u32 = .{ 0, 0, 0 };
+        var threads_tok: u32 = 0;
+        var has_threads = false;
+        var early_depth = false;
         while (p.peek() == .lbracket) {
+            const open = p.at;
             _ = p.advance();
             const name = p.expectIdent() orelse return;
-            var first: i64 = 0;
+            var vals: [3]i64 = .{ 0, 0, 0 };
             if (p.accept(.lparen)) {
                 var k: usize = 0;
                 while (p.peek() != .rparen and p.peek() != .eof) : (k += 1) {
                     const e = p.assignment();
-                    if (k == 0) first = p.constInt(e) orelse 0;
+                    if (k < vals.len) vals[k] = p.constInt(e) orelse 0;
                     if (!p.accept(.comma)) break;
                 }
                 if (!p.expect(.rparen)) return;
             }
             if (!p.expect(.rbracket)) return;
-            if (std.mem.eql(u8, p.text(name), "maxvertexcount")) max_vertex = @intCast(@max(first, 0));
+            if (std.mem.eql(u8, p.text(name), "maxvertexcount")) max_vertex = @intCast(@max(vals[0], 0));
+            if (std.mem.eql(u8, p.text(name), "numthreads")) {
+                for (&threads, vals) |*t, v| t.* = @intCast(std.math.clamp(v, 0, 0xffff_ffff));
+                threads_tok = @intCast(open + 1);
+                has_threads = true;
+            }
+            if (std.mem.eql(u8, p.text(name), "earlydepthstencil")) early_depth = true;
         }
         var flags: u32 = 0;
         const ty = p.typeSpec(&flags, true) orelse return;
         if (p.accept(.semicolon)) return; // (a struct declared alone)
         const name = p.expectIdent() orelse return;
-        if (p.peek() == .lparen) return p.function(ty, flags, name, max_vertex);
+        if (p.peek() == .lparen) {
+            p.function(ty, flags, name, max_vertex);
+            // (the newest function of that name is the one just declared)
+            if (has_threads or early_depth) {
+                var s = p.a.nsyms;
+                while (s > 1) {
+                    s -= 1;
+                    if (p.a.syms[s].kind == .function and p.a.syms[s].name_off == name.off) {
+                        p.a.syms[s].threads = threads;
+                        p.a.syms[s].threads_tok = threads_tok;
+                        if (early_depth) p.a.syms[s].flags |= ast.F_EARLY_DEPTH;
+                        break;
+                    }
+                }
+            }
+            return;
+        }
         p.globalVars(ty, flags, name);
     }
 
@@ -492,9 +519,9 @@ pub const Parser = struct {
         .{ .s = "centroid", .f = ast.F_CENTROID },
         .{ .s = "noperspective", .f = ast.F_NOPERSP },
         .{ .s = "sample", .f = ast.F_SAMPLE },
-        .{ .s = "unorm", .f = 0 },
-        .{ .s = "snorm", .f = 0 },
-        .{ .s = "globallycoherent", .f = 0 },
+        .{ .s = "unorm", .f = ast.F_UNORM },
+        .{ .s = "snorm", .f = ast.F_SNORM },
+        .{ .s = "globallycoherent", .f = ast.F_GLOBALLYCOHERENT },
         .{ .s = "point", .f = ast.F_GS_POINT },
         .{ .s = "line", .f = ast.F_GS_LINE },
         .{ .s = "triangle", .f = ast.F_GS_TRIANGLE },
@@ -1308,6 +1335,25 @@ const textures = [_]TexName{
     .{ .s = "Texture", .d = .unknown },
 };
 
+const rw_textures = [_]TexName{
+    .{ .s = "RWTexture1D", .d = .tex1d },
+    .{ .s = "RWTexture1DArray", .d = .tex1darray },
+    .{ .s = "RWTexture2D", .d = .tex2d },
+    .{ .s = "RWTexture2DArray", .d = .tex2darray },
+    .{ .s = "RWTexture3D", .d = .tex3d },
+    .{ .s = "RWBuffer", .d = .buffer },
+};
+
+const BufName = struct { s: []const u8, k: ast.BufKind };
+const buffers = [_]BufName{
+    .{ .s = "StructuredBuffer", .k = .structured },
+    .{ .s = "RWStructuredBuffer", .k = .rw_structured },
+    .{ .s = "ByteAddressBuffer", .k = .byte_address },
+    .{ .s = "RWByteAddressBuffer", .k = .rw_byte_address },
+    .{ .s = "AppendStructuredBuffer", .k = .append },
+    .{ .s = "ConsumeStructuredBuffer", .k = .consume },
+};
+
 /// A built-in type's id when `s` names one; with `consume`, its tokens
 /// (and template arguments) are read.
 fn builtinType(p: *Parser, s: []const u8, consume: bool) ?u32 {
@@ -1369,26 +1415,41 @@ fn builtinType(p: *Parser, s: []const u8, consume: bool) ?u32 {
         _ = p.advance();
         var ret = a.vector(.float, 4);
         var samples: u32 = 0;
+        var fl: u32 = 0;
         if (p.accept(.lt)) {
-            var fl: u32 = 0;
             ret = p.typeSpec(&fl, false) orelse return null;
             if (p.accept(.comma)) samples = @intCast(@max(p.constInt(ternaryNoGt(p)) orelse 0, 0));
             _ = p.expect(.gt);
         }
-        return a.intern(.{ .class = .texture, .dim = @intFromEnum(tx.d), .elem = ret, .len = samples });
+        return a.intern(.{ .class = .texture, .dim = @intFromEnum(tx.d), .elem = ret, .len = samples, .first = normOf(fl) });
     }
-    const rw = std.mem.startsWith(u8, s, "RWTexture") or std.mem.eql(u8, s, "RWBuffer");
-    const sb = std.mem.eql(u8, s, "StructuredBuffer") or std.mem.eql(u8, s, "RWStructuredBuffer") or std.mem.eql(u8, s, "ByteAddressBuffer") or std.mem.eql(u8, s, "RWByteAddressBuffer");
-    if (rw or sb) {
+    for (rw_textures) |tx| {
+        if (!std.mem.eql(u8, s, tx.s)) continue;
         if (!consume) return a.scalar(.float);
         _ = p.advance();
         var ret: u32 = a.vector(.float, 4);
+        var fl: u32 = 0;
         if (p.accept(.lt)) {
-            var fl: u32 = 0;
             ret = p.typeSpec(&fl, false) orelse return null;
             _ = p.expect(.gt);
         }
-        return a.intern(.{ .class = if (rw) .rwtexture else .sbuffer, .elem = ret });
+        return a.intern(.{ .class = .rwtexture, .dim = @intFromEnum(tx.d), .elem = ret, .first = normOf(fl) });
+    }
+    for (buffers) |bf| {
+        if (!std.mem.eql(u8, s, bf.s)) continue;
+        if (!consume) return a.scalar(.float);
+        _ = p.advance();
+        // (byte address buffers have no element type; the others name one)
+        var elem: u32 = 0;
+        if (ast.bufStructured(bf.k)) {
+            elem = a.vector(.float, 4);
+            if (p.accept(.lt)) {
+                var fl: u32 = 0;
+                elem = p.typeSpec(&fl, false) orelse return null;
+                _ = p.expect(.gt);
+            }
+        }
+        return a.intern(.{ .class = .sbuffer, .dim = @intFromEnum(bf.k), .elem = elem });
     }
     const streams = [_][]const u8{ "PointStream", "LineStream", "TriangleStream" };
     for (streams, 0..) |st, k| {
@@ -1404,6 +1465,13 @@ fn builtinType(p: *Parser, s: []const u8, consume: bool) ?u32 {
         return a.intern(.{ .class = .stream, .dim = @intCast(k), .elem = elem });
     }
     return null;
+}
+
+/// A texture's elements: unorm (1), snorm (2) or as their type (0).
+fn normOf(fl: u32) u32 {
+    if (fl & ast.F_UNORM != 0) return 1;
+    if (fl & ast.F_SNORM != 0) return 2;
+    return 0;
 }
 
 /// A template argument: a ternary that stops at '>' (not a comparison).

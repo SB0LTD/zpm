@@ -1,7 +1,9 @@
 //! @zpm/hlsl — an HLSL compiler: HLSL (Shader Model 4 and 5 vertex, pixel
-//! and geometry shaders) in, a DXBC container out, as Microsoft's
+//! and geometry shaders; Shader Model 5 compute shaders) in, a DXBC
+//! container out, as Microsoft's
 //! D3DCompile makes them: the program (SHDR/SHEX), its input and output
-//! signatures, its reflection (RDEF) and statistics (STAT), signed with
+//! signatures, its reflection (RDEF), the optional features it needs
+//! (SFI0) and statistics (STAT), signed with
 //! DXBC's checksum. Pure and allocation-free: a Compiler holds every table
 //! it uses (tens of MiB: keep it in static memory), and one compile runs
 //! in it at a time.
@@ -20,6 +22,7 @@ pub const gen = @import("gen.sig");
 pub const container = @import("container.sig");
 pub const live = @import("live.sig");
 pub const disasm = @import("disasm.sig");
+pub const mem = @import("mem.sig");
 
 pub const Include = pp.Include;
 pub const Define = pp.Define;
@@ -44,7 +47,7 @@ pub const flags = struct {
 
 pub const Options = struct {
     entry: []const u8 = "main",
-    /// a profile: vs_4_0, vs_4_1, vs_5_0, ps_*, gs_*
+    /// a profile: vs_4_0, vs_4_1, vs_5_0, ps_*, gs_*, cs_5_0
     target: []const u8,
     flags: u32 = 0,
     defines: []const Define = &.{},
@@ -108,7 +111,7 @@ pub const Compiler = struct {
     pub fn compile(c: *Compiler, src: []const u8, o: Options) Result {
         c.log = .{ .buf = &c.msgs, .file_name = if (o.source_name.len > 0) o.source_name else "hlsl" };
         const target = parseTarget(o.target) orelse {
-            c.log.err(0, "invalid target '{s}' (vs_4_0, vs_4_1, vs_5_0, ps_*, gs_*)", .{o.target});
+            c.log.err(0, "invalid target '{s}' (vs_4_0, vs_4_1, vs_5_0, ps_*, gs_*, cs_5_0)", .{o.target});
             return c.failed();
         };
         // the preprocessor
@@ -132,6 +135,7 @@ pub const Compiler = struct {
             var lv = live.Live{ .p = &c.prog, .arena = &c.live_arena, .n = c.prog.nvregs, .match = &c.live_match, .dead = &c.live_dead };
             if (lv.run()) ir.deadComponents(&c.prog, &c.reads);
         }
+        pruneBarriers(&c.prog);
         var ntemps = ir.allocate(&c.prog, &c.intervals, &c.vmap, &c.loops, &c.sorted);
         if (c.prog.nvregs == 0) ntemps = 0;
         const n = c.assemble(target, o.flags, ntemps) orelse return c.failed();
@@ -182,6 +186,9 @@ pub const Compiler = struct {
     fn assemble(c: *Compiler, t: gen.Target, fl: u32, ntemps: u32) ?usize {
         const g = &c.g;
         c.scanUsage();
+        if (!c.placeCbSlots()) return null;
+        if (!c.placeResources(t)) return null;
+        if (!c.placeTgsm()) return null;
         // the program
         var o = ir.Out{ .buf = &c.code };
         const ver: u32 = (@as(u32, @intFromEnum(t.stage)) << 16) | (@as(u32, t.major) << 4) | t.minor;
@@ -221,6 +228,14 @@ pub const Compiler = struct {
         const code_at = w.n;
         for (c.code[0..o.n]) |word| w.u32_(word);
         const code_end = w.n;
+        // (SFI0: the optional features the program needs, when any)
+        const sfi_at = w.n;
+        const feats = c.features();
+        if (feats != 0) {
+            w.u32_(@truncate(feats));
+            w.u32_(@truncate(feats >> 32));
+        }
+        const sfi_end = w.n;
         const stat_at = w.n;
         c.stats(&w, t, ntemps);
         const stat_end = w.n;
@@ -228,14 +243,22 @@ pub const Compiler = struct {
             c.log.err(0, "shader too long", .{});
             return null;
         }
-        const chunks = [_]container.Chunk{
+        const all = [_]container.Chunk{
             .{ .tag = "RDEF", .data = c.chunk[rdef_at..rdef_end] },
             .{ .tag = "ISGN", .data = c.chunk[isgn_at..isgn_end] },
             .{ .tag = "OSGN", .data = c.chunk[osgn_at..osgn_end] },
             .{ .tag = if (t.major >= 5) "SHEX" else "SHDR", .data = c.chunk[code_at..code_end] },
+            .{ .tag = "SFI0", .data = c.chunk[sfi_at..sfi_end] },
             .{ .tag = "STAT", .data = c.chunk[stat_at..stat_end] },
         };
-        return container.container(&c.blob, &chunks) orelse {
+        var chunks: [all.len]container.Chunk = undefined;
+        var nch: usize = 0;
+        for (all) |ch| {
+            if (std.mem.eql(u8, ch.tag, "SFI0") and ch.data.len == 0) continue;
+            chunks[nch] = ch;
+            nch += 1;
+        }
+        return container.container(&c.blob, chunks[0..nch]) orelse {
             c.log.err(0, "shader too long", .{});
             return null;
         };
@@ -251,8 +274,20 @@ pub const Compiler = struct {
             b.rows = 0;
         }
         for (g.res[0..g.nres]) |*r| r.used = false;
+        for (g.tgsm[0..g.ntgsm]) |*x| x.used = false;
         for (c.prog.insts[0..c.prog.n]) |*i| {
             for (i.ops[0..i.n], 0..) |op, k| {
+                // (UAVs and groupshared memory are written as destinations)
+                if (op.reg == .uav) {
+                    for (g.res[0..g.nres]) |*r| if (r.kind == 'u' and r.slot == op.idx[0]) {
+                        r.used = true;
+                    };
+                }
+                if (op.reg == .tgsm) {
+                    for (g.tgsm[0..g.ntgsm]) |*x| if (x.reg == op.idx[0]) {
+                        x.used = true;
+                    };
+                }
                 if (k < i.ndst) continue;
                 const comps: u8 = ir.readMask(i, k);
                 switch (op.reg) {
@@ -281,12 +316,152 @@ pub const Compiler = struct {
         }
     }
 
+    /// Each implicitly placed constant buffer the code reads gets its real
+    /// slot (the lowest one free, register(b#)'s reserved), and the code's
+    /// operands follow; one never read gets none. False: more than 14.
+    fn placeCbSlots(c: *Compiler) bool {
+        const g = &c.g;
+        var used_slots = g.cb_explicit;
+        for (g.cbs[0..g.ncbs]) |*b| {
+            if (!b.implicit or !b.used) continue;
+            const slot = gen.Gen.lowestFree(used_slots);
+            if (slot >= 14) {
+                c.log.err(0, "maximum cbuffer exceeded. target has 14 slots", .{});
+                return false;
+            }
+            used_slots |= @as(u32, 1) << @intCast(slot);
+            const old = b.slot;
+            b.slot = slot;
+            for (c.prog.insts[0..c.prog.n]) |*i| {
+                for (i.ops[0..i.n]) |*op| {
+                    if (op.reg == .cb and op.idx[0] == old) op.idx[0] = slot;
+                }
+            }
+        }
+        return true;
+    }
+
+    fn regOfKind(kind: u8) ir.Reg {
+        return switch (kind) {
+            's' => .sampler,
+            'u' => .uav,
+            else => .resource,
+        };
+    }
+
+    /// Rewrites operands of register type `reg` numbered `old` to `new`.
+    fn renumber(c: *Compiler, reg: ir.Reg, old: u32, new: u32) void {
+        for (c.prog.insts[0..c.prog.n]) |*i| {
+            for (i.ops[0..i.n]) |*op| {
+                if (op.reg == reg and op.idx[0] == old) op.idx[0] = new;
+            }
+        }
+    }
+
+    /// Each implicitly placed resource (s#, t#, u#) the code uses gets its
+    /// register as fxc gives them: in the order declared, a variable (an
+    /// array: all its elements) at the lowest free registers, register(x#)'s
+    /// reserved, used or not. A pixel shader's UAVs come after its render
+    /// targets. False: none free, or a register(u#) on a render target's.
+    fn placeResources(c: *Compiler, t: gen.Target) bool {
+        const g = &c.g;
+        for ([_]u8{ 's', 't', 'u' }) |kind| {
+            var taken = [_]bool{false} ** 128;
+            const base: u32 = if (kind == 'u' and t.stage == .pixel) g.rt_count else 0;
+            var s: u32 = 1;
+            while (s < c.ast.nsyms) : (s += 1) {
+                const sy = c.ast.syms[s];
+                if (sy.kind != .variable or sy.reg_kind != kind or !g.isObjectTy(sy.ty)) continue;
+                const cnt = g.arrayCount(sy.ty);
+                for (sy.reg_index..@min(sy.reg_index + cnt, 128)) |k| taken[k] = true;
+                if (kind == 'u' and sy.reg_index < base and c.symUsed(s, kind)) {
+                    c.log.col = 0;
+                    c.log.errCode(sy.line, 4509, "UAV registers live in the same name space as outputs, so they must be bound to at least u{d}, manual bind to slot u{d} failed", .{ base, sy.reg_index });
+                    return false;
+                }
+            }
+            s = 1;
+            while (s < c.ast.nsyms) : (s += 1) {
+                const sy = c.ast.syms[s];
+                if (sy.reg_kind == kind or !c.symUsed(s, kind)) continue;
+                const cnt = g.arrayCount(sy.ty);
+                var b: u32 = base;
+                while (b + cnt <= 128) : (b += 1) {
+                    var free = true;
+                    for (b..b + cnt) |k| free = free and !taken[k];
+                    if (free) break;
+                }
+                if (b + cnt > 128) {
+                    c.log.err(0, "too many resources", .{});
+                    return false;
+                }
+                for (b..b + cnt) |k| taken[k] = true;
+                for (g.res[0..g.nres]) |*r| {
+                    if (r.sym != s or r.kind != kind) continue;
+                    const slot = b + r.elem;
+                    c.renumber(regOfKind(kind), r.slot, slot);
+                    r.slot = slot;
+                }
+            }
+        }
+        return true;
+    }
+
+    fn symUsed(c: *Compiler, s: u32, kind: u8) bool {
+        for (c.g.res[0..c.g.nres]) |r| if (r.sym == s and r.kind == kind and r.used) return true;
+        return false;
+    }
+
+    /// The groupshared variables the code uses: g0, g1, ... in the order
+    /// declared. False: more than the 32 KiB of a thread group.
+    fn placeTgsm(c: *Compiler) bool {
+        const g = &c.g;
+        var next: u32 = 0;
+        var total: u32 = 0;
+        var s: u32 = 1;
+        while (s < c.ast.nsyms) : (s += 1) {
+            for (g.tgsm[0..g.ntgsm]) |*x| {
+                if (x.sym != s or !x.used) continue;
+                c.renumber(.tgsm, x.reg, next);
+                x.reg = next;
+                next += 1;
+                total += x.stride * x.count;
+            }
+        }
+        if (total > 32768) {
+            c.log.errCode(0, 4586, "The total amount of group shared memory ({d} bytes) exceeds the {s} limit of 32768 bytes", .{ total, g.targetName() });
+            return false;
+        }
+        return true;
+    }
+
+    /// SFI0's flags: typed UAV loads of more than one 32-bit component
+    /// (0x800), UAVs past u7 (0x8).
+    fn features(c: *Compiler) u64 {
+        const g = &c.g;
+        var f: u64 = 0;
+        for (c.prog.insts[0..c.prog.n]) |i| {
+            if (i.op != .ld_uav_typed) continue;
+            for (g.res[0..g.nres]) |r| {
+                if (r.kind != 'u' or r.slot != i.ops[2].idx[0]) continue;
+                const et = c.ast.types[c.ast.types[resElemTy(c, r.sym)].elem];
+                if (et.class == .vector and et.cols > 1) f |= 0x800;
+            }
+        }
+        for (g.res[0..g.nres]) |r| {
+            if (r.kind == 'u' and r.used and r.slot >= 8) f |= 0x8;
+        }
+        return f;
+    }
+
     // ── declarations ──
 
     fn declarations(c: *Compiler, o: *ir.Out, t: gen.Target, ntemps: u32) void {
         const g = &c.g;
         if (t.major >= 5) {
-            ir.encodeInst(o, &.{ .op = .dcl_global_flags, .ndst = 0, .ctl = 1 });
+            // (refactoringAllowed; [earlydepthstencil]: forceEarlyDepthStencil)
+            const early: u16 = if (c.ast.syms[g.entry].flags & ast.F_EARLY_DEPTH != 0) 4 else 0;
+            ir.encodeInst(o, &.{ .op = .dcl_global_flags, .ndst = 0, .ctl = 1 | early });
         }
         if (g.nicb > 0) {
             o.put(53 | (3 << 11));
@@ -304,15 +479,17 @@ pub const Compiler = struct {
                 ir.encodeInst(o, &i);
             }
         }
-        // samplers, then textures, by register
-        for ([_]u8{ 's', 't' }) |kind| {
+        // samplers, then textures and buffers, then UAVs, by register
+        for ([_]u8{ 's', 't', 'u' }) |kind| {
             var r: u32 = 0;
             while (r < 128) : (r += 1) {
                 for (g.res[0..g.nres]) |x| {
                     if (x.kind != kind or x.slot != r or !x.used) continue;
                     const ty = c.ast.types[resElemTy(c, x.sym)];
                     var i = ir.Inst{ .op = if (kind == 's') .dcl_sampler else .dcl_resource, .ndst = 0, .n = 1 };
-                    if (kind == 's') {
+                    if (kind == 'u' or ty.class == .sbuffer) {
+                        c.declareBuffer(o, x, ty);
+                    } else if (kind == 's') {
                         i.ctl = if (ty.dim == 1) 1 else 0;
                         i.ops[0] = .{ .reg = .sampler, .comps = 0, .dims = 1, .idx = .{ r, 0 } };
                         ir.encodeInst(o, &i);
@@ -323,12 +500,7 @@ pub const Compiler = struct {
                         const at = o.n;
                         ir.encodeInst(o, &i);
                         // the return type token, one nibble per component
-                        const et = c.ast.types[if (ty.elem == 0) c.ast.vector(.float, 4) else ty.elem];
-                        const rt: u32 = switch (ast.canon(et.base)) {
-                            .int => 3,
-                            .uint, .bool => 4,
-                            else => 5,
-                        };
+                        const rt = mem.objRet(&c.g, ty);
                         o.put(rt | rt << 4 | rt << 8 | rt << 12);
                         c.code[at] += 1 << 24;
                     }
@@ -380,6 +552,7 @@ pub const Compiler = struct {
                 ir.encodeInst(o, &i);
             }
         }
+        if (t.stage == .compute) c.threadInputs(o);
         if (t.stage == .geometry and g.gs_output_topo != 0) {
             ir.encodeInst(o, &.{ .op = .dcl_gs_output_primitive_topology, .ndst = 0, .ctl = @intCast(g.gs_output_topo) });
         }
@@ -414,6 +587,75 @@ pub const Compiler = struct {
             o.buf[o.n - 1] += 1 << 24;
             o.put(g.gs_max_vertex);
         }
+        if (t.stage == .compute) {
+            // groupshared memory by g#, then the thread group
+            var r: u32 = 0;
+            while (r < g.ntgsm) : (r += 1) {
+                for (g.tgsm[0..g.ntgsm]) |x| {
+                    if (x.reg != r or !x.used) continue;
+                    var i = ir.Inst{ .op = if (x.structured) .dcl_tgsm_structured else .dcl_tgsm_raw, .ndst = 0, .n = 1 };
+                    i.ops[0] = .{ .reg = .tgsm, .comps = 0, .dims = 1, .idx = .{ r, 0 } };
+                    putWords(o, &i, if (x.structured) &.{ x.stride, x.count } else &.{x.stride});
+                }
+            }
+            const th = c.ast.syms[g.entry].threads;
+            putWords(o, &.{ .op = .dcl_thread_group, .ndst = 0 }, &th);
+        }
+    }
+
+    /// A declaration followed by words of its own (sizes, counts).
+    fn putWords(o: *ir.Out, i: *const ir.Inst, words: []const u32) void {
+        const at = o.n;
+        ir.encodeInst(o, i);
+        for (words) |w| o.put(w);
+        if (at < o.buf.len) o.buf[at] += @as(u32, @intCast(words.len)) << 24;
+    }
+
+    /// A UAV's or an SRV buffer's declaration: dcl_uav_typed (its
+    /// dimension and return type), dcl_uav_structured / raw (globally
+    /// coherent, with a counter), dcl_resource_structured / raw.
+    fn declareBuffer(c: *Compiler, o: *ir.Out, x: gen.Res, ty: ast.Type) void {
+        const sy = c.ast.syms[x.sym];
+        const glc: u16 = if (sy.flags & ast.F_GLOBALLYCOHERENT != 0) 1 << 5 else 0;
+        const uav = x.kind == 'u';
+        var i = ir.Inst{ .op = .dcl_uav_typed, .ndst = 0, .n = 1 };
+        i.ops[0] = .{ .reg = if (uav) .uav else .resource, .comps = 0, .dims = 1, .idx = .{ x.slot, 0 } };
+        if (ty.class == .rwtexture) {
+            i.ctl = @intCast(gen_intrin_resDim(@enumFromInt(ty.dim)) | glc);
+            const g = &c.g;
+            return putWords(o, &i, &.{mem.objRetToken(g, ty)});
+        }
+        const k: ast.BufKind = @enumFromInt(ty.dim);
+        if (ast.bufStructured(k)) {
+            const counter = k == .rw_structured and x.counter != 0;
+            i.op = if (uav) .dcl_uav_structured else .dcl_resource_structured;
+            if (uav) i.ctl = glc | (if (counter) @as(u16, 1) << 12 else 0);
+            return putWords(o, &i, &.{mem.size(&c.g, ty.elem)});
+        }
+        i.op = if (uav) .dcl_uav_raw else .dcl_resource_raw;
+        if (uav) i.ctl = glc;
+        putWords(o, &i, &.{});
+    }
+
+    /// A compute shader's thread ids, each read (fxc's order: the
+    /// flattened index, the group, the thread in the group, the thread).
+    fn threadInputs(c: *Compiler, o: *ir.Out) void {
+        const order = [_]ir.Reg{ .input_thread_id_in_group_flattened, .input_thread_group_id, .input_thread_id_in_group, .input_thread_id };
+        for (order) |reg| {
+            var mask: u4 = 0;
+            for (c.prog.insts[0..c.prog.n]) |*ins| {
+                for (ins.ops[0..ins.n], 0..) |op, k| {
+                    if (op.reg == reg and k >= ins.ndst) mask |= ir.readMask(ins, k);
+                }
+            }
+            if (mask == 0) continue;
+            var i = ir.Inst{ .op = .dcl_input, .ndst = 0, .n = 1 };
+            i.ops[0] = if (reg == .input_thread_id_in_group_flattened)
+                .{ .reg = reg, .comps = 0, .dims = 0 }
+            else
+                .{ .reg = reg, .comps = 4, .mode = .mask, .mask = mask, .dims = 0 };
+            ir.encodeInst(o, &i);
+        }
     }
 
     fn interpMode(f: u32) u16 {
@@ -440,16 +682,20 @@ pub const Compiler = struct {
             .vertex => 0xFFFE,
             .pixel => 0xFFFF,
             .geometry => 0x4753,
+            .compute => 0x4353,
         };
         r.program = (kind << 16) | (@as(u32, t.major) << 8) | t.minor;
         r.flags = (fl & 0xffff) | 0x100;
         r.creator = CREATOR;
-        // the bindings: samplers, textures, then constant buffers. An
-        // array of them: Shader Model 5 binds each element read
+        // the bindings: samplers, textures and buffers, UAVs, then constant
+        // buffers. An array of them: Shader Model 5 binds each element read
         // ("name[i]"), 4 the array from its first register to the last
         // element read.
         var nnames: usize = 0;
-        for ([_]u8{ 's', 't' }) |k| {
+        // (structured buffers' bindings, described after the cbuffers)
+        var sbs: [64]struct { bind: u32, sym: u32 } = undefined;
+        var nsbs: usize = 0;
+        for ([_]u8{ 's', 't', 'u' }) |k| {
             var reg: u32 = 0;
             while (reg < 128) : (reg += 1) {
                 for (g.res[0..g.nres]) |x| {
@@ -480,15 +726,17 @@ pub const Compiler = struct {
                     }
                     const userpacked: u32 = if (sym.reg_kind == k) 1 else 0;
                     const ty = c.ast.types[resElemTy(c, x.sym)];
-                    if (k == 's') {
+                    if (k == 'u' or ty.class == .sbuffer) {
+                        r.binds[r.nbinds] = c.bufferBinding(x, ty, name, bind, count, userpacked);
+                        if (ty.class == .sbuffer and ast.bufStructured(@enumFromInt(ty.dim)) and nsbs < sbs.len) {
+                            sbs[nsbs] = .{ .bind = r.nbinds, .sym = x.sym };
+                            nsbs += 1;
+                        }
+                    } else if (k == 's') {
                         r.binds[r.nbinds] = .{ .name = name, .type = 3, .bind = bind, .count = count, .flags = (if (ty.dim == 1) @as(u32, 2) else 0) | userpacked };
                     } else {
                         const et = c.ast.types[if (ty.elem == 0) c.ast.vector(.float, 4) else ty.elem];
-                        const rt: u32 = switch (ast.canon(et.base)) {
-                            .int => 3,
-                            .uint, .bool => 4,
-                            else => 5,
-                        };
+                        const rt = mem.objRet(&c.g, ty);
                         const ncomp: u32 = if (et.class == .vector) et.cols else 1;
                         const ms = ty.dim == @intFromEnum(ast.TexDim.tex2dms) or ty.dim == @intFromEnum(ast.TexDim.tex2dmsarray);
                         r.binds[r.nbinds] = .{ .name = name, .type = 2, .ret = rt, .dim = ty.dim, .samples = if (ms) ty.len else 0xffff_ffff, .bind = bind, .count = count, .flags = ((ncomp - 1) << 2) | userpacked };
@@ -524,6 +772,38 @@ pub const Compiler = struct {
             r.bufs[r.nbufs] = .{ .name = if (b.sym == 0) "$Globals" else c.ast.symName(b.sym), .first = first, .nvars = r.nvars - first, .size = b.size, .kind = if (b.tbuffer) 1 else 0 };
             r.nbufs += 1;
         }
+        // structured buffers: their element ($Element), laid out tightly
+        for (sbs[0..nsbs]) |sb| {
+            if (r.nbufs >= r.bufs.len or r.nvars >= container.MAX_R) break;
+            const et = c.ast.types[resElemTy(c, sb.sym)].elem;
+            const stride = mem.size(g, et);
+            r.vars[r.nvars] = .{ .name = "$Element", .offset = 0, .size = stride, .flags = 2, .ty = c.rtypeIn(et, true) };
+            r.bufs[r.nbufs] = .{ .name = r.binds[sb.bind].name, .first = r.nvars, .nvars = 1, .size = stride, .kind = 3 };
+            r.nvars += 1;
+            r.nbufs += 1;
+        }
+    }
+
+    /// A UAV's or an SRV buffer's binding (D3D_SHADER_INPUT_TYPE: 4 typed
+    /// UAV, 5 structured, 6 RW structured, 7 byte address, 8 RW byte
+    /// address, 9 append, 10 consume, 11 RW structured with a counter).
+    fn bufferBinding(c: *Compiler, x: gen.Res, ty: ast.Type, name: []const u8, bind: u32, count: u32, userpacked: u32) container.RBind {
+        if (ty.class == .rwtexture) {
+            const et = c.ast.types[ty.elem];
+            const ncomp: u32 = if (et.class == .vector) et.cols else 1;
+            return .{ .name = name, .type = 4, .ret = mem.objRet(&c.g, ty), .dim = ty.dim, .samples = 0xffff_ffff, .bind = bind, .count = count, .flags = ((ncomp - 1) << 2) | userpacked };
+        }
+        const k: ast.BufKind = @enumFromInt(ty.dim);
+        const stride: u32 = if (ast.bufStructured(k)) mem.size(&c.g, ty.elem) else 0;
+        const typ: u32 = switch (k) {
+            .structured => 5,
+            .rw_structured => if (x.counter != 0) 11 else 6,
+            .byte_address => 7,
+            .rw_byte_address => 8,
+            .append => 9,
+            .consume => 10,
+        };
+        return .{ .name = name, .type = typ, .ret = 6, .dim = 1, .samples = stride, .bind = bind, .count = count, .flags = userpacked };
     }
 
     fn addVar(c: *Compiler, s: u32, cb_index: usize) void {
@@ -562,6 +842,12 @@ pub const Compiler = struct {
 
     /// A reflection type for an Ast type.
     fn rtype(c: *Compiler, ty: u32) u32 {
+        return c.rtypeIn(ty, false);
+    }
+
+    /// A reflection type, its members' offsets as constant buffers lay
+    /// them out or (`tight`) as memory does.
+    fn rtypeIn(c: *Compiler, ty: u32, tight: bool) u32 {
         const r = &c.refl;
         const g = &c.g;
         const x = c.ast.types[ty];
@@ -580,7 +866,8 @@ pub const Compiler = struct {
                     .vector => container.SVC.vector,
                     else => if (g.effPackPub(x) == .row) container.SVC.matrix_rows else container.SVC.matrix_columns,
                 };
-                const name = c.internName(c.ast.typeName(ty, &nb));
+                // (fxc names a scalar uint "dword")
+                const name = if (x.class == .scalar and x.base == .uint) "dword" else c.internName(c.ast.typeName(ty, &nb));
                 return r.addType(.{ .class = class, .type = vt, .rows = x.rows, .cols = x.cols, .elements = 0, .name = name });
             },
             .array => {
@@ -590,7 +877,7 @@ pub const Compiler = struct {
                     len *= c.ast.types[et].len;
                     et = c.ast.types[et].elem;
                 }
-                const e = c.rtype(et);
+                const e = c.rtypeIn(et, tight);
                 var t = r.types[e];
                 t.elements = @intCast(len);
                 return r.addType(t);
@@ -601,7 +888,7 @@ pub const Compiler = struct {
                 r.nmembers += x.len;
                 for (0..x.len) |k| {
                     const m = c.ast.members[x.first + k];
-                    r.members[first + k] = .{ .name = c.ast.name(m.name_off, m.name_len), .ty = c.rtype(m.ty), .offset = g.cbMemberOff(ty, k) };
+                    r.members[first + k] = .{ .name = c.ast.name(m.name_off, m.name_len), .ty = c.rtypeIn(m.ty, tight), .offset = if (tight) mem.memberOff(g, ty, k) else g.cbMemberOff(ty, k) };
                 }
                 return r.addType(.{ .class = container.SVC.structure, .type = container.SVT.void_, .rows = 1, .cols = @intCast(c.ast.comps(ty)), .elements = 0, .first = first, .nmembers = @intCast(x.len), .name = c.ast.name(x.name_off, x.name_len) });
             },
@@ -650,7 +937,7 @@ const type_names = [_][]const u8{
     "uint",     "uint1",    "uint2",    "uint3",    "uint4",    "bool",     "bool1",    "bool2",    "bool3",    "bool4",
     "float1x1", "float1x2", "float1x3", "float1x4", "float2x1", "float2x2", "float2x3", "float2x4", "float3x1", "float3x2",
     "float3x3", "float3x4", "float4x1", "float4x2", "float4x3", "float4x4", "half",     "half2",    "half3",    "half4",
-    "int2x2",   "int3x3",   "int4x4",   "double",   "min16float", "min16int", "min16uint",
+    "int2x2",   "int3x3",   "int4x4",   "double",   "min16float", "min16int", "min16uint", "dword",
 };
 
 fn sortElems(e: []gen.Elem) void {
@@ -662,6 +949,75 @@ fn sortElems(e: []gen.Elem) void {
     }.lt);
 }
 
+/// fxc drops a barrier when no memory of its kinds (groupshared memory,
+/// UAVs) is touched both before and after it (inside a loop, the loop's
+/// whole body is both).
+fn pruneBarriers(p: *ir.Program) void {
+    var w: u32 = 0;
+    var k: u32 = 0;
+    while (k < p.n) : (k += 1) {
+        const i = p.insts[k];
+        if (i.op == .sync and !barrierNeeded(p, k)) continue;
+        p.insts[w] = i;
+        w += 1;
+    }
+    p.n = w;
+}
+
+fn barrierNeeded(p: *const ir.Program, k: u32) bool {
+    const fl = p.insts[k].ctl;
+    // (the outermost loop around the barrier)
+    var lo: u32 = k;
+    var hi: u32 = k;
+    var depth: i32 = 0;
+    var j: u32 = k;
+    while (j > 0) {
+        j -= 1;
+        switch (p.insts[j].op) {
+            .endloop => depth += 1,
+            .loop => if (depth == 0) {
+                lo = j;
+            } else {
+                depth -= 1;
+            },
+            else => {},
+        }
+    }
+    if (lo != k) {
+        depth = 0;
+        j = lo + 1;
+        while (j < p.n) : (j += 1) {
+            if (p.insts[j].op == .loop) depth += 1;
+            if (p.insts[j].op == .endloop) {
+                if (depth == 0) break;
+                depth -= 1;
+            }
+        }
+        hi = j;
+    }
+    for ([_]struct { flag: u16, reg: ir.Reg }{ .{ .flag = ir.SYNC_TGSM, .reg = .tgsm }, .{ .flag = ir.SYNC_UAV_GLOBAL | ir.SYNC_UAV_GROUP, .reg = .uav } }) |kind| {
+        if (fl & kind.flag == 0) continue;
+        var before = false;
+        var after = false;
+        for (p.insts[0..p.n], 0..) |*x, at| {
+            if (!touches(x, kind.reg)) continue;
+            if (at < k or (at >= lo and at <= hi)) before = true;
+            if (at > k or (at >= lo and at <= hi)) after = true;
+        }
+        if (before and after) return true;
+    }
+    return false;
+}
+
+/// Whether an instruction reads or writes memory of register type `reg`.
+fn touches(i: *const ir.Inst, reg: ir.Reg) bool {
+    const n = @intFromEnum(i.op);
+    const access = n >= @intFromEnum(ir.Op.ld_uav_typed) and n <= @intFromEnum(ir.Op.imm_atomic_umin);
+    if (!access) return false;
+    for (i.ops[0..i.n]) |op| if (op.reg == reg) return true;
+    return false;
+}
+
 fn gen_intrin_resDim(d: ast.TexDim) u32 {
     return @import("intrin.sig").resDim(d);
 }
@@ -669,9 +1025,11 @@ fn gen_intrin_resDim(d: ast.TexDim) u32 {
 /// vs_4_0, ps_5_0, gs_4_1 ...
 pub fn parseTarget(s: []const u8) ?gen.Target {
     if (s.len != 6 or s[2] != '_' or s[4] != '_') return null;
-    const stage: gen.Stage = if (std.mem.startsWith(u8, s, "vs")) .vertex else if (std.mem.startsWith(u8, s, "ps")) .pixel else if (std.mem.startsWith(u8, s, "gs")) .geometry else return null;
+    const stage: gen.Stage = if (std.mem.startsWith(u8, s, "vs")) .vertex else if (std.mem.startsWith(u8, s, "ps")) .pixel else if (std.mem.startsWith(u8, s, "gs")) .geometry else if (std.mem.startsWith(u8, s, "cs")) .compute else return null;
     const major = s[3];
     const minor = s[5];
+    // (compute: Shader Model 5's; cs_4_x's one-UAV subset is not made)
+    if (stage == .compute) return if (major == '5' and minor == '0') .{ .stage = .compute, .major = 5, .minor = 0 } else null;
     if (major == '4' and (minor == '0' or minor == '1')) return .{ .stage = stage, .major = 4, .minor = minor - '0' };
     if (major == '5' and minor == '0') return .{ .stage = stage, .major = 5, .minor = 0 };
     return null;
@@ -680,11 +1038,7 @@ pub fn parseTarget(s: []const u8) ?gen.Target {
 fn predefine(p: *pp.Pp, t: gen.Target) void {
     // fxc's: the target's stage and version
     var b: [8]u8 = undefined;
-    const stage: u32 = switch (t.stage) {
-        .pixel => 0,
-        .vertex => 1,
-        .geometry => 2,
-    };
+    const stage: u32 = @intFromEnum(t.stage);
     p.defineText("__SHADER_TARGET_STAGE", std.fmt.bufPrint(&b, "{d}", .{stage}) catch "0");
     p.defineText("__SHADER_TARGET_MAJOR", std.fmt.bufPrint(&b, "{d}", .{t.major}) catch "4");
     p.defineText("__SHADER_TARGET_MINOR", std.fmt.bufPrint(&b, "{d}", .{t.minor}) catch "0");
@@ -696,5 +1050,6 @@ test {
     _ = ir;
     _ = container;
     _ = disasm;
+    _ = mem;
     _ = @import("tests.sig");
 }

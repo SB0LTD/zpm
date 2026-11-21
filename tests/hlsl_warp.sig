@@ -250,6 +250,319 @@ pub fn draw(d: Draw, out: *[W * H * 4]f32) error{ NoDevice, Target, Shader, Layo
     call(void, C, Unmap, .{ staging.?, @as(u32, 0) });
 }
 
+// ── compute: one dispatch, every UAV read back ────────────────────────────
+
+const CreateTexture1D = 4;
+const CreateUnorderedAccessView = 8;
+const CreateComputeShader = 18;
+const Dispatch = 41;
+const CSSetShaderResources = 67;
+const CSSetUnorderedAccessViews = 68;
+const CSSetShader = 69;
+const CSSetSamplers = 70;
+const CSSetConstantBuffers = 71;
+
+const Tex1DDesc = extern struct { Width: u32, MipLevels: u32, ArraySize: u32, Format: u32, Usage: u32, BindFlags: u32, CPUAccessFlags: u32, MiscFlags: u32 };
+const UavDesc = extern struct { Format: u32, ViewDimension: u32, a: u32, b: u32, c: u32 };
+
+/// Elements of every buffer made for a dispatch (and bytes of raw ones:
+/// BUF_WORDS words).
+const BUF_ELEMS = 64;
+const BUF_WORDS = 1024;
+/// typed UAV textures: 16x16 (1D: 16; arrays: 2 layers; 3D: 4 deep)
+const UAV_W = 16;
+
+/// A word of the buffers' and UAVs' first contents: floats and small
+/// integers in turn (no NaNs, no denormals).
+fn pattern(i: usize) u32 {
+    if (i % 2 == 0) return @bitCast(@as(f32, @floatFromInt(i % 16)) * 0.5 + 1.0);
+    return @intCast(i % 7 + 1);
+}
+
+/// A typed view's format: its components (1, 2 or 4) of 32 bits, by the
+/// return type (3 sint, 4 uint, else float).
+fn typedFormat(ret: u32, ncomp: u32) u32 {
+    const k: u32 = switch (ret) {
+        3 => 2,
+        4 => 1,
+        else => 0,
+    };
+    return switch (ncomp) {
+        1 => 41 + k,
+        2 => 16 + k,
+        3 => 6 + k,
+        else => 2 + k,
+    };
+}
+
+const Objs = struct {
+    list: [128]?*anyopaque = [_]?*anyopaque{null} ** 128,
+    n: usize = 0,
+    fn keep(o: *Objs, x: ?*anyopaque) void {
+        if (o.n < o.list.len) {
+            o.list[o.n] = x;
+            o.n += 1;
+        }
+    }
+};
+
+/// A buffer of `bytes` (contents: the pattern), bound as `bind`.
+fn newBuffer(D: *anyopaque, bytes: u32, bind: u32, misc: u32, stride: u32, objs: *Objs) error{Resource}!*anyopaque {
+    const S = struct {
+        var words: [BUF_WORDS * 4]u32 = undefined;
+    };
+    for (&S.words, 0..) |*w, i| w.* = pattern(i);
+    const bd = BufferDesc{ .ByteWidth = bytes, .Usage = 0, .BindFlags = bind, .CPUAccessFlags = 0, .MiscFlags = misc, .StructureByteStride = stride };
+    const init = SubresourceData{ .pSysMem = &S.words, .SysMemPitch = 0, .SysMemSlicePitch = 0 };
+    var b: ?*anyopaque = null;
+    if (call(HRESULT, D, CreateBuffer, .{ &bd, &init, &b }) < 0) return error.Resource;
+    objs.keep(b);
+    return b.?;
+}
+
+/// A UAV for a binding of the shader's reflection, and its resource (to
+/// read back).
+fn uavFor(D: *anyopaque, b: ct.RBind, objs: *Objs) error{Resource}!struct { view: *anyopaque, res: *anyopaque, buffer: bool } {
+    var ud = UavDesc{ .Format = 0, .ViewDimension = 1, .a = 0, .b = BUF_ELEMS, .c = 0 };
+    var res: *anyopaque = undefined;
+    var buffer = true;
+    switch (b.type) {
+        8 => {
+            res = try newBuffer(D, BUF_WORDS * 4, 0x80 | 0x8, 0x20, 0, objs);
+            ud = .{ .Format = 39, .ViewDimension = 1, .a = 0, .b = BUF_WORDS, .c = 1 };
+        },
+        6, 9, 10, 11 => {
+            res = try newBuffer(D, BUF_ELEMS * b.samples, 0x80 | 0x8, 0x40, b.samples, objs);
+            ud.c = if (b.type == 9 or b.type == 10) 2 else if (b.type == 11) 4 else 0;
+        },
+        4 => {
+            const fmt = typedFormat(b.ret, ((b.flags >> 2) & 3) + 1);
+            ud.Format = fmt;
+            if (b.dim == 1) {
+                res = try newBuffer(D, BUF_ELEMS * 16, 0x80, 0, 0, objs);
+            } else {
+                buffer = false;
+                const S = struct {
+                    var texels: [UAV_W * UAV_W * 4 * 4]u32 = undefined;
+                };
+                for (&S.texels, 0..) |*w, i| w.* = pattern(i);
+                const bpp: u32 = 4 * (((b.flags >> 2) & 3) + 1);
+                var t: ?*anyopaque = null;
+                const init = SubresourceData{ .pSysMem = &S.texels, .SysMemPitch = UAV_W * bpp, .SysMemSlicePitch = UAV_W * UAV_W * bpp };
+                const inits = [2]SubresourceData{ init, init };
+                switch (b.dim) {
+                    2, 3 => {
+                        const td = Tex1DDesc{ .Width = UAV_W, .MipLevels = 1, .ArraySize = if (b.dim == 3) 2 else 1, .Format = fmt, .Usage = 0, .BindFlags = 0x80, .CPUAccessFlags = 0, .MiscFlags = 0 };
+                        if (call(HRESULT, D, CreateTexture1D, .{ &td, &inits, &t }) < 0) return error.Resource;
+                        ud = .{ .Format = fmt, .ViewDimension = b.dim, .a = 0, .b = 0, .c = if (b.dim == 3) 2 else 0 };
+                    },
+                    8 => {
+                        const td = Tex3DDesc{ .Width = UAV_W, .Height = UAV_W, .Depth = 4, .MipLevels = 1, .Format = fmt, .Usage = 0, .BindFlags = 0x80, .CPUAccessFlags = 0, .MiscFlags = 0 };
+                        if (call(HRESULT, D, CreateTexture3D, .{ &td, &init, &t }) < 0) return error.Resource;
+                        ud = .{ .Format = fmt, .ViewDimension = 8, .a = 0, .b = 0, .c = 4 };
+                    },
+                    else => {
+                        const layers: u32 = if (b.dim == 5) 2 else 1;
+                        const td = Tex2DDesc{ .Width = UAV_W, .Height = UAV_W, .MipLevels = 1, .ArraySize = layers, .Format = fmt, .SampleCount = 1, .SampleQuality = 0, .Usage = 0, .BindFlags = 0x80, .CPUAccessFlags = 0, .MiscFlags = 0 };
+                        if (call(HRESULT, D, CreateTexture2D, .{ &td, &inits, &t }) < 0) return error.Resource;
+                        ud = .{ .Format = fmt, .ViewDimension = if (b.dim == 5) 5 else 4, .a = 0, .b = 0, .c = layers };
+                    },
+                }
+                objs.keep(t);
+                res = t.?;
+            }
+        },
+        else => return error.Resource,
+    }
+    var v: ?*anyopaque = null;
+    if (call(HRESULT, D, CreateUnorderedAccessView, .{ res, &ud, &v }) < 0) return error.Resource;
+    objs.keep(v);
+    return .{ .view = v.?, .res = res, .buffer = buffer };
+}
+
+/// An SRV for a buffer binding: structured, raw, or typed (Buffer<T>).
+fn bufferSrv(D: *anyopaque, b: ct.RBind, objs: *Objs) error{Resource}!*anyopaque {
+    var vd = SrvDesc{ .Format = 0, .ViewDimension = 1, .a = 0, .b = BUF_ELEMS, .c = 0, .d = 0 };
+    var res: *anyopaque = undefined;
+    switch (b.type) {
+        5 => res = try newBuffer(D, BUF_ELEMS * b.samples, 0x8, 0x40, b.samples, objs),
+        7 => {
+            res = try newBuffer(D, BUF_WORDS * 4, 0x8, 0x20, 0, objs);
+            vd = .{ .Format = 39, .ViewDimension = 11, .a = 0, .b = BUF_WORDS, .c = 1, .d = 0 };
+        },
+        else => {
+            res = try newBuffer(D, BUF_ELEMS * 16, 0x8, 0, 0, objs);
+            vd.Format = typedFormat(b.ret, ((b.flags >> 2) & 3) + 1);
+        },
+    }
+    var v: ?*anyopaque = null;
+    if (call(HRESULT, D, CreateShaderResourceView, .{ res, &vd, &v }) < 0) return error.Resource;
+    objs.keep(v);
+    return v.?;
+}
+
+/// A copy of a resource the CPU reads (a buffer's or a texture's).
+fn readable(D: *anyopaque, C: *anyopaque, res: *anyopaque, buffer: bool, b: ct.RBind, objs: *Objs) error{Readback}!*anyopaque {
+    var s: ?*anyopaque = null;
+    if (buffer) {
+        var bd: BufferDesc = undefined;
+        call(void, res, 10, .{&bd}); // ID3D11Buffer::GetDesc
+        bd.Usage = 3;
+        bd.BindFlags = 0;
+        bd.CPUAccessFlags = 0x20000;
+        bd.MiscFlags &= 0x40;
+        if (call(HRESULT, D, CreateBuffer, .{ &bd, @as(?*const SubresourceData, null), &s }) < 0) return error.Readback;
+    } else switch (b.dim) {
+        2, 3 => {
+            var td: Tex1DDesc = undefined;
+            call(void, res, 10, .{&td});
+            td.Usage = 3;
+            td.BindFlags = 0;
+            td.CPUAccessFlags = 0x20000;
+            if (call(HRESULT, D, CreateTexture1D, .{ &td, @as(?*const SubresourceData, null), &s }) < 0) return error.Readback;
+        },
+        8 => {
+            var td: Tex3DDesc = undefined;
+            call(void, res, 10, .{&td});
+            td.Usage = 3;
+            td.BindFlags = 0;
+            td.CPUAccessFlags = 0x20000;
+            if (call(HRESULT, D, CreateTexture3D, .{ &td, @as(?*const SubresourceData, null), &s }) < 0) return error.Readback;
+        },
+        else => {
+            var td: Tex2DDesc = undefined;
+            call(void, res, 10, .{&td});
+            td.Usage = 3;
+            td.BindFlags = 0;
+            td.CPUAccessFlags = 0x20000;
+            if (call(HRESULT, D, CreateTexture2D, .{ &td, @as(?*const SubresourceData, null), &s }) < 0) return error.Readback;
+        },
+    }
+    objs.keep(s);
+    call(void, C, CopyResource, .{ s.?, res });
+    return s.?;
+}
+
+/// Appends a mapped subresource's rows (`rows` of `row_bytes`, `slices`
+/// deep) to out.
+fn readMapped(C: *anyopaque, s: *anyopaque, sub: u32, row_bytes: u32, rows: u32, slices: u32, out: []u8, n: *usize) error{Readback}!void {
+    var m: MappedSubresource = undefined;
+    if (call(HRESULT, C, Map, .{ s, sub, @as(u32, 1), @as(u32, 0), &m }) < 0) return error.Readback;
+    defer call(void, C, Unmap, .{ s, sub });
+    for (0..slices) |z| for (0..rows) |y| {
+        if (n.* + row_bytes > out.len) return error.Readback;
+        const src = m.pData.? + z * m.DepthPitch + y * m.RowPitch;
+        @memcpy(out[n.*..][0..row_bytes], src[0..row_bytes]);
+        n.* += row_bytes;
+    };
+}
+
+pub const Compute = struct {
+    blob: []const u8,
+    /// its constant buffers' words, by slot
+    cbs: [16][]const u32 = [_][]const u32{&.{}} ** 16,
+    groups: [3]u32 = .{ 2, 2, 1 },
+};
+
+/// Runs a compute shader once (its bindings made from its reflection:
+/// buffers and UAVs filled with `pattern`); every UAV's contents after,
+/// in binding order, into `out`; their length.
+pub fn dispatch(d: Compute, out: []u8) error{ NoDevice, Shader, Buffer, Resource, Readback }!usize {
+    const D = dev orelse return error.NoDevice;
+    const C = ctx.?;
+    var objs = Objs{};
+    defer {
+        call(void, C, ClearState, .{});
+        for (objs.list[0..objs.n]) |o| release(o);
+    }
+    var cs: ?*anyopaque = null;
+    if (call(HRESULT, D, CreateComputeShader, .{ d.blob.ptr, d.blob.len, @as(?*anyopaque, null), &cs }) < 0) return error.Shader;
+    objs.keep(cs);
+    var cbs: [16]?*anyopaque = [_]?*anyopaque{null} ** 16;
+    for (d.cbs, 0..) |words, slot| {
+        if (words.len == 0) continue;
+        const bd = BufferDesc{ .ByteWidth = @intCast((words.len * 4 + 15) / 16 * 16), .Usage = 0, .BindFlags = 4, .CPUAccessFlags = 0, .MiscFlags = 0, .StructureByteStride = 0 };
+        const init = SubresourceData{ .pSysMem = words.ptr, .SysMemPitch = 0, .SysMemSlicePitch = 0 };
+        if (call(HRESULT, D, CreateBuffer, .{ &bd, &init, &cbs[slot] }) < 0) return error.Buffer;
+        objs.keep(cbs[slot]);
+    }
+    call(void, C, CSSetConstantBuffers, .{ @as(u32, 0), @as(u32, 14), &cbs });
+    var r: ct.Reflection = undefined;
+    if (!r.read(ct.findChunk(d.blob, "RDEF") orelse return error.Shader)) return error.Shader;
+    var srvs: [16]?*anyopaque = [_]?*anyopaque{null} ** 16;
+    var smps: [16]?*anyopaque = [_]?*anyopaque{null} ** 16;
+    var uavs: [8]?*anyopaque = [_]?*anyopaque{null} ** 8;
+    var counts: [8]u32 = [_]u32{0} ** 8;
+    var res: [8]?*anyopaque = [_]?*anyopaque{null} ** 8;
+    var is_buf: [8]bool = undefined;
+    var binds: [8]ct.RBind = undefined;
+    var nuav: usize = 0;
+    for (r.binds[0..r.nbinds]) |b| {
+        if (b.bind >= 16) continue;
+        switch (b.type) {
+            3 => {
+                const cmp = b.flags & 2 != 0;
+                const sd = SamplerDesc{ .Filter = if (cmp) 0x95 else 0x15, .AddressU = 3, .AddressV = 3, .AddressW = 3, .MipLODBias = 0, .MaxAnisotropy = 1, .ComparisonFunc = if (cmp) 4 else 1, .BorderColor = .{ 0, 0, 0, 0 }, .MinLOD = 0, .MaxLOD = 1000 };
+                if (call(HRESULT, D, CreateSamplerState, .{ &sd, &smps[b.bind] }) < 0) return error.Resource;
+                objs.keep(smps[b.bind]);
+            },
+            2 => {
+                if (b.dim == 1) {
+                    srvs[b.bind] = try bufferSrv(D, b, &objs);
+                } else {
+                    var list: [128]?*anyopaque = undefined;
+                    var n: usize = 0;
+                    srvs[b.bind] = try texture(D, b, isDepth(b), &list, &n);
+                    for (list[0..n]) |o| objs.keep(o);
+                }
+            },
+            5, 7 => srvs[b.bind] = try bufferSrv(D, b, &objs),
+            4, 6, 8, 9, 10, 11 => {
+                if (b.bind >= uavs.len) return error.Resource;
+                const u = try uavFor(D, b, &objs);
+                uavs[b.bind] = u.view;
+                // (a consume buffer starts full)
+                counts[b.bind] = if (b.type == 10) BUF_ELEMS else 0;
+                res[nuav] = u.res;
+                is_buf[nuav] = u.buffer;
+                binds[nuav] = b;
+                nuav += 1;
+            },
+            else => {},
+        }
+    }
+    call(void, C, CSSetShaderResources, .{ @as(u32, 0), @as(u32, 16), &srvs });
+    call(void, C, CSSetSamplers, .{ @as(u32, 0), @as(u32, 16), &smps });
+    call(void, C, CSSetUnorderedAccessViews, .{ @as(u32, 0), @as(u32, 8), &uavs, &counts });
+    call(void, C, CSSetShader, .{ cs.?, @as(?*anyopaque, null), @as(u32, 0) });
+    // (append, consume and counters hand out slots in the order threads
+    // come: one group, whose threads WARP runs in one order)
+    var groups = d.groups;
+    for (r.binds[0..r.nbinds]) |b| {
+        if (b.type == 9 or b.type == 10 or b.type == 11) groups = .{ 1, 1, 1 };
+    }
+    call(void, C, Dispatch, .{ groups[0], groups[1], groups[2] });
+    var n: usize = 0;
+    for (res[0..nuav], is_buf[0..nuav], binds[0..nuav]) |x, buf, b| {
+        const s = try readable(D, C, x.?, buf, b, &objs);
+        if (buf) {
+            var bd: BufferDesc = undefined;
+            call(void, s, 10, .{&bd});
+            try readMapped(C, s, 0, bd.ByteWidth, 1, 1, out, &n);
+            continue;
+        }
+        const bpp: u32 = 4 * (((b.flags >> 2) & 3) + 1);
+        switch (b.dim) {
+            2 => try readMapped(C, s, 0, UAV_W * bpp, 1, 1, out, &n),
+            3 => for (0..2) |l| try readMapped(C, s, @intCast(l), UAV_W * bpp, 1, 1, out, &n),
+            5 => for (0..2) |l| try readMapped(C, s, @intCast(l), UAV_W * bpp, UAV_W, 1, out, &n),
+            8 => try readMapped(C, s, 0, UAV_W * bpp, UAV_W, 4, out, &n),
+            else => try readMapped(C, s, 0, UAV_W * bpp, UAV_W, 1, out, &n),
+        }
+    }
+    return n;
+}
+
 /// Textures and samplers for every binding the shader's reflection names.
 fn resources(D: *anyopaque, C: *anyopaque, blob: []const u8, srv_at: usize, smp_at: usize, objs: *[128]?*anyopaque, nobj: *usize) error{Resource}!void {
     var r: ct.Reflection = undefined;

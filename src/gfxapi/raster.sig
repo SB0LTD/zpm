@@ -112,7 +112,10 @@ pub const GUARD: f32 = 24576;
 pub const MAX_ATTRS = 16;
 /// Scalar varyings (a vec4 is four): GL ES 3.0's 15 vectors, and room.
 pub const MAX_VARYINGS = 64;
-pub const MAX_UNIFORM_WORDS = 1024;
+/// A draw's uniform words at most (128 KiB: Direct3D 11's constant buffers
+/// a draw reads, Unigine's instance buffers near 64 KiB each, and textures'
+/// descriptors).
+pub const MAX_UNIFORM_WORDS = 32768;
 /// Buffers a pipeline's shaders may read and write besides the uniform
 /// words (Vulkan's uniform and storage buffers): bound after the textures.
 pub const MAX_BUFFERS = 32;
@@ -133,6 +136,14 @@ pub const BIN = TILE * BIN_TILES;
 /// Triangles a bin's list holds at most (Engine.bin_cap may lower it);
 /// past it, the bin's tiles go through every triangle.
 pub const BIN_CAP = 2048;
+/// Bins a draw has at most: a large target's bins are larger (BIN, then
+/// twice and four times its side ...). An 8192 x 8192 shadow map was
+/// 16384 bins of BIN: 134 MB of lists a draw, and a bin pass of every bin
+/// against every triangle (Unigine Superposition's loading screen, its
+/// GPU busy all the time); in 1024 bins, 8 MB and 16 times less.
+pub const MAX_BINS = 1024;
+/// A bin's side in tiles at most: 2^MAX_BIN_SHIFT (1024 pixels).
+const MAX_BIN_SHIFT = 7;
 /// Triangles a group culls at once: a tile's threads, and the bin
 /// kernel's group, one triangle each.
 const CULL = TILE * TILE;
@@ -1694,7 +1705,8 @@ const B_RECT = 2; // x0, y0 (the first bin's corner)
 const B_BINS_X = 4;
 const B_BASE = 5; // the bins' first word in the triangle buffer
 const B_CAP = 6;
-pub const BIN_PARAMS = 7;
+const B_SHIFT = 7; // a bin's side in tiles, log2
+pub const BIN_PARAMS = 8;
 
 /// A group per bin (BIN x BIN pixels from the draw's corner): the
 /// triangles whose boxes meet it, in order, CULL at a time. A bin's words
@@ -1709,10 +1721,12 @@ pub fn binKernel(s: kir.Storage) kir.Kernel {
     const ntri = k.param(.u32, B_NTRI);
     const sstride = k.param(.u32, B_SSTRIDE);
     const cap = k.param(.u32, B_CAP);
-    const x0 = k.op3(.imad, .i32, r(k.gid(0)), u(BIN), r(k.param(.i32, B_RECT)));
-    const y0 = k.op3(.imad, .i32, r(k.gid(1)), u(BIN), r(k.param(.i32, B_RECT + 1)));
-    const x1 = k.op2(.iadd, .i32, r(x0), i(BIN - 1));
-    const y1 = k.op2(.iadd, .i32, r(y0), i(BIN - 1));
+    // (a bin's side in pixels: TILE << the shift)
+    const side = k.op2(.shl, .i32, i(TILE), r(k.param(.u32, B_SHIFT)));
+    const x0 = k.op3(.imad, .i32, r(k.gid(0)), r(side), r(k.param(.i32, B_RECT)));
+    const y0 = k.op3(.imad, .i32, r(k.gid(1)), r(side), r(k.param(.i32, B_RECT + 1)));
+    const x1 = k.op2(.iadd, .i32, r(x0), r(k.op2(.isub, .i32, r(side), i(1))));
+    const y1 = k.op2(.iadd, .i32, r(y0), r(k.op2(.isub, .i32, r(side), i(1))));
     const bin = k.op3(.imad, .u32, r(k.gid(1)), r(k.param(.u32, B_BINS_X)), r(k.gid(0)));
     const bbase = k.op2(.shl, .u32, r(k.op3(.imad, .u32, r(bin), r(k.op2(.iadd, .u32, r(cap), u(1))), r(k.param(.u32, B_BASE)))), u(2));
     const sc = scanAlloc(&k);
@@ -1754,6 +1768,8 @@ pub const Bins = struct {
     /// the first bin's word in the triangle buffer, and a bin's list's room
     base: u32 = 0,
     cap: u32 = 0,
+    /// a bin's side in tiles, log2 (BIN's: BIN_SHIFT)
+    shift: u32 = BIN_SHIFT,
 
     /// Words the bins take after the triangle records.
     pub fn words(b: Bins) usize {
@@ -1761,22 +1777,30 @@ pub const Bins = struct {
     }
 };
 
-pub fn binsOf(d: *const Draw, cap_limit: u32) Bins {
+pub fn binsOf(d: *const Draw, cap_limit: u32, max_bins: u32) Bins {
     const w = d.rect.width();
     const h = d.rect.height();
     if (w <= BIN and h <= BIN) return .{};
     const ntri = d.records() * d.instances;
+    // (larger bins while there are more than max_bins: MAX_BINS)
+    var shift: u32 = BIN_SHIFT;
+    while (shift < MAX_BIN_SHIFT) : (shift += 1) {
+        const side = @as(u32, TILE) << @intCast(shift);
+        if (@as(u64, (w + side - 1) / side) * ((h + side - 1) / side) <= max_bins) break;
+    }
+    const side = @as(u32, TILE) << @intCast(shift);
     return .{
         .on = true,
-        .x = (w + BIN - 1) / BIN,
-        .y = (h + BIN - 1) / BIN,
+        .x = (w + side - 1) / side,
+        .y = (h + side - 1) / side,
         .base = ntri * d.pipe.sstride,
         .cap = @min(ntri, cap_limit),
+        .shift = shift,
     };
 }
 
 pub fn binParams(d: *const Draw, b: Bins, out: []u32) []u32 {
-    const p = [_]u32{ d.records() * d.instances, d.pipe.sstride, d.rect.x0, d.rect.y0, b.x, b.base, b.cap };
+    const p = [_]u32{ d.records() * d.instances, d.pipe.sstride, d.rect.x0, d.rect.y0, b.x, b.base, b.cap, b.shift };
     @memcpy(out[0..p.len], &p);
     return out[0..p.len];
 }
@@ -1809,7 +1833,7 @@ const R_SRC_RGB = 25; // c (3), ks, kd, ksa, kda
 const R_DST_RGB = 32;
 const R_SRC_A = 39; // c, ks, kd, ksa, kda
 const R_DST_A = 44;
-const R_BINNED = 49; // the triangles binned: bins a row, their first word, cap
+const R_BINNED = 49; // the triangles binned (a bin's side in tiles, log2; 0: not): bins a row, their first word, cap
 const R_BINS_X = 50;
 const R_BIN_BASE = 51;
 const R_BIN_CAP = 52;
@@ -2267,7 +2291,9 @@ pub fn rasterKernelFor(s: kir.Storage, p: *const Pipeline, v: Variant) kir.Kerne
     const sc = scanAlloc(&k);
     const list = k.sharedAlloc(CULL * 4, 4);
     const cap = k.param(.u32, R_BIN_CAP);
-    const bin = k.op3(.imad, .u32, r(k.op2(.shr, .u32, r(k.gid(1)), u(BIN_SHIFT))), r(k.param(.u32, R_BINS_X)), r(k.op2(.shr, .u32, r(k.gid(0)), u(BIN_SHIFT))));
+    // (R_BINNED: a bin's side in tiles, log2; 0: not binned)
+    const bshift = k.param(.u32, R_BINNED);
+    const bin = k.op3(.imad, .u32, r(k.op2(.shr, .u32, r(k.gid(1)), r(bshift))), r(k.param(.u32, R_BINS_X)), r(k.op2(.shr, .u32, r(k.gid(0)), r(bshift))));
     const bbase = k.op2(.shl, .u32, r(k.op3(.imad, .u32, r(bin), r(k.op2(.iadd, .u32, r(cap), u(1))), r(k.param(.u32, R_BIN_BASE)))), u(2));
     const n = k.reg(.u32);
     k.set(n, .mov, r(ntri), no, no);
@@ -2971,7 +2997,7 @@ pub fn recordsBox(d: *const Draw, recs: []const u8) ?engine.Rect {
 
 pub fn rasterParams(d: *const Draw, bins: Bins, out: []u32) []u32 {
     @memset(out[0..RASTER_PARAMS], 0);
-    out[R_BINNED] = @intFromBool(bins.on);
+    out[R_BINNED] = if (bins.on) bins.shift else 0;
     out[R_BINS_X] = bins.x;
     out[R_BIN_BASE] = bins.base;
     out[R_BIN_CAP] = bins.cap;
