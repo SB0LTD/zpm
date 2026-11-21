@@ -193,6 +193,9 @@ pub const Offer = struct {
     connection: u32 = 0,
     /// Not 0: a sub-channel of a device that asked for more than one.
     sub_index: u16 = 0,
+    /// The MMIO the device wants of the machine's (MiB): dxgkrnl's global
+    /// channel asks this much for its IO space.
+    mmio_megabytes: u16 = 0,
 
     /// From an OFFER_CHANNEL message (196 bytes), or null when it is short.
     pub fn parse(m: []const u8) ?Offer {
@@ -200,6 +203,7 @@ pub const Offer = struct {
         return .{
             .kind = m[8..24].*,
             .instance = m[24..40].*,
+            .mmio_megabytes = get16(m, 58),
             .sub_index = get16(m, 180),
             .relid = get32(m, 184),
             .connection = get32(m, 192),

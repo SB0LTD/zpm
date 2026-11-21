@@ -218,6 +218,8 @@ pub fn Gpu(comptime Host: type) type {
         pci: [8]u32 = @splat(0),
         /// The last NTSTATUS the host answered.
         status: i32 = 0,
+        /// set_iospace_region's NTSTATUS (-1: no answer; 0 when not asked).
+        io_status: i32 = 0,
         /// The step `start` stopped at.
         failed: ?Step = null,
         rx: [8192]u8 align(8) = undefined,
@@ -273,10 +275,13 @@ pub fn Gpu(comptime Host: type) type {
         /// device. `failed` names the step an error came from.
         pub fn start(self: *Self, io_start: u64, io_len: u64, name: []const u8) Error!void {
             self.guest_luid = luidOf(self.vgpu.offer.instance);
+            // (a refused IO space is kept in io_status and the rest tried:
+            // only fence pages need it)
             if (io_len != 0) {
-                self.failed = .io_space;
                 const m = SetIoSpaceRegion{ .start = io_start, .length = io_len };
-                try self.ntstatus(try self.call(&self.global, std.mem.asBytes(&m)));
+                if (self.call(&self.global, std.mem.asBytes(&m))) |b| {
+                    self.io_status = if (b.len >= 4) std.mem.readInt(i32, b[0..4], .little) else -1;
+                } else |_| self.io_status = -1;
             }
             self.failed = .open_adapter;
             const oa = OpenAdapter{ .version = self.version, .guest_adapter_luid = self.guest_luid };
