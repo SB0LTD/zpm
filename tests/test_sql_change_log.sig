@@ -628,6 +628,42 @@ fn scopedIdentitySequences() !void {
     try check(try integer(&dropped, "SELECT id FROM dst.t") == 10);
 }
 
+fn scopedStandaloneSequences() !void {
+    var db: DB = .{};
+    var log: Log = .{};
+    const create = try db.begin();
+    try run(&db, create, "CREATE SCHEMA src");
+    try run(&db, create, "CREATE SCHEMA dst");
+    try run(&db, create, "CREATE SEQUENCE src.s START WITH 31");
+    try run(&db, create, "CREATE SEQUENCE dst.s START WITH 48 CACHE 2");
+    try run(&db, create, "SELECT setval('src.s',34,true)");
+    try run(&db, create, "SELECT setval('dst.s',48,false)");
+    try log.commit(&db, create);
+    const alter = try db.begin();
+    try run(&db, alter, "ALTER SEQUENCE src.s RESTART WITH 40");
+    try log.commit(&db, alter);
+
+    var restarted: DB = .{};
+    try log.replay(&restarted);
+    try check(try integer(&restarted, "SELECT last_value FROM src.s WHERE NOT is_called") == 40);
+    try check(try integer(&restarted, "SELECT last_value FROM dst.s WHERE NOT is_called") == 48);
+    var result: DB.Result = .{};
+    if (db.execute("DROP SCHEMA src", &result)) |_| {
+        return error.DroppedSchemaWithSequence;
+    } else |err| try check(err == error.DependentObjects);
+
+    const drop = try db.begin();
+    try run(&db, drop, "DROP SCHEMA src CASCADE");
+    try log.commit(&db, drop);
+    try restarted.applyChangeRecord(log.record(2), &scratch);
+    try check(try integer(&restarted, "SELECT count(*) FROM pg_class WHERE relname='s' AND relkind='S'") == 1);
+    const explicit_drop = try db.begin();
+    try run(&db, explicit_drop, "DROP SEQUENCE dst.s");
+    try log.commit(&db, explicit_drop);
+    try restarted.applyChangeRecord(log.record(3), &scratch);
+    try check(try integer(&restarted, "SELECT count(*) FROM pg_class WHERE relname='s' AND relkind='S'") == 0);
+}
+
 fn addIdentityToColumn() !void {
     var db: DB = .{};
     var log: Log = .{};
@@ -1024,6 +1060,7 @@ pub fn main(init: std.process.Init) !void {
     try outOfOrderTables();
     try outOfOrderSequences();
     try scopedIdentitySequences();
+    try scopedStandaloneSequences();
     try addIdentityToColumn();
     try oidConflicts();
     try keyedIndexCollision();

@@ -3082,7 +3082,7 @@ pub fn Database(comptime config: Config) type {
                 },
                 .drop_table => |index| try self.dropTable(slot, index, false, snap),
                 .create_sequence => |*create| blk: {
-                    try self.createSequence(slot, catalog_module.public_namespace, create.name, create.spec, 0, 0, snap);
+                    try self.createSequence(slot, create.namespace, create.name, create.spec, 0, 0, snap);
                     break :blk 0;
                 },
                 .drop_sequence => |index| blk: {
@@ -3593,7 +3593,14 @@ pub fn Database(comptime config: Config) type {
             var relations: [K.relation_rows]K.Found = undefined;
             const count = self.catalog.visibleRelations(current, &relations);
             for (relations[0..count]) |found| {
-                if (found.kind == 'S' or self.tables[found.slot].namespace != drop.oid) continue;
+                if (found.kind == 'S') {
+                    const seq = &self.seqs[found.slot];
+                    if (seq.namespace != drop.oid or seq.owner != 0) continue;
+                    if (!drop.cascade) return error.DependentObjects;
+                    try self.dropSequence(slot, found.slot, current);
+                    continue;
+                }
+                if (self.tables[found.slot].namespace != drop.oid) continue;
                 if (!drop.cascade) return error.DependentObjects;
                 _ = try self.dropTable(slot, found.slot, true, current);
             }
@@ -3607,7 +3614,10 @@ pub fn Database(comptime config: Config) type {
                 var remaining: [K.relation_rows]K.Found = undefined;
                 const remaining_count = self.catalog.visibleRelations(after, &remaining);
                 for (remaining[0..remaining_count]) |found| {
-                    if (found.kind == 'S') continue;
+                    if (found.kind == 'S') {
+                        if (self.seqs[found.slot].namespace == drop.oid) return error.DependentObjects;
+                        continue;
+                    }
                     const survivor = &self.tables[found.slot];
                     if (survivor.namespace == drop.oid) return error.UnsupportedStatement;
                     for (survivor.constraints[0..survivor.constraint_count]) |*constraint| {
@@ -5437,7 +5447,25 @@ pub fn Database(comptime config: Config) type {
         // ---- sequences (design §4.11) ---------------------------------------
 
         /// CREATE SEQUENCE, or an identity column's owned sequence.
+        fn checkNamespaceForCreate(self: *Self, slot: u16, namespace: u32) Error!void {
+            if (namespace == catalog_module.public_namespace) return;
+            const tx = &self.txs[slot];
+            for (&self.schemas) |*schema| {
+                if (!schema.live or schema.oid != namespace) continue;
+                if (schema.pending_drop and schema.creator != slot) {
+                    var waits: L.Set = .{};
+                    waits.add(schema.creator);
+                    tx.fresh = tx.write_len == tx.subs[tx.sub_len - 1].write_start;
+                    return self.park(slot, waits);
+                }
+                if (schema.dead_csn != 0 or schema.pending_drop) return error.UndefinedSchema;
+                return;
+            }
+            return error.UndefinedSchema;
+        }
+
         fn createSequence(self: *Self, slot: u16, namespace: u32, name: Name, spec: sequence_module.Spec, owner: u32, owner_column: u8, snap: Snapshot) Error!void {
+            try self.checkNamespaceForCreate(slot, namespace);
             const tx = &self.txs[slot];
             if (self.catalog.creatorIn(namespace, name.slice(), snap)) |other| {
                 var waits: L.Set = .{};
@@ -7375,18 +7403,7 @@ pub fn Database(comptime config: Config) type {
                 tx.fresh = tx.write_len == tx.subs[tx.sub_len - 1].write_start;
                 return self.park(slot, waits);
             }
-            // A schema another transaction is dropping: wait for it.
-            for (&self.schemas) |*schema| {
-                if (!schema.live or schema.oid != create.namespace) continue;
-                if (schema.pending_drop and schema.creator != slot) {
-                    var waits: L.Set = .{};
-                    waits.add(schema.creator);
-                    tx.fresh = tx.write_len == tx.subs[tx.sub_len - 1].write_start;
-                    return self.park(slot, waits);
-                }
-                if (schema.dead_csn != 0) return error.UndefinedSchema;
-                break;
-            }
+            try self.checkNamespaceForCreate(slot, create.namespace);
             const creator = self.session.role;
             const write_owner = self.dialect == .postgres and create.plain_definition and creator != CO.bootstrap_role;
             if (write_owner) {

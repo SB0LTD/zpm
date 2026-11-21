@@ -1910,7 +1910,7 @@ pub fn Parser(comptime config: types.Config) type {
 
         fn createSequence(self: *Self) Error!Ast.CreateSequence {
             const conditional = try self.ifNotExists();
-            var out: Ast.CreateSequence = .{ .name = try self.identifier(), .if_not_exists = conditional };
+            var out: Ast.CreateSequence = .{ .name = try self.qualifiedName(), .if_not_exists = conditional };
             try self.sequenceOptions(&out.options);
             try self.finish();
             return out;

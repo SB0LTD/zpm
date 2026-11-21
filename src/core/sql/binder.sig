@@ -87,7 +87,7 @@ pub fn Binder(comptime config: types.Config) type {
         /// sequence's current state when it runs).
         pub const AlterSequence = struct { slot: usize, options: sequence.Options };
 
-        pub const CreateSequence = struct { name: V.Name, spec: sequence.Spec };
+        pub const CreateSequence = struct { name: V.Name, namespace: u32, spec: sequence.Spec };
 
         /// RETURNING output columns, evaluated over one table row (relation 0).
         pub const Returning = struct {
@@ -7921,19 +7921,19 @@ pub fn Binder(comptime config: types.Config) type {
                     return .{ .drop_table = found.slot };
                 },
                 .create_sequence => |*create| {
-                    if (!context.session.public_schema_on_path) return error.UndefinedSchema;
-                    const name = toName(context, create.name);
-                    if (context.catalog.find(name.slice(), context.snapshot) != null) {
+                    const namespace = try specifiedNamespace(context, create.name.schema);
+                    const name = toName(context, create.name.name);
+                    if (context.catalog.findIn(namespace, name.slice(), context.snapshot) != null or
+                        indexNameTaken(context, namespace, name.slice())) {
                         if (create.if_not_exists) return .{ .noop = .create_sequence };
                         return error.TableExists;
                     }
-                    return .{ .create_sequence = .{ .name = name, .spec = try sequence.resolve(create.options) } };
+                    return .{ .create_sequence = .{ .name = name, .namespace = namespace, .spec = try sequence.resolve(create.options) } };
                 },
                 .drop_sequence => |drop| {
-                    const wanted = toName(context, drop.name);
-                    const found = (if (publicLookup(context, drop.name)) context.catalog.find(wanted.slice(), context.snapshot) else null) orelse {
-                        if (drop.if_exists) return .{ .noop = .drop_sequence };
-                        return error.TableNotFound;
+                    const found = resolveRelation(context, drop.schema, drop.name) catch |err| {
+                        if (err == error.TableNotFound and drop.if_exists) return .{ .noop = .drop_sequence };
+                        return err;
                     };
                     if (found.kind != 'S') return error.WrongObjectType;
                     return .{ .drop_sequence = found.slot };
@@ -8098,13 +8098,9 @@ pub fn Binder(comptime config: types.Config) type {
                 .merge => |*merge| return bindMerge(context, merge),
                 .set_constraints => |*set| return bindSetConstraints(context, set),
                 .alter_sequence => |*alter| {
-                    if (alter.name.schema) |qualifier| {
-                        if (!types.same(toName(context, qualifier).slice(), "public")) return error.TableNotFound;
-                    }
-                    const wanted = toName(context, alter.name.name);
-                    const found = (if (alter.name.schema != null or publicLookup(context, alter.name.name)) context.catalog.find(wanted.slice(), context.snapshot) else null) orelse {
-                        if (alter.if_exists) return .{ .noop = .alter_sequence };
-                        return error.TableNotFound;
+                    const found = resolveRelation(context, alter.name.schema, alter.name.name) catch |err| {
+                        if (err == error.TableNotFound and alter.if_exists) return .{ .noop = .alter_sequence };
+                        return err;
                     };
                     if (found.kind != 'S') return error.WrongObjectType;
                     return .{ .alter_sequence = .{ .slot = found.slot, .options = alter.options } };

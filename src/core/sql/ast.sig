@@ -696,7 +696,7 @@ pub fn Ast(comptime config: types.Config) type {
 
         pub const CreateSequence = struct {
             if_not_exists: bool = false,
-            name: Ident = .{},
+            name: TableRef = .{},
             options: sequence.Options = .{},
         };
 
