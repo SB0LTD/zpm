@@ -306,13 +306,18 @@ pub fn Gpu(comptime Host: type) type {
             self.process = p.hprocess;
 
             self.failed = .query_pci;
-            var q: [@sizeOf(QueryAdapterInfo) + 32]u8 align(8) = @splat(0);
-            const qh = QueryAdapterInfo{ .hdr = .{ .process = self.process, .command_type = @intFromEnum(Command.query_adapter_info) }, .query_type = QUERY_PCI_IDS, .private_data_size = 32 };
+            // (D3DKMT_QUERY_DEVICE_IDS: the physical adapter's index, then
+            // vendor, device, subsystem vendor, subsystem, revision, bus
+            // type: 28 bytes; asked for 32, Hyper-V's host answered short)
+            var q: [@sizeOf(QueryAdapterInfo) + PCI_IDS_BYTES]u8 align(8) = @splat(0);
+            const qh = QueryAdapterInfo{ .hdr = .{ .process = self.process, .command_type = @intFromEnum(Command.query_adapter_info) }, .query_type = QUERY_PCI_IDS, .private_data_size = PCI_IDS_BYTES };
             @memcpy(q[0..@sizeOf(QueryAdapterInfo)], std.mem.asBytes(&qh));
             const qr = try self.call(self.adapterChannel(), &q);
             try self.ntstatus(qr);
-            if (qr.len < 4 + 32) return error.ShortReply;
-            for (&self.pci, 0..) |*w, i| w.* = std.mem.readInt(u32, qr[4 + 4 * i ..][0..4], .little);
+            if (qr.len < 4 + 12) return error.ShortReply;
+            self.pci = @splat(0);
+            const words = @min((qr.len - 4) / 4, self.pci.len);
+            for (self.pci[0..words], 0..) |*w, i| w.* = std.mem.readInt(u32, qr[4 + 4 * i ..][0..4], .little);
 
             self.failed = .create_device;
             const cd = CreateDevice{ .hdr = .{ .process = self.process, .command_type = @intFromEnum(Command.create_device) } };
@@ -338,6 +343,7 @@ pub fn Gpu(comptime Host: type) type {
 /// KMTQAITYPE 31: the adapter's PCI ids (dxg.kmt.PciIds: reserved, vendor,
 /// device, subsystem vendor, subsystem, revision, bus type).
 pub const QUERY_PCI_IDS: u32 = 31;
+pub const PCI_IDS_BYTES: u32 = 28;
 
 // ── Tests: the handshake against a host the test plays ──────────────────────
 
