@@ -5616,7 +5616,7 @@ pub fn Database(comptime config: Config) type {
                     if (oid != null) return error.AmbiguousFunction;
                     oid = am.handler;
                 }
-                for (catalog_module.text_search_callbacks) |callback| {
+                for (catalog_module.builtin_callbacks) |callback| {
                     if (!types.same(callback.name, name)) continue;
                     if (oid != null) return error.AmbiguousFunction;
                     oid = callback.oid;
@@ -6147,6 +6147,14 @@ pub fn Database(comptime config: Config) type {
             // UTF-8 is the only client and server encoding. Identity
             // transfer does not invoke a catalog conversion procedure.
             if (view == .pg_conversion) return;
+            if (view == .pg_range) {
+                for (catalog_module.ranges) |range| {
+                    // Supported subtypes have no collation and no subdiff callback.
+                    try sink.add(&.{ intCell(range.oid), intCell(range.subtype), intCell(range.multirange),
+                        intCell(0), intCell(range.opclass), .{ .regproc = range.canonical }, .{ .regproc = 0 } });
+                }
+                return;
+            }
             if (view == .pg_init_privs) {
                 // These fixed bootstrap ACLs have explicit catalog values.
                 const acl = try @import("sql/catalog_acl.sig").Acl(V).ownerAndPublic(CO.bootstrap_name, "UC", "U");
@@ -11572,7 +11580,7 @@ pub fn Database(comptime config: Config) type {
         fn objectViewRows(self: *const Self, snapshot: Snapshot, view: catalog_module.View, sink: *X.RowSink) Error!void {
             switch (view) {
                 .pg_proc => {
-                    for (catalog_module.text_search_callbacks) |callback| {
+                    for (catalog_module.builtin_callbacks) |callback| {
                         var buffer: [43]u8 = undefined;
                         var argtypes: CatalogTextWriter = .{ .out = &buffer };
                         for (callback.args, 0..) |oid, index| {

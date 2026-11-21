@@ -41,3 +41,12 @@ pub const btree_families = [_]Family{
     .{ .oid = 3253, .name = "pg_lsn_ops", .classes = &.{.{ .oid = 10067, .name = "pg_lsn_ops", .input = .pg_lsn }} },
     .{ .oid = 4033, .name = "jsonb_ops", .classes = &.{.{ .oid = 10088, .name = "jsonb_ops", .input = .jsonb }} },
 };
+
+pub fn defaultBtreeOid(comptime data_type: types.DataType) u32 {
+    for (btree_families) |family| {
+        for (family.classes) |class| {
+            if (class.input == data_type) return class.oid;
+        }
+    }
+    unreachable;
+}

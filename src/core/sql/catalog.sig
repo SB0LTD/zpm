@@ -55,7 +55,7 @@ pub const View = enum(u8) { pg_type, pg_namespace, pg_class, pg_attribute, pg_in
     // Catalog objects (B11 wave 3, catalog_objects.sig).
     pg_roles, pg_authid, pg_auth_members, pg_policy, pg_policies, pg_description, pg_shdescription, pg_foreign_data_wrapper, pg_foreign_server, pg_publication, pg_extension, pg_tables, table_privileges, pg_enum, pg_database, pg_am, pg_collation, pg_constraint, pg_statistic_ext,
     pg_publication_rel, pg_publication_namespace, pg_settings, pg_depend, pg_tablespace, pg_foreign_table,
-    pg_init_privs, pg_cast, pg_transform, pg_language, pg_operator, pg_opclass, pg_opfamily, pg_ts_parser, pg_ts_template, pg_ts_dict, pg_ts_config, pg_default_acl, pg_conversion };
+    pg_init_privs, pg_cast, pg_transform, pg_language, pg_operator, pg_opclass, pg_opfamily, pg_ts_parser, pg_ts_template, pg_ts_dict, pg_ts_config, pg_default_acl, pg_conversion, pg_range };
 
 pub const sql_language_oid: u32 = 14;
 pub const plpgsql_language_oid: u32 = 13002;
@@ -99,12 +99,12 @@ pub const builtin_pseudo_types = [_]struct { oid: u32, name: []const u8, bytes: 
 
 pub fn builtinRoutineName(oid: u32) ?[]const u8 {
     for (access_methods) |am| if (am.handler == oid) return am.handler_name;
-    for (text_search_callbacks) |callback| if (callback.oid == oid) return callback.name;
+    for (builtin_callbacks) |callback| if (callback.oid == oid) return callback.name;
     for (@import("operator_catalog.sig").functions) |op| if (op.function_oid == oid) return op.function_name;
     return null;
 }
 
-const TextSearchCallback = struct { oid: u32, name: []const u8, args: []const u32, result: u32 };
+const BuiltinCallback = struct { oid: u32, name: []const u8, args: []const u32, result: u32 };
 
 /// Catalog identities of the tokenizer used by the simple configuration.
 /// Parser.init and Parser.next own startup and tokenization. End releases
@@ -112,10 +112,10 @@ const TextSearchCallback = struct { oid: u32, name: []const u8, args: []const u3
 pub const text_parser = struct {
     pub const oid: u32 = 3722;
     pub const name = "default";
-    pub const start: TextSearchCallback = .{ .oid = 3717, .name = "prsd_start", .args = &.{ internal_type_oid, 23 }, .result = internal_type_oid };
-    pub const next: TextSearchCallback = .{ .oid = 3718, .name = "prsd_nexttoken", .args = &.{ internal_type_oid, internal_type_oid, internal_type_oid }, .result = internal_type_oid };
-    pub const end: TextSearchCallback = .{ .oid = 3719, .name = "prsd_end", .args = &.{internal_type_oid}, .result = 2278 };
-    pub const lex_type: TextSearchCallback = .{ .oid = 3721, .name = "prsd_lextype", .args = &.{internal_type_oid}, .result = internal_type_oid };
+    pub const start: BuiltinCallback = .{ .oid = 3717, .name = "prsd_start", .args = &.{ internal_type_oid, 23 }, .result = internal_type_oid };
+    pub const next: BuiltinCallback = .{ .oid = 3718, .name = "prsd_nexttoken", .args = &.{ internal_type_oid, internal_type_oid, internal_type_oid }, .result = internal_type_oid };
+    pub const end: BuiltinCallback = .{ .oid = 3719, .name = "prsd_end", .args = &.{internal_type_oid}, .result = 2278 };
+    pub const lex_type: BuiltinCallback = .{ .oid = 3721, .name = "prsd_lextype", .args = &.{internal_type_oid}, .result = internal_type_oid };
 };
 
 /// The built-in dictionary uses stateless default initialization and
@@ -123,8 +123,8 @@ pub const text_parser = struct {
 pub const simple_template = struct {
     pub const oid: u32 = 3727;
     pub const name = "simple";
-    pub const init: TextSearchCallback = .{ .oid = 3725, .name = "dsimple_init", .args = &.{internal_type_oid}, .result = internal_type_oid };
-    pub const lexize: TextSearchCallback = .{ .oid = 3726, .name = "dsimple_lexize",
+    pub const init: BuiltinCallback = .{ .oid = 3725, .name = "dsimple_init", .args = &.{internal_type_oid}, .result = internal_type_oid };
+    pub const lexize: BuiltinCallback = .{ .oid = 3726, .name = "dsimple_lexize",
         .args = &.{ internal_type_oid, internal_type_oid, internal_type_oid, internal_type_oid }, .result = internal_type_oid };
 };
 
@@ -140,9 +140,43 @@ pub const simple_configuration = struct {
     pub const parser_oid = text_parser.oid;
 };
 
-pub const text_search_callbacks = [_]TextSearchCallback{
+fn canonicalCallback(comptime ty: types.DataType, oid: u32) BuiltinCallback {
+    const range_oid = comptime types.typeOid(ty);
+    return .{ .oid = oid, .name = @tagName(ty) ++ "_canonical", .args = &.{range_oid}, .result = range_oid };
+}
+
+const int4range_canonical = canonicalCallback(.int4range, 3914);
+const int8range_canonical = canonicalCallback(.int8range, 3928);
+const daterange_canonical = canonicalCallback(.daterange, 3915);
+
+pub const builtin_callbacks = [_]BuiltinCallback{
     text_parser.start, text_parser.next, text_parser.end, text_parser.lex_type,
     simple_template.init, simple_template.lexize,
+    int4range_canonical, int8range_canonical, daterange_canonical,
+};
+
+const RangeEntry = struct { oid: u32, subtype: u32, multirange: u32, opclass: u32, canonical: u32 };
+
+fn rangeEntry(comptime ty: types.DataType, multirange: u32, canonical: u32) RangeEntry {
+    const subtype = comptime types.dataTypeOf(types.rangeSubtype(types.typeOfData(ty)).?);
+    return .{
+        .oid = types.typeOid(ty),
+        .subtype = types.typeOid(subtype),
+        .multirange = multirange,
+        .opclass = @import("index_operator_catalog.sig").defaultBtreeOid(subtype),
+        .canonical = canonical,
+    };
+}
+
+// Multirange OIDs identify PostgreSQL's companion types for the stock
+// cast filter. They do not register multirange values or casts.
+pub const ranges = [_]RangeEntry{
+    rangeEntry(.int4range, 4451, int4range_canonical.oid),
+    rangeEntry(.numrange, 4532, 0),
+    rangeEntry(.tsrange, 4533, 0),
+    rangeEntry(.tstzrange, 4534, 0),
+    rangeEntry(.daterange, 4535, daterange_canonical.oid),
+    rangeEntry(.int8range, 4536, int8range_canonical.oid),
 };
 const pg_am_columns = [_]ViewColumn{ col("oid", .oid), col("amname", .name), col("amhandler", .regproc), col("amtype", .pg_internal_char) };
 const pg_collation_columns = [_]ViewColumn{
@@ -205,6 +239,10 @@ const pg_default_acl_columns = [_]ViewColumn{
 const pg_conversion_columns = [_]ViewColumn{
     col("oid", .oid), col("conname", .name), col("connamespace", .oid), col("conowner", .oid),
     col("conforencoding", .int4), col("contoencoding", .int4), col("conproc", .regproc), col("condefault", .boolean),
+};
+const pg_range_columns = [_]ViewColumn{
+    col("rngtypid", .oid), col("rngsubtype", .oid), col("rngmultitypid", .oid),
+    col("rngcollation", .oid), col("rngsubopc", .oid), col("rngcanonical", .regproc), col("rngsubdiff", .regproc),
 };
 const pg_cast_columns = [_]ViewColumn{ col("oid", .oid), col("castsource", .oid), col("casttarget", .oid), col("castfunc", .oid), col("castcontext", .pg_internal_char), col("castmethod", .pg_internal_char) };
 const pg_transform_columns = [_]ViewColumn{ col("oid", .oid), col("trftype", .oid), col("trflang", .oid), col("trffromsql", .oid), col("trftosql", .oid) };
@@ -316,6 +354,7 @@ pub fn viewColumns(view: View) []const ViewColumn {
         .pg_init_privs => &pg_init_privs_columns,
         .pg_default_acl => &pg_default_acl_columns,
         .pg_conversion => &pg_conversion_columns,
+        .pg_range => &pg_range_columns,
         .pg_cast => &pg_cast_columns,
         .pg_transform => &pg_transform_columns,
         .pg_language => &pg_language_columns,
@@ -352,7 +391,7 @@ pub fn viewColumns(view: View) []const ViewColumn {
 pub fn findView(schema: ?[]const u8, name: []const u8) ?View {
     const catalog_views = [_]View{ .pg_type, .pg_enum, .pg_namespace, .pg_am, .pg_collation, .pg_class, .pg_settings, .pg_attribute, .pg_index, .pg_constraint, .pg_depend, .pg_statistic_ext, .pg_attrdef, .pg_sequence, .pg_indexes, .pg_views, .pg_matviews, .pg_inherits, .pg_proc, .pg_trigger, .pg_rewrite, .pg_rules,
         .pg_tablespace, .pg_foreign_table, .pg_roles, .pg_authid, .pg_auth_members, .pg_policy, .pg_policies, .pg_description, .pg_shdescription, .pg_foreign_data_wrapper, .pg_foreign_server, .pg_publication, .pg_publication_rel, .pg_publication_namespace, .pg_extension, .pg_tables,
-        .pg_init_privs, .pg_cast, .pg_transform, .pg_language, .pg_operator, .pg_opclass, .pg_opfamily, .pg_ts_parser, .pg_ts_template, .pg_ts_dict, .pg_ts_config, .pg_default_acl, .pg_conversion };
+        .pg_init_privs, .pg_cast, .pg_transform, .pg_language, .pg_operator, .pg_opclass, .pg_opfamily, .pg_ts_parser, .pg_ts_template, .pg_ts_dict, .pg_ts_config, .pg_default_acl, .pg_conversion, .pg_range };
     const information_views = [_]View{ .schemata, .tables, .columns, .table_constraints, .key_column_usage, .table_privileges };
     const qualified = schema orelse {
         for (catalog_views) |view| if (types.same(@tagName(view), name)) return view;
@@ -375,6 +414,7 @@ pub const bootstrap_relations = [_]struct { view: View, oid: u32 }{
     .{ .view = .pg_init_privs, .oid = 3394 }, .{ .view = .pg_transform, .oid = 3576 },
     .{ .view = .pg_default_acl, .oid = 826 },
     .{ .view = .pg_conversion, .oid = 2607 },
+    .{ .view = .pg_range, .oid = 3541 },
     .{ .view = .pg_operator, .oid = 2617 },
     .{ .view = .pg_opclass, .oid = 2616 }, .{ .view = .pg_opfamily, .oid = 2753 },
     .{ .view = .pg_ts_parser, .oid = 3601 },

@@ -229,6 +229,18 @@ fn conversionDiscovery() !void {
     try expect("SELECT 'pg_catalog.pg_conversion'::regclass::oid, count(*) FROM pg_catalog.pg_conversion", "2607|0");
 }
 
+fn rangeDiscovery() !void {
+    try expect("SELECT 'pg_catalog.pg_range'::regclass::oid", "3541");
+    try expect("SELECT r.tableoid,r.rngtypid,r.rngsubtype,r.rngmultitypid,c.opcname,r.rngcanonical,r.rngsubdiff "
+        ++ "FROM pg_range r JOIN pg_opclass c ON c.oid=r.rngsubopc ORDER BY r.rngtypid",
+        "3541|3904|23|4451|int4_ops|int4range_canonical|-;3541|3906|1700|4532|numeric_ops|-|-;"
+        ++ "3541|3908|1114|4533|timestamp_ops|-|-;3541|3910|1184|4534|timestamptz_ops|-|-;"
+        ++ "3541|3912|1082|4535|date_ops|daterange_canonical|-;3541|3926|20|4536|int8_ops|int8range_canonical|-");
+    try expect("SELECT c.castsource,c.casttarget FROM (VALUES (3904::oid,4451::oid),(3904::oid,4532::oid)) "
+        ++ "AS c(castsource,casttarget) WHERE NOT EXISTS (SELECT 1 FROM pg_range r "
+        ++ "WHERE c.castsource=r.rngtypid AND c.casttarget=r.rngmultitypid)", "3904|4532");
+}
+
 fn lifecycle() !void {
     try run("CREATE TABLE a (id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY, amount NUMERIC(10,2), at TIMESTAMPTZ(3), doc JSONB, label TEXT DEFAULT 'd', n INTEGER DEFAULT 2 + 3)");
     try expect(public_tables, "a");
@@ -377,6 +389,7 @@ pub fn main(init: std.process.Init) !void {
     try foreignWrapperDiscovery();
     try defaultAclDiscovery();
     try conversionDiscovery();
+    try rangeDiscovery();
     try lifecycle();
     try replay();
     try characterMetadata();
