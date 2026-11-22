@@ -673,16 +673,14 @@ pub const VideoChannel = struct {
 
     pub fn open(c: *VideoChannel, g: *Gpu, e: nv.VideoEngine) Error!void {
         c.* = .{ .gpu = g, .engine = e };
-        // (the video contexts' data and submissions are driver 592's, a
-        // host that schedules in hardware; a legacy host's (576's) are not
-        // traced yet. Through WSL the RTX 2080 Ti's host refused such a
-        // context; through its Hyper-V partition it made one, refused its
-        // first submission, and then every context after: not tried there)
-        if (g.legacy) return error.Refused;
+        // (the context's data is the same on both hosts traced; its node is
+        // not: a legacy host's (576's) decoder is node 8, not 592's 1. A
+        // decoder context on node 1 there took its first submission for
+        // invalid, and the host refused every context after it)
         nv.videoContext(&c.ctx_data, e);
         var cc = kmt.CreateContextVirtual{
             .device = g.device,
-            .node_ordinal = nv.videoNode(e),
+            .node_ordinal = nv.videoNodeOn(e, g.legacy),
             .flags = 0,
             .priv = @intFromPtr(&c.ctx_data),
             .priv_size = nv.VIDEO_CONTEXT_BYTES,
@@ -698,7 +696,8 @@ pub const VideoChannel = struct {
         nv.videoSubmit(&c.submit_data, va, dwords);
         var s = kmt.SubmitCommand{
             .command_buffer = va,
-            .command_length = dwords * 4,
+            // (576's: the private data's size, as NVIDIA's encoder gives it)
+            .command_length = if (c.gpu.legacy) nv.VIDEO_SUBMIT_BYTES else dwords * 4,
             .broadcast_context_count = 1,
             .priv = @intFromPtr(&c.submit_data),
             .priv_size = nv.VIDEO_SUBMIT_BYTES,

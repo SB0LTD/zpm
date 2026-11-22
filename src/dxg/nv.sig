@@ -124,6 +124,20 @@ pub fn videoNode(e: VideoEngine) u32 {
         .encoder => 5,
     };
 }
+
+/// Their nodes on a host whose GPU's work Windows schedules in software
+/// (`legacy`): the RTX 2080 Ti's, NVIDIA's driver 576.28, where ffmpeg's
+/// h264_nvenc made the decoder's context (engine 0) on node 8 and the
+/// encoder's on node 5 (traced 2026-11-22); the same context data and
+/// submissions as 592's. (The host's node metadata query, which would name
+/// each node's engine, is not answered there.)
+pub fn videoNodeOn(e: VideoEngine, legacy: bool) u32 {
+    if (!legacy) return videoNode(e);
+    return switch (e) {
+        .decoder => 8,
+        .encoder => 5,
+    };
+}
 pub const VIDEO_SUBCH: u32 = 4;
 pub const VIDEO_CONTEXT_BYTES = 3569;
 
@@ -327,6 +341,37 @@ test "a legacy submission's data is cudaprobe's on driver 576 (one entry, 6 dwor
     try testing.expectEqual(@as(u32, 1), word(&b, 0x18));
     try testing.expectEqual(@as(u32, 0x0220_0000), word(&b, 0x354));
     try testing.expectEqual(@as(u32, 0x1802), word(&b, 0x358));
+}
+
+test "the video contexts and submissions are h264_nvenc's on driver 576 (its decoder and encoder contexts, a decoder submission)" {
+    // (2026-11-22, this PC's RTX 2080 Ti: the decoder's context on node 8,
+    // the encoder's on node 5; every nonzero dword of each)
+    for ([_]VideoEngine{ .decoder, .encoder }) |e| {
+        var b: [VIDEO_CONTEXT_BYTES]u8 = undefined;
+        videoContext(&b, e);
+        const want = [_][2]u32{
+            .{ 0, MAGIC },          .{ 4, 0x10004 },                            .{ 8, 0xdf1 },          .{ 0xc, MAGIC2 },
+            .{ 0x10, 5 },           .{ 0x14, 0x400f },                          .{ 0x1c, 0x200 },       .{ 0x20, 0x8000_0000 | @as(u32, @intFromEnum(e)) },
+            .{ 0xdc0, 0xffffff00 }, .{ 0xdc4, 0xffffffff },                     .{ 0xdd4, 0xffffffff }, .{ 0xdd8, 0xff },
+        };
+        var nonzero: usize = 0;
+        var off: usize = 0;
+        while (off + 4 <= b.len) : (off += 4) nonzero += @intFromBool(word(&b, off) != 0);
+        for (want) |w| try testing.expectEqual(w[1], word(&b, w[0]));
+        try testing.expectEqual(@as(usize, 15), nonzero);
+    }
+    try testing.expectEqual(@as(u32, 8), videoNodeOn(.decoder, true));
+    try testing.expectEqual(@as(u32, 5), videoNodeOn(.encoder, true));
+    try testing.expectEqual(@as(u32, 1), videoNodeOn(.decoder, false));
+    // the decoder's first submission: 32 dwords at 0xf_0002_8000
+    var s: [VIDEO_SUBMIT_BYTES]u8 = undefined;
+    videoSubmit(&s, 0xf_0002_8000, 32);
+    const want = [_][2]u32{ .{ 0, MAGIC }, .{ 4, 0x10004 }, .{ 0xc, 0x354 }, .{ 0x14, 1 }, .{ 0x18, 2 }, .{ 0x1c, 8 }, .{ 0x358, 4 }, .{ 0x35c, 0x0002_8000 }, .{ 0x360, 0x820f } };
+    var nonzero: usize = 0;
+    var off: usize = 0;
+    while (off + 4 <= s.len) : (off += 4) nonzero += @intFromBool(word(&s, off) != 0);
+    for (want) |w| try testing.expectEqual(w[1], word(&s, w[0]));
+    try testing.expectEqual(want.len, nonzero);
 }
 
 test "a submission's data" {
