@@ -946,6 +946,33 @@ fn serialColumns() !void {
     try sameState(&sequence_probes);
 }
 
+fn sequenceOwnership() !void {
+    reset();
+    try run("CREATE SCHEMA src");
+    try run("CREATE SCHEMA dst");
+    try run("CREATE TABLE src.items (id SERIAL, n INT)");
+    try run("CREATE TABLE dst.items (id SERIAL, n INT)");
+    try run("INSERT INTO src.items(n) VALUES (10)");
+    try run("INSERT INTO dst.items(n) VALUES (20)");
+    try run("CREATE SEQUENCE src.ticket START WITH 21");
+    const registered = "SELECT pg_get_serial_sequence('src.items','n')";
+    const abandoned = try db.begin();
+    try statement(abandoned, "ALTER SEQUENCE src.ticket OWNED BY src.items.n");
+    db.abort(abandoned);
+    try expect(registered, "NULL");
+    try rejects("ALTER SEQUENCE src.ticket OWNED BY dst.items.n", error.InvalidParameterValue, registered, "NULL");
+    try run("ALTER SEQUENCE src.ticket OWNED BY src.items.n CACHE 2");
+    try expect(registered, "src.ticket");
+    try expect("SELECT pg_get_serial_sequence('src.items','id'),pg_get_serial_sequence('dst.items','id')", "src.items_id_seq|dst.items_id_seq");
+    try sameState(&.{ registered, "SELECT id,n FROM src.items", "SELECT id,n FROM dst.items" });
+    try run("ALTER SEQUENCE src.ticket OWNED BY NONE");
+    try expect(registered, "NULL");
+    try run("DROP TABLE src.items");
+    const count = "SELECT count(*) FROM pg_class WHERE relkind='S'";
+    try expect(count, "2");
+    try sameState(&.{ count, "SELECT last_value FROM src.ticket" });
+}
+
 var session_a: DB.SequenceSession = .{};
 var session_b: DB.SequenceSession = .{};
 
@@ -1018,7 +1045,8 @@ fn alterSequences() !void {
     try rejects("ALTER SEQUENCE tdd_seq RESTART WITH 41", error.InvalidParameterValue, "SELECT seqmax FROM pg_sequence WHERE seqrelid = 'tdd_seq'::regclass", "40");
     try rejects("ALTER SEQUENCE missing RESTART", error.TableNotFound, "SELECT COUNT(*) FROM pg_sequence", "2");
     try rejects("ALTER SEQUENCE tdd_serial RESTART", error.WrongObjectType, "SELECT COUNT(*) FROM pg_sequence", "2");
-    try rejects("ALTER SEQUENCE tdd_seq OWNED BY NONE", error.UnsupportedStatement, "SELECT COUNT(*) FROM pg_sequence", "2");
+    try run("ALTER SEQUENCE tdd_seq OWNED BY NONE");
+    try expect("SELECT COUNT(*) FROM pg_sequence", "2");
     try rejects("ALTER SEQUENCE tdd_seq INCREMENT BY 0", error.InvalidParameterValue, "SELECT seqincrement FROM pg_sequence WHERE seqrelid = 'tdd_seq'::regclass", "5");
     try sameState(&sequence_probes);
     try check(try int(&replica, "SELECT nextval('tdd_seq')") == 30);
@@ -1479,6 +1507,7 @@ pub fn main(init: std.process.Init) !void {
     try alterTransactions();
     try alterIsolation();
     try serialColumns();
+    try sequenceOwnership();
     try sequenceCache();
     try alterSequences();
     try updateFrom();

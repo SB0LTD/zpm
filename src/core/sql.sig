@@ -931,7 +931,7 @@ pub fn Database(comptime config: Config) type {
 
         pub const AlterRecord = struct {
             fold_created_primary: bool = false,
-            adds_identity: bool = false,
+            foldable_defaults: bool = false,
             sources: [config.columns]u8 = @splat(0),
             fills: [config.columns]V.Cell = @splat(.null_value),
         };
@@ -1192,27 +1192,9 @@ pub fn Database(comptime config: Config) type {
                         continue;
                     }
                     const view = &tables[found.slot];
-                    const parsed = try appendQuery(workspace, &length, source, view.query.slice());
-                    // View columns keep the names CREATE VIEW gave them.
-                    const top = &pool.queries[parsed];
-                    if (top.set_op == .none) {
-                        var star = false;
-                        for (top.targets[0..top.count]) |*output| star = star or output.star;
-                        if (!star and top.count == view.column_count) {
-                            for (top.targets[0..top.count], view.columns[0..top.count]) |*output, *column| {
-                                const label = column.name.slice();
-                                if (label.len + 3 > workspace.expansion.len - length) return error.TextCapacity;
-                                workspace.expansion[length] = ' ';
-                                workspace.expansion[length + 1] = '"';
-                                @memcpy(workspace.expansion[length + 2 ..][0..label.len], label);
-                                workspace.expansion[length + 2 + label.len] = '"';
-                                output.alias = .{ .span = .{ .start = length + 2, .len = label.len }, .quoted = true, .len = label.len };
-                                length += label.len + 3;
-                            }
-                        }
-                    }
-                    item.query = parsed;
+                    item.query = try appendQuery(workspace, &length, source, view.query.slice());
                     item.view = true;
+                    item.view_table = @intCast(found.slot);
                     if (item.alias == null) item.alias = item.name;
                     q.from = null;
                     pool.complex = true;
@@ -3087,7 +3069,7 @@ pub fn Database(comptime config: Config) type {
                 },
                 .drop_table => |index| try self.dropTable(slot, index, false, snap),
                 .create_sequence => |*create| blk: {
-                    try self.createSequence(slot, create.namespace, create.name, create.spec, 0, 0, snap);
+                    try self.createSequence(slot, create.namespace, create.name, create.spec, 0, 0, false, snap);
                     break :blk 0;
                 },
                 .drop_sequence => |index| blk: {
@@ -3154,7 +3136,7 @@ pub fn Database(comptime config: Config) type {
                     break :blk 0;
                 },
                 .alter_sequence => |*alter| blk: {
-                    try self.alterSequence(slot, alter.slot, alter.options, snap);
+                    try self.alterSequence(slot, alter.slot, alter.options, alter.ownership, snap);
                     break :blk 0;
                 },
                 .create_schema => |name| blk: {
@@ -5469,7 +5451,7 @@ pub fn Database(comptime config: Config) type {
             return error.UndefinedSchema;
         }
 
-        fn createSequence(self: *Self, slot: u16, namespace: u32, name: Name, spec: sequence_module.Spec, owner: u32, owner_column: u8, snap: Snapshot) Error!void {
+        fn createSequence(self: *Self, slot: u16, namespace: u32, name: Name, spec: sequence_module.Spec, owner: u32, owner_column: u8, serial: bool, snap: Snapshot) Error!void {
             try self.checkNamespaceForCreate(slot, namespace);
             const tx = &self.txs[slot];
             if (self.catalog.creatorIn(namespace, name.slice(), snap)) |other| {
@@ -5502,7 +5484,7 @@ pub fn Database(comptime config: Config) type {
             seq.pending_create = true;
             seq.creator = slot;
             self.oid_counter += 1;
-            tx.push(.{ .kind = .create_sequence, .table = @intCast(index) }) catch unreachable;
+            tx.push(.{ .kind = .create_sequence, .table = @intCast(index), .new = @intFromBool(serial) }) catch unreachable;
             var changes: [K.max_changes]K.Change = undefined;
             const count = try self.catalog.createSequence(index, seq, tx.ref(slot), snap.cid, 0, self.horizon(), &changes);
             for (changes[0..count]) |change| tx.push(.{ .kind = .catalog_insert, .table = @intFromEnum(change.relation), .new = change.version }) catch unreachable;
@@ -5550,7 +5532,7 @@ pub fn Database(comptime config: Config) type {
         /// this transaction, as ALTER TABLE does. Other sessions' nextval
         /// waits for it (PostgreSQL's lock); abort discards the copy. The
         /// own session forgets its cached values.
-        fn alterSequence(self: *Self, slot: u16, index: usize, options: sequence_module.Options, snap: Snapshot) Error!void {
+        fn alterSequence(self: *Self, slot: u16, index: usize, options: sequence_module.Options, ownership: ?sequence_module.Ownership, snap: Snapshot) Error!void {
             const tx = &self.txs[slot];
             const seq = &self.seqs[index];
             if (seq.pending_drop and seq.creator != slot) {
@@ -5560,6 +5542,34 @@ pub fn Database(comptime config: Config) type {
                 return self.park(slot, waits);
             }
             const altered = try sequence_module.alter(seq.spec, seq.last_value, options);
+            if (ownership) |dependency| {
+                var latest = snap;
+                latest.csn = self.csn;
+                if (seq.dead_csn != 0) return error.SerializationFailure;
+                var role: u32 = CO.bootstrap_role;
+                if (seq.owner != 0) {
+                    const origin = self.visibleTableSlot(seq.owner, snap) orelse return error.TableNotFound;
+                    try self.lockTable(slot, origin, .access_share);
+                    if (self.visibleTableSlot(seq.owner, latest) != origin) return error.SerializationFailure;
+                    switch (self.tables[origin].columns[seq.owner_column].default_kind) {
+                        .identity_always, .identity_by_default, .mysql_auto_increment => return error.UnsupportedStatement,
+                        else => {},
+                    }
+                    role = self.catalog_objects.owner(seq.owner, latest);
+                }
+                if (dependency.table != 0) {
+                    const destination = self.visibleTableSlot(dependency.table, snap) orelse return error.TableNotFound;
+                    try self.lockTable(slot, destination, .access_share);
+                    if (self.visibleTableSlot(dependency.table, latest) != destination) return error.SerializationFailure;
+                    if (self.tables[destination].namespace != seq.namespace or
+                        self.catalog_objects.owner(dependency.table, latest) != role)
+                        return error.InvalidParameterValue;
+                    switch (self.tables[destination].columns[dependency.column].default_kind) {
+                        .identity_always, .identity_by_default, .mysql_auto_increment => return error.UnsupportedStatement,
+                        else => {},
+                    }
+                }
+            }
             try self.reserveWrites(slot, 5);
             var destination: ?usize = null;
             for (0..2) |attempt| {
@@ -5574,6 +5584,10 @@ pub fn Database(comptime config: Config) type {
             const copy = &self.seqs[fresh_slot];
             copy.* = seq.*;
             copy.spec = altered.spec;
+            if (ownership) |dependency| {
+                copy.owner = dependency.table;
+                copy.owner_column = dependency.column;
+            }
             // The copy logs again before handing out a value.
             copy.log_cnt = 0;
             if (altered.restart) |value| {
@@ -6089,6 +6103,47 @@ pub fn Database(comptime config: Config) type {
             return .{ .text = text };
         }
 
+        /// A literal nextval default records a normal dependency on the
+        /// sequence. pg_dump uses it to order the default after the sequence.
+        fn defaultSequence(self: *const Self, pool: *A.Pool, column: *const V.Column, snapshot: Snapshot) ?*const Q.Seq {
+            const node_len = pool.len;
+            const query_len = pool.query_len;
+            const window_len = pool.window_len;
+            const complex = pool.complex;
+            defer {
+                pool.len = node_len;
+                pool.query_len = query_len;
+                pool.window_len = window_len;
+                pool.complex = complex;
+            }
+            const source = column.expression.slice();
+            const id = P.parseExpressionAt(source, 0, source.len, pool) catch return null;
+            const call = &pool.nodes[id];
+            if (call.kind != .function or call.b == ast.none or
+                !types.same(identName(source, call.name).slice(), "nextval") or
+                (call.qualifier.len != 0 and !types.same(identName(source, call.qualifier).slice(), "pg_catalog"))) return null;
+            const argument = &pool.nodes[call.b];
+            if (argument.next != ast.none) return null;
+            const literal = if (argument.kind == .cast and argument.typmod == ast.regclass_typmod)
+                &pool.nodes[argument.a]
+            else
+                argument;
+            if (literal.kind != .text_literal) return null;
+            const text = E.literalText(source, literal.text);
+            const raw = text.slice();
+            const separator = regclassSeparator(raw);
+            const whitespace = " \t\r\n";
+            const schema = if (separator) |dot|
+                namespaceIdentifier(std.mem.trim(u8, raw[0..dot], whitespace)) catch return null
+            else
+                null;
+            const offset = if (separator) |dot| dot + 1 else 0;
+            const name = namespaceIdentifier(std.mem.trim(u8, raw[offset..], whitespace)) catch return null;
+            const namespace = namespaceFor(&self.catalog, if (schema) |qualifier| qualifier.slice() else null, snapshot) orelse return null;
+            const found = self.catalog.findIn(namespace, name.slice(), snapshot) orelse return null;
+            return if (found.kind == 'S') &self.seqs[found.slot] else null;
+        }
+
         fn numericPrecision(column: *const V.Column) [3]?i64 {
             return switch (column.data_type) {
                 .smallint => .{ 16, 2, 0 },
@@ -6310,8 +6365,7 @@ pub fn Database(comptime config: Config) type {
                     if (seq.owner_column >= owner.column_count) continue;
                     const kind: u8 = switch (owner.columns[seq.owner_column].default_kind) {
                         .identity_always, .identity_by_default => 'i',
-                        .default => 'a',
-                        else => continue,
+                        else => 'a',
                     };
                     try dependencyRow(sink, relation, seq.oid, relation, owner.oid, @as(i64, seq.owner_column) + 1, kind);
                     continue;
@@ -6339,6 +6393,9 @@ pub fn Database(comptime config: Config) type {
                             if (yes and field != number) try dependencyRow(sink, catalog_module.attrdef_catalog,
                                 column.default_oid, relation, table.oid, @intCast(field), 'n');
                         }
+                    } else if (self.defaultSequence(pool, column, snapshot)) |seq| {
+                        try dependencyRow(sink, catalog_module.attrdef_catalog, column.default_oid,
+                            relation, seq.oid, 0, 'n');
                     }
                 }
                 if (S.keyed(table) and table.primary_constraint_oid != 0) {
@@ -6752,7 +6809,14 @@ pub fn Database(comptime config: Config) type {
                                     });
                                 },
                                 .pg_attrdef => if (has_expression) {
-                                    try sink.add(&.{ intCell(oid), intCell(attnum), expressionTextWithPool(pool,column), intCell(column.default_oid) });
+                                    var expression = expressionTextWithPool(pool, column);
+                                    if (kind == .default and !session_values.public_schema_on_path) {
+                                        if (self.defaultSequence(pool, column, snapshot)) |seq| {
+                                            if (seq.namespace == catalog_module.public_namespace)
+                                                expression = .{ .text = try B.serialDefault("public", seq.name) };
+                                        }
+                                    }
+                                    try sink.add(&.{ intCell(oid), intCell(attnum), expression, intCell(column.default_oid) });
                                 },
                                 .columns => {
                                     const numeric = numericPrecision(column);
@@ -6980,6 +7044,41 @@ pub fn Database(comptime config: Config) type {
             return null;
         }
 
+        const ViewAliasEdit = struct { start: usize, end: usize, column: usize };
+
+        /// Projection aliases can be replaced directly where no clause
+        /// resolves names against the SELECT list. Keep the raw expressions
+        /// and FROM items so dependent views retain their original shape.
+        fn viewAliasEdits(source: []const u8, pool: *const A.Pool, root: *const A.Select, view: *const S.Table, edits: *[config.columns]ViewAliasEdit) usize {
+            if (root.set_op != .none or root.values != ast.none or root.count != view.column_count or
+                root.order_count != 0 or root.group_count != 0 or root.grouping_sets != ast.none or
+                root.distinct_on_count != 0)
+                return 0;
+            for (root.targets[0..root.count]) |projection| {
+                if (projection.star or projection.expression_end == 0) return 0;
+            }
+            var count: usize = 0;
+            for (root.targets[0..root.count], view.columns[0..view.column_count], 0..) |projection, *column, index| {
+                const node = &pool.nodes[projection.expr];
+                if (projection.alias) |alias| {
+                    if (std.mem.eql(u8, identName(source, alias).slice(), column.name.slice())) continue;
+                    const quote: usize = @intFromBool(alias.quoted);
+                    edits[count] = .{ .start = alias.span.start - quote, .end = alias.span.start + alias.span.len + quote, .column = index };
+                } else {
+                    const matches = switch (node.kind) {
+                        .column => std.mem.eql(u8, identName(source, node.name).slice(), column.name.slice()),
+                        .int_literal, .decimal_literal, .text_literal, .bool_literal, .null_literal, .binary =>
+                        std.mem.eql(u8, "?column?", column.name.slice()),
+                        else => continue,
+                    };
+                    if (matches) continue;
+                    edits[count] = .{ .start = projection.expression_end, .end = projection.expression_end, .column = index };
+                }
+                count += 1;
+            }
+            return count;
+        }
+
         fn postgresViewDefinition(ptr: *anyopaque, oid: u32, _: bool, out: []u8) Error!?usize {
             const self: *Self = @ptrCast(@alignCast(ptr));
             const slot = self.visibleTableSlot(oid, self.seq_snap) orelse return null;
@@ -6997,9 +7096,9 @@ pub fn Database(comptime config: Config) type {
                 pool.window_len = window_len;
                 pool.complex = complex;
             }
-            _ = try P.parseQueryAt(source, 0, source.len, pool);
+            const root = try P.parseQueryAt(source, 0, source.len, pool);
             const blocks = pool.queries[query_len..pool.query_len];
-            var qualify: std.StaticBitSet(config.text_bytes) = .empty;
+            var changes: std.StaticBitSet(config.text_bytes + 1) = .empty;
             for (blocks) |*block| for (block.items[0..block.item_count]) |*item| {
                 if (item.schema != null or item.query != ast.none or item.function != ast.none or item.name.len == 0) continue;
                 const name = identName(source, item.name);
@@ -7016,17 +7115,32 @@ pub fn Database(comptime config: Config) type {
                 const dependency = self.tables[relation.slot].oid;
                 for (view.depends[0..view.depend_count]) |oid_ref| {
                     if (oid_ref != dependency) continue;
-                    qualify.set(item.name.span.start - @intFromBool(item.name.quoted));
+                    changes.set(item.name.span.start - @intFromBool(item.name.quoted));
                     break;
                 }
             };
+            var aliases: [config.columns]ViewAliasEdit = undefined;
+            const alias_count = viewAliasEdits(source, pool, &pool.queries[root], view, &aliases);
+            for (aliases[0..alias_count]) |edit| changes.set(edit.start);
             var text: CatalogTextWriter = .{ .out = out };
             var start: usize = 0;
-            var positions = qualify.iterator(.{});
+            var alias_index: usize = 0;
+            var positions = changes.iterator(.{});
             while (positions.next()) |position| {
                 text.add(source[start..position]);
-                text.add("public.");
                 start = position;
+                if (alias_index < alias_count and aliases[alias_index].start == position) {
+                    const edit = aliases[alias_index];
+                    if (edit.start == edit.end) text.add(" AS ");
+                    text.ident(view.columns[edit.column].name.slice());
+                    if (edit.start == edit.end and edit.end < source.len and
+                        (types.digit(source[edit.end]) or types.lower(source[edit.end]) >= 'a' and types.lower(source[edit.end]) <= 'z'))
+                        text.add(" ");
+                    start = edit.end;
+                    alias_index += 1;
+                } else {
+                    text.add("public.");
+                }
             }
             text.add(source[start..]);
             text.add("\n;");
@@ -7515,8 +7629,13 @@ pub fn Database(comptime config: Config) type {
                 var ownership: O.Object = .{ .kind = .relation, .target = table.oid, .owner = creator };
                 _ = try self.objectInsert(slot, &ownership, false, snap);
             }
-            if (create.identity) |identity| try self.createSequence(slot, table.namespace, identity.name, identity.spec, table.oid, identity.column, snap);
-            for (create.serials[0..create.serial_count]) |serial| try self.createSequence(slot, table.namespace, serial.name, serial.spec, table.oid, serial.column, snap);
+            // Keep identity sequences ahead of SERIAL in the OID order.
+            for ([_]bool{ false, true }) |serial| {
+                for (create.sequences[0..create.sequence_count]) |seq| {
+                    if ((table.columns[seq.column].default_kind == .default) == serial)
+                        try self.createSequence(slot, table.namespace, seq.name, seq.spec, table.oid, seq.column, serial, snap);
+                }
+            }
             const generated_context = self.bindContext("", .standard, snap);
             try B.validateGenerated(&generated_context, index);
             try B.validateConstraints(&generated_context, index);
@@ -7704,7 +7823,7 @@ pub fn Database(comptime config: Config) type {
                         owned[position] = true;
                     }
                 }
-                for (owned, 0..) |restart, position| if (restart) try self.alterSequence(slot, position, .{ .restart = true }, snap);
+                for (owned, 0..) |restart, position| if (restart) try self.alterSequence(slot, position, .{ .restart = true }, null, snap);
             }
             try self.reserveWrites(slot, truncate.count);
             for (truncate.tables[0..truncate.count]) |index| try self.truncateSlot(slot, index, snap, .truncate);
@@ -7733,24 +7852,27 @@ pub fn Database(comptime config: Config) type {
             var fold_created_primary = false;
             if (late_primary) {
                 const tx = &self.txs[slot];
+                var fresh_definition: ?usize = null;
                 for (tx.writes[0..tx.write_len]) |entry| switch (entry.kind) {
                     .create_table => if (self.tables[entry.table].oid == source.oid) {
-                        fold_created_primary = true;
+                        fresh_definition = entry.table;
                     },
                     .insert => {
-                        if (self.tables[entry.table].oid == source.oid and (!fold_created_primary or entry.table != alter.table))
+                        if (self.tables[entry.table].oid == source.oid and fresh_definition != entry.table)
                             return error.UnsupportedStatement;
                     },
                     .alter_table => {
-                        if (self.tables[entry.table].oid == source.oid and
-                            (!fold_created_primary or entry.table != alter.table or !self.alters[entry.table].adds_identity))
+                        if (self.tables[entry.table].oid != source.oid) continue;
+                        if (fresh_definition != entry.old or !self.alters[entry.table].foldable_defaults)
                             return error.UnsupportedStatement;
+                        fresh_definition = entry.table;
                     },
                     .update, .delete, .truncate, .refresh_rows, .drop_table => {
                         if (self.tables[entry.table].oid == source.oid) return error.UnsupportedStatement;
                     },
                     else => {},
                 };
+                fold_created_primary = fresh_definition == alter.table;
             }
             if (!types.same(alter.name.slice(), source.name.slice())) {
                 try self.checkRelationTypeName(slot, source.namespace, alter.name.slice(), snap);
@@ -7797,7 +7919,7 @@ pub fn Database(comptime config: Config) type {
             source.pending_drop = true;
             self.alters[index] = .{
                 .fold_created_primary = fold_created_primary,
-                .adds_identity = alter.identity != null,
+                .foldable_defaults = alter.identity != null or alter.sets_defaults,
                 .sources = alter.sources,
                 .fills = fills,
             };
@@ -7825,7 +7947,7 @@ pub fn Database(comptime config: Config) type {
             }
             try self.remapColumnComments(slot, source.oid, alter.sources[0..alter.count], snap);
             try self.remapStatistics(slot, source.oid, alter.sources[0..alter.count], snap);
-            if (alter.identity) |identity| try self.createSequence(slot, copy.namespace, identity.name, identity.spec, copy.oid, identity.column, snap);
+            if (alter.identity) |identity| try self.createSequence(slot, copy.namespace, identity.name, identity.spec, copy.oid, identity.column, false, snap);
         }
 
         /// Existing rows against the constraints ALTER TABLE added or
@@ -9430,7 +9552,7 @@ pub fn Database(comptime config: Config) type {
                 if (entry.kind != .alter_table or entry.old != previous) continue;
                 const change = &self.alters[entry.table];
                 if (change.fold_created_primary) return &self.tables[entry.table];
-                if (!change.adds_identity) break;
+                if (!change.foldable_defaults) break;
                 previous = entry.table;
             }
             return source;
@@ -9454,19 +9576,24 @@ pub fn Database(comptime config: Config) type {
                     },
                     .create_table => try C.encodeCreate(writer, self.createForWal(entry.table, tx.writes[0..tx.write_len])),
                     .drop_table => try C.encodeDrop(writer, self.tables[entry.table].oid),
-                    .create_sequence => try C.encodeCreateSequence(writer, &self.seqs[entry.table]),
+                    .create_sequence => try C.encodeCreateSequence(writer, &self.seqs[entry.table], entry.new != 0),
                     .drop_sequence => try C.encodeDropSequence(writer, self.seqs[entry.table].oid),
                     .truncate, .refresh_rows => try C.encodeTruncate(writer, self.tables[entry.table].oid),
-                    .alter_sequence => try C.encodeAlterSequence(writer, &self.seqs[entry.table]),
+                    .alter_sequence => {
+                        const seq = &self.seqs[entry.table];
+                        const previous = &self.seqs[entry.old];
+                        const ownership_changed = seq.owner != previous.owner or seq.owner_column != previous.owner_column;
+                        try C.encodeAlterSequence(writer, seq, ownership_changed);
+                    },
                     .create_schema => try C.encodeCreateSchema(writer, &self.schemas[entry.table]),
                     .drop_schema => try C.encodeDropSchema(writer, self.schemas[entry.table].oid),
                     .alter_table => {
                         const alter = &self.alters[entry.table];
                         if (alter.fold_created_primary) continue;
                         const table = &self.tables[entry.table];
-                        // The fresh CREATE record already carries the identity
-                        // definition when a later primary key folded into it.
-                        if (alter.adds_identity and self.createForWal(entry.table, tx.writes[0..tx.write_len]) != table) continue;
+                        // The fresh CREATE carries these defaults if a later
+                        // primary key was folded into the definition.
+                        if (alter.foldable_defaults and self.createForWal(entry.table, tx.writes[0..tx.write_len]) != table) continue;
                         try C.encodeAlter(writer, table, alter.sources[0..table.column_count], alter.fills[0..table.column_count]);
                     },
                     .catalog_insert, .catalog_delete => {},

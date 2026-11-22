@@ -46,6 +46,7 @@ pub fn Parser(comptime config: types.Config) type {
         const Self = @This();
         tokens: lexer.Tokenizer,
         current: Token = .{},
+        previous_end: usize = 0,
         /// One-token lookahead cache: the token after current and the
         /// tokenizer state after it.
         peeked: Token = .{},
@@ -180,6 +181,7 @@ pub fn Parser(comptime config: types.Config) type {
         }
 
         fn advance(self: *Self) Error!void {
+            self.previous_end = self.current.end + self.current.suffix;
             if (self.current.dialectQuotedIdentifier(self.source))
                 self.last_native_syntax = self.current.start - 1;
             if (self.has_peek) {
@@ -471,8 +473,7 @@ pub fn Parser(comptime config: types.Config) type {
                 if (try self.takeWord("SEQUENCE")) {
                     var out: Ast.AlterSequence = .{ .if_exists = try self.ifExists() };
                     out.name = try self.qualifiedName();
-                    try self.sequenceOptions(&out.options);
-                    // OWNED BY, RENAME TO, SET SCHEMA ... are outside the subset.
+                    try self.sequenceOptions(&out.options, &out.owned_by);
                     if (self.current.kind != .end and !self.isSymbol(.semicolon)) return error.UnsupportedStatement;
                     try self.finish();
                     return .{ .alter_sequence = out };
@@ -812,7 +813,7 @@ pub fn Parser(comptime config: types.Config) type {
                                 try self.expectWord("NAME");
                                 identity.name = try self.qualifiedName();
                             }
-                            try self.sequenceOptions(&identity.options);
+                            try self.sequenceOptions(&identity.options, null);
                             try self.expectSymbol(.rparen);
                         }
                         try pushAction(&out, action);
@@ -1837,7 +1838,7 @@ pub fn Parser(comptime config: types.Config) type {
         }
 
         /// Sequence options (CREATE SEQUENCE and identity specifications).
-        fn sequenceOptions(self: *Self, out: *sequence.Options) Error!void {
+        fn sequenceOptions(self: *Self, out: *sequence.Options, ownership: ?*?Ast.SequenceOwner) Error!void {
             var seen:u16=0;
             while (true) {
                 var option:u16=0;
@@ -1896,10 +1897,25 @@ pub fn Parser(comptime config: types.Config) type {
                         // creation skips option validation before resolve().
                         else => 0xffffffff,
                     };
+                } else if (ownership != null and try self.takeRaw("owned")) {
+                    option = 256;
+                    try self.expectWord("BY");
+                    ownership.?.* = try self.sequenceOwner();
                 } else return;
                 if(seen&option!=0) out.duplicate_options=true;
                 seen|=option;
             }
+        }
+
+        fn sequenceOwner(self: *Self) Error!Ast.SequenceOwner {
+            if (try self.takeRaw("none")) return .{};
+            const first = try self.identifier();
+            try self.expectSymbol(.dot);
+            const second = try self.identifier();
+            return if (try self.takeSymbol(.dot))
+                .{ .table = .{ .schema = first, .name = second }, .column = try self.identifier() }
+            else
+                .{ .table = .{ .name = first }, .column = second };
         }
 
         fn ifNotExists(self: *Self) Error!bool {
@@ -1911,7 +1927,7 @@ pub fn Parser(comptime config: types.Config) type {
         fn createSequence(self: *Self) Error!Ast.CreateSequence {
             const conditional = try self.ifNotExists();
             var out: Ast.CreateSequence = .{ .name = try self.qualifiedName(), .if_not_exists = conditional };
-            try self.sequenceOptions(&out.options);
+            try self.sequenceOptions(&out.options, null);
             try self.finish();
             return out;
         }
@@ -2163,7 +2179,7 @@ pub fn Parser(comptime config: types.Config) type {
                     if (try self.takeWord("IDENTITY")) {
                         column.default_kind = if (always) .identity_always else .identity_by_default;
                         if (try self.takeSymbol(.lparen)) {
-                            try self.sequenceOptions(&column.sequence);
+                            try self.sequenceOptions(&column.sequence, null);
                             try self.expectSymbol(.rparen);
                         }
                     } else {
@@ -3098,6 +3114,7 @@ pub fn Parser(comptime config: types.Config) type {
                                 if (types.same(name, "unnest")) self.pool.complex = true;
                             }
                         }
+                        target.expression_end = self.previous_end;
                         target.alias = try self.bareAlias();
                     }
                 }

@@ -45,22 +45,20 @@ pub fn Binder(comptime config: types.Config) type {
         /// INTEGER outside the PostgreSQL dialect and in legacy replay.
         pub const integer_type: types.DataType = if (config.integer_bits == 32) .integer32 else .integer;
 
-        /// An identity column's owned sequence `<table>_<column>_seq`.
-        pub const Identity = struct { column: u8, name: V.Name, spec: sequence.Spec };
+        /// A column-owned sequence created with its table definition.
+        pub const OwnedSequence = struct { column: u8, name: V.Name, spec: sequence.Spec };
 
         pub const Create = struct {
             name: V.Name,
             columns: [config.columns]V.Column,
             count: usize,
-            identity: ?Identity = null,
             /// CHECK / UNIQUE / named or composite PRIMARY KEY, named.
             constraints: [config.table_constraints]S.Constraint = undefined,
             constraint_count: usize = 0,
             namespace: u32 = catalog.public_namespace,
             plain_definition: bool = false,
-            /// SERIAL columns' owned sequences, created after the table.
-            serials: [config.columns]Identity = undefined,
-            serial_count: usize = 0,
+            sequences: [config.columns]OwnedSequence = undefined,
+            sequence_count: usize = 0,
             /// Relation kind, indexes (LIKE INCLUDING INDEXES), view query,
             /// inheritance and partitioning.
             extras: S.Extras = .{},
@@ -85,7 +83,7 @@ pub fn Binder(comptime config: types.Config) type {
 
         /// ALTER SEQUENCE target slot and options (resolved against the
         /// sequence's current state when it runs).
-        pub const AlterSequence = struct { slot: usize, options: sequence.Options };
+        pub const AlterSequence = struct { slot: usize, options: sequence.Options, ownership: ?sequence.Ownership = null };
 
         pub const CreateSequence = struct { name: V.Name, namespace: u32, spec: sequence.Spec };
 
@@ -295,6 +293,7 @@ pub fn Binder(comptime config: types.Config) type {
         /// expression) or NULL. Existing rows are re-checked for the flagged
         /// NOT NULL columns and constraints.
         pub const AlterTable = struct {
+            sets_defaults: bool = false,
             table: usize,
             name: V.Name,
             columns: [config.columns]V.Column,
@@ -303,7 +302,7 @@ pub fn Binder(comptime config: types.Config) type {
             constraint_count: usize,
             sources: [config.columns]u8,
             fills: [config.columns]u16 = @splat(none),
-            identity: ?Identity = null,
+            identity: ?OwnedSequence = null,
             check_not_null: [config.columns]bool = @splat(false),
             check_constraint: [config.table_constraints]bool = @splat(false),
             /// Kind, secondary indexes, view and partition definition after
@@ -7001,6 +7000,16 @@ pub fn Binder(comptime config: types.Config) type {
                     const child = try bindPlan(context, item.query, if (item.view) null else parent, if (item.view) null else env, false);
                     rel.plan = child;
                     source.plan = child;
+                    if (item.view_table != none) {
+                        const view = &context.tables[item.view_table];
+                        const child_plan = &plans.items[child];
+                        if (child_plan.count != view.column_count) return error.InvalidColumnReference;
+                        // The stored names belong to the outward relation.
+                        // The inner query binds ORDER BY and GROUP BY first.
+                        for (child_plan.names[0..child_plan.count], view.columns[0..view.column_count]) |*name, *column| {
+                            name.* = column.name;
+                        }
+                    }
                     if (plans.items[child].correlated) plans.items[id].correlated = true;
                 } else if (lookupCte(context, env, item.name)) |cte| {
                     rel.cte = cte;
@@ -7825,9 +7834,8 @@ pub fn Binder(comptime config: types.Config) type {
                     if (create.partition_of) |parent| return bindPartitionOf(context, create, table_name, namespace, parent);
                     if (create.inherits != null and (create.like != null or create.partition_by != .none)) return error.UnsupportedStatement;
                     var out: Create = .{ .name = table_name, .columns = @splat(.{}), .count = create.count, .namespace = namespace, .plain_definition = plain };
-                    // SERIAL's default expression still resolves the unqualified sequence.
                     if (namespace != catalog.public_namespace) for (create.columns[0..create.count]) |*definition| {
-                        if (definition.serial != 0 or definition.default_kind == .mysql_auto_increment) return error.UnsupportedStatement;
+                        if (definition.default_kind == .mysql_auto_increment) return error.UnsupportedStatement;
                     };
                     for (create.columns[0..create.count], 0..) |*definition, index| {
                         var column: V.Column = .{ .name = toName(context, definition.name), .not_null = definition.not_null, .primary_key = definition.primary_key, .typmod = definition.typmod, .default_kind = definition.default_kind, .virtual = definition.virtual };
@@ -7849,14 +7857,17 @@ pub fn Binder(comptime config: types.Config) type {
                             const seq_name = try serialSequence(context, &out, column.name);
                             column.not_null = true;
                             column.default_kind = .default;
-                            column.expression = try serialDefault(seq_name);
-                            out.serials[out.serial_count] = .{ .column = @intCast(index), .name = seq_name, .spec = try sequence.resolve(.{ .type_oid = definition.serial }) };
-                            out.serial_count += 1;
+                            const schema = if (namespace != catalog.public_namespace)
+                                toName(context, create.schema orelse return error.UndefinedSchema)
+                            else
+                                null;
+                            column.expression = try serialDefault(if (schema) |qualifier| qualifier.slice() else null, seq_name);
+                            out.sequences[out.sequence_count] = .{ .column = @intCast(index), .name = seq_name, .spec = try sequence.resolve(.{ .type_oid = definition.serial }) };
+                            out.sequence_count += 1;
                         }
                         switch (definition.default_kind) {
                             .identity_always, .identity_by_default, .mysql_auto_increment => {
                                 if (!integerColumn(column.data_type)) return error.TypeMismatch;
-                                if (out.identity != null) return error.UnsupportedStatement;
                                 if (definition.default_kind == .mysql_auto_increment and
                                     (create.inherits != null or create.like != null or create.partition_by != .none or
                                     (column.data_type != .integer32 and column.data_type != .integer))) return error.UnsupportedStatement;
@@ -7865,7 +7876,11 @@ pub fn Binder(comptime config: types.Config) type {
                                 if (options.type_oid == 0) options.type_oid = types.typeOid(column.data_type);
                                 const seq_name = try identityName(table_name, column.name);
                                 if (context.catalog.findIn(namespace, seq_name.slice(), context.snapshot) != null) return error.TableExists;
-                                out.identity = .{ .column = @intCast(index), .name = seq_name, .spec = try sequence.resolve(options) };
+                                for (out.sequences[0..out.sequence_count]) |other| {
+                                    if (types.same(other.name.slice(), seq_name.slice())) return error.TableExists;
+                                }
+                                out.sequences[out.sequence_count] = .{ .column = @intCast(index), .name = seq_name, .spec = try sequence.resolve(options) };
+                                out.sequence_count += 1;
                             },
                             // Type-checked now; evaluated per row.
                             .default => _ = try bindExpressionText(context, &column, null, -1),
@@ -7885,9 +7900,9 @@ pub fn Binder(comptime config: types.Config) type {
                         out.extras.parent = context.tables[parent_index].oid;
                     }
                     try bindTableConstraints(context, create.constraints[0..create.constraint_count], &out, false);
-                    if (out.identity) |identity| {
-                        const key = &out.columns[identity.column];
-                        if (key.default_kind == .mysql_auto_increment and (!key.primary_key or out.serial_count != 0))
+                    for (out.sequences[0..out.sequence_count]) |seq| {
+                        const key = &out.columns[seq.column];
+                        if (key.default_kind == .mysql_auto_increment and (!key.primary_key or out.sequence_count != 1))
                             return error.InvalidTableDefinition;
                     }
                     if (create.partition_by != .none) {
@@ -8104,7 +8119,18 @@ pub fn Binder(comptime config: types.Config) type {
                         return err;
                     };
                     if (found.kind != 'S') return error.WrongObjectType;
-                    return .{ .alter_sequence = .{ .slot = found.slot, .options = alter.options } };
+                    var bound: AlterSequence = .{ .slot = found.slot, .options = alter.options };
+                    if (alter.owned_by) |owned_by| {
+                        bound.ownership = .{};
+                        if (owned_by.column) |column| {
+                            const target = try resolveRelation(context, owned_by.table.schema, owned_by.table.name);
+                            if (target.kind != 'r' and target.kind != 'p') return error.WrongObjectType;
+                            const table = &context.tables[target.slot];
+                            const index = definitionColumn(table.columns[0..table.column_count], toName(context, column).slice()) orelse return error.ColumnNotFound;
+                            bound.ownership = .{ .table = table.oid, .column = index };
+                        }
+                    }
+                    return .{ .alter_sequence = bound };
                 },
             }
         }
@@ -8112,31 +8138,33 @@ pub fn Binder(comptime config: types.Config) type {
         /// A SERIAL column's sequence `<table>_<column>_seq` (ChooseRelationName
         /// numbering when taken) and its DEFAULT text nextval('name'::regclass).
         fn serialSequence(context: *const Context, out: *const Create, column: V.Name) Error!V.Name {
-            var taken: [config.columns + 1]S.Constraint = undefined;
-            var count: usize = 0;
-            for (out.serials[0..out.serial_count]) |serial| {
-                taken[count] = .{ .name = serial.name };
-                count += 1;
+            var taken: [config.columns]S.Constraint = undefined;
+            for (taken[0..out.sequence_count], out.sequences[0..out.sequence_count]) |*entry, seq| {
+                entry.* = .{ .name = seq.name };
             }
-            if (out.identity) |identity| {
-                taken[count] = .{ .name = identity.name };
-                count += 1;
-            }
-            return chooseName(context, out.name.slice(), column.slice(), "seq", taken[0..count], true);
+            return chooseName(context, out.namespace, out.name.slice(), column.slice(), "seq", taken[0..out.sequence_count], true);
         }
 
-        fn serialDefault(name: V.Name) Error!V.Text {
+        pub fn serialDefault(schema: ?[]const u8, name: V.Name) Error!V.Text {
             var out: V.Text = .{};
             try appendText(&out, "nextval('");
-            var plain = name.len != 0 and !types.digit(name.bytes[0]);
-            for (name.slice()) |byte| {
-                if (!((byte >= 'a' and byte <= 'z') or types.digit(byte) or byte == '_')) plain = false;
+            if (schema) |qualifier| {
+                try appendSerialName(&out, qualifier);
+                try appendText(&out, ".");
             }
-            if (!plain) try appendText(&out, "\"");
-            for (name.slice()) |byte| try appendText(&out, if (byte == '\'') "''" else if (byte == '"') "\"\"" else &[_]u8{byte});
-            if (!plain) try appendText(&out, "\"");
+            try appendSerialName(&out, name.slice());
             try appendText(&out, "'::regclass)");
             return out;
+        }
+
+        fn appendSerialName(out: *V.Text, name: []const u8) Error!void {
+            var plain = name.len != 0 and !types.digit(name[0]);
+            for (name) |byte| {
+                if (!((byte >= 'a' and byte <= 'z') or types.digit(byte) or byte == '_')) plain = false;
+            }
+            if (!plain) try appendText(out, "\"");
+            for (name) |byte| try appendText(out, if (byte == '\'') "''" else if (byte == '"') "\"\"" else &[_]u8{byte});
+            if (!plain) try appendText(out, "\"");
         }
 
         // ---- ALTER TABLE ------------------------------------------------
@@ -8348,6 +8376,10 @@ pub fn Binder(comptime config: types.Config) type {
             for (entry.columns[0..entry.column_count]) |column| if (column.default_kind == .mysql_auto_increment)
                 return error.UnsupportedStatement;
             var out = alterOf(context, index, .alter_table);
+            out.sets_defaults = alter.count != 0;
+            for (alter.actions[0..alter.count]) |*action| {
+                out.sets_defaults = out.sets_defaults and action.* == .set_default;
+            }
             // Inheritance and partition definitions keep their column lists.
             if (entry.parent != 0 or hasChildren(context, entry.oid)) for (alter.actions[0..alter.count]) |*action| switch (action.*) {
                 .add_column, .drop_column, .rename_column => return error.UnsupportedStatement,
@@ -8504,10 +8536,6 @@ pub fn Binder(comptime config: types.Config) type {
                     const column = &out.columns[position];
                     if (!column.not_null or column.default_kind != .none) return error.ObjectNotInPrerequisiteState;
                     if (!integerColumn(column.data_type)) return error.TypeMismatch;
-                    for (out.columns[0..out.count]) |*other| switch (other.default_kind) {
-                        .identity_always, .identity_by_default => return error.UnsupportedStatement,
-                        else => {},
-                    };
                     const name = if (definition.name) |reference| blk: {
                         if (reference.schema) |schema| {
                             if (try qualifierNamespace(context, schema) != entry.namespace) return error.InvalidTableDefinition;
@@ -8639,18 +8667,18 @@ pub fn Binder(comptime config: types.Config) type {
         /// A constraint name already used by this definition, by another
         /// visible table's constraint (PostgreSQL names are per schema) or,
         /// for index-backed kinds, by a relation.
-        fn constraintNameUsed(context: *const Context, table_name: []const u8, taken: []const S.Constraint, name: []const u8, relation: bool) bool {
+        fn constraintNameUsed(context: *const Context, namespace: u32, table_name: []const u8, taken: []const S.Constraint, name: []const u8, relation: bool) bool {
             for (taken) |*constraint| if (types.same(constraint.name.slice(), name)) return true;
             if (relation) {
                 if (types.same(table_name, name)) return true;
-                if (context.catalog.find(name, context.snapshot) != null) return true;
+                if (context.catalog.findIn(namespace, name, context.snapshot) != null) return true;
             }
             var relations: [K.relation_rows]K.Found = undefined;
             const count = context.catalog.visibleRelations(context.snapshot, &relations);
             for (relations[0..count]) |found| {
                 if (found.kind != 'r') continue;
                 const entry = &context.tables[found.slot];
-                if (types.same(entry.name.slice(), table_name)) continue;
+                if (entry.namespace != namespace or types.same(entry.name.slice(), table_name)) continue;
                 for (entry.constraints[0..entry.constraint_count]) |*constraint| if (types.same(constraint.name.slice(), name)) return true;
             }
             return false;
@@ -8658,7 +8686,7 @@ pub fn Binder(comptime config: types.Config) type {
 
         /// ChooseConstraintName / ChooseRelationName: label, then label1,
         /// label2, ... until unused.
-        fn chooseName(context: *const Context, table_name: []const u8, name2: []const u8, label: []const u8, taken: []const S.Constraint, relation: bool) V.Name {
+        fn chooseName(context: *const Context, namespace: u32, table_name: []const u8, name2: []const u8, label: []const u8, taken: []const S.Constraint, relation: bool) V.Name {
             var pass: usize = 0;
             while (true) : (pass += 1) {
                 var buffer: [24]u8 = undefined;
@@ -8678,7 +8706,7 @@ pub fn Binder(comptime config: types.Config) type {
                     length += digits.len - at;
                 }
                 const candidate = objectName(table_name, name2, buffer[0..length]);
-                if (!constraintNameUsed(context, table_name, taken, candidate.slice(), relation)) return candidate;
+                if (!constraintNameUsed(context, namespace, table_name, taken, candidate.slice(), relation)) return candidate;
             }
         }
 
@@ -8803,7 +8831,7 @@ pub fn Binder(comptime config: types.Config) type {
                         var avoid: [2 * config.table_constraints]S.Constraint = undefined;
                         @memcpy(avoid[0..taken.len], taken);
                         @memcpy(avoid[taken.len..][0..named_count], named[0..named_count]);
-                        break :blk chooseName(context, out.name.slice(), name2[0..name2_len], label, avoid[0 .. taken.len + named_count], definition.kind != .check and definition.kind != .foreign);
+                        break :blk chooseName(context, out.namespace, out.name.slice(), name2[0..name2_len], label, avoid[0 .. taken.len + named_count], definition.kind != .check and definition.kind != .foreign);
                     };
                 }
                 if (out.constraint_count == config.table_constraints) return error.ColumnCapacity;
@@ -9057,11 +9085,8 @@ pub fn Binder(comptime config: types.Config) type {
             const at = like.position;
             const shift = source.column_count;
             // Own identity / SERIAL columns after the LIKE position move.
-            if (out.identity) |*identity| if (identity.column >= at) {
-                identity.column += @intCast(shift);
-            };
-            for (out.serials[0..out.serial_count]) |*serial| if (serial.column >= at) {
-                serial.column += @intCast(shift);
+            for (out.sequences[0..out.sequence_count]) |*seq| if (seq.column >= at) {
+                seq.column += @intCast(shift);
             };
             var position = out.count;
             while (position > at) {
@@ -9083,8 +9108,8 @@ pub fn Binder(comptime config: types.Config) type {
                         copy.virtual = false;
                     },
                     .identity_always, .identity_by_default => if (like.identity) {
-                        if (out.identity != null) return error.UnsupportedStatement;
-                        out.identity = .{ .column = @intCast(at + index), .name = try identityName(out.name, copy.name), .spec = try sequence.resolve(.{ .type_oid = types.typeOid(copy.data_type) }) };
+                        out.sequences[out.sequence_count] = .{ .column = @intCast(at + index), .name = try identityName(out.name, copy.name), .spec = try sequence.resolve(.{ .type_oid = types.typeOid(copy.data_type) }) };
+                        out.sequence_count += 1;
                     } else {
                         copy.default_kind = .none;
                     },
@@ -9122,7 +9147,7 @@ pub fn Binder(comptime config: types.Config) type {
                         @memcpy(name2[name2_len..][0..take], part[0..take]);
                         name2_len += take;
                     }
-                    copy.name = if (constraint.kind == .primary) objectName(out.name.slice(), "", "pkey") else chooseName(context, out.name.slice(), name2[0..name2_len], if (constraint.kind == .unique) "key" else "excl", out.constraints[0..out.constraint_count], true);
+                    copy.name = if (constraint.kind == .primary) objectName(out.name.slice(), "", "pkey") else chooseName(context, out.namespace, out.name.slice(), name2[0..name2_len], if (constraint.kind == .unique) "key" else "excl", out.constraints[0..out.constraint_count], true);
                 }
                 out.constraints[out.constraint_count] = copy;
                 out.constraint_count += 1;

@@ -36,6 +36,39 @@ replay. Local stock PG16 passed 32 checks with those sequences, keyed
 identity and stored generated columns in both directions.
 [Scoped identity CI](https://github.com/SB0LTD/ramsql/actions/runs/44958119185)
 
+The multiple-identity candidate assigns an owned sequence to each PostgreSQL
+identity column. Stock restore can attach both sequences before COPY and apply
+the key afterward. The change-log contract passed 1,126 assertions. Stock
+PG16 and PG18 CI each passed all 36 checks, including archives in both
+directions and verification of both sequence states after WAL reopen.
+[Multiple-identity CI](https://github.com/SB0LTD/ramsql/actions/runs/45018672015)
+
+The SERIAL archive fixtures reproduced two failures on stock PG16 and PG18.
+The import rejected `ALTER SEQUENCE ... OWNED BY`. The export created
+tables before the sequences referenced by their defaults. The candidate
+versions sequence ownership in the transaction and records the change in
+WAL. The catalog now supplies the sequence dependency for literal
+`nextval` defaults and qualifies public sequence names with an empty
+search path. The focused DDL suite passed 1,213 assertions. Both fixture
+schemas passed both archive directions and WAL reopen on local PG16 and
+PG18. Hosted qualification and complete sequence privileges remain open.
+
+The checkpoint candidate adds a versioned image for supported public
+tables with ordinary defaults, identity columns and owned sequences.
+The prior three image formats remain readable. The 136-assertion Sig
+contract verifies recovered ownership, sequence reservations and a WAL
+suffix, and rejects corrupt ownership before publication. A local
+RAMSQL server test also passed process kills after checkpoint rotation
+and after writes to the selected WAL. Named schemas and full catalog
+images remain open.
+
+The named-schema follow-up restores committed schema definitions before
+their tables and sequences. The Sig image suite passed 147 assertions,
+including duplicate names across schemas, scoped defaults and sequence
+ownership. The local Linux server passed rotation and process-kill
+recovery with identity and SERIAL columns in a named schema. Images for
+role-owned schemas, ACLs and the full object catalog remain open.
+
 The dependent-view fixture found an outbound ordering failure after
 `pg_get_viewdef` first returned the stored query. Typed `pg_rewrite`
 rows now expose each view's implicit SELECT rule and its relation
@@ -44,6 +77,15 @@ including a view depending on another view whose base table sorts last.
 The updated routine and rule suite passed 767 assertions and replayed
 156 records. Column aliases introduced by a CREATE VIEW column list,
 general rule deparsing and arbitrary view definitions still need coverage.
+
+The view-column candidate binds catalog names at the outward relation after
+the stored query resolves its own aliases. It preserves doubled quotes and
+keeps the original name resolution for internal ordering. The dump deparser
+emits catalog aliases on supported simple projections with no top-level
+ORDER BY, GROUP BY or DISTINCT ON. The focused Sig suite passed 1,380
+assertions and replayed 276 records. Local stock PG16 and PG18 both restored
+the new dependent-view fixture in both directions, including quoted names,
+result metadata and WAL reopen. General deparsing remains open.
 
 The stock archive fixture now restores a two-column primary key after
 loading the rows of a fresh table in a single transaction. The WAL uses

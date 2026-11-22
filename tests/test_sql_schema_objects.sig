@@ -793,6 +793,22 @@ const matview_probes = [_][]const u8{
     "SELECT relname, relkind FROM pg_class WHERE relnamespace = 2200 ORDER BY oid",
 };
 
+fn viewColumnNames() !void {
+    reset();
+    try run("CREATE TABLE t (id INT, n INT)");
+    try run("INSERT INTO t VALUES (1,20)");
+    try run("CREATE VIEW v (\"Item\", \"a\"\"b\", total) AS SELECT id, n AS \"old\"\"name\", n+1 FROM t");
+    const definition = "SELECT pg_get_viewdef('v'::regclass)";
+    const aliases = "SELECT \"Item\", \"a\"\"b\", total FROM v";
+    try expect(aliases, "1|20|21");
+    try expect(definition, "SELECT id AS \"Item\", n AS \"a\"\"b\", n+1 AS total FROM public.t\n;");
+    try run("INSERT INTO t VALUES (2,30)");
+    try run("CREATE VIEW ranked (value) AS SELECT n+1 AS original FROM t ORDER BY original DESC LIMIT 1");
+    const ordered = "SELECT value FROM ranked";
+    try expect(ordered, "31");
+    try sameState(&.{ aliases, definition, ordered });
+}
+
 fn materializedViews() !void {
     reset();
     try run("CREATE TABLE a (id INT PRIMARY KEY, g INT, v INT)");
@@ -1573,6 +1589,7 @@ pub fn main() !void {
     try deferredConstraints();
     try views();
     try viewCapacity();
+    try viewColumnNames();
     try materializedViews();
     try createVariants();
     try mergeStatement();
