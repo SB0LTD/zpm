@@ -430,6 +430,22 @@ pub fn reconSurface(st: *const State) u32 {
     };
 }
 
+/// The picture's first reference's surface (its slot 0 in VA's list;
+/// INVALID_ID: none, or AV1).
+pub fn firstRefSurface(st: *const State) u32 {
+    return switch (st.kind) {
+        .h264 => blk: {
+            const r = st.h264_pic.ReferenceFrames[0];
+            break :blk if (r.flags & va.PICTURE_H264_INVALID != 0) va.INVALID_ID else r.picture_id;
+        },
+        .hevc => blk: {
+            const r = st.hevc_pic.reference_frames[0];
+            break :blk if (r.flags & va.PICTURE_HEVC_INVALID != 0) va.INVALID_ID else r.picture_id;
+        },
+        .av1 => va.INVALID_ID,
+    };
+}
+
 /// Whether the HEVC sequence uses temporal MVP: the app's packed SPS
 /// says so when it gave one (that is what goes into the stream), else
 /// its sequence parameters.
