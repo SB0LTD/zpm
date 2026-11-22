@@ -143,6 +143,8 @@ pub const msg = struct {
     pub const GPADL_HEADER: u32 = 8;
     pub const GPADL_BODY: u32 = 9;
     pub const GPADL_CREATED: u32 = 10;
+    pub const GPADL_TEARDOWN: u32 = 11;
+    pub const GPADL_TORNDOWN: u32 = 12;
     pub const INITIATE_CONTACT: u32 = 14;
     pub const VERSION_RESPONSE: u32 = 15;
 
@@ -355,7 +357,14 @@ pub const Error = error{
     Refused,
     /// The host gave no memory for a channel's rings.
     NoMemory,
+    /// More pages than one GPADL names (MAX_GPADL_PAGES).
+    TooManyPages,
 };
+
+/// The most pages one GPADL names: its range's length in the header is 16
+/// bits of bytes (8, then 8 a page), so just under 32 MiB (Linux keeps its
+/// own buffers at 31 MiB for this).
+pub const MAX_GPADL_PAGES: u32 = (0xffff - 8) / 8;
 
 pub const MAX_OFFERS = 24;
 
@@ -479,6 +488,7 @@ pub fn Bus(comptime Host: type) type {
         /// The pages [base, base + count pages) named to the hypervisor as
         /// a GPADL for channel `relid`; its handle.
         pub fn gpadl(self: *Self, relid: u32, base: u64, count: u32) Error!u32 {
+            if (count == 0 or count > MAX_GPADL_PAGES) return error.TooManyPages;
             const handle = self.next_gpadl;
             self.next_gpadl += 1;
             var m: [hv.MESSAGE_PAYLOAD_MAX]u8 = undefined;
@@ -513,6 +523,20 @@ pub fn Bus(comptime Host: type) type {
                     return error.Refused;
                 }
                 return handle;
+            }
+        }
+
+        /// GPADL `handle` of channel `relid` given back: the host lets go
+        /// of its pages (GPADL_TORNDOWN says so).
+        pub fn gpadlTeardown(self: *Self, relid: u32, handle: u32) Error!void {
+            var m = [_]u8{0} ** 16;
+            put32(&m, 0, msg.GPADL_TEARDOWN);
+            put32(&m, 8, relid);
+            put32(&m, 12, handle);
+            try self.post(&m);
+            while (true) {
+                const r = try self.wait(msg.GPADL_TORNDOWN, 5000);
+                if (r.len >= 12 and get32(r, 8) == handle) return;
             }
         }
 
@@ -714,6 +738,7 @@ const Fake = struct {
     gpadl_expected: usize = 0,
     gpadl_handle: u32 = 0,
     gpadl_relid: u32 = 0,
+    torn_down: u32 = 0,
     out_ring: Ring = .{},
     in_ring: Ring = .{},
     notes: u32 = 0,
@@ -800,6 +825,13 @@ const Fake = struct {
                     self.gpadl_count += 1;
                 }
                 if (self.gpadl_count == self.gpadl_expected) self.gpadlDone();
+            },
+            msg.GPADL_TEARDOWN => {
+                self.torn_down = get32(payload, 12);
+                var r = [_]u8{0} ** 12;
+                put32(&r, 0, msg.GPADL_TORNDOWN);
+                put32(&r, 8, get32(payload, 12));
+                self.enqueue(&r);
             },
             msg.OPEN_CHANNEL => {
                 // The far ends of the rings, from the GPADL and the offset.
@@ -1017,6 +1049,16 @@ test "vmbus: more pages than one message holds" {
     try expect(f.gpadl_count == 70 and f.gpadl_expected == 70);
     for (f.gpadl_pfns[0..70], 0..) |pfn, i| try expect(pfn == f.gpadl_pfns[0] + i);
     try expect(ch.in.base == ch.out.base + 30 * PAGE and ch.in.size == 39 * PAGE);
+}
+
+test "vmbus: a GPADL given back; one too big refused" {
+    const f = Bench.fresh();
+    var bus = Bus(Fake).init(f);
+    try bus.connect();
+    const h = try bus.gpadl(3, 0x10_0000, 16);
+    try bus.gpadlTeardown(3, h);
+    try expect(f.torn_down == h);
+    try expect(if (bus.gpadl(3, 0x10_0000, MAX_GPADL_PAGES + 1)) |_| false else |e| e == error.TooManyPages);
 }
 
 test "vmbus: memory for the host to read or fill" {
