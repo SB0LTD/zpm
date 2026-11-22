@@ -8964,10 +8964,13 @@ pub fn Binder(comptime config: types.Config) type {
                 out.columns[index] = column;
             }
             const text = create.text.slice(context.source);
-            if (text.len > config.text_bytes) return error.TextCapacity;
             out.extras.relkind = if (create.materialized) 'm' else 'v';
-            out.extras.query.len = text.len;
-            @memcpy(out.extras.query.bytes[0..text.len], text);
+            if (text.len > config.text_bytes) {
+                out.extras.query.len = try lexer.compactDefinition(text, &out.extras.query.bytes);
+            } else {
+                out.extras.query.len = text.len;
+                @memcpy(out.extras.query.bytes[0..text.len], text);
+            }
             for (plans.items[0..plans.len]) |*item| for (item.sources[0..item.source_count]) |*source| {
                 const table = source.table orelse continue;
                 const oid = context.tables[table].oid;
