@@ -997,7 +997,7 @@ fn advancedIndexes() !void {
         "a_adv|CREATE INDEX a_adv ON public.a USING btree (g, (v + 1)) INCLUDE (id) WHERE (v IS NOT NULL);" ++
         "a_expr_expr1_idx|CREATE INDEX a_expr_expr1_idx ON public.a USING btree ((g * 2), (v - 1));" ++
         "a_multi|CREATE INDEX a_multi ON public.a USING btree (g DESC, v NULLS FIRST, id)");
-    try expect("SELECT c.relname, c.relnatts, i.indkey FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname <> 'a_pkey' ORDER BY c.relname", "a_adv|3|2 0;a_expr_expr1_idx|2|0 0;a_multi|3|2 3 1");
+    try expect("SELECT c.relname, c.relnatts, i.indnkeyatts, i.indkey FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname <> 'a_pkey' ORDER BY c.relname", "a_adv|3|2|2 0 1;a_expr_expr1_idx|2|2|0 0;a_multi|3|3|2 3 1");
     // Entries cover every version; probes over the plain key column g
     // equal scans through updates, deletes and an abort.
     try indexAgrees(&db, "a", "a_adv");

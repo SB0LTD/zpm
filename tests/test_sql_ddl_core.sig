@@ -697,6 +697,31 @@ fn alterPrimaryKey() !void {
     try sameState(&.{pair_query});
 }
 
+fn restorePrimaryInCreateTransaction() !void {
+    reset();
+    const restore = try db.begin();
+    try statement(restore, "CREATE TABLE restore_parent(id INT, label TEXT DEFAULT 'north')");
+    try statement(restore, "CREATE TABLE restore_child(id INT, parent_id INT)");
+    try statement(restore, "INSERT INTO restore_parent(id) VALUES (1),(2)");
+    try statement(restore, "INSERT INTO restore_child VALUES (11,2),(12,1)");
+    try statement(restore, "ALTER TABLE ONLY restore_parent ADD CONSTRAINT restore_parent_pkey PRIMARY KEY (id)");
+    try statement(restore, "ALTER TABLE ONLY restore_child ADD CONSTRAINT restore_child_pkey PRIMARY KEY (id)");
+    try statement(restore, "ALTER TABLE ONLY restore_child ADD CONSTRAINT restore_parent_fk FOREIGN KEY (parent_id) REFERENCES restore_parent(id)");
+    try commit(restore);
+    const query_text = "SELECT c.id,p.label FROM restore_child c JOIN restore_parent p ON p.id=c.parent_id ORDER BY c.id";
+    try expect(query_text, "11|north;12|north");
+    try sameState(&.{query_text});
+    try rejects("INSERT INTO restore_parent(id) VALUES (1)", error.PrimaryKeyViolation, query_text, "11|north;12|north");
+    try rejects("INSERT INTO restore_child VALUES (13,99)", error.ForeignKeyViolation, query_text, "11|north;12|north");
+
+    const invalid = try db.begin();
+    try statement(invalid, "CREATE TABLE invalid_restore(id INT)");
+    try statement(invalid, "INSERT INTO invalid_restore VALUES (1),(1)");
+    try statementFails(invalid, "ALTER TABLE invalid_restore ADD PRIMARY KEY(id)", error.PrimaryKeyViolation);
+    db.abort(invalid);
+    try expect("SELECT count(*) FROM pg_class WHERE relname='invalid_restore'", "0");
+}
+
 fn latePrimaryRecordFence() !void {
     reset();
     try run("CREATE TABLE mixed (id INT)");
@@ -1445,6 +1470,7 @@ pub fn main(init: std.process.Init) !void {
     try alterValues();
     try alterConstraints();
     try alterPrimaryKey();
+    try restorePrimaryInCreateTransaction();
     try latePrimaryRecordFence();
     try alterErrors();
     try alterTransactions();

@@ -24,10 +24,42 @@ const Error = types.Error;
 
 // ---- default parser ----------------------------------------------------------
 
-/// Token types (wparser_def.c): 12 blank, 13 tag, 14 protocol and 23
-/// entity are not indexed by `simple`.
+/// Token descriptors use the numeric IDs emitted by the default parser.
+pub const TokenKind = struct { alias: []const u8, description: []const u8, indexed: bool = true };
+
+pub const token_kinds = [_]TokenKind{
+    .{ .alias = "asciiword", .description = "Word, all ASCII" },
+    .{ .alias = "word", .description = "Word, all letters" },
+    .{ .alias = "numword", .description = "Word, letters and digits" },
+    .{ .alias = "email", .description = "Email address" },
+    .{ .alias = "url", .description = "URL" },
+    .{ .alias = "host", .description = "Host" },
+    .{ .alias = "sfloat", .description = "Scientific notation" },
+    .{ .alias = "version", .description = "Version number" },
+    .{ .alias = "hword_numpart", .description = "Hyphenated word part, letters and digits" },
+    .{ .alias = "hword_part", .description = "Hyphenated word part, all letters" },
+    .{ .alias = "hword_asciipart", .description = "Hyphenated word part, all ASCII" },
+    .{ .alias = "blank", .description = "Space symbols", .indexed = false },
+    .{ .alias = "tag", .description = "XML tag", .indexed = false },
+    .{ .alias = "protocol", .description = "Protocol head", .indexed = false },
+    .{ .alias = "numhword", .description = "Hyphenated word, letters and digits" },
+    .{ .alias = "asciihword", .description = "Hyphenated word, all ASCII" },
+    .{ .alias = "hword", .description = "Hyphenated word, all letters" },
+    .{ .alias = "url_path", .description = "URL path" },
+    .{ .alias = "file", .description = "File or path name" },
+    .{ .alias = "float", .description = "Decimal notation" },
+    .{ .alias = "int", .description = "Signed integer" },
+    .{ .alias = "uint", .description = "Unsigned integer" },
+    .{ .alias = "entity", .description = "XML entity", .indexed = false },
+};
+
+pub fn tokenKind(id: u8) ?*const TokenKind {
+    if (id == 0 or id > token_kinds.len) return null;
+    return &token_kinds[id - 1];
+}
+
 pub fn simpleIndexes(kind: u8) bool {
-    return kind >= 1 and kind <= 22 and kind != 12 and kind != 13 and kind != 14;
+    return if (tokenKind(kind)) |descriptor| descriptor.indexed else false;
 }
 
 const Test = enum(u8) { always, eof, eq, alnum, alpha, asclet, digit, notalnum, space, special, stophost, ignore, host, url_path, urlchar, xdigit };
@@ -1362,8 +1394,8 @@ pub fn TextSearch(comptime text_bytes: usize, comptime depth_limit: usize) type 
             try writeVector(&vector, out, max_positions_per_lexeme);
         }
 
-        /// Folds ASCII letters (the simple dictionary under C ctype).
-        fn lowerInto(word: []const u8, buffer: []u8) []const u8 {
+        /// Lexizes one token with the built-in simple dictionary under C ctype.
+        fn simpleLexize(word: []const u8, buffer: []u8) []const u8 {
             for (word, 0..) |byte, index| buffer[index] = if (byte >= 'A' and byte <= 'Z') byte + 32 else byte;
             return buffer[0..word.len];
         }
@@ -1379,7 +1411,7 @@ pub fn TextSearch(comptime text_bytes: usize, comptime depth_limit: usize) type 
                 if (!simpleIndexes(token.kind)) continue;
                 if (token.bytes.len >= max_word) continue;
                 position += 1;
-                const lexeme = lowerInto(token.bytes, &buffer);
+                const lexeme = simpleLexize(token.bytes, &buffer);
                 const entry = try vector.add(lexeme);
                 // Positions beyond 16383 are recorded as 16383.
                 try vector.addPosition(entry, @intCast(@min(position, max_position)));

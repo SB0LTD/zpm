@@ -193,6 +193,7 @@ pub const Keyword = enum {
     user,
     value,
     regclass,
+    regproc,
     regnamespace,
     regtype,
     greatest,

@@ -239,9 +239,54 @@ fn reset() void {
     replica = .{};
 }
 
-const proc_probe = "SELECT oid, proname, prokind, prolang, provolatile, proisstrict, pronargs, prorettype, proargtypes FROM pg_proc ORDER BY oid";
+const proc_probe = "SELECT oid, proname, prokind, prolang, provolatile, proisstrict, pronargs, prorettype, proargtypes FROM pg_proc WHERE pronamespace=2200 ORDER BY oid";
 const trigger_probe = "SELECT oid, tgrelid, tgname, tgfoid, tgtype, tgenabled, tgnargs FROM pg_trigger ORDER BY oid";
 const rule_probe = "SELECT r.oid, r.rulename, r.ev_type, r.is_instead, p.definition FROM pg_rewrite r JOIN pg_rules p ON p.rulename = r.rulename ORDER BY r.oid";
+
+fn routineDiscovery() !void {
+    reset();
+    try run("CREATE ROLE routine_owner");
+    try run("CREATE ROLE routine_guest");
+    try run("SET ROLE routine_owner");
+    try run("CREATE FUNCTION discover_fn(x INT) RETURNS INT LANGUAGE SQL AS 'SELECT x + 1'");
+    try run("RESET ROLE");
+    const owner = "SELECT p.tableoid, l.lanname, r.rolname, p.proacl IS NULL, acldefault('f',p.proowner)::text "
+        ++ "FROM pg_proc p JOIN pg_language l ON l.oid=p.prolang JOIN pg_roles r ON r.oid=p.proowner WHERE p.proname='discover_fn'";
+    const expected = "1255|sql|routine_owner|t|{=X/routine_owner,routine_owner=X/routine_owner}";
+    try expect(owner, expected);
+    try run("CREATE OR REPLACE FUNCTION discover_fn(x INT) RETURNS INT LANGUAGE SQL AS 'SELECT x + 2'");
+    try expect(owner, expected);
+    try sameState(&.{owner});
+    try rejects("DROP ROLE routine_owner", error.DependentObjects, owner, expected);
+    try run("SET ROLE routine_guest");
+    try rejects("DROP FUNCTION discover_fn(INT)", error.InsufficientPrivilege, owner, expected);
+    try expect("SELECT discover_fn(1)", "3");
+    try run("RESET ROLE");
+    try run("REVOKE EXECUTE ON FUNCTION public.discover_fn(INT) FROM PUBLIC");
+    const acl = "SELECT proacl::text FROM pg_proc WHERE proname='discover_fn'";
+    const revoked = "{routine_owner=X/routine_owner}";
+    try expect(acl, revoked);
+    try run("SET ROLE routine_guest");
+    try rejects("SELECT discover_fn(1)", error.InsufficientPrivilege, acl, revoked);
+    try rejects("GRANT EXECUTE ON FUNCTION discover_fn(INT) TO PUBLIC", error.InsufficientPrivilege, acl, revoked);
+    try run("RESET ROLE");
+    try run("SET ROLE routine_owner");
+    try run("GRANT EXECUTE ON FUNCTION discover_fn(INT) TO routine_guest");
+    try run("RESET ROLE");
+    try expect(acl, "{routine_owner=X/routine_owner,routine_guest=X/routine_owner}");
+    try sameState(&.{owner, acl});
+    try run("SET ROLE routine_guest");
+    try expect("SELECT discover_fn(1)", "3");
+    try run("RESET ROLE");
+    const pending = try db.begin();
+    try statement(pending, "REVOKE EXECUTE ON FUNCTION discover_fn(INT) FROM routine_guest");
+    try same(try rows(pending, acl), revoked);
+    db.abort(pending);
+    try expect(acl, "{routine_owner=X/routine_owner,routine_guest=X/routine_owner}");
+    try run("DROP FUNCTION discover_fn(INT)");
+    try run("DROP ROLE routine_owner");
+    try run("DROP ROLE routine_guest");
+}
 
 // ---- the four oracle programs (PG.ROUTINE.*) --------------------------------
 
@@ -267,9 +312,10 @@ fn oraclePrograms() !void {
     try completes("CREATE RULE tdd_rule AS ON DELETE TO tdd_a DO INSTEAD NOTHING", .create_rule, 0);
     try completes("DELETE FROM tdd_a WHERE id=1", .delete, 0);
     try expectColumn("SELECT id FROM tdd_a ORDER BY id", "id", 23, "1;2;3;4;5");
-    try expect(proc_probe, "16388|tdd_fn|f|sql|i|f|1|23|23;16389|tdd_proc|p|sql|v|f|0|2278|;16390|tdd_trigger_fn|f|plpgsql|v|f|0|2279|");
+    try expect(proc_probe, "16388|tdd_fn|f|14|i|f|1|23|23;16389|tdd_proc|p|14|v|f|0|2278|;16390|tdd_trigger_fn|f|13002|v|f|0|2279|");
     try expect(trigger_probe, "16391|16384|tdd_trigger|16390|7|O|0");
     try expect("SELECT schemaname, tablename, rulename, definition FROM pg_rules", "public|tdd_a|tdd_rule|CREATE RULE tdd_rule AS\n    ON DELETE TO public.tdd_a DO INSTEAD NOTHING;");
+    try run("REVOKE EXECUTE ON FUNCTION tdd_trigger_fn() FROM PUBLIC");
     try sameState(&.{ proc_probe, trigger_probe, rule_probe, "SELECT id, g, v FROM tdd_a ORDER BY id", "SELECT tdd_fn(41)" });
     // The replica fires the replayed trigger and rule the same way.
     try sameEffect("INSERT INTO tdd_a VALUES(6,1,7)");
@@ -911,6 +957,7 @@ fn bodyValidationSetting() !void {
 }
 
 pub fn main() !void {
+    try routineDiscovery();
     try bodyValidationSetting();
     try oraclePrograms();
     try sqlFunctions();

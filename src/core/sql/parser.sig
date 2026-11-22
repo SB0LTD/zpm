@@ -1582,7 +1582,7 @@ pub fn Parser(comptime config: types.Config) type {
 
         fn typeWord(token: Token) bool {
             return switch (token.keyword) {
-                .integer, .int, .int4, .bigint, .int8, .smallint, .int2, .boolean, .@"bool", .text, .numeric, .decimal, .real, .float4, .float8, .float, .double, .name, .oid, .date, .timestamp, .timestamptz, .interval, .json, .jsonb, .regclass, .regtype, .regnamespace => true,
+                .integer, .int, .int4, .bigint, .int8, .smallint, .int2, .boolean, .@"bool", .text, .numeric, .decimal, .real, .float4, .float8, .float, .double, .name, .oid, .date, .timestamp, .timestamptz, .interval, .json, .jsonb, .regclass, .regtype, .regnamespace, .regproc => true,
                 .varchar, .character, .char, .bpchar, .uuid, .bytea, .time, .timetz, .bit, .varbit, .money => true,
                 .pg_lsn, .xid8, .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange, .inet, .cidr, .macaddr, .point, .box, .xml, .jsonpath, .tsvector, .tsquery => true,
                 else => false,
@@ -1747,6 +1747,7 @@ pub fn Parser(comptime config: types.Config) type {
                 .interval => .{ .ty = .interval },
                 .json => .{ .ty = .json },
                 .jsonb => .{ .ty = .jsonb },
+                .regproc => .{ .ty = .regproc },
                 .regclass => .{ .ty = .oid, .typmod = ast.regclass_typmod },
                 .regnamespace => .{ .ty = .oid, .typmod = ast.regnamespace_typmod },
                 .regtype => .{ .ty = .oid, .typmod = ast.regtype_typmod },
@@ -3056,7 +3057,8 @@ pub fn Parser(comptime config: types.Config) type {
             }
             var star = false;
             while (true) {
-                if (out.count == config.columns) return error.ColumnCapacity;
+                if (out.count == out.targets.len) return error.ColumnCapacity;
+                if (out.count == config.columns) self.pool.complex = true;
                 var target: Ast.Target = .{};
                 if (try self.takeSymbol(.star)) {
                     target.star = true;
@@ -3069,7 +3071,15 @@ pub fn Parser(comptime config: types.Config) type {
                         target.star = true;
                         star = true;
                         self.pool.complex = true;
-                    } else target.alias = try self.bareAlias();
+                    } else {
+                        if (self.mode == .standard and self.tokens.dialect == .postgres and !self.pool.complex and n.kind == .function) {
+                            var buf: [64]u8 = undefined;
+                            if (identText(self.source, n.name, &buf)) |name| {
+                                if (types.same(name, "unnest")) self.pool.complex = true;
+                            }
+                        }
+                        target.alias = try self.bareAlias();
+                    }
                 }
                 out.targets[out.count] = target;
                 out.count += 1;
@@ -3570,41 +3580,8 @@ pub fn Parser(comptime config: types.Config) type {
             var left = try self.pattern();
             while (self.comparisonOp()) |op| {
                 try self.advance();
-                if (self.mode == .standard and (self.isWord("ANY") or self.isWord("SOME") or self.isWord("ALL"))) {
-                    const all = self.isWord("ALL");
-                    try self.advance();
-                    try self.expectSymbol(.lparen);
-                    if (!self.isWord("SELECT") and !self.isWord("WITH") and !self.isSymbol(.lparen)) {
-                        // `x op ANY/ALL (array)`: an array_any call over
-                        // (x, array), with in_subquery's op/negated encoding.
-                        const array = try self.expression();
-                        try self.expectSymbol(.rparen);
-                        const any = try self.pool.add(.{ .kind = .function, .func = .array_any, .op = if (all) oppositeComparison(op) else op, .negated = all, .b = left });
-                        self.pool.nodes[left].next = array;
-                        try self.pool.raise(any, left);
-                        try self.pool.raise(any, array);
-                        left = try self.castTail(any);
-                        left = try self.collateTail(left);
-                        left = try self.atZoneTail(left);
-                        left = try self.multiplicativeTail(left);
-                        left = try self.additiveTail(left);
-                        left = try self.otherTail(left);
-                        left = try self.patternTail(left);
-                        continue;
-                    }
-                    const inner = try self.query();
-                    try self.expectSymbol(.rparen);
-                    self.pool.complex = true;
-                    // SQL three-valued De Morgan duality preserves NULL and
-                    // empty-set semantics without a new AST storage field.
-                    left = try self.pool.add(.{ .kind = .in_subquery, .op = if (all) oppositeComparison(op) else op, .negated = all, .a = left, .integer = inner });
-                    // A completed sublink can itself be a higher-precedence
-                    // operand: x=ANY(...)::text || 'suffix', or ... = TRUE.
-                    left = try self.castTail(left);
-                    left = try self.collateTail(left);
-                    left = try self.atZoneTail(left);
-                    left = try self.multiplicativeTail(left);
-                    left = try self.additiveTail(left);
+                if (self.hasQuantifier()) {
+                    left = try self.quantified(left, op);
                     left = try self.otherTail(left);
                     left = try self.patternTail(left);
                     continue;
@@ -3615,6 +3592,37 @@ pub fn Parser(comptime config: types.Config) type {
                 return self.pool.add(.{ .kind = .binary, .op = op, .a = left, .b = right });
             }
             return left;
+        }
+
+        fn hasQuantifier(self: *const Self) bool {
+            return self.mode == .standard and (self.isWord("ANY") or self.isWord("SOME") or self.isWord("ALL"));
+        }
+
+        fn quantified(self: *Self, left: u16, op: ast.Op) Error!u16 {
+            const all = self.isWord("ALL");
+            try self.advance();
+            try self.expectSymbol(.lparen);
+            const comparison_op = if (all) oppositeComparison(op) else op;
+            var value: u16 = undefined;
+            if (self.isWord("SELECT") or self.isWord("WITH") or self.isSymbol(.lparen)) {
+                const inner = try self.query();
+                try self.expectSymbol(.rparen);
+                self.pool.complex = true;
+                value = try self.pool.add(.{ .kind = .in_subquery, .op = comparison_op, .negated = all, .a = left, .integer = inner });
+            } else {
+                const array = try self.expression();
+                try self.expectSymbol(.rparen);
+                value = try self.pool.add(.{ .kind = .function, .func = .array_any, .op = comparison_op, .negated = all, .b = left });
+                self.pool.nodes[left].next = array;
+                try self.pool.raise(value, left);
+                try self.pool.raise(value, array);
+            }
+            // A completed sublink may be an operand of a tighter operator.
+            value = try self.castTail(value);
+            value = try self.collateTail(value);
+            value = try self.atZoneTail(value);
+            value = try self.multiplicativeTail(value);
+            return self.additiveTail(value);
         }
 
         fn oppositeComparison(op: ast.Op) ast.Op {
@@ -3752,8 +3760,15 @@ pub fn Parser(comptime config: types.Config) type {
                         else => self.comparisonOp() orelse return error.UndefinedFunction,
                     } else break,
                 };
+                const comparison_op = if (qualified) self.comparisonOp() else null;
                 try self.advance();
                 if (qualified) try self.expectSymbol(.rparen);
+                if (comparison_op) |comparison_operator| {
+                    if (self.hasQuantifier()) {
+                        left = try self.quantified(left, comparison_operator);
+                        continue;
+                    }
+                }
                 const right = try self.additive();
                 left = try self.pool.add(.{ .kind = .binary, .op = op, .a = left, .b = right,
                     .insensitive = symbol == .regex_icase or symbol == .not_regex_icase, .negated = symbol == .not_regex or symbol == .not_regex_icase });

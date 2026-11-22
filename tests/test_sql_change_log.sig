@@ -40,7 +40,8 @@ fn sameResult(a: *const DB.Result, b: *const DB.Result) bool {
 /// Logical equality over every table name that either side might hold,
 /// including unordered scan (rowid) order, next rowids and OIDs.
 fn sameDatabase(a: *DB, b: *DB) !bool {
-    if (a.tableCount() != b.tableCount() or a.oid_counter != b.oid_counter or a.next_constraint_oid != b.next_constraint_oid) return false;
+    if (a.tableCount() != b.tableCount() or a.oid_counter != b.oid_counter or
+        a.next_constraint_oid != b.next_constraint_oid or a.next_default_oid != b.next_default_oid) return false;
     for ([_][]const u8{ "t", "u", "v" }) |name| {
         const left = a.storageStats(name);
         const right = b.storageStats(name);
@@ -877,9 +878,67 @@ fn explicitPrimaryIdentity() !void {
     try check(fresh.csn == 1 and fresh.oid_counter == 1 and fresh.tableCount() == 1);
 }
 
+fn defaultIdentityRoundTrip() !void {
+    var primary: DB = .{};
+    var restored: DB = .{};
+    var record: [2048]u8 = undefined;
+    const statements = [_][]const u8{
+        "CREATE TABLE t (id INT DEFAULT 7, n INT GENERATED ALWAYS AS (id + 1) STORED)",
+        "ALTER TABLE t RENAME COLUMN n TO computed",
+        "ALTER TABLE t ALTER COLUMN id SET DEFAULT 9",
+        "ALTER TABLE t ALTER COLUMN id DROP DEFAULT",
+        "CREATE TABLE u (id INT DEFAULT 32)",
+    };
+    const query = "SELECT oid,adnum,pg_get_expr(adbin,adrelid) FROM pg_attrdef ORDER BY oid";
+    for (statements) |statement| {
+        var used: usize = 0;
+        var expected: DB.Result = .{};
+        var actual: DB.Result = .{};
+        try primary.executeChanges(statement, &expected, &record, &used, null, null);
+        try restored.applyChangeRecord(record[0..used], &scratch);
+        try primary.execute(query, &expected);
+        try restored.execute(query, &actual);
+        try check(sameResult(&expected, &actual));
+        try check(primary.next_default_oid == restored.next_default_oid);
+    }
+    var result: DB.Result = .{};
+    try restored.execute(query, &result);
+    try check(result.row_count == 2 and result.rows[0].cells[0].integer == oid + 1 and
+        result.rows[1].cells[0].integer == oid + 3);
+    var used: usize = 0;
+    try primary.encodeCatalogCounters(&record, &used);
+    try restored.applyChangeRecord(record[0..used], &scratch);
+    try check(restored.next_default_oid == oid + 4);
+}
+
+fn legacyDefaultIdentity() !void {
+    var restored: DB = .{};
+    var legacy: Builder = .{};
+    legacy.int(u8, 1);
+    legacy.int(u32, oid);
+    legacy.name("t");
+    legacy.int(u16, 1);
+    legacy.int(u8, 1);
+    legacy.name("k");
+    legacy.int(u32, 23);
+    legacy.int(i32, -1);
+    legacy.int(u8, 4);
+    legacy.int(u16, 1);
+    legacy.int(u8, '7');
+    legacy.ops = 1;
+    try restored.applyChangeRecord(legacy.record(), &scratch);
+    var result: DB.Result = .{};
+    try restored.execute("SELECT oid,pg_get_expr(adbin,adrelid) FROM pg_attrdef", &result);
+    try check(result.row_count == 1 and result.rows[0].cells[0].integer == oid and
+        std.mem.eql(u8, result.rows[0].cells[1].text.slice(), "7"));
+    try check(restored.next_default_oid == oid + 1);
+}
+
 pub fn main(init: std.process.Init) !void {
     try roundTrips();
     try constraintIdentityRoundTrip();
+    try defaultIdentityRoundTrip();
+    try legacyDefaultIdentity();
     try corruption();
     try atomicity();
     try outOfOrderTables();

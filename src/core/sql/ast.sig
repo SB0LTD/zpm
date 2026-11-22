@@ -135,7 +135,8 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     regexp_like, similar_to_escape,
     // Full text search (B11 text lane, text_search.sig): the first argument
     // is the regconfig name.
-    to_tsvector, to_tsquery, plainto_tsquery, phraseto_tsquery, mysql_ifnull, mysql_date_add, mysql_last_insert_id, sind, cosd };
+    to_tsvector, to_tsquery, plainto_tsquery, phraseto_tsquery, mysql_ifnull, mysql_date_add, mysql_last_insert_id, sind, cosd, acldefault, pg_encoding_to_char, current_schemas, array_remove, to_regproc,
+    quote_ident, quote_literal };
 
 /// JSON_TABLE column flags (Node.integer of a json_table_column).
 pub const JsonTableColumn = struct {
@@ -204,13 +205,14 @@ pub fn immutableFunction(func: Func) bool {
 /// STABLE: they use type output functions.
 pub fn immutableBuiltin(func: Func) bool {
     return switch (func) {
+        .quote_ident, .quote_literal => true,
         .lower, .upper, .initcap, .char_length, .octet_length, .bit_length, .substring, .btrim, .ltrim, .rtrim, .strpos, .replace,
         .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .overlay, .to_hex => true,
         .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .sind, .cosd, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => true,
         .extract, .date_part, .date_trunc, .age, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => true,
         .overlaps, .aggregate_pair, .normalize, .is_normalized, .mysql_date_add => true,
         .array_constructor, .array_subscript, .array_any, .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper,
-        .array_append, .array_prepend, .array_cat => true,
+        .array_append, .array_prepend, .array_cat, .array_remove => true,
         .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => true,
         .inet_host, .masklen, .inet_family, .inet_network, .broadcast, .netmask => true,
         .point_constructor, .box_constructor, .area, .center, .width, .height => true,
@@ -225,11 +227,12 @@ pub fn immutableBuiltin(func: Func) bool {
 
 pub fn strictFunction(func: Func) bool {
     return switch (func) {
+        .quote_ident, .quote_literal => true,
         .to_char, .round, .abs, .ceil, .floor, .trunc, .sign, .sqrt, .jsonb_typeof, .jsonb_array_length,
         .nextval, .currval, .setval, .lastval, .identity_next,
         .now, .transaction_timestamp, .statement_timestamp, .clock_timestamp,
-        .current_timestamp, .current_date, .current_database, .current_schema,
-        .to_regtype, .to_regclass, .pg_get_expr,
+        .current_timestamp, .current_date, .current_database, .current_schema, .current_schemas, .pg_encoding_to_char,
+        .to_regtype, .to_regclass, .to_regproc, .pg_get_expr, .acldefault,
         .regclass_in, .regtype_in, .regclass_out, .regtype_out, .to_regnamespace, .regnamespace_in, .regnamespace_out => true,
         .lower, .upper, .initcap, .char_length, .octet_length, .bit_length, .substring, .btrim, .ltrim, .rtrim, .strpos, .replace,
         .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .overlay, .to_hex => true,
@@ -861,7 +864,7 @@ pub fn Ast(comptime config: types.Config) type {
         /// blocks `left` and `right` (set_op != none). ORDER BY, LIMIT and
         /// OFFSET apply to the block's result.
         pub const Select = struct {
-            targets: [config.columns]Target = undefined,
+            targets: [types.projectionColumns(config)]Target = undefined,
             count: usize = 0,
             /// The single FROM table of a simple statement.
             from: ?TableRef = null,

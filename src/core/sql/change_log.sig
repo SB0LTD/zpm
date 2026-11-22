@@ -42,6 +42,7 @@
 //!    15 create_schema oid u32, name
 //!    16 drop_schema   oid u32 (the schema holds no table at that point)
 //!    17 catalog_counters_with_constraints: op 6 plus next constraint OID u32
+//!    20 catalog_counters_with_defaults: op 17 plus next default OID u32
 //!    18 create_owned_schema: op 15 plus nonzero owner role OID u32
 //!    19 create_private_schema: op 18 with owner-only USAGE
 //!    60-65 routines, triggers and rules (B11 wave 3): payload_len u32 +
@@ -91,7 +92,7 @@
 //!   f64 bits u64} | 26 box {high x, high y, low x, low y as f64 bits}
 //!   | 27 xml len u32 + the stored text | 28 tsvector / 29 tsquery len u32
 //!   + canonical output text (re-read and checked on replay) | 30 regtype
-//!   OID u32 | 31 PostgreSQL internal "char" byte.
+//!   OID u32 | 31 PostgreSQL internal "char" byte | 32 regproc OID u32.
 //!    70 object_create / 71 object_drop: catalog objects (roles, grants,
 //!                     policies, comments, wrappers, servers, publications);
 //!                     layout in catalog_objects.sig (B11 wave 3)
@@ -144,8 +145,9 @@ pub const definition_format_version: u16 = 2;
 pub const extensions_format_version: u16 = 3;
 pub const constraint_identity_format_version: u16 = 4;
 pub const primary_index_identity_format_version: u16 = 5;
+pub const default_identity_format_version: u16 = 6;
 
-pub const Op = enum(u8) { create_table = 1, drop_table = 2, insert = 3, update = 4, delete = 5, catalog_counters = 6, create_sequence = 7, drop_sequence = 8, sequence = 9, truncate = 11, alter_table = 12, create_sequence_cached = 13, alter_sequence = 14, create_schema = 15, drop_schema = 16, catalog_counters_with_constraints = 17, create_owned_schema = 18, create_private_schema = 19, create_routine = 60, drop_routine = 61, create_trigger = 62, drop_trigger = 63, create_rule = 64, drop_rule = 65, object_create = 70, object_drop = 71 };
+pub const Op = enum(u8) { create_table = 1, drop_table = 2, insert = 3, update = 4, delete = 5, catalog_counters = 6, create_sequence = 7, drop_sequence = 8, sequence = 9, truncate = 11, alter_table = 12, create_sequence_cached = 13, alter_sequence = 14, create_schema = 15, drop_schema = 16, catalog_counters_with_constraints = 17, create_owned_schema = 18, create_private_schema = 19, catalog_counters_with_defaults = 20, create_routine = 60, drop_routine = 61, create_trigger = 62, drop_trigger = 63, create_rule = 64, drop_rule = 65, object_create = 70, object_drop = 71 };
 
 fn Unsigned(comptime T: type) type {
     return switch (T) {
@@ -391,6 +393,10 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     try writer.int(u8, 30);
                     try writer.int(u32, oid);
                 },
+                .regproc => |oid| {
+                    try writer.int(u8, 32);
+                    try writer.int(u32, oid);
+                },
                 .tsvector, .tsquery => |*text| {
                     try writer.int(u8, if (cell.* == .tsvector) 28 else 29);
                     try writer.int(u32, @intCast(text.len));
@@ -438,12 +444,14 @@ pub fn ChangeLog(comptime config: types.Config) type {
         /// Name, format version, columns and (version 2) namespace and
         /// constraints of a table definition.
         pub fn encodeDefinition(writer: *Writer, table: *const S.Table) Error!void {
-            const v5 = table.primary_index_oid != 0;
+            var v6 = false;
+            for (table.columns[0..table.column_count]) |*column| v6 = v6 or column.default_oid != 0;
+            const v5 = v6 or table.primary_index_oid != 0;
             const v4 = v5 or table.primary_constraint_oid != 0 or table.constraint_count != 0;
             const v3 = v4 or S.extended(table);
             const extended = v3 or table.namespace != public_namespace or table.constraint_count != 0;
             try writer.name(table.name.slice());
-            try writer.int(u16, if (v5) primary_index_identity_format_version else if (v4) constraint_identity_format_version else if (v3) extensions_format_version else if (extended) definition_format_version else expr_format_version);
+            try writer.int(u16, if (v6) default_identity_format_version else if (v5) primary_index_identity_format_version else if (v4) constraint_identity_format_version else if (v3) extensions_format_version else if (extended) definition_format_version else expr_format_version);
             try writer.int(u8, @intCast(table.column_count));
             for (table.columns[0..table.column_count]) |*column| {
                 try writer.name(column.name.slice());
@@ -453,6 +461,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 const text = column.expression.slice();
                 try writer.int(u16, @intCast(text.len));
                 try writer.bytes(text);
+                if (v6 and text.len != 0) try writer.int(u32, column.default_oid);
             }
             if (!extended) return;
             try writer.int(u32, table.namespace);
@@ -667,9 +676,10 @@ pub fn ChangeLog(comptime config: types.Config) type {
         }
 
         /// Catalog counters and every live table's next rowid.
-        pub fn encodeCounters(writer: *Writer, next_oid: u32, next_constraint_oid: u32, tables: *const [config.tables]S.Table) Error!void {
-            const has_constraints = next_constraint_oid != first_oid;
-            try writer.op(if (has_constraints) .catalog_counters_with_constraints else .catalog_counters);
+        pub fn encodeCounters(writer: *Writer, next_oid: u32, next_constraint_oid: u32, next_default_oid: u32, tables: *const [config.tables]S.Table) Error!void {
+            const tag: Op = if (next_default_oid != first_oid) .catalog_counters_with_defaults else
+                if (next_constraint_oid != first_oid) .catalog_counters_with_constraints else .catalog_counters;
+            try writer.op(tag);
             try writer.int(u32, next_oid);
             // Committed tables only: a dropped or ALTERed slot awaiting
             // reclamation, or an uncommitted one, has no replayed OID.
@@ -682,7 +692,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 try writer.int(u32, table.oid);
                 try writer.int(u64, table.next_rowid);
             };
-            if (has_constraints) try writer.int(u32, next_constraint_oid);
+            if (tag != .catalog_counters) try writer.int(u32, next_constraint_oid);
+            if (tag == .catalog_counters_with_defaults) try writer.int(u32, next_default_oid);
         }
 
         // ----- validation overlay ---------------------------------------
@@ -1151,6 +1162,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 24 => .{ .macaddr = (try reader.take(6))[0..6].* },
                 30 => .{ .regtype = try reader.int(u32) },
                 31 => .{ .pg_internal_char = try reader.int(u8) },
+                32 => .{ .regproc = try reader.int(u32) },
                 28, 29 => blk: {
                     const len = try reader.int(u32);
                     if (len > config.text_bytes) return error.ChangeRecordConflict;
@@ -1470,7 +1482,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
             out.name.len = table_name.len;
             @memcpy(out.name.bytes[0..table_name.len], table_name);
             const version = try reader.int(u16);
-            if (version < expr_format_version or version > primary_index_identity_format_version) return error.UnsupportedLogVersion;
+            if (version < expr_format_version or version > default_identity_format_version) return error.UnsupportedLogVersion;
             out.count = try reader.int(u8);
             if (out.count == 0) return error.InvalidChangeRecord;
             if (out.count > config.columns) return error.ChangeRecordConflict;
@@ -1509,6 +1521,13 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 const text = try reader.take(text_len);
                 column.expression.len = text_len;
                 @memcpy(column.expression.bytes[0..text_len], text);
+                if (version >= default_identity_format_version and needs_text) {
+                    column.default_oid = try reader.int(u32);
+                    if (!validConstraintOid(column.default_oid)) return error.InvalidChangeRecord;
+                    for (out.columns[0..index]) |*previous| {
+                        if (previous.default_oid == column.default_oid) return error.InvalidChangeRecord;
+                    }
+                }
                 if ((column.default_kind == .identity_always or column.default_kind == .identity_by_default) and
                     (!column.not_null or (column.data_type != .smallint and column.data_type != .integer32 and column.data_type != .integer)))
                     return error.InvalidChangeRecord;
@@ -1532,9 +1551,52 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     for (out.constraints[0..i]) |*previous| if (constraint.oid == previous.oid) return error.InvalidChangeRecord;
                 }
             }
-            if (version == primary_index_identity_format_version) {
+            if (version >= primary_index_identity_format_version) {
                 out.primary_index_oid = try reader.int(u32);
-                if (!out.keyed() or !validConstraintOid(out.primary_index_oid) or out.primary_index_oid == out.oid) return error.InvalidChangeRecord;
+                if (version == primary_index_identity_format_version or out.primary_index_oid != 0) {
+                    if (!out.keyed() or !validConstraintOid(out.primary_index_oid) or out.primary_index_oid == out.oid) return error.InvalidChangeRecord;
+                }
+            }
+        }
+
+        pub fn assignDefaultOids(columns: []V.Column, previous: []const V.Column, sources: []const u8, next: *u32) Error!void {
+            for (columns, 0..) |*column, index| {
+                column.default_oid = 0;
+                if (column.default_kind != .default and column.default_kind != .generated) continue;
+                if (sources.len != 0 and sources[index] < previous.len) {
+                    const old = &previous[sources[index]];
+                    if (old.default_kind == column.default_kind and (column.default_kind == .generated or
+                        types.same(old.expression.slice(), column.expression.slice()))) column.default_oid = old.default_oid;
+                }
+                if (column.default_oid == 0) {
+                    if (next.* == 0xffffffff) return error.TableCapacity;
+                    column.default_oid = next.*;
+                    next.* += 1;
+                }
+            }
+        }
+
+        fn resolveDefaultOids(definition: *Definition, previous: []const V.Column, sources: []const u8, next: *u32) Error!void {
+            const columns = definition.columns[0..definition.count];
+            // A version with persisted identities encodes all expressions.
+            for (columns) |*column| {
+                if (column.default_oid == 0) continue;
+                for (columns) |*other| next.* = @max(next.*, other.default_oid + 1);
+                return;
+            }
+            try assignDefaultOids(columns, previous, sources, next);
+        }
+
+        fn validateDefaultOids(scratch: *const Scratch, definition: *const Definition, replaced: ?usize, sources: []const u8) Error!void {
+            for (definition.columns[0..definition.count], 0..) |*column, position| {
+                if (column.default_oid == 0) continue;
+                for (&scratch.tables, 0..) |*table, index| {
+                    if (!table.live) continue;
+                    for (table.columns[0..table.column_count], 0..) |*prior, prior_position| {
+                        if (prior.default_oid != column.default_oid) continue;
+                        if (replaced != index or sources[position] != prior_position) return error.ChangeRecordConflict;
+                    }
+                }
             }
         }
 
@@ -1752,10 +1814,12 @@ pub fn ChangeLog(comptime config: types.Config) type {
             scratch.object_overlay.init(&db.catalog_objects);
             var next_oid: u32 = first_oid + db.oid_counter;
             var next_constraint_oid = db.next_constraint_oid;
+            var next_default_oid = db.next_default_oid;
             const object_check: ObjectCheck(@TypeOf(db)) = .{ .db = db, .scratch = scratch, .next_oid = &next_oid };
             var reader = Reader{ .bytes = record };
             var row: V.Row = .{};
             var check_schema_owners = false;
+            var check_routine_references = false;
             var image_sequence: SequenceDefinition = undefined;
             for (0..count) |part| {
                 const tag = try reader.int(u8);
@@ -1791,6 +1855,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         try validateExtras(db, scratch, &definition, null);
                         try resolveConstraintOids(&definition, &.{}, &next_constraint_oid);
                         try validateConstraintOids(scratch, &definition, &.{});
+                        try resolveDefaultOids(&definition, &.{}, &.{}, &next_default_oid);
+                        try validateDefaultOids(scratch, &definition, null, &.{});
                         purge(scratch, @intCast(index));
                         const vt = &scratch.tables[index];
                         vt.* = .{ .live = true, .mutated = true, .keyed = definition.keyed(), .primary_index_oid = definition.primary_index_oid, .namespace = definition.namespace, .oid = definition.oid, .name = definition.name, .column_count = definition.count, .columns = definition.columns, .next_rowid = 1, .relkind = definition.extras.relkind };
@@ -1869,6 +1935,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         try validateExtras(db, scratch, &definition, vt);
                         try resolveConstraintOids(&definition, &vt.constraint_ids, &next_constraint_oid);
                         try validateConstraintOids(scratch, &definition, &vt.constraint_ids);
+                        try resolveDefaultOids(&definition, vt.columns[0..vt.column_count], sources[0..definition.count], &next_default_oid);
+                        try validateDefaultOids(scratch, &definition, index, sources[0..definition.count]);
                         noteIndexes(vt, &definition, &next_oid);
                         vt.constraint_ids = ConstraintIdentities.from(definition.primary_constraint_oid, definition.constraints[0..definition.constraint_count]);
                         // Identity sequences keep their column positions.
@@ -1951,7 +2019,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         if (!created) try putRow(scratch, .{ .epoch = scratch.epoch, .table = index, .live = false, .rowid = rowid });
                         vt.live_rows -= 1;
                     },
-                    @intFromEnum(Op.catalog_counters), @intFromEnum(Op.catalog_counters_with_constraints) => {
+                    @intFromEnum(Op.catalog_counters), @intFromEnum(Op.catalog_counters_with_constraints), @intFromEnum(Op.catalog_counters_with_defaults) => {
                         const counter = try reader.int(u32);
                         // next_oid is the maximum so far; a counter never lowers it.
                         if (counter < next_oid) return error.ChangeRecordConflict;
@@ -1970,10 +2038,15 @@ pub fn ChangeLog(comptime config: types.Config) type {
                             if (next < scratch.tables[index].next_rowid) return error.ChangeRecordConflict;
                             scratch.tables[index].next_rowid = next;
                         }
-                        if (tag == @intFromEnum(Op.catalog_counters_with_constraints)) {
+                        if (tag != @intFromEnum(Op.catalog_counters)) {
                             const constraint_counter = try reader.int(u32);
                             if (constraint_counter < next_constraint_oid) return error.ChangeRecordConflict;
                             next_constraint_oid = constraint_counter;
+                        }
+                        if (tag == @intFromEnum(Op.catalog_counters_with_defaults)) {
+                            const default_counter = try reader.int(u32);
+                            if (default_counter < next_default_oid) return error.ChangeRecordConflict;
+                            next_default_oid = default_counter;
                         }
                     },
                     @intFromEnum(Op.alter_sequence) => {
@@ -2006,6 +2079,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         const payload = try reader.take(try reader.int(u32));
                         const checks: ObjectChecks(@TypeOf(db)) = .{ .db = db, .scratch = scratch };
                         if (try RC.validateOp(&scratch.objects, tag, payload, checks)) |oid| next_oid = @max(next_oid, oid + 1);
+                        check_routine_references = true;
                     },
                     @intFromEnum(Op.create_sequence), @intFromEnum(Op.create_sequence_cached) => {
                         var definition = try decodeCreateSequence(&reader);
@@ -2060,8 +2134,9 @@ pub fn ChangeLog(comptime config: types.Config) type {
             if (reader.position != record.len) return error.InvalidChangeRecord;
             // Objects never outlive the tables, roles and objects they name.
             try scratch.object_overlay.finish(&object_check);
+            if (check_routine_references or check_schema_owners) try RC.finishOverlay(&scratch.objects, &scratch.object_overlay);
             if (check_schema_owners) for (&scratch.schemas) |*schema| {
-                if (schema.live and !scratch.object_overlay.roleExists(schema.owner)) return error.ChangeRecordConflict;
+                if (schema.live and !scratch.object_overlay.roleExists(scratch.object_overlay.schemaOwner(schema.oid, schema.owner))) return error.ChangeRecordConflict;
             };
         }
 
@@ -2147,7 +2222,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
             switch (image.op) {
                 .create_table, .insert => if (image.bank >= config.tables) return error.InvalidChangeRecord,
                 .create_sequence => {},
-                .catalog_counters, .catalog_counters_with_constraints => if (image.table_count > config.tables) return error.InvalidChangeRecord,
+                .catalog_counters, .catalog_counters_with_constraints, .catalog_counters_with_defaults => if (image.table_count > config.tables) return error.InvalidChangeRecord,
                 else => return error.InvalidChangeRecord,
             }
             return applyRecord(db, record, scratch, image);
@@ -2176,6 +2251,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     @intFromEnum(Op.create_table) => {
                         var definition = try decodeCreate(&reader);
                         try resolveConstraintOids(&definition, &.{}, &db.next_constraint_oid);
+                        try resolveDefaultOids(&definition, &.{}, &.{}, &db.next_default_oid);
                         const columns = definition.columns[0..definition.count];
                         for (&db.tables, 0..) |*table, index| if (!table.live and S.createBankFits(table, columns, definition.extras.index_count)) {
                             if (!S.indexFits(table, definition.extras.index_count, 0)) return error.ChangeRecordConflict;
@@ -2204,6 +2280,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                             sources[position] = try reader.int(u8);
                             if (sources[position] == 0xff) fills[position] = (try decodeValue(&reader)).cell;
                         }
+                        try resolveDefaultOids(&definition, table.columns[0..table.column_count], sources[0..definition.count], &db.next_default_oid);
                         const old_count = table.column_count;
                         if (!S.indexFits(table, definition.extras.index_count, 0)) return error.ChangeRecordConflict;
                         S.redefine(table, definition.name, definition.columns[0..definition.count], definition.constraints[0..definition.constraint_count], &definition.extras, sources[0..definition.count], fills[0..definition.count]);
@@ -2260,14 +2337,15 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         S.scanPublish(table, old, false);
                         retire(db, table, old, csn);
                     },
-                    @intFromEnum(Op.catalog_counters), @intFromEnum(Op.catalog_counters_with_constraints) => {
+                    @intFromEnum(Op.catalog_counters), @intFromEnum(Op.catalog_counters_with_constraints), @intFromEnum(Op.catalog_counters_with_defaults) => {
                         db.oid_counter = (try reader.int(u32)) - first_oid;
                         const tables = try reader.int(u8);
                         for (0..tables) |_| {
                             const table = try tableByOid(db, try reader.int(u32));
                             table.next_rowid = try reader.int(u64);
                         }
-                        if (tag == @intFromEnum(Op.catalog_counters_with_constraints)) db.next_constraint_oid = try reader.int(u32);
+                        if (tag != @intFromEnum(Op.catalog_counters)) db.next_constraint_oid = try reader.int(u32);
+                        if (tag == @intFromEnum(Op.catalog_counters_with_defaults)) db.next_default_oid = try reader.int(u32);
                     },
                     @intFromEnum(Op.alter_sequence) => {
                         const index = try seqByOid(db, try reader.int(u32));

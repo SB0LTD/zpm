@@ -1,5 +1,453 @@
 # SQL conformance TDD checkpoint
 
+## Stock PostgreSQL dump and restore candidate
+
+The full ZPM test run on `ab781b39` found five failures outside the
+qualified migration fixture. UNNEST detection now runs in SELECT target
+parsing so VALUES forms never read SELECT target nodes. Inner catalog
+joins can filter either source before retaining catalog rows, and a
+single-block query reads relation ACL arrays only when it references
+them. The composite and covering-index contracts check PostgreSQL's
+internal character type and complete `indkey` values.
+[Full ZPM run](https://github.com/SB0LTD/zpm/actions/runs/44926870713)
+
+Separate whole-database work passed all 27 stock checks on PostgreSQL
+16 and 18 at RAMSQL `f051b2e`. The fixture preserves a named schema
+owner, a reader's schema and table grants, a table comment, rows and
+defaults. The RamSQL import repeats these checks after WAL reopen.
+ZPM persists schema owner changes as catalog versions and rewrites
+existing schema ACL grantors with the change. The focused security
+contract passed 1,616 assertions and replayed 352 change records.
+[Whole-database CI](https://github.com/SB0LTD/ramsql/actions/runs/44929034456)
+
+RAMSQL `d1ddbe5` with ZPM `ed00a0a1` passed all 24 stock
+tooling checks on both PostgreSQL 16 and 18. Stock plain and custom
+imports passed row, default and constraint checks after WAL reopen.
+Stock custom archives from RamSQL restored on both native servers and
+passed the same checks. The archive fixture selects two tables and uses
+`--no-owner --no-acl`. Schema ACL metadata, generated expressions,
+partition and index discovery are exercised in separate probes.
+The local Sig catalog, change-log and snapshot contracts passed
+137, 1,089 and 122 assertions. Whole-database migrations, owner and ACL
+restore, wider schema fixtures and general PostgreSQL conformance remain
+open.
+[PG16 and PG18 stock round trips](https://github.com/SB0LTD/ramsql/actions/runs/44926381895)
+
+RAMSQL `af7af9a` with ZPM `64b1a717` passed the subscription probe
+with the standalone connection alias and progressed through operator
+dependency, security-label, and database metadata discovery. The custom
+archive stopped at the first target-list `unnest(setconfig)` query.
+The new executor expands one typed top-level UNNEST target after
+filtering, using the same array reader as FROM UNNEST. The contract covers
+null arrays, empty arrays, null elements, filters, ordering and row counts.
+General set-returning expressions and multiple set targets remain open.
+[PostgreSQL 16 and 18 archive metadata CI](https://github.com/SB0LTD/ramsql/actions/runs/44925969411)
+
+RAMSQL `ea70fda` with ZPM `a6f6cfe0` completed the stock
+subscription query on PostgreSQL 16 and 18. The dedicated metadata
+probe found that the standalone database row used the canonical name
+even when a connection supplied an alias. The stock dumps then failed
+when reading `pg_amop` and `pg_amproc` as part of dependency
+discovery. The follow-up exposes built-in B-tree strategies and the
+typed support-procedure catalog. ZPM uses its typed comparator directly.
+The follow-up also covers database and search-path metadata for custom
+archives. Logical subscriptions and security label providers remain
+outside the supported SQL surface.
+[PostgreSQL 16 and 18 subscription CI](https://github.com/SB0LTD/ramsql/actions/runs/44925395409)
+
+RAMSQL `c175b9f` with ZPM `c8b764ab` passed range and list
+partition discovery, default-child removal, and restored defaults on
+PostgreSQL 16 and 18. Both stock outbound dumps advanced to the
+logical subscription count, which returned `TableNotFound`. The new
+typed `pg_subscription` catalog is empty because the engine has no
+logical subscriptions. The standalone server supplies its own database
+row to the existing `pg_database` provider interface.
+[PostgreSQL 16 and 18 partition CI](https://github.com/SB0LTD/ramsql/actions/runs/44924845762)
+
+RAMSQL `0cadbf6` with ZPM `9b7446b8` passed CHECK and index
+discovery on PostgreSQL 16 and 18. Both lanes compared inherited CHECK
+locality, primary and covering indexes, and NULLS NOT DISTINCT.
+Both outbound stock dumps passed those queries and reached
+`pg_partitioned_table`, which returned `TableNotFound` during the
+enum hash-partition check.
+[PostgreSQL 16 and 18 CHECK and index CI](https://github.com/SB0LTD/ramsql/actions/runs/44924228856)
+
+`pg_attrdef` assigns catalog OIDs to column defaults and stored
+generation expressions. Current change records persist the OIDs,
+legacy records assign them during replay, and checkpoint counters
+preserve the high-water mark after a default is dropped. The Sig
+change-log and base-snapshot suites passed 1,089 and 122 assertions.
+The `adbin` representation remains SQL expression text for
+`pg_get_expr`.
+
+RAMSQL `26d1089` with ZPM `ed5493c7` passed default-expression
+discovery on PostgreSQL 16 and 18, including generated values and
+identity preservation after a column rename. Both lanes passed native
+plain and custom imports. Outbound stock `pg_dump` passed default
+discovery and reached the CHECK constraint projection, which reported
+`ColumnNotFound` for its `conislocal` query.
+[PostgreSQL 16 and 18 default-expression CI](https://github.com/SB0LTD/ramsql/actions/runs/44923741114)
+
+`pg_attribute` and `pg_type` expose the column and type metadata
+used by stock `pg_dump`. Attribute and type storage policies match so
+the dump does not emit an ALTER for a storage override. Attribute
+locality reflects supported inheritance and partitions. Statistics
+targets use the advertised PostgreSQL 16 default, and compression
+and option fields have no overrides. RamSQL materializes added column
+values, so `atthasmissing` is false and `attmissingval` is a typed
+`anyarray` NULL. That pseudo-type is available for catalog output.
+
+RAMSQL `9e4bfa6` with ZPM `7a160f13` passed the column discovery
+projection against PostgreSQL 16 and 18, including inherited and
+local columns, type formatting and the missing-value result OID.
+The standalone Windows Sig catalog suite passed 118 assertions.
+Native plain and custom imports passed row and constraint checks
+after WAL reopen. Both outbound stock dumps passed column discovery
+and returned `ColumnNotFound` on the subsequent `pg_attrdef` query
+for column defaults. Both stock directions on both versions remain
+the merge gate.
+[PostgreSQL 16 and 18 column discovery CI](https://github.com/SB0LTD/ramsql/actions/runs/44921924815)
+
+`pg_event_trigger` exposes the stock catalog at OID 3466, with an
+internal `"char"` firing mode and `text[]` command tags. It has no rows
+because RamSQL does not support DDL event triggers. Single-array
+`unnest` in FROM uses the input's element type and emits values in
+storage order, preserving NULL elements and supporting
+`WITH ORDINALITY`. The stock tag expression uses a correlated array
+subquery. Target-list and multi-array `unnest` remain open.
+
+RAMSQL `2294b9b` with ZPM `935daea0` passed event-trigger discovery
+on PostgreSQL 16 and 18. Both lanes matched native results for
+parameterized tag quoting, multidimensional arrays, NULLs, duplicates,
+and ordinality in text and binary formats. The standalone Windows
+Sig catalog suite passed 116 assertions. Native plain and custom
+imports passed row and constraint checks after WAL reopen. Both
+outbound dumps passed event-trigger discovery and reached the
+`pg_attribute` and `pg_type` column discovery query, which returned
+`ColumnNotFound`. That projection needs additional storage, options,
+and missing-value metadata. Both stock directions on both versions
+remain the merge gate.
+[PostgreSQL 16 and 18 event-trigger CI](https://github.com/SB0LTD/ramsql/actions/runs/44920992058)
+
+`pg_range` exposes the six built-in ranges the Sig engine supports.
+It derives subtype and B-tree operator-class references from the
+existing registries and identifies the canonicalization routines
+used for discrete integer and date ranges. PostgreSQL's companion
+multirange OIDs let the stock `pg_cast` filter identify generated
+casts. Multirange values and casts, subtype-distance callbacks,
+direct SQL calls to canonicalization callbacks, and custom ranges
+remain open.
+
+RAMSQL `c6b7c51` with ZPM `393f4b0b` passed range discovery on
+PostgreSQL 16 and 18. Both lanes compared range values and catalog
+metadata in text and binary formats, resolved the three canonical
+callbacks, and verified the stock cast filter. The standalone
+Windows Sig catalog suite passed 110 assertions. Native plain and
+custom imports passed row and constraint checks after WAL reopen.
+Both outbound dumps passed the cast scan and reached the
+`pg_event_trigger` discovery query, which returned `TableNotFound`.
+Both stock directions on both versions remain the merge gate.
+[PostgreSQL 16 and 18 range discovery CI](https://github.com/SB0LTD/ramsql/actions/runs/44920438148)
+
+`pg_conversion` exposes relation OID 2607 with PostgreSQL's encoding
+IDs, `regproc` callback column and Boolean default flag. RamSQL uses
+UTF-8 for both client and server. UTF-8 identity transfer calls no
+conversion procedure, so the catalog has zero rows. Cross-encoding
+transcoding and user-defined conversions remain open. The standalone
+Windows Sig catalog suite passed 107 assertions.
+
+RAMSQL `d921dd3` with ZPM `9c4e83bb` passed conversion discovery on
+PostgreSQL 16 and 18. Both lanes checked the stock projection, full
+column types, relation OID, multilingual UTF-8 round trips in text
+and binary formats, and rejection of LATIN1. Native plain and custom
+imports passed row and constraint checks after WAL reopen. Outbound
+`pg_dump` passed conversion discovery and stopped with `TableNotFound`
+on the `pg_range` subquery in its `pg_cast` scan. Both stock directions
+on both versions remain the merge gate.
+[PostgreSQL 16 and 18 conversion CI](https://github.com/SB0LTD/ramsql/actions/runs/44919740184)
+
+`pg_default_acl` exposes PostgreSQL's relation OID 826, with `"char"`
+object codes and `aclitem[]` for both stored grants and the baseline
+returned by the stock discovery query. Built-in privileges are
+computed by `acldefault`. The catalog is empty because RamSQL has no
+`ALTER DEFAULT PRIVILEGES` entries. The sequence catalog code
+`S` is converted to `s` by the stock query. Table defaults follow the
+server's advertised PostgreSQL 16 baseline. PostgreSQL 17 and 18 also
+include `MAINTAIN`. The standalone Windows Sig catalog suite passed 105
+assertions, including both arms of the stock ACL expression.
+
+RAMSQL `65c5725` with ZPM `d94845a9` passed default ACL discovery
+on PostgreSQL 16 and 18. Both lanes checked the stock projection's
+type OIDs, the sequence-code translation, schema-local empty ACLs,
+the built-in privilege lists and NULL arguments. Native plain and
+custom imports passed row and constraint checks after WAL reopen.
+Outbound stock `pg_dump` passed default ACL discovery and stopped
+with `TableNotFound` on `pg_conversion`, before creating an archive.
+Both stock directions on both versions remain the merge gate.
+[PostgreSQL 16 and 18 default ACL CI](https://github.com/SB0LTD/ramsql/actions/runs/44919209003)
+
+The stock `pg_foreign_data_wrapper` query uses the allocator-free
+`pg_options_to_table(text[])` row source, SQL identifier and literal
+quoting, and the default owner-only USAGE ACL. The Sig executor preserves
+the outer row when the option function is the first FROM item in a
+correlated array subquery. The PostgreSQL codec resolves explicit SELECT
+parameter casts before probing FROM relations, so clients can bind option
+arrays for table functions and derived tables. FDW handler callbacks and
+DDL for setting wrapper options remain open. Identifier quoting uses
+PostgreSQL 18's keyword categories.
+
+The Windows Sig catalog, query-composition, catalog-security and
+PostgreSQL protocol suites passed 101, 7,467, 1,594 and 23,830
+assertions, respectively.
+
+RAMSQL `0757df8` with ZPM `aaf1faa1` passed foreign-data-wrapper
+discovery on PostgreSQL 16 and 18. Both lanes compared the stock
+projection on an empty catalog and a created wrapper, option expansion
+with text and binary results, quoting, and parameterized correlated
+subqueries. Native plain and custom imports passed with row and
+constraint checks after WAL reopen. Outbound stock `pg_dump` passed the
+wrapper query and stopped with `TableNotFound` on `pg_default_acl` before
+producing an archive. Both stock directions on both versions remain the
+merge gate.
+[PostgreSQL 16 and 18 foreign-data-wrapper CI](https://github.com/SB0LTD/ramsql/actions/runs/44918456811)
+
+`pg_ts_config` exposes the supported `pg_catalog.simple` configuration
+(OID 3748), with the bootstrap owner and a reference to the built-in
+`default` parser (OID 3722). The standalone Windows Sig catalog suite
+passed 93 assertions, including the stock projection and joins to the
+namespace, owner and parser catalogs. The row describes the existing
+Sig text-search configuration. Custom configurations and Snowball
+configurations remain open.
+
+RAMSQL `10930e2` with ZPM `ec6015d3` passed configuration discovery
+against PostgreSQL 16 and 18 in text and binary modes. Native plain
+and custom imports passed with row and constraint checks after WAL
+reopen. Outbound `pg_dump` passed configuration discovery and then
+received `UndefinedFunction` from its `pg_foreign_data_wrapper`
+query in that earlier revision.
+[PostgreSQL 16 and 18 text-search configuration CI](https://github.com/SB0LTD/ramsql/actions/runs/44912646310)
+
+`pg_ts_dict` exposes the built-in `pg_catalog.simple` dictionary.
+Its row uses PostgreSQL dictionary OID 3765, the bootstrap owner and
+catalog namespace, and a reference to the supported `simple` template.
+The default initialization has no options, so `dictinitoption` is SQL
+NULL with type `text`. The row describes the existing stateless Sig
+dictionary. Custom dictionaries and configurable initialization remain open.
+
+RAMSQL `b9f3cde` with ZPM `ed450a4e` passed dictionary discovery on
+PostgreSQL 16 and 18. CI compared the full stock projection in text and
+binary mode and followed the owner, namespace, template and callback
+references. Native plain and custom imports passed with row and constraint
+checks after WAL reopen. The standalone Windows Sig catalog suite passed
+91 assertions. Outbound `pg_dump` passed dictionary discovery and stopped
+on the missing `pg_ts_config` catalog. The next catalog needs the
+supported configuration's owner, namespace and parser reference. Both
+stock directions on both versions remain the merge gate.
+[PostgreSQL 16 and 18 text-search dictionary CI](https://github.com/SB0LTD/ramsql/actions/runs/44910583546)
+
+`pg_ts_template` exposes the built-in `pg_catalog.simple` template with
+typed `regproc` references to `dsimple_init` and `dsimple_lexize`. Both
+references resolve through `pg_proc`. The Sig dictionary uses fixed,
+stateless initialization and ASCII case folding. Custom templates,
+custom dictionary options and direct SQL invocation of the internal
+callbacks remain open.
+
+RAMSQL `4f7ab02` with ZPM `516ed804` passed template discovery on
+PostgreSQL 16 and 18. Both lanes matched the stock catalog projection,
+text and binary `regproc` results, callback signatures, and default
+dictionary normalization for mixed case, common words and inflections.
+Native plain and custom imports passed with row and constraint checks
+after WAL reopen. Outbound `pg_dump` passed template discovery and stopped
+with `TableNotFound` on `pg_ts_dict`. Dictionary discovery needs the
+supported dictionary's owner, namespace, template link and initialization
+options. Both stock directions on both versions remain the merge gate.
+[PostgreSQL 16 and 18 text-search template CI](https://github.com/SB0LTD/ramsql/actions/runs/44909920551)
+
+`pg_ts_parser` exposes `pg_catalog.default`, the tokenizer used by
+`pg_catalog.simple`. The startup, next-token, shutdown and token-type
+references use `regproc` and resolve through `pg_proc`. The token-type
+descriptors use the IDs emitted by the Sig tokenizer and drive the
+`simple` dictionary's filtering. The headline reference is zero because
+headline generation is unavailable. The callback rows are metadata for
+internal routines. Parser registration and direct SQL invocation of
+callbacks remain open.
+
+RAMSQL `de05533` with ZPM `3fe43949` passed parser discovery on
+PostgreSQL 16 and 18. Both lanes compared the stock projection, typed
+references and callback signatures, and matched native `to_tsvector`
+output for hyphenated words, URLs, markup, email and numbers. Both also
+passed stock plain and custom imports with row and constraint checks after
+WAL reopen. Local WSL could not start, so the standalone Sig catalog suite
+was not run for this revision.
+
+That candidate passed parser discovery on both versions and stopped
+with `TableNotFound` on `pg_ts_template`.
+[PostgreSQL 16 and 18 text-search parser CI](https://github.com/SB0LTD/ramsql/actions/runs/44906328296)
+
+`pg_opclass` and `pg_opfamily` share the registry for 26 default index
+classes across 21 families. Each row uses PostgreSQL 16 catalog OIDs and
+links to the supported `btree` method and indexed type. Qualification
+compares every row and link and exercises unique-index creation, ordered
+reads, equality, and duplicate rejection for each type. The PostgreSQL 18
+comparison matches generated class OIDs by method and name. These catalog
+entries describe supported SQL semantics. Explicit operator-class selection,
+per-index `pg_index.indclass`, planner use of PostgreSQL operator families,
+and family-member catalogs remain open.
+
+RAMSQL `6a737d3` with ZPM `14a11b7c` passed operator-class and family
+qualification on PostgreSQL 16 and 18. Both lanes passed stock plain and
+custom imports with row and constraint checks after WAL reopen. The local
+Sig catalog suite passed 82 assertions.
+
+That candidate passed operator-class discovery and stopped with
+`TableNotFound` on `pg_ts_parser`.
+[PostgreSQL 16 and 18 operator-class discovery CI](https://github.com/SB0LTD/ramsql/actions/runs/44899082739)
+
+`pg_am` exposes the two implemented access methods with PostgreSQL table
+and index kind codes and typed `regproc` handler references. Handler OIDs
+resolve to `pg_proc` and their argument and result pseudo-types are visible
+in `pg_type`. The same OID alias is used for operator implementation
+references. Handler entries identify built-in implementation paths. Custom
+access methods and direct invocation of PostgreSQL handlers remain open.
+
+`regproc` resolves catalog and visible public routine names, supports
+qualified and quoted names, accepts numeric OIDs, and preserves the stored
+OID through binary encode and WAL replay. Ambiguous and missing names return
+NULL through `to_regproc` and raise errors in strict casts. Routine
+dependency tracking in stored expressions and `regprocedure` remain open.
+
+RAMSQL `459011f` with ZPM `b4415a17` passed access-method and handler
+comparisons on PostgreSQL 16 and 18. Both lanes verified bound routine
+names and binary OIDs through an overloaded name, and passed stock plain
+and custom imports with row and constraint checks after WAL reopen. The
+local Sig catalog suite passed 79 assertions, including scalar and array
+`regproc` replay.
+
+That candidate passed access-method discovery and failed with
+`TableNotFound` on `pg_opclass`.
+[PostgreSQL 16 and 18 access-method discovery CI](https://github.com/SB0LTD/ramsql/actions/runs/44897386171)
+
+`pg_operator` now exposes PostgreSQL identities for 427 concrete operator
+signatures that execute in Sig. It includes prefix and infix signatures,
+argument and result OIDs, owner and namespace, and links to internal
+implementation rows in `pg_proc`. Commutators and negators link to published
+signatures. The stock projection of `oprcode` uses OIDs. Planner estimator
+callbacks, polymorphic operator metadata and operator DDL remain open.
+The CI probe compares each published signature and runs
+typed operands against both PostgreSQL versions.
+
+For first-source catalog rows in eligible left-deep joins, the executor
+applies the existing early WHERE filter before reserving workspace for a
+row. The filter is limited to infallible predicates and kept out of outer
+joins. The routine catalog suite passed 767 assertions and replayed 156
+WAL records with its existing workspace.
+
+On RAMSQL `1de34ce` with ZPM `b70b3dfb`, PostgreSQL 16 and 18 both
+passed the comparison of all 427 operator signatures, implementation
+signatures and representative expression results. Both also passed stock
+plain and custom imports and row and constraint checks after WAL reopen.
+That candidate reached access-method discovery on both versions and
+stopped with `UndefinedObject` on `pg_am.amhandler::pg_catalog.regproc`.
+[PostgreSQL 16 and 18 operator discovery CI](https://github.com/SB0LTD/ramsql/actions/runs/44894008040)
+
+Type discovery now exposes `pg_type.typacl` as `aclitem[]` and
+`typisdefined` as boolean for defined built-in and user types. The types
+have no explicit ACL overrides. `acldefault('T', owner)` provides USAGE for
+PUBLIC and the owner. Shell type creation and per-type grants remain open.
+Type and relation kind fields used by the discovery query return PostgreSQL
+`"char"` values, including the range kind and a composite type's relation
+kind. The subsequent language discovery query uses the same owner and
+PUBLIC USAGE defaults through `acldefault('l', owner)`.
+
+`name` subscripting uses zero-based byte offsets and the 64-byte padded
+representation. Out-of-range or NULL indices yield NULL, padding yields
+zero, and fixed-length slices return an unsupported-feature error. Name
+casts clip at a UTF-8 boundary. The native comparison exercises stock
+discovery predicates on built-in types, enums, domains, composites and
+their array types, and checks byte subscripting and wire types.
+
+On RAMSQL `8ef23fe` with ZPM `60e82388`, the PostgreSQL 16 and 18 lanes
+passed the catalog comparisons and stock plain and custom imports, including
+row and constraint checks after WAL reopen. The local Sig catalog and catalog
+security suites passed 75 and 1,594 assertions, respectively.
+
+That candidate passed type and language discovery and stopped at operator
+discovery with `TableNotFound`.
+[PostgreSQL 16 and 18 type discovery CI](https://github.com/SB0LTD/ramsql/actions/runs/44805214919)
+
+Function discovery now reads routine owners and SQL language OIDs from the
+catalog. `acldefault('f', owner)` grants EXECUTE by default to the owner and
+PUBLIC. For supported functions and procedures, owner-authorized
+`GRANT EXECUTE` and `REVOKE EXECUTE` update the visible `pg_proc.proacl` and
+actual call permissions. The ACL and owner are versioned and survive WAL
+replay and routine replacement. Older routine records imply the bootstrap owner
+and default ACL. The default routine ACL admits 16 named grantees besides the
+owner and PUBLIC, and catalog output uses the configured text capacity. Grant
+delegation and multi-object statements remain open.
+
+`pg_init_privs` exposes the explicit bootstrap namespace ACLs.
+`pg_cast` lists the supported PostgreSQL binary-coercion entries that have no
+separate function. `pg_transform` has catalog metadata and no rows because
+language transforms cannot be installed. `pg_proc.proargtypes` stays a textual
+OID list. The native comparison exercises stock function discovery against a
+real user function and compares its default and modified routine ACLs.
+
+RAMSQL `86626c3` with ZPM `c5f4a78c` passed function discovery and stock
+imports on both PostgreSQL 16 and 18. The local Sig routine contract passed
+767 assertions and replayed 156 WAL records, including ACL changes on a
+trigger function and rollback of a pending revoke.
+
+That candidate reached type discovery and failed with `ColumnNotFound`
+before creating an archive.
+[PostgreSQL 16 and 18 function discovery CI](https://github.com/SB0LTD/ramsql/actions/runs/44803356629)
+
+Namespace introspection now returns `pg_namespace.nspacl` as `aclitem[]`
+(OID 1034), with NULL before a custom schema ACL is materialized. The
+projection reads visible schema grants and owner privilege changes.
+`acldefault('n', owner)` provides the schema default for stock tools.
+Catalog output uses RAMSQL's actual role names. General ACL input and
+broader grant administration remain open.
+
+The parser accepts the stock table-selection predicate
+`OPERATOR(pg_catalog.=) ANY (array)` and uses the existing quantified
+comparison semantics for ANY, SOME and ALL. Single-transaction restore can
+add a single-column primary key to a table created and populated earlier in
+that transaction. The WAL records the validated keyed definition before
+the inserts. Late key creation after writes to an existing table and late
+composite keys retain their earlier restrictions.
+
+The stock-tooling CI gate runs actual PostgreSQL 16 and 18 clients against
+the pinned RAMSQL build. It checks namespace ACL values and wire metadata,
+unmodified native plain and custom imports including forced WAL reopen, and
+the reverse custom export. Both native versions matched the namespace ACL
+values and wire type. Both passed the stock plain and custom imports,
+single-transaction restore, constraint checks and WAL reopen.
+[Stock tooling CI](https://github.com/SB0LTD/ramsql/actions/runs/44761342559)
+
+The candidate now sizes SELECT projections separately from stored rows.
+The default RAMSQL build allows 48 projected columns, eight stored columns
+and eight relations. Query workspace still accounts for projected cells.
+`pg_tablespace` exposes the two built-in placements. `pg_foreign_table`
+has the stock column types and stays empty until foreign tables are
+implemented. `pg_class` exposes ownership, explicit composite type OIDs,
+and visible table ACLs. Ordinary tables still lack implicit row type OIDs.
+Relations have no PostgreSQL heap pages or transaction-age bookkeeping, and
+no analyzed cardinality estimate or per-relation storage options.
+`acldefault` also handles tables, sequences and tablespaces. The catalog
+contract covers a populated wide DISTINCT result, stored-width rejection,
+and table ACL grants and revocation.
+
+CI built RAMSQL `cec3f10` against ZPM `5fe6f380` and ran the stock
+PostgreSQL 16 and 18 tools. Both lanes pass namespace ACL and relation
+discovery, and validate rows and constraints after stock plain and custom
+imports and a WAL reopen. The dump fixture uses two public tables and
+`--no-owner --no-acl`. Local Sig catalog, catalog security and core DDL
+contracts passed with 69, 1,594 and 1,192 assertions, respectively.
+
+That earlier candidate passed table discovery and failed with
+`TableNotFound` in function discovery, before it could produce an archive.
+[Stock tooling CI](https://github.com/SB0LTD/ramsql/actions/runs/44785147029)
+
 ## Shipped RAMSQL evidence, 20 November 2026
 
 The beta.3 [prerelease](https://github.com/SB0LTD/ramsql/releases/tag/ci-v0.3.0-beta.3-run.44655295188.1) matches RAMSQL main at

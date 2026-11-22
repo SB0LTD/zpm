@@ -51,7 +51,7 @@ fn catalog(db: *DB) ![5]i64 {
     try check(identity[3] != 10 and identity[4] != 2200);
     try db.execute(point_relation, &result);
     try check(result.row_count == 1 and result.rows[0].cells[0].integer == identity[2]);
-    try check(equal(result.rows[0].cells[1].text.slice(), "c") and result.rows[0].cells[2].integer == 6);
+    try check(result.rows[0].cells[1] == .pg_internal_char and result.rows[0].cells[1].pg_internal_char == 'c' and result.rows[0].cells[2].integer == 6);
     try check(result.rows[0].cells[3].integer == identity[4]);
     try db.execute("SELECT oid,typelem,typrelid FROM pg_type WHERE typname='_Point'", &result);
     try check(result.row_count == 1 and result.rows[0].cells[0].integer == identity[1]);
