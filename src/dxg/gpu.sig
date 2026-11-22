@@ -62,6 +62,43 @@ pub const Error = kmt.Error || error{
     DeviceLost,
 };
 
+/// How the calls reach dxgkrnl: WSL's /dev/dxg (an ioctl each), unless the
+/// program reaches it another way and says so in its root file (`pub const
+/// dxg_transport`): Galaxy's kernel as a Hyper-V guest, over its GPU
+/// partition's VMBus channels. A transport gives
+///   open() Error!i32, close(fd: i32) void,
+///   call(fd: i32, nr: kmt.Nr, arg: anytype) kmt.Error!isize (`arg` a
+///     pointer to the call's argument, as /dev/dxg's ioctl takes it, the
+///     answer written back into it; success or STATUS_PENDING returns),
+///   sleepUs(us: u32) void, lastStatus() isize (the last refusal's).
+pub const Transport = if (@hasDecl(@import("root"), "dxg_transport")) @import("root").dxg_transport else DevDxg;
+
+/// WSL's /dev/dxg.
+pub const DevDxg = struct {
+    pub fn open() Error!i32 {
+        const fd: isize = @bitCast(linux.open("/dev/dxg", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0));
+        if (fd < 0) return error.NoDxg;
+        return @intCast(fd);
+    }
+
+    pub fn close(fd: i32) void {
+        _ = linux.close(fd);
+    }
+
+    pub fn call(fd: i32, nr: kmt.Nr, arg: anytype) kmt.Error!isize {
+        return kmt.call(fd, nr, arg);
+    }
+
+    pub fn sleepUs(us: u32) void {
+        const ts: linux.timespec = .{ .sec = 0, .nsec = @as(isize, us) * 1000 };
+        _ = linux.nanosleep(&ts, null);
+    }
+
+    pub fn lastStatus() isize {
+        return kmt.last_status;
+    }
+};
+
 pub const NVIDIA: u32 = 0x10de;
 
 /// A channel's ring memory: 2 MiB (NVIDIA's allocation unit for it). The
@@ -154,19 +191,17 @@ pub const Gpu = struct {
     /// Opens the NVIDIA GPU: adapter, device, paging queue, VA_BASE's range.
     pub fn open(g: *Gpu, opts: Options) Error!void {
         g.* = .{};
-        const fd: isize = @bitCast(linux.open("/dev/dxg", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0));
-        if (fd < 0) return error.NoDxg;
-        g.fd = @intCast(fd);
+        g.fd = try Transport.open();
         errdefer g.close();
         try g.findAdapter(opts.index);
         g.legacy = opts.legacy orelse !g.hardwareScheduling();
 
         var dev = kmt.CreateDevice{ .adapter = g.adapter };
-        _ = try kmt.call(g.fd, .create_device, &dev);
+        _ = try Transport.call(g.fd, .create_device, &dev);
         g.device = dev.device;
 
         var pq = kmt.CreatePagingQueue{ .device = g.device };
-        _ = try kmt.call(g.fd, .create_paging_queue, &pq);
+        _ = try Transport.call(g.fd, .create_paging_queue, &pq);
         g.paging_queue = pq.paging_queue;
         g.paging_fence = @ptrFromInt(pq.fence_cpu);
         try g.reserve(VA_BASE, VA_BYTES);
@@ -175,7 +210,7 @@ pub const Gpu = struct {
     /// GPU addresses [base, base + bytes) kept for this Gpu's mappings.
     pub fn reserve(g: *Gpu, base: u64, bytes: u64) Error!void {
         var rv = kmt.ReserveGpuVa{ .adapter = g.adapter, .base = base, .size = bytes };
-        _ = try kmt.call(g.fd, .reserve_gpu_va, &rv);
+        _ = try Transport.call(g.fd, .reserve_gpu_va, &rv);
     }
 
     /// Whether Windows schedules the GPU's work in hardware (WDDM 2.7's
@@ -184,7 +219,7 @@ pub const Gpu = struct {
     fn hardwareScheduling(g: *Gpu) bool {
         var caps: u32 = 0;
         var q = kmt.QueryAdapterInfo{ .adapter = g.adapter, .type = kmt.QUERY_WDDM_2_7_CAPS, .data = @intFromPtr(&caps), .size = 4 };
-        _ = kmt.call(g.fd, .query_adapter_info, &q) catch return true;
+        _ = Transport.call(g.fd, .query_adapter_info, &q) catch return true;
         return caps & kmt.CAPS_HW_SCHEDULING_ON != 0;
     }
 
@@ -193,12 +228,12 @@ pub const Gpu = struct {
     fn findAdapter(g: *Gpu, index: u32) Error!void {
         var list: [8]kmt.AdapterInfo = undefined;
         var e = kmt.EnumAdapters3{ .count = list.len, .adapters = @intFromPtr(&list) };
-        _ = try kmt.call(g.fd, .enum_adapters3, &e);
+        _ = try Transport.call(g.fd, .enum_adapters3, &e);
         var seen: u32 = 0;
         for (list[0..@min(e.count, list.len)]) |a| {
             var ids: kmt.PciIds = .{};
             var q = kmt.QueryAdapterInfo{ .adapter = a.adapter, .type = kmt.QUERY_PCI_IDS, .data = @intFromPtr(&ids), .size = @sizeOf(kmt.PciIds) };
-            const ok = if (kmt.call(g.fd, .query_adapter_info, &q)) |_| true else |_| false;
+            const ok = if (Transport.call(g.fd, .query_adapter_info, &q)) |_| true else |_| false;
             if (g.adapter == 0 and ok and ids.vendor == NVIDIA) {
                 if (seen == index) {
                     g.adapter = a.adapter;
@@ -208,7 +243,7 @@ pub const Gpu = struct {
                 seen += 1;
             }
             var c = kmt.CloseAdapter{ .adapter = a.adapter };
-            _ = kmt.call(g.fd, .close_adapter, &c) catch {};
+            _ = Transport.call(g.fd, .close_adapter, &c) catch {};
         }
         if (g.adapter == 0) return error.NoNvidiaAdapter;
     }
@@ -227,8 +262,7 @@ pub const Gpu = struct {
                 continue;
             }
             if (slept_us >= 5_000_000) return;
-            const ts: linux.timespec = .{ .sec = 0, .nsec = 50_000 };
-            _ = linux.nanosleep(&ts, null);
+            Transport.sleepUs(50);
             slept_us += 50;
         }
     }
@@ -267,13 +301,13 @@ pub const Gpu = struct {
             .priv_size = nv.ALLOCATION_BYTES,
         };
         var ca = kmt.CreateAllocation{ .device = g.device, .info = @intFromPtr(&info) };
-        _ = try kmt.call(g.fd, .create_allocation, &ca);
+        _ = try Transport.call(g.fd, .create_allocation, &ca);
         var r = Region{ .handle = info.allocation, .bytes = bytes, .cpu = sysmem orelse &.{} };
         errdefer g.release(r);
 
         var handle = info.allocation;
         var mr = kmt.MakeResident{ .paging_queue = g.paging_queue, .allocations = @intFromPtr(&handle) };
-        _ = try kmt.call(g.fd, .make_resident, &mr);
+        _ = try Transport.call(g.fd, .make_resident, &mr);
         const va = at orelse try g.nextVa(bytes);
         var mp = kmt.MapGpuVa{
             .paging_queue = g.paging_queue,
@@ -284,7 +318,7 @@ pub const Gpu = struct {
             .allocation = info.allocation,
             .size_pages = bytes / 4096,
         };
-        _ = try kmt.call(g.fd, .map_gpu_va, &mp);
+        _ = try Transport.call(g.fd, .map_gpu_va, &mp);
         g.pagingDone(@max(mr.paging_fence, mp.paging_fence));
         r.va = mp.va;
         return r;
@@ -324,7 +358,7 @@ pub const Gpu = struct {
         if (r.handle == 0) return;
         var h = r.handle;
         var d = kmt.DestroyAllocation2{ .device = g.device, .allocations = @intFromPtr(&h), .count = 1 };
-        _ = kmt.call(g.fd, .destroy_allocation2, &d) catch {};
+        _ = Transport.call(g.fd, .destroy_allocation2, &d) catch {};
     }
 
     /// Closes the device (its channels first: Channel.close).
@@ -335,9 +369,9 @@ pub const Gpu = struct {
 
     pub fn fault(g: *Gpu) ?Fault {
         var ex = kmt.GetDeviceState{ .device = g.device, .state_type = kmt.DEVICESTATE_EXECUTION };
-        _ = kmt.call(g.fd, .get_device_state, &ex) catch return null;
+        _ = Transport.call(g.fd, .get_device_state, &ex) catch return null;
         var pf = kmt.GetDeviceState{ .device = g.device, .state_type = kmt.DEVICESTATE_PAGE_FAULT };
-        const got = if (kmt.call(g.fd, .get_device_state, &pf)) |_| true else |_| false;
+        const got = if (Transport.call(g.fd, .get_device_state, &pf)) |_| true else |_| false;
         return .{
             .execution = @truncate(ex.seq),
             .va = if (got) pf.va else 0,
@@ -351,17 +385,17 @@ pub const Gpu = struct {
         if (g.fd < 0) return;
         if (g.paging_queue != 0) {
             var d = kmt.DestroyPagingQueue{ .paging_queue = g.paging_queue };
-            _ = kmt.call(g.fd, .destroy_paging_queue, &d) catch {};
+            _ = Transport.call(g.fd, .destroy_paging_queue, &d) catch {};
         }
         if (g.device != 0) {
             var d = kmt.DestroyDevice{ .device = g.device };
-            _ = kmt.call(g.fd, .destroy_device, &d) catch {};
+            _ = Transport.call(g.fd, .destroy_device, &d) catch {};
         }
         if (g.adapter != 0) {
             var d = kmt.CloseAdapter{ .adapter = g.adapter };
-            _ = kmt.call(g.fd, .close_adapter, &d) catch {};
+            _ = Transport.call(g.fd, .close_adapter, &d) catch {};
         }
-        _ = linux.close(g.fd);
+        Transport.close(g.fd);
         g.fd = -1;
     }
 };
@@ -403,7 +437,7 @@ pub const Channel = struct {
             .priv_size = ctx_len,
             .client_hint = opts.client,
         };
-        _ = try kmt.call(g.fd, .create_context_virtual, &cc);
+        _ = try Transport.call(g.fd, .create_context_virtual, &cc);
         c.context = cc.context;
 
         c.ring = try g.map(ring_memory[0..RING_BYTES], .ring, null);
@@ -415,7 +449,7 @@ pub const Channel = struct {
             .priv_size = nv.QUEUE_BYTES,
             .priv = @intFromPtr(&c.queue_data),
         };
-        _ = try kmt.call(g.fd, .create_hw_queue, &hq);
+        _ = try Transport.call(g.fd, .create_hw_queue, &hq);
         c.queue = hq.queue;
         c.progress = @ptrFromInt(hq.progress_cpu);
         c.progress_gpu = hq.progress_gpu;
@@ -439,7 +473,7 @@ pub const Channel = struct {
             .priv_size = ctx_len,
             .client_hint = opts.client,
         };
-        _ = try kmt.call(g.fd, .create_context_virtual, &cc);
+        _ = try Transport.call(g.fd, .create_context_virtual, &cc);
         c.context = cc.context;
         c.ring = try g.map(ring_memory[0..RING_BYTES], .ring, null);
         const p: *volatile u64 = @ptrCast(@alignCast(c.ring.cpu.ptr + LEGACY_FENCE_OFFSET));
@@ -494,7 +528,7 @@ pub const Channel = struct {
             .priv_size = len,
         };
         s.broadcast_context[0] = c.context;
-        _ = try kmt.call(c.gpu.fd, .submit_command, &s);
+        _ = try Transport.call(c.gpu.fd, .submit_command, &s);
     }
 
     fn entry(c: *Channel, e: u64) void {
@@ -568,7 +602,7 @@ pub const Channel = struct {
             .priv_size = nv.SUBMIT_BYTES,
             .priv = @intFromPtr(&c.submit_data),
         };
-        _ = try kmt.call(c.gpu.fd, .submit_to_hw_queue, &s);
+        _ = try Transport.call(c.gpu.fd, .submit_to_hw_queue, &s);
     }
 
     /// The last fence the GPU finished.
@@ -601,8 +635,7 @@ pub const Channel = struct {
                 continue;
             }
             if (slept_us >= timeout_us) return error.Timeout;
-            const ts: linux.timespec = .{ .sec = 0, .nsec = 50_000 };
-            _ = linux.nanosleep(&ts, null);
+            Transport.sleepUs(50);
             slept_us += 50;
         }
     }
@@ -612,14 +645,14 @@ pub const Channel = struct {
         if (g.fd < 0) return;
         if (c.queue != 0) {
             var d = kmt.DestroyHwQueue{ .queue = c.queue };
-            _ = kmt.call(g.fd, .destroy_hw_queue, &d) catch {};
+            _ = Transport.call(g.fd, .destroy_hw_queue, &d) catch {};
             c.queue = 0;
         }
         g.release(c.ring);
         c.ring = .{};
         if (c.context != 0) {
             var d = kmt.DestroyContext{ .context = c.context };
-            _ = kmt.call(g.fd, .destroy_context, &d) catch {};
+            _ = Transport.call(g.fd, .destroy_context, &d) catch {};
             c.context = 0;
         }
     }
@@ -649,7 +682,7 @@ pub const VideoChannel = struct {
             .priv_size = nv.VIDEO_CONTEXT_BYTES,
             .client_hint = 1,
         };
-        _ = try kmt.call(g.fd, .create_context_virtual, &cc);
+        _ = try Transport.call(g.fd, .create_context_virtual, &cc);
         c.context = cc.context;
     }
 
@@ -666,13 +699,13 @@ pub const VideoChannel = struct {
         };
         s.broadcast_context[0] = c.context;
         fullFence();
-        _ = try kmt.call(c.gpu.fd, .submit_command, &s);
+        _ = try Transport.call(c.gpu.fd, .submit_command, &s);
     }
 
     pub fn close(c: *VideoChannel) void {
         if (c.context == 0 or c.gpu.fd < 0) return;
         var d = kmt.DestroyContext{ .context = c.context };
-        _ = kmt.call(c.gpu.fd, .destroy_context, &d) catch {};
+        _ = Transport.call(c.gpu.fd, .destroy_context, &d) catch {};
         c.context = 0;
     }
 };

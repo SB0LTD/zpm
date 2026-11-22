@@ -630,7 +630,15 @@ pub fn Gpu(comptime Host: type) type {
         /// `pages` of `allocation` at GPU address `base` (in a reserved
         /// range; 0: where the host likes in [minimum, maximum]).
         pub fn mapVa(self: *Self, paging_queue: u32, allocation: u32, base: u64, minimum: u64, maximum: u64, pages: u64) Error!Mapped {
-            const m = MapGpuVa{ .hdr = self.head(.map_gpu_va), .paging_queue = paging_queue, .base = base, .minimum = minimum, .maximum = maximum, .allocation = allocation, .size_pages = pages };
+            return self.map(.{ .paging_queue = paging_queue, .base = base, .minimum = minimum, .maximum = maximum, .allocation = allocation, .size_pages = pages });
+        }
+
+        /// The map `m` as given (its offset and protection too; its
+        /// header made here).
+        pub fn map(self: *Self, args: MapGpuVa) Error!Mapped {
+            var m = args;
+            m.hdr = self.head(.map_gpu_va);
+            m.device = 0;
             const r = try self.answer(MapGpuVaReturn, try self.vcall(std.mem.asBytes(&m)));
             try self.pendingOk(r.status);
             return .{ .va = r.va, .paging_fence = r.paging_fence };
@@ -770,22 +778,37 @@ pub fn Gpu(comptime Host: type) type {
             // after its status starts at the vendor: `pci` is vendor,
             // device, subsystem vendor, subsystem, revision, bus type, as
             // galaxy-turing's RTX 2080 Ti answered, 2026-11-21)
-            var q: [@sizeOf(QueryAdapterInfo) + PCI_IDS_BYTES]u8 align(8) = @splat(0);
-            const qh = QueryAdapterInfo{ .hdr = .{ .process = self.process, .command_type = @intFromEnum(Command.query_adapter_info) }, .query_type = QUERY_PCI_IDS, .private_data_size = PCI_IDS_BYTES };
-            @memcpy(q[0..@sizeOf(QueryAdapterInfo)], std.mem.asBytes(&qh));
-            const qr = try self.call(self.adapterChannel(), &q);
-            try self.ntstatus(qr);
-            if (qr.len < 4 + 12) return error.ShortReply;
+            var ids: [PCI_IDS_BYTES]u8 = @splat(0);
+            const got = try self.queryAdapterInfo(QUERY_PCI_IDS, &ids);
+            if (got < 12) return error.ShortReply;
             self.pci = @splat(0);
-            const words = @min((qr.len - 4) / 4, self.pci.len);
-            for (self.pci[0..words], 0..) |*w, i| w.* = std.mem.readInt(u32, qr[4 + 4 * i ..][0..4], .little);
+            for (self.pci[0..@min(got / 4, self.pci.len)], 0..) |*w, i| w.* = std.mem.readInt(u32, ids[4 * i ..][0..4], .little);
 
             self.failed = .create_device;
-            const cd = CreateDevice{ .hdr = .{ .process = self.process, .command_type = @intFromEnum(Command.create_device) } };
-            const d = try reply(CreateDeviceReturn, try self.call(self.adapterChannel(), std.mem.asBytes(&cd)));
-            if (d.device == 0) return error.Refused;
-            self.device = d.device;
+            self.device = try self.createDevice();
             self.failed = null;
+        }
+
+        /// The adapter's answer to query `query_type` (KMTQAITYPE) into
+        /// `out` (its size the size asked); how many bytes came.
+        pub fn queryAdapterInfo(self: *Self, query_type: u32, out: []u8) Error!usize {
+            const qh = QueryAdapterInfo{ .hdr = self.head(.query_adapter_info), .query_type = query_type, .private_data_size = @intCast(out.len) };
+            if (@sizeOf(QueryAdapterInfo) + out.len > self.msg.len - @sizeOf(ExtHeader)) return error.TooBig;
+            @memset(self.msg[0 .. @sizeOf(QueryAdapterInfo) + out.len], 0);
+            @memcpy(self.msg[0..@sizeOf(QueryAdapterInfo)], std.mem.asBytes(&qh));
+            const r = try self.vcall(self.msg[0 .. @sizeOf(QueryAdapterInfo) + out.len]);
+            try self.ntstatus(r);
+            const n = @min(r.len - 4, out.len);
+            @memcpy(out[0..n], r[4..][0..n]);
+            return n;
+        }
+
+        /// A device of this process; its handle.
+        pub fn createDevice(self: *Self) Error!u32 {
+            const cd = CreateDevice{ .hdr = self.head(.create_device) };
+            const d = try self.answer(CreateDeviceReturn, try self.vcall(std.mem.asBytes(&cd)));
+            if (d.device == 0) return error.Refused;
+            return d.device;
         }
 
         /// The adapter's description (UTF-16, ASCII kept) into `out`.

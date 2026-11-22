@@ -243,7 +243,7 @@ pub const Server = struct {
     /// the engine, beside the guest's on 0), each a submit_command.
     fn submitVideo(s: *Server, k: u32, r: fwd.Request) fwd.Response {
         s.vchans[k].submit(r.a, @intCast(r.b)) catch {
-            s.say("fwd: channel {d} (video): submit refused, status {d}", .{ k, @import("kmt.sig").last_status });
+            s.say("fwd: channel {d} (video): submit refused, status {d}", .{ k, gpu.Transport.lastStatus() });
             return fail(.refused);
         };
         s.vfence[k] +%= 1;
