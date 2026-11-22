@@ -36,6 +36,13 @@ replay. Local stock PG16 passed 32 checks with those sequences, keyed
 identity and stored generated columns in both directions.
 [Scoped identity CI](https://github.com/SB0LTD/ramsql/actions/runs/44958119185)
 
+The multiple-identity candidate assigns an owned sequence to each PostgreSQL
+identity column. Stock restore can attach both sequences before COPY and apply
+the key afterward. The change-log contract passed 1,126 assertions. Stock
+PG16 and PG18 CI each passed all 36 checks, including archives in both
+directions and verification of both sequence states after WAL reopen.
+[Multiple-identity CI](https://github.com/SB0LTD/ramsql/actions/runs/45018672015)
+
 The dependent-view fixture found an outbound ordering failure after
 `pg_get_viewdef` first returned the stored query. Typed `pg_rewrite`
 rows now expose each view's implicit SELECT rule and its relation
