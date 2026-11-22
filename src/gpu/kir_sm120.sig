@@ -787,6 +787,11 @@ fn CtxOf(comptime St: type) type {
         fn uniformOp(c: *const Ctx, in: kir.Inst) bool {
             switch (in.op) {
                 .tid, .lane, .atom, .cas => return false,
+                // (a graphics stage's input, a load through its IO binding
+                // at a fixed word: each lane's own vertex or pixel; taken as
+                // uniform, a pixel program's branches never diverged, so
+                // none reconverged)
+                .ld => if (c.isStageIO(@bitCast(in.aux))) return false,
                 .gid, .gsize, .subgroup, .param => return true,
                 .vote, .ballot => return true,
                 .shfl => return @as(kir.Shfl, @enumFromInt(in.aux)) == .idx and c.uniformArg(in.b),
@@ -1109,10 +1114,38 @@ fn CtxOf(comptime St: type) type {
             try c.stageOutputs();
             var regions: [MAX_DEPTH * 2]Region = undefined;
             var sp: usize = 0;
+            // A pixel program whose control flow diverges: the whole of it
+            // in one convergence region (B0, the others one deeper), its
+            // BSYNC right after the last control flow at the top, so the
+            // outputs, a KILL and EXIT run with the warp whole again. A
+            // loop a brk or cont leaves from an if gets no BSSY of its own
+            // (it desyncs), and the 3D engine's EXIT of a warp still split
+            // by one never came back (Unigine's light loop: the RTX hung
+            // until Windows reset it, 20 s, nvlddmkm 153).
+            const top_sync: ?usize = if (c.opts.stage == .pixel) topSyncAt(w, c.n) else null;
+            var l_top: u16 = 0;
+            if (top_sync != null) {
+                l_top = c.label();
+                c.depth = 1;
+                w.stats.bssy += 1;
+                try c.eff("BSSY.RECONVERGENT", 0, &.{ .{ .bar = 0 }, .{ .label = l_top } });
+            }
+            var top_open = top_sync != null;
             var idx: usize = 0;
             while (idx < c.n) : (idx += 1) {
                 const in = w.insts[idx];
                 if (w.folded[idx]) continue;
+                // (a KILL in straight-line code, every open region a
+                // predicated one: the top region closed before it, the warp
+                // whole when it discards)
+                if (top_open and in.op == .st and c.isKill(in) and allPredicated(regions[0..sp])) {
+                    const g = c.guard;
+                    c.guard = .none;
+                    try c.at(l_top);
+                    try c.eff("BSYNC.RECONVERGENT", 0, &.{.{ .bar = 0 }});
+                    c.guard = g;
+                    top_open = false;
+                }
                 switch (in.op) {
                     .@"if" => {
                         if (sp == regions.len) return tooBig("regions past their room");
@@ -1162,9 +1195,50 @@ fn CtxOf(comptime St: type) type {
                     .ret => try c.eff("EXIT", 0, &.{}),
                     else => try c.op(idx, in),
                 }
+                // (the top region's end: the last control flow closed, at
+                // the top; an endif or endloop, never a branch's continue)
+                if (top_sync == idx) {
+                    if (sp != 0) return error.Unbalanced;
+                    if (top_open) {
+                        try c.at(l_top);
+                        try c.eff("BSYNC.RECONVERGENT", 0, &.{.{ .bar = 0 }});
+                        top_open = false;
+                    }
+                    c.depth = 0;
+                }
             }
             if (sp != 0) return error.Unbalanced;
             try c.eff("EXIT", 0, &.{});
+        }
+
+        /// A store that discards the pixel (a pixel program's KILL).
+        fn isKill(c: *const Ctx, in: kir.Inst) bool {
+            const m: kir.Mem = @bitCast(in.aux);
+            return c.isStageIO(m) and m.imm >= KILL_AT;
+        }
+
+        fn allPredicated(rs: []const Region) bool {
+            for (rs) |r| if (r.mode != .predicate) return false;
+            return true;
+        }
+
+        /// Where a pixel program's top convergence region ends: its last
+        /// control-flow op (lowered at the top, outside every region), or
+        /// null when no region diverges (the warp never splits).
+        fn topSyncAt(w: anytype, n: usize) ?usize {
+            var last: ?usize = null;
+            var diverges = false;
+            for (w.insts[0..n], 0..) |in, i| {
+                if (w.folded[i]) continue;
+                switch (in.op) {
+                    .@"if", .@"else", .endif, .loop, .endloop, .brk, .cont => {
+                        last = i;
+                        if (w.diverge[i]) diverges = true;
+                    },
+                    else => {},
+                }
+            }
+            return if (diverges) last else null;
         }
 
         fn negate(p: Opd) Opd {

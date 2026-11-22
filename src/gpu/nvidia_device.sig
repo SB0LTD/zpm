@@ -1157,6 +1157,72 @@ fn glPixel(k: *kir.Kernel) void {
     }
 }
 
+test "a pixel program's branches on its inputs diverge: their regions reconverge, and the whole program reconverges before its KILL and EXIT" {
+    // (an input, a load through the stage's IO binding, is each pixel's
+    // own: taken as uniform, no branch on it reconverged, and a warp
+    // still split at the 3D engine's EXIT hung the RTX: Unigine's light
+    // loop, its continue inside an if)
+    const gl = @import("nvidia_gl.sig");
+    const S = struct {
+        var st: kir_sm120.State = .{};
+        var insts: [1024]kir.Inst = undefined;
+        var tys: [1024]kir.Ty = undefined;
+    };
+    const caps = rtx5070(1 << 30);
+    var k = kir.Kernel.init(.{ .insts = &S.insts, .tys = &S.tys }, "ps", .{ 1, 1, 1 });
+    const io = k.binding();
+    _ = k.binding();
+    const x = k.load(.f32, gl.ioMem(io, gl.generic(0, 0), false), u(0));
+    // a divergent if (with a loop in it: not predicated)
+    const acc = k.reg(.f32);
+    k.set(acc, .mov, kf(0), kir.no, kir.no);
+    k.ifp(r(k.cmp(.f32, .gt, r(x), kf(0.5))));
+    {
+        const j = k.reg(.u32);
+        k.set(j, .mov, u(0), kir.no, kir.no);
+        k.loop();
+        k.set(acc, .fadd, r(acc), kf(0.125), kir.no);
+        k.set(j, .iadd, r(j), u(1), kir.no);
+        k.brk(r(k.cmp(.u32, .ge, r(j), u(2))));
+        k.endloop();
+    }
+    k.endif();
+    // a loop a continue in a divergent if leaves (it desyncs: no BSSY of
+    // its own)
+    const i = k.reg(.u32);
+    k.set(i, .mov, u(0), kir.no, kir.no);
+    k.loop();
+    {
+        k.brk(r(k.cmp(.u32, .ge, r(i), u(3))));
+        const fi = k.cvt(.u32, .f32, .rne, r(i));
+        k.ifp(r(k.cmp(.f32, .gt, r(x), r(k.op2(.fmul, .f32, r(fi), kf(0.25))))));
+        k.set(i, .iadd, r(i), u(1), kir.no);
+        k.cont(u(1));
+        k.endif();
+        k.set(acc, .fadd, r(acc), r(x), kir.no);
+        k.set(i, .iadd, r(i), u(1), kir.no);
+    }
+    k.endloop();
+    // a discard, then the colour
+    k.ifp(r(k.cmp(.f32, .lt, r(acc), kf(0.1))));
+    k.store(.u32, gl.ioMem(io, gl.KILL_AT, false), u(0), u(0));
+    k.endif();
+    for (0..4) |c| k.store(.f32, gl.ioMem(io, gl.OUT_AT + 4 * @as(u32, @intCast(c)), false), u(0), r(acc));
+    try k.finish();
+    S.st.asm_work.sched = .{};
+    const text = try kir_sm120.compileText(&k, caps, &S.st, .{ .stage = .pixel, .stage_io = 0 });
+    // the whole program's region: opened first, closed before KILL and EXIT
+    const open = std.mem.indexOf(u8, text, "BSSY.RECONVERGENT B0,") orelse return error.NoTopRegion;
+    const close = std.mem.indexOf(u8, text, "BSYNC.RECONVERGENT B0") orelse return error.NoTopRegion;
+    const kill = std.mem.indexOf(u8, text, "KILL") orelse return error.NoKill;
+    const exit = std.mem.lastIndexOf(u8, text, "EXIT") orelse return error.NoExit;
+    try testing.expect(open < close and close < kill and close < exit);
+    try testing.expect(std.mem.indexOf(u8, text[0..open], "BRA") == null);
+    // the divergent if, a region of its own inside it
+    try testing.expect(std.mem.indexOf(u8, text, "BSSY.RECONVERGENT B1,") != null);
+    try testing.expect(S.st.stats.bssy >= 2);
+}
+
 test "graphics dispatches: a quad's colors carried across it by the emulated 3D engine, then blended over" {
     const gl = @import("nvidia_gl.sig");
     T.dev.init(&T.arena, &T.view, &T.work);
