@@ -188,7 +188,14 @@ pub const State = struct {
     /// AV1: the app's packed frame header said whether it is shown
     av1_shown: ?bool = null,
     av1_showable: bool = false,
-    /// a sequence parameter buffer came with this picture
+    /// a sequence parameter buffer unlike the one before came with this
+    /// picture: the driver's parameter sets go ahead of it then (else only
+    /// ahead of an IDR / key frame). An app may send the same buffer with
+    /// every picture (Galaxy's video_enc does; FFmpeg's vaapi encoders
+    /// send it only with an IDR): counted as new each time, every P
+    /// picture of video_enc's began with an SPS and a PPS, as a key
+    /// frame's does (Galaxy's Media Foundation H.264 encoder in mf_api,
+    /// galaxy-turing on the RTX 2080 Ti, 2026-11-22).
     new_seq: bool = false,
     h264_slices: [nvenc.MAX_SLICES]h264.Slice = undefined,
     hevc_slices: [nvenc.MAX_SLICES]hevc.Slice = undefined,
@@ -246,6 +253,16 @@ fn value(comptime T: type, data: []const u8) ?T {
     return std.mem.bytesToValue(T, data[0..@sizeOf(T)]);
 }
 
+/// A sequence parameter buffer kept (false: too short); `new_seq` when it
+/// is the first or unlike the one before.
+fn keepSeq(st: *State, comptime T: type, kept: *T, data: []const u8) bool {
+    const s = value(T, data) orelse return false;
+    if (!st.have_seq or !std.meta.eql(kept.*, s)) st.new_seq = true;
+    kept.* = s;
+    st.have_seq = true;
+    return true;
+}
+
 /// The sequence's GOP shape for the rate control.
 fn gopOf(st: *State, intra_period: u32, ip_period: u32, bps: u32) void {
     st.rate.intra_period = intra_period;
@@ -258,22 +275,16 @@ pub fn take(st: *State, b: codec.Buffer) va.Status {
     switch (b.kind) {
         ve.ENC_SEQUENCE_PARAMETER_BUFFER => switch (st.kind) {
             .h264 => {
-                st.h264_seq = value(h264.Seq, b.data) orelse return va.ERROR_INVALID_BUFFER;
+                if (!keepSeq(st, h264.Seq, &st.h264_seq, b.data)) return va.ERROR_INVALID_BUFFER;
                 gopOf(st, st.h264_seq.intra_period, st.h264_seq.ip_period, st.h264_seq.bits_per_second);
-                st.have_seq = true;
-                st.new_seq = true;
             },
             .hevc => {
-                st.hevc_seq = value(hevc.Seq, b.data) orelse return va.ERROR_INVALID_BUFFER;
+                if (!keepSeq(st, hevc.Seq, &st.hevc_seq, b.data)) return va.ERROR_INVALID_BUFFER;
                 gopOf(st, st.hevc_seq.intra_period, st.hevc_seq.ip_period, st.hevc_seq.bits_per_second);
-                st.have_seq = true;
-                st.new_seq = true;
             },
             .av1 => {
-                st.av1_seq = value(av1.Seq, b.data) orelse return va.ERROR_INVALID_BUFFER;
+                if (!keepSeq(st, av1.Seq, &st.av1_seq, b.data)) return va.ERROR_INVALID_BUFFER;
                 gopOf(st, st.av1_seq.intra_period, st.av1_seq.ip_period, st.av1_seq.bits_per_second);
-                st.have_seq = true;
-                st.new_seq = true;
             },
         },
         ve.ENC_PICTURE_PARAMETER_BUFFER => switch (st.kind) {
