@@ -128,7 +128,8 @@ class Pg:
 def run_case(port, args, manifest, case):
     connection = Pg(port, args.user, args.database)
     try:
-        commands = ["BEGIN"] + manifest["fixtures"][case["setup"]] + case["statements"]
+        commands = ["BEGIN"] if case["scope"] in ("transaction", "copy_protocol") else []
+        commands += manifest["fixtures"][case["setup"]] + case["statements"]
         results = []
         for command in commands:
             result = connection.query(command)
@@ -148,7 +149,7 @@ def run_case(port, args, manifest, case):
                     result["user_type_error"] = types["error"]
         return results
     finally:
-        connection.close()  # Disconnect aborts the isolated fixture transaction.
+        connection.close()
 
 
 def explain_measurement(result):
@@ -231,6 +232,8 @@ def main():
     parser.add_argument("--user", default="postgres")
     parser.add_argument("--database", default="postgres")
     parser.add_argument("--case", action="append", help="Select stable feature IDs")
+    parser.add_argument("--outside-transaction", action="store_true",
+                        help="Run one explicit cluster or session case on fresh disposable instances")
     parser.add_argument("--report", type=Path, required=True)
     args = parser.parse_args()
     if not args.oracle_only and args.candidate_port is None:
@@ -242,6 +245,9 @@ def main():
     selected = [c for c in manifest["cases"] if not args.case or c["id"] in args.case]
     if not selected or (args.case and set(args.case) - {c["id"] for c in selected}):
         parser.error("Unknown or empty case selection")
+    if args.outside_transaction and (len(selected) != 1 or selected[0]["scope"] not in ("cluster", "session")
+                                     or selected[0]["dialect"] != "postgresql18"):
+        parser.error("--outside-transaction requires one explicit PostgreSQL cluster or session case")
     connection = Pg(args.oracle_port, args.user, args.database)
     try:
         version = connection.query("SHOW server_version_num")
@@ -256,7 +262,7 @@ def main():
               "oracle_version": full_version["rows"], "cases": []}
     for case in selected:
         entry = {"id": case["id"], "status": "unexecuted_scope"}
-        if case["scope"] in ("transaction", "copy_protocol") and case["dialect"] == "postgresql18":
+        if (args.outside_transaction or case["scope"] in ("transaction", "copy_protocol")) and case["dialect"] == "postgresql18":
             try:
                 oracle = run_case(args.oracle_port, args, manifest, case)
                 comparator = case.get("comparator", "exact")

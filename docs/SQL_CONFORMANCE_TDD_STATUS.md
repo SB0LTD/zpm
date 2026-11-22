@@ -62,6 +62,14 @@ existing rows for a fixed-width key. The local change-log suite passed
 PG18 each passed all 35 stock and differential checks.
 [Late composite-key CI](https://github.com/SB0LTD/ramsql/actions/runs/44962874305)
 
+The current 118-program smoke inventory matched all 106 PostgreSQL
+programs against native PG18.3, including the database lifecycle,
+prepared transactions and maintenance cases run on separate fresh
+instances. The oracle was built with XML support. The audit resolves
+allocated type OIDs to their namespace, name and kind and retains the
+raw OIDs. All 19 audit unit tests passed. Twelve MySQL and T-SQL scopes
+and the separate 755-record SQL feature inventory remain unqualified.
+
 RAMSQL `d1ddbe5` with ZPM `ed00a0a1` passed all 24 stock
 tooling checks on both PostgreSQL 16 and 18. Stock plain and custom
 imports passed row, default and constraint checks after WAL reopen.

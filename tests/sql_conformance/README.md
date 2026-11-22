@@ -216,6 +216,10 @@ For allocated type OIDs, the audit resolves namespace, type name and kind
 inside the fixture transaction and compares those identities. It retains the
 raw IDs in the report. Object OIDs inside row values still need fixture-specific
 normalization before qualification.
+Select one PostgreSQL cluster or session fixture with
+`--outside-transaction --case ID` to run it outside the harness transaction.
+Use fresh instances because the fixture can commit changes. Enable cluster
+routing for `PG.DDL.DATABASE` and prepared transactions for `PG.TX.TWO_PHASE`.
 Positive-oracle errors are reported as `oracle_invalid`. The audit always exits
 nonzero while only smoke coverage exists, including when every selected smoke
 passes.
@@ -232,6 +236,12 @@ native PostgreSQL 18.3 returned **93 passes, 10 mismatches and 15 unexecuted
 scopes**. `EXPLAIN` and `COPY ... FORCE_QUOTE` each returned `0A000` in the
 candidate. The run preserves the same 118-case inventory and records both
 servers' responses. [Audited prerelease](https://github.com/SB0LTD/ramsql/releases/tag/ci-v0.3.0-beta.2-run.44099014318.1)
+
+On 22 November 2026, RAMSQL `be1cfe4` matched all 106 PostgreSQL programs
+against native PostgreSQL 18.3 with XML support. The comparison ran 103
+transaction and COPY programs and three isolated programs for database
+lifecycle, prepared transactions and maintenance. The remaining 12
+programs require native MySQL and SQL Server comparisons.
 
 `postgres18_oracle.json` records the native PostgreSQL 18.3 fixture run, including
 exact server version and manifest SHA-256 (UTF-8 with LF newlines): 102 valid programs and 16 unexecuted
