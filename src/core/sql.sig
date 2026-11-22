@@ -3098,7 +3098,7 @@ pub fn Database(comptime config: Config) type {
                 .insert => |*insert| blk: {
                     try self.lockTable(slot, insert.table, .row_exclusive);
                     if (mysqlAutoColumn(&self.tables[insert.table]) != null) {
-                        if (self.dialect != .mysql or insert.replace or insert.plan != ast.none or insert.rows == ast.none or
+                        if (self.dialect != .mysql or insert.plan != ast.none or insert.rows == ast.none or
                             insert.conflict.action != .none or insert.returning.count != 0 or self.insertHooks(insert.table, snap))
                             return error.UnsupportedStatement;
                     }
@@ -8033,8 +8033,8 @@ pub fn Database(comptime config: Config) type {
                 else => return error.UnsupportedStatement,
             };
             for (table.columns[0..table.column_count]) |column| {
-                if (column.default_kind == .identity_always or column.default_kind == .identity_by_default or
-                    column.default_kind == .mysql_auto_increment) return error.UnsupportedStatement;
+                if (column.default_kind == .identity_always or column.default_kind == .identity_by_default)
+                    return error.UnsupportedStatement;
             }
             var triggers: [config.triggers]u8 = undefined;
             if (self.objects.tableTriggers(table.oid, snap, &triggers) != 0 or

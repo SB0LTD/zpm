@@ -240,8 +240,10 @@ servers' responses. [Audited prerelease](https://github.com/SB0LTD/ramsql/releas
 On 22 November 2026, RAMSQL `be1cfe4` matched all 106 PostgreSQL programs
 against native PostgreSQL 18.3 with XML support. The comparison ran 103
 transaction and COPY programs and three isolated programs for database
-lifecycle, prepared transactions and maintenance. The remaining 12
-programs require native MySQL and SQL Server comparisons.
+lifecycle, prepared transactions and maintenance. The six MySQL
+programs matched native MySQL 8.0.36 through PyMySQL. The six
+T-SQL programs matched expected rows over python-tds. Native
+SQL Server comparison remains open.
 
 `postgres18_oracle.json` records the native PostgreSQL 18.3 fixture run, including
 exact server version and manifest SHA-256 (UTF-8 with LF newlines): 102 valid programs and 16 unexecuted
