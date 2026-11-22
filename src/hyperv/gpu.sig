@@ -393,6 +393,65 @@ pub const HOST_SIGNAL_GUEST_EVENT: u32 = 0;
 pub const HOST_SET_GUEST_DATA: u32 = 2;
 pub const HOST_SIGNAL_GUEST_EVENT_PASSIVE: u32 = 3;
 
+/// The guest's pages behind an allocation named by their page numbers
+/// (the u64s follow), `pages` of them from `offset` pages into it: no
+/// GPADL. Only when the host maps guest pages (PciCaps.map_guest_pages).
+pub const SetSysmemPages = extern struct {
+    hdr: VgpuToHost = .{ .command_type = @intFromEnum(Command.set_existing_sysmem_pages) },
+    device: u32,
+    allocation: u32,
+    pages: u32,
+    offset: u32,
+};
+
+// ── The vGPU's PCI config space (dxgkrnl's handshake there) ─────────────────
+//
+// The virtual GPU is also a function on the machine's virtual PCI bus
+// (pci.sig), vendor 0x1414, whose config space carries dxgkrnl's
+// interface: the guest says what it is (guest caps), reads the host's
+// version, asks for VERSION, reads what the host can do (host caps: bit 0,
+// it maps guest pages, so allocations need no GPADL), then the vGPU
+// channel's instance and the vGPU's LUID. As WSL's dxgkrnl does it
+// (dxg_pci_probe_device). Without it, version 27 and GPADLs.
+
+pub const PCI_CHANNEL_ID: u16 = 192;
+pub const PCI_VERSION: u16 = 208;
+pub const PCI_GUEST_CAPS: u16 = 212;
+pub const PCI_VGPU_LUID: u16 = 212;
+pub const PCI_HOST_CAPS: u16 = 220;
+/// Guest caps: a WSL2 guest (bit 0).
+pub const GUEST_CAPS_WSL2: u32 = 1;
+pub const HOST_CAPS_MAP_GUEST_MEMORY: u32 = 1;
+
+pub const PciCaps = struct {
+    /// The interface version the host and the guest agreed.
+    version: u32 = VERSION_OLD,
+    /// What the host's version word said first.
+    host_version: u32 = 0,
+    host_caps: u32 = 0,
+    map_guest_pages: bool = false,
+    channel: [16]u8 = @splat(0),
+    vgpu_luid: Luid = .{},
+};
+
+/// dxgkrnl's handshake through `cfg` (read32(offset) u32, write32(offset,
+/// value): the vGPU function's config space).
+pub fn pciHandshake(cfg: anytype) PciCaps {
+    var c = PciCaps{};
+    cfg.write32(PCI_GUEST_CAPS, GUEST_CAPS_WSL2);
+    c.host_version = cfg.read32(PCI_VERSION);
+    c.version = if (c.host_version != 0) c.host_version else VERSION_OLD;
+    if (c.version >= VERSION) {
+        cfg.write32(PCI_VERSION, VERSION);
+        c.host_caps = cfg.read32(PCI_HOST_CAPS);
+        c.map_guest_pages = c.host_caps & HOST_CAPS_MAP_GUEST_MEMORY != 0;
+        c.version = VERSION;
+    }
+    for (0..4) |i| std.mem.writeInt(u32, c.channel[4 * i ..][0..4], cfg.read32(PCI_CHANNEL_ID + @as(u16, @intCast(4 * i))), .little);
+    if (c.version >= VERSION) c.vgpu_luid = .{ .a = cfg.read32(PCI_VGPU_LUID), .b = cfg.read32(PCI_VGPU_LUID + 4) };
+    return c;
+}
+
 /// NTSTATUS STATUS_PENDING: a map or residency change the paging fence
 /// finishes (the call itself succeeded).
 pub const STATUS_PENDING: i32 = 259;
@@ -414,6 +473,7 @@ comptime {
     if (@sizeOf(SubmitCommand) != 408 or @offsetOf(SubmitCommand, "broadcast_context") != 52 or @offsetOf(SubmitCommand, "priv_size") != 320) @compileError("gpu: submit_command");
     if (@sizeOf(WaitFromGpu) != 40 or @sizeOf(WaitFromCpu) != 56 or @offsetOf(WaitFromCpu, "guest_event") != 40) @compileError("gpu: waits");
     if (@sizeOf(GetDeviceState) != 80 or @sizeOf(DestroyAllocation) != 48 or @sizeOf(DestroyContext) != 32) @compileError("gpu: device state, destroys");
+    if (@sizeOf(SetSysmemPages) != 40) @compileError("gpu: set_existing_sysmem_pages");
 }
 
 pub const Error = error{
@@ -455,13 +515,19 @@ pub fn Gpu(comptime Host: type) type {
         /// length, for the log.
         command: u32 = 0,
         reply_len: usize = 0,
+        /// The host maps guest pages (version 40's host caps): an
+        /// allocation's memory is named by its page numbers, no GPADL.
+        map_guest_pages: bool = false,
+        /// The vGPU's LUID (version 40's header names it): from the PCI
+        /// handshake, then the adapter's own answer.
+        vgpu_luid: Luid = .{},
         /// Guest events the host signaled (SIGNALGUESTEVENT) and no one
         /// has taken yet (0: a free slot).
         events: [16]u64 = @splat(0),
         rx: [8192]u8 align(8) = undefined,
-        tx: [8192]u8 align(8) = undefined,
+        tx: [32768]u8 align(8) = undefined,
         /// A message being put together (its parts after its head).
-        msg: [8192]u8 align(8) = undefined,
+        msg: [32768]u8 align(8) = undefined,
 
         /// The adapter's messages go on the vGPU channel until the host
         /// says it takes them asynchronously on the global one.
@@ -473,7 +539,10 @@ pub fn Gpu(comptime Host: type) type {
         fn frame(self: *Self, bytes: []const u8) []const u8 {
             var n: usize = 0;
             if (self.version >= VERSION) {
-                const h = ExtHeader{ .vgpu_luid = self.info.host_vgpu_luid };
+                // (the adapter's messages name the vGPU; the global
+                // channel's commands, from 1000, name none)
+                const global = bytes.len >= 20 and std.mem.readInt(u32, bytes[16..20], .little) >= 1000;
+                const h = ExtHeader{ .vgpu_luid = if (global) .{} else self.vgpu_luid };
                 @memcpy(self.tx[0..@sizeOf(ExtHeader)], std.mem.asBytes(&h));
                 n = @sizeOf(ExtHeader);
             }
@@ -610,6 +679,22 @@ pub fn Gpu(comptime Host: type) type {
         pub fn setSysmemStore(self: *Self, allocation: u32, gpadl: u32) Error!void {
             const m = SetSysmemStore{ .hdr = self.head(.set_existing_sysmem_store), .device = self.device, .allocation = allocation, .gpadl = gpadl };
             try self.ntstatus(try self.vcall(std.mem.asBytes(&m)));
+        }
+
+        /// The guest's pages [base, base + pages pages) (contiguous) behind
+        /// `allocation`, named by their page numbers in as few messages as
+        /// `msg` holds (only when map_guest_pages).
+        pub fn setSysmemPages(self: *Self, allocation: u32, base: u64, pages: u64) Error!void {
+            const per = (self.msg.len - @sizeOf(ExtHeader) - @sizeOf(SetSysmemPages)) / 8;
+            var done: u64 = 0;
+            while (done < pages) {
+                const n: usize = @intCast(@min(pages - done, per));
+                const m = SetSysmemPages{ .hdr = self.head(.set_existing_sysmem_pages), .device = self.device, .allocation = allocation, .pages = @intCast(n), .offset = @intCast(done) };
+                @memcpy(self.msg[0..@sizeOf(SetSysmemPages)], std.mem.asBytes(&m));
+                for (0..n) |i| std.mem.writeInt(u64, self.msg[@sizeOf(SetSysmemPages) + 8 * i ..][0..8], base / 4096 + done + i, .little);
+                try self.ntstatus(try self.vcall(self.msg[0 .. @sizeOf(SetSysmemPages) + 8 * n]));
+                done += n;
+            }
         }
 
         /// `allocation` resident; the paging fence's value that says so.
@@ -767,6 +852,7 @@ pub fn Gpu(comptime Host: type) type {
             if (body.len < want) return error.ShortReply;
             self.info = std.mem.zeroes(AdapterInfo);
             @memcpy(std.mem.asBytes(&self.info)[0..want], body[0..want]);
+            if (self.version >= VERSION and (self.info.host_vgpu_luid.a != 0 or self.info.host_vgpu_luid.b != 0)) self.vgpu_luid = self.info.host_vgpu_luid;
 
             self.failed = .create_process;
             self.process = try self.createProcess(name, 1);
@@ -858,10 +944,14 @@ const Play = struct {
     submitted: [16]u8 = @splat(0),
     submit_bytes: u32 = 0,
     context_bytes: usize = 0,
+    page_calls: u32 = 0,
+    pages_named: u64 = 0,
+    last_offset: u32 = 0,
+    last_pfn: u64 = 0,
 
     fn answer(ctx: *anyopaque) void {
         const s: *Play = @ptrCast(@alignCast(ctx));
-        var buf: [4096]u8 align(8) = undefined;
+        var buf: [40 << 10]u8 align(8) = undefined;
         // the guest's newest message: on the vGPU channel or the global one
         for ([_]*vmbus.Channel(vmbus.testing.Host){ &s.g.vgpu, &s.g.global }) |ch| {
             const n = ch.out.read(&buf) orelse continue;
@@ -905,6 +995,12 @@ const Play = struct {
                     len = 88 + priv;
                 },
                 @intFromEnum(Command.set_existing_sysmem_store) => s.gpadl = std.mem.readInt(u32, body[32..36], .little),
+                @intFromEnum(Command.set_existing_sysmem_pages) => {
+                    s.page_calls += 1;
+                    s.pages_named += std.mem.readInt(u32, body[32..36], .little);
+                    s.last_offset = std.mem.readInt(u32, body[36..40], .little);
+                    s.last_pfn = std.mem.readInt(u64, body[40..48], .little);
+                },
                 @intFromEnum(Command.make_resident) => {
                     std.mem.writeInt(u64, r[0..8], 5, .little);
                     std.mem.writeInt(i32, r[16..20], STATUS_PENDING, .little);
@@ -1036,4 +1132,55 @@ test "GPU-PV: memory, a context and work against a played host" {
     try testing.expect(!g.signaled(0x6a1a));
     const st = try g.deviceState(DEVICESTATE_EXECUTION);
     try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, st[0..4], .little));
+}
+
+test "GPU-PV: dxgkrnl's handshake in the vGPU's config space (version 40, guest pages)" {
+    const Cfg = struct {
+        regs: [256]u32 = @splat(0),
+        fn read32(c: *@This(), off: u16) u32 {
+            return c.regs[off / 4];
+        }
+        fn write32(c: *@This(), off: u16, v: u32) void {
+            c.regs[off / 4] = v;
+        }
+    };
+    var cfg = Cfg{};
+    cfg.regs[PCI_VERSION / 4] = 44;
+    cfg.regs[PCI_HOST_CAPS / 4] = HOST_CAPS_MAP_GUEST_MEMORY;
+    cfg.regs[PCI_CHANNEL_ID / 4] = 0x6e38_2d18;
+    cfg.regs[PCI_VGPU_LUID / 4 + 1] = 0x77;
+    const c = pciHandshake(&cfg);
+    try testing.expectEqual(@as(u32, VERSION), c.version);
+    try testing.expectEqual(@as(u32, VERSION), cfg.regs[PCI_VERSION / 4]);
+    try testing.expect(c.map_guest_pages);
+    try testing.expectEqual(@as(u32, 0x6e38_2d18), std.mem.readInt(u32, c.channel[0..4], .little));
+    // (the guest caps went where the LUID is read back from: one place)
+    try testing.expectEqual(@as(u32, GUEST_CAPS_WSL2), c.vgpu_luid.a);
+    try testing.expectEqual(@as(u32, 0x77), c.vgpu_luid.b);
+    var old = Cfg{};
+    const o = pciHandshake(&old);
+    try testing.expectEqual(@as(u32, VERSION_OLD), o.version);
+    try testing.expect(!o.map_guest_pages);
+}
+
+test "GPU-PV: an allocation's pages named by number, in pieces of what a message holds" {
+    var host = vmbus.testing.Host{};
+    var mem_g: [4 * vmbus.PAGE]u8 align(vmbus.PAGE) = undefined;
+    var mem_v: [24 * vmbus.PAGE]u8 align(vmbus.PAGE) = undefined;
+    @memset(&mem_g, 0);
+    @memset(&mem_v, 0);
+    var g = Gpu(vmbus.testing.Host){
+        .global = vmbus.testing.channel(vmbus.testing.Host, &host, &mem_g, 2),
+        .vgpu = vmbus.testing.channel(vmbus.testing.Host, &host, &mem_v, 12),
+    };
+    var play = Play{ .g = &g };
+    host.answer = Play.answer;
+    host.ctx = &play;
+    try g.start(0, 0, "galaxy");
+    const per = (g.msg.len - @sizeOf(ExtHeader) - @sizeOf(SetSysmemPages)) / 8;
+    try g.setSysmemPages(0x22, 0x1_0000_0000, per + 10);
+    try testing.expectEqual(@as(u32, 2), play.page_calls);
+    try testing.expectEqual(@as(u64, per + 10), play.pages_named);
+    try testing.expectEqual(@as(u32, @intCast(per)), play.last_offset);
+    try testing.expectEqual(@as(u64, 0x1_0000_0000 / 4096 + per), play.last_pfn);
 }
