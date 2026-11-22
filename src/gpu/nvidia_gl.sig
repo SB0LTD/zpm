@@ -188,6 +188,42 @@ test "nvidia_gl: a pixel program reads a varying in perspective and one flat, wr
     try testing.expect(!sph.bit(head, 609));
 }
 
+test "nvidia_gl: a pixel program's global loads write 0 first (a helper lane's load does nothing on the RTX)" {
+    var k = kir.Kernel.init(.{ .insts = &T.insts, .tys = &T.tys }, "ps", .{ 1, 1, 1 });
+    const io = k.binding();
+    const uni = k.binding();
+    const n = k.load(.u32, kir.global(uni, 32), u(0x81d0));
+    const v = k.load(.u32, kir.global(uni, 128), u(16));
+    var sum = n;
+    for (0..4) |j| sum = k.op2(.iadd, .u32, r(sum), r(kir.Kernel.at(v, @intCast(j))));
+    k.store(.f32, ioMem(io, OUT_AT + 0, false), u(0), r(k.cvt(.u32, .f32, .rne, r(sum))));
+    try k.finish();
+    T.st.asm_work.sched = .{};
+    _ = try compileStage(&k, rtx(), &T.st, .pixel, io, &T.out);
+    const text = try kir_sm120.compileText(&k, rtx(), &T.st, .{ .stage = .pixel, .stage_io = io });
+    // each LDG's registers zeroed before it: the 32-bit load's one, the
+    // 128-bit load's four (Rn..Rn+3)
+    for ([_][]const u8{ "LDG.E R", "LDG.E.128 R" }, [_]u32{ 1, 4 }) |ld, regs| {
+        const at = std.mem.indexOf(u8, text, ld) orelse {
+            std.debug.print("{s}\n", .{text});
+            return error.TestUnexpectedResult;
+        };
+        const num_at = at + ld.len;
+        var num_end = num_at;
+        while (num_end < text.len and std.ascii.isDigit(text[num_end])) num_end += 1;
+        const first = try std.fmt.parseInt(u32, text[num_at..num_end], 10);
+        for (0..regs) |j| {
+            var want: [32]u8 = undefined;
+            const w = try std.fmt.bufPrint(&want, "MOV R{d}, RZ", .{first + @as(u32, @intCast(j))});
+            const z = std.mem.indexOf(u8, text, w) orelse {
+                std.debug.print("no '{s}' in\n{s}\n", .{ w, text });
+                return error.TestUnexpectedResult;
+            };
+            try testing.expect(z < at);
+        }
+    }
+}
+
 test "nvidia_gl: a pixel program writing target 2 alone and the depth: its registers packed (R0..R3, then the depth in R5)" {
     var k = kir.Kernel.init(.{ .insts = &T.insts, .tys = &T.tys }, "ps", .{ 1, 1, 1 });
     const io = k.binding();

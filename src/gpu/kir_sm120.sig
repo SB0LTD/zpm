@@ -2311,6 +2311,20 @@ fn CtxOf(comptime St: type) type {
             if (m.width_log2 < 3) return error.BadOperand;
             if (m.space == .global) {
                 const ad = try c.gaddr(m, in.a);
+                // A pixel program's helper lanes (a 2x2 quad's pixels the
+                // triangle does not cover, along its edges) do no global
+                // load on the RTX's 3D engine: the register keeps what an
+                // earlier warp left there. Unigine Superposition's light
+                // loop, whose count is a uniform, then ran for ever on the
+                // edge of its screen quad (the RTX hung, 20 s, until
+                // Windows reset it; one triangle past the target's edges
+                // never did). So the destination is 0 first, each register
+                // of a 64- or 128-bit load's: what a helper lane reads (its
+                // results only feed derivatives).
+                if (c.opts.stage == .pixel) {
+                    const d = @intFromEnum(in.dst);
+                    for (0..vecWidth(in) orelse 1) |j| try c.eff("MOV", 1, &.{ R(d + @as(u16, @intCast(j))), .rz });
+                }
                 try c.ins(sizeName("LDG.E", m), 1, &.{ c.dst(in), ad });
             } else {
                 const ad = try c.saddr(m, in.a);

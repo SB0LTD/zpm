@@ -482,7 +482,12 @@ pub const Adapter = struct {
             a.codeFree(ctx, code);
             return error.BadProgram;
         }
-        return .{ .bin = bin.*, .code = code };
+        // (its code the copy loaded, as amd_device's and emu_device's: the
+        // caller's bytes may be a compiler buffer it reuses, as
+        // Engine.loadStages's for the vertex stage after the pixel one)
+        var b = bin.*;
+        b.code = code.cpu[0..bin.code.len];
+        return .{ .bin = b, .code = code };
     }
 
     fn unload(ctx: *anyopaque, p: *const gpu.Program) void {
