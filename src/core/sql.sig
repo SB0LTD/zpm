@@ -1323,6 +1323,11 @@ pub fn Database(comptime config: Config) type {
                 if (comptime config.external_storage) {
                     if (db.contiguous_backing) |backing| {
                         if (!overlaps(bounds, backing)) return;
+                        // Worker scratch and results can straddle the backing
+                        // in address space without either touching it.
+                        for (parts) |part| {
+                            if (overlaps(part, backing)) break;
+                        } else return;
                     }
                     try disjointParts(parts, bounds, try StorageSpan.of(db.workspace.query.refs[0..]));
                 }
