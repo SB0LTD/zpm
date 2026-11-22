@@ -14,6 +14,8 @@ from pathlib import Path
 import socket
 import struct
 
+FIRST_USER_OID = 16384
+
 
 class Pg:
     def __init__(self, port, user, database):
@@ -133,6 +135,17 @@ def run_case(port, args, manifest, case):
             results.append(result)
             if result["error"]:
                 break
+            oids = sorted({column[1] for column in result["columns"] if column[1] >= FIRST_USER_OID})
+            if oids:
+                oid_list = ",".join(map(str, oids))
+                types = connection.query(
+                    "SELECT t.oid,n.nspname,t.typname,t.typtype FROM pg_catalog.pg_type t "
+                    "JOIN pg_catalog.pg_namespace n ON n.oid=t.typnamespace "
+                    f"WHERE t.oid IN ({oid_list})"
+                )
+                result["user_types"] = {row[0]: row[1:] for row in types["rows"]}
+                if types["error"]:
+                    result["user_type_error"] = types["error"]
         return results
     finally:
         connection.close()  # Disconnect aborts the isolated fixture transaction.
@@ -171,14 +184,30 @@ def explain_measurement(result):
     return None
 
 
+def equivalent_columns(left, right):
+    if len(left["columns"]) != len(right["columns"]):
+        return False
+    for a, b in zip(left["columns"], right["columns"]):
+        if a[0] != b[0] or a[2:] != b[2:]:
+            return False
+        if a[1] < FIRST_USER_OID or b[1] < FIRST_USER_OID:
+            if a[1] != b[1]:
+                return False
+            continue
+        left_type = left.get("user_types", {}).get(str(a[1]))
+        right_type = right.get("user_types", {}).get(str(b[1]))
+        if left_type is None or left_type != right_type:
+            return False
+    return True
+
+
 def equivalent(left, right, ordered, comparator="exact"):
     if len(left) != len(right):
         return False
     for index, (a, b) in enumerate(zip(left, right)):
-        # Object OIDs are not compared; type OIDs, typmods and formats are.
         if a["error"] or b["error"]:
             return False
-        if any(a[key] != b[key] for key in ("columns", "command", "transaction")):
+        if not equivalent_columns(a, b) or any(a[key] != b[key] for key in ("command", "transaction")):
             return False
         if a.get("copy") != b.get("copy"):
             return False

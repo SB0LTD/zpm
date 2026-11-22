@@ -211,7 +211,11 @@ matching database, user, extension and catalog setup. Each transaction fixture
 gets its own connection. Disconnect rolls back. The harness compares typed
 metadata, command tags, transaction state, bags including multiplicity, NULLs
 and SQL errors. Set `ordered: true` where the statement promises row order.
-OID-valued discovery cases need stable-object normalization before qualification.
+Result columns keep exact built-in type OIDs, lengths, modifiers and formats.
+For allocated type OIDs, the audit resolves namespace, type name and kind
+inside the fixture transaction and compares those identities. It retains the
+raw IDs in the report. Object OIDs inside row values still need fixture-specific
+normalization before qualification.
 Positive-oracle errors are reported as `oracle_invalid`. The audit always exits
 nonzero while only smoke coverage exists, including when every selected smoke
 passes.
