@@ -673,6 +673,12 @@ pub const VideoChannel = struct {
 
     pub fn open(c: *VideoChannel, g: *Gpu, e: nv.VideoEngine) Error!void {
         c.* = .{ .gpu = g, .engine = e };
+        // (the video contexts' data and submissions are driver 592's, a
+        // host that schedules in hardware; a legacy host's (576's) are not
+        // traced yet. Through WSL the RTX 2080 Ti's host refused such a
+        // context; through its Hyper-V partition it made one, refused its
+        // first submission, and then every context after: not tried there)
+        if (g.legacy) return error.Refused;
         nv.videoContext(&c.ctx_data, e);
         var cc = kmt.CreateContextVirtual{
             .device = g.device,
