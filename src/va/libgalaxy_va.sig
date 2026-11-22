@@ -280,88 +280,9 @@ fn options() driver.Options {
     return optionsOf(env_buf[0..n]);
 }
 
-/// GALAXY_VA_DEBUG (set and not "0": say things on stderr, each decode
-/// context's pipeline at its end), GALAXY_VA_SERIAL ("1": a module's step
-/// after a decode at its EndPicture, as before the pipeline),
-/// GALAXY_VA_SCRATCH ("vram": H.264's decoder-only buffers in VRAM),
-/// GALAXY_VA_GOB
-/// ("turing": Turing's GOB layout instead of Blackwell's; "b8", "b16",
-/// "swapped": test readings of the encoder's input, tiling.Gob), GALAXY_VA_PROBE
-/// ("0": no decoder probe at init), GALAXY_VA_BLACKWELL and
-/// GALAXY_VA_{HEVC,VP9,AV1}_BLACKWELL (Blackwell's additions, codec.Blackwell:
-/// "full" or "1" the default, "buffer", "fields", "off" or "0"; a codec's own
-/// wins over the common one), GALAXY_VA_CONTROL (HEVC's, VP9's and AV1's
-/// control word: "nvk" the default, "prod", "nvidia"), GALAXY_VA_VP9_INTRA_TOP
-/// ("0": no intra-top buffer), GALAXY_VA_VP9_STREAM_LEN ("frame" the
-/// default, "tiles"), GALAXY_VA_ENCODE ("0": no
-/// encode entrypoints), GALAXY_VA_NVENC_MAGIC (hex: the encoder setup's
-/// magic word), GALAXY_VA_NVENC_RC ("firmware": the encoder's own rate
-/// control), GALAXY_VA_NVENC_B ("1": B pictures on the encoder),
-/// GALAXY_VA_NVENC_TRY (readings of HEVC's and AV1's setups: encode.Try), from an
-/// environment block. Values not understood leave the
-/// default.
-pub fn optionsOf(block: []const u8) driver.Options {
-    var o: driver.Options = .{};
-    var all_bw: ?codec.Blackwell = null;
-    var hevc_bw: ?codec.Blackwell = null;
-    var vp9_bw: ?codec.Blackwell = null;
-    var av1_bw: ?codec.Blackwell = null;
-    var it = std.mem.splitScalar(u8, block, 0);
-    while (it.next()) |kv| {
-        const eq = std.mem.indexOfScalar(u8, kv, '=') orelse continue;
-        const k = kv[0..eq];
-        const v = kv[eq + 1 ..];
-        if (std.mem.eql(u8, k, "GALAXY_VA_DEBUG")) {
-            o.debug = v.len != 0 and !std.mem.eql(u8, v, "0");
-        } else if (std.mem.eql(u8, k, "GALAXY_VA_GOB")) {
-            o.gob = tiling.Gob.named(v);
-        } else if (std.mem.eql(u8, k, "GALAXY_VA_PROBE")) {
-            o.probe = !std.mem.eql(u8, v, "0");
-        } else if (std.mem.eql(u8, k, "GALAXY_VA_SERIAL")) {
-            o.serial_after = std.mem.eql(u8, v, "1");
-        } else if (std.mem.eql(u8, k, "GALAXY_VA_SCRATCH")) {
-            o.h264_scratch_vram = std.ascii.eqlIgnoreCase(v, "vram");
-        } else if (std.mem.eql(u8, k, "GALAXY_VA_BLACKWELL")) {
-            all_bw = codec.Blackwell.parse(v);
-        } else if (std.mem.eql(u8, k, "GALAXY_VA_HEVC_BLACKWELL")) {
-            hevc_bw = codec.Blackwell.parse(v);
-        } else if (std.mem.eql(u8, k, "GALAXY_VA_VP9_BLACKWELL")) {
-            vp9_bw = codec.Blackwell.parse(v);
-        } else if (std.mem.eql(u8, k, "GALAXY_VA_AV1_BLACKWELL")) {
-            av1_bw = codec.Blackwell.parse(v);
-        } else if (std.mem.eql(u8, k, "GALAXY_VA_CONTROL")) {
-            o.control = codec.Control.parse(v) orelse o.control;
-        } else if (std.mem.eql(u8, k, "GALAXY_VA_VP9_INTRA_TOP")) {
-            o.vp9_intra_top = !std.mem.eql(u8, v, "0");
-        } else if (std.mem.eql(u8, k, "GALAXY_VA_VP9_STREAM_LEN")) {
-            o.vp9_stream_len = vp9.StreamLen.parse(v) orelse o.vp9_stream_len;
-        } else if (std.mem.eql(u8, k, "GALAXY_VA_ENCODE")) {
-            o.encode = !std.mem.eql(u8, v, "0");
-        } else if (std.mem.eql(u8, k, "GALAXY_VA_NVENC_MAGIC")) {
-            const hex = if (std.mem.startsWith(u8, v, "0x") or std.mem.startsWith(u8, v, "0X")) v[2..] else v;
-            o.nvenc_magic = std.fmt.parseInt(u32, hex, 16) catch null;
-        } else if (std.mem.eql(u8, k, "GALAXY_VA_NVENC_B")) {
-            // ("1": B pictures offered and taken, encode.MAX_REFS)
-            o.nvenc_b_frames = std.mem.eql(u8, v, "1");
-        } else if (std.mem.eql(u8, k, "GALAXY_VA_NVENC_RC")) {
-            // ("firmware": the encoder's own CBR/VBR, enc_rc.sig)
-            o.nvenc_rc_firmware = std.ascii.eqlIgnoreCase(v, "firmware");
-        } else if (std.mem.eql(u8, k, "GALAXY_VA_NVENC_DUMP")) {
-            o.nvenc_dump = v.len != 0 and !std.mem.eql(u8, v, "0");
-        } else if (std.mem.eql(u8, k, "GALAXY_VA_NVENC_TRY")) {
-            // (readings of HEVC's and AV1's setups for a test boot)
-            o.nvenc_try = encode.Try.parse(v);
-        } else if (std.mem.eql(u8, k, "GALAXY_VA_VPX_ENCODE")) {
-            o.vpx_encode = !std.mem.eql(u8, v, "0");
-        } else if (std.mem.eql(u8, k, "GALAXY_VA_VPX_GPU")) {
-            o.vpx_gpu = !std.mem.eql(u8, v, "0");
-        }
-    }
-    o.hevc_blackwell = hevc_bw orelse all_bw orelse o.hevc_blackwell;
-    o.vp9_blackwell = vp9_bw orelse all_bw orelse o.vp9_blackwell;
-    o.av1_blackwell = av1_bw orelse all_bw orelse o.av1_blackwell;
-    return o;
-}
+/// The options from an environment block: driver.optionsOf (where the
+/// variables are listed), which galaxy-pe reads its own with too.
+pub const optionsOf = driver.optionsOf;
 
 // ── libva's entry points ────────────────────────────────────────────────────
 
