@@ -7515,8 +7515,13 @@ pub fn Database(comptime config: Config) type {
                 var ownership: O.Object = .{ .kind = .relation, .target = table.oid, .owner = creator };
                 _ = try self.objectInsert(slot, &ownership, false, snap);
             }
-            if (create.identity) |identity| try self.createSequence(slot, table.namespace, identity.name, identity.spec, table.oid, identity.column, snap);
-            for (create.serials[0..create.serial_count]) |serial| try self.createSequence(slot, table.namespace, serial.name, serial.spec, table.oid, serial.column, snap);
+            // Keep identity sequences ahead of SERIAL in the OID order.
+            for ([_]bool{ false, true }) |serial| {
+                for (create.sequences[0..create.sequence_count]) |seq| {
+                    if ((table.columns[seq.column].default_kind == .default) == serial)
+                        try self.createSequence(slot, table.namespace, seq.name, seq.spec, table.oid, seq.column, snap);
+                }
+            }
             const generated_context = self.bindContext("", .standard, snap);
             try B.validateGenerated(&generated_context, index);
             try B.validateConstraints(&generated_context, index);
@@ -7733,24 +7738,27 @@ pub fn Database(comptime config: Config) type {
             var fold_created_primary = false;
             if (late_primary) {
                 const tx = &self.txs[slot];
+                var fresh_definition: ?usize = null;
                 for (tx.writes[0..tx.write_len]) |entry| switch (entry.kind) {
                     .create_table => if (self.tables[entry.table].oid == source.oid) {
-                        fold_created_primary = true;
+                        fresh_definition = entry.table;
                     },
                     .insert => {
-                        if (self.tables[entry.table].oid == source.oid and (!fold_created_primary or entry.table != alter.table))
+                        if (self.tables[entry.table].oid == source.oid and fresh_definition != entry.table)
                             return error.UnsupportedStatement;
                     },
                     .alter_table => {
-                        if (self.tables[entry.table].oid == source.oid and
-                            (!fold_created_primary or entry.table != alter.table or !self.alters[entry.table].adds_identity))
+                        if (self.tables[entry.table].oid != source.oid) continue;
+                        if (fresh_definition != entry.old or !self.alters[entry.table].adds_identity)
                             return error.UnsupportedStatement;
+                        fresh_definition = entry.table;
                     },
                     .update, .delete, .truncate, .refresh_rows, .drop_table => {
                         if (self.tables[entry.table].oid == source.oid) return error.UnsupportedStatement;
                     },
                     else => {},
                 };
+                fold_created_primary = fresh_definition == alter.table;
             }
             if (!types.same(alter.name.slice(), source.name.slice())) {
                 try self.checkRelationTypeName(slot, source.namespace, alter.name.slice(), snap);

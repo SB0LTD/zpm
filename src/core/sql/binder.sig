@@ -45,22 +45,20 @@ pub fn Binder(comptime config: types.Config) type {
         /// INTEGER outside the PostgreSQL dialect and in legacy replay.
         pub const integer_type: types.DataType = if (config.integer_bits == 32) .integer32 else .integer;
 
-        /// An identity column's owned sequence `<table>_<column>_seq`.
-        pub const Identity = struct { column: u8, name: V.Name, spec: sequence.Spec };
+        /// A column-owned sequence created with its table definition.
+        pub const OwnedSequence = struct { column: u8, name: V.Name, spec: sequence.Spec };
 
         pub const Create = struct {
             name: V.Name,
             columns: [config.columns]V.Column,
             count: usize,
-            identity: ?Identity = null,
             /// CHECK / UNIQUE / named or composite PRIMARY KEY, named.
             constraints: [config.table_constraints]S.Constraint = undefined,
             constraint_count: usize = 0,
             namespace: u32 = catalog.public_namespace,
             plain_definition: bool = false,
-            /// SERIAL columns' owned sequences, created after the table.
-            serials: [config.columns]Identity = undefined,
-            serial_count: usize = 0,
+            sequences: [config.columns]OwnedSequence = undefined,
+            sequence_count: usize = 0,
             /// Relation kind, indexes (LIKE INCLUDING INDEXES), view query,
             /// inheritance and partitioning.
             extras: S.Extras = .{},
@@ -303,7 +301,7 @@ pub fn Binder(comptime config: types.Config) type {
             constraint_count: usize,
             sources: [config.columns]u8,
             fills: [config.columns]u16 = @splat(none),
-            identity: ?Identity = null,
+            identity: ?OwnedSequence = null,
             check_not_null: [config.columns]bool = @splat(false),
             check_constraint: [config.table_constraints]bool = @splat(false),
             /// Kind, secondary indexes, view and partition definition after
@@ -7850,13 +7848,12 @@ pub fn Binder(comptime config: types.Config) type {
                             column.not_null = true;
                             column.default_kind = .default;
                             column.expression = try serialDefault(seq_name);
-                            out.serials[out.serial_count] = .{ .column = @intCast(index), .name = seq_name, .spec = try sequence.resolve(.{ .type_oid = definition.serial }) };
-                            out.serial_count += 1;
+                            out.sequences[out.sequence_count] = .{ .column = @intCast(index), .name = seq_name, .spec = try sequence.resolve(.{ .type_oid = definition.serial }) };
+                            out.sequence_count += 1;
                         }
                         switch (definition.default_kind) {
                             .identity_always, .identity_by_default, .mysql_auto_increment => {
                                 if (!integerColumn(column.data_type)) return error.TypeMismatch;
-                                if (out.identity != null) return error.UnsupportedStatement;
                                 if (definition.default_kind == .mysql_auto_increment and
                                     (create.inherits != null or create.like != null or create.partition_by != .none or
                                     (column.data_type != .integer32 and column.data_type != .integer))) return error.UnsupportedStatement;
@@ -7865,7 +7862,11 @@ pub fn Binder(comptime config: types.Config) type {
                                 if (options.type_oid == 0) options.type_oid = types.typeOid(column.data_type);
                                 const seq_name = try identityName(table_name, column.name);
                                 if (context.catalog.findIn(namespace, seq_name.slice(), context.snapshot) != null) return error.TableExists;
-                                out.identity = .{ .column = @intCast(index), .name = seq_name, .spec = try sequence.resolve(options) };
+                                for (out.sequences[0..out.sequence_count]) |other| {
+                                    if (types.same(other.name.slice(), seq_name.slice())) return error.TableExists;
+                                }
+                                out.sequences[out.sequence_count] = .{ .column = @intCast(index), .name = seq_name, .spec = try sequence.resolve(options) };
+                                out.sequence_count += 1;
                             },
                             // Type-checked now; evaluated per row.
                             .default => _ = try bindExpressionText(context, &column, null, -1),
@@ -7885,9 +7886,9 @@ pub fn Binder(comptime config: types.Config) type {
                         out.extras.parent = context.tables[parent_index].oid;
                     }
                     try bindTableConstraints(context, create.constraints[0..create.constraint_count], &out, false);
-                    if (out.identity) |identity| {
-                        const key = &out.columns[identity.column];
-                        if (key.default_kind == .mysql_auto_increment and (!key.primary_key or out.serial_count != 0))
+                    for (out.sequences[0..out.sequence_count]) |seq| {
+                        const key = &out.columns[seq.column];
+                        if (key.default_kind == .mysql_auto_increment and (!key.primary_key or out.sequence_count != 1))
                             return error.InvalidTableDefinition;
                     }
                     if (create.partition_by != .none) {
@@ -8112,17 +8113,11 @@ pub fn Binder(comptime config: types.Config) type {
         /// A SERIAL column's sequence `<table>_<column>_seq` (ChooseRelationName
         /// numbering when taken) and its DEFAULT text nextval('name'::regclass).
         fn serialSequence(context: *const Context, out: *const Create, column: V.Name) Error!V.Name {
-            var taken: [config.columns + 1]S.Constraint = undefined;
-            var count: usize = 0;
-            for (out.serials[0..out.serial_count]) |serial| {
-                taken[count] = .{ .name = serial.name };
-                count += 1;
+            var taken: [config.columns]S.Constraint = undefined;
+            for (taken[0..out.sequence_count], out.sequences[0..out.sequence_count]) |*entry, seq| {
+                entry.* = .{ .name = seq.name };
             }
-            if (out.identity) |identity| {
-                taken[count] = .{ .name = identity.name };
-                count += 1;
-            }
-            return chooseName(context, out.name.slice(), column.slice(), "seq", taken[0..count], true);
+            return chooseName(context, out.name.slice(), column.slice(), "seq", taken[0..out.sequence_count], true);
         }
 
         fn serialDefault(name: V.Name) Error!V.Text {
@@ -8504,10 +8499,6 @@ pub fn Binder(comptime config: types.Config) type {
                     const column = &out.columns[position];
                     if (!column.not_null or column.default_kind != .none) return error.ObjectNotInPrerequisiteState;
                     if (!integerColumn(column.data_type)) return error.TypeMismatch;
-                    for (out.columns[0..out.count]) |*other| switch (other.default_kind) {
-                        .identity_always, .identity_by_default => return error.UnsupportedStatement,
-                        else => {},
-                    };
                     const name = if (definition.name) |reference| blk: {
                         if (reference.schema) |schema| {
                             if (try qualifierNamespace(context, schema) != entry.namespace) return error.InvalidTableDefinition;
@@ -9057,11 +9048,8 @@ pub fn Binder(comptime config: types.Config) type {
             const at = like.position;
             const shift = source.column_count;
             // Own identity / SERIAL columns after the LIKE position move.
-            if (out.identity) |*identity| if (identity.column >= at) {
-                identity.column += @intCast(shift);
-            };
-            for (out.serials[0..out.serial_count]) |*serial| if (serial.column >= at) {
-                serial.column += @intCast(shift);
+            for (out.sequences[0..out.sequence_count]) |*seq| if (seq.column >= at) {
+                seq.column += @intCast(shift);
             };
             var position = out.count;
             while (position > at) {
@@ -9083,8 +9071,8 @@ pub fn Binder(comptime config: types.Config) type {
                         copy.virtual = false;
                     },
                     .identity_always, .identity_by_default => if (like.identity) {
-                        if (out.identity != null) return error.UnsupportedStatement;
-                        out.identity = .{ .column = @intCast(at + index), .name = try identityName(out.name, copy.name), .spec = try sequence.resolve(.{ .type_oid = types.typeOid(copy.data_type) }) };
+                        out.sequences[out.sequence_count] = .{ .column = @intCast(at + index), .name = try identityName(out.name, copy.name), .spec = try sequence.resolve(.{ .type_oid = types.typeOid(copy.data_type) }) };
+                        out.sequence_count += 1;
                     } else {
                         copy.default_kind = .none;
                     },
