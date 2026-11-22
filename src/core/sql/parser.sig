@@ -46,6 +46,7 @@ pub fn Parser(comptime config: types.Config) type {
         const Self = @This();
         tokens: lexer.Tokenizer,
         current: Token = .{},
+        previous_end: usize = 0,
         /// One-token lookahead cache: the token after current and the
         /// tokenizer state after it.
         peeked: Token = .{},
@@ -180,6 +181,7 @@ pub fn Parser(comptime config: types.Config) type {
         }
 
         fn advance(self: *Self) Error!void {
+            self.previous_end = self.current.end + self.current.suffix;
             if (self.current.dialectQuotedIdentifier(self.source))
                 self.last_native_syntax = self.current.start - 1;
             if (self.has_peek) {
@@ -3112,6 +3114,7 @@ pub fn Parser(comptime config: types.Config) type {
                                 if (types.same(name, "unnest")) self.pool.complex = true;
                             }
                         }
+                        target.expression_end = self.previous_end;
                         target.alias = try self.bareAlias();
                     }
                 }

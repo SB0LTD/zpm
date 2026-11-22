@@ -78,6 +78,15 @@ The updated routine and rule suite passed 767 assertions and replayed
 156 records. Column aliases introduced by a CREATE VIEW column list,
 general rule deparsing and arbitrary view definitions still need coverage.
 
+The view-column candidate binds catalog names at the outward relation after
+the stored query resolves its own aliases. It preserves doubled quotes and
+keeps the original name resolution for internal ordering. The dump deparser
+emits catalog aliases on supported simple projections with no top-level
+ORDER BY, GROUP BY or DISTINCT ON. The focused Sig suite passed 1,380
+assertions and replayed 276 records. Local stock PG16 and PG18 both restored
+the new dependent-view fixture in both directions, including quoted names,
+result metadata and WAL reopen. General deparsing remains open.
+
 The stock archive fixture now restores a two-column primary key after
 loading the rows of a fresh table in a single transaction. The WAL uses
 the validated keyed table definition before the row records. It preserves

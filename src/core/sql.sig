@@ -1192,27 +1192,9 @@ pub fn Database(comptime config: Config) type {
                         continue;
                     }
                     const view = &tables[found.slot];
-                    const parsed = try appendQuery(workspace, &length, source, view.query.slice());
-                    // View columns keep the names CREATE VIEW gave them.
-                    const top = &pool.queries[parsed];
-                    if (top.set_op == .none) {
-                        var star = false;
-                        for (top.targets[0..top.count]) |*output| star = star or output.star;
-                        if (!star and top.count == view.column_count) {
-                            for (top.targets[0..top.count], view.columns[0..top.count]) |*output, *column| {
-                                const label = column.name.slice();
-                                if (label.len + 3 > workspace.expansion.len - length) return error.TextCapacity;
-                                workspace.expansion[length] = ' ';
-                                workspace.expansion[length + 1] = '"';
-                                @memcpy(workspace.expansion[length + 2 ..][0..label.len], label);
-                                workspace.expansion[length + 2 + label.len] = '"';
-                                output.alias = .{ .span = .{ .start = length + 2, .len = label.len }, .quoted = true, .len = label.len };
-                                length += label.len + 3;
-                            }
-                        }
-                    }
-                    item.query = parsed;
+                    item.query = try appendQuery(workspace, &length, source, view.query.slice());
                     item.view = true;
+                    item.view_table = @intCast(found.slot);
                     if (item.alias == null) item.alias = item.name;
                     q.from = null;
                     pool.complex = true;
@@ -7062,6 +7044,41 @@ pub fn Database(comptime config: Config) type {
             return null;
         }
 
+        const ViewAliasEdit = struct { start: usize, end: usize, column: usize };
+
+        /// Projection aliases can be replaced directly where no clause
+        /// resolves names against the SELECT list. Keep the raw expressions
+        /// and FROM items so dependent views retain their original shape.
+        fn viewAliasEdits(source: []const u8, pool: *const A.Pool, root: *const A.Select, view: *const S.Table, edits: *[config.columns]ViewAliasEdit) usize {
+            if (root.set_op != .none or root.values != ast.none or root.count != view.column_count or
+                root.order_count != 0 or root.group_count != 0 or root.grouping_sets != ast.none or
+                root.distinct_on_count != 0)
+                return 0;
+            for (root.targets[0..root.count]) |projection| {
+                if (projection.star or projection.expression_end == 0) return 0;
+            }
+            var count: usize = 0;
+            for (root.targets[0..root.count], view.columns[0..view.column_count], 0..) |projection, *column, index| {
+                const node = &pool.nodes[projection.expr];
+                if (projection.alias) |alias| {
+                    if (std.mem.eql(u8, identName(source, alias).slice(), column.name.slice())) continue;
+                    const quote: usize = @intFromBool(alias.quoted);
+                    edits[count] = .{ .start = alias.span.start - quote, .end = alias.span.start + alias.span.len + quote, .column = index };
+                } else {
+                    const matches = switch (node.kind) {
+                        .column => std.mem.eql(u8, identName(source, node.name).slice(), column.name.slice()),
+                        .int_literal, .decimal_literal, .text_literal, .bool_literal, .null_literal, .binary =>
+                        std.mem.eql(u8, "?column?", column.name.slice()),
+                        else => continue,
+                    };
+                    if (matches) continue;
+                    edits[count] = .{ .start = projection.expression_end, .end = projection.expression_end, .column = index };
+                }
+                count += 1;
+            }
+            return count;
+        }
+
         fn postgresViewDefinition(ptr: *anyopaque, oid: u32, _: bool, out: []u8) Error!?usize {
             const self: *Self = @ptrCast(@alignCast(ptr));
             const slot = self.visibleTableSlot(oid, self.seq_snap) orelse return null;
@@ -7079,9 +7096,9 @@ pub fn Database(comptime config: Config) type {
                 pool.window_len = window_len;
                 pool.complex = complex;
             }
-            _ = try P.parseQueryAt(source, 0, source.len, pool);
+            const root = try P.parseQueryAt(source, 0, source.len, pool);
             const blocks = pool.queries[query_len..pool.query_len];
-            var qualify: std.StaticBitSet(config.text_bytes) = .empty;
+            var changes: std.StaticBitSet(config.text_bytes + 1) = .empty;
             for (blocks) |*block| for (block.items[0..block.item_count]) |*item| {
                 if (item.schema != null or item.query != ast.none or item.function != ast.none or item.name.len == 0) continue;
                 const name = identName(source, item.name);
@@ -7098,17 +7115,32 @@ pub fn Database(comptime config: Config) type {
                 const dependency = self.tables[relation.slot].oid;
                 for (view.depends[0..view.depend_count]) |oid_ref| {
                     if (oid_ref != dependency) continue;
-                    qualify.set(item.name.span.start - @intFromBool(item.name.quoted));
+                    changes.set(item.name.span.start - @intFromBool(item.name.quoted));
                     break;
                 }
             };
+            var aliases: [config.columns]ViewAliasEdit = undefined;
+            const alias_count = viewAliasEdits(source, pool, &pool.queries[root], view, &aliases);
+            for (aliases[0..alias_count]) |edit| changes.set(edit.start);
             var text: CatalogTextWriter = .{ .out = out };
             var start: usize = 0;
-            var positions = qualify.iterator(.{});
+            var alias_index: usize = 0;
+            var positions = changes.iterator(.{});
             while (positions.next()) |position| {
                 text.add(source[start..position]);
-                text.add("public.");
                 start = position;
+                if (alias_index < alias_count and aliases[alias_index].start == position) {
+                    const edit = aliases[alias_index];
+                    if (edit.start == edit.end) text.add(" AS ");
+                    text.ident(view.columns[edit.column].name.slice());
+                    if (edit.start == edit.end and edit.end < source.len and
+                        (types.digit(source[edit.end]) or types.lower(source[edit.end]) >= 'a' and types.lower(source[edit.end]) <= 'z'))
+                        text.add(" ");
+                    start = edit.end;
+                    alias_index += 1;
+                } else {
+                    text.add("public.");
+                }
             }
             text.add(source[start..]);
             text.add("\n;");

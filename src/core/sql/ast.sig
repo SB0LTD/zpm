@@ -715,6 +715,7 @@ pub fn Ast(comptime config: types.Config) type {
             expr: u16 = none,
             star: bool = false,
             alias: ?Ident = null,
+            expression_end: usize = 0,
         };
 
         /// RETURNING or T-SQL OUTPUT target list (count 0: none).
@@ -803,6 +804,7 @@ pub fn Ast(comptime config: types.Config) type {
             only: bool = false,
             /// A derived table expanded from a stored view definition.
             view: bool = false,
+            view_table: u16 = none,
             // Query composition (B11). NATURAL join: USING over every common
             // column name of the two operands.
             natural: bool = false,

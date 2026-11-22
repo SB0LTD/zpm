@@ -7000,6 +7000,16 @@ pub fn Binder(comptime config: types.Config) type {
                     const child = try bindPlan(context, item.query, if (item.view) null else parent, if (item.view) null else env, false);
                     rel.plan = child;
                     source.plan = child;
+                    if (item.view_table != none) {
+                        const view = &context.tables[item.view_table];
+                        const child_plan = &plans.items[child];
+                        if (child_plan.count != view.column_count) return error.InvalidColumnReference;
+                        // The stored names belong to the outward relation.
+                        // The inner query binds ORDER BY and GROUP BY first.
+                        for (child_plan.names[0..child_plan.count], view.columns[0..view.column_count]) |*name, *column| {
+                            name.* = column.name;
+                        }
+                    }
                     if (plans.items[child].correlated) plans.items[id].correlated = true;
                 } else if (lookupCte(context, env, item.name)) |cte| {
                     rel.cte = cte;
