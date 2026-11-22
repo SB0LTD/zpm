@@ -297,7 +297,10 @@ pub const MapGpuVa = extern struct {
     reserved1: u64 = 0,
     va: u64 = 0,
     paging_fence: u64 = 0,
-    device: u32,
+    /// 0, as dxgkrnl sends it (its ioctl passes no device: the paging
+    /// queue names it); a device's handle here is refused (0xC000000D,
+    /// galaxy-turing's RTX 2080 Ti, 2026-11-22).
+    device: u32 = 0,
 };
 pub const MapGpuVaReturn = extern struct { va: u64, paging_fence: u64, status: i32 };
 
@@ -627,7 +630,7 @@ pub fn Gpu(comptime Host: type) type {
         /// `pages` of `allocation` at GPU address `base` (in a reserved
         /// range; 0: where the host likes in [minimum, maximum]).
         pub fn mapVa(self: *Self, paging_queue: u32, allocation: u32, base: u64, minimum: u64, maximum: u64, pages: u64) Error!Mapped {
-            const m = MapGpuVa{ .hdr = self.head(.map_gpu_va), .paging_queue = paging_queue, .base = base, .minimum = minimum, .maximum = maximum, .allocation = allocation, .size_pages = pages, .device = self.device };
+            const m = MapGpuVa{ .hdr = self.head(.map_gpu_va), .paging_queue = paging_queue, .base = base, .minimum = minimum, .maximum = maximum, .allocation = allocation, .size_pages = pages };
             const r = try self.answer(MapGpuVaReturn, try self.vcall(std.mem.asBytes(&m)));
             try self.pendingOk(r.status);
             return .{ .va = r.va, .paging_fence = r.paging_fence };
