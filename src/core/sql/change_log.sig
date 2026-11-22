@@ -1766,16 +1766,24 @@ pub fn ChangeLog(comptime config: types.Config) type {
             op: Op,
             bank: usize = 0,
             table_count: usize = 0,
+            with_defaults: bool = false,
         };
 
-        fn baseImageSchema(namespace: u32, relkind: u8, indexes: usize, parent: u32, dependencies: usize, constraints: usize, columns: []const V.Column) bool {
+        fn baseImageSchema(namespace: u32, relkind: u8, indexes: usize, parent: u32, dependencies: usize, constraints: usize, columns: []const V.Column, with_defaults: bool) bool {
             if (namespace != public_namespace or relkind != 'r' or indexes != 0 or parent != 0 or dependencies != 0 or constraints != 0) return false;
-            for (columns) |column| if (column.default_kind != .none or column.virtual) return false;
+            for (columns) |column| {
+                if (column.virtual) return false;
+                switch (column.default_kind) {
+                    .none => {},
+                    .default, .identity_always, .identity_by_default => if (!with_defaults) return false,
+                    else => return false,
+                }
+            }
             return true;
         }
 
         pub fn supportsBaseImage(table: *const S.Table) bool {
-            return baseImageSchema(table.namespace, table.relkind, table.index_count, table.parent, table.depend_count, table.constraint_count, table.columns[0..table.column_count]);
+            return baseImageSchema(table.namespace, table.relkind, table.index_count, table.parent, table.depend_count, table.constraint_count, table.columns[0..table.column_count], true);
         }
 
         fn validate(db: anytype, record: []const u8, scratch: *Scratch, image: anytype) Error!void {
@@ -1873,7 +1881,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         if (comptime base_image) {
                             const extras = &definition.extras;
                             if (index != image.bank or !baseImageSchema(definition.namespace, extras.relkind, extras.index_count,
-                                extras.parent, extras.depend_count, definition.constraint_count, columns)) return error.ChangeRecordConflict;
+                                extras.parent, extras.depend_count, definition.constraint_count, columns, image.with_defaults)) return error.ChangeRecordConflict;
                         }
                         if (!S.indexFits(&db.tables[index], definition.extras.index_count, 0)) return error.ChangeRecordConflict;
                         try validateExtras(db, scratch, &definition, null);
@@ -2140,7 +2148,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     @intFromEnum(Op.create_sequence), @intFromEnum(Op.create_sequence_cached), @intFromEnum(Op.create_scoped_identity_sequence), @intFromEnum(Op.create_scoped_sequence), @intFromEnum(Op.create_scoped_serial_sequence) => {
                         const definition = try decodeCreateSequence(&reader, tag);
                         if (base_sequence) {
-                            if (definition.owner != 0 or definition.owner_column != 0) return error.InvalidChangeRecord;
+                            if ((definition.owner == 0 and definition.owner_column != 0) or
+                                (!image.with_defaults and definition.owner != 0)) return error.InvalidChangeRecord;
                             image_sequence = definition;
                         }
                         if (definition.oid < first_oid or definition.oid == 0xffffffff or oidTaken(db, scratch, definition.oid, 1)) return error.ChangeRecordConflict;

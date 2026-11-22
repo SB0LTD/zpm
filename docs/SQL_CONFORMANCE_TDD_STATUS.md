@@ -51,8 +51,16 @@ WAL. The catalog now supplies the sequence dependency for literal
 `nextval` defaults and qualifies public sequence names with an empty
 search path. The focused DDL suite passed 1,213 assertions. Both fixture
 schemas passed both archive directions and WAL reopen on local PG16 and
-PG18. Hosted qualification is pending. Checkpoint images for owned
-sequences and complete sequence privileges remain open.
+PG18. Hosted qualification and complete sequence privileges remain open.
+
+The checkpoint candidate adds a versioned image for supported public
+tables with ordinary defaults, identity columns and owned sequences.
+The prior three image formats remain readable. The 136-assertion Sig
+contract verifies recovered ownership, sequence reservations and a WAL
+suffix, and rejects corrupt ownership before publication. A local
+RAMSQL server test also passed process kills after checkpoint rotation
+and after writes to the selected WAL. Named schemas and full catalog
+images remain open.
 
 The dependent-view fixture found an outbound ordering failure after
 `pg_get_viewdef` first returned the stored query. Typed `pg_rewrite`

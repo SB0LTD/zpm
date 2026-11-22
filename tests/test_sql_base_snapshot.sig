@@ -308,9 +308,63 @@ fn exerciseSequences(with_table: bool) !void {
     try check(result.rows[0].cells[0].integer == 101);
 }
 
+fn exerciseOwnedSequences() !void {
+    try reset(&live, 0);
+    try reset(&restored, 1);
+    try live.execute("CREATE TABLE orders (id INT GENERATED ALWAYS AS IDENTITY (START 7) PRIMARY KEY, ordinal SERIAL, label TEXT DEFAULT 'ready')", &result);
+    try live.execute("INSERT INTO orders DEFAULT VALUES", &result);
+    try live.execute("SELECT setval('orders_ordinal_seq',20,true)", &result);
+    try live.execute("CREATE SEQUENCE audit_ticket START 17", &result);
+    try live.execute("ALTER SEQUENCE audit_ticket OWNED BY orders.label", &result);
+    const reserved = live.seqs[0].logged_value;
+    const csn = live.csn;
+    var image: Image = .{};
+    var scratch: [512]u8 = undefined;
+    try DB.BaseSnapshot.write(&live, &image, &scratch);
+    try check(std.mem.eql(u8, image.bytes[0..8], "RSBASE04"));
+    try check(std.mem.readInt(u32, image.bytes[20..24], .little) == 3);
+
+    // Make the first sequence standalone without disturbing its framing.
+    // The missing identity association is invalid even though every part
+    // remains syntactically valid.
+    var missing = image;
+    var offset: usize = 32;
+    for (0..2) |_| offset += 5 + std.mem.readInt(u32, image.bytes[offset + 1 ..][0..4], .little);
+    try check(image.bytes[offset + 5 + sql.change_records.header_size] == 7); // CREATE SEQUENCE without CACHE
+    offset += 5 + std.mem.readInt(u32, image.bytes[offset + 1 ..][0..4], .little);
+    try check(std.mem.readInt(u32, image.bytes[offset - 19 ..][0..4], .little) == live.seqs[0].owner);
+    @memset(missing.bytes[offset - 19 ..][0..5], 0);
+    if (DB.BaseSnapshot.restore(&restored, &missing, csn, &scratch, &replay)) |_|
+        return error.MissingIdentityOwnerAccepted
+    else |err| try check(err == error.InvalidSnapshotImage);
+    try reset(&restored, 1);
+
+    try DB.BaseSnapshot.restore(&restored, &image, csn, &scratch, &replay);
+    try check(restored.csn == csn and restored.oid_counter == live.oid_counter);
+    try check(restored.seqs[0].oid == live.seqs[0].oid and restored.seqs[0].last_value == reserved);
+    try check(restored.seqs[1].last_value == 20 and restored.seqs[1].is_called);
+    try check(restored.seqs[2].owner == live.seqs[0].owner and restored.seqs[2].owner_column == 2);
+    try restored.execute("SELECT id,ordinal,label FROM orders", &result);
+    try check(result.row_count == 1 and result.rows[0].cells[0].integer == 7 and result.rows[0].cells[1].integer == 1);
+    try check(std.mem.eql(u8, result.rows[0].cells[2].text.slice(), "ready"));
+
+    const slot = try live.begin();
+    try live.statement(slot, "INSERT INTO orders DEFAULT VALUES", &result, .{});
+    var record: [512]u8 = undefined;
+    const changes = try live.prepareCommit(slot, &record);
+    live.publishCommit(slot);
+    try restored.applyChangeRecord(changes, &replay);
+    try restored.execute("SELECT id,ordinal,label FROM orders WHERE id=8", &result);
+    try check(result.row_count == 1 and result.rows[0].cells[1].integer == 21);
+    try check(std.mem.eql(u8, result.rows[0].cells[2].text.slice(), "ready"));
+    try restored.execute("INSERT INTO orders DEFAULT VALUES RETURNING id,ordinal,label", &result);
+    try check(result.rows[0].cells[0].integer > reserved and result.rows[0].cells[1].integer > 21);
+}
+
 pub fn main() !void {
     try exerciseSequences(false);
     try exerciseSequences(true);
+    try exerciseOwnedSequences();
     try exercise(true);
     try exercise(false);
     try exerciseMultiple();
