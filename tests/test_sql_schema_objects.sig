@@ -754,6 +754,9 @@ fn views() !void {
     try run("ALTER TABLE a RENAME COLUMN v TO val");
     try run("CREATE VIEW v AS SELECT id, val FROM a WHERE id <= 2");
     try expect(view_probes[0], "1|10;2|20");
+    try run("CREATE VIEW compacted AS SELECT id, /* View text is intentionally padded to test lexical compaction. Quoted spaces and comment markers in SQL literals must remain unchanged. */ 'a  --  b' AS label FROM a WHERE id=1");
+    try expect("SELECT id,label FROM compacted", "1|a  --  b");
+    try sameState(&.{"SELECT id,label FROM compacted"});
     // A concurrent DROP TABLE waits for the transaction that created a view
     // over it (AccessShare) and then fails on the committed dependent.
     const creator = try db.begin();

@@ -1740,33 +1740,15 @@ pub fn ChangeLog(comptime config: types.Config) type {
             return if (a <= b) b - a < a_len else a - b < b_len;
         }
 
-        fn validateLatePrimary(db: anytype, scratch: *Scratch, record: []const u8, index: usize, column: usize, target: *const V.Column) Error!void {
+        fn validateLatePrimary(db: anytype, scratch: *Scratch, record: []const u8, index: usize, columns: []const u8, definitions: []const V.Column) Error!void {
             if (!db.replayQuiescent()) return error.ChangeRecordConflict;
             const table = &db.tables[index];
             const bank = table.key_index[0..];
-            if (bank.len == 0 or bank.len & (bank.len - 1) != 0 or table.version_used > bank.len / 2) return error.ChangeRecordConflict;
             const bank_start = @intFromPtr(bank.ptr);
             const bank_bytes = bank.len * @sizeOf(u32);
             if (rangesOverlap(bank_start, bank_bytes, @intFromPtr(record.ptr), record.len) or
                 rangesOverlap(bank_start, bank_bytes, @intFromPtr(scratch), @sizeOf(Scratch))) return error.InvalidParameterValue;
-            // The caller exclusively owns replay. A keyless table's verified
-            // empty bank can lend capacity for its committed rows, independent
-            // of the transaction record's smaller touched-row overlay.
-            for (bank) |entry| if (entry != 0) return error.ChangeRecordConflict;
-            defer @memset(bank, 0);
-            for (0..table.row_high) |row| {
-                const version = S.visible(table, row) orelse continue;
-                var cell: V.Cell = undefined;
-                const key = S.borrowVersionCell(table, version, column, &cell);
-                if (key.* == .null_value) return error.ChangeRecordConflict;
-                V.validate(target, key) catch return error.ChangeRecordConflict;
-                var position = V.hash(key) & (bank.len - 1);
-                while (bank[position] != 0) : (position = (position + 1) & (bank.len - 1)) {
-                    var earlier: V.Cell = undefined;
-                    if (sameValue(key, S.borrowVersionCell(table, bank[position] - 1, column, &earlier))) return error.ChangeRecordConflict;
-                }
-                bank[position] = version + 1;
-            }
+            S.validatePrimaryColumns(table, columns, definitions, storage.committed_view, null) catch return error.ChangeRecordConflict;
         }
 
         pub const BaseImageRecord = struct {
@@ -1934,7 +1916,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         const late = definition.keyed() and !vt.keyed;
                         if (late) {
                             const base = &db.tables[index];
-                            if (vt.mutated or !vt.base or definition.primary_index_oid == 0 or primary == null or
+                            if (vt.mutated or !vt.base or definition.primary_index_oid == 0 or
                                 base.relkind != 'r' or base.parent != 0 or definition.extras.parent != 0 or
                                 definition.constraint_count != base.constraint_count + 1 or definition.extras.index_count != vt.index_count or
                                 definition.count != vt.column_count or !types.same(definition.name.slice(), vt.name.slice()) or
@@ -1945,7 +1927,14 @@ pub fn ChangeLog(comptime config: types.Config) type {
                             for (sources[0..definition.count], 0..) |source, column| {
                                 if (source != column or !types.same(vt.columns[column].name.slice(), definition.columns[column].name.slice())) return error.ChangeRecordConflict;
                             }
-                            try validateLatePrimary(db, scratch, record, index, primary.?, &definition.columns[primary.?]);
+                            const scalar = [1]u8{@intCast(primary orelse 0)};
+                            const columns = if (primary != null) &scalar else blk: {
+                                for (definition.constraints[0..definition.constraint_count]) |*constraint| {
+                                    if (constraint.kind == .primary) break :blk constraint.keyColumns();
+                                }
+                                return error.ChangeRecordConflict;
+                            };
+                            try validateLatePrimary(db, scratch, record, index, columns, definition.columns[0..definition.count]);
                             vt.late_primary = true;
                             next_oid = @max(next_oid, definition.primary_index_oid + 1);
                         } else {

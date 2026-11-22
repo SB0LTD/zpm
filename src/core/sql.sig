@@ -1323,6 +1323,11 @@ pub fn Database(comptime config: Config) type {
                 if (comptime config.external_storage) {
                     if (db.contiguous_backing) |backing| {
                         if (!overlaps(bounds, backing)) return;
+                        // Worker scratch and results can straddle the backing
+                        // in address space without either touching it.
+                        for (parts) |part| {
+                            if (overlaps(part, backing)) break;
+                        } else return;
                     }
                     try disjointParts(parts, bounds, try StorageSpan.of(db.workspace.query.refs[0..]));
                 }
@@ -3093,7 +3098,7 @@ pub fn Database(comptime config: Config) type {
                 .insert => |*insert| blk: {
                     try self.lockTable(slot, insert.table, .row_exclusive);
                     if (mysqlAutoColumn(&self.tables[insert.table]) != null) {
-                        if (self.dialect != .mysql or insert.replace or insert.plan != ast.none or insert.rows == ast.none or
+                        if (self.dialect != .mysql or insert.plan != ast.none or insert.rows == ast.none or
                             insert.conflict.action != .none or insert.returning.count != 0 or self.insertHooks(insert.table, snap))
                             return error.UnsupportedStatement;
                     }
@@ -7721,9 +7726,8 @@ pub fn Database(comptime config: Config) type {
             if (S.anyIntegralBank(&self.tables)) return error.UnsupportedStatement;
             const source = &self.tables[alter.table];
             try checkPendingLatePrimary(source);
-            var scalar_primary = false;
-            for (alter.columns[0..alter.count]) |*column| scalar_primary = scalar_primary or column.primary_key;
-            var primary = scalar_primary;
+            var primary = false;
+            for (alter.columns[0..alter.count]) |*column| primary = primary or column.primary_key;
             for (alter.constraints[0..alter.constraint_count]) |*constraint| primary = primary or constraint.kind == .primary;
             const late_primary = primary and !S.keyed(source);
             var fold_created_primary = false;
@@ -7747,10 +7751,6 @@ pub fn Database(comptime config: Config) type {
                     },
                     else => {},
                 };
-                // Replay's standalone late-primary operation builds a
-                // scalar index over committed rows. A fresh composite key is
-                // logged as part of CREATE before its loaded rows.
-                if (!scalar_primary and !fold_created_primary) return error.UnsupportedStatement;
             }
             if (!types.same(alter.name.slice(), source.name.slice())) {
                 try self.checkRelationTypeName(slot, source.namespace, alter.name.slice(), snap);
@@ -7838,6 +7838,13 @@ pub fn Database(comptime config: Config) type {
             var checks: [config.table_constraints]u16 = @splat(ast.none);
             try B.bindFlaggedChecks(&context, index, &alter.check_constraint, &checks);
             const table = &self.tables[index];
+            if (table.primary_column == null) {
+                if (S.primaryConstraint(table)) |primary| {
+                    if (alter.check_constraint[primary]) {
+                        try S.validatePrimaryColumns(table, table.constraints[primary].keyColumns(), table.columns[0..table.column_count], snap, self.session.control);
+                    }
+                }
+            }
             var ctx = self.evalContext("");
             var row_scratch: S.VersionRowScratch = undefined;
             for (0..table.row_high) |row| {
@@ -7866,8 +7873,8 @@ pub fn Database(comptime config: Config) type {
                 }
                 for (table.constraints[0..table.constraint_count], 0..) |*constraint, position| {
                     if (!alter.check_constraint[position]) continue;
-                    const status = if (constraint.kind == .primary and table.primary_column != null)
-                        S.primaryKeyCheck(table, &cells[table.primary_column.?], @intCast(row), snap)
+                    const status = if (constraint.kind == .primary)
+                        if (table.primary_column) |column| S.primaryKeyCheck(table, &cells[column], @intCast(row), snap) else continue
                     else if (S.scannedUnique(table, constraint))
                         S.uniqueCheck(table, constraint, cells, @intCast(row), snap)
                     else
@@ -8026,8 +8033,8 @@ pub fn Database(comptime config: Config) type {
                 else => return error.UnsupportedStatement,
             };
             for (table.columns[0..table.column_count]) |column| {
-                if (column.default_kind == .identity_always or column.default_kind == .identity_by_default or
-                    column.default_kind == .mysql_auto_increment) return error.UnsupportedStatement;
+                if (column.default_kind == .identity_always or column.default_kind == .identity_by_default)
+                    return error.UnsupportedStatement;
             }
             var triggers: [config.triggers]u8 = undefined;
             if (self.objects.tableTriggers(table.oid, snap, &triggers) != 0 or

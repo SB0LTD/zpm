@@ -53,6 +53,32 @@ PG16 and PG18 CI each passed all 34 checks. Adding a composite primary key
 to an existing committed table remains unsupported.
 [Composite-key archive CI](https://github.com/SB0LTD/ramsql/actions/runs/44962030582)
 
+A separate candidate supports adding a composite primary key to an
+existing dense table in its own transaction. Live validation and replay
+borrow an empty primary-index bank, use a composite hash, and check
+equality on collisions. Expected validation cost is linear in the
+existing rows for a fixed-width key. The local change-log suite passed
+1,119 assertions, including WAL rejection on duplicate rows. PG16 and
+PG18 each passed all 35 stock and differential checks.
+[Late composite-key CI](https://github.com/SB0LTD/ramsql/actions/runs/44962874305)
+
+The current 118-program smoke inventory matched all 106 PostgreSQL
+programs against native PG18.3, including the database lifecycle,
+prepared transactions and maintenance cases run on separate fresh
+instances. The oracle was built with XML support. The audit resolves
+allocated type OIDs to their namespace, name and kind and retains the
+raw OIDs. All 19 audit unit tests passed. All six MySQL programs matched
+native MySQL 8.0.36 through PyMySQL. The six T-SQL programs returned their
+expected rows through python-tds. Native SQL Server comparison and the
+separate 755-record SQL feature inventory remain unqualified.
+
+Combining MySQL `REPLACE` with an `AUTO_INCREMENT` primary key exposed
+a guard that rejected the statement despite both paths sharing the
+same insert implementation. The focused MySQL contract passed 1,530
+assertions and 1,024 fuzz inputs after enabling the combination for the
+supported single-key table type. It verifies explicit and generated
+IDs, affected rows, rollback and WAL reopen.
+
 RAMSQL `d1ddbe5` with ZPM `ed00a0a1` passed all 24 stock
 tooling checks on both PostgreSQL 16 and 18. Stock plain and custom
 imports passed row, default and constraint checks after WAL reopen.

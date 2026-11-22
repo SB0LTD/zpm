@@ -14,6 +14,8 @@ from pathlib import Path
 import socket
 import struct
 
+FIRST_USER_OID = 16384
+
 
 class Pg:
     def __init__(self, port, user, database):
@@ -126,16 +128,28 @@ class Pg:
 def run_case(port, args, manifest, case):
     connection = Pg(port, args.user, args.database)
     try:
-        commands = ["BEGIN"] + manifest["fixtures"][case["setup"]] + case["statements"]
+        commands = ["BEGIN"] if case["scope"] in ("transaction", "copy_protocol") else []
+        commands += manifest["fixtures"][case["setup"]] + case["statements"]
         results = []
         for command in commands:
             result = connection.query(command)
             results.append(result)
             if result["error"]:
                 break
+            oids = sorted({column[1] for column in result["columns"] if column[1] >= FIRST_USER_OID})
+            if oids:
+                oid_list = ",".join(map(str, oids))
+                types = connection.query(
+                    "SELECT t.oid,n.nspname,t.typname,t.typtype FROM pg_catalog.pg_type t "
+                    "JOIN pg_catalog.pg_namespace n ON n.oid=t.typnamespace "
+                    f"WHERE t.oid IN ({oid_list})"
+                )
+                result["user_types"] = {row[0]: row[1:] for row in types["rows"]}
+                if types["error"]:
+                    result["user_type_error"] = types["error"]
         return results
     finally:
-        connection.close()  # Disconnect aborts the isolated fixture transaction.
+        connection.close()
 
 
 def explain_measurement(result):
@@ -171,14 +185,30 @@ def explain_measurement(result):
     return None
 
 
+def equivalent_columns(left, right):
+    if len(left["columns"]) != len(right["columns"]):
+        return False
+    for a, b in zip(left["columns"], right["columns"]):
+        if a[0] != b[0] or a[2:] != b[2:]:
+            return False
+        if a[1] < FIRST_USER_OID or b[1] < FIRST_USER_OID:
+            if a[1] != b[1]:
+                return False
+            continue
+        left_type = left.get("user_types", {}).get(str(a[1]))
+        right_type = right.get("user_types", {}).get(str(b[1]))
+        if left_type is None or left_type != right_type:
+            return False
+    return True
+
+
 def equivalent(left, right, ordered, comparator="exact"):
     if len(left) != len(right):
         return False
     for index, (a, b) in enumerate(zip(left, right)):
-        # Object OIDs are not compared; type OIDs, typmods and formats are.
         if a["error"] or b["error"]:
             return False
-        if any(a[key] != b[key] for key in ("columns", "command", "transaction")):
+        if not equivalent_columns(a, b) or any(a[key] != b[key] for key in ("command", "transaction")):
             return False
         if a.get("copy") != b.get("copy"):
             return False
@@ -202,6 +232,8 @@ def main():
     parser.add_argument("--user", default="postgres")
     parser.add_argument("--database", default="postgres")
     parser.add_argument("--case", action="append", help="Select stable feature IDs")
+    parser.add_argument("--outside-transaction", action="store_true",
+                        help="Run one explicit cluster or session case on fresh disposable instances")
     parser.add_argument("--report", type=Path, required=True)
     args = parser.parse_args()
     if not args.oracle_only and args.candidate_port is None:
@@ -213,6 +245,9 @@ def main():
     selected = [c for c in manifest["cases"] if not args.case or c["id"] in args.case]
     if not selected or (args.case and set(args.case) - {c["id"] for c in selected}):
         parser.error("Unknown or empty case selection")
+    if args.outside_transaction and (len(selected) != 1 or selected[0]["scope"] not in ("cluster", "session")
+                                     or selected[0]["dialect"] != "postgresql18"):
+        parser.error("--outside-transaction requires one explicit PostgreSQL cluster or session case")
     connection = Pg(args.oracle_port, args.user, args.database)
     try:
         version = connection.query("SHOW server_version_num")
@@ -227,7 +262,7 @@ def main():
               "oracle_version": full_version["rows"], "cases": []}
     for case in selected:
         entry = {"id": case["id"], "status": "unexecuted_scope"}
-        if case["scope"] in ("transaction", "copy_protocol") and case["dialect"] == "postgresql18":
+        if (args.outside_transaction or case["scope"] in ("transaction", "copy_protocol")) and case["dialect"] == "postgresql18":
             try:
                 oracle = run_case(args.oracle_port, args, manifest, case)
                 comparator = case.get("comparator", "exact")
