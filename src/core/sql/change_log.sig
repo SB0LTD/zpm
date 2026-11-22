@@ -48,6 +48,7 @@
 //!    23 alter_sequence_ownership: op 14 plus table OID u32 and column u8
 //!                     (zero table and column detach an automatic dependency)
 //!    24 create_scoped_serial_sequence: op 21 layout for an automatic dependency
+//!                     (checkpoint images also use it for an explicit attachment)
 //!    60-65 routines, triggers and rules (B11 wave 3): payload_len u32 +
 //!                     payload, decoded by routine_catalog.sig: 60
 //!                     create_routine, 61 drop_routine, 62 create_trigger,
@@ -1767,10 +1768,11 @@ pub fn ChangeLog(comptime config: types.Config) type {
             bank: usize = 0,
             table_count: usize = 0,
             with_defaults: bool = false,
+            with_schemas: bool = false,
         };
 
-        fn baseImageSchema(namespace: u32, relkind: u8, indexes: usize, parent: u32, dependencies: usize, constraints: usize, columns: []const V.Column, with_defaults: bool) bool {
-            if (namespace != public_namespace or relkind != 'r' or indexes != 0 or parent != 0 or dependencies != 0 or constraints != 0) return false;
+        fn baseImageSchema(relkind: u8, indexes: usize, parent: u32, dependencies: usize, constraints: usize, columns: []const V.Column, with_defaults: bool) bool {
+            if (relkind != 'r' or indexes != 0 or parent != 0 or dependencies != 0 or constraints != 0) return false;
             for (columns) |column| {
                 if (column.virtual) return false;
                 switch (column.default_kind) {
@@ -1783,7 +1785,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
         }
 
         pub fn supportsBaseImage(table: *const S.Table) bool {
-            return baseImageSchema(table.namespace, table.relkind, table.index_count, table.parent, table.depend_count, table.constraint_count, table.columns[0..table.column_count], true);
+            return baseImageSchema(table.relkind, table.index_count, table.parent, table.depend_count, table.constraint_count, table.columns[0..table.column_count], true);
         }
 
         fn validate(db: anytype, record: []const u8, scratch: *Scratch, image: anytype) Error!void {
@@ -1858,7 +1860,11 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 if (comptime base_image) {
                     const required = if (base_sequence and part == 1) Op.sequence else image.op;
                     const cached_definition = base_sequence and part == 0 and tag == @intFromEnum(Op.create_sequence_cached);
-                    if (tag != @intFromEnum(required) and !cached_definition) return error.InvalidChangeRecord;
+                    const scoped_sequence = image.with_schemas and base_sequence and part == 0 and
+                        (tag == @intFromEnum(Op.create_scoped_sequence) or tag == @intFromEnum(Op.create_scoped_identity_sequence) or
+                            tag == @intFromEnum(Op.create_scoped_serial_sequence));
+                    const private_schema = image.with_schemas and required == .create_schema and tag == @intFromEnum(Op.create_private_schema);
+                    if (tag != @intFromEnum(required) and !cached_definition and !scoped_sequence and !private_schema) return error.InvalidChangeRecord;
                 }
                 switch (tag) {
                     @intFromEnum(Op.create_table) => {
@@ -1880,7 +1886,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         const index = free orelse return error.ChangeRecordConflict;
                         if (comptime base_image) {
                             const extras = &definition.extras;
-                            if (index != image.bank or !baseImageSchema(definition.namespace, extras.relkind, extras.index_count,
+                            if (index != image.bank or (!image.with_schemas and definition.namespace != public_namespace) or
+                                !baseImageSchema(extras.relkind, extras.index_count,
                                 extras.parent, extras.depend_count, definition.constraint_count, columns, image.with_defaults)) return error.ChangeRecordConflict;
                         }
                         if (!S.indexFits(&db.tables[index], definition.extras.index_count, 0)) return error.ChangeRecordConflict;
@@ -2159,10 +2166,12 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         if (definition.owner != 0) {
                             const owner = try findVTable(scratch, definition.owner);
                             if (definition.owner_column >= scratch.tables[owner].column_count) return error.ChangeRecordConflict;
-                            if (tag == @intFromEnum(Op.create_scoped_serial_sequence) and
+                            if (!base_image and tag == @intFromEnum(Op.create_scoped_serial_sequence) and
                                 scratch.tables[owner].columns[definition.owner_column].default_kind != .default)
                                 return error.ChangeRecordConflict;
-                            if (tag == @intFromEnum(Op.create_scoped_identity_sequence) or tag == @intFromEnum(Op.create_scoped_serial_sequence)) {
+                            if (tag == @intFromEnum(Op.create_scoped_identity_sequence) or
+                                (!base_image and tag == @intFromEnum(Op.create_scoped_serial_sequence)))
+                            {
                                 for (&scratch.seqs) |*seq| {
                                     if (seq.live and seq.owner == definition.owner and seq.owner_column == definition.owner_column) return error.ChangeRecordConflict;
                                 }
@@ -2304,6 +2313,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
             switch (image.op) {
                 .create_table, .insert => if (image.bank >= config.tables) return error.InvalidChangeRecord,
                 .create_sequence => {},
+                .create_schema => if (!image.with_schemas) return error.InvalidChangeRecord,
                 .catalog_counters, .catalog_counters_with_constraints, .catalog_counters_with_defaults => if (image.table_count > config.tables) return error.InvalidChangeRecord,
                 else => return error.InvalidChangeRecord,
             }

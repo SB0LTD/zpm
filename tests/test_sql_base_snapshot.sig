@@ -361,10 +361,52 @@ fn exerciseOwnedSequences() !void {
     try check(result.rows[0].cells[0].integer > reserved and result.rows[0].cells[1].integer > 21);
 }
 
+fn exerciseNamedSchemas() !void {
+    try reset(&live, 0);
+    try reset(&restored, 1);
+    try live.execute("CREATE SCHEMA src", &result);
+    try live.execute("CREATE SCHEMA dst", &result);
+    try live.execute("CREATE TABLE src.orders (id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, ordinal SERIAL, n INT DEFAULT 23)", &result);
+    try live.execute("CREATE TABLE dst.orders (id INT PRIMARY KEY, n INT DEFAULT 41)", &result);
+    try live.execute("CREATE SEQUENCE src.audit START 53", &result);
+    try live.execute("ALTER SEQUENCE src.audit OWNED BY src.orders.n", &result);
+    try live.execute("CREATE SEQUENCE dst.audit START 73", &result);
+    try live.execute("INSERT INTO src.orders DEFAULT VALUES", &result);
+    try live.execute("INSERT INTO dst.orders(id) VALUES (2)", &result);
+
+    const csn = live.csn;
+    var image: Image = .{};
+    var scratch: [512]u8 = undefined;
+    try DB.BaseSnapshot.write(&live, &image, &scratch);
+    try check(std.mem.eql(u8, image.bytes[0..8], "RSBASE05"));
+    try check(std.mem.readInt(u32, image.bytes[24..28], .little) == 2);
+    var invalid = image;
+    @memset(invalid.bytes[24..28], 0);
+    if (DB.BaseSnapshot.restore(&restored, &invalid, csn, &scratch, &replay)) |_|
+        return error.EmptySchemaSectionAccepted
+    else |err| try check(err == error.InvalidSnapshotImage);
+    try check(restored.csn == 0);
+
+    try DB.BaseSnapshot.restore(&restored, &image, csn, &scratch, &replay);
+    try check(restored.csn == csn and restored.oid_counter == live.oid_counter);
+    try check(restored.schemas[0].oid == live.schemas[0].oid and restored.schemas[1].oid == live.schemas[1].oid);
+    try restored.execute("SELECT id,ordinal,n FROM src.orders", &result);
+    try check(result.row_count == 1 and result.rows[0].cells[0].integer == 1 and result.rows[0].cells[1].integer == 1 and result.rows[0].cells[2].integer == 23);
+    try restored.execute("SELECT id,n FROM dst.orders", &result);
+    try check(result.row_count == 1 and result.rows[0].cells[0].integer == 2 and result.rows[0].cells[1].integer == 41);
+    try restored.execute("SELECT pg_get_serial_sequence('src.orders','n')", &result);
+    try check(std.mem.eql(u8, result.rows[0].cells[0].text.slice(), "src.audit"));
+    try restored.execute("SELECT nextval('src.audit'),nextval('dst.audit')", &result);
+    try check(result.rows[0].cells[0].integer == 53 and result.rows[0].cells[1].integer == 73);
+    try restored.execute("INSERT INTO src.orders DEFAULT VALUES RETURNING id,ordinal", &result);
+    try check(result.rows[0].cells[0].integer > 1 and result.rows[0].cells[1].integer > 1);
+}
+
 pub fn main() !void {
     try exerciseSequences(false);
     try exerciseSequences(true);
     try exerciseOwnedSequences();
+    try exerciseNamedSchemas();
     try exercise(true);
     try exercise(false);
     try exerciseMultiple();

@@ -62,6 +62,13 @@ RAMSQL server test also passed process kills after checkpoint rotation
 and after writes to the selected WAL. Named schemas and full catalog
 images remain open.
 
+The named-schema follow-up restores committed schema definitions before
+their tables and sequences. The Sig image suite passed 147 assertions,
+including duplicate names across schemas, scoped defaults and sequence
+ownership. The local Linux server passed rotation and process-kill
+recovery with identity and SERIAL columns in a named schema. Images for
+role-owned schemas, ACLs and the full object catalog remain open.
+
 The dependent-view fixture found an outbound ordering failure after
 `pg_get_viewdef` first returned the stored query. Typed `pg_rewrite`
 rows now expose each view's implicit SELECT rule and its relation
