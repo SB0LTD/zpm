@@ -378,7 +378,9 @@ pub const Graphics = struct {
 
     pub const Index = struct { va: u64, bytes: u32, size: u8, first: u32, restart: bool = false };
 
-    pub const TargetFormat = enum(u8) { rgba8, bgra8, r8, rg8 };
+    /// (the float ones: 32-bit float channels, drawn unclamped and blended
+    /// in floats; Direct3D's 16-bit and packed float targets stored so)
+    pub const TargetFormat = enum(u8) { rgba8, bgra8, r8, rg8, r32f, rg32f, rgba32f };
     pub const ColorTarget = struct {
         va: u64,
         stride: u32,

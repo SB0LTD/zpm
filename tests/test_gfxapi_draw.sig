@@ -2519,6 +2519,72 @@ test "draw: colour targets of both layouts (a block-linear target 0, targets of 
     }
 }
 
+test "draw: float colour targets (RGBA32F, R32F: Direct3D's float targets) beside a depth image go to the RTX's 3D engine, made block linear, cleared word by word, written unclamped and blended in floats; off the 3D engine they are not drawn" {
+    Rtx3d.engine3d = .{};
+    Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+    Rtx.dev.withEngine(&Rtx3d.engine3d);
+    eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs, .graphics = true });
+    defer eng_rtx.deinit();
+    defer eng_rtx.unloadPipeline(&mrt_pipe);
+    const e = &eng_rtx;
+    var t0 = e.newImage(W, H, .rgba32f) orelse return error.OutOfMemory;
+    defer e.freeImage(&t0);
+    var t1 = e.newImage(W, H, .r32f) orelse return error.OutOfMemory;
+    defer e.freeImage(&t1);
+    var zd = e.newImageSamples(W, H, .d24s8, 1) orelse return error.OutOfMemory;
+    defer e.freeImage(&zd);
+    var ab = e.newBuffer(12 * 16) orelse return error.OutOfMemory;
+    defer e.freeImage(&ab);
+    // (rows first, then block linear in Turing2D's GOBs, as galaxy-pe's
+    // depth-tested draws make them)
+    try std.testing.expect(e.promote(&t0));
+    try std.testing.expect(e.promote(&t1));
+    try std.testing.expect(t0.layout.block and t1.layout.block and t0.layout.swizzle == .turing2d);
+    const f = struct {
+        fn w(x: f32) u32 {
+            return @bitCast(x);
+        }
+    }.w;
+    e.fillWords(&t0, t0.bounds(), .{ f(0.5), f(-1), f(2), f(1) });
+    e.fillWords(&t1, t1.bounds(), .{ f(3), 0, 0, 0 });
+    e.fillDepth(&zd, zd.bounds(), 1.0, 0, 0xff);
+    const add = raster.Blend{ .dst_rgb = .{ .c = .{ 1, 1, 1, 1 } }, .dst_a = .{ .c = .{ 1, 1, 1, 1 } }, .gl = .{ g.ONE, g.ONE, g.ONE, g.ONE } };
+    const col = rgba(.{ 4, -2, 0.5, 1 });
+    const before = e.stats.graphics_draws;
+    const computed = e.stats.compute_draws;
+    var d = raster.Draw{ .pipe = &mrt_pipe, .color = &t0, .depth = &zd, .depth_test = true, .depth_write = true, .depth_func = 0b001, .uniforms = &col, .blend = add };
+    d.targets[1] = .{ .img = &t1 };
+    const q = fullQuad(0);
+    featDraw(e, d, &ab, &q) catch |err| {
+        std.debug.print("float targets: {s}; the 3D engine: {s}\n", .{ @errorName(err), Rtx3d.engine3d.why });
+        return err;
+    };
+    if (e.stats.graphics_draws - before != 1 or e.stats.compute_draws != computed) {
+        for (e.said_compute) |w| if (w.len != 0) std.debug.print("float targets: on the compute kernels: {s}\n", .{w});
+        return error.WrongRasterizer;
+    }
+    var p0: [W * H * 4]f32 = undefined;
+    var p1: [W * H]f32 = undefined;
+    e.read(&t0, 0, 0, W, H, std.mem.sliceAsBytes(&p0), W * 16, .rgba32f);
+    e.read(&t1, 0, 0, W, H, std.mem.sliceAsBytes(&p1), W * 4, .r32f);
+    // every pixel: the fill plus the colour, past 0..1; target 1 the
+    // fill plus x / 64 at the pixel's centre
+    for (0..H) |y| for (0..W) |x| {
+        const at = y * W + x;
+        try std.testing.expectEqualSlices(f32, &.{ 4.5, -3, 2.5, 2 }, p0[at * 4 ..][0..4]);
+        try std.testing.expectEqual(@as(f32, 3) + (@as(f32, @floatFromInt(x)) + 0.5) / 64, p1[at]);
+    };
+    // off the 3D engine: not drawn (the compute raster writes 8-bit
+    // pixels), counted, the target as it was
+    e.compute_only = true;
+    defer e.compute_only = false;
+    const not_drawn = e.stats.float_not_drawn;
+    try featDraw(e, d, &ab, &q);
+    try std.testing.expectEqual(not_drawn + 1, e.stats.float_not_drawn);
+    e.read(&t0, 0, 0, W, H, std.mem.sliceAsBytes(&p0), W * 16, .rgba32f);
+    try std.testing.expectEqualSlices(f32, &.{ 4.5, -3, 2.5, 2 }, p0[0..4]);
+}
+
 /// The RTX's compiler, but a tile kernel (gl_raster...) too big for it, as
 /// a large program's is (kir_sm120's MAX_INSTS): those draws run on the CPU.
 fn noRaster(k: *const gpu.kir.Kernel, caps: gpu.Caps, work: *gpu.Work, out: []u8) anyerror!gpu.Binary {

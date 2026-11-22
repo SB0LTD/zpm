@@ -98,6 +98,20 @@ pub const Format = enum(u8) {
         return f.isColor() or f == .r8 or f == .rg8;
     }
 
+    /// A float format draws write through the GPU's 3D engine (Direct3D's
+    /// float render targets: R32F, RG32F, RGBA32F, and the 16-bit and
+    /// packed float ones stored so): the colour unclamped, blended in
+    /// floats. The compute raster writes 8-bit pixels: its draws into
+    /// them are not made (Engine.draw).
+    pub fn floatTarget(f: Format) bool {
+        return f == .r32f or f == .rg32f or f == .rgba32f;
+    }
+
+    /// A colour target of any draw: renderable, or a float target.
+    pub fn targetable(f: Format) bool {
+        return f.renderable() or f.floatTarget();
+    }
+
     pub fn bytes(f: Format) u32 {
         return switch (f) {
             .r8 => 1,
@@ -129,6 +143,20 @@ pub const Format = enum(u8) {
             .r32ui, .rg32ui, .rgba32ui, .d24s8 => .uint,
             else => .unorm8,
         };
+    }
+};
+
+/// A fill's texels of several words (a float target's clear:
+/// Engine.fillWords): word i of each texel words[i], n words a texel; n 1:
+/// the fill's value alone.
+pub const Pattern = struct {
+    words: [4]u32 = @splat(0),
+    n: u32 = 1,
+
+    /// Word `x` of a row's (x counted in words) as the pattern has it, or
+    /// `value` for a fill of one word a texel.
+    pub fn at(p: Pattern, x: u32, value: u32) u32 {
+        return if (p.n > 1) p.words[x % p.n] else value;
     }
 };
 
@@ -260,11 +288,11 @@ pub const Image = struct {
     /// raster and the RTX's 3D engine both draw into it). GL's other paths
     /// (copies, blits, completeness) still take `drawable`, rows alone.
     pub fn gpuDrawable(img: *const Image) bool {
-        if (!img.format.renderable()) return false;
+        if (!img.format.targetable()) return false;
         if (img.layout.linear()) return true;
         // (8- and 16-bit texels: the engine's own images alone, promoted;
         // an imported plane in those GOBs (a video picture's) is sampled)
-        if (img.format.bytes() != 4 and (img.share != null or !img.own)) return false;
+        if (img.format.bytes() < 4 and (img.share != null or !img.own)) return false;
         return img.blockFits();
     }
 
@@ -274,7 +302,7 @@ pub const Image = struct {
     pub fn blockFits(img: *const Image) bool {
         if (!img.layout.block) return false;
         return switch (img.format.bytes()) {
-            4 => img.layout.swizzle == .turing2d,
+            4, 8, 16 => img.layout.swizzle == .turing2d,
             2 => img.layout.swizzle == .blackwell16,
             1 => img.layout.swizzle == .blackwell8,
             else => false,
@@ -526,7 +554,12 @@ fn fillKernel(s: kir.Storage, masked: bool) kir.Kernel {
     const swz = k.op2(.shr, .u32, r(bl), u(8));
     const at = k.sel(.u32, r(k.cmp(.u32, .ne, r(bl), u(0))), r(blocklinear.address(&k, r(stride), r(gobs), r(swz), r(xb), r(row))), r(k.op2(.iadd, .u32, r(k.op2(.imul, .u32, r(row), r(stride))), r(xb))));
     const off = k.op2(.iadd, .u32, r(at), r(k.param(.u32, 8)));
-    var v = value;
+    // (params 9..13: a texel of several words (Pattern): its words less
+    // one as a mask, then the words, word (x0 + x) & mask of them)
+    const wi = k.op2(.@"and", .u32, r(k.op2(.iadd, .u32, r(x0), r(x))), r(k.param(.u32, 9)));
+    var v = k.param(.u32, 10);
+    for (1..4) |i| v = k.sel(.u32, r(k.cmp(.u32, .eq, r(wi), u(@intCast(i)))), r(k.param(.u32, @intCast(10 + i))), r(v));
+    v = k.sel(.u32, r(k.cmp(.u32, .eq, r(k.param(.u32, 9)), u(0))), r(value), r(v));
     if (masked) {
         const keep = k.param(.u32, 5);
         const old = pixelLoad(&k, img, bpp, off);
@@ -1109,16 +1142,20 @@ fn targetFormatOf(f: Format) gpu.Graphics.TargetFormat {
         .rgba8 => .rgba8,
         .bgra8 => .bgra8,
         .rg8 => .rg8,
+        .r32f => .r32f,
+        .rg32f => .rg32f,
+        .rgba32f => .rgba32f,
         else => .r8,
     };
 }
 
 fn maskOf(f: Format, keep: u32) u4 {
-    // (each channel's byte in the pixel word; none: not there)
+    // (each channel's byte in the pixel word; none: not there; a float
+    // target's channels kept as RGBA8's bytes say)
     const at: [4]?u5 = switch (f) {
         .bgra8 => .{ 16, 8, 0, 24 },
-        .rg8 => .{ 0, 8, null, null },
-        .r8 => .{ 0, null, null, null },
+        .rg8, .rg32f => .{ 0, 8, null, null },
+        .r8, .r32f => .{ 0, null, null, null },
         else => .{ 0, 8, 16, 24 },
     };
     var m: u4 = 0;
@@ -1305,6 +1342,9 @@ pub const Stats = struct {
     /// drew (raster.stageWhyNot)
     graphics_draws: u64 = 0,
     compute_draws: u64 = 0,
+    /// draws into a float colour target the 3D engine did not take (not
+    /// made: Engine.draw)
+    float_not_drawn: u64 = 0,
     /// GL colour images made block linear (Engine.promote), and moved back
     /// to rows (Engine.toRows): each image at most once each way
     promoted: u32 = 0,
@@ -1469,7 +1509,7 @@ pub const Engine = struct {
     /// again on the CPU writes where the GPU would have, whatever a table
     /// holds since)
     const CpuOp = union(enum) {
-        fill: struct { img: Image, rect: Rect, value: u32, keep: u32, base: u32 = 0 },
+        fill: struct { img: Image, rect: Rect, value: u32, keep: u32, base: u32 = 0, pat: Pattern = .{} },
         copy: struct { src: Image, sx: u32, sy: u32, dst: Image, dx: u32, dy: u32, w: u32, h: u32 },
     };
 
@@ -1717,7 +1757,7 @@ pub const Engine = struct {
     /// Not for an image an outside reader takes as rows (a window's, a
     /// dma-buf's without a block-linear modifier).
     pub fn newBlockImage(e: *Engine, width: u32, height: u32, format: Format) ?Image {
-        if (width == 0 or height == 0 or !format.renderable()) return null;
+        if (width == 0 or height == 0 or !format.targetable()) return null;
         const swizzle = e.blockSwizzle(format) orelse return null;
         // (rows on 128 bytes and the image on a page, as the 3D engine's
         // targets must be: whole GOBs, a GOB's 512 bytes aligned)
@@ -1737,7 +1777,7 @@ pub const Engine = struct {
     pub fn blockSwizzle(e: *const Engine, format: Format) ?blocklinear.Swizzle {
         const blackwell = e.dev != null and e.dev.?.caps.target == .sm_120;
         return switch (format.bytes()) {
-            4 => .turing2d,
+            4, 8, 16 => .turing2d,
             2 => if (blackwell) .blackwell16 else null,
             1 => if (blackwell) .blackwell8 else null,
             else => null,
@@ -1759,7 +1799,7 @@ pub const Engine = struct {
     pub fn promoteWhyNot(e: *const Engine, img: *const Image, comptime pre: []const u8) ?[]const u8 {
         if (!e.block_targets or !e.onGpu()) return pre ++ "block-linear targets off (GALAXY_GL_BLOCK=0, or no GPU)";
         if (!img.live() or !img.own or img.share != null) return pre ++ "an image the engine does not own alone (shared, imported, or a view)";
-        if (!img.format.renderable() or e.blockSwizzle(img.format) == null) return pre ++ "a format with no block-linear GOBs here (only RGBA8, BGRA8, and on Blackwell R8 and RG8)";
+        if (!img.format.targetable() or e.blockSwizzle(img.format) == null) return pre ++ "a format with no block-linear GOBs here (only RGBA8, BGRA8, the float targets, and on Blackwell R8 and RG8)";
         if (img.no_block) return pre ++ "moved back to rows for good (an op that takes rows alone was done on it)";
         if (img.levels != 1) return pre ++ "an image with mipmap levels";
         if (img.samples != 1) return pre ++ "multisampled";
@@ -1805,7 +1845,7 @@ pub const Engine = struct {
     /// moves between layouts frame after frame). True when it is rows
     /// (already, or now); false: no memory to move it.
     pub fn toRows(e: *Engine, img: *Image, why: []const u8) bool {
-        if (!img.layout.block or !img.format.renderable() or img.depth_float) return true;
+        if (!img.layout.block or !img.format.targetable() or img.depth_float) return true;
         // (memory others name too: an imported block-linear dma-buf; its
         // readers take its layout from the modifier)
         if (img.share != null) return false;
@@ -1845,7 +1885,7 @@ pub const Engine = struct {
     fn allocImage(e: *Engine, width: u32, height: u32, format: Format, shareable: bool) ?Image {
         if (width == 0 or height == 0) return null;
         // (rows 128 bytes apart where the 3D engine may draw into it)
-        const stride = std.mem.alignForward(u32, width * format.bytes(), if (e.graphics and format.renderable()) 128 else 4);
+        const stride = std.mem.alignForward(u32, width * format.bytes(), if (e.graphics and format.targetable()) 128 else 4);
         const m = e.allocBytes(@as(usize, stride) * height, shareable) orelse return null;
         return .{ .buf = m.buf, .width = width, .height = height, .stride = stride, .format = format, .own = true, .pooled = m.pooled };
     }
@@ -1908,7 +1948,7 @@ pub const Engine = struct {
         if (width == 0 or height == 0 or levels == 0 or levels > MAX_LEVELS) return null;
         var img = Image{ .width = width, .height = height, .format = format, .levels = @intCast(levels) };
         // (level 0 rows 128 bytes apart where the 3D engine may draw into it)
-        img.stride = std.mem.alignForward(u32, width * format.bytes(), if (e.graphics and format.renderable()) 128 else 4);
+        img.stride = std.mem.alignForward(u32, width * format.bytes(), if (e.graphics and format.targetable()) 128 else 4);
         var at: usize = 0;
         for (0..levels) |l| {
             img.level_at[l] = @intCast(at);
@@ -3038,6 +3078,12 @@ pub const Engine = struct {
         return true;
     }
 
+    fn floatTargetIn(d: *const raster.Draw) bool {
+        if (!d.color_off and d.color.format.floatTarget()) return true;
+        for (d.targets[1..]) |tt| if (tt) |x| if (x.img.format.floatTarget()) return true;
+        return false;
+    }
+
     /// Whether the draw's colour targets are of one layout, the ones in
     /// rows made block linear (promote) where another is block linear;
     /// false (said: the reason a rows image stays rows) when one cannot be.
@@ -3127,6 +3173,13 @@ pub const Engine = struct {
         // (made at the first draw: an engine that never draws has none)
         if (e.zero.buf.cpu.len == 0) e.zero = e.newBuffer(256) orelse return false;
         if (e.graphicsDraw(d)) |done| return done;
+        // (a float colour target: the compute raster writes 8-bit pixels,
+        // so the draw is not made, said and counted)
+        if (floatTargetIn(d)) {
+            e.stats.float_not_drawn += 1;
+            e.sayCompute("a float colour target off the 3D engine: not drawn (the compute raster writes 8-bit pixels)");
+            return true;
+        }
         const p = d.pipe;
         const v = d.variant();
         const kind = d.setupKind();
@@ -3522,7 +3575,18 @@ pub const Engine = struct {
             const depth: ?f32 = if (keep & 0x00ff_ffff != 0x00ff_ffff) @as(f32, @floatFromInt(value & 0x00ff_ffff)) / 16777215.0 else null;
             return e.fillDepth(img, rect, depth, @truncate(value >> 24), @truncate(~keep >> 24));
         }
-        e.fillPlane(img, rect, value, keep, img.*, 0);
+        e.fillPlane(img, rect, value, keep, img.*, 0, .{});
+    }
+
+    /// A clear of a float colour target (Format.floatTarget) to `words`,
+    /// its channels' bits (as many as its texel has 32-bit words): the
+    /// image filled as words, each texel's word i words[i].
+    pub fn fillWords(e: *Engine, img: *Image, rect: Rect, words: [4]u32) void {
+        const n = img.format.bytes() / 4;
+        if (n <= 1) return e.fill(img, rect, words[0], 0);
+        var plane = img.*;
+        plane.format = .r32f;
+        e.fillPlane(img, rect, words[0], 0, plane, 0, .{ .words = words, .n = n });
     }
 
     /// A depth clear of a depth-stencil image: `depth` (0..1) where not
@@ -3538,31 +3602,33 @@ pub const Engine = struct {
                 value |= unorm24(z);
                 written |= 0x00ff_ffff;
             }
-            return e.fillPlane(img, rect, value, ~written, img.*, 0);
+            return e.fillPlane(img, rect, value, ~written, img.*, 0, .{});
         }
-        if (depth) |z| e.fillPlane(img, rect, depthBits(z), 0, img.*, 0);
+        if (depth) |z| e.fillPlane(img, rect, depthBits(z), 0, img.*, 0, .{});
         if (smask != 0) {
             var s8 = img.*;
             s8.format = .r8;
             s8.stride = img.s8Pitch();
             s8.layout = img.s8Layout();
-            e.fillPlane(img, rect, stencil & smask, ~@as(u32, smask) & 0xff, s8, img.s8_at);
+            e.fillPlane(img, rect, stencil & smask, ~@as(u32, smask) & 0xff, s8, img.s8_at, .{});
         }
     }
 
     /// Pixels of `rect` of `plane` (img's memory as one plane of it: img
     /// itself, or a float depth image's S8 plane from byte `base`).
-    fn fillPlane(e: *Engine, img: *Image, rect: Rect, value: u32, keep: u32, plane: Image, base: u32) void {
+    /// `pat`: a texel of pat.n words (a float target's: fillWords), the
+    /// plane taken as words, word i of each texel pat.words[i].
+    fn fillPlane(e: *Engine, img: *Image, rect: Rect, value: u32, keep: u32, plane: Image, base: u32, pat: Pattern) void {
         const a0 = rect.meet(img.bounds());
         if (a0.empty() or keep == 0xffff_ffff) return;
         // (multisampled: every sample of the pixels, the row's samples side
-        // by side)
-        const ns = img.samples;
+        // by side; a texel of pat.n words: its words side by side)
+        const ns = img.samples * pat.n;
         const a = Rect{ .x0 = a0.x0 * ns, .y0 = a0.y0, .x1 = a0.x1 * ns, .y1 = a0.y1 };
         var flat = plane;
         flat.width *= ns;
         flat.samples = 1;
-        const op = CpuOp{ .fill = .{ .img = flat, .rect = a, .value = value & ~keep, .keep = keep, .base = base } };
+        const op = CpuOp{ .fill = .{ .img = flat, .rect = a, .value = value & ~keep, .keep = keep, .base = base, .pat = pat } };
         if (!e.gpuUsable(img)) {
             e.settle(img);
             return e.cpuDo(op);
@@ -3570,7 +3636,8 @@ pub const Engine = struct {
         // (memory rows: a top-down image's GL rows are flipped)
         const y0 = if (img.top_down) img.height - a.y1 else a.y0;
         const groups = [3]u32{ std.math.divCeil(u32, a.width(), GROUP) catch unreachable, a.height(), 1 };
-        const p = [_]u32{ a.x0, y0, a.width(), plane.stride, value & ~keep, keep, plane.format.bytes(), raster.colourBlWord(&plane), base };
+        const pw = if (pat.n > 1) pat.words else [4]u32{ value & ~keep, 0, 0, 0 };
+        const p = [_]u32{ a.x0, y0, a.width(), plane.stride, value & ~keep, keep, plane.format.bytes(), raster.colourBlWord(&plane), base, pat.n - 1, pw[0], pw[1], pw[2], pw[3] };
         const prog: Prog = if (keep == 0) .fill else .fill_masked;
         const regs = [_]Region{rowsOf(img, a.y0, a.y1)};
         const checking = e.checkFirst(prog, @as(u64, a.width()) * a.height(), &regs);
@@ -3717,6 +3784,12 @@ pub const Engine = struct {
                 const d = dst[j * dst_stride ..][0 .. @as(usize, w) * db];
                 for (0..w) |i| {
                     const at = blocklinear.addressCpu(img.stride, img.layout.gobs_log2, img.layout.swizzle, (x + @as(u32, @intCast(i))) * sb, row);
+                    // (8- and 16-byte texels, a float target's: as they
+                    // are, whole in their GOB's 16-byte run)
+                    if (sb > 4 and sb == db) {
+                        @memcpy(d[i * db ..][0..db], img.buf.cpu[at..][0..sb]);
+                        continue;
+                    }
                     const v = getPixel(img.buf.cpu[at..], sb) | set;
                     putPixel(d[i * db ..], db, if (swap) swapRB(v) else v);
                 }
@@ -3893,7 +3966,7 @@ pub const Engine = struct {
     /// the CPU takes its bytes as rows (hostView's callers: GL's texture
     /// re-specification, CopyImageSubData's CPU form, ...).
     fn rowsForCpu(e: *Engine, img: *Image) void {
-        if (img.layout.block and img.format.renderable() and img.share == null and !img.depth_float)
+        if (img.layout.block and img.format.targetable() and img.share == null and !img.depth_float)
             _ = e.toRows(img, "the CPU took its bytes as rows (a texture re-specified or copied by the CPU)");
     }
 
@@ -4077,7 +4150,7 @@ pub const Engine = struct {
                         while (xx < f.rect.x1) : (xx += 1) {
                             const at = f.base + blocklinear.addressCpu(img.stride, img.layout.gobs_log2, img.layout.swizzle, xx * bpp, img.rowOf(yy));
                             const px = img.buf.cpu[at..];
-                            putPixel(px, bpp, (getPixel(px, bpp) & f.keep) | f.value);
+                            putPixel(px, bpp, (getPixel(px, bpp) & f.keep) | f.pat.at(xx, f.value));
                         }
                     }
                     e.toDevice(img, 0, img.buf.cpu.len);
@@ -4092,7 +4165,7 @@ pub const Engine = struct {
                     if (img.gpuWrote()) e.fromDevice(img, off, len);
                     if (bpp == 4) {
                         const row = img.words()[off / 4 ..][0..f.rect.width()];
-                        for (row) |*p| p.* = (p.* & f.keep) | f.value;
+                        for (row, f.rect.x0..) |*p, xx| p.* = (p.* & f.keep) | f.pat.at(@intCast(xx), f.value);
                     } else {
                         const row = img.buf.cpu[off..][0..len];
                         for (0..f.rect.width()) |i| {
@@ -4121,6 +4194,12 @@ pub const Engine = struct {
                             const ii: u32 = @intCast(i);
                             const so = byteAt(&c.src, (c.sx + ii) * sb, sr);
                             const do_ = byteAt(&c.dst, (c.dx + ii) * db, dr);
+                            // (8- and 16-byte texels, a float target's: as
+                            // they are, whole in their GOB's 16-byte run)
+                            if (sb > 4 and sb == db) {
+                                @memcpy(c.dst.buf.cpu[do_..][0..db], c.src.buf.cpu[so..][0..sb]);
+                                continue;
+                            }
                             const v = getPixel(c.src.buf.cpu[so..], sb) | set;
                             putPixel(c.dst.buf.cpu[do_..], db, if (swap) swapRB(v) else v);
                         }

@@ -961,6 +961,9 @@ fn formatOf(f: gpu.Graphics.TargetFormat) gl3d.Format {
         .bgra8 => .bgra8,
         .r8 => .r8,
         .rg8 => .rg8,
+        .r32f => .r32f,
+        .rg32f => .rg32f,
+        .rgba32f => .rgba32f,
     };
 }
 

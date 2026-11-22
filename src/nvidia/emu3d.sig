@@ -87,7 +87,7 @@ const Target = struct {
 };
 
 /// A colour target's pixels: the renderer's three, and GL's RG8.
-const Fmt = enum { rgba8, bgra8, r8, rg8 };
+const Fmt = enum { rgba8, bgra8, r8, rg8, r32f, rg32f, rgba32f };
 
 const Clip = struct { x0: i64, y0: i64, x1: i64, y1: i64 };
 
@@ -269,6 +269,9 @@ pub const Engine = struct {
             0xd5 => .rgba8,
             0xf3 => .r8,
             0xea => .rg8,
+            0xe5 => .r32f,
+            0xcb => .rg32f,
+            0xc0 => .rgba32f,
             else => return g.refuse("a color target format the renderer does not use"),
         };
         try g.need(g.reg(a + 24) == 1 and g.reg(a + 28) == 0 and g.reg(a + 32) == 0, "the color target is not one layer");
@@ -1356,6 +1359,8 @@ fn pixelBytes(f: Fmt) u32 {
     return switch (f) {
         .r8 => 1,
         .rg8 => 2,
+        .rg32f => 8,
+        .rgba32f => 16,
         else => 4,
     };
 }
@@ -1366,12 +1371,36 @@ fn pixelBytes(f: Fmt) u32 {
 fn write(t: Target, x: u32, y: u32, src0: [4]f32, bl: ?Blend, mask: u4) void {
     const one: f32 = 1.0 / 255.0;
     const at = if (t.gobs) |n| blTexel(t.pitch, n, pixelBytes(t.format), x, y) else @as(usize, y) * t.pitch + @as(usize, x) * pixelBytes(t.format);
+    // (float channels, 32 bits each: the colour unclamped, blended in
+    // floats; the channels the format lacks not kept)
+    const floats: u32 = switch (t.format) {
+        .r32f => 1,
+        .rg32f => 2,
+        .rgba32f => 4,
+        else => 0,
+    };
+    if (floats != 0) {
+        var dst: [4]f32 = .{ 0, 0, 0, 1 };
+        for (0..floats) |ch| dst[ch] = @bitCast(std.mem.readInt(u32, t.bytes[at + 4 * ch ..][0..4], .little));
+        for (0..floats) |ch| {
+            if ((mask >> @intCast(ch)) & 1 == 0) continue;
+            const v = if (bl) |bx| blk: {
+                const base: usize = if (ch == 3) 3 else 0;
+                const fs = factor(bx.ops[base + 1], ch, src0, dst, bx.constant);
+                const fd = factor(bx.ops[base + 2], ch, src0, dst, bx.constant);
+                break :blk equation(bx.ops[base], src0[ch], fs, dst[ch], fd);
+            } else src0[ch];
+            std.mem.writeInt(u32, t.bytes[at + 4 * ch ..][0..4], @bitCast(v), .little);
+        }
+        return;
+    }
     // (where each of r, g, b, a is among the pixel's bytes; none: not kept)
     const order: [4]?u8 = switch (t.format) {
         .bgra8 => .{ 2, 1, 0, 3 },
         .rgba8 => .{ 0, 1, 2, 3 },
         .rg8 => .{ 0, 1, null, null },
         .r8 => .{ 0, null, null, null },
+        else => unreachable,
     };
     var src: [4]f32 = undefined;
     for (&src, src0) |*o, v| o.* = if (v != v) 0 else std.math.clamp(v, 0, 1);

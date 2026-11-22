@@ -72,7 +72,8 @@ const gr = @import("draw.sig");
 const Push = push.Push;
 const SUBCH = gr.SUBCH;
 
-pub const Format = enum(u8) { rgba8, bgra8, r8, rg8 };
+/// (the float ones 32 bits a channel: written unclamped, blended in floats)
+pub const Format = enum(u8) { rgba8, bgra8, r8, rg8, r32f, rg32f, rgba32f };
 
 /// SET_COLOR_TARGET_FORMAT's values.
 pub fn targetFormat(f: Format) u32 {
@@ -81,6 +82,9 @@ pub fn targetFormat(f: Format) u32 {
         .rgba8 => 0xd5, // A8B8G8R8
         .rg8 => 0xea, // R8G8
         .r8 => 0xf3,
+        .r32f => 0xe5, // RF32
+        .rg32f => 0xcb, // RF32_GF32
+        .rgba32f => 0xc0, // RF32_GF32_BF32_AF32
     };
 }
 
@@ -88,6 +92,8 @@ pub fn formatBytes(f: Format) u32 {
     return switch (f) {
         .r8 => 1,
         .rg8 => 2,
+        .rg32f => 8,
+        .rgba32f => 16,
         else => 4,
     };
 }
