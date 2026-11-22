@@ -126,17 +126,27 @@ pub fn videoNode(e: VideoEngine) u32 {
 }
 
 /// Their nodes on a host whose GPU's work Windows schedules in software
-/// (`legacy`): the RTX 2080 Ti's, NVIDIA's driver 576.28, where ffmpeg's
-/// h264_nvenc made the decoder's context (engine 0) on node 8 and the
-/// encoder's on node 5 (traced 2026-11-22); the same context data and
-/// submissions as 592's. (The host's node metadata query, which would name
-/// each node's engine, is not answered there.)
+/// (`legacy`): the RTX 2080 Ti's, NVIDIA's driver 576.28. Windows' GPU
+/// engine counters name its nodes: 0 3D, 1 Compute_0, 2 LegacyOverlay,
+/// 3 VideoDecode, 4-6 Copy, 7 Security, 8 and 9 VideoEncode, 10
+/// Graphics_1, 11 Cuda, 12 Compute_1, 13 VR, 14-17 Copy. ffmpeg's
+/// h264_nvenc made its encoder's context on node 8 and a copy context on
+/// node 5, with the context data and submissions zpm writes for 592
+/// (traced 2026-11-22). (The node metadata query, which would name each
+/// node's engine to a program, is not answered there.)
 pub fn videoNodeOn(e: VideoEngine, legacy: bool) u32 {
     if (!legacy) return videoNode(e);
     return switch (e) {
-        .decoder => 8,
-        .encoder => 5,
+        .decoder => 3,
+        .encoder => 8,
     };
+}
+
+/// The context data's engine word (0x20, low bits) on such a host: 0 for
+/// the encoder on node 8, as NVIDIA's driver gave it (1 on its copy
+/// context); 592's decoder's 0 for the decoder.
+pub fn videoEngineWordOn(e: VideoEngine, legacy: bool) u32 {
+    return if (legacy) 0 else @intFromEnum(e);
 }
 pub const VIDEO_SUBCH: u32 = 4;
 pub const VIDEO_CONTEXT_BYTES = 3569;
@@ -150,6 +160,13 @@ pub fn videoContext(b: *[VIDEO_CONTEXT_BYTES]u8, e: VideoEngine) void {
     put(b, 0x1c, 0x200);
     put(b, 0x20, 0x8000_0000 | @intFromEnum(e));
     @memset(b[0xdc1..0xdd9], 0xff);
+}
+
+/// The same on a host that schedules in software (`legacy`: the engine's
+/// word as there, videoEngineWordOn).
+pub fn videoContextOn(b: *[VIDEO_CONTEXT_BYTES]u8, e: VideoEngine, legacy: bool) void {
+    videoContext(b, e);
+    put(b, 0x20, 0x8000_0000 | videoEngineWordOn(e, legacy));
 }
 
 pub const VIDEO_SUBMIT_BYTES = 868;
@@ -360,9 +377,15 @@ test "the video contexts and submissions are h264_nvenc's on driver 576 (its dec
         for (want) |w| try testing.expectEqual(w[1], word(&b, w[0]));
         try testing.expectEqual(@as(usize, 15), nonzero);
     }
-    try testing.expectEqual(@as(u32, 8), videoNodeOn(.decoder, true));
-    try testing.expectEqual(@as(u32, 5), videoNodeOn(.encoder, true));
+    try testing.expectEqual(@as(u32, 3), videoNodeOn(.decoder, true));
+    try testing.expectEqual(@as(u32, 8), videoNodeOn(.encoder, true));
     try testing.expectEqual(@as(u32, 1), videoNodeOn(.decoder, false));
+    // (the encoder's context on node 8 as h264_nvenc made it: engine word 0)
+    var enc: [VIDEO_CONTEXT_BYTES]u8 = undefined;
+    videoContextOn(&enc, .encoder, true);
+    try testing.expectEqual(@as(u32, 0x8000_0000), word(&enc, 0x20));
+    videoContextOn(&enc, .encoder, false);
+    try testing.expectEqual(@as(u32, 0x8000_0001), word(&enc, 0x20));
     // the decoder's first submission: 32 dwords at 0xf_0002_8000
     var s: [VIDEO_SUBMIT_BYTES]u8 = undefined;
     videoSubmit(&s, 0xf_0002_8000, 32);

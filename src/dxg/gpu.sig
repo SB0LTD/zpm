@@ -673,11 +673,11 @@ pub const VideoChannel = struct {
 
     pub fn open(c: *VideoChannel, g: *Gpu, e: nv.VideoEngine) Error!void {
         c.* = .{ .gpu = g, .engine = e };
-        // (the context's data is the same on both hosts traced; its node is
-        // not: a legacy host's (576's) decoder is node 8, not 592's 1. A
-        // decoder context on node 1 there took its first submission for
-        // invalid, and the host refused every context after it)
-        nv.videoContext(&c.ctx_data, e);
+        // (a legacy host's (576's) nodes are its own: the decoder 3, the
+        // encoder 8, not 592's 1 and 5. A decoder context on node 1 there
+        // took its first submission for invalid, and the host refused every
+        // context after it)
+        nv.videoContextOn(&c.ctx_data, e, g.legacy);
         var cc = kmt.CreateContextVirtual{
             .device = g.device,
             .node_ordinal = nv.videoNodeOn(e, g.legacy),
