@@ -308,6 +308,9 @@ const Coded = struct {
     header_bytes: u32 = 0,
     /// what the picture was (encode.finish's rate control and filler)
     done: encode.Done = .{},
+    /// its reconstructed picture's surface (GALAXY_VA_NVENC_DUMP prints
+    /// it once the encode is done; NONE otherwise)
+    recon: u16 = NONE,
 };
 
 const Surface = struct {
@@ -1641,7 +1644,31 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 if (say_it) d.say("encode done: {s}", .{encode.reportLine(&line, cb.done, f.result)});
                 d.debug("encode done: {d} bytes ({d} of headers), {d} slices, average QP {d}{s}", .{ f.bytes, cb.header_bytes, f.result.slices, f.result.avg_qp, if (f.overflow) ", cut: the coded buffer is too small" else "" });
             }
+            if (cb.recon != NONE) d.dumpRecon(cb.done, cb.recon);
             return va.SUCCESS;
+        }
+
+        /// GALAXY_VA_NVENC_DUMP: the reconstructed picture the engine wrote
+        /// (its surface's buffer, as bytes: what the next picture reads as
+        /// its reference), 64 bytes a line; lines still as makeSurface
+        /// filled them (luma 16, chroma 128) and zero lines past the planes
+        /// left out. Past the planes too, to the buffer's end or 16 KiB.
+        fn dumpRecon(d: *Self, done: encode.Done, si: u16) void {
+            const s = &d.surfaces[si];
+            if (!s.used) return;
+            const b = s.tiled.bytes();
+            const planes: usize = @intCast(s.layout.bytes);
+            const chroma_at: usize = @intCast(s.layout.chroma_offset);
+            const end = @min(b.len, planes + (16 << 10));
+            d.say("dump {s} {d} recon: surface {d}, {d}x{d}, luma pitch {d}, chroma at 0x{x} pitch {d}, planes 0x{x}, buffer 0x{x}", .{ @tagName(done.kind), done.picture_index, si, s.width, s.height, s.layout.luma.pitch, chroma_at, s.layout.chroma.pitch, planes, b.len });
+            var at: usize = 0;
+            while (at + 64 <= end) : (at += 64) {
+                const r = b[at..][0..64];
+                const fill: u8 = if (at < chroma_at) 16 else if (at < planes) 128 else 0;
+                if (std.mem.allEqual(u8, r, fill)) continue;
+                const hex = std.fmt.bytesToHex(r.*, .lower);
+                d.say("dump {s} {d} recon {x:0>5}: {s}", .{ @tagName(done.kind), done.picture_index, at, &hex });
+            }
         }
 
         /// The encode reading surface `s`'s block-linear copy done.
@@ -2139,7 +2166,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 var line: [400]u8 = undefined;
                 d.say("{s}", .{encode.setupLine(&line, c.enc.kind, frame[setup_off..][0..nvenc.SETUP_BYTES])});
                 const t = d.opts.nvenc_try;
-                d.say("readings (GALAXY_VA_NVENC_TRY): hevc co-located {s}, co-located buffers {s}, av1 tiles at 0x{x}, av1 co-located {s}, setup at 0x{x} of its slot", .{ @tagName(t.hevc_coloc), if (t.coloc_apart) "apart (1 MiB aligned)" else "tight (after the history)", t.av1_tiles_at, if (t.av1_coloc) "bound" else "none", setup_off });
+                d.say("readings (GALAXY_VA_NVENC_TRY): hevc co-located {s}, co-located buffers {s}, av1 tiles at 0x{x}, av1 co-located {s}, setup at 0x{x} of its slot, h264 references {s}", .{ @tagName(t.hevc_coloc), if (t.coloc_apart) "apart (1 MiB aligned)" else "tight (after the history)", t.av1_tiles_at, if (t.av1_coloc) "bound" else "none", setup_off, if (t.h264_bl) "block linear" else "tiled 16x16" });
                 d.say("first picture's methods: {s}", .{encode.pushLine(&line, words(frame.ptr, ENC_PUSH_OFF, nvenc.PUSH_DWORDS_MAX)[0..out.dwords])});
             }
             if (d.opts.nvenc_dump and c.decodes < DUMP_PICTURES) {
@@ -2165,7 +2192,8 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 return if (e == error.NoEncoder) va.ERROR_UNIMPLEMENTED else va.ERROR_OPERATION_FAILED;
             };
             const kept = cb.buf;
-            cb.* = .{ .used = true, .buf = kept, .pending = true, .fence = fence, .ctx = ci, .header_bytes = out.header_bytes, .done = out.done };
+            const recon: u16 = if (d.opts.nvenc_dump and c.decodes < DUMP_PICTURES) (d.surfaceIndex(encode.reconSurface(&c.enc)) orelse NONE) else NONE;
+            cb.* = .{ .used = true, .buf = kept, .pending = true, .fence = fence, .ctx = ci, .header_bytes = out.header_bytes, .done = out.done, .recon = recon };
             s.enc_pending = true;
             s.enc_fence = fence;
             c.frame_fence[f] = fence;

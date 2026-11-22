@@ -589,6 +589,10 @@ pub const Try = struct {
     /// matches its source read so (luma b8, chroma b16) and not read as
     /// Turing's; only GB206's H.264 engine reads Turing's (driver.nvencInput)
     turing_all: bool = false,
+    /// H.264's reference and reconstructed pictures block linear, 2 GOBs a
+    /// block, as HEVC's and AV1's ("h264bl"); by default the engine's
+    /// tiled 16x16 (NVIDIA's Tegra driver's, grc)
+    h264_bl: bool = false,
 
     /// The words of `v` (others ignored).
     pub fn parse(v: []const u8) Try {
@@ -614,6 +618,7 @@ pub const Try = struct {
             if (std.ascii.eqlIgnoreCase(w, "hevcp3")) t.hevc_p3 = true;
             if (std.ascii.eqlIgnoreCase(w, "av1nofilter")) t.av1_nofilter = true;
             if (std.ascii.eqlIgnoreCase(w, "turingall")) t.turing_all = true;
+            if (std.ascii.eqlIgnoreCase(w, "h264bl")) t.h264_bl = true;
         }
         return t;
     }
@@ -851,6 +856,7 @@ pub fn end(st: *State, in: EndIn, out: *EndOut) va.Status {
                 .bitstream_room = room,
                 .history_bytes = @intCast(in.scratch.sizes.history),
                 .magic = in.magic,
+                .recon_bl = in.try_.h264_bl,
             });
             a.application_id = nvenc.APPLICATION_ID_H264;
             a.codec_type = nvenc.CODEC_TYPE_H264;

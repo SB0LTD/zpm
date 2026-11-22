@@ -286,6 +286,10 @@ pub const Setup = struct {
     bitstream_room: u32,
     history_bytes: u32,
     magic: u32 = nvenc.MAGIC,
+    /// the reference and reconstructed pictures block linear (2 GOBs a
+    /// block, the surfaces' own layout, as HEVC's and AV1's), not the
+    /// engine's tiled 16x16 (encode.Try.h264_bl)
+    recon_bl: bool = false,
 };
 
 /// The block height of the input picture's blocks: log2 of GOBs per
@@ -348,8 +352,13 @@ pub fn setup(buf: []u8, s: Setup) void {
     }
     // (offsets 0: each plane has its own address method, as NVK's
     // decoder setup leaves its offsets 0)
-    nvenc.set(buf, H.refpic_cfg_tiled_16x16, 1);
-    nvenc.set(buf, H.outputpic_cfg_tiled_16x16, 1);
+    if (s.recon_bl) {
+        nvenc.set(buf, H.refpic_cfg_block_height, nvenc.blockHeightField(INPUT_BLOCK_HEIGHT));
+        nvenc.set(buf, H.outputpic_cfg_block_height, nvenc.blockHeightField(INPUT_BLOCK_HEIGHT));
+    } else {
+        nvenc.set(buf, H.refpic_cfg_tiled_16x16, 1);
+        nvenc.set(buf, H.outputpic_cfg_tiled_16x16, 1);
+    }
     nvenc.set(buf, H.input_cfg_block_height, nvenc.blockHeightField(s.input.block_height));
     // sps_data, pps_data: what the parameter sets say
     nvenc.set(buf, H.profile_idc, profileIdc(s.profile));
