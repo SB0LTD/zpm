@@ -8,6 +8,7 @@ const engine = @import("../engine.sig");
 const raster = @import("../raster.sig");
 const texture = @import("../texture.sig");
 const gen = @import("gen.sig");
+const dxbc = @import("dxbc.sig");
 const fx = @import("fixtures.sig");
 
 const W = 32;
@@ -124,6 +125,163 @@ test "Direct3D: the vertex and pixel shaders draw color times tint" {
     uniforms(.{ 0.5, 1, 1, 1 }, &uni);
     const px = try drawOne(&fx.vs40, &fx.ps40, coverAll(.{ 1, 0.5, 0.25, 1 }), &uni, null);
     try near(px, .{ 128, 128, 64, 255 }, 1);
+}
+
+/// The triangle drawn with its COLOR attribute read as `color` says from
+/// `bytes` (the same bytes at each vertex, after its three f32 position);
+/// the middle pixel.
+fn drawColorAttr(color: raster.Attr, bytes: [8]u8) ![4]u8 {
+    const e = engineCpu();
+    var target = e.newImage(W, H, .rgba8) orelse return error.NoImage;
+    defer e.freeImage(&target);
+    e.fill(&target, target.bounds(), 0, 0);
+    const V = extern struct { pos: [3]f32, color: [8]u8 };
+    const pos = coverAll(.{ 0, 0, 0, 0 });
+    var verts: [3]V = undefined;
+    for (&verts, pos) |*v, p| v.* = .{ .pos = p.pos, .color = bytes };
+    var vb = e.newBuffer(@sizeOf([3]V)) orelse return error.NoBuffer;
+    defer e.freeImage(&vb);
+    e.writeBytes(&vb, 0, std.mem.asBytes(&verts));
+    var uni: [CB_WORDS]u32 = undefined;
+    uniforms(.{ 1, 1, 1, 1 }, &uni);
+    var log = gen.Log{};
+    const pair = gen.Pair{ .vs = &fx.vs40, .ps = &fx.ps40, .lay = lay, .log = &log };
+    var pipe = raster.Pipeline.init(pair.shaders(2, 4, 0));
+    defer e.unloadPipeline(&pipe);
+    var d = raster.Draw{ .pipe = &pipe, .color = &target, .count = 3, .center = .{ W / 2, H / 2 }, .half = .{ W / 2, H / 2 }, .rect = .{ .x0 = 0, .y0 = 0, .x1 = W, .y1 = H }, .uniforms = &uni };
+    d.attrs[0] = .{ .buf = &vb, .offset = 0, .stride = @sizeOf(V), .comps = 3 };
+    var ca = color;
+    ca.buf = &vb;
+    ca.offset = 12;
+    ca.stride = @sizeOf(V);
+    d.attrs[1] = ca;
+    if (!e.draw(&d)) return error.DrawRefused;
+    e.finish();
+    if (log.len != 0) return error.Generation;
+    var px: [W * H * 4]u8 = undefined;
+    e.read(&target, 0, 0, W, H, &px, W * 4, .rgba8);
+    const at = ((H / 2) * W + W / 2) * 4;
+    return px[at..][0..4].*;
+}
+
+test "Direct3D: vertex colours as halves, as B8G8R8A8 bytes, and as packed R10G10B10A2" {
+    // halves 1.0, 0.5, 0.25, 1.0 (0x3c00, 0x3800, 0x3400, 0x3c00)
+    const halves = [8]u8{ 0x00, 0x3c, 0x00, 0x38, 0x00, 0x34, 0x00, 0x3c };
+    try near(try drawColorAttr(.{ .comps = 4, .size = 2 }, halves), .{ 255, 128, 64, 255 }, 1);
+    // B, G, R, A bytes: R 255, G 128, B 64
+    const bgra = [8]u8{ 64, 128, 255, 255, 0, 0, 0, 0 };
+    try near(try drawColorAttr(.{ .comps = 4, .size = 1, .float = false, .normalized = true, .bgra = true }, bgra), .{ 255, 128, 64, 255 }, 1);
+    // R 1023, G 512, B 256 of 1023; A 3 of 3
+    const w: u32 = 1023 | 512 << 10 | 256 << 20 | 3 << 30;
+    var p: [8]u8 = @splat(0);
+    std.mem.writeInt(u32, p[0..4], w, .little);
+    try near(try drawColorAttr(.{ .comps = 4, .size = 1, .float = false, .normalized = true, .rgb10a2 = true }, p), .{ 255, 128, 64, 255 }, 1);
+}
+
+test "Direct3D: a draw with no pixel shader (dxbc.empty_pixel_shader) writes depth and no colour" {
+    const e = engineCpu();
+    var target = e.newImage(W, H, .rgba8) orelse return error.NoImage;
+    defer e.freeImage(&target);
+    e.fill(&target, target.bounds(), 0x11223344, 0);
+    var before: [4]u8 = undefined;
+    e.read(&target, W / 2, H / 2, 1, 1, &before, 4, .rgba8);
+    var zd = e.newImageSamples(W, H, .d24s8, 1) orelse return error.NoImage;
+    defer e.freeImage(&zd);
+    e.fillDepth(&zd, zd.bounds(), 1.0, 0, 0xff);
+    const verts = coverAll(.{ 1, 1, 1, 1 });
+    var vb = e.newBuffer(@sizeOf([3]Vert)) orelse return error.NoBuffer;
+    defer e.freeImage(&vb);
+    e.writeBytes(&vb, 0, std.mem.asBytes(&verts));
+    var uni: [CB_WORDS]u32 = undefined;
+    uniforms(.{ 1, 1, 1, 1 }, &uni);
+    var log = gen.Log{};
+    const pair = gen.Pair{ .vs = &fx.vs40, .ps = &dxbc.empty_pixel_shader, .lay = lay, .log = &log };
+    var pipe = raster.Pipeline.init(pair.shaders(2, 0, 0));
+    defer e.unloadPipeline(&pipe);
+    var d = raster.Draw{
+        .pipe = &pipe,
+        .color = &target,
+        .color_off = true,
+        .depth = &zd,
+        .depth_test = true,
+        .depth_write = true,
+        .count = 3,
+        .center = .{ W / 2, H / 2 },
+        .half = .{ W / 2, H / 2 },
+        .rect = .{ .x0 = 0, .y0 = 0, .x1 = W, .y1 = H },
+        .uniforms = &uni,
+    };
+    d.attrs[0] = .{ .buf = &vb, .offset = 0, .stride = @sizeOf(Vert), .comps = 3 };
+    d.attrs[1] = .{ .buf = &vb, .offset = 12, .stride = @sizeOf(Vert), .comps = 4 };
+    try std.testing.expect(e.draw(&d));
+    e.finish();
+    if (log.len != 0) {
+        std.debug.print("{s}\n", .{log.text()});
+        return error.Generation;
+    }
+    var z: [1]u32 = undefined;
+    e.readDepthBits(&zd, W / 2, H / 2, 1, 1, &z, null);
+    // (the triangle's z, nearer than the cleared 1.0)
+    try std.testing.expect(z[0] & 0xffffff < 0xffffff);
+    var px: [4]u8 = undefined;
+    e.read(&target, W / 2, H / 2, 1, 1, &px, 4, .rgba8);
+    try std.testing.expectEqual(before, px);
+}
+
+test "Direct3D: early returns inside an if and inside a loop (ps_early)" {
+    var uni: [CB_WORDS]u32 = undefined;
+    uniforms(.{ 1, 1, 1, 1 }, &uni);
+    // red past 0.75: the first return
+    try near(try drawOne(&fx.vs40, &fx.ps_early, coverAll(.{ 0.9, 0, 0, 1 }), &uni, null), .{ 255, 0, 0, 255 }, 1);
+    // the loop's return after 4 rounds: the colour times 0.5
+    try near(try drawOne(&fx.vs40, &fx.ps_early, coverAll(.{ 0.5, 0.5, 0.4, 1 }), &uni, null), .{ 64, 64, 51, 128 }, 1);
+    // no return taken: blue at the end
+    try near(try drawOne(&fx.vs40, &fx.ps_early, coverAll(.{ 0.5, 0.1, 1, 1 }), &uni, null), .{ 0, 0, 255, 255 }, 1);
+}
+
+fn sbufAt(_: ?*const anyopaque, n: u32) ?gen.Mem {
+    // (t1: the pipeline's buffer 0, its bytes and stride after cb0)
+    return if (n == 1) .{ .b = 0, .word = CB_WORDS } else null;
+}
+
+test "Direct3D: a pixel shader reads a structured buffer (t1) bound as the draw's buffer" {
+    const e = engineCpu();
+    var target = e.newImage(W, H, .rgba8) orelse return error.NoImage;
+    defer e.freeImage(&target);
+    e.fill(&target, target.bounds(), 0, 0);
+    const entries = [4][4]f32{ .{ 1, 0, 0, 1 }, .{ 0, 0.5, 1, 1 }, .{ 0, 1, 0, 1 }, .{ 1, 1, 1, 1 } };
+    var sb = e.newBuffer(@sizeOf(@TypeOf(entries))) orelse return error.NoBuffer;
+    defer e.freeImage(&sb);
+    e.writeBytes(&sb, 0, std.mem.asBytes(&entries));
+    const verts = coverAll(.{ 1.0 / 3.0, 0, 0, 1 });
+    var vb = e.newBuffer(@sizeOf([3]Vert)) orelse return error.NoBuffer;
+    defer e.freeImage(&vb);
+    e.writeBytes(&vb, 0, std.mem.asBytes(&verts));
+    var uni: [CB_WORDS + 2]u32 = undefined;
+    uniforms(.{ 1, 1, 1, 1 }, uni[0..CB_WORDS]);
+    uni[CB_WORDS] = @sizeOf(@TypeOf(entries));
+    uni[CB_WORDS + 1] = 16;
+    var l = lay;
+    l.tbuffer = sbufAt;
+    var log = gen.Log{};
+    const pair = gen.Pair{ .vs = &fx.vs40, .ps = &fx.ps_sbuf, .lay = l, .log = &log };
+    var sh = pair.shaders(2, 4, 0);
+    sh.buffers = 1;
+    var pipe = raster.Pipeline.init(sh);
+    defer e.unloadPipeline(&pipe);
+    var d = raster.Draw{ .pipe = &pipe, .color = &target, .count = 3, .center = .{ W / 2, H / 2 }, .half = .{ W / 2, H / 2 }, .rect = .{ .x0 = 0, .y0 = 0, .x1 = W, .y1 = H }, .uniforms = &uni };
+    d.attrs[0] = .{ .buf = &vb, .offset = 0, .stride = @sizeOf(Vert), .comps = 3 };
+    d.attrs[1] = .{ .buf = &vb, .offset = 12, .stride = @sizeOf(Vert), .comps = 4 };
+    d.buffers[0] = &sb;
+    try std.testing.expect(e.draw(&d));
+    e.finish();
+    if (log.len != 0) {
+        std.debug.print("{s}\n", .{log.text()});
+        return error.Generation;
+    }
+    var px: [4]u8 = undefined;
+    e.read(&target, W / 2, H / 2, 1, 1, &px, 4, .rgba8);
+    try near(px, .{ 0, 128, 255, 255 }, 1);
 }
 
 test "Direct3D: Shader Model 5's vertex shader too" {

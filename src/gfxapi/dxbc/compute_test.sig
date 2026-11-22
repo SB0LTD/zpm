@@ -246,3 +246,95 @@ test "compute: a texture sampled at a level into a typed buffer" {
         try std.testing.expectEqual(top * 0.5 + bot * 0.5, f32At(&out, (y * 4 + x) * 4 + c));
     };
 }
+
+test "compute: bit counts, first bits, bit reverse, halves, a bit field and a switch (cs_bits)" {
+    var in: [32 * 4]u8 align(16) = undefined;
+    var out: [32 * 32]u8 align(16) = undefined;
+    // (words with every case of the switch, 0, -1, a sign bit; the low
+    // half's exponent below 31: no half NaN or infinity)
+    const some = [_]u32{ 0, 0xffff_ffff, 0x8000_0000, 1, 2, 3, 0x1234_5678, 0x8765_4321, 0x7fff_ffff, 0x3c00, 0xbc00_3555, 0x0001_0000 };
+    for (0..32) |t| {
+        var w: u32 = if (t < some.len) some[t] else @truncate(@as(u64, t) * 0x9e37_79b1);
+        if (t >= some.len) w &= ~@as(u32, 0x4000);
+        putU32(&in, t, w);
+    }
+    @memset(&out, 0);
+    var uni = [4]u32{ in.len, 0, out.len, 0 };
+    var l = Lay{};
+    l.tbufs[0] = .{ .b = 1, .word = 0 };
+    l.uavs[0] = .{ .b = 2, .word = 2 };
+    try run(&fx.cs_bits, &l, &.{ std.mem.sliceAsBytes(&uni), &in, &out }, .{ 1, 1, 1 });
+    for (0..32) |t| {
+        const x = u32At(&in, t);
+        const sx: i32 = @bitCast(x);
+        const sw: u32 = switch (x & 3) {
+            0 => 10,
+            1, 2 => 20 + (x & 3),
+            else => 99,
+        };
+        const bf = (x & ~@as(u32, 0xff0)) | ((sw << 4) & 0xff0);
+        const hi: u32 = if (x == 0) 0xffff_ffff else 31 - @as(u32, @clz(x));
+        const lo: u32 = if (x == 0) 0xffff_ffff else @ctz(x);
+        const shi: u32 = if (sx == 0 or sx == -1) 0xffff_ffff else 31 - @as(u32, @clz(if (sx < 0) ~x else x));
+        const h: f16 = @floatCast(@as(f32, @bitCast(x & 0x3fff_ffff)));
+        const back: f32 = @floatCast(@as(f16, @bitCast(@as(u16, @truncate(x)))));
+        const want = [8]u32{ @popCount(x), hi, lo, @bitReverse(x), @as(u16, @bitCast(h)), @bitCast(back), shi, sw + bf };
+        for (want, 0..) |wv, c| {
+            const got = u32At(&out, t * 8 + c);
+            // (a half NaN widened: any NaN, as Direct3D allows)
+            if (c == 5 and std.math.isNan(back) and std.math.isNan(@as(f32, @bitCast(got)))) continue;
+            if (got != wv) {
+                std.debug.print("cs_bits thread {d} (x {x}) word {d}: got {x}, want {x}\n", .{ t, x, c, got, wv });
+                return error.TestExpectedEqual;
+            }
+        }
+    }
+}
+
+test "compute: a local array indexed at run time (an indexable temp, cs_xarr)" {
+    var out: [16 * 4]u8 align(16) = undefined;
+    @memset(&out, 0);
+    var uni = [2]u32{ out.len, 0 };
+    var l = Lay{};
+    l.uavs[0] = .{ .b = 1, .word = 0 };
+    try run(&fx.cs_xarr, &l, &.{ std.mem.sliceAsBytes(&uni), &out }, .{ 1, 1, 1 });
+    for (0..16) |t_| {
+        const t: u32 = @intCast(t_);
+        var a: [8]u32 = undefined;
+        for (&a, 0..) |*e, i| e.* = @as(u32, @intCast(i * i)) + t;
+        a[t & 7] += 100;
+        try std.testing.expectEqual(a[(t * 3) & 7] + a[t & 7], u32At(&out, t));
+    }
+}
+
+test "compute: Gather (red, and green with an offset) from a 4x4 texture (cs_gather)" {
+    var tex: [4 * 4 * 16]u8 align(16) = undefined;
+    for (0..4 * 4 * 4) |i| putF32(&tex, i, @floatFromInt((i * 7) % 13));
+    var out: [32 * 16]u8 align(16) = undefined;
+    @memset(&out, 0);
+    var uni: [2 * D]u32 = undefined;
+    var ti = image(&tex, 4, 4, .rgba32f);
+    texture.descriptor(.{ .img = &ti, .linear = true, .min_linear = true, .wrap_s = .clamp, .wrap_t = .clamp }, uni[0..D]);
+    var oi = image(&out, 32, 1, .rgba32f);
+    texture.descriptor(.{ .img = &oi }, uni[D..][0..D]);
+    var l = Lay{ .textures = 1 };
+    l.uavs[0] = .{ .b = 2, .word = D };
+    try run(&fx.cs_gather, &l, &.{ std.mem.sliceAsBytes(&uni), &tex, &out }, .{ 1, 1, 1 });
+    const at = struct {
+        fn f_(b: []const u8, xx: i32, yy: i32, ch: usize) f32 {
+            const cx: usize = @intCast(std.math.clamp(xx, 0, 3));
+            const cy: usize = @intCast(std.math.clamp(yy, 0, 3));
+            return f32At(b, (cy * 4 + cx) * 4 + ch);
+        }
+    }.f_;
+    for (0..4) |y_| for (0..4) |x_| {
+        const x: i32 = @intCast(x_);
+        const y: i32 = @intCast(y_);
+        const n = (y_ * 4 + x_) * 2;
+        // (x0, y1), (x1, y1), (x1, y0), (x0, y0)
+        for ([2]usize{ 0, 1 }, [2]i32{ 0, -1 }) |ch, dx| {
+            const want = [4]f32{ at(&tex, x + dx, y + 1, ch), at(&tex, x + dx + 1, y + 1, ch), at(&tex, x + dx + 1, y, ch), at(&tex, x + dx, y, ch) };
+            for (want, 0..) |w, c| try std.testing.expectEqual(w, f32At(&out, (n + ch) * 4 + c));
+        }
+    };
+}

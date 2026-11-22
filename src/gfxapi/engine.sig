@@ -242,6 +242,13 @@ pub const Image = struct {
     /// takes rows alone met it): never made block linear again, so no
     /// image goes back and forth between layouts.
     no_block: bool = false,
+    /// The memory holds more than this image's one plane: a layered
+    /// texture's other layers (an array's slices, a cube's faces, a
+    /// volume's depth) after the first, drawn into as the first layer.
+    /// Never moved between layouts: promote and toRows copy one plane,
+    /// and the layers past it would be lost (their memory freed while
+    /// views, samplers and copies still reach past the new one's end).
+    layered: bool = false,
     /// Block-compressed (bc.Kind + 1: 1 BC1, 2 BC2, 3 BC3, 4 BC4, 5 BC4
     /// signed, 6 BC5, 7 BC5 signed; 0 none): the memory holds the 4x4
     /// blocks themselves, each level's rows of blocks one after another
@@ -1802,6 +1809,7 @@ pub const Engine = struct {
         if (!img.format.targetable() or e.blockSwizzle(img.format) == null) return pre ++ "a format with no block-linear GOBs here (only RGBA8, BGRA8, the float targets, and on Blackwell R8 and RG8)";
         if (img.no_block) return pre ++ "moved back to rows for good (an op that takes rows alone was done on it)";
         if (img.levels != 1) return pre ++ "an image with mipmap levels";
+        if (img.layered) return pre ++ "a layered texture (its other layers share the memory)";
         if (img.samples != 1) return pre ++ "multisampled";
         if (img.pooled) return pre ++ "in the pool (not GPU memory of its own)";
         if (img.depth_float or !img.layout.linear()) return pre ++ "a depth image, or already another layout";
@@ -1848,7 +1856,7 @@ pub const Engine = struct {
         if (!img.layout.block or !img.format.targetable() or img.depth_float) return true;
         // (memory others name too: an imported block-linear dma-buf; its
         // readers take its layout from the modifier)
-        if (img.share != null) return false;
+        if (img.share != null or img.layered) return false;
         var rows = e.allocImage(img.width, img.height, img.format, true) orelse return false;
         e.fromVram(img);
         rows.top_down = img.top_down;

@@ -384,6 +384,29 @@ pub fn compute(blob: []const u8, lay: Layout, k: *kir.Kernel, uni: u8, texb: u8,
 
 // ── The generator ──────────────────────────────────────────────────────────
 
+const MAX_FLOW = 32;
+/// indexable temps: arrays, and their components in all (registers)
+const MAX_XARRAYS = 16;
+const MAX_XREGS = 512;
+
+/// A loop, or a switch: a loop once round (so its cases' `break` leaves
+/// it), each run of case labels an if on its selector, `default` taken
+/// when no label matches; a `continue` inside it leaves it with `cont`
+/// set, the enclosing loop continued after it.
+const Flow = struct {
+    sw: bool,
+    val: V = .none,
+    /// any of the switch's labels matched (a pred)
+    any: V = .none,
+    /// the labels read since the last body (a pred), and a `default` among them
+    pending: V = .none,
+    default: bool = false,
+    /// a case's body is open (its if)
+    open: bool = false,
+    cont: V = .none,
+    cont_used: bool = false,
+};
+
 const Gen = struct {
     k: *kir.Kernel,
     lay: Layout,
@@ -425,6 +448,21 @@ const Gen = struct {
     res_buf: [128]Buf,
     res_stride: [128]u32,
     tgsm: [MAX_TGSM]Tgsm,
+    /// the reader `run` steps (a switch reads ahead for its labels)
+    rd: ?*dxbc.Reader = null,
+    /// loops and switches, innermost last: what break and continue leave
+    flow: [MAX_FLOW]Flow = undefined,
+    nflow: u32 = 0,
+    /// indexable temps (x#[n]): each array's first register in `xregs`
+    /// (4 an entry) and its entries; a relative index a select chain
+    xat: [MAX_XARRAYS]u32 = @splat(0),
+    xlen: [MAX_XARRAYS]u32 = @splat(0),
+    xregs: [MAX_XREGS]V = undefined,
+    nxregs: u32 = 0,
+    /// a vertex or pixel shader that returns early: its body inside a
+    /// once-round loop, `done` set where it returns and every loop and
+    /// switch left after it while set (its outputs are taken at the end)
+    done: V = .none,
 
     fn begin(g: *Gen, blob: []const u8, lay: Layout, k: *kir.Kernel, log: *Log, want: dxbc.Stage, uni: u8, texb: u8) bool {
         g.* = .{
@@ -477,6 +515,14 @@ const Gen = struct {
 
     fn run(g: *Gen) void {
         var rd = g.prog.reader();
+        g.rd = &rd;
+        const k = g.k;
+        const wrap = g.stage != .compute and returnsEarly(g.prog);
+        if (wrap) {
+            g.done = k.reg(.u32);
+            k.set(g.done, .mov, u(0), no, no);
+            k.loop();
+        }
         while (true) {
             const one = rd.next() catch {
                 _ = g.fail("a damaged instruction", .{});
@@ -486,6 +532,39 @@ const Gen = struct {
             if (g.failed) return;
         }
         if (g.depth != 0) _ = g.fail("unbalanced flow", .{});
+        if (wrap) {
+            k.brk(u(1));
+            k.endloop();
+        }
+    }
+
+    /// A ret inside flow, or a retc.
+    fn returnsEarly(p: dxbc.Program) bool {
+        var rd = p.reader();
+        var depth: u32 = 0;
+        while (rd.next() catch return false) |i| switch (i.op) {
+            .@"if", .loop, .@"switch" => depth += 1,
+            .endif, .endloop, .endswitch => depth -|= 1,
+            .retc => return true,
+            .ret => if (depth != 0) return true,
+            else => {},
+        };
+        return false;
+    }
+
+    /// An early return (c: where it is taken): `done` set, the innermost
+    /// loop (the body's own, at worst) left.
+    fn returnIf(g: *Gen, c: Arg) void {
+        const k = g.k;
+        k.set(g.done, .sel, u(1), r(g.done), c);
+        k.brk(c);
+    }
+
+    /// After a loop or switch inside an early-returning body: left too
+    /// when the return was taken inside it.
+    fn leaveIfDone(g: *Gen) void {
+        if (g.done == .none) return;
+        g.k.brk(r(g.k.cmp(.u32, .ne, r(g.done), u(0))));
     }
 
     // ── Declarations ──
@@ -527,7 +606,23 @@ const Gen = struct {
             .customdata => if (i.nonzero) {
                 g.icb = i.data;
             },
-            .dcl_indexable_temp => _ = g.fail("indexable temps (x#[]) not yet", .{}),
+            .dcl_indexable_temp => {
+                // (the array's number, its entries, the components each)
+                const xn = if (i.raw.len > 1) i.raw[1] else 0;
+                const len = if (i.raw.len > 2) i.raw[2] else 0;
+                if (xn >= MAX_XARRAYS or g.nxregs + len * 4 > MAX_XREGS) {
+                    _ = g.fail("indexable temp x{d}[{d}]: past {d} arrays or {d} components in all", .{ xn, len, MAX_XARRAYS, MAX_XREGS });
+                    return;
+                }
+                g.xat[xn] = g.nxregs;
+                g.xlen[xn] = len;
+                for (0..len * 4) |j| {
+                    const v = k.reg(.u32);
+                    k.set(v, .mov, u(0), no, no);
+                    g.xregs[g.nxregs + j] = v;
+                }
+                g.nxregs += len * 4;
+            },
             .dcl_resource => {
                 // (bits 11-15: the dimension: 1 a buffer, 2 1D, 3 2D, 5 3D,
                 // 6 cube, 7 1D array, 8 2D array; then a return type per
@@ -679,6 +774,24 @@ const Gen = struct {
             },
             .input_thread_id, .input_thread_group_id, .input_thread_id_in_group, .input_thread_id_in_group_flattened => return g.threadId(o.reg, sc),
             .immediate32 => return u(if (o.comps == 1) o.imm[0] else o.imm[c]),
+            .indexable_temp => {
+                const xn = o.index[0].imm;
+                if (xn >= MAX_XARRAYS or g.xlen[xn] == 0) {
+                    _ = g.fail("x{d} read but not declared", .{xn});
+                    return u(0);
+                }
+                const ix = o.index[1];
+                const base = g.xat[xn];
+                if (!ix.rel) return if (ix.imm < g.xlen[xn]) r(g.xregs[base + ix.imm * 4 + sc]) else u(0);
+                // (an index past the array reads 0)
+                const at = g.k.op2(.iadd, .u32, g.relValue(ix), u(ix.imm));
+                var acc: Arg = u(0);
+                for (0..g.xlen[xn]) |e| {
+                    const hit = g.k.cmp(.u32, .eq, r(at), u(@intCast(e)));
+                    acc = r(g.k.sel(.u32, r(hit), r(g.xregs[base + e * 4 + sc]), acc));
+                }
+                return acc;
+            },
             .constant_buffer => return g.cbuf(o, sc),
             .immediate_constant_buffer => return g.icbRead(o, sc),
             else => {
@@ -784,6 +897,14 @@ const Gen = struct {
                 }
                 return g.outs[n][c];
             },
+            .indexable_temp => {
+                const xn = o.index[0].imm;
+                if (xn >= MAX_XARRAYS or o.index[1].imm >= g.xlen[xn]) {
+                    _ = g.fail("x{d}[{d}] written but not declared", .{ xn, o.index[1].imm });
+                    return .none;
+                }
+                return g.xregs[g.xat[xn] + o.index[1].imm * 4 + c];
+            },
             .output_depth, .output_depth_greater_equal, .output_depth_less_equal => {
                 if (c != 0) return .none;
                 if (g.depth_out == .none) {
@@ -804,9 +925,31 @@ const Gen = struct {
     /// clamped to [0, 1] when the instruction saturates.
     fn write(g: *Gen, o: *const dxbc.Operand, vals: [4]?Arg, sat: bool) void {
         const k = g.k;
+        // (x#[relative]: every entry, the one the index names changed)
+        var at: V = .none;
+        if (o.reg == .indexable_temp and o.index[1].rel) at = k.op2(.iadd, .u32, g.relValue(o.index[1]), u(o.index[1].imm));
         for (0..4) |c_| {
             const c: u2 = @intCast(c_);
             const v = vals[c] orelse continue;
+            if (at != .none) {
+                if (o.mask & (@as(u4, 1) << c) == 0) continue;
+                const xn = o.index[0].imm;
+                if (xn >= MAX_XARRAYS or g.xlen[xn] == 0) {
+                    _ = g.fail("x{d} written but not declared", .{xn});
+                    return;
+                }
+                var x = v;
+                if (sat) {
+                    const fx = if (x == .reg) r(k.mov(.f32, x)) else x;
+                    x = r(k.op2(.fmin, .f32, r(k.op2(.fmax, .f32, fx, f(0))), f(1)));
+                }
+                const xv = k.mov(.u32, x);
+                for (0..g.xlen[xn]) |e| {
+                    const reg = g.xregs[g.xat[xn] + e * 4 + c];
+                    k.set(reg, .sel, r(xv), r(reg), r(k.cmp(.u32, .eq, r(at), u(@intCast(e)))));
+                }
+                continue;
+            }
             const d = g.dstReg(o, c);
             if (d == .none) continue;
             var x = v;
@@ -831,8 +974,42 @@ const Gen = struct {
         if (op == .customdata or (n >= @intFromEnum(dxbc.Op.dcl_resource) and n <= @intFromEnum(dxbc.Op.dcl_global_flags)) or
             (n >= @intFromEnum(dxbc.Op.dcl_thread_group) and n <= @intFromEnum(dxbc.Op.dcl_resource_structured))) return g.declare(i);
         const sat = i.saturate;
+        // (a switch's labels read, its body not yet open: opened here)
+        if (g.nflow != 0 and op != .case and op != .default and op != .endswitch) {
+            const fl = &g.flow[g.nflow - 1];
+            if (fl.sw and (fl.pending != .none or fl.default)) {
+                var c = fl.pending;
+                if (fl.default) {
+                    const none = k.op1(.pnot, .pred, r(fl.any));
+                    c = if (c == .none) none else k.op2(.por, .pred, r(c), r(none));
+                }
+                k.ifp(r(c));
+                fl.open = true;
+                fl.pending = .none;
+                fl.default = false;
+            }
+        }
         switch (op) {
             .nop, .label => {},
+            .@"switch" => g.switchBegin(i),
+            .case, .default => {
+                if (g.nflow == 0 or !g.flow[g.nflow - 1].sw) {
+                    _ = g.fail("a case outside a switch", .{});
+                    return;
+                }
+                const fl = &g.flow[g.nflow - 1];
+                if (fl.open) {
+                    k.endif();
+                    fl.open = false;
+                }
+                if (op == .default) {
+                    fl.default = true;
+                } else {
+                    const m = k.cmp(.u32, .eq, r(fl.val), u(i.operands[0].imm[0]));
+                    fl.pending = if (fl.pending == .none) m else k.op2(.por, .pred, r(fl.pending), r(m));
+                }
+            },
+            .endswitch => g.switchEnd(),
             // float ops, componentwise
             .add, .mul, .div, .min, .max, .mad, .mov, .frc, .round_ne, .round_ni, .round_pi, .round_z, .exp, .log, .rsq, .sqrt, .rcp, .eq, .ne, .lt, .ge => {
                 const d = &i.operands[0];
@@ -886,7 +1063,7 @@ const Gen = struct {
                 g.write(&i.operands[1], vc, sat);
             },
             // integer ops, componentwise
-            .iadd, .@"and", .@"or", .xor, .not, .ishl, .ishr, .ushr, .imin, .imax, .umin, .umax, .ineg, .ieq, .ine, .ilt, .ige, .ult, .uge, .imad, .umad, .ftoi, .ftou, .itof, .utof, .ubfe, .ibfe => {
+            .iadd, .@"and", .@"or", .xor, .not, .ishl, .ishr, .ushr, .imin, .imax, .umin, .umax, .ineg, .ieq, .ine, .ilt, .ige, .ult, .uge, .imad, .umad, .ftoi, .ftou, .itof, .utof, .ubfe, .ibfe, .bfi, .bfrev, .countbits, .firstbit_hi, .firstbit_lo, .firstbit_shi, .f32tof16, .f16tof32 => {
                 const d = &i.operands[0];
                 var vals: [4]?Arg = .{ null, null, null, null };
                 for (0..4) |c_| {
@@ -910,6 +1087,38 @@ const Gen = struct {
                 }
                 g.write(&i.operands[0], hi, false);
                 g.write(&i.operands[1], lo, false);
+            },
+            .uaddc, .usubb => {
+                // dst0: the sum (difference), dst1: the carry (borrow), 1 or 0
+                var v0: [4]?Arg = .{ null, null, null, null };
+                var v1: [4]?Arg = .{ null, null, null, null };
+                for (0..4) |c_| {
+                    const c: u2 = @intCast(c_);
+                    const a = g.isrc(&i.operands[2], c, .u32);
+                    const b = g.isrc(&i.operands[3], c, .u32);
+                    const res = k.op2(if (op == .uaddc) .iadd else .isub, .u32, a, b);
+                    // (a carry: the sum below an addend; a borrow: a below b)
+                    const flag = if (op == .uaddc) k.cmp(.u32, .lt, r(res), a) else k.cmp(.u32, .lt, a, b);
+                    if (masked(&i.operands[0], c)) v0[c] = r(res);
+                    if (masked(&i.operands[1], c)) v1[c] = r(k.sel(.u32, r(flag), u(1), u(0)));
+                }
+                g.write(&i.operands[0], v0, false);
+                g.write(&i.operands[1], v1, false);
+            },
+            .swapc => {
+                // dst0 = cond ? src2 : src1, dst1 = cond ? src1 : src2
+                var v0: [4]?Arg = .{ null, null, null, null };
+                var v1: [4]?Arg = .{ null, null, null, null };
+                for (0..4) |c_| {
+                    const c: u2 = @intCast(c_);
+                    const which = k.cmp(.u32, .ne, g.isrc(&i.operands[2], c, .u32), u(0));
+                    const a = g.isrc(&i.operands[3], c, .u32);
+                    const b = g.isrc(&i.operands[4], c, .u32);
+                    if (masked(&i.operands[0], c)) v0[c] = r(k.sel(.u32, r(which), b, a));
+                    if (masked(&i.operands[1], c)) v1[c] = r(k.sel(.u32, r(which), a, b));
+                }
+                g.write(&i.operands[0], v0, false);
+                g.write(&i.operands[1], v1, false);
             },
             .udiv => {
                 // dst0: the quotient, dst1: the remainder
@@ -938,23 +1147,40 @@ const Gen = struct {
             .loop => {
                 k.loop();
                 g.depth += 1;
+                if (g.nflow == MAX_FLOW) {
+                    _ = g.fail("flow nested past {d}", .{MAX_FLOW});
+                    return;
+                }
+                g.flow[g.nflow] = .{ .sw = false };
+                g.nflow += 1;
             },
             .endloop => {
                 k.endloop();
                 g.depth -|= 1;
+                g.nflow -|= 1;
+                g.leaveIfDone();
             },
             .@"break" => k.brk(u(1)),
             .breakc => k.brk(g.cond(&i.operands[0], i.nonzero)),
-            .@"continue" => k.cont(u(1)),
-            .continuec => k.cont(g.cond(&i.operands[0], i.nonzero)),
+            .@"continue" => g.continueIf(u(1)),
+            .continuec => g.continueIf(g.cond(&i.operands[0], i.nonzero)),
             .discard => {
                 const p = g.cond(&i.operands[0], i.nonzero);
                 if (g.discard != .none) k.set(g.discard, .por, r(g.discard), p, no);
             },
             .ret => if (g.depth != 0) {
                 // (a compute shader's lanes leave where they return; the
-                // other stages' outputs are taken at the end)
-                if (g.stage == .compute) k.ret() else _ = g.fail("a return inside flow (an early return) not yet", .{});
+                // other stages' outputs are taken at the end: the body
+                // left, `done` set)
+                if (g.stage == .compute) k.ret() else g.returnIf(u(1));
+            },
+            .retc => {
+                const c = g.cond(&i.operands[0], i.nonzero);
+                if (g.stage == .compute) {
+                    k.ifp(c);
+                    k.ret();
+                    k.endif();
+                } else g.returnIf(c);
             },
             .deriv_rtx, .deriv_rty, .deriv_rtx_coarse, .deriv_rtx_fine, .deriv_rty_coarse, .deriv_rty_fine => {
                 const up = op == .deriv_rty or op == .deriv_rty_coarse or op == .deriv_rty_fine;
@@ -967,6 +1193,7 @@ const Gen = struct {
                 g.write(d, vals, sat);
             },
             .sample, .sample_l, .sample_b, .sample_d, .sample_c, .sample_c_lz => g.sample(i),
+            .gather4, .gather4_c => g.gather(i),
             .ld => g.ld(i),
             .resinfo => g.resinfo(i),
             .ld_uav_typed => g.ldUav(i),
@@ -980,6 +1207,71 @@ const Gen = struct {
             .sync => if (i.raw[0] & 0x800 != 0) k.barrier(),
             else => _ = g.fail("instruction {s} not yet", .{@tagName(op)}),
         }
+    }
+
+    /// switch: its selector kept, its labels read ahead (to its endswitch,
+    /// nested switches' left out) for `default`, the once-round loop
+    /// opened.
+    fn switchBegin(g: *Gen, i: *const dxbc.Inst) void {
+        const k = g.k;
+        if (g.nflow == MAX_FLOW) {
+            _ = g.fail("flow nested past {d}", .{MAX_FLOW});
+            return;
+        }
+        const val = k.mov(.u32, g.isrc(&i.operands[0], 0, .u32));
+        var any: V = k.cmp(.u32, .ne, r(val), r(val));
+        if (g.rd) |live| {
+            var ahead = live.*;
+            var nest: u32 = 0;
+            while (ahead.next() catch null) |j| switch (j.op) {
+                .@"switch" => nest += 1,
+                .endswitch => {
+                    if (nest == 0) break;
+                    nest -= 1;
+                },
+                .case => if (nest == 0) {
+                    any = k.op2(.por, .pred, r(any), r(k.cmp(.u32, .eq, r(val), u(j.operands[0].imm[0]))));
+                },
+                else => {},
+            };
+        }
+        const cont = k.reg(.u32);
+        k.set(cont, .mov, u(0), no, no);
+        k.loop();
+        g.depth += 1;
+        g.flow[g.nflow] = .{ .sw = true, .val = val, .any = any, .cont = cont };
+        g.nflow += 1;
+    }
+
+    /// endswitch: the last body closed, the once-round loop left; a
+    /// `continue` taken inside it continues the enclosing loop (or leaves
+    /// an enclosing switch with its own flag set).
+    fn switchEnd(g: *Gen) void {
+        const k = g.k;
+        if (g.nflow == 0 or !g.flow[g.nflow - 1].sw) {
+            _ = g.fail("an endswitch with no switch", .{});
+            return;
+        }
+        const fl = g.flow[g.nflow - 1];
+        if (fl.open) k.endif();
+        k.brk(u(1));
+        k.endloop();
+        g.depth -|= 1;
+        g.nflow -= 1;
+        if (fl.cont_used) g.continueIf(r(k.cmp(.u32, .ne, r(fl.cont), u(0))));
+        g.leaveIfDone();
+    }
+
+    /// continue(c): the innermost loop's; out of a switch first (its flag
+    /// set, the switch left).
+    fn continueIf(g: *Gen, c: Arg) void {
+        const k = g.k;
+        if (g.nflow != 0 and g.flow[g.nflow - 1].sw) {
+            const fl = &g.flow[g.nflow - 1];
+            k.set(fl.cont, .sel, u(1), r(fl.cont), c);
+            fl.cont_used = true;
+            k.brk(c);
+        } else k.cont(c);
     }
 
     fn isCompare(op: dxbc.Op) bool {
@@ -1064,8 +1356,66 @@ const Gen = struct {
             // bit fields: width (low 5 bits), offset, value
             .ubfe => r(k.op3(.bfe, .u32, g.isrc(&s[2], c, .u32), r(k.op2(.@"and", .u32, g.isrc(&s[1], c, .u32), u(31))), r(k.op2(.@"and", .u32, g.isrc(&s[0], c, .u32), u(31))))),
             .ibfe => r(k.mov(.u32, r(k.op3(.bfe, .i32, g.isrc(&s[2], c, .i32), r(k.mov(.i32, r(k.op2(.@"and", .u32, g.isrc(&s[1], c, .u32), u(31))))), r(k.mov(.i32, r(k.op2(.@"and", .u32, g.isrc(&s[0], c, .u32), u(31))))))))),
+            // bfi width, offset, insert, base: mask = ((1 << width) - 1) <<
+            // offset (each the low 5 bits); (insert << offset) & mask |
+            // base & ~mask
+            .bfi => blk: {
+                const w = k.op2(.@"and", .u32, g.isrc(&s[0], c, .u32), u(31));
+                const o = k.op2(.@"and", .u32, g.isrc(&s[1], c, .u32), u(31));
+                const ones = k.op2(.isub, .u32, r(k.op2(.shl, .u32, u(1), r(w))), u(1));
+                const mask = k.op2(.shl, .u32, r(ones), r(o));
+                const ins = k.op2(.@"and", .u32, r(k.op2(.shl, .u32, g.isrc(&s[2], c, .u32), r(o))), r(mask));
+                const keep = k.op2(.@"and", .u32, g.isrc(&s[3], c, .u32), r(k.op1(.not, .u32, r(mask))));
+                break :blk r(k.op2(.@"or", .u32, r(ins), r(keep)));
+            },
+            .bfrev => r(bitReverse(k, g.isrc(&s[0], c, .u32))),
+            .countbits => r(popCount(k, g.isrc(&s[0], c, .u32))),
+            // the lowest set bit's index; none: 0xffffffff
+            .firstbit_lo => blk: {
+                const x = g.isrc(&s[0], c, .u32);
+                const low = k.op2(.@"and", .u32, x, r(k.op1(.ineg, .u32, x)));
+                const n = popCount(k, r(k.op2(.isub, .u32, r(low), u(1))));
+                break :blk r(k.sel(.u32, r(k.cmp(.u32, .eq, x, u(0))), u(0xffff_ffff), r(n)));
+            },
+            // the highest set bit counted from the top (bit 31: 0); for
+            // shi a negative value's highest clear bit; none: 0xffffffff
+            .firstbit_hi, .firstbit_shi => blk: {
+                var x = g.isrc(&s[0], c, .u32);
+                if (op == .firstbit_shi) {
+                    const neg = k.cmp(.i32, .lt, r(k.mov(.i32, x)), r(k.mov(.i32, u(0))));
+                    x = r(k.sel(.u32, r(neg), r(k.op1(.not, .u32, x)), x));
+                }
+                var y = k.mov(.u32, x);
+                for ([_]u32{ 1, 2, 4, 8, 16 }) |sh| y = k.op2(.@"or", .u32, r(y), r(k.op2(.shr, .u32, r(y), u(sh))));
+                const lead = popCount(k, r(k.op1(.not, .u32, r(y))));
+                break :blk r(k.sel(.u32, r(k.cmp(.u32, .eq, x, u(0))), u(0xffff_ffff), r(lead)));
+            },
+            // a float as a half's bits (the low 16, nearest even), and back
+            .f32tof16 => r(k.op2(.@"and", .u32, r(k.mov(.u32, r(k.cvt(.f32, .f16, .rne, g.fsrc(&s[0], c))))), u(0xffff))),
+            .f16tof32 => r(k.mov(.u32, r(k.cvt(.f16, .f32, .rne, r(k.mov(.f16, r(k.op2(.@"and", .u32, g.isrc(&s[0], c, .u32), u(0xffff))))))))),
             else => u(0),
         };
+    }
+
+    /// The set bits of a u32 (SWAR: pairs, nibbles, bytes, then the bytes
+    /// summed by a multiply).
+    fn popCount(k: *kir.Kernel, a: Arg) V {
+        var x = k.op2(.isub, .u32, a, r(k.op2(.@"and", .u32, r(k.op2(.shr, .u32, a, u(1))), u(0x5555_5555))));
+        x = k.op2(.iadd, .u32, r(k.op2(.@"and", .u32, r(x), u(0x3333_3333))), r(k.op2(.@"and", .u32, r(k.op2(.shr, .u32, r(x), u(2))), u(0x3333_3333))));
+        x = k.op2(.@"and", .u32, r(k.op2(.iadd, .u32, r(x), r(k.op2(.shr, .u32, r(x), u(4))))), u(0x0f0f_0f0f));
+        return k.op2(.shr, .u32, r(k.op2(.imul, .u32, r(x), u(0x0101_0101))), u(24));
+    }
+
+    /// A u32's bits in the other order (swaps of halves, bytes, nibbles,
+    /// pairs, bits).
+    fn bitReverse(k: *kir.Kernel, a: Arg) V {
+        var x = k.op2(.@"or", .u32, r(k.op2(.shr, .u32, a, u(16))), r(k.op2(.shl, .u32, a, u(16))));
+        for ([_]struct { u32, u32 }{ .{ 8, 0x00ff_00ff }, .{ 4, 0x0f0f_0f0f }, .{ 2, 0x3333_3333 }, .{ 1, 0x5555_5555 } }) |st| {
+            const hi = k.op2(.@"and", .u32, r(k.op2(.shr, .u32, r(x), u(st[0]))), u(st[1]));
+            const lo = k.op2(.shl, .u32, r(k.op2(.@"and", .u32, r(x), u(st[1]))), u(st[0]));
+            x = k.op2(.@"or", .u32, r(hi), r(lo));
+        }
+        return x;
     }
 
     /// a / b and a % b, unsigned: 32 steps of long division (D3D: by 0,
@@ -1218,6 +1568,31 @@ const Gen = struct {
         g.writeTexel(d, res, texture.sampleArray(k, slot, s, t, layer, if (compare) .float else g.kindOf(res), off, lod));
     }
 
+    /// gather4 dst, address, t#, s# (its component: the channel), and
+    /// gather4_c's reference after: a 2D texture's or array's four texels.
+    fn gather(g: *Gen, i: *const dxbc.Inst) void {
+        const d = &i.operands[0];
+        const c = &i.operands[1];
+        const res = &i.operands[2];
+        const smp = &i.operands[3];
+        const dim = g.dimOf(res);
+        if (dim != 3 and dim != 8) {
+            _ = g.fail("gather from a texture of dimension {d} (2D textures and arrays alone yet)", .{dim});
+            return;
+        }
+        const compare = i.op == .gather4_c;
+        var slot = g.slotOf(res, smp) orelse {
+            g.writeTexel(d, res, .{ f(0), f(0), f(0), f(0) });
+            return;
+        };
+        if (compare) slot.shadow = g.fsrc(&i.operands[4], 0);
+        const layer: ?Arg = if (dim == 8) g.fsrc(c, 2) else null;
+        const off = [2]i32{ i.offset[0], i.offset[1] };
+        // (a comparison's result is its texel's first channel)
+        const comp: u2 = if (compare) 0 else smp.swizzle[0];
+        g.writeTexel(d, res, texture.gather(g.k, slot, g.fsrc(c, 0), g.fsrc(c, 1), layer, if (compare) .float else g.kindOf(res), off, comp));
+    }
+
     fn ld(g: *Gen, i: *const dxbc.Inst) void {
         const k = g.k;
         const d = &i.operands[0];
@@ -1312,7 +1687,10 @@ const Gen = struct {
             .resource => {
                 if (n >= g.res_buf.len or g.res_buf[n] == .none) return g.failNull("t{d} read as a buffer, not declared one", .{n});
                 const m = g.lay.tbuffer(g.lay.ctx, n) orelse return null;
-                return .{ .mem = kir.global(m.b, 32), .base = u(0), .bytes = r(raster.uniform(k, .u32, g.uni, m.word)), .stride = if (g.res_stride[n] != 0) u(g.res_stride[n]) else r(raster.uniform(k, .u32, g.uni, m.word + 1)) };
+                // (a draw's: the pipeline's buffer m.b, after the stage's
+                // first binding; a compute kernel's: the binding itself)
+                const first: u8 = if (g.vio) |io| io.buffers else if (g.fio) |io| io.buffers else 0;
+                return .{ .mem = kir.global(first + m.b, 32), .base = u(0), .bytes = r(raster.uniform(k, .u32, g.uni, m.word)), .stride = if (g.res_stride[n] != 0) u(g.res_stride[n]) else r(raster.uniform(k, .u32, g.uni, m.word + 1)) };
             },
             .thread_group_shared_memory => {
                 if (n >= MAX_TGSM or g.tgsm[n].bytes == 0) return g.failNull("g{d} not declared", .{n});

@@ -51,3 +51,26 @@ float4 ps_int(VSOut i) : SV_Target
     int d = y / 3;
     return float4(m / 255.0, d / 127.0, abs(y) / 128.0, (x & 1u) ? 1.0 : 0.0);
 }
+
+// Early returns: inside an if, and inside a loop (ret inside flow).
+float4 ps_early(VSOut i) : SV_Target
+{
+    if (i.color.r > 0.75)
+        return float4(1, 0, 0, 1);
+    float4 acc = 0;
+    [loop] for (int k = 0; k < 8; k++) {
+        acc += i.color * 0.125;
+        if (acc.g > i.color.b * 0.5)
+            return acc;
+    }
+    return float4(0, 0, 1, 1);
+}
+
+// A pixel shader reading a structured buffer (t1): the entry the colour's
+// red names, times the tint.
+StructuredBuffer<float4> sb : register(t1);
+
+float4 ps_sbuf(VSOut i) : SV_Target
+{
+    return sb[(uint)(i.color.x * 3.0 + 0.5)] * tint;
+}

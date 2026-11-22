@@ -518,15 +518,57 @@ pub fn sample(k: *kir.Kernel, slot: Slot, s: Arg, t: Arg, kind: Kind, off: [2]i3
     return sampleArray(k, slot, s, t, null, kind, off, lod);
 }
 
+/// An array's layer coordinate as its layer (rounded, clamped to the
+/// array's); a volume's or cube's as it came.
+fn sliceIndex(k: *kir.Kernel, slot: Slot, layer: ?Arg) ?Arg {
+    if (slot.volume or slot.cube) return layer;
+    const z = layer orelse return null;
+    const count = k.op2(.imax, .u32, r(descWord(k, slot, D_LAYERS)), u(1));
+    const last = k.cvt(.u32, .f32, .rne, r(k.op2(.isub, .u32, r(count), u(1))));
+    const rounded = k.op1(.ffloor, .f32, r(k.op2(.fadd, .f32, z, f(0.5))));
+    const clamped = k.op2(.fmin, .f32, r(k.op2(.fmax, .f32, r(rounded), f(0))), r(last));
+    return r(k.cvt(.f32, .u32, .rz, r(clamped)));
+}
+
+/// Gather (Direct3D's gather4, Texture2D.Gather*): the four texels a
+/// bilinear sample of the base level at (s, t) reads (wrapped, `off`
+/// added, the border where it applies), channel `comp` of each after the
+/// swizzle, as Direct3D orders them: (x0, y1), (x1, y1), (x1, y0), (x0,
+/// y0). A shadow slot's: each texel's comparison (gather4_c). 2D textures
+/// and their arrays.
+pub fn gather(k: *kir.Kernel, slot: Slot, s: Arg, t: Arg, layer: ?Arg, kind: Kind, off: [2]i32, comp: u2) [4]Arg {
+    const d = loadDesc(k, slot);
+    const base = k.op3(.bfe, .u32, r(descWord(k, slot, D_LOD)), u(0), u(4));
+    const lv = sliceOf(k, levelOf(k, slot, d, base), sliceIndex(k, slot, layer));
+    const wf = k.cvt(.u32, .f32, .rne, r(lv.w));
+    const hf = k.cvt(.u32, .f32, .rne, r(lv.h));
+    var x0 = k.op1(.ffloor, .f32, r(k.op2(.fsub, .f32, r(k.op2(.fmul, .f32, s, r(wf))), f(0.5))));
+    var y0 = k.op1(.ffloor, .f32, r(k.op2(.fsub, .f32, r(k.op2(.fmul, .f32, t, r(hf))), f(0.5))));
+    if (off[0] != 0) x0 = k.op2(.fadd, .f32, r(x0), f(@floatFromInt(off[0])));
+    if (off[1] != 0) y0 = k.op2(.fadd, .f32, r(y0), f(@floatFromInt(off[1])));
+    const x1 = k.op2(.fadd, .f32, r(x0), f(1));
+    const y1 = k.op2(.fadd, .f32, r(y0), f(1));
+    const ws = k.op3(.bfe, .u32, r(d.mode), u(0), u(2));
+    const wt = k.op3(.bfe, .u32, r(d.mode), u(4), u(2));
+    const bc = borderColor(k, slot);
+    const xs = [2]V{ x0, x1 };
+    const ys = [2]V{ y0, y1 };
+    // (x index, y index) of each result: (0, 1), (1, 1), (1, 0), (0, 0)
+    const order = [4][2]u1{ .{ 0, 1 }, .{ 1, 1 }, .{ 1, 0 }, .{ 0, 0 } };
+    var out: [4]Arg = undefined;
+    for (&out, order) |*o, at| {
+        const xi = r(k.cvt(.f32, .u32, .rz, r(wrap(k, xs[at[0]], wf, ws))));
+        const yi = r(k.cvt(.f32, .u32, .rz, r(wrap(k, ys[at[1]], hf, wt))));
+        const raw = filteredTexel(k, slot, d, lv, xi, yi, kind, true);
+        const out_xy = k.op2(.por, .pred, r(outside(k, xs[at[0]], wf, ws)), r(outside(k, ys[at[1]], hf, wt)));
+        o.* = finish(k, d, withBorder(k, raw, bc, out_xy, kind), kind)[comp];
+    }
+    return out;
+}
+
 pub fn sampleArray(k: *kir.Kernel, slot: Slot, s: Arg, t: Arg, layer: ?Arg, kind: Kind, off: [2]i32, lod: Lod) [4]Arg {
     const d = loadDesc(k, slot);
-    const slice: ?Arg = if (slot.volume or slot.cube) layer else if (layer) |z| blk: {
-        const count = k.op2(.imax, .u32, r(descWord(k, slot, D_LAYERS)), u(1));
-        const last = k.cvt(.u32, .f32, .rne, r(k.op2(.isub, .u32, r(count), u(1))));
-        const rounded = k.op1(.ffloor, .f32, r(k.op2(.fadd, .f32, z, f(0.5))));
-        const clamped = k.op2(.fmin, .f32, r(k.op2(.fmax, .f32, r(rounded), f(0))), r(last));
-        break :blk r(k.cvt(.f32, .u32, .rz, r(clamped)));
-    } else null;
+    const slice = sliceIndex(k, slot, layer);
     const lw = descWord(k, slot, D_LOD);
     const base = k.op3(.bfe, .u32, r(lw), u(0), u(4));
     if (kind != .float) {

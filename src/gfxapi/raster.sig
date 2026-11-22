@@ -459,6 +459,14 @@ pub const Attr = struct {
     normalized: bool = false,
     /// glVertexAttribIPointer's: the bits, unconverted
     integer: bool = false,
+    /// (float with size 2: halves, widened)
+    /// One 32-bit word holding all four: 10-bit R, G, B and a 2-bit A from
+    /// bit 0 up (GL's *INT_2_10_10_10_REV, Direct3D's R10G10B10A2; size 1,
+    /// comps 4: the word's four bytes)
+    rgb10a2: bool = false,
+    /// Components 0 and 2 read from each other's place (Direct3D's
+    /// B8G8R8A8 and B8G8R8X8 vertex colours, GL's BGRA size)
+    bgra: bool = false,
     /// 0: per vertex; 1: per instance
     divisor: u32 = 0,
     /// the value where comps is 0 (glVertexAttrib*'s)
@@ -759,6 +767,8 @@ const F_FLOAT = 1 << 8;
 const F_SIGNED = 1 << 9;
 const F_NORM = 1 << 10;
 const F_INT = 1 << 11;
+const F_PACKED = 1 << 12;
+const F_BGRA = 1 << 13;
 
 /// bindings: 0 vertex records (written), 1 uniforms, 2 the element array,
 /// 3.. each attribute's buffer, then the textures
@@ -1124,6 +1134,9 @@ fn fetch(k: *kir.Kernel, b: u8, pw: u16, v: V, inst: V) [4]V {
     const float = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(fmt), u(F_FLOAT))), u(0));
     const signed = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(fmt), u(F_SIGNED))), u(0));
     const norm = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(fmt), u(F_NORM))), u(0));
+    const pk = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(fmt), u(F_PACKED))), u(0));
+    const bgra = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(fmt), u(F_BGRA))), u(0));
+    const half = k.op2(.pand, .pred, r(float), r(k.cmp(.u32, .eq, r(size), u(2))));
     const per_inst = k.cmp(.u32, .ne, r(k.param(.u32, pw + 3)), u(0));
     const ai = k.sel(.u32, r(per_inst), r(inst), r(v));
     const base = k.op3(.imad, .u32, r(ai), r(k.param(.u32, pw + 1)), r(k.param(.u32, pw)));
@@ -1141,16 +1154,26 @@ fn fetch(k: *kir.Kernel, b: u8, pw: u16, v: V, inst: V) [4]V {
         k.els();
         k.ifp(r(k.cmp(.u32, .gt, r(comps), u(@intCast(c)))));
         {
-            const at = k.op3(.imad, .u32, r(size), u(@intCast(c)), r(base));
+            // (BGRA: component 0 from 2's place, 2 from 0's)
+            const src: Arg = if (c == 0) r(k.sel(.u32, r(bgra), u(2), u(0))) else if (c == 2) r(k.sel(.u32, r(bgra), u(0), u(2))) else u(@intCast(c));
+            // (packed: every component in the one word at the base)
+            const at = k.sel(.u32, r(pk), r(base), r(k.op3(.imad, .u32, r(size), src, r(base))));
             // (inside the buffer whatever the app asks: its last word at most)
             const wat = k.op2(.imin, .u32, r(k.op2(.@"and", .u32, r(at), u(0xffff_fffc))), r(k.param(.u32, pw + 5)));
             const word = k.load(.u32, kir.global(b, 32), r(wat));
+            const byte_shift = k.op2(.shl, .u32, r(k.op2(.@"and", .u32, r(at), u(3))), u(3));
             k.ifp(r(float));
-            k.set(o, .mov, r(word), no, no);
+            {
+                // (a half: its 16 bits widened; else the word)
+                const hbits = k.op3(.bfe, .u32, r(word), r(byte_shift), u(16));
+                const wide = k.mov(.u32, r(k.cvt(.f16, .f32, .rne, r(k.mov(.f16, r(hbits))))));
+                k.set(o, .sel, r(wide), r(word), r(half));
+            }
             k.els();
             {
-                const shift = k.op2(.shl, .u32, r(k.op2(.@"and", .u32, r(at), u(3))), u(3));
-                const bits = k.op2(.shl, .u32, r(size), u(3));
+                // (packed: 10 bits at 10c, alpha's 2 at 30)
+                const shift = k.sel(.u32, r(pk), u(10 * @as(u32, @intCast(c))), r(byte_shift));
+                const bits = k.sel(.u32, r(pk), u(if (c == 3) 2 else 10), r(k.op2(.shl, .u32, r(size), u(3))));
                 const uraw = k.op3(.bfe, .u32, r(word), r(shift), r(bits));
                 const sraw = k.op3(.bfe, .i32, r(word), r(shift), r(bits));
                 k.ifp(r(integer));
@@ -1160,8 +1183,12 @@ fn fetch(k: *kir.Kernel, b: u8, pw: u16, v: V, inst: V) [4]V {
                     const fu = k.cvt(.u32, .f32, .rne, r(uraw));
                     const fs = k.cvt(.i32, .f32, .rne, r(sraw));
                     const fv = k.sel(.f32, r(signed), r(fs), r(fu));
-                    // (normalized: c / (2^b - 1), or c / (2^(b-1) - 1) at least -1)
-                    const nv = k.div(r(fv), r(k.param(.f32, pw + 4)));
+                    // (normalized: c / (2^b - 1), or c / (2^(b-1) - 1) at least -1;
+                    // a packed one's from its own bits)
+                    const pbits = k.op2(.isub, .u32, r(bits), r(k.sel(.u32, r(signed), u(1), u(0))));
+                    const pdiv = k.cvt(.u32, .f32, .rne, r(k.op2(.isub, .u32, r(k.op2(.shl, .u32, u(1), r(pbits))), u(1))));
+                    const div = k.sel(.f32, r(pk), r(pdiv), r(k.param(.f32, pw + 4)));
+                    const nv = k.div(r(fv), r(div));
                     const ns = k.sel(.f32, r(signed), r(k.op2(.fmax, .f32, r(nv), f(-1))), r(nv));
                     // (f32 bits into the attribute's register: mov reinterprets)
                     k.set(o, .sel, r(k.mov(.u32, r(ns))), r(k.mov(.u32, r(fv))), r(norm));
@@ -2914,6 +2941,8 @@ pub fn vertexParams(d: *const Draw, out: []u32) []u32 {
         if (a.signed) fmt |= F_SIGNED;
         if (a.normalized and !a.integer and !a.float) fmt |= F_NORM;
         if (a.integer) fmt |= F_INT;
+        if (a.rgb10a2) fmt |= F_PACKED;
+        if (a.bgra) fmt |= F_BGRA;
         const bits: u6 = @intCast(@as(u32, a.size) * 8 - @intFromBool(a.signed));
         const div: f32 = if (bits >= 32) 4294967295.0 else @floatFromInt((@as(u64, 1) << bits) - 1);
         w.* = .{ a.offset, a.stride, fmt, @intFromBool(a.divisor != 0), fbits(div), lastWord(a.buf.?), 0, 0 };

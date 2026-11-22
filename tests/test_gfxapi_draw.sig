@@ -2592,6 +2592,38 @@ fn noRaster(k: *const gpu.kir.Kernel, caps: gpu.Caps, work: *gpu.Work, out: []u8
     return engine.compileAny(k, caps, work, out);
 }
 
+test "draw: a layered texture (its layers in one memory) is never made block linear: promote would copy its first layer and free the rest" {
+    Rtx3d.engine3d = .{};
+    Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+    Rtx.dev.withEngine(&Rtx3d.engine3d);
+    eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs, .graphics = true });
+    defer eng_rtx.deinit();
+    const e = &eng_rtx;
+    // two layers of RGBA32F, W x H each, one after the other (as
+    // galaxy-pe's and gles' layered textures are)
+    const plane: usize = W * H * 16;
+    var img = e.newBuffer(2 * plane) orelse return error.OutOfMemory;
+    defer e.freeImage(&img);
+    img.width = W;
+    img.height = H;
+    img.stride = W * 16;
+    img.format = .rgba32f;
+    img.levels = 1;
+    img.layered = true;
+    @memset(img.buf.cpu[plane..][0..16], 0x5a);
+    const before = img.buf;
+    try std.testing.expect(e.promoteWhyNot(&img, "") != null);
+    try std.testing.expect(!e.promote(&img));
+    try std.testing.expect(img.layout.linear());
+    try std.testing.expectEqual(before.gpu, img.buf.gpu);
+    try std.testing.expectEqual(2 * plane, img.buf.cpu.len);
+    try std.testing.expectEqual(@as(u8, 0x5a), img.buf.cpu[plane]);
+    // the same image as one layer's alone moves
+    var one = e.newImage(W, H, .rgba32f) orelse return error.OutOfMemory;
+    defer e.freeImage(&one);
+    try std.testing.expect(e.promote(&one));
+}
+
 test "draw: draws whose tile kernel is too big for the GPU run on the CPU and leave a block-linear target block linear: the CPU's kernels take its layout" {
     Rtx3d.engine3d = .{};
     Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
