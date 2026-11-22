@@ -658,6 +658,7 @@ pub fn Gpu(comptime Host: type) type {
             @memcpy(self.msg[0..CONTEXT_DATA_AT], std.mem.asBytes(&m)[0..CONTEXT_DATA_AT]);
             @memcpy(self.msg[CONTEXT_DATA_AT..][0..priv.len], priv);
             const b = try self.vcall(self.msg[0..n]);
+            self.reply_len = b.len;
             if (b.len < 28) {
                 if (b.len >= 4) self.status = std.mem.readInt(i32, b[0..4], .little);
                 return if (b.len >= 4) error.Refused else error.ShortReply;
