@@ -121,7 +121,7 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
             if (sequence_count != 0) for (&db.seqs) |*seq| {
                 if (!seq.live or seq.dead_csn != 0) continue;
                 var state = try change_log.Writer.init(scratch, 0);
-                try C.encodeCreateSequence(&state, seq);
+                try C.encodeCreateSequence(&state, seq, false);
                 // Preserve the WAL's reservation boundary, including numbers
                 // reserved in live session caches that restart discards.
                 try C.encodeSequenceValue(&state, seq.oid, seq.logged_value, seq.logged_called);

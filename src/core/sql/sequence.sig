@@ -16,6 +16,9 @@ const Error = types.Error;
 /// PostgreSQL SEQ_LOG_VALS.
 pub const log_values: i64 = 32;
 
+/// A table column dependency. Table OID zero detaches the sequence.
+pub const Ownership = struct { table: u32 = 0, column: u8 = 0 };
+
 /// Parsed CREATE SEQUENCE / identity options (null: not given).
 pub const Options = struct {
     /// Parser-observed conflicting/redundant options; defer semantic failure

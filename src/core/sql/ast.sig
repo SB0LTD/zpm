@@ -544,7 +544,10 @@ pub fn Ast(comptime config: types.Config) type {
             if_exists: bool = false,
             name: TableRef = .{},
             options: sequence.Options = .{},
+            owned_by: ?SequenceOwner = null,
         };
+
+        pub const SequenceOwner = struct { table: TableRef = .{}, column: ?Ident = null };
 
         pub const ConstraintKind = enum { check, unique, primary, foreign, exclusion };
 

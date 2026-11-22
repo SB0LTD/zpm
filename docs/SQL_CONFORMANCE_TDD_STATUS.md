@@ -43,6 +43,17 @@ PG16 and PG18 CI each passed all 36 checks, including archives in both
 directions and verification of both sequence states after WAL reopen.
 [Multiple-identity CI](https://github.com/SB0LTD/ramsql/actions/runs/45018672015)
 
+The SERIAL archive fixtures reproduced two failures on stock PG16 and PG18.
+The import rejected `ALTER SEQUENCE ... OWNED BY`. The export created
+tables before the sequences referenced by their defaults. The candidate
+versions sequence ownership in the transaction and records the change in
+WAL. The catalog now supplies the sequence dependency for literal
+`nextval` defaults and qualifies public sequence names with an empty
+search path. The focused DDL suite passed 1,213 assertions. Both fixture
+schemas passed both archive directions and WAL reopen on local PG16 and
+PG18. Hosted qualification is pending. Checkpoint images for owned
+sequences and complete sequence privileges remain open.
+
 The dependent-view fixture found an outbound ordering failure after
 `pg_get_viewdef` first returned the stored query. Typed `pg_rewrite`
 rows now expose each view's implicit SELECT rule and its relation
