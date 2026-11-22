@@ -160,6 +160,7 @@ pub fn Exec(comptime config: types.Config) type {
         pub const ViewHook = struct {
             ptr: *anyopaque,
             rows: *const fn (ptr: *anyopaque, view: catalog.View, sink: *RowSink) Error!void,
+            sequence_rows: ?*const fn (ptr: *anyopaque, slot: usize, sink: *RowSink) Error!void = null,
         };
 
         /// Appends rows of `width` cells to a workspace row list.
@@ -530,7 +531,10 @@ pub fn Exec(comptime config: types.Config) type {
                         filter = .{ .context = self.context(outer), .predicate = predicate };
                         sink.filter = &filter;
                     }
-                    try hook.rows(hook.ptr, view, &sink);
+                    if (source.sequence) |slot| {
+                        const scan = hook.sequence_rows orelse return error.UnsupportedStatement;
+                        try scan(hook.ptr, slot, &sink);
+                    } else try hook.rows(hook.ptr, view, &sink);
                     return sink.list;
                 }
                 return self.run(source.plan, outer);
@@ -934,6 +938,7 @@ pub fn Exec(comptime config: types.Config) type {
             fn projectCatalog(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!?List {
                 if (p.source_count != 1 or p.grouped or p.general_join) return null;
                 const view = p.sources[0].view orelse return null;
+                if (p.sources[0].sequence != null) return null;
                 if (!self.availableAtStage(p.where, 0, true)) return null;
                 for (p.targets[0..p.width], 0..) |target, column| {
                     if (!p.required[column]) continue;

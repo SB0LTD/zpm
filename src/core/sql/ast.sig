@@ -129,7 +129,7 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     obj_description, col_description, shobj_description, current_user, session_user,
     // Discovery (B11 text lane): pg_typeof (the argument's type OID in
     // `integer`, set by the binder) and pg_get_serial_sequence.
-    pg_typeof, pg_get_serial_sequence, pg_table_is_visible, pg_get_indexdef, pg_get_constraintdef, pg_get_triggerdef, pg_partition_ancestors,
+    pg_typeof, pg_get_serial_sequence, pg_table_is_visible, pg_get_indexdef, pg_get_constraintdef, pg_get_triggerdef, pg_get_viewdef, pg_partition_ancestors,
     to_regnamespace, regnamespace_in, regnamespace_out, pg_get_statisticsobjdef_columns, pg_relation_is_publishable, pg_get_partkeydef,
     // Regular expressions (B11 text lane, regex.sig).
     regexp_like, similar_to_escape,
@@ -246,7 +246,7 @@ pub fn strictFunction(func: Func) bool {
         .xml_is_well_formed, .xml_is_well_formed_document, .xml_is_well_formed_content => true,
         // jsonb_set_lax reads NULL arguments itself.
         .jsonb_set_lax => false,
-        .pg_get_serial_sequence, .pg_table_is_visible, .pg_get_indexdef, .pg_get_constraintdef, .pg_get_triggerdef, .pg_partition_ancestors, .pg_get_statisticsobjdef_columns, .pg_relation_is_publishable, .pg_get_partkeydef => true,
+        .pg_get_serial_sequence, .pg_table_is_visible, .pg_get_indexdef, .pg_get_constraintdef, .pg_get_triggerdef, .pg_get_viewdef, .pg_partition_ancestors, .pg_get_statisticsobjdef_columns, .pg_relation_is_publishable, .pg_get_partkeydef => true,
         .regexp_like, .similar_to_escape => true,
         .to_tsvector, .to_tsquery, .plainto_tsquery, .phraseto_tsquery => true,
         else => jsonFunction(func),
@@ -696,7 +696,7 @@ pub fn Ast(comptime config: types.Config) type {
 
         pub const CreateSequence = struct {
             if_not_exists: bool = false,
-            name: Ident = .{},
+            name: TableRef = .{},
             options: sequence.Options = .{},
         };
 
@@ -974,6 +974,12 @@ pub fn Ast(comptime config: types.Config) type {
             rename_column: struct { from: Ident, to: Ident },
             set_default: struct { column: Ident, expression: Span },
             drop_default: Ident,
+            add_identity: struct {
+                column: Ident,
+                always: bool,
+                name: ?TableRef = null,
+                options: sequence.Options = .{},
+            },
             set_not_null: Ident,
             drop_not_null: Ident,
             add_constraint: ConstraintDef,

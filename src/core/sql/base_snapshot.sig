@@ -4,6 +4,7 @@
 const std = @import("std");
 const types = @import("types.sig");
 const storage = @import("storage.sig");
+const catalog = @import("catalog.sig");
 const objects = @import("catalog_objects.sig");
 const change_log = @import("change_log.sig");
 
@@ -90,7 +91,8 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
             var sequence_count: usize = 0;
             for (&db.seqs) |*seq| {
                 if (!seq.live or seq.dead_csn != 0) continue;
-                if (seq.pending_create or seq.pending_drop or seq.owner != 0) return error.SnapshotUnsupportedState;
+                if (seq.pending_create or seq.pending_drop or seq.owner != 0 or seq.namespace != catalog.public_namespace)
+                    return error.SnapshotUnsupportedState;
                 sequence_count += 1;
             }
             if (selected.count == 0 and sequence_count == 0) return error.SnapshotUnsupportedState;

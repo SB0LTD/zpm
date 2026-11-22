@@ -122,6 +122,7 @@ pub const SequenceHook = struct {
     /// Index definition or one index attribute in the owning snapshot.
     index_definition: ?*const fn (ptr: *anyopaque, oid: u32, column: i32, pretty: bool, out: []u8) Error!?usize = null,
     constraint_definition: ?*const fn (ptr: *anyopaque, oid: u32, pretty: bool, out: []u8) Error!?usize = null,
+    view_definition: ?*const fn (ptr: *anyopaque, oid: u32, pretty: bool, out: []u8) Error!?usize = null,
     statistics_columns: ?*const fn (ptr: *anyopaque, oid: u32, out: []u8) Error!?usize = null,
     relation_publishable: ?*const fn (ptr: *anyopaque, oid: u32) ?bool = null,
     partition_key_definition: ?*const fn (ptr: *anyopaque, oid: u32, out: []u8) Error!?usize = null,

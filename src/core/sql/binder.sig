@@ -87,7 +87,7 @@ pub fn Binder(comptime config: types.Config) type {
         /// sequence's current state when it runs).
         pub const AlterSequence = struct { slot: usize, options: sequence.Options };
 
-        pub const CreateSequence = struct { name: V.Name, spec: sequence.Spec };
+        pub const CreateSequence = struct { name: V.Name, namespace: u32, spec: sequence.Spec };
 
         /// RETURNING output columns, evaluated over one table row (relation 0).
         pub const Returning = struct {
@@ -303,6 +303,7 @@ pub fn Binder(comptime config: types.Config) type {
             constraint_count: usize,
             sources: [config.columns]u8,
             fills: [config.columns]u16 = @splat(none),
+            identity: ?Identity = null,
             check_not_null: [config.columns]bool = @splat(false),
             check_constraint: [config.table_constraints]bool = @splat(false),
             /// Kind, secondary indexes, view and partition definition after
@@ -493,6 +494,7 @@ pub fn Binder(comptime config: types.Config) type {
         pub const Source = struct {
             table: ?usize = null,
             view: ?catalog.View = null,
+            sequence: ?usize = null,
             plan: u16 = none,
             cte: u8 = no_cte,
             join: ast.JoinKind = .first,
@@ -1324,6 +1326,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "pg_get_indexdef", .func = .pg_get_indexdef },
                 .{ .name = "pg_get_constraintdef", .func = .pg_get_constraintdef },
                 .{ .name = "pg_get_triggerdef", .func = .pg_get_triggerdef },
+                .{ .name = "pg_get_viewdef", .func = .pg_get_viewdef },
                 .{ .name = "pg_get_statisticsobjdef_columns", .func = .pg_get_statisticsobjdef_columns },
                 .{ .name = "pg_relation_is_publishable", .func = .pg_relation_is_publishable },
                 .{ .name = "pg_get_partkeydef", .func = .pg_get_partkeydef },
@@ -2298,7 +2301,7 @@ pub fn Binder(comptime config: types.Config) type {
                     try bindSignature(context, n, signature, .text, true);
                     n.constant = false;
                 },
-                .pg_get_constraintdef, .pg_get_triggerdef => {
+                .pg_get_constraintdef, .pg_get_triggerdef, .pg_get_viewdef => {
                     if (context.dialect != .postgres) return error.UndefinedFunction;
                     const signature: []const ast.Type = if (count == 1) &.{.oid} else &.{ .oid, .boolean };
                     try bindSignature(context, n, signature, .text, true);
@@ -4446,15 +4449,18 @@ pub fn Binder(comptime config: types.Config) type {
                 (context.stored_source_start != 0 and ident.span.start >= context.stored_source_start);
         }
 
-        /// A user table, optionally schema-qualified (public by default,
-        /// as the default search_path).
-        pub fn resolveQualified(context: *const Context, schema: ?ast.Ident, name: ast.Ident) Error!usize {
+        fn resolveRelation(context: *const Context, schema: ?ast.Ident, name: ast.Ident) Error!K.Found {
             // PostgreSQL reports a relation in a missing schema as 42P01.
             const namespace = if (schema != null) qualifierNamespace(context, schema) catch |err| {
                 return if (err == error.UndefinedSchema) error.TableNotFound else err;
             } else if (publicLookup(context, name)) catalog.public_namespace else return error.TableNotFound;
             const wanted = toName(context, name);
-            const found = context.catalog.findIn(namespace, wanted.slice(), context.snapshot) orelse return error.TableNotFound;
+            return context.catalog.findIn(namespace, wanted.slice(), context.snapshot) orelse return error.TableNotFound;
+        }
+
+        /// A user table, optionally schema-qualified.
+        pub fn resolveQualified(context: *const Context, schema: ?ast.Ident, name: ast.Ident) Error!usize {
+            const found = try resolveRelation(context, schema, name);
             if (found.kind == 'S') return error.TableNotFound;
             return found.slot;
         }
@@ -6887,7 +6893,7 @@ pub fn Binder(comptime config: types.Config) type {
             scope.rels[0] = rel.*;
             scope.rel_count = 1;
             const p = &plans.items[id];
-            p.sources[0] = .{ .table = source.table, .view = source.view, .plan = source.plan, .cte = source.cte };
+            p.sources[0] = .{ .table = source.table, .view = source.view, .sequence = source.sequence, .plan = source.plan, .cte = source.cte };
             p.source_count = 1;
             for (0..relationWidth(context, rel)) |column| {
                 const node = try columnNode(context, &scope, 0, column);
@@ -7012,10 +7018,19 @@ pub fn Binder(comptime config: types.Config) type {
                     rel.name = literalName(@tagName(view));
                     source.view = view;
                 } else {
-                    const table = try readableTable(context, try resolveQualified(context, item.schema, item.name));
-                    rel.table = table;
-                    rel.name = context.tables[table].name;
-                    source.table = table;
+                    const found = try resolveRelation(context, item.schema, item.name);
+                    if (found.kind == 'S') {
+                        if (context.dialect != .postgres) return error.TableNotFound;
+                        rel.view = .sequence_state;
+                        rel.name = toName(context, item.name);
+                        source.view = .sequence_state;
+                        source.sequence = found.slot;
+                    } else {
+                        const table = try readableTable(context, found.slot);
+                        rel.table = table;
+                        rel.name = context.tables[table].name;
+                        source.table = table;
+                    }
                 }
                 if (item.alias) |alias| rel.name = toName(context, alias);
                 if (item.sample_method != 0) {
@@ -7810,11 +7825,9 @@ pub fn Binder(comptime config: types.Config) type {
                     if (create.partition_of) |parent| return bindPartitionOf(context, create, table_name, namespace, parent);
                     if (create.inherits != null and (create.like != null or create.partition_by != .none)) return error.UnsupportedStatement;
                     var out: Create = .{ .name = table_name, .columns = @splat(.{}), .count = create.count, .namespace = namespace, .plain_definition = plain };
-                    // Owned sequences live in public: identity and SERIAL
-                    // columns stay outside other schemas (0A000).
+                    // SERIAL's default expression still resolves the unqualified sequence.
                     if (namespace != catalog.public_namespace) for (create.columns[0..create.count]) |*definition| {
-                        if (definition.serial != 0 or definition.default_kind == .identity_always or definition.default_kind == .identity_by_default or
-                            definition.default_kind == .mysql_auto_increment) return error.UnsupportedStatement;
+                        if (definition.serial != 0 or definition.default_kind == .mysql_auto_increment) return error.UnsupportedStatement;
                     };
                     for (create.columns[0..create.count], 0..) |*definition, index| {
                         var column: V.Column = .{ .name = toName(context, definition.name), .not_null = definition.not_null, .primary_key = definition.primary_key, .typmod = definition.typmod, .default_kind = definition.default_kind, .virtual = definition.virtual };
@@ -7851,7 +7864,7 @@ pub fn Binder(comptime config: types.Config) type {
                                 var options = definition.sequence;
                                 if (options.type_oid == 0) options.type_oid = types.typeOid(column.data_type);
                                 const seq_name = try identityName(table_name, column.name);
-                                if (context.catalog.find(seq_name.slice(), context.snapshot) != null) return error.TableExists;
+                                if (context.catalog.findIn(namespace, seq_name.slice(), context.snapshot) != null) return error.TableExists;
                                 out.identity = .{ .column = @intCast(index), .name = seq_name, .spec = try sequence.resolve(options) };
                             },
                             // Type-checked now; evaluated per row.
@@ -7909,19 +7922,19 @@ pub fn Binder(comptime config: types.Config) type {
                     return .{ .drop_table = found.slot };
                 },
                 .create_sequence => |*create| {
-                    if (!context.session.public_schema_on_path) return error.UndefinedSchema;
-                    const name = toName(context, create.name);
-                    if (context.catalog.find(name.slice(), context.snapshot) != null) {
+                    const namespace = try specifiedNamespace(context, create.name.schema);
+                    const name = toName(context, create.name.name);
+                    if (context.catalog.findIn(namespace, name.slice(), context.snapshot) != null or
+                        indexNameTaken(context, namespace, name.slice())) {
                         if (create.if_not_exists) return .{ .noop = .create_sequence };
                         return error.TableExists;
                     }
-                    return .{ .create_sequence = .{ .name = name, .spec = try sequence.resolve(create.options) } };
+                    return .{ .create_sequence = .{ .name = name, .namespace = namespace, .spec = try sequence.resolve(create.options) } };
                 },
                 .drop_sequence => |drop| {
-                    const wanted = toName(context, drop.name);
-                    const found = (if (publicLookup(context, drop.name)) context.catalog.find(wanted.slice(), context.snapshot) else null) orelse {
-                        if (drop.if_exists) return .{ .noop = .drop_sequence };
-                        return error.TableNotFound;
+                    const found = resolveRelation(context, drop.schema, drop.name) catch |err| {
+                        if (err == error.TableNotFound and drop.if_exists) return .{ .noop = .drop_sequence };
+                        return err;
                     };
                     if (found.kind != 'S') return error.WrongObjectType;
                     return .{ .drop_sequence = found.slot };
@@ -7986,7 +7999,16 @@ pub fn Binder(comptime config: types.Config) type {
                         try resolveUnknown(context, root);
                         return .{ .query = root };
                     };
-                    return .{ .select = try bindSelect(context, q) };
+                    const selected = bindSelect(context, q) catch |err| {
+                        if (err != error.TableNotFound or context.dialect != .postgres) return err;
+                        const ref = q.from orelse return err;
+                        if ((try resolveRelation(context, ref.schema, ref.name)).kind != 'S') return err;
+                        if (context.plans == null or q.lock.strength != .none) return error.UnsupportedStatement;
+                        const root = try bindPlan(context, index, null, null, false);
+                        try resolveUnknown(context, root);
+                        return .{ .query = root };
+                    };
+                    return .{ .select = selected };
                 },
                 .query => |index| {
                     const plans = context.plans orelse return error.UnsupportedStatement;
@@ -8077,13 +8099,9 @@ pub fn Binder(comptime config: types.Config) type {
                 .merge => |*merge| return bindMerge(context, merge),
                 .set_constraints => |*set| return bindSetConstraints(context, set),
                 .alter_sequence => |*alter| {
-                    if (alter.name.schema) |qualifier| {
-                        if (!types.same(toName(context, qualifier).slice(), "public")) return error.TableNotFound;
-                    }
-                    const wanted = toName(context, alter.name.name);
-                    const found = (if (alter.name.schema != null or publicLookup(context, alter.name.name)) context.catalog.find(wanted.slice(), context.snapshot) else null) orelse {
-                        if (alter.if_exists) return .{ .noop = .alter_sequence };
-                        return error.TableNotFound;
+                    const found = resolveRelation(context, alter.name.schema, alter.name.name) catch |err| {
+                        if (err == error.TableNotFound and alter.if_exists) return .{ .noop = .alter_sequence };
+                        return err;
                     };
                     if (found.kind != 'S') return error.WrongObjectType;
                     return .{ .alter_sequence = .{ .slot = found.slot, .options = alter.options } };
@@ -8479,6 +8497,29 @@ pub fn Binder(comptime config: types.Config) type {
                     _ = try bindExpressionText(context, &candidate, null, -1);
                     column.* = candidate;
                 },
+                .add_identity => |*definition| {
+                    if (context.dialect != .postgres or alter.count != 1 or
+                        entry.parent != 0 or hasChildren(context, entry.oid)) return error.UnsupportedStatement;
+                    const position = alterColumn(&out, toName(context, definition.column).slice()) orelse return error.ColumnNotFound;
+                    const column = &out.columns[position];
+                    if (!column.not_null or column.default_kind != .none) return error.ObjectNotInPrerequisiteState;
+                    if (!integerColumn(column.data_type)) return error.TypeMismatch;
+                    for (out.columns[0..out.count]) |*other| switch (other.default_kind) {
+                        .identity_always, .identity_by_default => return error.UnsupportedStatement,
+                        else => {},
+                    };
+                    const name = if (definition.name) |reference| blk: {
+                        if (reference.schema) |schema| {
+                            if (try qualifierNamespace(context, schema) != entry.namespace) return error.InvalidTableDefinition;
+                        }
+                        break :blk toName(context, reference.name);
+                    } else try identityName(entry.name, column.name);
+                    if (indexNameTaken(context, entry.namespace, name.slice())) return error.TableExists;
+                    var options = definition.options;
+                    if (options.type_oid == 0) options.type_oid = types.typeOid(column.data_type);
+                    out.identity = .{ .column = @intCast(position), .name = name, .spec = try sequence.resolve(options) };
+                    column.default_kind = if (definition.always) .identity_always else .identity_by_default;
+                },
                 .drop_default => |ident| {
                     const position = alterColumn(&out, toName(context, ident).slice()) orelse return error.ColumnNotFound;
                     const column = &out.columns[position];
@@ -8503,7 +8544,7 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 .add_constraint => |*definition| {
                     if (definition.kind == .primary) {
-                        if (context.dialect != .postgres or alter.count != 1 or definition.column_count != 1 or
+                        if (context.dialect != .postgres or alter.count != 1 or
                             entry.parent != 0 or hasChildren(context, entry.oid)) return error.UnsupportedStatement;
                         if (definition.name) |ident| if (indexNameTaken(context, entry.namespace, toName(context, ident).slice())) return error.TableExists;
                         for (out.columns[0..out.count]) |*column| if (column.primary_key) return error.InvalidTableDefinition;

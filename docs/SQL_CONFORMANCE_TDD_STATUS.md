@@ -20,6 +20,39 @@ existing schema ACL grantors with the change. The focused security
 contract passed 1,616 assertions and replayed 352 change records.
 [Whole-database CI](https://github.com/SB0LTD/ramsql/actions/runs/44929034456)
 
+The scoped identity candidate creates an owned sequence in the table's
+schema. Two schemas can contain the same table and derived sequence
+names with independent values and OIDs. The new WAL record validates
+the schema and owning column before applying. Older sequence records
+retain their public placement. The scoped identity fixture passed 28 checks
+on both PostgreSQL versions. The next candidate serves live sequence rows
+and supports ADD GENERATED on existing NOT NULL integer columns. The local
+Sig change-log suite passed 1,109 assertions, including rollback,
+cross-schema record rejection, and replay of preserved rows and sequence
+state. The stock archive tests exercise identity state and its use after
+restore. Separate scoped standalone sequence DDL passed 1,114 local
+change-log assertions, including qualified ALTER and DROP, CASCADE and
+replay. Local stock PG16 passed 32 checks with those sequences, keyed
+identity and stored generated columns in both directions.
+[Scoped identity CI](https://github.com/SB0LTD/ramsql/actions/runs/44958119185)
+
+The dependent-view fixture found an outbound ordering failure after
+`pg_get_viewdef` first returned the stored query. Typed `pg_rewrite`
+rows now expose each view's implicit SELECT rule and its relation
+dependencies. Local stock PG16 passed all 33 checks with that metadata,
+including a view depending on another view whose base table sorts last.
+The updated routine and rule suite passed 767 assertions and replayed
+156 records. Column aliases introduced by a CREATE VIEW column list,
+general rule deparsing and arbitrary view definitions still need coverage.
+
+The stock archive fixture now restores a two-column primary key after
+loading the rows of a fresh table in a single transaction. The WAL uses
+the validated keyed table definition before the row records. It preserves
+rows, duplicate and NULL rejection, and key metadata after reopen. Stock
+PG16 and PG18 CI each passed all 34 checks. Adding a composite primary key
+to an existing committed table remains unsupported.
+[Composite-key archive CI](https://github.com/SB0LTD/ramsql/actions/runs/44962030582)
+
 RAMSQL `d1ddbe5` with ZPM `ed00a0a1` passed all 24 stock
 tooling checks on both PostgreSQL 16 and 18. Stock plain and custom
 imports passed row, default and constraint checks after WAL reopen.

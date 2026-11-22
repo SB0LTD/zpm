@@ -56,7 +56,7 @@ pub const View = enum(u8) { pg_type, pg_namespace, pg_class, pg_attribute, pg_in
     pg_roles, pg_authid, pg_auth_members, pg_policy, pg_policies, pg_description, pg_shdescription, pg_foreign_data_wrapper, pg_foreign_server, pg_publication, pg_extension, pg_tables, table_privileges, pg_enum, pg_database, pg_am, pg_collation, pg_constraint, pg_statistic_ext,
     pg_publication_rel, pg_publication_namespace, pg_settings, pg_depend, pg_tablespace, pg_foreign_table,
     pg_init_privs, pg_cast, pg_transform, pg_language, pg_operator, pg_opclass, pg_opfamily, pg_ts_parser, pg_ts_template, pg_ts_dict, pg_ts_config, pg_default_acl, pg_conversion, pg_range, pg_event_trigger, pg_partitioned_table, pg_subscription,
-    pg_seclabel, pg_shseclabel, pg_seclabels, pg_db_role_setting, pg_amop, pg_amproc, pg_largeobject, pg_largeobject_metadata };
+    pg_seclabel, pg_shseclabel, pg_seclabels, pg_db_role_setting, pg_amop, pg_amproc, pg_largeobject, pg_largeobject_metadata, sequence_state };
 
 pub const sql_language_oid: u32 = 14;
 pub const plpgsql_language_oid: u32 = 13002;
@@ -83,6 +83,7 @@ const pg_type_columns = [_]ViewColumn{
     col("typacl", types.arrayType(.aclitem).?), col("typisdefined", .boolean), col("typstorage", .pg_internal_char),
 };
 const pg_namespace_columns = [_]ViewColumn{ col("oid", .oid), col("nspname", .name), col("nspowner", .oid), col("nspacl", types.arrayType(.aclitem).?) };
+pub const pg_namespace_acl_column = pg_namespace_columns.len - 1;
 const pg_enum_columns = [_]ViewColumn{ col("oid", .oid), col("enumtypid", .oid), col("enumsortorder", .float4), col("enumlabel", .name) };
 pub const utf8_encoding: i64 = 6;
 pub const default_tablespace: i64 = 1663;
@@ -256,6 +257,7 @@ const pg_statistic_ext_columns = [_]ViewColumn{
 };
 const pg_attrdef_columns = [_]ViewColumn{ col("adrelid", .oid), col("adnum", .int2), col("adbin", .text), col("oid", .oid) };
 const pg_sequence_columns = [_]ViewColumn{ col("seqrelid", .oid), col("seqtypid", .oid), col("seqstart", .int8), col("seqincrement", .int8), col("seqmax", .int8), col("seqmin", .int8), col("seqcache", .int8), col("seqcycle", .boolean) };
+const sequence_state_columns = [_]ViewColumn{ col("last_value", .int8), col("log_cnt", .int8), col("is_called", .boolean) };
 const schemata_columns = [_]ViewColumn{ col("catalog_name", .name), col("schema_name", .name) };
 const tables_columns = [_]ViewColumn{ col("table_catalog", .name), col("table_schema", .name), col("table_name", .name), col("table_type", .text) };
 const columns_columns = [_]ViewColumn{ col("table_catalog", .name), col("table_schema", .name), col("table_name", .name), col("column_name", .name), col("ordinal_position", .int4), col("column_default", .text), col("is_nullable", .text), col("data_type", .varchar), col("character_maximum_length", .int4), col("numeric_precision", .int4), col("numeric_precision_radix", .int4), col("numeric_scale", .int4), col("datetime_precision", .int4), col("is_identity", .text), col("identity_generation", .text), col("is_generated", .text), col("generation_expression", .text) };
@@ -333,7 +335,8 @@ pub const binary_casts = [_]struct { oid: u32, source: types.DataType, target: t
     .{ .oid = 10184, .source = .varbit, .target = .bit },
 };
 const pg_trigger_columns = [_]ViewColumn{ col("oid", .oid), col("tgrelid", .oid), col("tgname", .name), col("tgfoid", .oid), col("tgtype", .int2), col("tgenabled", .text), col("tgisinternal", .boolean), col("tgnargs", .int2), col("tgparentid", .oid) };
-const pg_rewrite_columns = [_]ViewColumn{ col("oid", .oid), col("rulename", .name), col("ev_class", .oid), col("ev_type", .text), col("ev_enabled", .text), col("is_instead", .boolean) };
+pub const rewrite_catalog: u32 = 2618;
+const pg_rewrite_columns = [_]ViewColumn{ col("oid", .oid), col("rulename", .name), col("ev_class", .oid), col("ev_type", .pg_internal_char), col("ev_enabled", .pg_internal_char), col("is_instead", .boolean) };
 const pg_rules_columns = [_]ViewColumn{ col("schemaname", .name), col("tablename", .name), col("rulename", .name), col("definition", .text) };
 const key_column_usage_columns = [_]ViewColumn{ col("constraint_catalog", .name), col("constraint_schema", .name), col("constraint_name", .name), col("table_catalog", .name), col("table_schema", .name), col("table_name", .name), col("column_name", .name), col("ordinal_position", .int4) };
 
@@ -407,6 +410,7 @@ pub fn viewColumns(view: View) []const ViewColumn {
         .pg_statistic_ext => &pg_statistic_ext_columns,
         .pg_attrdef => &pg_attrdef_columns,
         .pg_sequence => &pg_sequence_columns,
+        .sequence_state => &sequence_state_columns,
         .schemata => &schemata_columns,
         .tables => &tables_columns,
         .columns => &columns_columns,
@@ -515,7 +519,7 @@ pub const bootstrap_relations = [_]struct { view: View, oid: u32 }{
     .{ .view = .pg_attrdef, .oid = attrdef_catalog }, .{ .view = .pg_constraint, .oid = constraint_catalog },
     .{ .view = .pg_depend, .oid = 2608 }, .{ .view = .pg_description, .oid = 2609 }, .{ .view = .pg_index, .oid = 2610 },
     .{ .view = .pg_inherits, .oid = 2611 }, .{ .view = .pg_namespace, .oid = 2615 },
-    .{ .view = .pg_rewrite, .oid = 2618 }, .{ .view = .pg_trigger, .oid = 2620 },
+    .{ .view = .pg_rewrite, .oid = rewrite_catalog }, .{ .view = .pg_trigger, .oid = 2620 },
     .{ .view = .pg_extension, .oid = 3079 }, .{ .view = .pg_policy, .oid = 3256 },
     .{ .view = .pg_statistic_ext, .oid = 3381 }, .{ .view = .pg_enum, .oid = 3501 },
     .{ .view = .pg_collation, .oid = 3456 }, .{ .view = .pg_publication, .oid = 6104 },
@@ -655,7 +659,7 @@ pub fn Catalog(comptime config: types.Config) type {
             var count: usize = 0;
             errdefer for (out[0..count]) |change| SC.reclaimVersion(self.relation(change.relation), change.version);
             const oid: i64 = seq.oid;
-            const relation_cells = [_]CV.Cell{ int(oid), text(seq.name.slice()), text("S"), int(public_namespace), int(@intCast(slot)) };
+            const relation_cells = [_]CV.Cell{ int(oid), text(seq.name.slice()), text("S"), int(seq.namespace), int(@intCast(slot)) };
             out[count] = .{ .relation = .relations, .version = try self.addVersion(.relations, sequenceRow(slot), &relation_cells, xmin, cid, csn, horizon) };
             count += 1;
             const spec = seq.spec;
@@ -792,12 +796,20 @@ pub fn Catalog(comptime config: types.Config) type {
         /// A live transaction other than the snapshot's own that has an
         /// uncommitted relation row with this name.
         pub fn creator(self: *const Self, name: []const u8, snap: storage.Snapshot) ?u16 {
+            return self.creatorIn(null, name, snap);
+        }
+
+        pub fn creatorIn(self: *const Self, namespace: ?u32, name: []const u8, snap: storage.Snapshot) ?u16 {
             const relations = self.relationConst(.relations);
             for (relations.versions[0..relations.version_high], 0..) |*version, index| {
                 if (version.rowLink() == 0 or version.xmin_csn != 0 or snap.own(version.xmin)) continue;
                 if (version.xmax.epoch != 0) continue;
                 var temporary: CV.Cell = undefined;
-                if (sameName(SC.borrowVersionCell(relations, index, 1, &temporary), name)) return version.xmin.slot;
+                if (!sameName(SC.borrowVersionCell(relations, index, 1, &temporary), name)) continue;
+                if (namespace) |requested| {
+                    if (SC.borrowVersionCell(relations, index, 3, &temporary).integer != requested) continue;
+                }
+                return version.xmin.slot;
             }
             return null;
         }
