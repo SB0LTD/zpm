@@ -424,6 +424,8 @@ pub const GUEST_CAPS_WSL2: u32 = 1;
 pub const HOST_CAPS_MAP_GUEST_MEMORY: u32 = 1;
 
 pub const PciCaps = struct {
+    /// The guest caps were written (a WSL2 guest): Gpu.wsl2.
+    wsl2: bool = false,
     /// The interface version the host and the guest agreed.
     version: u32 = VERSION_OLD,
     /// What the host's version word said first.
@@ -437,7 +439,7 @@ pub const PciCaps = struct {
 /// dxgkrnl's handshake through `cfg` (read32(offset) u32, write32(offset,
 /// value): the vGPU function's config space).
 pub fn pciHandshake(cfg: anytype) PciCaps {
-    var c = PciCaps{};
+    var c = PciCaps{ .wsl2 = true };
     cfg.write32(PCI_GUEST_CAPS, GUEST_CAPS_WSL2);
     c.host_version = cfg.read32(PCI_VERSION);
     c.version = if (c.host_version != 0) c.host_version else VERSION_OLD;
@@ -521,6 +523,9 @@ pub fn Gpu(comptime Host: type) type {
         /// The vGPU's LUID (version 40's header names it): from the PCI
         /// handshake, then the adapter's own answer.
         vgpu_luid: Luid = .{},
+        /// The guest said it is a WSL2 guest (pciHandshake's guest caps):
+        /// the host then answers as it answers WSL's dxgkrnl.
+        wsl2: bool = false,
         /// Guest events the host signaled (SIGNALGUESTEVENT) and no one
         /// has taken yet (0: a free slot).
         events: [16]u64 = @splat(0),
@@ -880,16 +885,19 @@ pub fn Gpu(comptime Host: type) type {
             @memset(self.msg[0 .. @sizeOf(QueryAdapterInfo) + out.len], 0);
             @memcpy(self.msg[0..@sizeOf(QueryAdapterInfo)], std.mem.asBytes(&qh));
             const r = try self.vcall(self.msg[0 .. @sizeOf(QueryAdapterInfo) + out.len]);
-            // (the answer is the query's data alone, no NTSTATUS: the WDDM
-            // 2.7 caps came back as 0x9, the PCI ids with the adapter's
-            // index first, galaxy-turing's RTX 2080 Ti, 2026-11-22; a
-            // shorter one is taken for the host's refusal)
+            // (a WSL2 guest's answer is the NTSTATUS, then the data, as
+            // dxgkrnl reads it; a guest that has not said what it is gets
+            // the data alone: the WDDM 2.7 caps came back as 0x9, the PCI
+            // ids index first; galaxy-turing's RTX 2080 Ti, 2026-11-22. A
+            // shorter one is the host's refusal.)
             self.reply_len = r.len;
-            if (r.len < out.len) {
-                if (r.len >= 4) self.status = std.mem.readInt(i32, r[0..4], .little);
+            const at: usize = if (self.wsl2) 4 else 0;
+            if (self.wsl2) try self.ntstatus(r);
+            if (r.len < at + out.len) {
+                if (!self.wsl2 and r.len >= 4) self.status = std.mem.readInt(i32, r[0..4], .little);
                 return error.Refused;
             }
-            @memcpy(out, r[0..out.len]);
+            @memcpy(out, r[at..][0..out.len]);
             return out.len;
         }
 
