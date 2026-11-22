@@ -836,10 +836,23 @@ fn materializedViews() !void {
     // WITH NO DATA: unpopulated until REFRESH (55000); REFRESH WITH NO DATA
     // empties it again. Both change the durable definition.
     try run("CREATE MATERIALIZED VIEW later AS SELECT id FROM a WITH NO DATA");
-    try rejects("SELECT * FROM later", error.ObjectNotInPrerequisiteState, matview_probes[1], "later|f|SELECT id FROM a;mv|t|SELECT g, SUM(v) AS total, COUNT(*) AS n FROM a WHERE g < 9 GROUP BY g");
+    try run("CREATE VIEW later_report AS SELECT id FROM later");
+    try run("CREATE MATERIALIZED VIEW later_copy AS SELECT id FROM later WITH NO DATA");
+    try run("CREATE TABLE empty_later AS SELECT id FROM later WITH NO DATA");
+    try expect("SELECT count(*) FROM empty_later", "0");
+    try run("DROP TABLE empty_later");
+    try rejects("SELECT * FROM later_report", error.ObjectNotInPrerequisiteState, "SELECT COUNT(*) FROM a", "5");
+    try rejects("REFRESH MATERIALIZED VIEW later_copy", error.ObjectNotInPrerequisiteState, "SELECT COUNT(*) FROM a", "5");
+    try rejects("SELECT * FROM later", error.ObjectNotInPrerequisiteState, matview_probes[1], "later|f|SELECT id FROM a;later_copy|f|SELECT id FROM later;mv|t|SELECT g, SUM(v) AS total, COUNT(*) AS n FROM a WHERE g < 9 GROUP BY g");
     try run("REFRESH MATERIALIZED VIEW later");
     try expect("SELECT COUNT(*) FROM later", "5");
+    try expect("SELECT COUNT(*) FROM later_report", "5");
+    try run("REFRESH MATERIALIZED VIEW later_copy");
+    try expect("SELECT COUNT(*) FROM later_copy", "5");
     try run("REFRESH MATERIALIZED VIEW later WITH NO DATA");
+    try run("REFRESH MATERIALIZED VIEW later_copy WITH NO DATA");
+    try run("DROP MATERIALIZED VIEW later_copy");
+    try run("DROP VIEW later_report");
     try rejects("SELECT * FROM later", error.ObjectNotInPrerequisiteState, "SELECT COUNT(*) FROM a", "5");
     try sameState(&[_][]const u8{ matview_probes[0], matview_probes[1], matview_probes[2] });
     // Writes are 42809; REFRESH of a table 42809; dependents 2BP01.

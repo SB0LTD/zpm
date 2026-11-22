@@ -83,9 +83,19 @@ the stored query resolves its own aliases. It preserves doubled quotes and
 keeps the original name resolution for internal ordering. The dump deparser
 emits catalog aliases on supported simple projections with no top-level
 ORDER BY, GROUP BY or DISTINCT ON. The focused Sig suite passed 1,380
-assertions and replayed 276 records. Local stock PG16 and PG18 both restored
-the new dependent-view fixture in both directions, including quoted names,
-result metadata and WAL reopen. General deparsing remains open.
+assertions and replayed 276 records. The packaged binary passed all 39
+stock checks in PostgreSQL 16 and 18 CI, including quoted names, result
+metadata and WAL reopen. The qualified revisions merged as ZPM #293 and
+RAMSQL #100. General deparsing remains open.
+[Exact release qualification](https://github.com/SB0LTD/ramsql/actions/runs/45051553539)
+
+Stock PG16 and PG18 both restore materialized views with no data before
+creating their dependents, then refresh the objects that had data at dump
+time. RAMSQL now binds these definitions without requiring their source to
+be populated. Queries and refreshes that read rows still enforce the
+55000 error. The local Sig contract passed 1,393 assertions and replayed
+284 records. The stock fixture passed both archive directions on both
+versions locally and checked data, population state and WAL reopen.
 
 The stock archive fixture now restores a two-column primary key after
 loading the rows of a fresh table in a single transaction. The WAL uses
