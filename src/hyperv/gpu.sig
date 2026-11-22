@@ -451,8 +451,10 @@ pub fn Gpu(comptime Host: type) type {
         io_status: i32 = 0,
         /// The step `start` stopped at.
         failed: ?Step = null,
-        /// The command (its type) of the last call made, for the log.
+        /// The command (its type) of the last call made, and its answer's
+        /// length, for the log.
         command: u32 = 0,
+        reply_len: usize = 0,
         /// Guest events the host signaled (SIGNALGUESTEVENT) and no one
         /// has taken yet (0: a free slot).
         events: [16]u64 = @splat(0),
@@ -556,6 +558,7 @@ pub fn Gpu(comptime Host: type) type {
         /// An answer of kind T; a shorter one is the host's NTSTATUS alone
         /// (a refusal), kept in `status`.
         fn answer(self: *Self, comptime T: type, body: []const u8) Error!T {
+            self.reply_len = body.len;
             if (body.len >= @sizeOf(T)) return std.mem.bytesToValue(T, body[0..@sizeOf(T)]);
             if (body.len < 4) return error.ShortReply;
             self.status = std.mem.readInt(i32, body[0..4], .little);
@@ -765,24 +768,17 @@ pub fn Gpu(comptime Host: type) type {
             @memcpy(std.mem.asBytes(&self.info)[0..want], body[0..want]);
 
             self.failed = .create_process;
-            var cp = CreateProcess{ .process = 1, .process_id = 1 };
-            for (name[0..@min(name.len, PROCESS_NAME_LENGTH)], 0..) |c, i| cp.process_name[i] = c;
-            const p = try reply(CreateProcessReturn, try self.call(&self.global, std.mem.asBytes(&cp)));
-            if (p.hprocess == 0) return error.Refused;
-            self.process = p.hprocess;
+            self.process = try self.createProcess(name, 1);
 
             self.failed = .query_pci;
             // (D3DKMT_QUERY_DEVICE_IDS: the physical adapter's index, then
             // vendor, device, subsystem vendor, subsystem, revision, bus
-            // type: 28 bytes asked, as the call takes it; the host's answer
-            // after its status starts at the vendor: `pci` is vendor,
-            // device, subsystem vendor, subsystem, revision, bus type, as
-            // galaxy-turing's RTX 2080 Ti answered, 2026-11-21)
+            // type: `pci` from the vendor on)
             var ids: [PCI_IDS_BYTES]u8 = @splat(0);
             const got = try self.queryAdapterInfo(QUERY_PCI_IDS, &ids);
-            if (got < 12) return error.ShortReply;
+            if (got < 16) return error.ShortReply;
             self.pci = @splat(0);
-            for (self.pci[0..@min(got / 4, self.pci.len)], 0..) |*w, i| w.* = std.mem.readInt(u32, ids[4 * i ..][0..4], .little);
+            for (self.pci[0..@min(got / 4 - 1, self.pci.len)], 0..) |*w, i| w.* = std.mem.readInt(u32, ids[4 + 4 * i ..][0..4], .little);
 
             self.failed = .create_device;
             self.device = try self.createDevice();
@@ -797,10 +793,28 @@ pub fn Gpu(comptime Host: type) type {
             @memset(self.msg[0 .. @sizeOf(QueryAdapterInfo) + out.len], 0);
             @memcpy(self.msg[0..@sizeOf(QueryAdapterInfo)], std.mem.asBytes(&qh));
             const r = try self.vcall(self.msg[0 .. @sizeOf(QueryAdapterInfo) + out.len]);
-            try self.ntstatus(r);
-            const n = @min(r.len - 4, out.len);
-            @memcpy(out[0..n], r[4..][0..n]);
-            return n;
+            // (the answer is the query's data alone, no NTSTATUS: the WDDM
+            // 2.7 caps came back as 0x9, the PCI ids with the adapter's
+            // index first, galaxy-turing's RTX 2080 Ti, 2026-11-22; a
+            // shorter one is taken for the host's refusal)
+            self.reply_len = r.len;
+            if (r.len < out.len) {
+                if (r.len >= 4) self.status = std.mem.readInt(i32, r[0..4], .little);
+                return error.Refused;
+            }
+            @memcpy(out, r[0..out.len]);
+            return out.len;
+        }
+
+        /// A process (every later call names one; each has its own GPU
+        /// address space) named `name`; its handle. `cookie`: the guest's
+        /// own number for it.
+        pub fn createProcess(self: *Self, name: []const u8, cookie: u64) Error!u32 {
+            var cp = CreateProcess{ .process = cookie, .process_id = cookie };
+            for (name[0..@min(name.len, PROCESS_NAME_LENGTH)], 0..) |c, i| cp.process_name[i] = c;
+            const p = try self.answer(CreateProcessReturn, try self.call(&self.global, std.mem.asBytes(&cp)));
+            if (p.hprocess == 0) return error.Refused;
+            return p.hprocess;
         }
 
         /// A device of this process; its handle.
@@ -870,7 +884,7 @@ const Play = struct {
                 @intFromEnum(Command.query_adapter_info) => {
                     std.mem.writeInt(u32, r[4..8], 0x10de, .little);
                     std.mem.writeInt(u32, r[8..12], 0x1e07, .little);
-                    len = 36;
+                    len = 28;
                 },
                 @intFromEnum(Command.create_device) => std.mem.writeInt(u32, r[0..4], 0x4000_0040, .little),
                 @intFromEnum(Command.create_paging_queue) => {
