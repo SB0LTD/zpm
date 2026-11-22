@@ -693,7 +693,10 @@ fn alterPrimaryKey() !void {
     try run("CREATE TABLE pairs (a INT, b INT)");
     try run("INSERT INTO pairs VALUES (1,1),(1,2),(2,1)");
     const pair_query = "SELECT a,b FROM pairs ORDER BY a,b";
-    try rejects("ALTER TABLE pairs ADD PRIMARY KEY (a,b)", error.UnsupportedStatement, pair_query, "1|1;1|2;2|1");
+    try run("ALTER TABLE pairs ADD PRIMARY KEY (a,b)");
+    try expect(pair_query, "1|1;1|2;2|1");
+    try rejects("INSERT INTO pairs VALUES (1,2)", error.PrimaryKeyViolation, pair_query, "1|1;1|2;2|1");
+    try rejects("INSERT INTO pairs VALUES (2,NULL)", error.NotNullViolation, pair_query, "1|1;1|2;2|1");
     try sameState(&.{pair_query});
 }
 
