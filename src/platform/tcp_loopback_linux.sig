@@ -36,6 +36,11 @@ const active_established = 4;
 const passive_established = 5;
 const sk_pass = 1;
 const ingress = 1;
+// All eligible flows have one fixed service endpoint and a distinct peer
+// port. Use one bank per side and the full u16 port space in each bank.
+const server_bank = 1 << 16;
+const map_entries = 2 * server_bank;
+const redirect_bytes = 64 * 1024;
 
 fn field(comptime Context: type, comptime name: []const u8) i16 {
     return @offsetOf(Context, "endpoints") + @offsetOf(Endpoints, name);
@@ -45,8 +50,8 @@ fn skip(comptime at: i16, comptime destination: i16) i16 {
     return destination - at - 1;
 }
 
-fn registration(map: linux.fd_t, service: u16, netns: u64) [28]Insn {
-    const done = 26;
+fn registration(map: linux.fd_t, service: u16, netns: u64) [31]Insn {
+    const done = 29;
     return .{
         Insn.ldx(.word, .r0, .r1, @offsetOf(SockOps, "op")),
         Insn.jeq(.r0, active_established, skip(1, 3)),
@@ -64,16 +69,19 @@ fn registration(map: linux.fd_t, service: u16, netns: u64) [28]Insn {
         Insn.ldx(.word, .r2, .r1, field(SockOps, "local_port")),
         Insn.ldx(.word, .r3, .r1, field(SockOps, "remote_port")),
         Insn.be(.word, .r3),
-        Insn.jeq(.r2, @as(i32, service), skip(16, 18)),
+        Insn.jeq(.r2, @as(i32, service), skip(16, 19)),
         Insn.jne(.r3, @as(i32, service), skip(17, done)),
-        Insn.stx(.word, .r10, -8, .r2),
-        Insn.stx(.word, .r10, -4, .r3),
+        Insn.ja(skip(18, 22)),
+        Insn.jeq(.r3, @as(i32, service), skip(19, done)),
+        Insn.mov(.r2, .r3),
+        Insn.add(.r2, server_bank),
+        Insn.stx(.word, .r10, -4, .r2),
         Insn.ld_map_fd1(.r2, map),
         Insn.ld_map_fd2(map),
         Insn.mov(.r3, .r10),
-        Insn.add(.r3, -8),
+        Insn.add(.r3, -4),
         Insn.mov(.r4, 1), // BPF_NOEXIST
-        Insn.call(.sock_hash_update),
+        Insn.call(.sock_map_update),
         Insn.mov(.r0, 1),
         Insn.exit(),
     };
@@ -82,23 +90,27 @@ fn registration(map: linux.fd_t, service: u16, netns: u64) [28]Insn {
 fn verdict(map: linux.fd_t, service: u16, direction: Direction) [18]Insn {
     const done = 16;
     return .{
-        Insn.ldx(.word, .r0, .r1, field(Message, "remote_ip4")),
-        Insn.jne(.r0, loopback, skip(1, done)),
-        Insn.ldx(.word, .r0, .r1, field(Message, "local_ip4")),
-        Insn.jne(.r0, loopback, skip(3, done)),
+        // Only registered sockets reach this program. Their endpoint
+        // addresses, service port and network namespace are already fixed.
         Insn.ldx(.word, .r2, .r1, field(Message, "local_port")),
-        if (direction == .replies) Insn.jne(.r2, @as(i32, service), skip(5, done)) else Insn.ja(0),
-        Insn.ldx(.word, .r3, .r1, field(Message, "remote_port")),
-        Insn.be(.word, .r3),
-        // Swap local and remote ports to look up the peer of this socket.
-        Insn.stx(.word, .r10, -8, .r3),
-        Insn.stx(.word, .r10, -4, .r2),
+        if (direction == .replies) Insn.jne(.r2, @as(i32, service), skip(1, done)) else
+            Insn.jeq(.r2, @as(i32, service), skip(1, 4)),
+        if (direction == .replies) Insn.ja(0) else Insn.add(.r2, server_bank),
+        if (direction == .replies) Insn.ja(0) else Insn.ja(skip(3, 6)),
+        Insn.ldx(.word, .r2, .r1, field(Message, "remote_port")),
+        Insn.be(.word, .r2),
+        Insn.mov(.r3, .r2),
         Insn.ld_map_fd1(.r2, map),
         Insn.ld_map_fd2(map),
-        Insn.mov(.r3, .r10),
-        Insn.add(.r3, -8),
         Insn.mov(.r4, ingress),
-        Insn.call(.msg_redirect_hash),
+        Insn.mov(.r6, .r1),
+        Insn.call(.msg_redirect_map),
+        // Cache only a successful peer resolution. Linux retains the peer
+        // on the sending socket for this bounded byte range.
+        Insn.jne(.r0, sk_pass, skip(12, done)),
+        Insn.mov(.r1, .r6),
+        Insn.mov(.r2, redirect_bytes),
+        Insn.call(.msg_apply_bytes),
         // The helper sets the redirect only if the matching peer exists.
         Insn.mov(.r0, sk_pass),
         Insn.exit(),
@@ -142,14 +154,13 @@ pub const Shortcut = struct {
     message: linux.fd_t,
     cgroup_link: linux.fd_t,
 
-    /// The caller supplies a dedicated cgroup-v2 directory descriptor and
-    /// bounded socket capacity. Both ends must open their sockets in that cgroup.
-    /// The kernel owns map storage. All userspace instructions and log storage
-    /// are fixed-size or caller-owned.
-    pub fn init(cgroup: linux.fd_t, service: u16, capacity: u32, direction: Direction, log: *bpf.Log) !Shortcut {
-        if (service == 0 or capacity < 2) return error.InvalidSocketMap;
+    /// Both endpoints must open their sockets in the supplied dedicated
+    /// cgroup-v2 directory. The kernel owns a fixed two-bank port map.
+    /// All userspace instructions and log storage are fixed-size or caller-owned.
+    pub fn init(cgroup: linux.fd_t, service: u16, direction: Direction, log: *bpf.Log) !Shortcut {
+        if (service == 0) return error.InvalidSocketMap;
         const netns = try netnsCookie();
-        const sockets = try bpf.map_create(.sockhash, 8, 4, capacity);
+        const sockets = try bpf.map_create(.sockmap, 4, 4, map_entries);
         errdefer _ = linux.close(sockets);
         const message = try bpf.prog_load(.sk_msg, &verdict(sockets, service, direction), log, "GPL", 0, 0);
         errdefer _ = linux.close(message);

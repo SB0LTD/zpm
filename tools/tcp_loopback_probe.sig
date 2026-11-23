@@ -24,7 +24,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     var verifier: [16384]u8 = @splat(0);
     var log: linux.BPF.Log = .{ .level = 1, .buf = &verifier };
-    const shortcut = loopback.Shortcut.init(cgroup, port, 128, direction, &log) catch |err| {
+    const shortcut = loopback.Shortcut.init(cgroup, port, direction, &log) catch |err| {
         write(2, verifier[0 .. std.mem.indexOfScalar(u8, &verifier, 0) orelse verifier.len]);
         return err;
     };
