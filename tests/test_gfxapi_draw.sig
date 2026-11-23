@@ -2353,7 +2353,7 @@ test "draw: depth- and stencil-tested draws into block-linear colour with a floa
 /// float depth image `depth`, then EQUAL (another quarter where the
 /// depth is the pass's own): all on the 3D engine or all on the compute
 /// raster, as `engine3d` says.
-fn slopedPasses(e: *engine.Engine, img: *engine.Image, depth: *engine.Image, ab: *engine.Image, pts: [4][2]f32, engine3d: bool) !void {
+fn slopedPasses(e: *engine.Engine, img: *engine.Image, depth: *engine.Image, ab: *engine.Image, pts: [4][2]f32, engine3d: bool, bias: [3]f32) !void {
     e.fill(img, img.bounds(), 0, 0);
     e.fillDepth(depth, depth.bounds(), 1.0, 0, 0xff);
     var verts: [6][4]f32 = undefined;
@@ -2371,6 +2371,9 @@ fn slopedPasses(e: *engine.Engine, img: *engine.Image, depth: *engine.Image, ab:
         const before = e.stats.graphics_draws;
         var d = raster.Draw{ .pipe = &solid, .color = img, .depth = depth, .depth_test = true, .depth_write = pass == 0, .depth_func = if (pass == 0) 0b001 else 0b010, .rect = .{ .x0 = 0, .y0 = 0, .x1 = W, .y1 = H }, .count = 6, .center = .{ W / 2, H / 2 }, .half = .{ W / 2, H / 2 }, .uniforms = &quarter, .blend = add };
         d.attrs[0] = .{ .buf = ab, .stride = 16, .comps = 4 };
+        d.bias_factor = bias[0];
+        d.bias_units = bias[1];
+        d.bias_clamp = bias[2];
         if (!e.draw(&d)) return error.NotDrawn;
         e.finish();
         if (e.lost or e.why_pipe != null) return error.EngineLost;
@@ -2712,7 +2715,7 @@ test "draw: the compute raster's float depth is the 3D engine's within 3 ulps (p
         for (&zd) |*z| z.top_down = top_down;
         for (shapes, 0..) |s, si| {
             for (0..2) |n| {
-                slopedPasses(e, &img, &zd[n], &ab, s, n == 1) catch |err| {
+                slopedPasses(e, &img, &zd[n], &ab, s, n == 1, .{ 0, 0, 0 }) catch |err| {
                     std.debug.print("float depth ulps: shape {d} (top down {}, engine {}): {s}; the 3D engine: {s}\n", .{ si, top_down, n == 1, @errorName(err), Rtx3d.engine3d.why });
                     if (e.why_pipe) |w| std.debug.print("float depth ulps: the engine's pipeline: {s}, lost {}\n", .{ @errorName(w), e.lost });
                     return err;
@@ -2743,6 +2746,60 @@ test "draw: the compute raster's float depth is the 3D engine's within 3 ulps (p
             std.debug.print("float depth ulps: shape {d} (top down {}): {d} pixels apart, at most {d} ulps\n", .{ si, top_down, differ, most });
             try std.testing.expect(most <= 3);
         }
+    }
+}
+
+test "draw: depth bias (a slope's factor, units, a clamp of either sign) on the RTX's 3D engine: the compute raster's biased float depths within 3 ulps, the same pixels; each path's EQUAL pass meets its own biased LESS pass" {
+    Rtx3d.engine3d = .{};
+    Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+    Rtx.dev.withEngine(&Rtx3d.engine3d);
+    eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs, .graphics = true });
+    defer eng_rtx.deinit();
+    defer eng_rtx.unloadPipeline(&solid);
+    const e = &eng_rtx;
+    var img = e.newBlockImage(W, H, .rgba8) orelse return error.OutOfMemory;
+    defer e.freeImage(&img);
+    var zd: [2]engine.Image = undefined;
+    for (&zd) |*z| z.* = e.newImageSamples(W, H, .d24s8, 1) orelse return error.OutOfMemory;
+    defer for (&zd) |*z| e.freeImage(z);
+    var ab = e.newBuffer(6 * 16) orelse return error.OutOfMemory;
+    defer e.freeImage(&ab);
+    const shape = [4][2]f32{ .{ 5.37, 3.11 }, .{ 58.93, 6.71 }, .{ 52.18, 29.42 }, .{ 9.66, 26.05 } };
+    // (units alone, a slope's factor with units, each clamped: a clamp
+    // that bites (under the raw offset) and a negative bias's)
+    const biases = [_][3]f32{ .{ 0, 4000, 0 }, .{ 1.5, 400, 0 }, .{ 2.5, 60000, 0.004 }, .{ -1, -3000, -0.0001 } };
+    var words: [2][W * H]u32 = undefined;
+    var plain: [W * H]u32 = undefined;
+    var pic: [W * H * 4]u8 = undefined;
+    const one: u32 = @bitCast(@as(f32, 1.0));
+    try slopedPasses(e, &img, &zd[0], &ab, shape, false, .{ 0, 0, 0 });
+    e.readDepthBits(&zd[0], 0, 0, W, H, &plain, null);
+    for (biases, 0..) |b, bi| {
+        for (0..2) |n| {
+            slopedPasses(e, &img, &zd[n], &ab, shape, n == 1, b) catch |err| {
+                std.debug.print("depth bias {d} (engine {}): {s}; the 3D engine: {s}\n", .{ bi, n == 1, @errorName(err), Rtx3d.engine3d.why });
+                return err;
+            };
+            e.readDepthBits(&zd[n], 0, 0, W, H, &words[n], null);
+            e.read(&img, 0, 0, W, H, &pic, W * 4, .rgba8);
+            for (0..W * H) |p| {
+                if (words[n][p] == one) continue;
+                try std.testing.expectEqual(@as(u32, 2), hits(pic[p * 4]));
+            }
+        }
+        var most: u32 = 0;
+        var moved: u32 = 0;
+        for (0..W * H) |p| {
+            const a = words[0][p];
+            const c = words[1][p];
+            try std.testing.expectEqual(a == one, c == one);
+            const ulps = if (a > c) a - c else c - a;
+            most = @max(most, ulps);
+            moved += @intFromBool(a != one and a != plain[p]);
+        }
+        std.debug.print("depth bias {d}: at most {d} ulps apart, {d} pixels moved by it\n", .{ bi, most, moved });
+        try std.testing.expect(most <= 3);
+        try std.testing.expect(moved > 100);
     }
 }
 

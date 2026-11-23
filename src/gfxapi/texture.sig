@@ -1115,8 +1115,8 @@ pub fn fetchArray(k: *kir.Kernel, slot: Slot, x: Arg, y: Arg, layer: ?Arg, kind:
 
 /// Where a typed UAV's texel (x, y, layer: u32) is: its byte offset in
 /// the binding, and whether it is inside the view (level 0 of the
-/// descriptor: a UAV view's level; its layers or depth). Rows only (a
-/// view's image is never block linear).
+/// descriptor: a UAV view's level; its layers or depth). Rows, or block
+/// linear (an image the 3D engine drew into: never layered).
 pub const Place = struct { addr: V, inside: V };
 
 pub fn texelPlace(k: *kir.Kernel, slot: Slot, x: Arg, y: Arg, layer: ?Arg) Place {
@@ -1129,7 +1129,22 @@ pub fn texelPlace(k: *kir.Kernel, slot: Slot, x: Arg, y: Arg, layer: ?Arg) Place
         lv = sliceOf(k, lv, z);
     }
     const shift = k.op3(.bfe, .u32, r(d.fmt), u(0), u(3));
-    const addr = k.op2(.iadd, .u32, r(lv.off), r(k.op3(.imad, .u32, y, r(lv.stride), r(k.op2(.shl, .u32, x, r(shift))))));
+    const xb = k.op2(.shl, .u32, x, r(shift));
+    const addr = k.reg(.u32);
+    k.set(addr, .iadd, r(lv.off), r(k.op3(.imad, .u32, y, r(lv.stride), r(xb))), kir.no);
+    // (an image the 3D engine drew into, made block linear: the GOB the
+    // texel is in and its place in it, as `texel` reads it; a branch on the
+    // descriptor, so every lane takes the same way. Written as rows, a
+    // block-linear target's texels landed in other GOBs: Superposition's
+    // picture in bands 128 rows high)
+    k.ifp(r(k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(d.fmt), u(F_BLOCK))), u(0))));
+    {
+        const swz = k.op3(.bfe, .u32, r(d.fmt), u(16), u(2));
+        const gobs = k.op3(.bfe, .u32, r(d.fmt), u(18), u(3));
+        const at = blocklinear.address(k, r(lv.stride), r(gobs), r(swz), r(xb), y);
+        k.set(addr, .iadd, r(lv.off), r(at), kir.no);
+    }
+    k.endif();
     // (and never past the image)
     const last = k.op2(.shl, .u32, r(d.last), u(2));
     inside = k.op2(.pand, .pred, r(inside), r(k.cmp(.u32, .le, r(addr), r(last))));

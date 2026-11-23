@@ -255,6 +255,7 @@ pub const Engine = struct {
             else => false,
         }, "a culled face other than FRONT, BACK or FRONT_AND_BACK");
         try g.need(g.reg(gr.OGL_SET_FRONT_FACE) == gl3d.FRONT_CW or g.reg(gr.OGL_SET_FRONT_FACE) == gl3d.FRONT_CCW, "a front face other than CW or CCW");
+        try g.need(g.reg(gl3d.SET_POLY_OFFSET_FILL) == 0 or g.reg(gl3d.SET_DEPTH_BIAS_CONTROL) == 0, "a depth bias whose unit follows the depth's format: not modelled");
         const topo = g.reg(gr.SET_PRIMITIVE_TOPOLOGY);
         try g.need(g.reg(gr.SET_PRIMITIVE_TOPOLOGY_CONTROL) == 1 and topo >= 4 and topo <= 6, "not triangles, a strip or a fan by SET_PRIMITIVE_TOPOLOGY");
         try g.need(g.reg(gr.SET_DRAW_CONTROL_A) == gr.DRAW_CONTROL and g.reg(gr.SET_DRAW_CONTROL_A + 4) >= 1, "SET_DRAW_CONTROL is not instances from the first");
@@ -814,7 +815,16 @@ pub const Engine = struct {
             w[k] = @floatCast(g.vfloat(v, POSITION + 3));
             win[k] = g.win[v];
         }
-        return planeOf(zc, w, win, @floatCast(g.zscale), @floatCast(g.zoffset), area);
+        var p = planeOf(zc, w, win, @floatCast(g.zscale), @floatCast(g.zoffset), area);
+        // depth bias (POLY_OFFSET_FILL, the unit a 24-bit depth's step,
+        // SET_DEPTH_BIAS in those steps): the compute raster's, op for op
+        if (g.reg(gl3d.SET_POLY_OFFSET_FILL) != 0) {
+            const slope: f32 = @bitCast(g.reg(gl3d.SET_SLOPE_SCALE_DEPTH_BIAS));
+            const units: f32 = @bitCast(g.reg(gl3d.SET_DEPTH_BIAS));
+            const clamp: f32 = @bitCast(g.reg(gl3d.SET_DEPTH_BIAS_CLAMP));
+            p.z0 = biased(p.z0, p.gx, p.gy, slope, units, clamp);
+        }
+        return p;
     }
 
     /// Whether a triangle whose grid places give `area` (edge(v0, v1, v2):
@@ -1229,6 +1239,18 @@ pub fn shaderDepth(z: f32) f32 {
 }
 
 /// x rounded to the nearest whole number, ties to even (as cvt's .rne).
+/// z0 moved by a depth bias as gfxapi's compute raster moves it (raster.sig's
+/// setup): factor * max(|gx|, |gy|) + units * 2^-24, clamped to `clamp`'s
+/// side (0: not clamped); no bias (factor and units 0): z0 as it is.
+pub fn biased(z0: f32, gx: f32, gy: f32, slope: f32, units: f32, clamp: f32) f32 {
+    if (slope == 0 and units == 0) return z0;
+    const dz = @max(@abs(gx), @abs(gy));
+    const raw = slope * dz + units * (1.0 / 16777216.0);
+    var off = if (clamp > 0) @min(raw, clamp) else raw;
+    if (clamp < 0) off = @max(off, clamp);
+    return z0 + off;
+}
+
 pub fn rne(x: f32) f32 {
     return if (@abs(x - @trunc(x)) == 0.5) 2 * @round(x / 2) else @round(x);
 }

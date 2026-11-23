@@ -129,6 +129,38 @@ test "compute: a typed UAV (RGBA32F, then RGBA8) from a texture and the thread i
     };
 }
 
+test "compute: a typed UAV into a block-linear image (one the 3D engine drew into): each texel where the GOB layout puts it, as the sampler reads it" {
+    const W = 64;
+    const H = 64;
+    const blocklinear = @import("../blocklinear.sig");
+    var src: [W * H * 16]u8 align(16) = undefined;
+    for (0..W * H * 4) |i| putF32(&src, i, @floatFromInt(i % 11));
+    // (blocks four GOBs high, 32 rows: two blocks down; sixteen GOBs
+    // across, a row of 1024 bytes)
+    const pitch: u32 = W * 16;
+    const gobs: u3 = 2;
+    const bytes = blocklinear.planeBytes(pitch, H, gobs);
+    var dst: [W * H * 16 * 2]u8 align(16) = undefined;
+    @memset(&dst, 0);
+    var uni: [4 + 2 * D]u32 = undefined;
+    const scale = [4]f32{ 0.5, 2, -1, 0.25 };
+    for (scale, 0..) |sc, c| uni[c] = @bitCast(sc);
+    var si = image(&src, W, H, .rgba32f);
+    texture.descriptor(.{ .img = &si }, uni[4..][0..D]);
+    var di = image(dst[0..@intCast(bytes)], W, H, .rgba32f);
+    di.stride = pitch;
+    di.layout = .{ .block = true, .swizzle = .turing2d, .gobs_log2 = gobs };
+    texture.descriptor(.{ .img = &di }, uni[4 + D ..][0..D]);
+    var l = Lay{ .cb_vecs = 1, .textures = 1 };
+    l.uavs[0] = .{ .b = 2, .word = 4 + D };
+    try run(&fx.cs_typed, &l, &.{ std.mem.sliceAsBytes(&uni), &src, dst[0..@intCast(bytes)] }, .{ W / 8, H / 8, 1 });
+    for (0..H) |y| for (0..W) |x| for (0..4) |c| {
+        const add: f32 = if (c == 0) @floatFromInt(x) else if (c == 1) @floatFromInt(y) else 0;
+        const at = blocklinear.addressCpu(pitch, gobs, .turing2d, @intCast(x * 16 + c * 4), @intCast(y));
+        try std.testing.expectEqual(f32At(&src, (y * W + x) * 4 + c) * scale[c] + add, f32At(&dst, at / 4));
+    };
+}
+
 test "compute: structured buffers, GetDimensions and an early return" {
     const N = 100;
     var in: [N * 20]u8 align(16) = undefined;

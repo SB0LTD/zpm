@@ -1503,6 +1503,14 @@ pub const Engine = struct {
     said_compute: [16][]const u8 = @splat(""),
     /// The draws each of said_compute's reasons sent to the compute kernels.
     compute_why_n: [16]u32 = @splat(0),
+    /// Samples through the GPU's texture unit where the device has one
+    /// (off: every pixel program samples in its own code; to compare).
+    tex_unit: bool = true,
+    /// The 3D engine's last refusal (graphicsDraw's), and the float
+    /// targets' draws not drawn, said once each by refusal and target
+    /// shape (the compute raster writes 8-bit pixels).
+    last_why: []const u8 = "",
+    said_float: [16]u64 = @splat(0),
     said_promote: bool = false,
     said_rows: [8][]const u8 = @splat(""),
     compiler: Compiler = compileAny,
@@ -2936,7 +2944,7 @@ pub const Engine = struct {
         const gl = gpu.nvidia_gl;
         const s = kir.Storage{ .insts = &e.kir_insts, .tys = &e.kir_tys };
         st.asm_work.sched = .{};
-        var pk = raster.pixelStage(s, p, d.caps.tex);
+        var pk = raster.pixelStage(s, p, d.caps.tex and e.tex_unit);
         try pk.finish();
         const pbin = try gl.compileStage(&pk, d.caps, st, .pixel, 0, &e.pcode);
         const reads = st.io.loads;
@@ -2998,6 +3006,7 @@ pub const Engine = struct {
     /// (the compute kernels draw it). Said once a reason, per engine.
     fn graphicsDraw(e: *Engine, d: *const raster.Draw) ?bool {
         if (!e.graphics or !e.onGpu()) return null;
+        e.last_why = "not said (a buffer not usable by the GPU, or no memory)";
         if (e.compute_only) {
             e.stats.compute_draws += 1;
             e.sayCompute("kept there (Engine.compute_only)");
@@ -3016,6 +3025,7 @@ pub const Engine = struct {
         // it did not (Unigine's, thousands a frame))
         if (!e.oneLayout(d)) {
             e.stats.compute_draws += 1;
+            e.last_why = "colour targets of both layouts, one kept in rows (oneLayout)";
             return null;
         }
         // (the engine refuses a depth target beside a colour target of rows
@@ -3198,6 +3208,8 @@ pub const Engine = struct {
             // rows run the other way, so its front face is the other)
             .cull = d.cull,
             .front_ccw = d.front_ccw != flip,
+            // (the slopes' sizes, so the bias, the same flipped or not)
+            .bias = .{ d.bias_factor, d.bias_units, d.bias_clamp },
             .tex = tex_pools,
         };
         if (d.stencil) |st| if (st != zimg) e.vramIn(st);
@@ -3535,7 +3547,25 @@ pub const Engine = struct {
         }
     }
 
+    /// A float target's draw not drawn: why the 3D engine refused it and
+    /// the targets' shapes, said once a refusal and first target's shape.
+    fn sayFloat(e: *Engine, d: *const raster.Draw) void {
+        const c = d.color;
+        const key: u64 = (@as(u64, @intFromPtr(e.last_why.ptr)) *% 0x9e37_79b9_7f4a_7c15) ^ (@as(u64, c.width) << 40) ^ (@as(u64, c.height) << 20) ^ (@as(u64, c.stride) << 2) ^ @intFromEnum(c.format) ^ @as(u64, @intFromBool(d.color_off)) << 63;
+        for (&e.said_float) |*s| {
+            if (s.* == key) return;
+            if (s.* == 0) {
+                s.* = key;
+                var more: u32 = 0;
+                for (d.targets[1..]) |tt| more += @intFromBool(tt != null);
+                report.say(.pipeline, "a float target's draw not drawn: {s}; target {d}x{d} {s} stride {d} at +{d} ({s}, {s}), {d} more targets, depth {s}, {d} vertices", .{ e.last_why, c.width, c.height, @tagName(c.format), c.stride, c.buf.gpu % 4096, if (c.layout.block) "block linear" else "rows", if (d.color_off) "colour off" else "colour on", more, if (d.depth != null) "yes" else "no", d.count });
+                return;
+            }
+        }
+    }
+
     fn sayCompute(e: *Engine, why: []const u8) void {
+        e.last_why = why;
         for (&e.said_compute, 0..) |*s, i| {
             if (s.len != 0 and s.ptr == why.ptr) {
                 e.compute_why_n[i] +%= 1;
@@ -3602,6 +3632,7 @@ pub const Engine = struct {
         // so the draw is not made, said and counted)
         if (floatTargetIn(d)) {
             e.stats.float_not_drawn += 1;
+            e.sayFloat(d);
             e.sayCompute("a float colour target off the 3D engine: not drawn (the compute raster writes 8-bit pixels)");
             return true;
         }

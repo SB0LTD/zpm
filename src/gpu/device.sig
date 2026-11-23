@@ -369,6 +369,9 @@ pub const Graphics = struct {
     /// count (x right, y as its rows grow: the window's after the
     /// viewport).
     front_ccw: bool = true,
+    /// Depth bias of filled triangles: factor, units (2^-24 each), clamp
+    /// (gfxapi raster.Draw's bias_factor, bias_units, bias_clamp).
+    bias: [3]f32 = .{ 0, 0, 0 },
     /// Colour targets 1 .. 7 (the pixel program's output t into target
     /// t; null: none): as wide and high as target 0, rows of `stride`
     /// bytes from `va`.

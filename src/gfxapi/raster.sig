@@ -938,7 +938,6 @@ pub fn stageWhyNot(d: *const Draw) ?[]const u8 {
     }
     if (d.query != null) return "an occlusion query";
     if (d.alpha_to_coverage or d.sample_mask & 1 == 0) return "alpha to coverage or a sample mask";
-    if (d.bias_factor != 0 or d.bias_units != 0) return "depth bias";
     if (!d.color_off and !d.color.gpuDrawable()) return "a target the engine does not draw into";
     if (d.blend) |b| {
         if (b.gl[0] == 0xffff) return "a blend not given as GL's factors";

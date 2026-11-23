@@ -285,6 +285,13 @@ pub const Draw = struct {
     /// Front faces counter-clockwise in the window's coordinates (x
     /// right, y as the rows grow).
     front_ccw: bool = true,
+    /// Depth bias (polygon offset) of filled triangles: factor, units,
+    /// clamp. A triangle's depth moves by factor * max(|dz/dx|, |dz/dy|) +
+    /// units * 2^-24, at most |clamp| toward its sign (0: no clamp), as
+    /// gfxapi's compute raster moves it: the unit a 24-bit depth's step
+    /// whatever the depth's format (SET_DEPTH_BIAS_CONTROL's
+    /// DEPTH_FORMAT_DEPENDENT off, NVK's FORCE_UNORM representation).
+    bias: [3]f32 = .{ 0, 0, 0 },
     /// Colour targets 1 .. 7 (null: none; one inside the highest is sent
     /// off: format 0): as wide and high as target 0.
     more: [7]?More = @splat(null),
@@ -483,6 +490,16 @@ fn ctWrite(mask: u4) u32 {
 
 /// OGL_SET_CULL_FACE (cl9097.h): the faces culled when OGL_SET_CULL is on.
 pub const OGL_SET_CULL_FACE: u32 = 0x1920;
+/// Depth bias (clcb97.h): filled triangles' offset on, its constant (with
+/// DEPTH_FORMAT_DEPENDENT off, in 24-bit steps as the API gives it: the
+/// real RTX's depths moved by twice as much when it was sent doubled, as
+/// nouveau's nvc0 sends it for the format-dependent unit), its slope
+/// factor, its clamp, and whether the unit follows the depth's format.
+pub const SET_POLY_OFFSET_FILL: u32 = 0x0dc8;
+pub const SET_DEPTH_BIAS_CONTROL: u32 = 0x1110;
+pub const SET_SLOPE_SCALE_DEPTH_BIAS: u32 = 0x156c;
+pub const SET_DEPTH_BIAS: u32 = 0x15bc;
+pub const SET_DEPTH_BIAS_CLAMP: u32 = 0x187c;
 pub const CULL_FRONT: u32 = 0x404;
 pub const CULL_BACK: u32 = 0x405;
 pub const CULL_FRONT_AND_BACK: u32 = 0x408;
@@ -630,6 +647,15 @@ fn emitDraw(p: *Push, d: *const Draw, whole: bool) void {
         });
         one(p, gr.OGL_SET_CULL, 1);
     } else one(p, gr.OGL_SET_CULL, 0);
+    // (the depth bias: every draw's own, as the cull's)
+    const biased = d.bias[0] != 0 or d.bias[1] != 0;
+    one(p, SET_POLY_OFFSET_FILL, @intFromBool(biased));
+    if (biased) {
+        one(p, SET_DEPTH_BIAS_CONTROL, 0);
+        one(p, SET_DEPTH_BIAS, bits(d.bias[1]));
+        one(p, SET_SLOPE_SCALE_DEPTH_BIAS, bits(d.bias[0]));
+        one(p, SET_DEPTH_BIAS_CLAMP, bits(d.bias[2]));
+    }
     if (d.depth) |z| {
         // (as NVK sends a Blackwell depth image: X8Z24 alone, or S8Z24
         // with its stencil the SET_ST_* plane; the width in words of a

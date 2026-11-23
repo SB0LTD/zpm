@@ -818,6 +818,7 @@ pub const Adapter = struct {
             .instances = g.instances,
             .cull = g.cull,
             .front_ccw = g.front_ccw,
+            .bias = g.bias,
             .depth = if (g.depth) |z| .{
                 .va = z.va,
                 .stencil_va = z.stencil_va,
