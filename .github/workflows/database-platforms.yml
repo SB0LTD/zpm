@@ -24,7 +24,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SIG_RELEASE_TAG: sig-0.6.4-zig0.17.0.90a898d
+  SIG_RELEASE_TAG: sig-0.6.5-zig0.17.0.3c72687
 
 jobs:
   parameter-oracle:
@@ -94,16 +94,16 @@ jobs:
         include:
           - os: ubuntu-latest
             timeout_minutes: 95
-            asset: sig-0.6.4-zig0.17.0.90a898d-x86_64-linux.tar.xz
-            sha256: 8dd32622531b5f81dbb12502c78e187141dd42ea3553f4d9e2c09c3e82d64a89
+            asset: sig-0.6.5-zig0.17.0.3c72687-x86_64-linux.tar.xz
+            sha256: 179094228e2e6b0db3a5a1e01a8a57e8e91db6aa3b5ca80094ca22d870cc373a
           - os: macos-latest
             timeout_minutes: 110
-            asset: sig-0.6.4-zig0.17.0.90a898d-aarch64-macos.tar.xz
-            sha256: 75ae868e63b6a90ffd3e282f410b18e5098ea87d02cbdc0fd95224f5e922491f
+            asset: sig-0.6.5-zig0.17.0.3c72687-aarch64-macos.tar.xz
+            sha256: a936b163c87b471b603caa78aa84d4542c28b9ce3885f502d6901d68a3d716ae
           - os: windows-latest
             timeout_minutes: 110
-            asset: sig-0.6.4-zig0.17.0.90a898d-x86_64-windows.zip
-            sha256: 49fc99ac20af7841a5b686c68a8720515deda9c28dcad0cb9191fa0de30e33a0
+            asset: sig-0.6.5-zig0.17.0.3c72687-x86_64-windows.zip
+            sha256: 291a3225ff33c32e8c479471c44be6db0d811d6023d759c64e0a7d5bf810576c
     defaults:
       run:
         shell: pwsh

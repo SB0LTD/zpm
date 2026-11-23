@@ -54,6 +54,7 @@ pub fn ArrayEval(comptime config: types.Config, comptime E: type) type {
                     }, &first, &second, n.ty);
                 },
                 .array_to_string => toString(ctx, n),
+                .array_remove => remove(ctx, n),
                 else => measure(ctx, n),
             };
         }
@@ -139,6 +140,16 @@ pub fn ArrayEval(comptime config: types.Config, comptime E: type) type {
                 }
             }
             if (any_null) return .null_value;
+            if (node(ctx, n.b).ty == .name) {
+                // PostgreSQL treats name as a fixed-length zero-padded byte
+                // array, with a zero-based index and a "char" result.
+                if (layout.count != 1) return .null_value;
+                const index = lower[0].?;
+                if (index < 0 or index >= types.pg_name_bytes) return .null_value;
+                const offset: usize = @intCast(index);
+                const bytes = base.text.slice();
+                return .{ .pg_internal_char = if (offset < @min(bytes.len, types.pg_name_bytes - 1)) bytes[offset] else 0 };
+            }
             const bytes = base.array.slice();
             const shape = A.shape(bytes);
             if (!layout.slice()) {
@@ -327,6 +338,34 @@ pub fn ArrayEval(comptime config: types.Config, comptime E: type) type {
                     return false;
                 },
             }
+        }
+
+        fn remove(ctx: *const E.Context, n: *const ast.Node) Error!V.Cell {
+            const source = try E.eval(ctx, n.b);
+            const needle = try E.eval(ctx, node(ctx, n.b).next);
+            if (source == .null_value) return .null_value;
+            var layout = A.shape(source.array.slice());
+            if (layout.ndim == 0) return source;
+            if (layout.ndim != 1) return error.UnsupportedStatement;
+            var reader = A.Reader.init(source.array.slice());
+            var cell: V.Cell = undefined;
+            var kept: u32 = 0;
+            while (reader.next(&cell)) {
+                try ctx.session.checkpoint();
+                if (V.compare(&cell, &needle) != 0) kept += 1;
+            }
+            if (kept == layout.dims[0]) return source;
+            if (kept == 0) return empty(layout.element);
+
+            layout.dims[0] = kept;
+            var out: V.Text = .{};
+            var writer = try A.Writer.begin(&out, &layout);
+            reader = A.Reader.init(source.array.slice());
+            while (reader.next(&cell)) {
+                try ctx.session.checkpoint();
+                if (V.compare(&cell, &needle) != 0) try writer.append(&cell);
+            }
+            return .{ .array = out };
         }
 
         /// array_to_string(array, delimiter [, null_string]).

@@ -1357,6 +1357,30 @@ pub fn blAddress8(pitch: u32, gobs: u3, x: u32, y: u32) usize {
     return (@as(usize, block) << (@as(u6, gobs) + 9)) + gob * 512 + inner;
 }
 
+/// Byte `xb` of row `y` of a block-linear plane of 16-bit texels on
+/// Blackwell: its GOBs swizzled (x/32)*256 + ((x%32)/16)*128 + y*16 + x%16
+/// (drm_fourcc.h's GB20x 16-bpp sector layout; gfxapi blocklinear's
+/// Blackwell16).
+pub fn blAddress16(pitch: u32, gobs: u3, xb: u32, y: u32) usize {
+    const shift: u5 = @as(u5, gobs) + 3;
+    const block = (y >> shift) * (pitch / 64) + xb / 64;
+    const gob = (y >> 3) & ((@as(u32, 1) << gobs) - 1);
+    const ix = xb % 64;
+    const inner = (ix / 32) * 256 + ((ix % 32) / 16) * 128 + (y % 8) * 16 + ix % 16;
+    return (@as(usize, block) << (@as(u6, gobs) + 9)) + gob * 512 + inner;
+}
+
+/// Texel (x, y) of a block-linear colour target of `bytes`-byte texels,
+/// in the GOBs Blackwell draws them in: 8-bit Blackwell8's, 16-bit
+/// Blackwell16's, 32-bit Turing2D's.
+fn blTexel(pitch: u32, gobs: u3, bytes: u32, x: u32, y: u32) usize {
+    return switch (bytes) {
+        1 => blAddress8(pitch, gobs, x, y),
+        2 => blAddress16(pitch, gobs, x * 2, y),
+        else => blAddress(pitch, gobs, x * bytes, y),
+    };
+}
+
 /// Byte `xb` of row `y` of a block-linear surface (`pitch` bytes across,
 /// blocks of 2^gobs GOBs, Turing2D's swizzle: 32-bit texels).
 pub fn blAddress(pitch: u32, gobs: u3, xb: u32, y: u32) usize {
@@ -1426,7 +1450,7 @@ fn pixelBytes(f: Fmt) u32 {
 /// [0, 1] first), the channels `mask` names alone written.
 fn write(t: Target, x: u32, y: u32, src0: [4]f32, bl: ?Blend, mask: u4) void {
     const one: f32 = 1.0 / 255.0;
-    const at = if (t.gobs) |n| blAddress(t.pitch, n, x * pixelBytes(t.format), y) else @as(usize, y) * t.pitch + @as(usize, x) * pixelBytes(t.format);
+    const at = if (t.gobs) |n| blTexel(t.pitch, n, pixelBytes(t.format), x, y) else @as(usize, y) * t.pitch + @as(usize, x) * pixelBytes(t.format);
     // (where each of r, g, b, a is among the pixel's bytes; none: not kept)
     const order: [4]?u8 = switch (t.format) {
         .bgra8 => .{ 2, 1, 0, 3 },

@@ -1,4 +1,4 @@
-//! Expression evaluation over bound nodes (Layer 0, design §4.1).
+//! Expression evaluation over bound nodes (Layer 0, design Ã‚Â§4.1).
 //!
 //! Three-valued logic: AND/OR/NOT, IS [NOT] TRUE/FALSE/UNKNOWN/NULL, IN,
 //! BETWEEN and LIKE follow PostgreSQL's NULL rules; WHERE keeps a row only
@@ -372,7 +372,7 @@ pub fn Eval(comptime config: types.Config) type {
             return &base[n.column];
         }
 
-        fn textCell(bytes: []const u8) Error!V.Cell {
+        pub fn textCell(bytes: []const u8) Error!V.Cell {
             if (bytes.len > config.text_bytes) return error.TextCapacity;
             var text: V.Text = .{ .len = bytes.len };
             @memcpy(text.bytes[0..bytes.len], bytes);
@@ -470,7 +470,61 @@ pub fn Eval(comptime config: types.Config) type {
             return textCell(types.sqlTypeName(known));
         }
 
-        /// Discovery functions and regclass/regtype conversions (design §4.10).
+        fn aclDefault(ctx: *const Context, kind: u8, owner: u32) Error!V.Cell {
+            const Acl = @import("catalog_acl.sig").Acl(V);
+            const privileges = switch (kind) {
+                'c' => return Acl.empty(),
+                'd' => "CTc",
+                'f' => "X",
+                'T', 'l' => "U",
+                'n' => "UC",
+                'r' => "arwdDxt",
+                's' => "rwU",
+                't' => "C",
+                'F', 'S' => "U",
+                'L' => "rw",
+                'p' => "sA",
+                else => return error.UnsupportedStatement,
+            };
+            const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
+            const get_name = hook.catalog_text orelse return error.UnsupportedStatement;
+            var buffer: [64]u8 = undefined;
+            const used = try get_name(hook.ptr, .role_name, owner, 0, 0, &buffer);
+            const name = if (used) |len| buffer[0..len] else @import("std").fmt.bufPrint(&buffer, "{d}", .{owner}) catch unreachable;
+            return switch (kind) {
+                'd' => Acl.publicAndOwner(name, privileges, "Tc"),
+                'f', 'T', 'l' => Acl.publicAndOwner(name, privileges, privileges),
+                else => Acl.ownerOnly(name, privileges),
+            };
+        }
+
+        /// Discovery functions and regclass/regtype conversions (design Ã‚Â§4.10).
+        fn currentSchemas(ctx: *const Context, implicit: bool) Error!V.Cell {
+            const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
+            const read = hook.schema_path orelse return error.UnsupportedStatement;
+            var names: [2][]const u8 = undefined;
+            const count = read(hook.ptr, implicit, &names);
+            var result: V.Text = .{};
+            var writer = try V.Arrays.Writer.begin(&result, &.{
+                .element = .name, .ndim = if (count == 0) 0 else 1,
+                .dims = .{ @intCast(count), 0, 0, 0, 0, 0 },
+            });
+            for (names[0..count]) |name| {
+                const cell = try textCell(name);
+                try writer.append(&cell);
+            }
+            return .{ .array = result };
+        }
+
+        // PostgreSQL encoding IDs describe names independently of conversion support.
+        const encoding_names = [_][]const u8{
+            "SQL_ASCII", "EUC_JP", "EUC_CN", "EUC_KR", "EUC_TW", "EUC_JIS_2004", "UTF8", "MULE_INTERNAL",
+            "LATIN1", "LATIN2", "LATIN3", "LATIN4", "LATIN5", "LATIN6", "LATIN7", "LATIN8", "LATIN9", "LATIN10",
+            "WIN1256", "WIN1258", "WIN866", "WIN874", "KOI8R", "WIN1251", "WIN1252",
+            "ISO_8859_5", "ISO_8859_6", "ISO_8859_7", "ISO_8859_8", "WIN1250",
+            "WIN1253", "WIN1254", "WIN1255", "WIN1257", "KOI8U", "SJIS", "BIG5", "GBK", "UHC", "GB18030", "JOHAB", "SHIFT_JIS_2004",
+        };
+
         fn catalogValue(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
             switch (n.func) {
                 .current_database => return textCell(ctx.session.database),
@@ -480,6 +534,16 @@ pub fn Eval(comptime config: types.Config) type {
             const first = try eval(ctx, n.b);
             if (first == .null_value) return .null_value;
             switch (n.func) {
+                .current_schemas => return currentSchemas(ctx, first.boolean),
+                .pg_encoding_to_char => {
+                    const id = first.integer;
+                    return textCell(if (id >= 0 and id < encoding_names.len) encoding_names[@intCast(id)] else "");
+                },
+                .acldefault => {
+                    const owner = try eval(ctx, node(ctx, n.b).next);
+                    if (owner == .null_value) return .null_value;
+                    return aclDefault(ctx, first.pg_internal_char, @intCast(owner.integer));
+                },
                 .pg_table_is_visible => {
                     const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
                     const visible = hook.relation_visible orelse return error.UnsupportedStatement;
@@ -489,6 +553,10 @@ pub fn Eval(comptime config: types.Config) type {
                     if (types.typeByName(first.text.slice())) |data_type| return .{ .integer = types.typeOid(data_type) };
                     if (n.func == .to_regtype) return .null_value;
                     return error.UndefinedObject;
+                },
+                .to_regproc => {
+                    const oid = (try value_module.routineOid(ctx.session, first.text.slice(), false)) orelse return .null_value;
+                    return .{ .regproc = oid };
                 },
                 .to_regclass, .regclass_in => {
                     const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
@@ -552,9 +620,13 @@ pub fn Eval(comptime config: types.Config) type {
                     const length = try definition(hook.ptr, @intCast(first.integer), column, pretty, &buffer) orelse return .null_value;
                     return textCell(buffer[0..length]);
                 },
-                .pg_get_constraintdef, .pg_get_triggerdef => {
+                .pg_get_constraintdef, .pg_get_triggerdef, .pg_get_viewdef => {
                     const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
-                    const definition = (if (n.func == .pg_get_triggerdef) hook.trigger_definition else hook.constraint_definition) orelse return error.UnsupportedStatement;
+                    const definition = (switch (n.func) {
+                        .pg_get_triggerdef => hook.trigger_definition,
+                        .pg_get_viewdef => hook.view_definition,
+                        else => hook.constraint_definition,
+                    }) orelse return error.UnsupportedStatement;
                     const second = node(ctx, n.b).next;
                     const pretty = if (second == none) V.Cell{ .boolean = false } else try eval(ctx, second);
                     if (pretty == .null_value) return .null_value;
@@ -1361,9 +1433,9 @@ pub fn Eval(comptime config: types.Config) type {
                         return .{ .text = text };
                     },
                     .nextval, .currval, .setval, .lastval, .identity_next => return sequenceValue(ctx, n),
-                    .current_database, .current_schema, .to_regtype, .to_regclass, .format_type, .pg_get_expr, .regclass_in, .regtype_in, .regclass_out, .regtype_out,
+                    .current_database, .current_schema, .current_schemas, .pg_encoding_to_char, .to_regtype, .to_regclass, .to_regproc, .format_type, .pg_get_expr, .regclass_in, .regtype_in, .regclass_out, .regtype_out,
                     .to_regnamespace, .regnamespace_in, .regnamespace_out,
-                    .pg_table_is_visible, .pg_get_indexdef, .pg_get_constraintdef, .pg_get_triggerdef, .pg_get_statisticsobjdef_columns, .pg_relation_is_publishable, .pg_get_partkeydef => return catalogValue(ctx, n),
+                    .acldefault, .pg_table_is_visible, .pg_get_indexdef, .pg_get_constraintdef, .pg_get_triggerdef, .pg_get_viewdef, .pg_get_statisticsobjdef_columns, .pg_relation_is_publishable, .pg_get_partkeydef => return catalogValue(ctx, n),
                     .pg_partition_ancestors, .array_subquery => return error.UnsupportedStatement,
                     .obj_description, .col_description, .shobj_description, .current_user, .session_user => return objectText(ctx, n),
                     .to_tsvector, .to_tsquery, .plainto_tsquery, .phraseto_tsquery => {
@@ -1420,7 +1492,7 @@ pub fn Eval(comptime config: types.Config) type {
                         return textCell(buffer[0..length]);
                     },
                     .lower, .upper, .initcap, .char_length, .octet_length, .bit_length, .substring, .btrim, .ltrim, .rtrim, .strpos, .replace,
-                    .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .concat, .concat_ws,
+                    .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .concat, .concat_ws, .quote_ident, .quote_literal,
                     .overlay, .to_hex => return builtins.Builtins(config, @This()).call(ctx, n),
                     .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .sind, .cosd, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => return builtins.Builtins(config, @This()).call(ctx, n),
                     .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => return builtins.Builtins(config, @This()).call(ctx, n),
@@ -1454,7 +1526,7 @@ pub fn Eval(comptime config: types.Config) type {
                     .to_date, .to_number, .to_timestamp => return builtins.Builtins(config, @This()).call(ctx, n),
                     .normalize, .is_normalized => return builtins.Builtins(config, @This()).call(ctx, n),
                     .array_constructor, .array_subscript, .array_any, .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper,
-                    .array_append, .array_prepend, .array_cat, .array_to_string => return array_eval.ArrayEval(config, @This()).call(ctx, n),
+                    .array_append, .array_prepend, .array_cat, .array_to_string, .array_remove => return array_eval.ArrayEval(config, @This()).call(ctx, n),
                     .jsonb_set, .jsonb_set_lax, .jsonb_insert, .jsonb_delete_path, .jsonb_strip_nulls, .jsonb_pretty, .to_json, .to_jsonb, .jsonb_path_exists, .jsonb_path_match, .jsonb_path_query_array, .jsonb_path_query_first, .jsonb_exists_any, .jsonb_exists_all, .jsonb_minus_op, .jsonb_delete_path_op, .jsonb_exists_any_op, .jsonb_exists_all_op, .jsonb_path_exists_op, .jsonb_path_match_op => return json_eval.JsonEval(config, @This()).call(ctx, n),
                     .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => return range_eval.RangeEval(config, @This()).call(ctx, n),
                     .current_setting, .set_config, .pg_try_advisory_lock, .pg_try_advisory_lock_shared, .pg_try_advisory_xact_lock, .pg_try_advisory_xact_lock_shared, .pg_advisory_unlock, .pg_advisory_unlock_shared, .pg_backend_pid, .pg_is_in_recovery => return sessionFunction(ctx, n),

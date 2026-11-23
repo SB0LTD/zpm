@@ -618,19 +618,40 @@ fn drained(uses: []const Uses, cycle: []const u32, start: usize, j: usize) u32 {
 
 // ── Scheduling ──────────────────────────────────────────────────────────────
 
-pub const Work = struct {
-    /// The shader model scheduled for.
-    sm: Sm = .sm_120,
-    uses: [MAX_INSTRS]Uses = undefined,
-    cycle: [MAX_INSTRS]u32 = undefined,
-    need_rd: [MAX_INSTRS]bool = undefined,
-    need_wr: [MAX_INSTRS]bool = undefined,
-    /// The scoreboard an instruction's reads / writes hold, and its
-    /// generation then (7: none).
-    rd_bar: [MAX_INSTRS]u3 = undefined,
-    wr_bar: [MAX_INSTRS]u3 = undefined,
-    rd_gen: [MAX_INSTRS]u32 = undefined,
-    wr_gen: [MAX_INSTRS]u32 = undefined,
+/// The scheduler's storage for up to `n` instructions (Work: MAX_INSTRS;
+/// a larger one for larger programs: kir_sm120's LARGE).
+pub fn WorkOf(comptime n: usize) type {
+    return struct {
+        /// The shader model scheduled for.
+        sm: Sm = .sm_120,
+        uses: [n]Uses = undefined,
+        cycle: [n]u32 = undefined,
+        need_rd: [n]bool = undefined,
+        need_wr: [n]bool = undefined,
+        /// The scoreboard an instruction's reads / writes hold, and its
+        /// generation then (7: none).
+        rd_bar: [n]u3 = undefined,
+        wr_bar: [n]u3 = undefined,
+        rd_gen: [n]u32 = undefined,
+        wr_gen: [n]u32 = undefined,
+    };
+}
+pub const Work = WorkOf(MAX_INSTRS);
+
+/// A WorkOf's shader model and arrays, whatever its size.
+const View = struct {
+    sm: Sm,
+    uses: []Uses,
+    cycle: []u32,
+    need_rd: []bool,
+    need_wr: []bool,
+    rd_bar: []u3,
+    wr_bar: []u3,
+    rd_gen: []u32,
+    wr_gen: []u32,
+    fn of(w: anytype) View {
+        return .{ .sm = w.sm, .uses = &w.uses, .cycle = &w.cycle, .need_rd = &w.need_rd, .need_wr = &w.need_wr, .rd_bar = &w.rd_bar, .wr_bar = &w.wr_bar, .rd_gen = &w.rd_gen, .wr_gen = &w.wr_gen };
+    }
 };
 
 /// An instruction's control field, and the NOPs that follow it (for a
@@ -691,7 +712,7 @@ const Bars = struct {
 };
 
 const Pass1 = struct {
-    w: *Work,
+    w: *const View,
     fn mark(self: Pass1, h: Hazard) void {
         if (!h.need.sb) return;
         if (h.which == .rd) self.w.need_rd[h.first] = true else self.w.need_wr[h.first] = true;
@@ -699,7 +720,7 @@ const Pass1 = struct {
 };
 
 const Pass2 = struct {
-    w: *Work,
+    w: *const View,
     bars: *const Bars,
     wait: *u6,
     min: *u32,
@@ -717,8 +738,10 @@ const Pass2 = struct {
 };
 
 /// Control fields for `ins` (their own are ignored) into `out`.
-pub fn schedule(ins: []const sm120.Instr, out: []Slot, w: *Work) Error!void {
-    if (ins.len > MAX_INSTRS or out.len < ins.len) return error.TooManyInstructions;
+pub fn schedule(ins: []const sm120.Instr, out: []Slot, work: anytype) Error!void {
+    const view = View.of(work);
+    const w = &view;
+    if (ins.len > w.uses.len or out.len < ins.len) return error.TooManyInstructions;
     const n = ins.len;
     for (ins, 0..) |*in, i| {
         w.uses[i] = try usesOfFor(w.sm, in);
@@ -840,8 +863,10 @@ const CheckVisit = struct {
 
 /// `slots`' fields for `ins` against the model: every hazard closed, every
 /// branch drained.
-pub fn check(ins: []const sm120.Instr, slots: []const Slot, w: *Work) Error!Report {
-    if (ins.len > MAX_INSTRS) return error.TooManyInstructions;
+pub fn check(ins: []const sm120.Instr, slots: []const Slot, work: anytype) Error!Report {
+    const view = View.of(work);
+    const w = &view;
+    if (ins.len > w.uses.len) return error.TooManyInstructions;
     const n = ins.len;
     var c: u32 = 0;
     for (ins, 0..) |*in, i| {

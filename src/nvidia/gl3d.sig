@@ -376,14 +376,14 @@ pub fn whyNot(d: *const Draw) ?[]const u8 {
     if (d.color_gobs) |n| {
         if (n > 5 or d.target.va % 512 != 0 or d.target.pitch % 64 != 0 or d.target.pitch % formatBytes(d.format) != 0)
             return "a block-linear colour target not on a GOB, or its blocks over 32 GOBs high";
-        // (8- and 16-bit texels have GOBs of their own on Blackwell)
-        if (formatBytes(d.format) != 4) return "a block-linear colour target of 8- or 16-bit pixels (Blackwell's GOBs for them are not modelled)";
+        // (8- and 16-bit texels are drawn in GOBs of their own on
+        // Blackwell, Blackwell8's and Blackwell16's: the memory's, the
+        // engine's state the same)
     }
     for (d.more) |mm| {
         const m = mm orelse continue;
         if (m.va % 128 != 0 or m.pitch % 128 != 0) return "a colour target whose address or rows are not on 128 bytes (RT_INVALID_ALIGNMENT)";
         if (d.color_gobs != null and (m.va % 512 != 0 or m.pitch % formatBytes(m.format) != 0)) return "a block-linear colour target not on a GOB";
-        if (d.color_gobs != null and formatBytes(m.format) != 4) return "a block-linear colour target of 8- or 16-bit pixels (Blackwell's GOBs for them are not modelled)";
     }
     if (d.depth) |z| {
         if (z.gobs_log2 > 5 or z.va % 512 != 0 or z.width == 0 or z.height == 0) return "a depth target not on a GOB, with no size, or its blocks over 32 GOBs high";

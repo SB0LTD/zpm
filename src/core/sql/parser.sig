@@ -46,6 +46,7 @@ pub fn Parser(comptime config: types.Config) type {
         const Self = @This();
         tokens: lexer.Tokenizer,
         current: Token = .{},
+        previous_end: usize = 0,
         /// One-token lookahead cache: the token after current and the
         /// tokenizer state after it.
         peeked: Token = .{},
@@ -180,6 +181,7 @@ pub fn Parser(comptime config: types.Config) type {
         }
 
         fn advance(self: *Self) Error!void {
+            self.previous_end = self.current.end + self.current.suffix;
             if (self.current.dialectQuotedIdentifier(self.source))
                 self.last_native_syntax = self.current.start - 1;
             if (self.has_peek) {
@@ -471,8 +473,7 @@ pub fn Parser(comptime config: types.Config) type {
                 if (try self.takeWord("SEQUENCE")) {
                     var out: Ast.AlterSequence = .{ .if_exists = try self.ifExists() };
                     out.name = try self.qualifiedName();
-                    try self.sequenceOptions(&out.options);
-                    // OWNED BY, RENAME TO, SET SCHEMA ... are outside the subset.
+                    try self.sequenceOptions(&out.options, &out.owned_by);
                     if (self.current.kind != .end and !self.isSymbol(.semicolon)) return error.UnsupportedStatement;
                     try self.finish();
                     return .{ .alter_sequence = out };
@@ -796,7 +797,27 @@ pub fn Parser(comptime config: types.Config) type {
                 } else if (try self.takeRaw("alter")) {
                     _ = try self.takeRaw("column");
                     const name = try self.identifier();
-                    if (try self.takeWord("SET")) {
+                    if (self.mode == .standard and try self.takeRaw("add")) {
+                        try self.expectWord("GENERATED");
+                        const always = try self.takeWord("ALWAYS");
+                        if (!always) {
+                            try self.expectWord("BY");
+                            try self.expectWord("DEFAULT");
+                        }
+                        try self.expectWord("AS");
+                        try self.expectWord("IDENTITY");
+                        var action: Ast.AlterAction = .{ .add_identity = .{ .column = name, .always = always } };
+                        if (try self.takeSymbol(.lparen)) {
+                            const identity = &action.add_identity;
+                            if (try self.takeWord("SEQUENCE")) {
+                                try self.expectWord("NAME");
+                                identity.name = try self.qualifiedName();
+                            }
+                            try self.sequenceOptions(&identity.options, null);
+                            try self.expectSymbol(.rparen);
+                        }
+                        try pushAction(&out, action);
+                    } else if (try self.takeWord("SET")) {
                         if (try self.takeWord("DEFAULT")) {
                             const start = self.tokenStart();
                             _ = try self.expression();
@@ -1582,7 +1603,7 @@ pub fn Parser(comptime config: types.Config) type {
 
         fn typeWord(token: Token) bool {
             return switch (token.keyword) {
-                .integer, .int, .int4, .bigint, .int8, .smallint, .int2, .boolean, .@"bool", .text, .numeric, .decimal, .real, .float4, .float8, .float, .double, .name, .oid, .date, .timestamp, .timestamptz, .interval, .json, .jsonb, .regclass, .regtype, .regnamespace => true,
+                .integer, .int, .int4, .bigint, .int8, .smallint, .int2, .boolean, .@"bool", .text, .numeric, .decimal, .real, .float4, .float8, .float, .double, .name, .oid, .date, .timestamp, .timestamptz, .interval, .json, .jsonb, .regclass, .regtype, .regnamespace, .regproc => true,
                 .varchar, .character, .char, .bpchar, .uuid, .bytea, .time, .timetz, .bit, .varbit, .money => true,
                 .pg_lsn, .xid8, .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange, .inet, .cidr, .macaddr, .point, .box, .xml, .jsonpath, .tsvector, .tsquery => true,
                 else => false,
@@ -1747,6 +1768,7 @@ pub fn Parser(comptime config: types.Config) type {
                 .interval => .{ .ty = .interval },
                 .json => .{ .ty = .json },
                 .jsonb => .{ .ty = .jsonb },
+                .regproc => .{ .ty = .regproc },
                 .regclass => .{ .ty = .oid, .typmod = ast.regclass_typmod },
                 .regnamespace => .{ .ty = .oid, .typmod = ast.regnamespace_typmod },
                 .regtype => .{ .ty = .oid, .typmod = ast.regtype_typmod },
@@ -1816,7 +1838,7 @@ pub fn Parser(comptime config: types.Config) type {
         }
 
         /// Sequence options (CREATE SEQUENCE and identity specifications).
-        fn sequenceOptions(self: *Self, out: *sequence.Options) Error!void {
+        fn sequenceOptions(self: *Self, out: *sequence.Options, ownership: ?*?Ast.SequenceOwner) Error!void {
             var seen:u16=0;
             while (true) {
                 var option:u16=0;
@@ -1875,10 +1897,25 @@ pub fn Parser(comptime config: types.Config) type {
                         // creation skips option validation before resolve().
                         else => 0xffffffff,
                     };
+                } else if (ownership != null and try self.takeRaw("owned")) {
+                    option = 256;
+                    try self.expectWord("BY");
+                    ownership.?.* = try self.sequenceOwner();
                 } else return;
                 if(seen&option!=0) out.duplicate_options=true;
                 seen|=option;
             }
+        }
+
+        fn sequenceOwner(self: *Self) Error!Ast.SequenceOwner {
+            if (try self.takeRaw("none")) return .{};
+            const first = try self.identifier();
+            try self.expectSymbol(.dot);
+            const second = try self.identifier();
+            return if (try self.takeSymbol(.dot))
+                .{ .table = .{ .schema = first, .name = second }, .column = try self.identifier() }
+            else
+                .{ .table = .{ .name = first }, .column = second };
         }
 
         fn ifNotExists(self: *Self) Error!bool {
@@ -1889,8 +1926,8 @@ pub fn Parser(comptime config: types.Config) type {
 
         fn createSequence(self: *Self) Error!Ast.CreateSequence {
             const conditional = try self.ifNotExists();
-            var out: Ast.CreateSequence = .{ .name = try self.identifier(), .if_not_exists = conditional };
-            try self.sequenceOptions(&out.options);
+            var out: Ast.CreateSequence = .{ .name = try self.qualifiedName(), .if_not_exists = conditional };
+            try self.sequenceOptions(&out.options, null);
             try self.finish();
             return out;
         }
@@ -2142,7 +2179,7 @@ pub fn Parser(comptime config: types.Config) type {
                     if (try self.takeWord("IDENTITY")) {
                         column.default_kind = if (always) .identity_always else .identity_by_default;
                         if (try self.takeSymbol(.lparen)) {
-                            try self.sequenceOptions(&column.sequence);
+                            try self.sequenceOptions(&column.sequence, null);
                             try self.expectSymbol(.rparen);
                         }
                     } else {
@@ -3056,7 +3093,8 @@ pub fn Parser(comptime config: types.Config) type {
             }
             var star = false;
             while (true) {
-                if (out.count == config.columns) return error.ColumnCapacity;
+                if (out.count == out.targets.len) return error.ColumnCapacity;
+                if (out.count == config.columns) self.pool.complex = true;
                 var target: Ast.Target = .{};
                 if (try self.takeSymbol(.star)) {
                     target.star = true;
@@ -3069,7 +3107,16 @@ pub fn Parser(comptime config: types.Config) type {
                         target.star = true;
                         star = true;
                         self.pool.complex = true;
-                    } else target.alias = try self.bareAlias();
+                    } else {
+                        if (self.mode == .standard and self.tokens.dialect == .postgres and !self.pool.complex and n.kind == .function) {
+                            var buf: [64]u8 = undefined;
+                            if (identText(self.source, n.name, &buf)) |name| {
+                                if (types.same(name, "unnest")) self.pool.complex = true;
+                            }
+                        }
+                        target.expression_end = self.previous_end;
+                        target.alias = try self.bareAlias();
+                    }
                 }
                 out.targets[out.count] = target;
                 out.count += 1;
@@ -3570,41 +3617,8 @@ pub fn Parser(comptime config: types.Config) type {
             var left = try self.pattern();
             while (self.comparisonOp()) |op| {
                 try self.advance();
-                if (self.mode == .standard and (self.isWord("ANY") or self.isWord("SOME") or self.isWord("ALL"))) {
-                    const all = self.isWord("ALL");
-                    try self.advance();
-                    try self.expectSymbol(.lparen);
-                    if (!self.isWord("SELECT") and !self.isWord("WITH") and !self.isSymbol(.lparen)) {
-                        // `x op ANY/ALL (array)`: an array_any call over
-                        // (x, array), with in_subquery's op/negated encoding.
-                        const array = try self.expression();
-                        try self.expectSymbol(.rparen);
-                        const any = try self.pool.add(.{ .kind = .function, .func = .array_any, .op = if (all) oppositeComparison(op) else op, .negated = all, .b = left });
-                        self.pool.nodes[left].next = array;
-                        try self.pool.raise(any, left);
-                        try self.pool.raise(any, array);
-                        left = try self.castTail(any);
-                        left = try self.collateTail(left);
-                        left = try self.atZoneTail(left);
-                        left = try self.multiplicativeTail(left);
-                        left = try self.additiveTail(left);
-                        left = try self.otherTail(left);
-                        left = try self.patternTail(left);
-                        continue;
-                    }
-                    const inner = try self.query();
-                    try self.expectSymbol(.rparen);
-                    self.pool.complex = true;
-                    // SQL three-valued De Morgan duality preserves NULL and
-                    // empty-set semantics without a new AST storage field.
-                    left = try self.pool.add(.{ .kind = .in_subquery, .op = if (all) oppositeComparison(op) else op, .negated = all, .a = left, .integer = inner });
-                    // A completed sublink can itself be a higher-precedence
-                    // operand: x=ANY(...)::text || 'suffix', or ... = TRUE.
-                    left = try self.castTail(left);
-                    left = try self.collateTail(left);
-                    left = try self.atZoneTail(left);
-                    left = try self.multiplicativeTail(left);
-                    left = try self.additiveTail(left);
+                if (self.hasQuantifier()) {
+                    left = try self.quantified(left, op);
                     left = try self.otherTail(left);
                     left = try self.patternTail(left);
                     continue;
@@ -3615,6 +3629,37 @@ pub fn Parser(comptime config: types.Config) type {
                 return self.pool.add(.{ .kind = .binary, .op = op, .a = left, .b = right });
             }
             return left;
+        }
+
+        fn hasQuantifier(self: *const Self) bool {
+            return self.mode == .standard and (self.isWord("ANY") or self.isWord("SOME") or self.isWord("ALL"));
+        }
+
+        fn quantified(self: *Self, left: u16, op: ast.Op) Error!u16 {
+            const all = self.isWord("ALL");
+            try self.advance();
+            try self.expectSymbol(.lparen);
+            const comparison_op = if (all) oppositeComparison(op) else op;
+            var value: u16 = undefined;
+            if (self.isWord("SELECT") or self.isWord("WITH") or self.isSymbol(.lparen)) {
+                const inner = try self.query();
+                try self.expectSymbol(.rparen);
+                self.pool.complex = true;
+                value = try self.pool.add(.{ .kind = .in_subquery, .op = comparison_op, .negated = all, .a = left, .integer = inner });
+            } else {
+                const array = try self.expression();
+                try self.expectSymbol(.rparen);
+                value = try self.pool.add(.{ .kind = .function, .func = .array_any, .op = comparison_op, .negated = all, .b = left });
+                self.pool.nodes[left].next = array;
+                try self.pool.raise(value, left);
+                try self.pool.raise(value, array);
+            }
+            // A completed sublink may be an operand of a tighter operator.
+            value = try self.castTail(value);
+            value = try self.collateTail(value);
+            value = try self.atZoneTail(value);
+            value = try self.multiplicativeTail(value);
+            return self.additiveTail(value);
         }
 
         fn oppositeComparison(op: ast.Op) ast.Op {
@@ -3752,8 +3797,15 @@ pub fn Parser(comptime config: types.Config) type {
                         else => self.comparisonOp() orelse return error.UndefinedFunction,
                     } else break,
                 };
+                const comparison_op = if (qualified) self.comparisonOp() else null;
                 try self.advance();
                 if (qualified) try self.expectSymbol(.rparen);
+                if (comparison_op) |comparison_operator| {
+                    if (self.hasQuantifier()) {
+                        left = try self.quantified(left, comparison_operator);
+                        continue;
+                    }
+                }
                 const right = try self.additive();
                 left = try self.pool.add(.{ .kind = .binary, .op = op, .a = left, .b = right,
                     .insensitive = symbol == .regex_icase or symbol == .not_regex_icase, .negated = symbol == .not_regex or symbol == .not_regex_icase });

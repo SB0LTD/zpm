@@ -1578,6 +1578,54 @@ fn firstKernel() !void {
     try testing.expect(after > before);
 }
 
+test "a kernel past the State's limits compiles in the LargeState when the work has room for it, and runs right" {
+    // 9,000 live FADDs in a chain and 9,000 dead FMULs: about 18,000 KIR
+    // instructions and values (past MAX_INSTS and MAX_VREGS), about 9,000
+    // machine instructions once the dead are dropped (inside the
+    // emulator's)
+    const N = 9000;
+    const S = struct {
+        var insts: [kir_sm120.LARGE.insts]kir.Inst = undefined;
+        var tys: [kir_sm120.LARGE.vregs]kir.Ty = undefined;
+        var small: [kir_sm120.WORK_BYTES]u8 align(64) = undefined;
+        var large: [kir_sm120.LARGE_WORK_BYTES]u8 align(64) = undefined;
+        var code: [1 << 20]u8 align(16) = undefined;
+    };
+    const d = freshEmu();
+    var k = kir.Kernel.init(.{ .insts = &S.insts, .tys = &S.tys }, "large", .{ 64, 1, 1 });
+    const A = k.binding();
+    const O = k.binding();
+    const off = k.op2(.shl, .u32, r(k.tid(0)), u(2));
+    var v = k.load(.f32, kir.global(A, 32), r(off));
+    for (0..N) |_| {
+        _ = k.op2(.fmul, .f32, r(v), kf(3));
+        v = k.op2(.fadd, .f32, r(v), kf(0.375));
+    }
+    k.store(.f32, kir.global(O, 32), r(off), r(v));
+    try k.finish();
+    try testing.expect(k.n > kir_sm120.MAX_INSTS and k.nv > kir_sm120.MAX_VREGS);
+    // (work for the State alone: refused, as before)
+    var small = gpu.Work.init(&S.small);
+    try testing.expectError(error.TooBig, gpu.compile(&k, d.caps, &small, &S.code));
+    var large = gpu.Work.init(&S.large);
+    const bin = try gpu.compile(&k, d.caps, &large, &S.code);
+    try testing.expect(bin.extra[kir_sm120.EXTRA_KIR] > kir_sm120.MAX_INSTS);
+    const prog = try d.load(&bin);
+    const ba = try d.alloc(256, .upload);
+    const bo = try d.alloc(256, .host);
+    const fa: []f32 = @alignCast(std.mem.bytesAsSlice(f32, ba.cpu[0..256]));
+    for (fa, 0..) |*x, j| x.* = @as(f32, @floatFromInt(j)) * 0.1 - 2;
+    d.toDevice(ba, 0, 256);
+    try runWait(d, &.{.{ .prog = &prog, .groups = .{ 1, 1, 1 }, .buffers = &.{ ba, bo }, .params = &.{} }});
+    d.fromDevice(bo, 0, 256);
+    const fo: []f32 = @alignCast(std.mem.bytesAsSlice(f32, bo.cpu[0..256]));
+    for (fa, fo) |x, got| {
+        var want = x;
+        for (0..N) |_| want += 0.375;
+        try testing.expectEqual(want, got);
+    }
+}
+
 // ── LFM3's Q4_K matrix, rewritten in KIR ────────────────────────────────────
 //
 // lfm3_nv_matrix's q4kMatrix(1), op for op: 64 threads a CTA, two a row

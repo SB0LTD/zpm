@@ -45,22 +45,20 @@ pub fn Binder(comptime config: types.Config) type {
         /// INTEGER outside the PostgreSQL dialect and in legacy replay.
         pub const integer_type: types.DataType = if (config.integer_bits == 32) .integer32 else .integer;
 
-        /// An identity column's owned sequence `<table>_<column>_seq`.
-        pub const Identity = struct { column: u8, name: V.Name, spec: sequence.Spec };
+        /// A column-owned sequence created with its table definition.
+        pub const OwnedSequence = struct { column: u8, name: V.Name, spec: sequence.Spec };
 
         pub const Create = struct {
             name: V.Name,
             columns: [config.columns]V.Column,
             count: usize,
-            identity: ?Identity = null,
             /// CHECK / UNIQUE / named or composite PRIMARY KEY, named.
             constraints: [config.table_constraints]S.Constraint = undefined,
             constraint_count: usize = 0,
             namespace: u32 = catalog.public_namespace,
             plain_definition: bool = false,
-            /// SERIAL columns' owned sequences, created after the table.
-            serials: [config.columns]Identity = undefined,
-            serial_count: usize = 0,
+            sequences: [config.columns]OwnedSequence = undefined,
+            sequence_count: usize = 0,
             /// Relation kind, indexes (LIKE INCLUDING INDEXES), view query,
             /// inheritance and partitioning.
             extras: S.Extras = .{},
@@ -85,9 +83,9 @@ pub fn Binder(comptime config: types.Config) type {
 
         /// ALTER SEQUENCE target slot and options (resolved against the
         /// sequence's current state when it runs).
-        pub const AlterSequence = struct { slot: usize, options: sequence.Options };
+        pub const AlterSequence = struct { slot: usize, options: sequence.Options, ownership: ?sequence.Ownership = null };
 
-        pub const CreateSequence = struct { name: V.Name, spec: sequence.Spec };
+        pub const CreateSequence = struct { name: V.Name, namespace: u32, spec: sequence.Spec };
 
         /// RETURNING output columns, evaluated over one table row (relation 0).
         pub const Returning = struct {
@@ -98,7 +96,7 @@ pub fn Binder(comptime config: types.Config) type {
             count: usize = 0,
             output: bool = false,
             deleted_columns: std.StaticBitSet(config.columns) = .empty,
-            non_null_columns: std.StaticBitSet(config.columns) = .empty,
+            non_null_columns: std.StaticBitSet(types.projectionColumns(config)) = .empty,
         };
 
         /// VALUES: `rows` is the first values_row node; item p of every row
@@ -134,7 +132,7 @@ pub fn Binder(comptime config: types.Config) type {
             names: [config.columns]V.Name,
             types: [config.columns]types.DataType,
             typmods: [config.columns]i32 = @splat(-1),
-            non_null_columns: std.StaticBitSet(config.columns) = .empty,
+            non_null_columns: std.StaticBitSet(types.projectionColumns(config)) = .empty,
             has_nominal_types: bool = false,
             nominal_types: [config.columns]types.NominalColumnType = undefined,
             count: usize,
@@ -295,6 +293,7 @@ pub fn Binder(comptime config: types.Config) type {
         /// expression) or NULL. Existing rows are re-checked for the flagged
         /// NOT NULL columns and constraints.
         pub const AlterTable = struct {
+            sets_defaults: bool = false,
             table: usize,
             name: V.Name,
             columns: [config.columns]V.Column,
@@ -303,6 +302,7 @@ pub fn Binder(comptime config: types.Config) type {
             constraint_count: usize,
             sources: [config.columns]u8,
             fills: [config.columns]u16 = @splat(none),
+            identity: ?OwnedSequence = null,
             check_not_null: [config.columns]bool = @splat(false),
             check_constraint: [config.table_constraints]bool = @splat(false),
             /// Kind, secondary indexes, view and partition definition after
@@ -493,6 +493,7 @@ pub fn Binder(comptime config: types.Config) type {
         pub const Source = struct {
             table: ?usize = null,
             view: ?catalog.View = null,
+            sequence: ?usize = null,
             plan: u16 = none,
             cte: u8 = no_cte,
             join: ast.JoinKind = .first,
@@ -532,7 +533,7 @@ pub fn Binder(comptime config: types.Config) type {
         /// FROM (one row).
         pub const Series = enum { none, integer, numeric, timestamp,
             // JSON_TABLE (B11 json-agg lane): `function` is the table node.
-            json_table, partition_ancestors };
+            json_table, partition_ancestors, options_to_table, unnest };
 
         /// A bound query block of the general engine (design §4.9). Its
         /// materialized rows are `width` cells: the `count` visible output
@@ -542,16 +543,16 @@ pub fn Binder(comptime config: types.Config) type {
             // arguments from CASE. Report only if this plan remains reachable.
             planned_checked:bool=false,
             planned_error:?Error=null,
-            planned_targets:[2*config.columns]?Error=@splat(null),
-            prunable:[2*config.columns]bool=@splat(false),
-            required:[2*config.columns]bool=@splat(true),
+            planned_targets:[2 * types.projectionColumns(config)]?Error=@splat(null),
+            prunable:[2 * types.projectionColumns(config)]bool=@splat(false),
+            required:[2 * types.projectionColumns(config)]bool=@splat(true),
             demanded:bool=false,
             constant_source_safe:bool=false,
-            constant_outputs:[2*config.columns]V.Cell=undefined,
-            constant_known:[2*config.columns]bool=@splat(false),
-            constant_dependencies:[2*config.columns][config.ctes]bool=@splat(@splat(false)),
+            constant_outputs:[2 * types.projectionColumns(config)]V.Cell=undefined,
+            constant_known:[2 * types.projectionColumns(config)]bool=@splat(false),
+            constant_dependencies:[2 * types.projectionColumns(config)][config.ctes]bool=@splat(@splat(false)),
             windows:[config.columns]Window=undefined,window_count:usize=0,
-            window_late:[2*config.columns]bool=.{false}**(2*config.columns),
+            window_late:[2 * types.projectionColumns(config)]bool=.{false}**(2 * types.projectionColumns(config)),
             window_origins:[config.columns]u16=.{none}**config.columns,
             set_op: ast.SetOp = .none,
             set_all: bool = false,
@@ -571,14 +572,16 @@ pub fn Binder(comptime config: types.Config) type {
             /// clauses, including definitions with no consuming WindowAgg.
             window_aggregate_count:usize=0,
             having: u16 = none,
-            targets: [2 * config.columns]u16 = undefined,
+            targets: [2 * types.projectionColumns(config)]u16 = undefined,
+            /// One top-level set-returning UNNEST target, expanded after WHERE.
+            unnest_column: u16 = none,
             count: usize = 0,
             width: usize = 0,
-            names: [config.columns]V.Name = undefined,
-            tys: [config.columns]ast.Type = undefined,
-            typmods: [config.columns]i32 = undefined,
-            non_null_columns: std.StaticBitSet(config.columns) = .empty,
-            order: [2 * config.columns]SortKey = undefined,
+            names: [types.projectionColumns(config)]V.Name = undefined,
+            tys: [types.projectionColumns(config)]ast.Type = undefined,
+            typmods: [types.projectionColumns(config)]i32 = undefined,
+            non_null_columns: std.StaticBitSet(types.projectionColumns(config)) = .empty,
+            order: [2 * types.projectionColumns(config)]SortKey = undefined,
             order_count: usize = 0,
             distinct: Distinct = .none,
             distinct_on: [config.columns]u16 = undefined,
@@ -781,6 +784,12 @@ pub fn Binder(comptime config: types.Config) type {
                         n.kind = .bool_literal;
                     },
                     .text, .unknown => {},
+                    .regproc => if (!context.describe_only) {
+                        // Routine names require the serialized statement's
+                        // catalog snapshot. Describe only needs the type.
+                        if (context.session.sequences == null) return error.UnsupportedStatement;
+                        _ = try Io.parse(target, -1, text.slice(), context.session);
+                    },
                     .date=>{
                         const date=try Io.parse(target,-1,text.slice(),context.session);
                         n.integer=date.date;n.date_bound=true;
@@ -819,6 +828,8 @@ pub fn Binder(comptime config: types.Config) type {
             // coercible), so an untyped literal beside it is read as an oid.
             if (context.node(a.*).ty == .regtype) a.* = try convert(context, a.*, .oid, -1, .implicit);
             if (context.node(b.*).ty == .regtype) b.* = try convert(context, b.*, .oid, -1, .implicit);
+            if (context.node(a.*).ty == .regproc) a.* = try convert(context, a.*, .oid, -1, .implicit);
+            if (context.node(b.*).ty == .regproc) b.* = try convert(context, b.*, .oid, -1, .implicit);
             const left = context.node(a.*).ty;
             const right = context.node(b.*).ty;
             if (left == .mysql_bigint_unsigned or right == .mysql_bigint_unsigned) {
@@ -1302,15 +1313,19 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "setval", .func = .setval },
                 .{ .name = "lastval", .func = .lastval },
                 .{ .name = "current_database", .func = .current_database },
+                .{ .name = "current_schemas", .func = .current_schemas },
+                .{ .name = "pg_encoding_to_char", .func = .pg_encoding_to_char },
                 .{ .name = "current_schema", .func = .current_schema },
                 .{ .name = "to_regtype", .func = .to_regtype },
                 .{ .name = "to_regclass", .func = .to_regclass },
                 .{ .name = "to_regnamespace", .func = .to_regnamespace },
+                .{ .name = "to_regproc", .func = .to_regproc },
                 .{ .name = "format_type", .func = .format_type },
                 .{ .name = "pg_get_expr", .func = .pg_get_expr },
                 .{ .name = "pg_get_indexdef", .func = .pg_get_indexdef },
                 .{ .name = "pg_get_constraintdef", .func = .pg_get_constraintdef },
                 .{ .name = "pg_get_triggerdef", .func = .pg_get_triggerdef },
+                .{ .name = "pg_get_viewdef", .func = .pg_get_viewdef },
                 .{ .name = "pg_get_statisticsobjdef_columns", .func = .pg_get_statisticsobjdef_columns },
                 .{ .name = "pg_relation_is_publishable", .func = .pg_relation_is_publishable },
                 .{ .name = "pg_get_partkeydef", .func = .pg_get_partkeydef },
@@ -1330,6 +1345,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "ascii", .func = .ascii },               .{ .name = "chr", .func = .chr },
                 .{ .name = "translate", .func = .translate },       .{ .name = "concat", .func = .concat },
                 .{ .name = "concat_ws", .func = .concat_ws },       .{ .name = "overlay", .func = .overlay },
+                .{ .name = "quote_ident", .func = .quote_ident },   .{ .name = "quote_literal", .func = .quote_literal },
                 .{ .name = "to_hex", .func = .to_hex },
                 // Mathematical functions (B11).
                 .{ .name = "power", .func = .power },               .{ .name = "pow", .func = .power },
@@ -1362,6 +1378,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "array_ndims", .func = .array_ndims },   .{ .name = "array_dims", .func = .array_dims },
                 .{ .name = "array_lower", .func = .array_lower },   .{ .name = "array_upper", .func = .array_upper },
                 .{ .name = "array_append", .func = .array_append }, .{ .name = "array_prepend", .func = .array_prepend },
+                .{ .name = "array_remove", .func = .array_remove },
                 .{ .name = "array_cat", .func = .array_cat },       .{ .name = "array_to_string", .func = .array_to_string },
                 // Range constructors and functions (B11 advanced types).
                 .{ .name = "int4range", .func = .range_constructor }, .{ .name = "int8range", .func = .range_constructor },
@@ -1417,6 +1434,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "pg_typeof", .func = .pg_typeof },
                 .{ .name = "pg_get_serial_sequence", .func = .pg_get_serial_sequence },
                 .{ .name = "pg_table_is_visible", .func = .pg_table_is_visible },
+                .{ .name = "acldefault", .func = .acldefault },
             };
             for (table) |entry| if (types.same(name.slice(), entry.name)) return entry.func;
             return .none;
@@ -2240,6 +2258,11 @@ pub fn Binder(comptime config: types.Config) type {
                     if (count != 0) return error.UndefinedFunction;
                     n.ty = .name;
                 },
+                .current_schemas => {
+                    try bindSignature(context, n, &.{.boolean}, types.arrayType(.name).?, true);
+                    n.constant = false;
+                },
+                .pg_encoding_to_char => try bindSignature(context, n, &.{.int4}, .name, true),
                 .to_regtype, .to_regclass, .to_regnamespace => {
                     if (count != 1) return error.UndefinedFunction;
                     const ty = context.node(n.b).ty;
@@ -2247,6 +2270,10 @@ pub fn Binder(comptime config: types.Config) type {
                     n.ty = .oid;
                     // PostgreSQL returns regtype / regclass: `::text` prints the name.
                     n.reg = switch (n.func) { .to_regtype => .regtype, .to_regclass => .regclass, .to_regnamespace => .regnamespace, else => unreachable };
+                    n.constant = false;
+                },
+                .to_regproc => {
+                    try bindSignature(context, n, &.{.text}, .regproc, false);
                     n.constant = false;
                 },
                 .format_type => {
@@ -2273,7 +2300,7 @@ pub fn Binder(comptime config: types.Config) type {
                     try bindSignature(context, n, signature, .text, true);
                     n.constant = false;
                 },
-                .pg_get_constraintdef, .pg_get_triggerdef => {
+                .pg_get_constraintdef, .pg_get_triggerdef, .pg_get_viewdef => {
                     if (context.dialect != .postgres) return error.UndefinedFunction;
                     const signature: []const ast.Type = if (count == 1) &.{.oid} else &.{ .oid, .boolean };
                     try bindSignature(context, n, signature, .text, true);
@@ -2287,7 +2314,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .identity_next, .regclass_in, .regtype_in, .regclass_out, .regtype_out, .regnamespace_in, .regnamespace_out => unreachable,
                 .pg_partition_ancestors, .array_subquery => return error.UnsupportedStatement,
                 .lower, .upper, .initcap, .char_length, .octet_length, .bit_length, .substring, .btrim, .ltrim, .rtrim, .strpos, .replace,
-                .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .concat, .concat_ws,
+                .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .concat, .concat_ws, .quote_ident, .quote_literal,
                 .overlay, .to_hex => try typeStringFunction(context, n, count),
                 .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .sind, .cosd, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => try typeMathFunction(context, n, count),
                 .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => try typeTemporalFunction(context, n, count),
@@ -2324,7 +2351,7 @@ pub fn Binder(comptime config: types.Config) type {
                 // to_timestamp(text, text) or to_timestamp(double precision).
                 .to_timestamp => try bindSignature(context, n, if (count == 1) &[_]ast.Type{.float8} else &[_]ast.Type{ .text, .text }, .timestamptz, true),
                 .array_constructor, .array_subscript, .array_any, .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper,
-                .array_append, .array_prepend, .array_cat, .array_to_string => try typeArrayFunction(context, n, count),
+                .array_append, .array_prepend, .array_cat, .array_to_string, .array_remove => try typeArrayFunction(context, n, count),
                 .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => try typeRangeFunction(context, n, count),
                 .xmlparse => {
                     n.b = try convert(context, n.b, .text, -1, .implicit);
@@ -2398,6 +2425,10 @@ pub fn Binder(comptime config: types.Config) type {
                     n.constant = false;
                 },
                 .pg_get_serial_sequence => try bindSignature(context, n, &[_]ast.Type{ .text, .text }, .text, true),
+                .acldefault => {
+                    try bindSignature(context, n, &[_]ast.Type{ .pg_internal_char, .oid }, types.arrayType(.aclitem).?, true);
+                    n.constant = false;
+                },
                 .pg_table_is_visible => {
                     try bindSignature(context, n, &[_]ast.Type{.oid}, .boolean, true);
                     n.constant = false;
@@ -2643,13 +2674,14 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 .array_subscript => {
                     const base_ty = context.node(n.b).ty;
-                    const element = types.elementType(base_ty) orelse return error.TypeMismatch;
+                    const element = if (base_ty == .name) .pg_internal_char else types.elementType(base_ty) orelse return error.TypeMismatch;
                     // Subscripts are int4 by assignment (array subscript
                     // must have type integer: 42804).
                     try convertTail(context, n.b, .int4, .assignment);
                     const layout = array_module.Subscripts.decode(n.integer);
+                    if (base_ty == .name and layout.slice()) return error.UnsupportedStatement;
                     n.ty = if (layout.slice()) base_ty else element;
-                    n.typmod = outputTypmod(context, n.b);
+                    n.typmod = if (base_ty == .name) -1 else outputTypmod(context, n.b);
                     n.constant = listConstant(context, n.b);
                 },
                 .array_any => {
@@ -2687,12 +2719,12 @@ pub fn Binder(comptime config: types.Config) type {
                     n.ty = .int4;
                     n.constant = listConstant(context, n.b);
                 },
-                .array_append, .array_prepend, .array_cat => {
+                .array_append, .array_prepend, .array_cat, .array_remove => {
                     if (count != 2) return error.UndefinedFunction;
                     var first = n.b;
                     var second = context.node(first).next;
                     n.ty = try arrayConcatTypes(context, &first, &second, switch (n.func) {
-                        .array_append => .append,
+                        .array_append, .array_remove => .append,
                         .array_prepend => .prepend,
                         else => .cat,
                     });
@@ -2928,7 +2960,18 @@ pub fn Binder(comptime config: types.Config) type {
         fn typeStringFunction(context: *const Context, n: *ast.Node, count: usize) Error!void {
             const T = ast.Type;
             switch (n.func) {
-                .lower, .upper, .initcap, .reverse => try bindSignature(context, n, &[_]T{.text}, .text, true),
+                .lower, .upper, .initcap, .reverse, .quote_ident => try bindSignature(context, n, &[_]T{.text}, .text, true),
+                .quote_literal => {
+                    if (count != 1) return error.UndefinedFunction;
+                    const from = argumentType(context, n, 0);
+                    if (from != .unknown and !value.stringType(from)) {
+                        n.b = try convert(context, n.b, .text, -1, .explicit);
+                        n.ty = .text;
+                        n.constant = false;
+                        return;
+                    }
+                    try bindSignature(context, n, &[_]T{.text}, .text, true);
+                },
                 // octet_length(bpchar) counts CHAR(n) padding; the others read
                 // CHAR(n) through text, which drops trailing spaces.
                 .char_length, .octet_length, .bit_length, .ascii => try bindSignature(context, n, &[_]T{if (n.func == .octet_length and count == 1 and argumentType(context, n, 0) == .bpchar) .bpchar else .text}, .int4, true),
@@ -3021,6 +3064,19 @@ pub fn Binder(comptime config: types.Config) type {
 
         /// Binds a column's DEFAULT or generation text (its own source) into
         /// the statement pool; generation expressions see the row (relation 0).
+        pub fn generatedColumnDependencies(context: *const Context, table: usize) Error![config.columns]bool {
+            const start = context.pool.len;
+            defer context.pool.len = start;
+            const id = try P.parseExpression(context.source, context.pool);
+            const scope = tableScope(context, table);
+            try typeExpr(context, &scope, id);
+            var columns: [config.columns]bool = @splat(false);
+            for (context.pool.nodes[start..context.pool.len]) |node| {
+                if (node.kind == .column and node.ty != .unknown and node.column < columns.len) columns[node.column] = true;
+            }
+            return columns;
+        }
+
         fn storedSource(table: usize, column: usize) i64 {
             return 1 + @as(i64, @intCast(table * config.columns + column));
         }
@@ -3097,9 +3153,12 @@ pub fn Binder(comptime config: types.Config) type {
             const n = context.node(id);
             switch (n.kind) {
                 .function => if (!ast.immutableFunction(n.func)) return false,
+                .text_literal => if (n.ty == .regproc) return false,
                 .cast => {
                     const from = context.node(n.a).ty; const to = n.cast_type;
                     if (from != to) {
+                        if ((from == .regproc and value.characterType(to)) or
+                            (to == .regproc and value.characterType(from))) return false;
                         if (value.stringType(from) and (value.datetime(to) or to == .interval)) return false;
                         if (value.stringType(to) and (value.datetime(from) or from == .interval)) return false;
                         if ((from == .timestamptz and value.datetime(to)) or (to == .timestamptz and value.datetime(from))) return false;
@@ -4389,15 +4448,18 @@ pub fn Binder(comptime config: types.Config) type {
                 (context.stored_source_start != 0 and ident.span.start >= context.stored_source_start);
         }
 
-        /// A user table, optionally schema-qualified (public by default,
-        /// as the default search_path).
-        pub fn resolveQualified(context: *const Context, schema: ?ast.Ident, name: ast.Ident) Error!usize {
+        fn resolveRelation(context: *const Context, schema: ?ast.Ident, name: ast.Ident) Error!K.Found {
             // PostgreSQL reports a relation in a missing schema as 42P01.
             const namespace = if (schema != null) qualifierNamespace(context, schema) catch |err| {
                 return if (err == error.UndefinedSchema) error.TableNotFound else err;
             } else if (publicLookup(context, name)) catalog.public_namespace else return error.TableNotFound;
             const wanted = toName(context, name);
-            const found = context.catalog.findIn(namespace, wanted.slice(), context.snapshot) orelse return error.TableNotFound;
+            return context.catalog.findIn(namespace, wanted.slice(), context.snapshot) orelse return error.TableNotFound;
+        }
+
+        /// A user table, optionally schema-qualified.
+        pub fn resolveQualified(context: *const Context, schema: ?ast.Ident, name: ast.Ident) Error!usize {
+            const found = try resolveRelation(context, schema, name);
             if (found.kind == 'S') return error.TableNotFound;
             return found.slot;
         }
@@ -6022,7 +6084,7 @@ pub fn Binder(comptime config: types.Config) type {
                         return @intCast(index);
                     };
                     if (forbid_resjunk) return error.InvalidColumnReference;
-                    if (p.width == 2 * config.columns) return error.StatementTooComplex;
+                    if (p.width == p.targets.len) return error.StatementTooComplex;
                     p.targets[p.width] = id;
                     p.width += 1;
                     return @intCast(p.width - 1);
@@ -6336,7 +6398,7 @@ pub fn Binder(comptime config: types.Config) type {
         }
 
         fn addTarget(context: *const Context, p: *Plan, id: u16, name: V.Name) Error!void {
-            if (p.count == config.columns) return error.ColumnCapacity;
+            if (p.count == p.names.len) return error.ColumnCapacity;
             p.targets[p.count] = id;
             p.names[p.count] = name;
             p.tys[p.count] = context.node(id).ty;
@@ -6616,6 +6678,19 @@ pub fn Binder(comptime config: types.Config) type {
             return if (call.qualifier.span.len == 0) null else call.qualifier;
         }
 
+        fn unnestName(context: *const Context, name: ast.Ident, schema: ?ast.Ident) bool {
+            if (context.dialect != .postgres or !types.same(toName(context, name).slice(), "unnest")) return false;
+            return if (schema) |namespace| types.same(toName(context, namespace).slice(), "pg_catalog") else true;
+        }
+
+        fn bindUnnestArgument(context: *const Context, scope: *const Scope, call: *ast.Node) Error!ast.Type {
+            if (call.star or call.distinct or call.c != none or call.order != none or call.b == none or context.node(call.b).next != none) return error.UndefinedFunction;
+            try typeExpr(context, scope, call.b);
+            const argument = context.node(call.b).ty;
+            if (argument == .unknown) return error.AmbiguousFunction;
+            return types.elementType(argument) orelse error.UndefinedFunction;
+        }
+
         fn replacePartitionAncestorTarget(context: *const Context, expression: u16, function: u16, column: u16) Error!u16 {
             if (expression == function) return column;
             var cast = context.node(expression).*;
@@ -6700,6 +6775,17 @@ pub fn Binder(comptime config: types.Config) type {
                 call.ty = .oid;
                 series = .partition_ancestors;
                 ty = .oid;
+            } else if (context.dialect == .postgres and types.same(name.slice(), "pg_options_to_table") and
+                (if (item.schema) |schema| types.same(toName(context, schema).slice(), "pg_catalog") else true))
+            {
+                if (call.star or call.distinct or call.c != none or call.order != none or call.b == none or context.node(call.b).next != none) return error.UndefinedFunction;
+                try typeExpr(context, &inner, call.b);
+                try bindSignature(context, call, &.{types.arrayType(.text).?}, .text, true);
+                series = .options_to_table;
+                ty = .text;
+            } else if (unnestName(context, item.name, item.schema)) {
+                ty = try bindUnnestArgument(context, &inner, call);
+                series = .unnest;
             } else {
                 try typeExpr(context, &inner, item.function);
                 ty = context.node(item.function).ty;
@@ -6716,17 +6802,23 @@ pub fn Binder(comptime config: types.Config) type {
             p.tys[0] = ty;
             p.typmods[0] = -1;
             p.count = 1;
-            if (item.ordinality) {
-                // A one-column configuration has no slot for the ordinality
-                // column; the comptime branch keeps index 1 out of its build.
+            if (series == .options_to_table) {
                 if (comptime p.names.len < 2) return error.ColumnCapacity;
-                if (comptime p.names.len >= 2) {
-                    p.targets[1] = try context.pool.add(.{ .kind = .null_literal, .ty = .int8, .constant = true });
-                    p.names[1] = literalName("ordinality");
-                    p.tys[1] = .int8;
-                    p.typmods[1] = -1;
-                    p.count = 2;
-                }
+                p.names[0] = literalName("option_name");
+                p.targets[1] = try context.pool.add(.{ .kind = .null_literal, .ty = .text, .constant = true });
+                p.names[1] = literalName("option_value");
+                p.tys[1] = .text;
+                p.typmods[1] = -1;
+                p.count = 2;
+            }
+            if (item.ordinality) {
+                const column = p.count;
+                if (column == p.names.len) return error.ColumnCapacity;
+                p.targets[column] = try context.pool.add(.{ .kind = .null_literal, .ty = .int8, .constant = true });
+                p.names[column] = literalName("ordinality");
+                p.tys[column] = .int8;
+                p.typmods[column] = -1;
+                p.count += 1;
             }
             p.width = p.count;
             return id;
@@ -6800,7 +6892,7 @@ pub fn Binder(comptime config: types.Config) type {
             scope.rels[0] = rel.*;
             scope.rel_count = 1;
             const p = &plans.items[id];
-            p.sources[0] = .{ .table = source.table, .view = source.view, .plan = source.plan, .cte = source.cte };
+            p.sources[0] = .{ .table = source.table, .view = source.view, .sequence = source.sequence, .plan = source.plan, .cte = source.cte };
             p.source_count = 1;
             for (0..relationWidth(context, rel)) |column| {
                 const node = try columnNode(context, &scope, 0, column);
@@ -6908,6 +7000,16 @@ pub fn Binder(comptime config: types.Config) type {
                     const child = try bindPlan(context, item.query, if (item.view) null else parent, if (item.view) null else env, false);
                     rel.plan = child;
                     source.plan = child;
+                    if (item.view_table != none) {
+                        const view = &context.tables[item.view_table];
+                        const child_plan = &plans.items[child];
+                        if (child_plan.count != view.column_count) return error.InvalidColumnReference;
+                        // The stored names belong to the outward relation.
+                        // The inner query binds ORDER BY and GROUP BY first.
+                        for (child_plan.names[0..child_plan.count], view.columns[0..view.column_count]) |*name, *column| {
+                            name.* = column.name;
+                        }
+                    }
                     if (plans.items[child].correlated) plans.items[id].correlated = true;
                 } else if (lookupCte(context, env, item.name)) |cte| {
                     rel.cte = cte;
@@ -6925,10 +7027,19 @@ pub fn Binder(comptime config: types.Config) type {
                     rel.name = literalName(@tagName(view));
                     source.view = view;
                 } else {
-                    const table = try readableTable(context, try resolveQualified(context, item.schema, item.name));
-                    rel.table = table;
-                    rel.name = context.tables[table].name;
-                    source.table = table;
+                    const found = try resolveRelation(context, item.schema, item.name);
+                    if (found.kind == 'S') {
+                        if (context.dialect != .postgres) return error.TableNotFound;
+                        rel.view = .sequence_state;
+                        rel.name = toName(context, item.name);
+                        source.view = .sequence_state;
+                        source.sequence = found.slot;
+                    } else {
+                        const table = try readableTable(context, found.slot);
+                        rel.table = table;
+                        rel.name = context.tables[table].name;
+                        source.table = table;
+                    }
                 }
                 if (item.alias) |alias| rel.name = toName(context, alias);
                 if (item.sample_method != 0) {
@@ -6969,7 +7080,15 @@ pub fn Binder(comptime config: types.Config) type {
                     try expandStar(context, &scope, q, p, target);
                     continue;
                 }
-                if (branch) try typeExpr(context, &scope, target.expr) else try valueExpr(context, &scope, target.expr);
+                const call = context.node(target.expr);
+                if (call.kind == .function and unnestName(context, call.name, functionSchema(call))) {
+                    if (p.unnest_column != none or q.lock.strength != .none) return error.UnsupportedStatement;
+                    scope.windows = false;
+                    const element = try bindUnnestArgument(context, &scope, call);
+                    scope.windows = true;
+                    call.ty = element;
+                    p.unnest_column = @intCast(p.count);
+                } else if (branch) try typeExpr(context, &scope, target.expr) else try valueExpr(context, &scope, target.expr);
                 const name = if (target.alias) |alias| toName(context, alias) else targetName(context, target.expr);
                 try addTarget(context, p, target.expr, name);
             }
@@ -7025,6 +7144,7 @@ pub fn Binder(comptime config: types.Config) type {
             }
             p.rollup=q.rollup;
             p.grouped = q.rollup or p.key_count != 0 or saw or p.having != none or p.grouping_sets != none;
+            if (p.grouped and p.unnest_column != none) return error.UnsupportedStatement;
             if (p.grouped) {
                 window_def=q.window_defs;
                 while(window_def!=none) : (window_def=context.pool.windows[window_def].next) {
@@ -7091,6 +7211,7 @@ pub fn Binder(comptime config: types.Config) type {
             bindTies(q, p, order[0..order_count]);
             p.constant_source_safe=!q.distinct and q.order_count==0 and !q.limit_present and !q.offset_present;
             try lowerWindows(context,id);
+            if (p.window_count != 0 and p.unnest_column != none) return error.UnsupportedStatement;
             if (context.dialect == .tds and !p.grouped and p.window_count == 0) {
                 var direct: [config.relations]?Int4Source = @splat(null);
                 for (p.sources[0..p.source_count], 0..) |operand, index| {
@@ -7444,7 +7565,7 @@ pub fn Binder(comptime config: types.Config) type {
             var conservative=bound.*!=.query;
             for(plans.items[0..plans.len]) |*p| conservative=conservative or p.correlated;
             // B11 composition plans keep every output (no demand pruning).
-            for(plans.items[0..plans.len]) |*p| conservative=conservative or p.values!=none or p.general_join or p.limit_expr!=none or p.offset_expr!=none or p.with_ties or p.grouping_sets!=none or p.function!=none or (p.source_count!=0 and p.sources[0].sample_method!=0);
+            for(plans.items[0..plans.len]) |*p| conservative=conservative or p.values!=none or p.general_join or p.limit_expr!=none or p.offset_expr!=none or p.with_ties or p.grouping_sets!=none or p.function!=none or p.unnest_column!=none or (p.source_count!=0 and p.sources[0].sample_method!=0);
             for(plans.ctes[0..plans.cte_len]) |*def| conservative=conservative or def.search or def.cycle or def.dml!=no_dml;
             for(plans.items[0..plans.len]) |*p| {p.demanded=conservative;p.required=@splat(conservative);p.aggregate_required=@splat(conservative);}
             if(conservative) return;
@@ -7713,11 +7834,8 @@ pub fn Binder(comptime config: types.Config) type {
                     if (create.partition_of) |parent| return bindPartitionOf(context, create, table_name, namespace, parent);
                     if (create.inherits != null and (create.like != null or create.partition_by != .none)) return error.UnsupportedStatement;
                     var out: Create = .{ .name = table_name, .columns = @splat(.{}), .count = create.count, .namespace = namespace, .plain_definition = plain };
-                    // Owned sequences live in public: identity and SERIAL
-                    // columns stay outside other schemas (0A000).
                     if (namespace != catalog.public_namespace) for (create.columns[0..create.count]) |*definition| {
-                        if (definition.serial != 0 or definition.default_kind == .identity_always or definition.default_kind == .identity_by_default or
-                            definition.default_kind == .mysql_auto_increment) return error.UnsupportedStatement;
+                        if (definition.default_kind == .mysql_auto_increment) return error.UnsupportedStatement;
                     };
                     for (create.columns[0..create.count], 0..) |*definition, index| {
                         var column: V.Column = .{ .name = toName(context, definition.name), .not_null = definition.not_null, .primary_key = definition.primary_key, .typmod = definition.typmod, .default_kind = definition.default_kind, .virtual = definition.virtual };
@@ -7739,14 +7857,17 @@ pub fn Binder(comptime config: types.Config) type {
                             const seq_name = try serialSequence(context, &out, column.name);
                             column.not_null = true;
                             column.default_kind = .default;
-                            column.expression = try serialDefault(seq_name);
-                            out.serials[out.serial_count] = .{ .column = @intCast(index), .name = seq_name, .spec = try sequence.resolve(.{ .type_oid = definition.serial }) };
-                            out.serial_count += 1;
+                            const schema = if (namespace != catalog.public_namespace)
+                                toName(context, create.schema orelse return error.UndefinedSchema)
+                            else
+                                null;
+                            column.expression = try serialDefault(if (schema) |qualifier| qualifier.slice() else null, seq_name);
+                            out.sequences[out.sequence_count] = .{ .column = @intCast(index), .name = seq_name, .spec = try sequence.resolve(.{ .type_oid = definition.serial }) };
+                            out.sequence_count += 1;
                         }
                         switch (definition.default_kind) {
                             .identity_always, .identity_by_default, .mysql_auto_increment => {
                                 if (!integerColumn(column.data_type)) return error.TypeMismatch;
-                                if (out.identity != null) return error.UnsupportedStatement;
                                 if (definition.default_kind == .mysql_auto_increment and
                                     (create.inherits != null or create.like != null or create.partition_by != .none or
                                     (column.data_type != .integer32 and column.data_type != .integer))) return error.UnsupportedStatement;
@@ -7754,8 +7875,12 @@ pub fn Binder(comptime config: types.Config) type {
                                 var options = definition.sequence;
                                 if (options.type_oid == 0) options.type_oid = types.typeOid(column.data_type);
                                 const seq_name = try identityName(table_name, column.name);
-                                if (context.catalog.find(seq_name.slice(), context.snapshot) != null) return error.TableExists;
-                                out.identity = .{ .column = @intCast(index), .name = seq_name, .spec = try sequence.resolve(options) };
+                                if (context.catalog.findIn(namespace, seq_name.slice(), context.snapshot) != null) return error.TableExists;
+                                for (out.sequences[0..out.sequence_count]) |other| {
+                                    if (types.same(other.name.slice(), seq_name.slice())) return error.TableExists;
+                                }
+                                out.sequences[out.sequence_count] = .{ .column = @intCast(index), .name = seq_name, .spec = try sequence.resolve(options) };
+                                out.sequence_count += 1;
                             },
                             // Type-checked now; evaluated per row.
                             .default => _ = try bindExpressionText(context, &column, null, -1),
@@ -7775,9 +7900,9 @@ pub fn Binder(comptime config: types.Config) type {
                         out.extras.parent = context.tables[parent_index].oid;
                     }
                     try bindTableConstraints(context, create.constraints[0..create.constraint_count], &out, false);
-                    if (out.identity) |identity| {
-                        const key = &out.columns[identity.column];
-                        if (key.default_kind == .mysql_auto_increment and (!key.primary_key or out.serial_count != 0))
+                    for (out.sequences[0..out.sequence_count]) |seq| {
+                        const key = &out.columns[seq.column];
+                        if (key.default_kind == .mysql_auto_increment and (!key.primary_key or out.sequence_count != 1))
                             return error.InvalidTableDefinition;
                     }
                     if (create.partition_by != .none) {
@@ -7812,19 +7937,19 @@ pub fn Binder(comptime config: types.Config) type {
                     return .{ .drop_table = found.slot };
                 },
                 .create_sequence => |*create| {
-                    if (!context.session.public_schema_on_path) return error.UndefinedSchema;
-                    const name = toName(context, create.name);
-                    if (context.catalog.find(name.slice(), context.snapshot) != null) {
+                    const namespace = try specifiedNamespace(context, create.name.schema);
+                    const name = toName(context, create.name.name);
+                    if (context.catalog.findIn(namespace, name.slice(), context.snapshot) != null or
+                        indexNameTaken(context, namespace, name.slice())) {
                         if (create.if_not_exists) return .{ .noop = .create_sequence };
                         return error.TableExists;
                     }
-                    return .{ .create_sequence = .{ .name = name, .spec = try sequence.resolve(create.options) } };
+                    return .{ .create_sequence = .{ .name = name, .namespace = namespace, .spec = try sequence.resolve(create.options) } };
                 },
                 .drop_sequence => |drop| {
-                    const wanted = toName(context, drop.name);
-                    const found = (if (publicLookup(context, drop.name)) context.catalog.find(wanted.slice(), context.snapshot) else null) orelse {
-                        if (drop.if_exists) return .{ .noop = .drop_sequence };
-                        return error.TableNotFound;
+                    const found = resolveRelation(context, drop.schema, drop.name) catch |err| {
+                        if (err == error.TableNotFound and drop.if_exists) return .{ .noop = .drop_sequence };
+                        return err;
                     };
                     if (found.kind != 'S') return error.WrongObjectType;
                     return .{ .drop_sequence = found.slot };
@@ -7889,7 +8014,16 @@ pub fn Binder(comptime config: types.Config) type {
                         try resolveUnknown(context, root);
                         return .{ .query = root };
                     };
-                    return .{ .select = try bindSelect(context, q) };
+                    const selected = bindSelect(context, q) catch |err| {
+                        if (err != error.TableNotFound or context.dialect != .postgres) return err;
+                        const ref = q.from orelse return err;
+                        if ((try resolveRelation(context, ref.schema, ref.name)).kind != 'S') return err;
+                        if (context.plans == null or q.lock.strength != .none) return error.UnsupportedStatement;
+                        const root = try bindPlan(context, index, null, null, false);
+                        try resolveUnknown(context, root);
+                        return .{ .query = root };
+                    };
+                    return .{ .select = selected };
                 },
                 .query => |index| {
                     const plans = context.plans orelse return error.UnsupportedStatement;
@@ -7980,16 +8114,23 @@ pub fn Binder(comptime config: types.Config) type {
                 .merge => |*merge| return bindMerge(context, merge),
                 .set_constraints => |*set| return bindSetConstraints(context, set),
                 .alter_sequence => |*alter| {
-                    if (alter.name.schema) |qualifier| {
-                        if (!types.same(toName(context, qualifier).slice(), "public")) return error.TableNotFound;
-                    }
-                    const wanted = toName(context, alter.name.name);
-                    const found = (if (alter.name.schema != null or publicLookup(context, alter.name.name)) context.catalog.find(wanted.slice(), context.snapshot) else null) orelse {
-                        if (alter.if_exists) return .{ .noop = .alter_sequence };
-                        return error.TableNotFound;
+                    const found = resolveRelation(context, alter.name.schema, alter.name.name) catch |err| {
+                        if (err == error.TableNotFound and alter.if_exists) return .{ .noop = .alter_sequence };
+                        return err;
                     };
                     if (found.kind != 'S') return error.WrongObjectType;
-                    return .{ .alter_sequence = .{ .slot = found.slot, .options = alter.options } };
+                    var bound: AlterSequence = .{ .slot = found.slot, .options = alter.options };
+                    if (alter.owned_by) |owned_by| {
+                        bound.ownership = .{};
+                        if (owned_by.column) |column| {
+                            const target = try resolveRelation(context, owned_by.table.schema, owned_by.table.name);
+                            if (target.kind != 'r' and target.kind != 'p') return error.WrongObjectType;
+                            const table = &context.tables[target.slot];
+                            const index = definitionColumn(table.columns[0..table.column_count], toName(context, column).slice()) orelse return error.ColumnNotFound;
+                            bound.ownership = .{ .table = table.oid, .column = index };
+                        }
+                    }
+                    return .{ .alter_sequence = bound };
                 },
             }
         }
@@ -7997,31 +8138,33 @@ pub fn Binder(comptime config: types.Config) type {
         /// A SERIAL column's sequence `<table>_<column>_seq` (ChooseRelationName
         /// numbering when taken) and its DEFAULT text nextval('name'::regclass).
         fn serialSequence(context: *const Context, out: *const Create, column: V.Name) Error!V.Name {
-            var taken: [config.columns + 1]S.Constraint = undefined;
-            var count: usize = 0;
-            for (out.serials[0..out.serial_count]) |serial| {
-                taken[count] = .{ .name = serial.name };
-                count += 1;
+            var taken: [config.columns]S.Constraint = undefined;
+            for (taken[0..out.sequence_count], out.sequences[0..out.sequence_count]) |*entry, seq| {
+                entry.* = .{ .name = seq.name };
             }
-            if (out.identity) |identity| {
-                taken[count] = .{ .name = identity.name };
-                count += 1;
-            }
-            return chooseName(context, out.name.slice(), column.slice(), "seq", taken[0..count], true);
+            return chooseName(context, out.namespace, out.name.slice(), column.slice(), "seq", taken[0..out.sequence_count], true);
         }
 
-        fn serialDefault(name: V.Name) Error!V.Text {
+        pub fn serialDefault(schema: ?[]const u8, name: V.Name) Error!V.Text {
             var out: V.Text = .{};
             try appendText(&out, "nextval('");
-            var plain = name.len != 0 and !types.digit(name.bytes[0]);
-            for (name.slice()) |byte| {
-                if (!((byte >= 'a' and byte <= 'z') or types.digit(byte) or byte == '_')) plain = false;
+            if (schema) |qualifier| {
+                try appendSerialName(&out, qualifier);
+                try appendText(&out, ".");
             }
-            if (!plain) try appendText(&out, "\"");
-            for (name.slice()) |byte| try appendText(&out, if (byte == '\'') "''" else if (byte == '"') "\"\"" else &[_]u8{byte});
-            if (!plain) try appendText(&out, "\"");
+            try appendSerialName(&out, name.slice());
             try appendText(&out, "'::regclass)");
             return out;
+        }
+
+        fn appendSerialName(out: *V.Text, name: []const u8) Error!void {
+            var plain = name.len != 0 and !types.digit(name[0]);
+            for (name) |byte| {
+                if (!((byte >= 'a' and byte <= 'z') or types.digit(byte) or byte == '_')) plain = false;
+            }
+            if (!plain) try appendText(out, "\"");
+            for (name) |byte| try appendText(out, if (byte == '\'') "''" else if (byte == '"') "\"\"" else &[_]u8{byte});
+            if (!plain) try appendText(out, "\"");
         }
 
         // ---- ALTER TABLE ------------------------------------------------
@@ -8233,6 +8376,10 @@ pub fn Binder(comptime config: types.Config) type {
             for (entry.columns[0..entry.column_count]) |column| if (column.default_kind == .mysql_auto_increment)
                 return error.UnsupportedStatement;
             var out = alterOf(context, index, .alter_table);
+            out.sets_defaults = alter.count != 0;
+            for (alter.actions[0..alter.count]) |*action| {
+                out.sets_defaults = out.sets_defaults and action.* == .set_default;
+            }
             // Inheritance and partition definitions keep their column lists.
             if (entry.parent != 0 or hasChildren(context, entry.oid)) for (alter.actions[0..alter.count]) |*action| switch (action.*) {
                 .add_column, .drop_column, .rename_column => return error.UnsupportedStatement,
@@ -8382,6 +8529,25 @@ pub fn Binder(comptime config: types.Config) type {
                     _ = try bindExpressionText(context, &candidate, null, -1);
                     column.* = candidate;
                 },
+                .add_identity => |*definition| {
+                    if (context.dialect != .postgres or alter.count != 1 or
+                        entry.parent != 0 or hasChildren(context, entry.oid)) return error.UnsupportedStatement;
+                    const position = alterColumn(&out, toName(context, definition.column).slice()) orelse return error.ColumnNotFound;
+                    const column = &out.columns[position];
+                    if (!column.not_null or column.default_kind != .none) return error.ObjectNotInPrerequisiteState;
+                    if (!integerColumn(column.data_type)) return error.TypeMismatch;
+                    const name = if (definition.name) |reference| blk: {
+                        if (reference.schema) |schema| {
+                            if (try qualifierNamespace(context, schema) != entry.namespace) return error.InvalidTableDefinition;
+                        }
+                        break :blk toName(context, reference.name);
+                    } else try identityName(entry.name, column.name);
+                    if (indexNameTaken(context, entry.namespace, name.slice())) return error.TableExists;
+                    var options = definition.options;
+                    if (options.type_oid == 0) options.type_oid = types.typeOid(column.data_type);
+                    out.identity = .{ .column = @intCast(position), .name = name, .spec = try sequence.resolve(options) };
+                    column.default_kind = if (definition.always) .identity_always else .identity_by_default;
+                },
                 .drop_default => |ident| {
                     const position = alterColumn(&out, toName(context, ident).slice()) orelse return error.ColumnNotFound;
                     const column = &out.columns[position];
@@ -8406,7 +8572,7 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 .add_constraint => |*definition| {
                     if (definition.kind == .primary) {
-                        if (context.dialect != .postgres or alter.count != 1 or definition.column_count != 1 or
+                        if (context.dialect != .postgres or alter.count != 1 or
                             entry.parent != 0 or hasChildren(context, entry.oid)) return error.UnsupportedStatement;
                         if (definition.name) |ident| if (indexNameTaken(context, entry.namespace, toName(context, ident).slice())) return error.TableExists;
                         for (out.columns[0..out.count]) |*column| if (column.primary_key) return error.InvalidTableDefinition;
@@ -8501,18 +8667,18 @@ pub fn Binder(comptime config: types.Config) type {
         /// A constraint name already used by this definition, by another
         /// visible table's constraint (PostgreSQL names are per schema) or,
         /// for index-backed kinds, by a relation.
-        fn constraintNameUsed(context: *const Context, table_name: []const u8, taken: []const S.Constraint, name: []const u8, relation: bool) bool {
+        fn constraintNameUsed(context: *const Context, namespace: u32, table_name: []const u8, taken: []const S.Constraint, name: []const u8, relation: bool) bool {
             for (taken) |*constraint| if (types.same(constraint.name.slice(), name)) return true;
             if (relation) {
                 if (types.same(table_name, name)) return true;
-                if (context.catalog.find(name, context.snapshot) != null) return true;
+                if (context.catalog.findIn(namespace, name, context.snapshot) != null) return true;
             }
             var relations: [K.relation_rows]K.Found = undefined;
             const count = context.catalog.visibleRelations(context.snapshot, &relations);
             for (relations[0..count]) |found| {
                 if (found.kind != 'r') continue;
                 const entry = &context.tables[found.slot];
-                if (types.same(entry.name.slice(), table_name)) continue;
+                if (entry.namespace != namespace or types.same(entry.name.slice(), table_name)) continue;
                 for (entry.constraints[0..entry.constraint_count]) |*constraint| if (types.same(constraint.name.slice(), name)) return true;
             }
             return false;
@@ -8520,7 +8686,7 @@ pub fn Binder(comptime config: types.Config) type {
 
         /// ChooseConstraintName / ChooseRelationName: label, then label1,
         /// label2, ... until unused.
-        fn chooseName(context: *const Context, table_name: []const u8, name2: []const u8, label: []const u8, taken: []const S.Constraint, relation: bool) V.Name {
+        fn chooseName(context: *const Context, namespace: u32, table_name: []const u8, name2: []const u8, label: []const u8, taken: []const S.Constraint, relation: bool) V.Name {
             var pass: usize = 0;
             while (true) : (pass += 1) {
                 var buffer: [24]u8 = undefined;
@@ -8540,7 +8706,7 @@ pub fn Binder(comptime config: types.Config) type {
                     length += digits.len - at;
                 }
                 const candidate = objectName(table_name, name2, buffer[0..length]);
-                if (!constraintNameUsed(context, table_name, taken, candidate.slice(), relation)) return candidate;
+                if (!constraintNameUsed(context, namespace, table_name, taken, candidate.slice(), relation)) return candidate;
             }
         }
 
@@ -8665,7 +8831,7 @@ pub fn Binder(comptime config: types.Config) type {
                         var avoid: [2 * config.table_constraints]S.Constraint = undefined;
                         @memcpy(avoid[0..taken.len], taken);
                         @memcpy(avoid[taken.len..][0..named_count], named[0..named_count]);
-                        break :blk chooseName(context, out.name.slice(), name2[0..name2_len], label, avoid[0 .. taken.len + named_count], definition.kind != .check and definition.kind != .foreign);
+                        break :blk chooseName(context, out.namespace, out.name.slice(), name2[0..name2_len], label, avoid[0 .. taken.len + named_count], definition.kind != .check and definition.kind != .foreign);
                     };
                 }
                 if (out.constraint_count == config.table_constraints) return error.ColumnCapacity;
@@ -8826,10 +8992,13 @@ pub fn Binder(comptime config: types.Config) type {
                 out.columns[index] = column;
             }
             const text = create.text.slice(context.source);
-            if (text.len > config.text_bytes) return error.TextCapacity;
             out.extras.relkind = if (create.materialized) 'm' else 'v';
-            out.extras.query.len = text.len;
-            @memcpy(out.extras.query.bytes[0..text.len], text);
+            if (text.len > config.text_bytes) {
+                out.extras.query.len = try lexer.compactDefinition(text, &out.extras.query.bytes);
+            } else {
+                out.extras.query.len = text.len;
+                @memcpy(out.extras.query.bytes[0..text.len], text);
+            }
             for (plans.items[0..plans.len]) |*item| for (item.sources[0..item.source_count]) |*source| {
                 const table = source.table orelse continue;
                 const oid = context.tables[table].oid;
@@ -8916,11 +9085,8 @@ pub fn Binder(comptime config: types.Config) type {
             const at = like.position;
             const shift = source.column_count;
             // Own identity / SERIAL columns after the LIKE position move.
-            if (out.identity) |*identity| if (identity.column >= at) {
-                identity.column += @intCast(shift);
-            };
-            for (out.serials[0..out.serial_count]) |*serial| if (serial.column >= at) {
-                serial.column += @intCast(shift);
+            for (out.sequences[0..out.sequence_count]) |*seq| if (seq.column >= at) {
+                seq.column += @intCast(shift);
             };
             var position = out.count;
             while (position > at) {
@@ -8942,8 +9108,8 @@ pub fn Binder(comptime config: types.Config) type {
                         copy.virtual = false;
                     },
                     .identity_always, .identity_by_default => if (like.identity) {
-                        if (out.identity != null) return error.UnsupportedStatement;
-                        out.identity = .{ .column = @intCast(at + index), .name = try identityName(out.name, copy.name), .spec = try sequence.resolve(.{ .type_oid = types.typeOid(copy.data_type) }) };
+                        out.sequences[out.sequence_count] = .{ .column = @intCast(at + index), .name = try identityName(out.name, copy.name), .spec = try sequence.resolve(.{ .type_oid = types.typeOid(copy.data_type) }) };
+                        out.sequence_count += 1;
                     } else {
                         copy.default_kind = .none;
                     },
@@ -8981,7 +9147,7 @@ pub fn Binder(comptime config: types.Config) type {
                         @memcpy(name2[name2_len..][0..take], part[0..take]);
                         name2_len += take;
                     }
-                    copy.name = if (constraint.kind == .primary) objectName(out.name.slice(), "", "pkey") else chooseName(context, out.name.slice(), name2[0..name2_len], if (constraint.kind == .unique) "key" else "excl", out.constraints[0..out.constraint_count], true);
+                    copy.name = if (constraint.kind == .primary) objectName(out.name.slice(), "", "pkey") else chooseName(context, out.namespace, out.name.slice(), name2[0..name2_len], if (constraint.kind == .unique) "key" else "excl", out.constraints[0..out.constraint_count], true);
                 }
                 out.constraints[out.constraint_count] = copy;
                 out.constraint_count += 1;

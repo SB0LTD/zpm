@@ -559,6 +559,16 @@ fn nativeAutoIncrement() !void {
     try check(output[4] == 0 and output[5] == 1 and output[6] == 0);
     _ = try command(&a, &first, "INSERT INTO autos VALUES(NULL,88)");
     try check(output[4] == 0 and output[5] == 1 and output[6] == 1);
+    _ = try command(&a, &first, "REPLACE INTO autos VALUES(1,99)");
+    try check(output[4] == 0 and output[5] == 2 and output[6] == 1);
+    _ = try command(&a, &first, "BEGIN");
+    _ = try command(&a, &first, "REPLACE INTO autos VALUES(1,100)");
+    try check(output[4] == 0 and output[5] == 2);
+    _ = try command(&a, &first, "ROLLBACK");
+    _ = try command(&a, &first, "SELECT v FROM autos WHERE id=1");
+    try check(a.result.row_count == 1 and a.result.rows[0].cells[0].integer == 99);
+    _ = try command(&a, &first, "REPLACE INTO autos(v) VALUES(101)");
+    try check(output[4] == 0 and output[5] == 1 and output[6] == 2);
 
     store = .{};
     store.database.dialect = .mysql;
@@ -568,16 +578,17 @@ fn nativeAutoIncrement() !void {
     for ([_][]const u8{
         "CREATE TABLE autos(id INT AUTO_INCREMENT PRIMARY KEY,v INT NOT NULL)",
         "INSERT INTO autos(v) VALUES(19)",
+        "REPLACE INTO autos VALUES(1,24)",
         "INSERT INTO autos VALUES(77,20)",
     }) |source| {
         var used: usize = 0;
         try store.database.executeChanges(source, &result, &record, &used, null, null);
         try syntax_recovered.applyChangeRecord(record[0..used], &syntax_replay);
     }
-    try syntax_recovered.execute("SELECT id FROM autos WHERE v=19", &result);
+    try syntax_recovered.execute("SELECT id FROM autos WHERE v=24", &result);
     try check(result.row_count == 1 and result.rows[0].cells[0].integer == 1);
     syntax_recovered.dialect = .mysql;
-    try syntax_recovered.execute("INSERT INTO autos(v) VALUES(21)", &result);
+    try syntax_recovered.execute("REPLACE INTO autos(v) VALUES(21)", &result);
     try check(result.mysql_insert_id == 78 and result.mysql_generated_id == 78);
 }
 
