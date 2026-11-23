@@ -284,6 +284,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
         (if (@hasDecl(DB, "detached_primary_key")) DB.detached_primary_key else true);
     const has_cached_primary_key = @hasDecl(DB, "executeCachedDetachedPrimaryKey") and
         (if (@hasDecl(DB, "detached_cached_primary_key")) DB.detached_cached_primary_key else true);
+    const KeyView = if (@hasDecl(DB, "DetachedKeyView") and @hasDecl(DB, "viewCachedDetachedPrimaryKey")) DB.DetachedKeyView else void;
     const primary_key_sql_capacity = 256;
     const result_format_capacity = 256;
     const CopyInfo = if (has_copy) DB.CopyInfo else struct {};
@@ -604,19 +605,26 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             if (output.len < try self.requiredCapacity()) return error.BufferTooSmall;
             var w: Writer = .{ .bytes = output };
             var execution_error: ?anyerror = null;
-            const found = db.executeCachedDetachedPrimaryKey(exchange.key.source, exchange.key.oid, exchange.key.key, &self.result) catch |err| failed: {
+            const view: ?KeyView = if (comptime KeyView == void) null else
+                db.viewCachedDetachedPrimaryKey(exchange.key.source, exchange.key.oid, exchange.key.key, output) catch |err| failed: {
+                    execution_error = err;
+                    break :failed null;
+                };
+            const found = view != null or execution_error != null or (db.executeCachedDetachedPrimaryKey(exchange.key.source, exchange.key.oid, exchange.key.key, &self.result) catch |err| failed: {
                 execution_error = err;
                 break :failed true;
-            };
+            });
             if (!found) return null;
             try w.empty('2');
             const bind_end = w.at;
-            if (execution_error == null and exchange.formats.len > 2 and exchange.formats.len / 2 != self.result.column_count)
+            const columns = if (comptime KeyView == void) self.result.column_count else
+                if (view) |projection| projection.columns.len else self.result.column_count;
+            if (execution_error == null and exchange.formats.len > 2 and exchange.formats.len / 2 != columns)
                 execution_error = error.ProtocolViolation;
             try writeNotice(db, &w);
             if (execution_error == null) {
                 self.commit_rolled_back = false;
-                self.writeKeyResult(db, &w, exchange.formats) catch |err| {
+                self.writeKeyResult(db, &w, exchange.formats, view) catch |err| {
                     w.at = bind_end;
                     execution_error = err;
                 };
@@ -631,10 +639,29 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             return .{ .consumed = exchange.consumed, .written = w.at };
         }
 
-        fn writeKeyResult(self: *Self, db: *DB, w: *Writer, formats: []const u8) !void {
-            try self.rows(db, w, formats, 0, self.result.row_count);
+        fn writeKeyResult(self: *Self, db: *DB, w: *Writer, formats: []const u8, view: ?KeyView) !void {
+            const present = if (comptime KeyView == void) self.result.row_count != 0 else
+                if (view) |projection| projection.version != null else self.result.row_count != 0;
+            if (comptime KeyView != void) {
+                if (view) |projection| {
+                    if (present) try self.projectedKeyRow(db, w, formats, projection);
+                } else try self.rows(db, w, formats, 0, self.result.row_count);
+            } else try self.rows(db, w, formats, 0, self.result.row_count);
             const tag = try w.begin('C');
-            try w.append(if (self.result.row_count == 0) "SELECT 0\x00" else "SELECT 1\x00");
+            try w.append(if (present) "SELECT 1\x00" else "SELECT 0\x00");
+            w.end(tag);
+        }
+
+        fn projectedKeyRow(self: *Self, db: *DB, w: *Writer, formats: []const u8, view: KeyView) !void {
+            const session = valueSession(db);
+            const tag = try w.begin('D');
+            try w.u16be(@intCast(view.columns.len));
+            var scratch: @TypeOf(self.result.rows[0].cells[0]) = undefined;
+            for (view.types, 0..) |data_type, index| {
+                const format_index = if (formats.len == 2) 1 else index * 2 + 1;
+                const binary = formats.len != 0 and formats[format_index] == 1;
+                try self.dataCell(w, view.cell(index, &scratch), data_type, session, binary, null);
+            }
             w.end(tag);
         }
 
@@ -2138,33 +2165,33 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                 const p = try w.begin('D');
                 try w.u16be(@intCast(self.result.column_count));
                 for (0..self.result.column_count) |i| {
-                    const cell = self.result.rows[row].cells[i];
-                    if (cell == .null_value) {
-                        try w.u32be(0xffffffff);
-                        continue;
-                    }
-                    const length = w.at;
-                    try w.u32be(0);
-                    const start = w.at;
                     const format_index = if (format_count == 1) 0 else i;
                     const binary = format_count != 0 and formats[format_index * stride + stride - 1] == 1;
-                    switch (cell) {
-                        .null_value => unreachable,
-                        .integer => |n| if (binary) {
-                            w.at += T.sendBinary(&cell, self.result.column_types[i], session, w.bytes[w.at..]) catch return error.BufferTooSmall;
-                        } else try w.number(n),
-                        .boolean => |b| try w.byte(if (binary) @intFromBool(b) else if (b) 't' else 'f'),
-                        .text => |t| try w.append(t.slice()),
-                        else => {
-                            const nominal = if (binary) null else try self.nominalText(i, &cell, w.bytes[w.at..]);
-                            const size = nominal orelse ((if (binary) T.sendBinary(&cell, self.result.column_types[i], session, w.bytes[w.at..]) else T.sendText(&cell, session, w.bytes[w.at..])) catch return error.BufferTooSmall);
-                            w.at += size;
-                        },
-                    }
-                    write32(w.bytes[length..][0..4], @intCast(w.at - start));
+                    try self.dataCell(w, &self.result.rows[row].cells[i], self.result.column_types[i], session, binary, i);
                 }
                 w.end(p);
             }
+        }
+
+        fn dataCell(self: *const Self, w: *Writer, cell: *const @TypeOf(@as(DB.Result, undefined).rows[0].cells[0]), data_type: @TypeOf(@as(DB.Result, undefined).column_types[0]), session: *const T.Session, binary: bool, nominal_column: ?usize) !void {
+            if (cell.* == .null_value) return w.u32be(0xffffffff);
+            const length = w.at;
+            try w.u32be(0);
+            const start = w.at;
+            switch (cell.*) {
+                .null_value => unreachable,
+                .integer => |n| if (binary) {
+                    w.at += T.sendBinary(cell, data_type, session, w.bytes[w.at..]) catch return error.BufferTooSmall;
+                } else try w.number(n),
+                .boolean => |b| try w.byte(if (binary) @intFromBool(b) else if (b) 't' else 'f'),
+                .text => |*t| try w.append(t.slice()),
+                else => {
+                    const nominal = if (binary) null else if (nominal_column) |i| try self.nominalText(i, cell, w.bytes[w.at..]) else null;
+                    const size = nominal orelse ((if (binary) T.sendBinary(cell, data_type, session, w.bytes[w.at..]) else T.sendText(cell, session, w.bytes[w.at..])) catch return error.BufferTooSmall);
+                    w.at += size;
+                },
+            }
+            write32(w.bytes[length..][0..4], @intCast(w.at - start));
         }
         fn command(self: *Self, w: *Writer, source: []const u8) !void {
             if (self.objectTag()) |tag| {

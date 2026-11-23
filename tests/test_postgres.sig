@@ -1549,12 +1549,13 @@ fn detachedPrimaryKeys() !void {
     const request = exchange_bytes[0..request_len];
     try check(s.detachedKeyExchange(request[0 .. request.len - 1]) == null);
     const exchange = s.detachedKeyExchange(request) orelse return error.MissingPrimaryKeyExchange;
+    s.result.row_count = 0;
     db.read_context = &context;
     db.running_statement = true;
     const fused = (try s.handleDetachedKeyExchange(&db, exchange, &store_output)) orelse return error.MissedRetainedKeyExchange;
     db.read_context = null;
     db.running_statement = false;
-    try check(fused.consumed == request.len and context.primary_key_cache_hits == 2);
+    try check(fused.consumed == request.len and context.primary_key_cache_hits == 2 and s.result.row_count == 0);
     try tags(store_output[0..fused.written], "2DCZ");
     var fused_frames: Frames = .{ .bytes = store_output[0..fused.written] };
     _ = try fused_frames.next();

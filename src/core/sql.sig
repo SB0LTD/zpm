@@ -1527,15 +1527,49 @@ pub fn Database(comptime config: Config) type {
             /// Reuse the retained read plan without installing it into the
             /// working plan union. On a miss the caller still owns the request.
             pub fn runCachedPrimaryKey(self: *Context, db: *const Self, source: []const u8, snapshot: Snapshot, parameter: DataType, key: *const Cell, result: *Result) Error!bool {
-                const cached = if (self.cached_primary_key) |*entry| entry else return false;
-                const plan = &cached.plan;
-                if (cached.database != db or plan.data_type != parameter or db.detachedReadsBlocked() or
-                    !snapshotMatches(plan.snapshot, snapshot) or !self.primaryKeyTableCurrent(db, plan) or
-                    !types.same(cached.source[0..cached.len], source)) return false;
+                const plan = self.cachedKeyPlan(db, source, snapshot, parameter) orelse return false;
                 try self.probePrimaryKey(db, source, snapshot, plan, key, result);
                 self.last_result_reused = false;
                 self.primary_key_cache_hits +%= 1;
                 return true;
+            }
+
+            fn cachedKeyPlan(self: *const Context, db: *const Self, source: []const u8, snapshot: Snapshot, parameter: DataType) ?*const PrimaryKeyPlan {
+                const cached = if (self.cached_primary_key) |*entry| entry else return null;
+                const plan = &cached.plan;
+                if (cached.database != db or plan.data_type != parameter or db.detachedReadsBlocked() or
+                    !snapshotMatches(plan.snapshot, snapshot) or !self.primaryKeyTableCurrent(db, plan) or
+                    !types.same(cached.source[0..cached.len], source)) return null;
+                return plan;
+            }
+
+            /// Valid only while the caller retains the read gate and leaves
+            /// this context unchanged. A null version is a valid empty result.
+            pub const PrimaryKeyView = struct {
+                table: *const S.Table,
+                version: ?u32,
+                columns: []const u16,
+                types: []const DataType,
+
+                pub fn cell(self: PrimaryKeyView, index: usize, scratch: *Cell) *const Cell {
+                    return S.borrowVersionCell(self.table, self.version.?, self.columns[index], scratch);
+                }
+            };
+
+            pub fn cachedPrimaryKeyView(self: *Context, db: *const Self, source: []const u8, snapshot: Snapshot, parameter: DataType, key: *const Cell, output: []u8) Error!?PrimaryKeyView {
+                const plan = self.cachedKeyPlan(db, source, snapshot, parameter) orelse return null;
+                if (plan.select.has_nominal_types) return null;
+                const span = try StorageSpan.of(output);
+                if (overlaps(span, try StorageSpan.of(source)) or overlaps(span, try objectSpan(self))) return error.InvalidParameterValue;
+                try disjointDatabase(db, &.{span});
+                const table = &db.tables[plan.select.table.?];
+                if (key.* != .null_value) try V.validate(&table.columns[plan.column], key);
+                try self.session.checkpoint();
+                const version = if (key.* == .null_value) null else S.lookupVersionAt(table, key, snapshot);
+                self.workspace.query.read_stats = .{};
+                self.last_result_reused = false;
+                self.primary_key_cache_hits +%= 1;
+                return .{ .table = table, .version = version, .columns = plan.projection[0..plan.select.count], .types = plan.select.types[0..plan.select.count] };
             }
 
             fn probePrimaryKey(self: *Context, db: *const Self, source: []const u8, snapshot: Snapshot, plan: *const PrimaryKeyPlan, key: *const Cell, result: *Result) Error!void {
