@@ -1465,7 +1465,10 @@ const Gen = struct {
         const slot = g.lay.texture(g.lay.ctx, tn, sn) orelse return null;
         if (slot >= texture.MAX_TEX) return null;
         const dim = g.dimOf(t);
-        return .{ .b = g.texb + @as(u8, @intCast(slot)), .uni = g.uni, .word = g.lay.desc_base + slot * texture.DESC_WORDS, .volume = dim == 5, .cube = dim == 6 };
+        // (a pixel stage's 2D samples through the GPU's texture unit,
+        // where its builder says: raster.pixelStage)
+        const hw = if (g.fio) |io| io.tex_hw else null;
+        return .{ .b = g.texb + @as(u8, @intCast(slot)), .uni = g.uni, .word = g.lay.desc_base + slot * texture.DESC_WORDS, .volume = dim == 5, .cube = dim == 6, .hw = hw };
     }
 
     /// A resource's declared dimension (2D when undeclared).

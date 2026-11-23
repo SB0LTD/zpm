@@ -217,6 +217,9 @@ pub const FragmentIO = struct {
     discard: V = .none,
     /// the code takes derivatives (set by the fragment emitter)
     derivatives: bool = false,
+    /// a GPU's pixel program's (pixelStage with the texture unit): its 2D
+    /// samples go through the unit (texture.Slot.hw)
+    tex_hw: ?*texture.HwTex = null,
 };
 
 /// The shaders: KIR emitters (what GLSL compiles to, or Sig code).
@@ -362,6 +365,13 @@ pub const Pipeline = struct {
     /// pixel), loaded by `owner` at the first draw that may use them; the
     /// engine that could not compile or load them.
     gfx: [2]?gpu.Program = .{ null, null },
+    /// the pixel program with every sample in its own code (pixelStage
+    /// without the texture unit), for a draw whose textures the unit
+    /// cannot read: made at the first such draw
+    gfx_soft: ?gpu.Program = null,
+    gfx_soft_refused: bool = false,
+    /// what its pixel program samples through the texture unit (pixelStage)
+    tex_hw: texture.HwTex = .{ .param = P_TEX, .first = 0 },
     gfx_owner: ?*anyopaque = null,
     gfx_refused_by: ?*anyopaque = null,
     /// draws of it checked against the CPU (the engine's Check)
@@ -885,7 +895,9 @@ fn vertexOf(k: *kir.Kernel, b_idx: u8, x: V) V {
 /// flipped (a top-down image: GL's y = height - the engine's).
 const P_HEIGHT = VERTEX_PARAMS;
 const P_FLIP = VERTEX_PARAMS + 1;
-pub const STAGE_PARAMS = VERTEX_PARAMS + 2;
+/// Texture j's handle base for the texture unit (texture.HwTex), P_TEX + j.
+pub const P_TEX = VERTEX_PARAMS + 2;
+pub const STAGE_PARAMS = P_TEX + texture.MAX_TEX;
 
 /// Why a draw is not one the 3D engine draws yet (its pipeline's or its
 /// own), or null: the compute kernels draw those.
@@ -1013,10 +1025,14 @@ pub fn vertexStage(s: kir.Storage, p: *const Pipeline, reads: *const [8]u32) kir
 /// bits, the rest carried in perspective), gl_FragCoord (y flipped back
 /// to GL's for a top-down target), the shader's fragment code; its colour
 /// into the target (the engine clamps and blends), a discard a KILL.
-pub fn pixelStage(s: kir.Storage, p: *const Pipeline) kir.Kernel {
+pub fn pixelStage(s: kir.Storage, p: *Pipeline, tex_unit: bool) kir.Kernel {
     var k = kir.Kernel.init(s, "gl_pixel_stage", .{ 1, 1, 1 });
     const sh = p.shaders;
     const b = stageBindings(&k, sh);
+    // (its 2D samples through the GPU's texture unit, the draw filling
+    // each texture's handle: P_TEX + j; without it, the record the
+    // pipeline's other pixel program made stays)
+    if (tex_unit) p.tex_hw = .{ .param = P_TEX, .first = b.tex };
     const io_m = struct {
         fn at(bb: u8, a: u32) kir.Mem {
             return nvidia_gl.ioMem(bb, a, false);
@@ -1024,7 +1040,7 @@ pub fn pixelStage(s: kir.Storage, p: *const Pipeline) kir.Kernel {
     };
     const iw = k.load(.f32, io_m.at(b.io, nvidia_gl.POSITION + 12), u(0));
     const wv = k.div(f(1), r(iw));
-    var io = FragmentIO{ .uniforms = b.uni, .textures = b.tex, .buffers = b.buf };
+    var io = FragmentIO{ .uniforms = b.uni, .textures = b.tex, .buffers = b.buf, .tex_hw = if (tex_unit) &p.tex_hw else null };
     if (sh.quads) {
         // A pixel warp's quads: lanes 4q .. 4q + 3 are a 2 x 2 block, x
         // across in bit 0, the target's rows down in bit 1 (GL's up, unless

@@ -786,7 +786,7 @@ fn CtxOf(comptime St: type) type {
 
         fn uniformOp(c: *const Ctx, in: kir.Inst) bool {
             switch (in.op) {
-                .tid, .lane, .atom, .cas => return false,
+                .tid, .lane, .atom, .cas, .tex => return false,
                 // (a graphics stage's input, a load through its IO binding
                 // at a fixed word: each lane's own vertex or pixel; taken as
                 // uniform, a pixel program's branches never diverged, so
@@ -1253,9 +1253,11 @@ fn CtxOf(comptime St: type) type {
         fn groups(c: *Ctx) Error!void {
             const w = c.w;
             for (c.insts()) |in| {
+                // (a texture sample: its coordinates a pair too, TEX's Ra)
+                if (in.op == .tex) try c.group(if (isReg(in.b)) vOf(in.b) else return error.BadOperand, 2);
                 const n = vecWidth(in) orelse continue;
                 const v: u16 = switch (in.op) {
-                    .ld => @intFromEnum(in.dst),
+                    .ld, .tex => @intFromEnum(in.dst),
                     .st => if (isReg(in.b)) vOf(in.b) else return error.BadOperand,
                     else => continue,
                 };
@@ -1278,6 +1280,23 @@ fn CtxOf(comptime St: type) type {
                     w.lead[x] = v;
                     w.off[x] = @intCast(j);
                 }
+            }
+        }
+
+        /// Registers v .. v + n - 1 as an aligned run (none of them in
+        /// another).
+        fn group(c: *Ctx, v: u16, n: u8) Error!void {
+            const w = c.w;
+            if (@as(usize, v) + n > c.nv_kir) return error.BadOperand;
+            for (0..n) |j| {
+                const x = v + @as(u16, @intCast(j));
+                if (w.lead[x] != x or w.size[x] != 1) return error.Unsupported;
+            }
+            w.size[v] = n;
+            for (1..n) |j| {
+                const x = v + @as(u16, @intCast(j));
+                w.lead[x] = v;
+                w.off[x] = @intCast(j);
             }
         }
 
@@ -1318,7 +1337,7 @@ fn CtxOf(comptime St: type) type {
             if (to - from > limit) return false;
             for (c.w.insts[from..to]) |in| {
                 switch (in.op) {
-                    .@"if", .@"else", .endif, .loop, .endloop, .brk, .cont, .ret, .barrier, .shfl, .vote, .ballot, .fdiv, .fsqrt => return false,
+                    .@"if", .@"else", .endif, .loop, .endloop, .brk, .cont, .ret, .barrier, .shfl, .vote, .ballot, .fdiv, .fsqrt, .tex => return false,
                     .sel, .pand, .por, .pnot, .icmp, .fcmp => return false,
                     else => {},
                 }
@@ -1707,6 +1726,7 @@ fn CtxOf(comptime St: type) type {
                     try c.eff("VOTE.ANY", 2, &.{ c.dst(in), .{ .pt = true }, p });
                 },
                 .fsqrt => try c.sqrtNative(in),
+                .tex => try c.texture(in),
                 .fdiv => return error.Unsupported,
                 .@"if", .@"else", .endif, .loop, .brk, .cont, .endloop, .ret => unreachable,
             }
@@ -2237,6 +2257,24 @@ fn CtxOf(comptime St: type) type {
                 .pixel => try c.ins(if (flat) "IPA.CONSTANT" else "IPA.PASS", 1, &.{ c.dst(in), .{ .attr = addr & ~FLAT } }),
                 .compute => unreachable,
             }
+        }
+
+        /// A hardware sample: TEX.B.LZ (.DC: a comparison), NAK's operands
+        /// on sm_120: Ra the coordinates' pair (KIR's b, b + 1), Rb the
+        /// handle and then the reference (b + 2), the four channels into
+        /// the destination's run of four (red and green from Rd0, blue and
+        /// alpha from Rd1). Level zero of the header: no derivatives, so a
+        /// helper lane's sample matters to nothing. A graphics stage's
+        /// alone (a compute launch has no texture pools).
+        fn texture(c: *Ctx, in: kir.Inst) Error!void {
+            if (c.opts.stage == .compute) return error.Unsupported;
+            const t: kir.Tex = @bitCast(in.aux);
+            const xy = vOf(in.b);
+            const d = @intFromEnum(in.dst);
+            const hb = try c.newRun(if (t.compare) 2 else 1);
+            try c.ins("MOV", 1, &.{ R(hb), c.src(in.a) });
+            if (t.compare) try c.ins("MOV", 1, &.{ R(hb + 1), c.src(.{ .reg = @enumFromInt(xy + 2) }) });
+            try c.ins(if (t.compare) "TEX.B.LZ.DC" else "TEX.B.LZ", 2, &.{ R(d + 2), R(d), R(xy), R(hb), .{ .sreg = "2D" } });
         }
 
         fn stageStore(c: *Ctx, in: kir.Inst, m: kir.Mem) Error!void {
@@ -3190,6 +3228,13 @@ fn readsOf(in: kir.Inst) [4]?u16 {
             out[0] = S.of(in.a);
             out[1] = S.of(in.b);
         },
+        // (a sample's coordinates, and a comparison's reference)
+        .tex => {
+            out[0] = S.of(in.a);
+            if (S.of(in.b)) |b| {
+                for (0..kir.texCoords(in.aux)) |j| out[1 + j] = b + @as(u16, @intCast(j));
+            }
+        },
         else => {
             out[0] = S.of(in.a);
             out[1] = S.of(in.b);
@@ -3208,6 +3253,8 @@ fn writesDst(in: kir.Inst) bool {
 
 /// A 64- or 128-bit load's or store's registers.
 fn vecWidth(in: kir.Inst) ?usize {
+    // (a texture sample's four channels)
+    if (in.op == .tex) return 4;
     if (in.op != .ld and in.op != .st) return null;
     const m: kir.Mem = @bitCast(in.aux);
     return switch (m.width_log2) {

@@ -55,6 +55,9 @@ pub const Caps = struct {
     /// stage programs: nvidia_gl's), at most `max_graphics` a run.
     graphics: bool = false,
     max_graphics: u32 = 0,
+    /// The graphics pipeline's programs may sample through the GPU's
+    /// texture unit (KIR's tex: Graphics.tex's pools; the RTX's 3D engine).
+    tex: bool = false,
 };
 
 /// The interpreter's default: an ideal GPU (fused, denormals kept, a
@@ -375,8 +378,16 @@ pub const Graphics = struct {
     /// program reads; with `restart`, the type's largest begins a strip
     /// or a fan anew. Null: the vertices' indices 0 .. count - 1.
     index: ?Index = null,
+    /// The texture unit's pools the programs' KIR tex handles name
+    /// (Caps.tex; null: they sample nothing through it).
+    tex: ?TexPools = null,
 
     pub const Index = struct { va: u64, bytes: u32, size: u8, first: u32, restart: bool = false };
+    /// `headers` texture headers from `headers_va` (index 0 the null
+    /// texture), `samplers` samplers from `samplers_va`, 32 bytes each, as
+    /// the GPU's texture unit reads them (nvidia/gl3d.headerWords,
+    /// samplerWords); `fresh`: entries written since the last draw.
+    pub const TexPools = struct { headers_va: u64, headers: u32, samplers_va: u64, samplers: u32, fresh: bool = false };
 
     /// (the float ones: 32-bit float channels, drawn unclamped and blended
     /// in floats; Direct3D's 16-bit and packed float targets stored so)

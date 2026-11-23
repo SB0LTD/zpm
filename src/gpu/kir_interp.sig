@@ -948,6 +948,8 @@ const Machine = struct {
             .shfl => return m.shfl(in),
             .vote => return m.vote(in),
             .ballot => return m.ballot(in),
+            // (the GPU's texture unit: no model here, Caps.tex is off)
+            .tex => return error.BadProgram,
             else => {},
         }
         const a = m.src(in.a, m.sa);

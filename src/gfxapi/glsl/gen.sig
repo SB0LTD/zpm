@@ -192,6 +192,9 @@ const Gen = struct {
     uni: u8,
     /// the first texture's binding
     texb: u8,
+    /// a pixel stage's 2D samples through the GPU's texture unit
+    /// (raster.FragmentIO.tex_hw)
+    tex_hw: ?*texture.HwTex = null,
     ncomps: u32 = 0,
     nvars: u32 = 0,
     nglobals: u32 = 0,
@@ -1975,7 +1978,7 @@ const Gen = struct {
             if (n == 4) g.put(at, 3, if (kind == .float) f(1) else u(1));
             return out;
         }
-        var ts = texture.Slot{ .b = g.texb + @as(u8, @intCast(slot)), .uni = g.uni, .word = g.lay.desc_base + slot * texture.DESC_WORDS, .volume = volume, .cube = cube };
+        var ts = texture.Slot{ .b = g.texb + @as(u8, @intCast(slot)), .uni = g.uni, .word = g.lay.desc_base + slot * texture.DESC_WORDS, .volume = volume, .cube = cube, .hw = g.tex_hw };
         const k = g.k;
         var res: [4]Arg = undefined;
         switch (which) {
@@ -2588,6 +2591,7 @@ pub fn vertex(s: *glsl.Scratch, lay: Layout, k: *kir.Kernel, io: *raster.VertexI
 pub fn fragment(s: *glsl.Scratch, lay: Layout, k: *kir.Kernel, io: *raster.FragmentIO, log: *pp.Log) bool {
     const lo = k.n;
     var g = begin(s, lay, k, log, .fragment, io.uniforms, io.textures);
+    g.tex_hw = io.tex_hw;
     g.quads = io.quads and io.odd_x != .none and io.odd_y != .none;
     g.odd_x = io.odd_x;
     g.odd_y = io.odd_y;

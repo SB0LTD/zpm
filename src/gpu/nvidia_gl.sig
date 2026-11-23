@@ -28,6 +28,20 @@ const nvidia = @import("nvidia");
 const sph = nvidia.sph;
 
 pub const Stage = kir_sm120.Stage;
+/// The texture unit's headers and samplers (KIR's tex: the pools a draw
+/// names, device.Graphics.tex).
+pub const tex = struct {
+    pub const Header = nvidia.gl3d.Header;
+    pub const Components = nvidia.gl3d.Components;
+    pub const DataType = nvidia.gl3d.DataType;
+    pub const Source = nvidia.gl3d.Source;
+    pub const Wrap = nvidia.gl3d.Wrap;
+    pub const Sampler = nvidia.gl3d.Sampler;
+    pub const headerWords = nvidia.gl3d.headerWords;
+    pub const headerFits = nvidia.gl3d.headerFits;
+    pub const samplerWords = nvidia.gl3d.samplerWords;
+    pub const handleOf = nvidia.gl3d.handleOf;
+};
 pub const StageIO = kir_sm120.StageIO;
 pub const OUT_AT = kir_sm120.OUT_AT;
 pub const KILL_AT = kir_sm120.KILL_AT;
@@ -246,4 +260,56 @@ test "nvidia_gl: a pixel program writing target 2 alone and the depth: its regis
             return error.TestUnexpectedResult;
         }
     }
+}
+
+test "nvidia_gl: a pixel program samples through the texture unit: TEX.B.LZ, its coordinates a pair, the handle then a comparison's reference (TEX.B.LZ.DC), the four channels a run" {
+    var caps = rtx();
+    caps.tex = true;
+    var k = kir.Kernel.init(.{ .insts = &T.insts, .tys = &T.tys }, "ps", .{ 1, 1, 1 });
+    const io = k.binding();
+    const x = k.load(.f32, ioMem(io, generic(0, 0), false), u(0));
+    const y = k.load(.f32, ioMem(io, generic(0, 1), false), u(0));
+    const handle = k.param(.u32, 0);
+    const v = k.tex(r(handle), r(x), r(y), null);
+    const c = k.tex(r(k.op2(.iadd, .u32, r(handle), u(1))), r(y), r(x), f(0.5));
+    for (0..4) |j| k.store(.f32, ioMem(io, OUT_AT + 4 * @as(u32, @intCast(j)), false), u(0), r(kir.Kernel.at(v, @intCast(j))));
+    k.store(.f32, ioMem(io, OUT_AT + 16, false), u(0), r(c));
+    try k.finish();
+    // (without the texture unit's caps the op is refused)
+    try testing.expectError(error.BadOperand, kir.verify(&k, rtx()));
+    try kir.verify(&k, caps);
+    T.st.asm_work.sched = .{};
+    _ = try compileStage(&k, caps, &T.st, .pixel, io, &T.out);
+    const text = try kir_sm120.compileText(&k, caps, &T.st, .{ .stage = .pixel, .stage_io = io });
+    const plain = std.mem.indexOf(u8, text, "TEX.B.LZ R") orelse {
+        std.debug.print("{s}\n", .{text});
+        return error.TestUnexpectedResult;
+    };
+    const dc = std.mem.indexOf(u8, text, "TEX.B.LZ.DC R") orelse {
+        std.debug.print("{s}\n", .{text});
+        return error.TestUnexpectedResult;
+    };
+    // each: Rd1, Rd0 two apart (the run of four), Ra even (a pair), Rb
+    for ([_]usize{ plain, dc }) |at| {
+        var regs: [4]u32 = undefined;
+        var i = std.mem.indexOfScalarPos(u8, text, at, ' ').?;
+        for (&regs) |*rg| {
+            i = std.mem.indexOfScalarPos(u8, text, i, 'R').? + 1;
+            var e = i;
+            while (std.ascii.isDigit(text[e])) e += 1;
+            rg.* = try std.fmt.parseInt(u32, text[i..e], 10);
+            i = e;
+        }
+        try testing.expectEqual(regs[1] + 2, regs[0]);
+        try testing.expectEqual(@as(u32, 0), regs[1] % 4);
+        try testing.expectEqual(@as(u32, 0), regs[2] % 2);
+        if (at == dc) {
+            // (the reference moved into the register after the handle)
+            var want: [24]u8 = undefined;
+            const mv = try std.fmt.bufPrint(&want, "MOV R{d}, ", .{regs[3] + 1});
+            try testing.expect(std.mem.lastIndexOf(u8, text[0..at], mv) != null);
+        }
+    }
+    // (a compute kernel has no texture pools)
+    try testing.expectError(error.Unsupported, kir_sm120.compileText(&k, caps, &T.st, .{ .stage = .compute }));
 }

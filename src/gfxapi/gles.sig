@@ -2539,7 +2539,8 @@ pub const Context = struct {
             .height = @intCast(h),
             .format = format,
             .levels = @intCast(levels),
-            .stride = std.mem.alignForward(u32, @as(u32, @intCast(w)) * format.bytes(), 4),
+            .stride = std.mem.alignForward(u32, @as(u32, @intCast(w)) * format.bytes(), c.eng.rowAlign()),
+            .row_align = c.eng.rowAlign(),
         };
         var bytes: usize = 0;
         for (0..@intCast(levels)) |at| {
@@ -2555,6 +2556,7 @@ pub const Context = struct {
         img.format = layout.format;
         img.levels = layout.levels;
         img.level_at = layout.level_at;
+        img.row_align = layout.row_align;
         img.layered = true;
         return img;
     }

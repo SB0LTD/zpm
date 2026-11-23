@@ -167,6 +167,7 @@ pub fn withGraphics(c: gpu.Caps) gpu.Caps {
     var x = c;
     x.graphics = true;
     x.max_graphics = MAX_GRAPHICS;
+    x.tex = true;
     return x;
 }
 
@@ -605,6 +606,9 @@ pub const Adapter = struct {
                 } else if (a.serial_draws or drawn.hazard(d, g) or writesMemory(d, g)) {
                     p.method(gl3dSubch(), WAIT_FOR_IDLE, &.{0});
                     p.invalidateShaderCaches();
+                    // (a texture the draws before drew into, sampled by
+                    // this one through the texture unit: its cache too)
+                    if (g.tex != null) p.method(gl3dSubch(), gl3d.INVALIDATE_TEXTURE_DATA_CACHE_NO_WFI, &.{0});
                     a.barriers += 1;
                     drawn = .{};
                 }
@@ -768,6 +772,7 @@ pub const Adapter = struct {
             .color_gobs = g.gobs_log2,
             .color_off = g.color_off,
             .index = if (g.index) |ix| .{ .va = ix.va, .bytes = ix.bytes, .size = ix.size, .first = ix.first, .restart = ix.restart } else null,
+            .tex = if (g.tex) |t| .{ .headers_va = t.headers_va, .headers = t.headers, .samplers_va = t.samplers_va, .samplers = t.samplers, .fresh = t.fresh } else null,
             .more = more: {
                 var m: [7]?gl3d.More = @splat(null);
                 for (g.more, 0..) |x, t| {

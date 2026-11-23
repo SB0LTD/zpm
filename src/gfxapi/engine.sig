@@ -216,6 +216,20 @@ pub const Image = struct {
     /// apart, from byte level_at[l]; level 0 is the image itself
     levels: u8 = 1,
     level_at: [MAX_LEVELS]u32 = [_]u32{0} ** MAX_LEVELS,
+    /// The bytes each level's rows (a block-compressed level's rows of
+    /// blocks) are aligned to past level 0's own `stride`: 4, or 32 where
+    /// the GPU's texture unit may read the levels (Engine.rowAlign: its
+    /// headers take rows on 32 bytes; texture.sig's F_ROW32).
+    row_align: u8 = 4,
+    /// The texture unit's headers of this image (Engine.texHeads): each
+    /// view's first header's index in the pool (0: none yet) and the layers
+    /// it was made for (a header a level and layer), for the pool's
+    /// generation `tex_gen` and the memory and shape `tex_key` names.
+    tex_heads: [3]u32 = .{ 0, 0, 0 },
+    tex_layers: [3]u32 = .{ 0, 0, 0 },
+    tex_swz: [3]u32 = .{ 0, 0, 0 },
+    tex_gen: u32 = 0,
+    tex_key: u64 = 0,
     /// how its memory is laid out: pitch linear (the engine's own, and
     /// most imports), or block linear (a video decoder's picture imported
     /// with NVIDIA's modifier: `stride` its pitch in bytes, whole GOBs).
@@ -323,8 +337,9 @@ pub const Image = struct {
         return @max(img.height >> @intCast(l), 1);
     }
     pub fn levelStride(img: *const Image, l: u32) u32 {
-        if (img.bc != 0) return (img.levelWidth(l) + 3) / 4 * img.bcBlockBytes();
-        return if (l == 0) img.stride else std.mem.alignForward(u32, img.levelWidth(l) * img.format.bytes(), 4);
+        const a: u32 = @max(img.row_align, 4);
+        if (img.bc != 0) return std.mem.alignForward(u32, (img.levelWidth(l) + 3) / 4 * img.bcBlockBytes(), a);
+        return if (l == 0) img.stride else std.mem.alignForward(u32, img.levelWidth(l) * img.format.bytes(), a);
     }
 
     pub fn bounds(img: *const Image) Rect {
@@ -498,7 +513,19 @@ const N_PROGS = @typeInfo(Prog).@"enum".field_names.len;
 pub const CODE_BYTES = 16 * 1024;
 /// A dispatch's parameter words and bindings at most (a draw's vertex
 /// kernel has the most).
-const MAX_PARAMS = 160;
+const MAX_PARAMS = 176;
+/// The texture unit's pools: headers (4 MiB: each texture's levels, a
+/// view each), samplers (a pair each: nearest, linear; the handle's 12
+/// bits), and the table finding a sampler pair by its words.
+const TEX_HEADERS = 1 << 17;
+const TEX_SAMPLERS = 1 << 12;
+const TEX_FIND = 1 << 13;
+/// The headers every pool starts with: 0 the null texture, 1 the zero
+/// texture (an unbound or incomplete texture's: its descriptor says so,
+/// and texture.sig reads (0, 0, 0, 1)), 2 its depth view (a comparison's).
+const TEX_ZERO = 1;
+const TEX_ZERO_Z = 2;
+const TEX_FIRST = 3;
 /// a kernel's bindings at most: the capture kernel's (its buffers,
 /// uniforms, element array, attributes, textures)
 const MAX_BIND = raster.MAX_CAPTURE_BUFFERS + 2 + raster.MAX_ATTRS + texture.MAX_TEX + raster.MAX_BUFFERS + raster.MAX_TARGETS;
@@ -1349,6 +1376,14 @@ pub const Stats = struct {
     /// drew (raster.stageWhyNot)
     graphics_draws: u64 = 0,
     compute_draws: u64 = 0,
+    /// graphics_draws whose pixel program samples through the GPU's
+    /// texture unit (texture.HwTex)
+    tex_unit_draws: u64 = 0,
+    /// times the texture unit's pools started over (the GPU waited for)
+    tex_resets: u64 = 0,
+    /// graphics_draws whose textures the unit could not read: their
+    /// pipeline's pixel program sampling in its own code
+    tex_soft_draws: u64 = 0,
     /// draws into a float colour target the 3D engine did not take (not
     /// made: Engine.draw)
     float_not_drawn: u64 = 0,
@@ -1444,6 +1479,22 @@ pub const Engine = struct {
     /// Images in VRAM now, and their bytes (stats).
     vram_count: u32 = 0,
     said_graphics: bool = false,
+    /// The texture unit's pools (texHandles): TEX_HEADERS headers, then
+    /// TEX_SAMPLERS samplers, 32 bytes each, in memory the GPU reads; how
+    /// many of each are used; the generation (bumped when both start over,
+    /// the GPU idle); the bytes written since they last went to the
+    /// device; each sampler pair's words (its key) and the table finding
+    /// them; why the last draw's textures could not go through it.
+    tex_pool: gpu.Buffer = .{},
+    tex_heads_n: u32 = 0,
+    tex_samps_n: u32 = 0,
+    tex_gen: u32 = 1,
+    tex_dirty: [2]usize = .{ 0, 0 },
+    tex_keys: [TEX_SAMPLERS / 2][6]u32 = undefined,
+    tex_find: [TEX_FIND]u16 = @splat(0),
+    tex_why: []const u8 = "",
+    /// the texture unit's refusals said (once each)
+    said_tex: [8][]const u8 = @splat(""),
     said_compute: [16][]const u8 = @splat(""),
     /// The draws each of said_compute's reasons sent to the compute kernels.
     compute_why_n: [16]u32 = @splat(0),
@@ -1572,6 +1623,8 @@ pub const Engine = struct {
         if (e.dev) |d| {
             if (e.uni_ring.cpu.len != 0) d.free(e.uni_ring);
             e.uni_ring = .{};
+            if (e.tex_pool.cpu.len != 0) d.free(e.tex_pool);
+            e.tex_pool = .{};
             if (e.scratch_ring.cpu.len != 0) d.free(e.scratch_ring);
             e.scratch_ring = .{};
             for (&e.read_slots) |*sl| {
@@ -1585,6 +1638,13 @@ pub const Engine = struct {
             }
         }
         e.dev = null;
+    }
+
+    /// The rows of the images the engine lays out (Image.row_align): on 32
+    /// bytes where draws go to the 3D engine (its pixel programs sample
+    /// through the texture unit, whose headers take such rows), else 4.
+    pub fn rowAlign(e: *const Engine) u8 {
+        return if (e.graphics) 32 else 4;
     }
 
     /// The GPU does the work (not lost, and there is one).
@@ -1893,9 +1953,9 @@ pub const Engine = struct {
     fn allocImage(e: *Engine, width: u32, height: u32, format: Format, shareable: bool) ?Image {
         if (width == 0 or height == 0) return null;
         // (rows 128 bytes apart where the 3D engine may draw into it)
-        const stride = std.mem.alignForward(u32, width * format.bytes(), if (e.graphics and format.targetable()) 128 else 4);
+        const stride = std.mem.alignForward(u32, width * format.bytes(), if (e.graphics and format.targetable()) 128 else e.rowAlign());
         const m = e.allocBytes(@as(usize, stride) * height, shareable) orelse return null;
-        return .{ .buf = m.buf, .width = width, .height = height, .stride = stride, .format = format, .own = true, .pooled = m.pooled };
+        return .{ .buf = m.buf, .width = width, .height = height, .stride = stride, .format = format, .own = true, .pooled = m.pooled, .row_align = e.rowAlign() };
     }
 
     /// The image's memory goes back (after the GPU is done with it), if it
@@ -1954,9 +2014,9 @@ pub const Engine = struct {
     /// or null when there is no memory for it.
     pub fn newImageChain(e: *Engine, width: u32, height: u32, format: Format, levels: u32) ?Image {
         if (width == 0 or height == 0 or levels == 0 or levels > MAX_LEVELS) return null;
-        var img = Image{ .width = width, .height = height, .format = format, .levels = @intCast(levels) };
+        var img = Image{ .width = width, .height = height, .format = format, .levels = @intCast(levels), .row_align = e.rowAlign() };
         // (level 0 rows 128 bytes apart where the 3D engine may draw into it)
-        img.stride = std.mem.alignForward(u32, width * format.bytes(), if (e.graphics and format.targetable()) 128 else 4);
+        img.stride = std.mem.alignForward(u32, width * format.bytes(), if (e.graphics and format.targetable()) 128 else img.row_align);
         var at: usize = 0;
         for (0..levels) |l| {
             img.level_at[l] = @intCast(at);
@@ -2802,6 +2862,11 @@ pub const Engine = struct {
                 }
                 q.* = null;
             }
+            if (p.gfx_soft) |*prog| {
+                if (!e.lost) e.dev.?.unload(prog);
+            }
+            p.gfx_soft = null;
+            p.gfx_soft_refused = false;
             p.gfx_owner = null;
         }
         if (p.gfx_refused_by == @as(?*anyopaque, e)) p.gfx_refused_by = null;
@@ -2861,7 +2926,7 @@ pub const Engine = struct {
         const gl = gpu.nvidia_gl;
         const s = kir.Storage{ .insts = &e.kir_insts, .tys = &e.kir_tys };
         st.asm_work.sched = .{};
-        var pk = raster.pixelStage(s, p);
+        var pk = raster.pixelStage(s, p, d.caps.tex);
         try pk.finish();
         const pbin = try gl.compileStage(&pk, d.caps, st, .pixel, 0, &e.pcode);
         const reads = st.io.loads;
@@ -2884,6 +2949,39 @@ pub const Engine = struct {
         p.gfx_owner = e;
         p.gfx[0].?.label = "gl_vertex_stage";
         p.gfx[1].?.label = "gl_pixel_stage";
+    }
+
+    /// p's pixel program with every sample in its own code (no texture
+    /// unit), for draws whose textures the unit cannot read; made at the
+    /// first. Null when it does not compile or load.
+    fn softPixel(e: *Engine, p: *raster.Pipeline) ?*const gpu.Program {
+        if (p.gfx_soft) |*q| return q;
+        if (p.gfx_soft_refused) return null;
+        const d = e.dev.?;
+        const gl = gpu.nvidia_gl;
+        const K = gpu.nvidia_device.kir_sm120;
+        const s = kir.Storage{ .insts = &e.kir_insts, .tys = &e.kir_tys };
+        var w = gpu.Work.init(e.work);
+        const loaded: anyerror!gpu.Program = blk: {
+            var pk = raster.pixelStage(s, p, false);
+            pk.finish() catch |err| break :blk err;
+            if (w.take(K.LargeState, 1)) |large| {
+                large[0].asm_work.sched = .{};
+                const bin = gl.compileStage(&pk, d.caps, &large[0], .pixel, 0, &e.pcode) catch |err| break :blk err;
+                break :blk d.load(&bin);
+            }
+            const st = &(w.take(K.State, 1) orelse break :blk error.OutOfMemory)[0];
+            st.asm_work.sched = .{};
+            const bin = gl.compileStage(&pk, d.caps, st, .pixel, 0, &e.pcode) catch |err| break :blk err;
+            break :blk d.load(&bin);
+        };
+        p.gfx_soft = loaded catch |err| {
+            e.why_pipe = err;
+            p.gfx_soft_refused = true;
+            return null;
+        };
+        p.gfx_soft.?.label = "gl_pixel_stage_soft";
+        return &p.gfx_soft.?;
     }
 
     /// The draw on the GPU's 3D engine, or null when it is not one it takes
@@ -2946,6 +3044,26 @@ pub const Engine = struct {
             e.sayCompute("its program did not compile for the 3D engine");
             return null;
         }
+        // the textures its pixel program samples through the texture unit:
+        // each one's handle (made before anything of the draw's is placed
+        // in the open batch: a pool starting over waits for the GPU)
+        // (one the unit cannot read: the program sampling in its own code,
+        // as before the unit, the draw on the 3D engine all the same)
+        var tex_words: [texture.MAX_TEX]u32 = @splat(0);
+        var tex_pools: ?gpu.Graphics.TexPools = null;
+        var pixel: *const gpu.Program = &p.gfx[1].?;
+        if (p.tex_hw.used != 0) {
+            tex_pools = e.texHandles(d, &p.tex_hw, &tex_words);
+            if (tex_pools == null) {
+                e.stats.tex_soft_draws += 1;
+                e.sayTexSoft(e.tex_why);
+                pixel = e.softPixel(p) orelse {
+                    e.stats.compute_draws += 1;
+                    e.sayCompute("its program sampling in its own code did not compile for the 3D engine");
+                    return null;
+                };
+            }
+        }
         // the bindings: the vertex kernel's, its first the stage's words
         var bs: [MAX_BIND]*Image = undefined;
         bs[0] = &e.zero;
@@ -2973,6 +3091,7 @@ pub const Engine = struct {
         }
         var pw: [MAX_PARAMS]u32 = undefined;
         const params = raster.stageParams(d, &pw);
+        @memcpy(pw[raster.P_TEX..][0..texture.MAX_TEX], &tex_words);
         // GL's window (y up) as the target's rows: flipped for a top-down
         // image; the scissor the draw's rectangle
         const H: f32 = @floatFromInt(t.height);
@@ -3069,9 +3188,10 @@ pub const Engine = struct {
             // rows run the other way, so its front face is the other)
             .cull = d.cull,
             .front_ccw = d.front_ccw != flip,
+            .tex = tex_pools,
         };
         if (d.stencil) |st| if (st != zimg) e.vramIn(st);
-        e.recordGraphics(&p.gfx[1].?, g, bs[0..nb], params, t, zimg, &more_imgs);
+        e.recordGraphics(pixel, g, bs[0..nb], params, t, zimg, &more_imgs);
         // (a stencil image apart from the depth image: its S8 plane written)
         if (d.stencil) |st| if (st != zimg) {
             st.trk().last = e.batch;
@@ -3079,11 +3199,269 @@ pub const Engine = struct {
             if (st.vram != null) st.trk().shadow_old = true;
         };
         e.stats.graphics_draws += 1;
+        if (tex_pools != null) e.stats.tex_unit_draws += 1;
         if (!e.said_graphics) {
             e.said_graphics = true;
             report.say(.pipeline, "draws through the GPU's 3D engine (the RTX's BLACKWELL_B: its rasterizer and blender), the compute kernels for what it does not take yet", .{});
         }
         return true;
+    }
+
+    // ── The texture unit (the 3D engine's pixel programs' samples) ────────
+
+    /// Each texture `hw` names: its handle word (its view's first level's
+    /// header, its nearest sampler) into `out`, headers and samplers made
+    /// in the pools where they are not yet; the pools as the draw names
+    /// them. Null (tex_why says why) when one cannot go through the unit:
+    /// the draw takes its pipeline's pixel program that samples in its own
+    /// code (softPixel).
+    fn texHandles(e: *Engine, d: *const raster.Draw, hw: *const texture.HwTex, out: *[texture.MAX_TEX]u32) ?gpu.Graphics.TexPools {
+        if (!e.texPool()) return null;
+        // (a pool that starts over meanwhile: the handles made before it
+        // are gone, so once more; a draw's own fit in an empty pool)
+        attempt: for (0..2) |_| {
+            const gen = e.tex_gen;
+            var m = hw.used;
+            while (m != 0) : (m &= m - 1) {
+                const j: u4 = @intCast(@ctz(m));
+                const bit = @as(u16, 1) << j;
+                const cmp = hw.compared & bit != 0;
+                if (cmp and hw.plain & bit != 0) {
+                    e.tex_why = "a texture both compared and sampled (one view each through the texture unit)";
+                    return null;
+                }
+                const at = hw.words[j];
+                if (at + texture.DESC_WORDS > d.uniforms.len) {
+                    e.tex_why = "a texture's descriptor past the uniforms";
+                    return null;
+                }
+                const st = texture.samplerState(d.uniforms[at..][0..texture.DESC_WORDS]);
+                const head = if (!st.valid or d.textures[j] == null)
+                    (if (cmp) @as(u32, TEX_ZERO_Z) else TEX_ZERO)
+                else
+                    e.texHeads(d.textures[j].?, if (cmp) 2 else if (st.srgb) 1 else 0, st.layers, st.swz) orelse return null;
+                const samp = e.texSampler(st, cmp) orelse return null;
+                if (e.tex_gen != gen) continue :attempt;
+                out[j] = gpu.nvidia_gl.tex.handleOf(head, samp);
+            }
+            const lo = e.tex_dirty[0];
+            const hi = e.tex_dirty[1];
+            const fresh = hi > lo;
+            if (fresh) {
+                e.dev.?.toDevice(e.tex_pool, lo, hi - lo);
+                e.tex_dirty = .{ 0, 0 };
+            }
+            return .{ .headers_va = e.tex_pool.gpu, .headers = TEX_HEADERS, .samplers_va = e.tex_pool.gpu + TEX_HEADERS * 32, .samplers = TEX_SAMPLERS, .fresh = fresh };
+        }
+        e.tex_why = "the texture unit's pools filled twice in one draw";
+        return null;
+    }
+
+    /// The pools, made at the first draw that samples through the unit:
+    /// the null texture, the zero texture and its depth view.
+    fn texPool(e: *Engine) bool {
+        if (e.tex_pool.cpu.len != 0) return true;
+        if (e.zero.buf.cpu.len == 0 or e.zero.buf.gpu % 32 != 0) {
+            e.tex_why = "no zero image for the texture unit's unbound textures";
+            return false;
+        }
+        const bytes = (TEX_HEADERS + TEX_SAMPLERS) * 32;
+        const b = e.dev.?.alloc(bytes, .host) catch {
+            e.tex_why = "no memory for the texture unit's pools";
+            return false;
+        };
+        if (b.cpu.len < bytes) {
+            e.dev.?.free(b);
+            e.tex_why = "no memory for the texture unit's pools";
+            return false;
+        }
+        e.tex_pool = b;
+        @memset(b.cpu[0 .. TEX_FIRST * 32], 0);
+        const T = gpu.nvidia_gl.tex;
+        const zero = T.Header{ .va = e.zero.buf.gpu, .width = 1, .height = 1, .components = .r32, .data = .float, .pitch = 32, .sources = .{ .r, .zero, .zero, .one_float } };
+        var z = zero;
+        z.components = .zf32;
+        e.texPut(TEX_ZERO, T.headerWords(zero));
+        e.texPut(TEX_ZERO_Z, T.headerWords(z));
+        e.tex_heads_n = TEX_FIRST;
+        e.tex_samps_n = 0;
+        e.tex_find = @splat(0);
+        e.dev.?.toDevice(b, 0, TEX_FIRST * 32);
+        e.tex_dirty = .{ 0, 0 };
+        return true;
+    }
+
+    /// Both pools start over (the GPU idle first: the open batch's draws
+    /// and every one before read them), a new generation: every image's
+    /// headers made again as its draws come.
+    fn texReset(e: *Engine) void {
+        e.wait_why = .doomed;
+        e.finish();
+        e.tex_heads_n = TEX_FIRST;
+        e.tex_samps_n = 0;
+        e.tex_find = @splat(0);
+        e.tex_gen +%= 1;
+        if (e.tex_gen == 0) e.tex_gen = 1;
+        e.stats.tex_resets += 1;
+    }
+
+    /// Entry `i` of the pools (headers first, then the samplers) written.
+    fn texPut(e: *Engine, i: usize, words: [8]u32) void {
+        const at = i * 32;
+        for (words, 0..) |w, k| std.mem.writeInt(u32, e.tex_pool.cpu[at + 4 * k ..][0..4], w, .little);
+        if (e.tex_dirty[1] <= e.tex_dirty[0]) e.tex_dirty = .{ at, at + 32 } else e.tex_dirty = .{ @min(e.tex_dirty[0], at), @max(e.tex_dirty[1], at + 32) };
+    }
+
+    /// What the texture unit reads an image's texels as: its components,
+    /// data type and channels (a block-compressed one's blocks), or null.
+    fn texFormat(img: *const Image) ?struct { comps: gpu.nvidia_gl.tex.Components, data: gpu.nvidia_gl.tex.DataType, channels: u3 } {
+        if (img.bc != 0) return switch (img.bc) {
+            1 => .{ .comps = .dxt1, .data = .unorm, .channels = 4 },
+            2 => .{ .comps = .dxt23, .data = .unorm, .channels = 4 },
+            3 => .{ .comps = .dxt45, .data = .unorm, .channels = 4 },
+            4 => .{ .comps = .dxn1, .data = .unorm, .channels = 1 },
+            5 => .{ .comps = .dxn1, .data = .snorm, .channels = 1 },
+            6 => .{ .comps = .dxn2, .data = .unorm, .channels = 2 },
+            else => .{ .comps = .dxn2, .data = .snorm, .channels = 2 },
+        };
+        const fmt: Format = if (img.depth_float) .r32f else img.format;
+        return switch (fmt) {
+            // (bgra8's bytes B, G, R, A read in order: the texel's
+            // channels as texture.sig's, storedAt swizzling them)
+            .rgba8, .bgra8 => .{ .comps = .a8b8g8r8, .data = .unorm, .channels = 4 },
+            .r8 => .{ .comps = .r8, .data = .unorm, .channels = 1 },
+            .rg8 => .{ .comps = .g8r8, .data = .unorm, .channels = 2 },
+            .r16 => .{ .comps = .r16, .data = .unorm, .channels = 1 },
+            .rg16 => .{ .comps = .r16_g16, .data = .unorm, .channels = 2 },
+            .r32f => .{ .comps = .r32, .data = .float, .channels = 1 },
+            .rg32f => .{ .comps = .r32_g32, .data = .float, .channels = 2 },
+            .rgba32f => .{ .comps = .r32_g32_b32_a32, .data = .float, .channels = 4 },
+            else => null,
+        };
+    }
+
+    /// The first header index of `img`'s view `view` (0 as it is, 1 sRGB, 2
+    /// a depth view of its float words: a comparison's) of `layers` layers:
+    /// level l's layer z at that index + l * layers + z (each layer of a
+    /// level after the one before in memory, texture.sig's sliceOf), each
+    /// header made in the pool when it is not yet; null (tex_why) when the
+    /// texture unit cannot read it so.
+    fn texHeads(e: *Engine, img: *Image, view: u2, layers: u32, swz_in: u32) ?u32 {
+        // (a comparison's view: its result in red, 0, 0, 1)
+        const swz: u32 = if (view == 2) 0 else swz_in;
+        // (the memory and shape the headers were made for: a view copied
+        // from an image (galaxy-pe's layers past the first) has its own
+        // level offsets, a moved image its own address)
+        var key: u64 = img.buf.gpu ^ (@as(u64, img.width) << 40) ^ (@as(u64, img.height) << 20) ^ (@as(u64, @intFromEnum(img.format)) << 58) ^
+            (@as(u64, img.bc) << 61) ^ (@as(u64, img.levels) << 52) ^ (@as(u64, img.stride) << 7) ^ @as(u64, @intFromBool(img.layout.block)) << 63 ^ @as(u64, img.row_align) << 1;
+        for (img.level_at[0..@min(img.levels, MAX_LEVELS)]) |at| key = (key ^ at) *% 0x100_0000_01b3;
+        if (img.tex_gen != e.tex_gen or img.tex_key != key) {
+            img.tex_heads = .{ 0, 0, 0 };
+            img.tex_gen = e.tex_gen;
+            img.tex_key = key;
+        }
+        if (img.tex_heads[view] != 0 and img.tex_layers[view] == layers and img.tex_swz[view] == swz) return img.tex_heads[view];
+        const T = gpu.nvidia_gl.tex;
+        const tf = texFormat(img) orelse {
+            e.tex_why = "a texture of a format the texture unit is not given (a packed depth, or integers)";
+            return null;
+        };
+        if (img.samples != 1) {
+            e.tex_why = "a multisampled texture";
+            return null;
+        }
+        if (view == 2 and tf.comps != .r32) {
+            e.tex_why = "a comparison of a texture that is not 32-bit floats";
+            return null;
+        }
+        const levels: u32 = @max(img.levels, 1);
+        if (layers == 0 or levels * layers > 4096) {
+            e.tex_why = "a texture of more than 4096 levels and layers";
+            return null;
+        }
+        const n = levels * layers;
+        if (img.layout.block and (n != 1 or !img.blockFits() or img.stride != std.mem.alignForward(u32, img.width * img.format.bytes(), 64))) {
+            e.tex_why = "a block-linear texture of levels, or in GOBs or rows the texture unit does not read";
+            return null;
+        }
+        if (e.tex_heads_n + n > TEX_HEADERS) e.texReset();
+        const base = e.tex_heads_n;
+        // (each channel's source the view's swizzle: one of the texel's
+        // components (a missing one 0, alpha 1), zero or one; a
+        // comparison's red, 0, 0, 1)
+        var sources: [4]T.Source = .{ .r, .zero, .zero, .one_float };
+        if (view != 2) for (&sources, 0..) |*src, c| {
+            const code = (swz >> @intCast(3 * c)) & 7;
+            src.* = switch (code) {
+                0...3 => if (code < tf.channels) @as(T.Source, @enumFromInt(2 + code)) else if (code == 3) .one_float else .zero,
+                texture.SWZ_ONE => .one_float,
+                else => .zero,
+            };
+        };
+        for (0..n) |i| {
+            const lv: u32 = @intCast(i / layers);
+            const z: u64 = i % layers;
+            const h = T.Header{
+                .va = img.buf.gpu + img.level_at[lv] + z * img.levelStride(lv) * img.levelRows(lv),
+                .width = img.levelWidth(lv),
+                .height = img.levelHeight(lv),
+                .components = if (view == 2) .zf32 else tf.comps,
+                .data = tf.data,
+                .pitch = if (img.layout.block) 0 else img.levelStride(lv),
+                .block = if (img.layout.block) img.layout.gobs_log2 else null,
+                .sources = sources,
+                .srgb = view == 1,
+            };
+            if (!T.headerFits(h)) {
+                e.tex_why = "a texture level whose address or rows are not on 32 bytes (or a GOB), or too large";
+                return null;
+            }
+            e.texPut(base + @as(u32, @intCast(i)), T.headerWords(h));
+        }
+        e.tex_heads_n += n;
+        img.tex_heads[view] = base;
+        img.tex_layers[view] = layers;
+        img.tex_swz[view] = swz;
+        return base;
+    }
+
+    /// The nearest sampler of a pair (the linear one the next) with `st`'s
+    /// wrap modes and border colour, and with `compare` its comparison;
+    /// made in the pool where it is not yet.
+    fn texSampler(e: *Engine, st: texture.SamplerState, compare: bool) ?u32 {
+        const T = gpu.nvidia_gl.tex;
+        var wraps: [3]T.Wrap = undefined;
+        for (&wraps, st.wrap) |*w, x| w.* = switch (x) {
+            .repeat => .wrap,
+            .clamp => .clamp_to_edge,
+            .mirror => .mirror,
+            .border => .border,
+        };
+        const near = T.samplerWords(.{ .wrap = wraps, .compare = if (compare) st.compare else null, .border = st.border });
+        const key = [6]u32{ near[0], near[1], near[4], near[5], near[6], near[7] };
+        var hsh: u32 = 2166136261;
+        for (key) |w| hsh = (hsh ^ w) *% 16777619;
+        for (0..2) |_| {
+            var slot = hsh % TEX_FIND;
+            while (e.tex_find[slot] != 0) : (slot = (slot + 1) % TEX_FIND) {
+                const pi = e.tex_find[slot] - 1;
+                if (std.mem.eql(u32, &e.tex_keys[pi], &key)) return pi * 2;
+            }
+            if (e.tex_samps_n + 2 > TEX_SAMPLERS) {
+                e.texReset();
+                continue;
+            }
+            const pi = e.tex_samps_n / 2;
+            e.tex_keys[pi] = key;
+            e.tex_find[slot] = @intCast(pi + 1);
+            const lin = T.Sampler{ .wrap = wraps, .compare = if (compare) st.compare else null, .border = st.border, .linear = true };
+            e.texPut(TEX_HEADERS + e.tex_samps_n, near);
+            e.texPut(TEX_HEADERS + e.tex_samps_n + 1, T.samplerWords(lin));
+            e.tex_samps_n += 2;
+            return @intCast(pi * 2);
+        }
+        e.tex_why = "the texture unit's sampler pool filled";
+        return null;
     }
 
     fn floatTargetIn(d: *const raster.Draw) bool {
@@ -3118,6 +3496,19 @@ pub const Engine = struct {
 
     /// Why a draw went to the compute kernels while the 3D engine was on:
     /// said once a reason.
+    /// Why a draw's textures do not go through the texture unit, said once
+    /// a reason (its pixel program then samples in its own code).
+    fn sayTexSoft(e: *Engine, why: []const u8) void {
+        for (&e.said_tex) |*s| {
+            if (s.len != 0 and s.ptr == why.ptr) return;
+            if (s.len == 0) {
+                s.* = why;
+                report.say(.pipeline, "a draw's textures not through the GPU's texture unit ({s}): its program samples them in its own code", .{why});
+                return;
+            }
+        }
+    }
+
     fn sayCompute(e: *Engine, why: []const u8) void {
         for (&e.said_compute, 0..) |*s, i| {
             if (s.len != 0 and s.ptr == why.ptr) {

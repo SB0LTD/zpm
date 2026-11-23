@@ -1295,6 +1295,7 @@ fn lowerInst(w: *Work, in: Inst) Error!void {
             try predDone(w, in.dst, d);
         },
         .ballot => return w.fail(error.BadOperand, "a ballot kir.expand did not expand", .{}),
+        .tex => return w.fail(error.BadOperand, "a hardware texture sample (the RTX's alone)", .{}),
         .@"if", .@"else", .endif, .loop, .brk, .cont, .endloop, .ret => try lowerFlow(w, in),
     }
 }

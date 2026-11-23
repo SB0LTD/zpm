@@ -23,6 +23,20 @@
 //! matter (no mipmaps, and one filter both ways).
 //!
 //! Integer textures read their base level for filtered lookups.
+//!
+//! The GPU's texture unit (a slot's `hw`: the RTX's pixel programs, KIR's
+//! tex): a float 2D sample, or a 2D array's (not a cube's or a volume's),
+//! reads a level (an array's layer of it) through the unit, which wraps,
+//! filters and compares in hardware: one instruction for the four taps, their reads and their
+//! decoders (some 800 KIR instructions here). The level, the blend of two
+//! levels and the swizzle stay this code's, so the level chosen and what
+//! the program does with it are the same either way. The view's swizzle
+//! (its format's channels and the API's) is the header's sources, so the
+//! unit's channels are the sample's; an unbound texture's header reads
+//! (0, 0, 0, 1). Each texture's handle
+//! is a parameter word the draw fills (HwTex): its image's first header
+//! (one a level and layer, level by level: Engine.texHeads) and its
+//! nearest sampler, the linear one the next.
 
 const std = @import("std");
 const gpu = @import("gpu");
@@ -58,6 +72,9 @@ const D_IMAGE_LEVELS = D_LAYERS + 1;
 const D_BORDER = D_IMAGE_LEVELS + 1;
 pub const DESC_WORDS = D_BORDER + 4;
 
+/// Rows of every level on 32 bytes (Image.row_align: the GPU's texture
+/// unit reads such levels), else on 4.
+const F_ROW32: u32 = 1 << 25;
 // D_FMT: log2 of the texel's bytes (bits 0..2), its kind (4..6:
 // unorm16 is 4, its bits 4..5 reading as unorm8's and bit 6 saying two
 // bytes a channel), its channels (8..10), sRGB (12), a texture there (13)
@@ -144,6 +161,7 @@ pub fn descriptor(s: State, out: *[DESC_WORDS]u32) void {
     if (img.layout.block) {
         out[D_FMT] |= F_BLOCK | @as(u32, @intFromEnum(img.layout.swizzle)) << 16 | @as(u32, img.layout.gobs_log2) << 18;
     }
+    if (img.row_align == 32) out[D_FMT] |= F_ROW32;
     // (the format's R, G, B, A as the texel's channels: bgra8's B, G, R, A)
     const at = storedAt(fmt);
     var swz: u32 = 0;
@@ -174,7 +192,42 @@ pub const Kind = enum { float, int, uint };
 
 /// Where a texture is: its binding, its descriptor's first word in the
 /// uniform binding `uni`.
-pub const Slot = struct { b: u8, uni: u8, word: u32, volume: bool = false, cube: bool = false, offset_z: i32 = 0, shadow: ?Arg = null };
+pub const Slot = struct { b: u8, uni: u8, word: u32, volume: bool = false, cube: bool = false, offset_z: i32 = 0, shadow: ?Arg = null, hw: ?*HwTex = null };
+
+/// What a program samples through the GPU's texture unit (a Slot's `hw`,
+/// filled as the program is built): texture j's handle base in parameter
+/// word `param` + j (its binding `first` + j); the textures sampled so
+/// (bit j), those compared (sample_c) and those not, and each one's
+/// descriptor's first uniform word (the draw reads its sampler state
+/// there).
+pub const HwTex = struct {
+    param: u16,
+    first: u8,
+    used: u16 = 0,
+    compared: u16 = 0,
+    plain: u16 = 0,
+    words: [MAX_TEX]u32 = @splat(0),
+};
+
+/// A texture's descriptor words as the draw's sampler: an axis's wrap
+/// (Wrap), the magnification filter LINEAR, a comparison (GL's bits), the
+/// border colour's words (the texel's channel order), sRGB, and whether a
+/// texture is there.
+pub const SamplerState = struct { wrap: [3]Wrap, linear: bool, compare: u3, border: [4]u32, srgb: bool, valid: bool, layers: u32, swz: u32 };
+
+pub fn samplerState(desc: []const u32) SamplerState {
+    const m = desc[D_MODE];
+    return .{
+        .wrap = .{ @enumFromInt(@as(u2, @truncate(m))), @enumFromInt(@as(u2, @truncate(m >> 4))), @enumFromInt(@as(u2, @truncate(m >> 12))) },
+        .linear = m & M_LINEAR != 0,
+        .compare = @truncate(m >> 16),
+        .border = desc[D_BORDER..][0..4].*,
+        .srgb = desc[D_FMT] & F_SRGB != 0,
+        .valid = desc[D_FMT] & F_VALID != 0,
+        .layers = @max(desc[D_LAYERS], 1),
+        .swz = desc[D_SWZ],
+    };
+}
 
 const D = struct { w: V, h: V, stride: V, fmt: V, swz: V, mode: V, last: V };
 
@@ -202,14 +255,17 @@ fn levelOf(k: *kir.Kernel, s: Slot, d: D, l: V) Lvl {
     const w = k.op2(.imax, .u32, r(k.op2(.shr, .u32, r(d.w), r(l))), u(1));
     const h = k.op2(.imax, .u32, r(k.op2(.shr, .u32, r(d.h), r(l))), u(1));
     const sh = k.op3(.bfe, .u32, r(d.fmt), u(0), u(3));
-    const packed_stride = k.op2(.@"and", .u32, r(k.op2(.iadd, .u32, r(k.op2(.shl, .u32, r(w), r(sh))), u(3))), u(0xffff_fffc));
+    // (rows on 4 bytes, or on 32: F_ROW32)
+    const am = k.sel(.u32, r(k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(d.fmt), u(F_ROW32))), u(0))), u(31), u(3));
+    const packed_stride = k.op2(.@"and", .u32, r(k.op2(.iadd, .u32, r(k.op2(.shl, .u32, r(w), r(sh))), r(am))), r(k.op1(.not, .u32, r(am))));
     const is0 = k.cmp(.u32, .eq, r(l), u(0));
     var m = kir.global(s.uni, 32);
     m.imm = @intCast((s.word + D_AT) * 4);
     const off = k.load(.u32, m, r(k.op2(.shl, .u32, r(l), u(2))));
     // (block-compressed: a row of blocks, 8 or 16 bytes each)
     const bck = k.op3(.bfe, .u32, r(d.fmt), u(F_BC_SHIFT), u(3));
-    const block_stride = k.op2(.shl, .u32, r(k.op2(.shr, .u32, r(k.op2(.iadd, .u32, r(w), u(3))), u(2))), r(bcBlockShift(k, bck)));
+    const block_row = k.op2(.shl, .u32, r(k.op2(.shr, .u32, r(k.op2(.iadd, .u32, r(w), u(3))), u(2))), r(bcBlockShift(k, bck)));
+    const block_stride = k.op2(.@"and", .u32, r(k.op2(.iadd, .u32, r(block_row), r(am))), r(k.op1(.not, .u32, r(am))));
     const stride = k.sel(.u32, r(is0), r(d.stride), r(packed_stride));
     const is_bc = k.cmp(.u32, .ne, r(bck), u(0));
     const rows = k.sel(.u32, r(is_bc), r(k.op2(.shr, .u32, r(k.op2(.iadd, .u32, r(h), u(3))), u(2))), r(h));
@@ -666,6 +722,9 @@ pub fn sampleArray(k: *kir.Kernel, slot: Slot, s: Arg, t: Arg, layer: ?Arg, kind
     }
     var out: [4]Arg = undefined;
     for (outv, 0..) |o, c| out[c] = r(o);
+    // (through the texture unit: its header's sources are the swizzle,
+    // an unbound texture's header (0, 0, 0, 1))
+    if (hwOf(slot, kind) != null) return out;
     return finish(k, d, out, kind);
 }
 
@@ -760,6 +819,7 @@ fn cubeTap(k: *kir.Kernel, slot: Slot, d: D, lv: Lvl, face: Arg, x: V, y: V, lin
 }
 
 fn sampleLayerLevel(k: *kir.Kernel, slot: Slot, d: D, level: V, layer: ?Arg, s: Arg, t: Arg, linear: V, kind: Kind, off: [2]i32) [4]Arg {
+    if (hwOf(slot, kind)) |hw| return hwSample(k, slot, hw, d, level, layer, s, t, linear, off);
     const lv = levelOf(k, slot, d, level);
     if (slot.cube) return sampleLevel(k, slot, d, lv, s, t, linear, kind, off, layer);
     if (!slot.volume) return sampleLevel(k, slot, d, sliceOf(k, lv, layer), s, t, linear, kind, off, null);
@@ -794,6 +854,54 @@ fn sampleLayerLevel(k: *kir.Kernel, slot: Slot, d: D, level: V, layer: ?Arg, s: 
     k.set(second, .mov, u(1), no, no);
     k.endloop();
     return out;
+}
+
+/// The slot's texture-unit record when this sample goes through it: a
+/// float 2D sample or a 2D array's, not a cube's or a volume's.
+fn hwOf(slot: Slot, kind: Kind) ?*HwTex {
+    const hw = slot.hw orelse return null;
+    if (slot.cube or slot.volume or kind != .float) return null;
+    if (slot.b < hw.first or slot.b - hw.first >= MAX_TEX) return null;
+    return hw;
+}
+
+/// One level's sample through the GPU's texture unit (KIR's tex): the
+/// level's header (the texture's handle base + the level times the layers
+/// + the layer `slice`: sliceIndex's, clamped), the nearest or
+/// the linear sampler (the next), (s, t) as they are (normalized: the
+/// header is the level's) with `off` in the level's texels; a comparison's
+/// reference clamped to [0, 1] as `filteredTexel` clamps it. The channels
+/// before the swizzle, as sampleLevel's (the header's sources the
+/// texel's channels in order; missing ones 0, 0, 0, 1), or after the
+/// swizzle: the header's sources are the view's (sampleArray then skips
+/// `finish`).
+fn hwSample(k: *kir.Kernel, slot: Slot, hw: *HwTex, d: D, level: V, slice: ?Arg, s: Arg, t: Arg, linear: V, off: [2]i32) [4]Arg {
+    const j: u4 = @intCast(slot.b - hw.first);
+    const bit = @as(u16, 1) << j;
+    hw.used |= bit;
+    hw.words[j] = slot.word;
+    if (slot.shadow != null) hw.compared |= bit else hw.plain |= bit;
+    const base = k.param(.u32, hw.param + j);
+    const sampler = k.sel(.u32, r(linear), u(1 << 20), u(0));
+    const layers = k.op2(.imax, .u32, r(descWord(k, slot, D_LAYERS)), u(1));
+    const head = k.op3(.imad, .u32, r(level), r(layers), slice orelse u(0));
+    const handle = k.op2(.iadd, .u32, r(k.op2(.iadd, .u32, r(base), r(head))), r(sampler));
+    var x = s;
+    var y = t;
+    for ([2]struct { *Arg, V }{ .{ &x, d.w }, .{ &y, d.h } }, 0..) |c, axis| {
+        if (off[axis] == 0) continue;
+        const n = k.cvt(.u32, .f32, .rne, r(k.op2(.imax, .u32, r(k.op2(.shr, .u32, r(c[1]), r(level))), u(1))));
+        // (off times the reciprocal: exact for a power of two, else within
+        // an ulp, not a division's code each)
+        c[0].* = r(k.op2(.fadd, .f32, c[0].*, r(k.op2(.fmul, .f32, f(@floatFromInt(off[axis])), r(k.op1(.frcp, .f32, r(n)))))));
+    }
+    if (slot.shadow) |reference| {
+        const ref = k.op2(.fmin, .f32, r(k.op2(.fmax, .f32, reference, f(0))), f(1));
+        const v = k.tex(r(handle), x, y, r(ref));
+        return .{ r(v), f(0), f(0), f(1) };
+    }
+    const v = k.tex(r(handle), x, y, null);
+    return .{ r(v), r(kir.Kernel.at(v, 1)), r(kir.Kernel.at(v, 2)), r(kir.Kernel.at(v, 3)) };
 }
 
 /// One level's sample: (s, t) in [0, 1] across it, nearest or bilinear

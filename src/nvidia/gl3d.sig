@@ -23,6 +23,14 @@
 //!   vertex's index 0 .. count - 1 (the programs fetch their attributes
 //!   and the element array themselves), `instances` times.
 //!
+//! - the texture unit's pools, when the programs sample through it (KIR's
+//!   tex: TEX.B.LZ): texture headers (TEXHEAD_V2: a level's rows of
+//!   bytes, or its block-linear GOBs; normalized coordinates) and samplers
+//!   (TEXSAMP: the wrap modes, one filter, a depth comparison, the border
+//!   colour), 32 bytes each, the handle a header's index and a sampler's
+//!   (`headerWords`, `samplerWords`: NIL's fields for clcb97, Hopper's
+//!   class headers, which Blackwell's texture unit reads).
+//!
 //! Not yet (the GL layer keeps such draws on its compute kernels): points
 //! and lines, multisampling, depth textures, depth bias, clip distances.
 //!
@@ -283,7 +291,156 @@ pub const Draw = struct {
     /// Indexed (the hardware's index buffer and primitive restart), else
     /// the vertices' indices 0 .. count - 1.
     index: ?Index = null,
+    /// The texture unit's pools the programs' TEX handles name (null: the
+    /// programs sample nothing through it).
+    tex: ?TexPools = null,
 };
+
+/// The texture header and sampler pools: `headers` headers from
+/// `headers_va` (the first, index 0, the null texture), `samplers` samplers
+/// from `samplers_va` (both 32 bytes an entry, on 32 bytes). `fresh`:
+/// entries were written since the engine last read either pool, so its
+/// caches of both are invalidated before the draw.
+pub const TexPools = struct { headers_va: u64, headers: u32, samplers_va: u64, samplers: u32, fresh: bool = false };
+
+// ── Textures ────────────────────────────────────────────────────────────────
+
+/// A texture header's components (TEXHEAD_V2_BL_COMPONENTS, NIL's table).
+pub const Components = enum(u7) {
+    r32_g32_b32_a32 = 0x01,
+    r16_g16_b16_a16 = 0x03,
+    r32_g32 = 0x04,
+    a8b8g8r8 = 0x08,
+    a2b10g10r10 = 0x09,
+    r16_g16 = 0x0c,
+    r32 = 0x0f,
+    b5g6r5 = 0x15,
+    g8r8 = 0x18,
+    r16 = 0x1b,
+    r8 = 0x1d,
+    bf10gf11rf11 = 0x21,
+    dxt1 = 0x24,
+    dxt23 = 0x25,
+    dxt45 = 0x26,
+    dxn1 = 0x27,
+    dxn2 = 0x28,
+    bc6h_sf16 = 0x10,
+    bc6h_uf16 = 0x11,
+    bc7u = 0x17,
+    zf32 = 0x2f,
+    _,
+};
+
+/// A header's data type (TEXHEAD_V2_BL_DATA_TYPE: one for every channel).
+pub const DataType = enum(u4) { unorm = 0, snorm = 1, float = 2, uint = 6, sint = 7 };
+
+/// A header's channel source (X_SOURCE ..): zero, a component, one.
+pub const Source = enum(u3) { zero = 0, r = 2, g = 3, b = 4, a = 5, one_int = 6, one_float = 7 };
+
+/// One level of an image as the texture unit reads it.
+pub const Header = struct {
+    va: u64,
+    width: u32,
+    height: u32,
+    components: Components,
+    data: DataType,
+    /// Rows of `pitch` bytes (whole 32 bytes), or (block) block linear:
+    /// one GOB wide and deep, blocks of 2^block GOBs high, as wide as the
+    /// width's texels in whole GOBs (64 bytes).
+    pitch: u32 = 0,
+    block: ?u3 = null,
+    /// The four channels' sources: the components in order.
+    sources: [4]Source = .{ .r, .g, .b, .a },
+    srgb: bool = false,
+};
+
+/// Whether `h` is a header the texture unit takes: its address on 32
+/// bytes (block linear: a GOB, 512), rows on 32 bytes under 4 MiB, its
+/// size within 1 .. 2^17.
+pub fn headerFits(h: Header) bool {
+    if (h.width == 0 or h.height == 0 or h.width > 0x2_0000 or h.height > 0x2_0000) return false;
+    if (h.va >> 57 != 0) return false;
+    if (h.block) |n| return h.va % 512 == 0 and n <= 5;
+    return h.va % 32 == 0 and h.pitch % 32 == 0 and h.pitch != 0 and h.pitch < (1 << 22);
+}
+
+fn putBits(w: *[8]u32, lo: u32, width: u5, v: u32) void {
+    const word = lo / 32;
+    const at: u5 = @intCast(lo % 32);
+    const mask: u32 = (@as(u32, 1) << width) - 1;
+    w[word] = (w[word] & ~(mask << at)) | ((v & mask) << at);
+}
+
+/// The 8 words of header `h`: TEXHEAD_V2_PITCH or _BL, two dimensions, one
+/// level (TWO_D_NO_MIPMAP for rows), normalized coordinates (the
+/// sampler's USE_HEADER_SETTING), the border from the sampler, NIL's
+/// qualities and spreads.
+pub fn headerWords(h: Header) [8]u32 {
+    var w: [8]u32 = @splat(0);
+    // the format: its sources, data type and components (word 3)
+    for (h.sources, 0..) |src, c| putBits(&w, 96 + 3 * @as(u32, @intCast(c)), 3, @intFromEnum(src));
+    putBits(&w, 108, 4, @intFromEnum(h.data));
+    putBits(&w, 112, 7, @intFromEnum(h.components));
+    if (h.block) |n| {
+        putBits(&w, 124, 4, 3); // SELECT_BLOCKLINEAR_V2
+        putBits(&w, 9, 23, @truncate(h.va >> 9));
+        putBits(&w, 32, 25, @truncate(h.va >> 32));
+        // (one GOB wide and deep: 0; the block's height)
+        putBits(&w, 67, 3, n);
+        putBits(&w, 150, 4, 1); // TWO_D
+        putBits(&w, 80, 1, 1); // LOD_ANISO_QUALITY2
+        putBits(&w, 81, 1, 1); // LOD_ANISO_QUALITY: high
+        putBits(&w, 82, 1, 1); // LOD_ISO_QUALITY: high
+    } else {
+        putBits(&w, 124, 4, 2); // SELECT_PITCH_V2
+        putBits(&w, 5, 27, @truncate(h.va >> 5));
+        putBits(&w, 32, 25, @truncate(h.va >> 32));
+        putBits(&w, 64, 17, h.pitch >> 5);
+        putBits(&w, 150, 4, 7); // TWO_D_NO_MIPMAP
+        putBits(&w, 81, 1, 1); // LOD_ANISO_QUALITY2
+        putBits(&w, 82, 1, 1); // LOD_ANISO_QUALITY: high
+        putBits(&w, 83, 1, 1); // LOD_ISO_QUALITY: high
+    }
+    putBits(&w, 128, 17, h.width - 1);
+    putBits(&w, 160, 17, h.height - 1);
+    putBits(&w, 145, 1, 1); // NORMALIZED_COORDS
+    putBits(&w, 149, 1, @intFromBool(h.srgb));
+    putBits(&w, 156, 1, 1); // BORDER_SOURCE: the sampler's colour
+    putBits(&w, 215, 2, 2); // ANISO_FINE_SPREAD_FUNC: TWO
+    putBits(&w, 217, 2, 1); // ANISO_COARSE_SPREAD_FUNC: ONE
+    return w;
+}
+
+/// A sampler's wrap mode on an axis (TEXSAMP0_ADDRESS_U ..).
+pub const Wrap = enum(u3) { wrap = 0, mirror = 1, clamp_to_edge = 2, border = 3 };
+
+/// A sampler: each axis's wrap mode (u, v, p), nearest or linear (both
+/// filters; the first level), a depth comparison (GL's NEVER .. ALWAYS as
+/// less 1, equal 2, greater 4: TEXSAMP's ZC_ codes are the same numbers),
+/// the border colour's four words (the components' order, a float's bits).
+pub const Sampler = struct {
+    wrap: [3]Wrap = .{ .clamp_to_edge, .clamp_to_edge, .clamp_to_edge },
+    linear: bool = false,
+    compare: ?u3 = null,
+    border: [4]u32 = @splat(0),
+};
+
+/// The 8 words of sampler `s` (NVK's fields and its legacy font-filter
+/// bits; normalized coordinates as the header says; the first level).
+pub fn samplerWords(s: Sampler) [8]u32 {
+    var w0: u32 = @as(u32, @intFromEnum(s.wrap[0])) | @as(u32, @intFromEnum(s.wrap[1])) << 3 | @as(u32, @intFromEnum(s.wrap[2])) << 6;
+    if (s.compare) |c| w0 |= 1 << 9 | @as(u32, c) << 10;
+    w0 |= 1 << 13 | 1 << 14 | 1 << 17;
+    const f: u32 = if (s.linear) 2 else 1;
+    // (MAG, MIN, MIP_POINT; the cube seams AUTO_SPAN_SEAM, as NVK's)
+    const w1: u32 = f | f << 4 | 2 << 6 | 2 << 8;
+    return .{ w0, w1, 0, 0, s.border[0], s.border[1], s.border[2], s.border[3] };
+}
+
+/// The word a TEX instruction is handed: header `h`, sampler `s`.
+pub fn handleOf(h: u32, s: u32) u32 {
+    return (h & 0xf_ffff) | s << 20;
+}
 
 /// A colour target past the first: rows of `pitch` bytes from `va` (128
 /// bytes apart, as the first's; block linear as the first is, with
@@ -352,6 +509,10 @@ pub fn targetWords(va: u64, pitch: u32, height: u32, f: Format, gobs: ?u3) [9]u3
 /// Why the engine would refuse `d` (a class error: GSP-RM recovers the
 /// channel, Xid 69), or null. Checked before a draw is sent.
 pub fn whyNot(d: *const Draw) ?[]const u8 {
+    if (d.tex) |t| {
+        if (t.headers == 0 or t.samplers == 0 or t.headers > 1 << 20 or t.samplers > 1 << 12 or t.headers_va % 32 != 0 or t.samplers_va % 32 != 0)
+            return "texture pools not on 32 bytes, empty, or past the handle's indices";
+    }
     if (d.color_off) {
         if (d.depth == null) return "no colour target and no depth target: nothing to draw into";
         for (d.more) |m| if (m != null) return "colour targets past the first with target 0 off";
@@ -401,6 +562,7 @@ fn bits(x: f32) u32 {
 pub const SET_VIEWPORT_SCALE_Z_CLIP_GL: u32 = 0; // SET_VIEWPORT_Z_CLIP: NEGATIVE_W_TO_POSITIVE_W
 pub const SET_BLEND_CONST: u32 = gr.SET_BLEND_CONST_RED;
 pub const SET_CONSTANT_BUFFER_SELECTOR_A = gr.SET_CONSTANT_BUFFER_SELECTOR_A;
+pub const INVALIDATE_TEXTURE_DATA_CACHE_NO_WFI = gr.INVALIDATE_TEXTURE_DATA_CACHE_NO_WFI;
 /// SET_PROVOKING_VERTEX: GL's flat varyings are the last vertex's.
 pub const PROVOKING_LAST: u32 = 1;
 
@@ -518,6 +680,15 @@ fn emitDraw(p: *Push, d: *const Draw, whole: bool) void {
     one(p, gr.BIND_GROUP_CONSTANT_BUFFER + 32 * gr.GROUP_VERTEX, 1);
     one(p, gr.BIND_GROUP_CONSTANT_BUFFER + 32 * gr.GROUP_PIXEL, 1);
     if (whole) one(p, gr.INVALIDATE_SHADER_CACHES_NO_WFI, 0x1001); // the code and the constants
+    // the texture unit's pools (each draw's: a run's draws may name others)
+    if (d.tex) |t| {
+        many(p, gr.SET_TEX_HEADER_POOL_A, &.{ @truncate(t.headers_va >> 32), @truncate(t.headers_va), t.headers - 1 });
+        many(p, gr.SET_TEX_SAMPLER_POOL_A, &.{ @truncate(t.samplers_va >> 32), @truncate(t.samplers_va), t.samplers - 1 });
+        if (t.fresh or whole) {
+            many(p, gr.INVALIDATE_SAMPLER_CACHE_NO_WFI, &.{ 0, 0 }); // and the headers'
+            one(p, gr.INVALIDATE_TEXTURE_DATA_CACHE_NO_WFI, 0);
+        }
+    }
     if (d.index) |ix| {
         many(p, SET_INDEX_BUFFER_A, &.{ @truncate(ix.va >> 32), @truncate(ix.va) });
         many(p, SET_INDEX_BUFFER_SIZE_A, &.{ 0, ix.bytes });
@@ -546,7 +717,7 @@ pub fn restartIndex(size: u8) u32 {
 
 /// Dwords emit takes at most (draw.sig's state, and the draw's own: 26
 /// a colour target past the first).
-pub const MAX_DWORDS = 1100;
+pub const MAX_DWORDS = 1120;
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 
@@ -636,5 +807,77 @@ test "gl3d: what the Legion refused (depth beside pitch colour, a combined depth
     try testing.expect(frontCcwOf(frontFaceWord(true)) and !frontCcwOf(frontFaceWord(false)));
     // (a target off a GOB is refused as block linear)
     d.target.va += 128;
+    try testing.expect(whyNot(&d) != null);
+}
+
+test "gl3d: texture headers and samplers: a level of RGBA8 rows is the renderer's own header (draw.sig's) word for word; a block-linear ZF32 level; a sampler's wraps, comparison and border; the pools sent with their caches invalidated" {
+    // rows: the compositor's header, the same words (normalized in the
+    // header both: the compositor's sampler forces texels)
+    const t = gr.Texture{ .va = 0x12_3456_7800, .width = 50, .height = 20, .pitch = 256, .format = .rgba8 };
+    try testing.expectEqualSlices(u32, &gr.headerWords(t), &headerWords(.{ .va = t.va, .width = 50, .height = 20, .components = .a8b8g8r8, .data = .unorm, .pitch = 256 }));
+    try testing.expect(headerFits(.{ .va = t.va, .width = 50, .height = 20, .components = .a8b8g8r8, .data = .unorm, .pitch = 256 }));
+    try testing.expect(!headerFits(.{ .va = t.va + 4, .width = 50, .height = 20, .components = .a8b8g8r8, .data = .unorm, .pitch = 256 }));
+    try testing.expect(!headerFits(.{ .va = t.va, .width = 50, .height = 20, .components = .a8b8g8r8, .data = .unorm, .pitch = 200 }));
+    // block linear: BLOCKLINEAR_V2 (3), the address's bits 9.. in word 0,
+    // blocks 2^4 GOBs high, TWO_D, ZF32 floats, its sources
+    const z = headerWords(.{ .va = 0x2_0000_4200, .width = 640, .height = 360, .components = .zf32, .data = .float, .block = 4, .sources = .{ .r, .zero, .zero, .one_float } });
+    try testing.expectEqual(@as(u32, 3), z[3] >> 28);
+    try testing.expectEqual(@as(u32, 0x4200), z[0]);
+    try testing.expectEqual(@as(u32, 2), z[1]);
+    try testing.expectEqual(@as(u32, 4), (z[2] >> 3) & 7);
+    try testing.expectEqual(@as(u32, 1), (z[4] >> 22) & 0xf);
+    try testing.expectEqual(@as(u32, 0x2f), (z[3] >> 16) & 0x7f);
+    try testing.expectEqual(@as(u32, 2), (z[3] >> 12) & 0xf);
+    try testing.expectEqual(@as(u32, 0b111_000_000_010), z[3] & 0xfff);
+    try testing.expectEqual(@as(u32, 639), z[4] & 0x1_ffff);
+    try testing.expectEqual(@as(u32, 359), z[5] & 0x1_ffff);
+    try testing.expect(z[4] & (1 << 17) != 0); // normalized
+    try testing.expect(!headerFits(.{ .va = 0x2_0000_4100, .width = 640, .height = 360, .components = .zf32, .data = .float, .block = 4 }));
+    // samplers: the compositor's linear one but for normalized coordinates
+    const lin = samplerWords(.{ .linear = true });
+    const want = gr.samplerWords(.linear);
+    try testing.expectEqual(want[0], lin[0]);
+    try testing.expectEqual(want[1] & ~@as(u32, 1 << 25), lin[1]);
+    const near = samplerWords(.{ .wrap = .{ .wrap, .mirror, .border }, .compare = 3, .border = .{ 1, 2, 3, 4 } });
+    try testing.expectEqual(@as(u32, 0 | 1 << 3 | 3 << 6), near[0] & 0x1ff);
+    try testing.expect(near[0] & (1 << 9) != 0);
+    try testing.expectEqual(@as(u32, 3), (near[0] >> 10) & 7);
+    try testing.expectEqual(@as(u32, 1), near[1] & 7);
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4 }, near[4..8]);
+    try testing.expectEqual(@as(u32, 0x0030_0007), handleOf(7, 3));
+    // a draw naming pools: sent, its caches invalidated when fresh
+    var buf: [MAX_DWORDS]u32 = undefined;
+    var p = Push{ .buf = &buf };
+    var d = Draw{
+        .vertex = .{ .va = 0x10_0000_0000, .registers = 24, .bytes = 0x300 },
+        .pixel = .{ .va = 0x10_0000_1000, .registers = 32, .bytes = 0x200 },
+        .cb_va = 0x10_0000_2000,
+        .cb_bytes = 0x400,
+        .zero_va = 0x10_0000_3000,
+        .target = .{ .va = 0x10_0001_0000, .width = 64, .height = 32, .pitch = 256 },
+        .format = .rgba8,
+        .scale = .{ 32, 16, 0.5 },
+        .offset = .{ 32, 16, 0.5 },
+        .scissor = .{ 0, 0, 64, 32 },
+        .count = 6,
+    };
+    d.tex = .{ .headers_va = 0x30_0000_0000, .headers = 1 << 17, .samplers_va = 0x30_0040_0000, .samplers = 1 << 12, .fresh = true };
+    try testing.expectEqual(@as(?[]const u8, null), whyNot(&d));
+    emitNext(&p, &d);
+    try p.check();
+    try testing.expect(std.mem.indexOf(u32, p.words(), &[_]u32{ push.header(SUBCH, gr.SET_TEX_HEADER_POOL_A, 3), 0x30, 0, (1 << 17) - 1 }) != null);
+    try testing.expect(std.mem.indexOf(u32, p.words(), &[_]u32{ push.header(SUBCH, gr.SET_TEX_SAMPLER_POOL_A, 3), 0x30, 0x0040_0000, (1 << 12) - 1 }) != null);
+    try testing.expect(std.mem.indexOf(u32, p.words(), &[_]u32{ push.header(SUBCH, gr.INVALIDATE_SAMPLER_CACHE_NO_WFI, 2), 0, 0 }) != null);
+    // (the whole state, every target, depth and stencil, and the pools: fits)
+    var all = d;
+    for (&all.more) |*m| m.* = .{ .va = 0x10_0002_0000, .pitch = 256, .format = .bgra8 };
+    all.color_gobs = 2;
+    all.target.va = 0x10_0001_0000;
+    all.depth = .{ .va = 0x10_0003_0000, .stencil_va = 0x10_0004_0000, .width = 64, .height = 32, .gobs_log2 = 2, .tested = true, .write = true, .stencil = .{}, .back = .{} };
+    p = Push{ .buf = &buf };
+    emit(&p, &all);
+    try p.check();
+    try testing.expect(p.words().len < MAX_DWORDS);
+    d.tex.?.headers_va += 16;
     try testing.expect(whyNot(&d) != null);
 }

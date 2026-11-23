@@ -3349,7 +3349,7 @@ const d3d = struct {
     }
 };
 
-test "Direct3D's frame through the emulated RTX's 3D engine: textured B8G8R8A8 draws batched (their uniforms in the ring, the draws overlapping), the target read back as begun and finished: the CPU's pixels" {
+test "Direct3D's frame through the emulated RTX's 3D engine: textured B8G8R8A8 draws batched, sampled through its texture unit (their uniforms in the ring, the draws overlapping), the target read back as begun and finished: the CPU's pixels" {
     var want: [d3d.FW * d3d.FH * 4]u8 = undefined;
     var want2: [d3d.FW * d3d.FH * 4]u8 = undefined;
     d3d.cpu_eng.init(.{ .pool = &d3d.cpu_pool, .cpu_work = &cpu_work });
@@ -3373,8 +3373,157 @@ test "Direct3D's frame through the emulated RTX's 3D engine: textured B8G8R8A8 d
     for (eng_rtx.said_compute) |w| if (w.len != 0) std.debug.print("Direct3D frame: on the compute kernels: {s}\n", .{w});
     try std.testing.expectEqual(@as(u64, d3d.DRAWS), s.graphics_draws);
     try std.testing.expectEqual(@as(u64, 0), s.compute_draws);
+    // (their textures through the RTX's texture unit: TEX.B.LZ, the
+    // emulated unit's taps and filter texture.sig's, the CPU's bytes)
+    try std.testing.expectEqual(@as(u64, d3d.DRAWS), s.tex_unit_draws);
+    try std.testing.expectEqual(@as(u64, 0), s.tex_soft_draws);
     // (one run for the draws: they and the reads wait for the GPU once each)
     try std.testing.expect(eng_rtx.uni_ring.cpu.len != 0);
     try std.testing.expectEqual(@as(u32, 0), apart(&want, &got, d3d.FW, 0, "Direct3D frame: the CPU against the RTX (read)"));
     try std.testing.expectEqual(@as(u32, 0), apart(&want, &got2, d3d.FW, 0, "Direct3D frame: the CPU against the RTX (readStart, readFinish)"));
+}
+
+/// Direct3D's samples the RTX's texture unit takes beside the plain 2D
+/// one (d3d's frame): a 2D array's comparisons, one at a texel offset
+/// (Unigine's cascaded shadows: sample_c_lz, aoffimmi), and a mipmapped
+/// texture at a level between two (sample_l: the levels' blend in the
+/// program, each level's bilinear in the unit).
+const unit = struct {
+    const gen = gfxapi.dxbc_gen;
+    const fx = gfxapi.dxbc_fixtures;
+    const texture = gfxapi.texture;
+    const FW = 32;
+    const FH = 32;
+    const CB_WORDS = 20;
+    const DVert = extern struct { pos: [3]f32, color: [4]f32 };
+
+    fn varying(_: ?*const anyopaque, name: []const u8, index: u32) ?u32 {
+        if (std.ascii.eqlIgnoreCase(name, "COLOR") and index == 0) return 0;
+        return null;
+    }
+    fn cbuffer(_: ?*const anyopaque, slot: u32) ?gen.CBuffer {
+        return if (slot == 0) .{ .word = 0, .vecs = 5 } else null;
+    }
+    fn tex(_: ?*const anyopaque, t: u32, smp: u32) ?u32 {
+        if (t == 0 and (smp == 0 or smp == gen.NO_SAMPLER)) return 0;
+        if (t == 1 and (smp == 1 or smp == gen.NO_SAMPLER)) return 1;
+        return null;
+    }
+    var log: gen.Log = .{};
+    var pair: gen.Pair = undefined;
+    var pipe: raster.Pipeline = undefined;
+    var cpu_eng: engine.Engine = undefined;
+    var cpu_pool: [4 << 20]u8 align(64) = undefined;
+
+    /// An image of `layers` layers of one level, each after the one before
+    /// (as galaxy-pe's and GL's layered textures), rows on the engine's
+    /// alignment.
+    fn layered(e: *engine.Engine, w: u32, h: u32, f: engine.Format, layers: u32) ?engine.Image {
+        const ra = e.rowAlign();
+        const stride = std.mem.alignForward(u32, w * f.bytes(), ra);
+        var img = e.newBuffer(@as(usize, stride) * h * layers) orelse return null;
+        img.width = w;
+        img.height = h;
+        img.stride = stride;
+        img.format = f;
+        img.row_align = ra;
+        img.layered = true;
+        return img;
+    }
+
+    fn frame(e: *engine.Engine, out: *[FW * FH * 4]u8) !void {
+        pair = .{ .vs = &fx.vs40, .ps = &fx.ps_unit, .lay = .{ .varying = varying, .cbuffer = cbuffer, .texture = tex, .desc_base = CB_WORDS }, .log = &log };
+        pipe = raster.Pipeline.init(pair.shaders(2, 4, 2));
+        defer e.unloadPipeline(&pipe);
+        var target = e.newImage(FW, FH, .bgra8) orelse return error.OutOfMemory;
+        defer e.freeImage(&target);
+        // the shadow maps: 8 x 8 floats, three layers, a ramp across each
+        // (layer z: x / 8 + z / 4)
+        var shadow = layered(e, 8, 8, .r32f, 3) orelse return error.OutOfMemory;
+        defer e.freeImage(&shadow);
+        for (0..3) |z| for (0..8) |y| {
+            var row: [8]f32 = undefined;
+            for (&row, 0..) |*texel_v, x| texel_v.* = @as(f32, @floatFromInt(x)) / 8 + @as(f32, @floatFromInt(z)) / 4 - @as(f32, @floatFromInt(y)) / 32;
+            e.writeBytes(&shadow, (z * 8 + y) * shadow.stride, std.mem.asBytes(&row));
+        };
+        // the mipmapped texture: 8 x 8 RGBA8, four levels, each its colours
+        var mipped = e.newImageChain(8, 8, .rgba8, 4) orelse return error.OutOfMemory;
+        defer e.freeImage(&mipped);
+        for (0..4) |l| {
+            const lv: u32 = @intCast(l);
+            const w = mipped.levelWidth(lv);
+            for (0..mipped.levelHeight(lv)) |y| {
+                var row: [32]u8 = undefined;
+                for (0..w) |x| row[x * 4 ..][0..4].* = .{ @intCast(30 * l), @intCast(20 * x + 60 * l), @intCast(25 * y + 9 * l), 255 };
+                e.writeBytes(&mipped, mipped.level_at[l] + y * mipped.levelStride(lv), row[0 .. w * 4]);
+            }
+        }
+        e.fill(&target, target.bounds(), 0xff20_4060, 0);
+        // the quad: the colour's x and y the coordinates, 0 .. 1 across
+        const q = [6][2]f32{ .{ -1, -1 }, .{ 1, -1 }, .{ -1, 1 }, .{ 1, -1 }, .{ 1, 1 }, .{ -1, 1 } };
+        var verts: [6]DVert = undefined;
+        for (q, 0..) |pt, j| verts[j] = .{ .pos = .{ pt[0], pt[1], 0.5 }, .color = .{ (pt[0] + 1) / 2, (pt[1] + 1) / 2, 0, 1 } };
+        var vb = e.newBuffer(@sizeOf(@TypeOf(verts))) orelse return error.OutOfMemory;
+        defer e.freeImage(&vb);
+        e.writeBytes(&vb, 0, std.mem.asBytes(&verts));
+        var u: [CB_WORDS + 2 * texture.DESC_WORDS]u32 = @splat(0);
+        for (0..4) |i| u[i * 4 + i] = @bitCast(@as(f32, 1));
+        for (0..4) |c| u[16 + c] = @bitCast(@as(f32, 1));
+        // (LEQUAL: the reference at or below the texel's depth passes)
+        var dw: [texture.DESC_WORDS]u32 = undefined;
+        texture.descriptor(.{ .img = &shadow, .layers = 3, .wrap_s = .clamp, .wrap_t = .clamp, .compare = 0b011, .linear = true, .min_linear = true }, &dw);
+        @memcpy(u[CB_WORDS..][0..texture.DESC_WORDS], &dw);
+        texture.descriptor(.{ .img = &mipped, .wrap_s = .repeat, .wrap_t = .mirror, .linear = true, .min_linear = true, .mip = .linear, .last = 3 }, &dw);
+        @memcpy(u[CB_WORDS + texture.DESC_WORDS ..][0..texture.DESC_WORDS], &dw);
+        var dr = raster.Draw{
+            .pipe = &pipe,
+            .color = &target,
+            .count = 6,
+            .center = .{ FW / 2, FH / 2 },
+            .half = .{ FW / 2, FH / 2 },
+            .rect = target.bounds(),
+            .uniforms = &u,
+        };
+        dr.attrs[0] = .{ .buf = &vb, .offset = 0, .stride = @sizeOf(DVert), .comps = 3 };
+        dr.attrs[1] = .{ .buf = &vb, .offset = 12, .stride = @sizeOf(DVert), .comps = 4 };
+        dr.textures[0] = &shadow;
+        dr.textures[1] = &mipped;
+        if (!e.draw(&dr)) return error.DrawRefused;
+        if (log.len != 0) {
+            std.debug.print("{s}\n", .{log.text()});
+            return error.Generation;
+        }
+        e.read(&target, 0, 0, FW, FH, out, FW * 4, .bgra8);
+        e.finish();
+    }
+};
+
+test "Direct3D through the emulated RTX's texture unit: a 2D array's comparisons (one at a texel offset) and a level between two of a mipmapped texture: the CPU's pixels, within a step" {
+    var want: [unit.FW * unit.FH * 4]u8 = undefined;
+    unit.cpu_eng.init(.{ .pool = &unit.cpu_pool, .cpu_work = &cpu_work });
+    try unit.frame(&unit.cpu_eng, &want);
+    // (the comparisons' half steps, the levels' colours: neither all one
+    // value nor the clear's)
+    var reds = [_]bool{false} ** 256;
+    for (0..unit.FW * unit.FH) |i| reds[want[i * 4 + 2]] = true;
+    var distinct: u32 = 0;
+    for (reds) |x| distinct += @intFromBool(x);
+    try std.testing.expect(distinct >= 3);
+    Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+    Rtx.dev.withEngine(&Rtx3d.engine3d);
+    eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs, .graphics = true });
+    defer eng_rtx.deinit();
+    var got: [unit.FW * unit.FH * 4]u8 = undefined;
+    unit.frame(&eng_rtx, &got) catch |err| {
+        std.debug.print("texture unit frame: {s}; the 3D engine: {s}\n", .{ @errorName(err), Rtx3d.engine3d.why });
+        return err;
+    };
+    const s = eng_rtx.stats;
+    for (eng_rtx.said_compute) |w| if (w.len != 0) std.debug.print("texture unit frame: on the compute kernels: {s}\n", .{w});
+    try std.testing.expectEqual(@as(u64, 1), s.graphics_draws);
+    try std.testing.expectEqual(@as(u64, 1), s.tex_unit_draws);
+    try std.testing.expectEqual(@as(u64, 0), s.tex_soft_draws);
+    // (a texel offset's coordinate is the reciprocal's: within a step of
+    // 255 where it meets a texel's edge)
+    try std.testing.expectEqual(@as(u32, 0), apart(&want, &got, unit.FW, 1, "texture unit frame: the CPU against the RTX"));
 }
