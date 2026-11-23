@@ -697,6 +697,7 @@ pub fn Store(comptime Raw: type) type {
 
         pub const Connection = struct {
             pub const detached_primary_key = if (@hasDecl(Raw, "ReadContext")) @hasDecl(Raw.ReadContext, "primaryKeyMatches") else false;
+            pub const detached_cached_primary_key = if (@hasDecl(Raw, "ReadContext")) @hasDecl(Raw.ReadContext, "runCachedPrimaryKey") else false;
 
             pub const Result = Raw.Result;
             pub const simple_query_batches = @hasDecl(Raw, "preflightPostgresBatch");
@@ -2006,6 +2007,24 @@ pub fn Store(comptime Raw: type) type {
 
             pub fn execute(self: *Connection, source: []const u8, result: *Result) !void {
                 return self.executeMode(source, result, false);
+            }
+
+            /// The reactor owns the database read gate and a private context.
+            /// A cache miss leaves the request to the ordinary portal path.
+            pub fn executeCachedDetachedPrimaryKey(self: *Connection, source: []const u8, oid: u32, key: ?i64, result: *Result) !bool {
+                if (comptime !detached_cached_primary_key) return false;
+                const context = self.read_context orelse return false;
+                if (self.id == 0 or !self.running_statement or self.failed or self.in_transaction or self.tx != null or
+                    !self.autocommit or self.pending.active or self.dialect != .postgres or !self.detachedIdentity()) return false;
+                const data_type: @TypeOf(@as(Result, undefined).column_types[0]) = switch (oid) {
+                    20 => .integer,
+                    21 => .smallint,
+                    23 => .integer32,
+                    else => return false,
+                };
+                const raw = &self.store.database;
+                const argument: Raw.Cell = if (key) |value| .{ .integer = value } else .null_value;
+                return context.runCachedPrimaryKey(raw, source, .{ .csn = raw.csn }, data_type, &argument, result);
             }
 
             pub fn executeExtended(self: *Connection, source: []const u8, result: *Result) !void {

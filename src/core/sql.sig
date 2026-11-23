@@ -1224,6 +1224,9 @@ pub fn Database(comptime config: Config) type {
                 data_type: DataType,
                 oid: u32,
                 role: u32,
+                public_schema_on_path: bool,
+                row_security: bool,
+                restricted_relation_kinds: value_module.RestrictedRelationKinds,
                 prepared_csn: u64,
                 snapshot: Snapshot,
             };
@@ -1469,6 +1472,9 @@ pub fn Database(comptime config: Config) type {
                     .data_type = parameter,
                     .oid = table.oid,
                     .role = self.session.role,
+                    .public_schema_on_path = self.session.public_schema_on_path,
+                    .row_security = self.session.row_security,
+                    .restricted_relation_kinds = self.session.restricted_relation_kinds,
                     .prepared_csn = db.csn,
                     .snapshot = snapshot,
                 };
@@ -1498,6 +1504,9 @@ pub fn Database(comptime config: Config) type {
 
             fn primaryKeyTableCurrent(self: *const Context, db: *const Self, plan: *const PrimaryKeyPlan) bool {
                 if (plan.prepared_csn != db.csn or self.session.role != plan.role or self.dialect != .postgres) return false;
+                if (self.session.public_schema_on_path != plan.public_schema_on_path or
+                    self.session.row_security != plan.row_security or
+                    !std.meta.eql(self.session.restricted_relation_kinds, plan.restricted_relation_kinds)) return false;
                 const table = &db.tables[plan.select.table.?];
                 return table.live and table.oid == plan.oid and table.primary_column == plan.column and
                     table.columns[plan.column].data_type == plan.data_type;
@@ -1511,13 +1520,30 @@ pub fn Database(comptime config: Config) type {
                 if (prepared.* != .primary_key) return false;
                 const plan = &prepared.primary_key;
                 if (!self.primaryKeyCurrent(db, snapshot, plan)) return false;
-                try self.validate(db, self.source, result);
+                try self.probePrimaryKey(db, self.source, snapshot, plan, key, result);
+                return true;
+            }
+
+            /// Reuse the retained read plan without installing it into the
+            /// working plan union. On a miss the caller still owns the request.
+            pub fn runCachedPrimaryKey(self: *Context, db: *const Self, source: []const u8, snapshot: Snapshot, parameter: DataType, key: *const Cell, result: *Result) Error!bool {
+                const cached = if (self.cached_primary_key) |*entry| entry else return false;
+                const plan = &cached.plan;
+                if (cached.database != db or plan.data_type != parameter or db.detachedReadsBlocked() or
+                    !snapshotMatches(plan.snapshot, snapshot) or !self.primaryKeyTableCurrent(db, plan) or
+                    !types.same(cached.source[0..cached.len], source)) return false;
+                try self.probePrimaryKey(db, source, snapshot, plan, key, result);
+                self.primary_key_cache_hits +%= 1;
+                return true;
+            }
+
+            fn probePrimaryKey(self: *Context, db: *const Self, source: []const u8, snapshot: Snapshot, plan: *const PrimaryKeyPlan, key: *const Cell, result: *Result) Error!void {
+                try self.validate(db, source, result);
                 if (config.external_results and result.rows.len == 0) return error.InvalidParameterValue;
                 const table = &db.tables[plan.select.table.?];
                 if (key.* != .null_value) try V.validate(&table.columns[plan.column], key);
                 self.workspace.query.read_stats = .{};
                 try X.selectPrimaryKey(table, &plan.select, plan.projection[0..plan.select.count], key, snapshot, result, &self.session);
-                return true;
             }
 
             pub fn run(self:*Context,result:*Result) Error!void {

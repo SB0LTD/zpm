@@ -282,7 +282,10 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
     const has_admission = detects_admission or external_admission;
     const has_primary_key = @hasDecl(DB, "executeDetachedPrimaryKey") and
         (if (@hasDecl(DB, "detached_primary_key")) DB.detached_primary_key else true);
+    const has_cached_primary_key = @hasDecl(DB, "executeCachedDetachedPrimaryKey") and
+        (if (@hasDecl(DB, "detached_cached_primary_key")) DB.detached_cached_primary_key else true);
     const primary_key_sql_capacity = 256;
+    const result_format_capacity = 256;
     const CopyInfo = if (has_copy) DB.CopyInfo else struct {};
     const line_bytes: usize = if (has_copy) DB.copy_line_bytes else 1;
     const field_capacity: usize = if (has_copy) (CopyInfo{}).types.len else 1;
@@ -376,7 +379,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             name: Name = .{},
             sql: [sql_capacity]u8 = @splat(0),
             len: usize = 0,
-            formats: [256]u16 = @splat(0),
+            formats: [result_format_capacity]u16 = @splat(0),
             format_count: usize = 0,
             row: usize = 0,
             complete: bool = false,
@@ -539,6 +542,100 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
         pub fn detachedCandidate(self:*Self,input:[]const u8) ?DetachedCandidate {
             if(!self.detachedReady()) return null;
             return self.detachedFrame(input) catch null;
+        }
+
+        pub const DetachedKeyExchange = struct {
+            key: DetachedPrimaryKey,
+            formats: []const u8,
+            consumed: usize,
+        };
+
+        /// Recognize a complete unnamed Bind, unlimited Execute, and Sync.
+        /// Borrow the statement and frame until the caller consumes the input.
+        /// A miss leaves the ordinary decoder in charge of all three frames.
+        pub fn detachedKeyExchange(self: *Self, input: []const u8) ?DetachedKeyExchange {
+            if (comptime !has_cached_primary_key) return null;
+            if (!self.waiting_for_command or !self.detachedReady() or input.len < 5 or input[0] != 'B') return null;
+            if (comptime has_admission) if (self.admission.rejected) return null;
+            const size = read32(input[1..5]);
+            if (size < 4 or size > max_packet) return null;
+            const end = @as(usize, size) + 1;
+            const execute_sync = "E\x00\x00\x00\x09\x00\x00\x00\x00\x00S\x00\x00\x00\x04";
+            if (end + execute_sync.len > input.len or !equal(input[end..][0..execute_sync.len], execute_sync)) return null;
+            return self.detachedBind(input[5..end], end + execute_sync.len) catch null;
+        }
+
+        fn detachedBind(self: *Self, body: []const u8, consumed: usize) !?DetachedKeyExchange {
+            var r: Reader = .{ .bytes = body };
+            if (try r.byte() != 0) return null;
+            const stmt = try self.statement(try r.string());
+            if (stmt.count != 1 or stmt.single_parameter == null or stmt.len > primary_key_sql_capacity or !integralParameter(stmt.oids[0])) return null;
+            const format_count = try r.u16be();
+            if (format_count > 1) return null;
+            const format = if (format_count == 0) 0 else try r.u16be();
+            if (format > 1 or try r.u16be() != 1) return null;
+            const length = try r.u32be();
+            var key: ?i64 = null;
+            if (length != 0xffffffff) {
+                const bytes = try r.take(length);
+                if (format == 0 and !integerText(bytes)) return null;
+                key = primaryKeyNumber(bytes, stmt.oids[0], format) orelse return null;
+            }
+            const result_count = try r.u16be();
+            if (result_count > result_format_capacity) return null;
+            const formats = try r.take(@as(usize, result_count) * 2);
+            try r.done();
+            var index: usize = 0;
+            while (index < formats.len) : (index += 2) if (formats[index] != 0 or formats[index + 1] > 1) return null;
+            for (&self.portals) |*portal_value| {
+                if (!portal_value.live or portal_value.name.len == 0) return .{
+                    .key = .{ .source = stmt.source(), .oid = stmt.oids[0], .key = key },
+                    .formats = formats,
+                    .consumed = consumed,
+                };
+            }
+            return null;
+        }
+
+        /// Execute the recognized exchange under the caller's detached-read
+        /// ownership. The DB must leave its result untouched on a cache miss.
+        pub fn handleDetachedKeyExchange(self: *Self, db: *DB, exchange: DetachedKeyExchange, output: []u8) error{BufferTooSmall}!?Reply {
+            if (comptime !has_cached_primary_key) return null;
+            if (output.len < try self.requiredCapacity()) return error.BufferTooSmall;
+            var w: Writer = .{ .bytes = output };
+            var execution_error: ?anyerror = null;
+            const found = db.executeCachedDetachedPrimaryKey(exchange.key.source, exchange.key.oid, exchange.key.key, &self.result) catch |err| failed: {
+                execution_error = err;
+                break :failed true;
+            };
+            if (!found) return null;
+            try w.empty('2');
+            const bind_end = w.at;
+            if (execution_error == null and exchange.formats.len > 2 and exchange.formats.len / 2 != self.result.column_count)
+                execution_error = error.ProtocolViolation;
+            try writeNotice(db, &w);
+            if (execution_error == null) {
+                self.commit_rolled_back = false;
+                self.writeKeyResult(db, &w, exchange.formats) catch |err| {
+                    w.at = bind_end;
+                    execution_error = err;
+                };
+            }
+            if (execution_error) |err| {
+                try failure(&w, sqlstate(err), diagnosticMessage(err));
+                if (@hasDecl(DB, "failTransaction")) db.failTransaction();
+            }
+            // A detached read cannot open an implicit extended transaction.
+            self.closeIdlePortals(db);
+            try self.ready(db, &w);
+            return .{ .consumed = exchange.consumed, .written = w.at };
+        }
+
+        fn writeKeyResult(self: *Self, db: *DB, w: *Writer, formats: []const u8) !void {
+            try self.rows(db, w, formats, 0, self.result.row_count);
+            const tag = try w.begin('C');
+            try w.append(if (self.result.row_count == 0) "SELECT 0\x00" else "SELECT 1\x00");
+            w.end(tag);
         }
 
         /// Additional scheduling hint for unlimited Execute. Portal storage
@@ -970,7 +1067,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             try writeNotice(db, w);
             if (self.result.column_count == 0) return;
             try self.description(w, null);
-            try self.rows(db, w, null, 0, self.result.row_count);
+            try self.rows(db, w, @as([]const u16, &.{}), 0, self.result.row_count);
         }
 
         /// Produce one complete command's responses using the same result and
@@ -1108,7 +1205,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                     }
                     if (p.format_count > 1 and p.format_count != self.result.column_count) return error.ProtocolViolation;
                     const end = if (limit == 0) self.result.row_count else @min(self.result.row_count, p.row + limit);
-                    try self.rows(db, w, p, p.row, end);
+                    try self.rows(db, w, @as([]const u16, p.formats[0..p.format_count]), p.row, end);
                     p.row = end;
                     if (end < self.result.row_count) try w.empty('s') else {
                         try self.command(w, p.source());
@@ -2033,8 +2130,10 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             return null;
         }
 
-        fn rows(self: *Self, db: *DB, w: *Writer, portal_value: ?*const Portal, first: usize, end: usize) !void {
+        fn rows(self: *Self, db: *DB, w: *Writer, formats: anytype, first: usize, end: usize) !void {
             const session = valueSession(db);
+            const stride = if (@TypeOf(formats) == []const u8) 2 else 1;
+            const format_count = formats.len / stride;
             for (first..end) |row| {
                 const p = try w.begin('D');
                 try w.u16be(@intCast(self.result.column_count));
@@ -2047,7 +2146,8 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                     const length = w.at;
                     try w.u32be(0);
                     const start = w.at;
-                    const binary = if (portal_value) |v| v.format(i) == 1 else false;
+                    const format_index = if (format_count == 1) 0 else i;
+                    const binary = format_count != 0 and formats[format_index * stride + stride - 1] == 1;
                     switch (cell) {
                         .null_value => unreachable,
                         .integer => |n| if (binary) {
