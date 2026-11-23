@@ -46,11 +46,12 @@
 //! prefetch word, ...) is a refused stream; a texture's header is Maxwell's
 //! TEXHEAD_PITCH; the depth target is one surface, the stencil in its
 //! words (S8Z24: depth in bits 0..23, stencil in 24..31), no
-//! STENCIL_IS_SEPARATE. Where Turing's engine keeps a depth word is NOT
-//! known: Mesa's NIL gives every depth and stencil format Turing's FermiZS
-//! GOBs, whose layout is not public. Modelled here as Turing2D's 32-bit
-//! words (a guess the card has to confirm); nothing on the CPU reads them
-//! (the GL layer keeps depth draws off Turing's 3D engine).
+//! STENCIL_IS_SEPARATE. Mesa's NIL gives every depth and stencil format
+//! Turing's FermiZS GOBs, whose layout is not public; modelled here as
+//! Turing2D's 32-bit words, which the 2080 Ti confirmed for ZF32 (its draw
+//! test through Windows' driver: step 4c within 3 ulps, 4d exact), so
+//! gfxapi's float depth images go to Turing's 3D engine as to Blackwell's.
+//! The 24-bit ones are not that layout on the card (4f lost the channel).
 //!
 //! Allocation-free: an Engine is the caller's (about 1 MB, static).
 

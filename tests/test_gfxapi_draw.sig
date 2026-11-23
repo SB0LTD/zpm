@@ -1503,6 +1503,31 @@ test "draw: stencil operations with the emulated RTX's 3D engine on: the framebu
     }
 }
 
+test "draw: stencil operations with the emulated RTX 2080 Ti's 3D engine on (TURING_A): its stencil-tested draws kept on the compute kernels (no batch refused), the CPU's bytes" {
+    for ([_]bool{ false, true }) |separate| {
+        Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+        Rtx.dev.setSm(.sm_75);
+        Rtx.dev.withEngine(&Rtx3d.engine3d);
+        eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs, .graphics = true });
+        defer eng_rtx.deinit();
+        stencilScene(&eng_rtx, separate) catch |e| {
+            std.debug.print("TURING_A stencil scene (separate {}): {s}; the 3D engine: {s}\n", .{ separate, @errorName(e), Rtx3d.engine3d.why });
+            return e;
+        };
+        std.debug.print("TURING_A stencil scene (separate {}): {d} draws through the 3D engine, {d} on the compute kernels\n", .{ separate, eng_rtx.stats.graphics_draws, eng_rtx.stats.compute_draws });
+        try std.testing.expect(eng_rtx.why_pipe == null);
+        try std.testing.expect(!eng_rtx.lost);
+        // (Turing has no stencil plane of its own: graphicsDraw keeps a
+        // stencil test off its 3D engine rather than fail the batch)
+        try std.testing.expect(eng_rtx.stats.compute_draws > 0);
+        var kept = false;
+        for (eng_rtx.said_compute) |w| if (std.mem.indexOf(u8, w, "stencil test on Turing") != null) {
+            kept = true;
+        };
+        try std.testing.expect(kept);
+    }
+}
+
 test "draw: the scene on the emulated RTX (sm_120, discrete memory) gives the CPU's bytes" {
     const want = try cpuOut();
     Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
@@ -1607,7 +1632,7 @@ test "draw: the scene through the emulated RTX's 3D engine where it draws, the c
 
 var out_tu3d: Out = .{};
 
-test "draw: the scene on the emulated RTX 2080 Ti with its 3D engine (TURING_A, sm_75): colour draws through it, depth and stencil on the compute kernels, the CPU's picture" {
+test "draw: the scene on the emulated RTX 2080 Ti with its 3D engine (TURING_A, sm_75): colour and depth draws through it, stencil on the compute kernels, the CPU's picture" {
     const want = try cpuOut();
     Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
     Rtx.dev.setSm(.sm_75);
@@ -1615,8 +1640,9 @@ test "draw: the scene on the emulated RTX 2080 Ti with its 3D engine (TURING_A, 
     eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs, .graphics = true });
     defer eng_rtx.deinit();
     try std.testing.expect(eng_rtx.onGpu() and eng_rtx.graphics);
-    // (a Turing card's depth words are where nothing here reads them)
-    try std.testing.expect(!eng_rtx.graphics_depth and !eng_rtx.depth_float);
+    // (a Turing card's float depth where the compute raster reads it: the
+    // emulated engine keeps it as Turing2D's words, as the card's step 4c)
+    try std.testing.expect(eng_rtx.graphics_depth and eng_rtx.depth_float);
     scene(&eng_rtx, &out_tu3d) catch |e| {
         std.debug.print("rtx 2080 ti 3D scene: {s}; the engine lost the GPU {} ({?s}), its pipeline error {?s}; the 3D engine: {s}\n", .{ @errorName(e), eng_rtx.lost, if (eng_rtx.why) |w| @errorName(w) else null, if (eng_rtx.why_pipe) |w| @errorName(w) else null, Rtx3d.engine3d.why });
         if (Rtx.dev.lastError()) |le| {
@@ -1630,7 +1656,9 @@ test "draw: the scene on the emulated RTX 2080 Ti with its 3D engine (TURING_A, 
     try std.testing.expect(eng_rtx.why_pipe == null);
     try std.testing.expect(!eng_rtx.lost);
     try std.testing.expect(eng_rtx.stats.graphics_draws > 0);
-    try std.testing.expect(eng_rtx.stats.compute_draws > 0);
+    // (the scene has no stencil test: every draw the 3D engine's, its
+    // depth-tested ones too)
+    try std.testing.expectEqual(@as(u64, 0), eng_rtx.stats.compute_draws);
     try std.testing.expectEqual(eng_rtx.stats.graphics_draws, Rtx3d.engine3d.draws);
     try std.testing.expectEqual(@as(u32, 0), apart(&want.fbo, &out_tu3d.fbo, W, 2, "fbo"));
     try std.testing.expectEqual(@as(u32, 0), apart(&want.win, &out_tu3d.win, WW, 2, "window"));
