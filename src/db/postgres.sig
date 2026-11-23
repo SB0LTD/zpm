@@ -578,7 +578,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             var key: ?i64 = null;
             if (length != 0xffffffff) {
                 const bytes = try r.take(length);
-                if (format == 0 and !integerText(bytes)) return null;
+                if (format == 0 and (bytes.len > 20 or !integerText(bytes))) return null;
                 key = primaryKeyNumber(bytes, stmt.oids[0], format) orelse return null;
             }
             const result_count = try r.u16be();

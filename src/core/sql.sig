@@ -1533,6 +1533,7 @@ pub fn Database(comptime config: Config) type {
                     !snapshotMatches(plan.snapshot, snapshot) or !self.primaryKeyTableCurrent(db, plan) or
                     !types.same(cached.source[0..cached.len], source)) return false;
                 try self.probePrimaryKey(db, source, snapshot, plan, key, result);
+                self.last_result_reused = false;
                 self.primary_key_cache_hits +%= 1;
                 return true;
             }
