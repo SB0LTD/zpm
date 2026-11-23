@@ -878,7 +878,7 @@ pub const Engine = struct {
         const n = g.queued;
         g.queued = 0;
         if (n == 0) return;
-        var ps = emu.Stage{ .kind = .pixel, .header = &g.phead, .in = g.pin[0..n], .front = g.front[0..n], .killed = g.killed[0..n], .cbufs = cb, .ctx = g, .sample = &sampleCall, .compare = &compareCall };
+        var ps = emu.Stage{ .kind = .pixel, .header = &g.phead, .in = g.pin[0..n], .front = g.front[0..n], .killed = g.killed[0..n], .cbufs = cb, .ctx = g, .sample = &sampleCall, .compare = &compareCall, .fetch = &fetchCall };
         try emu.stageBegin(g.host.work, n);
         try emu.stageRun(g.host.work, &g.host.mem, &ps, n, stats);
         // Each colour target SET_CT_SELECT counts that the program writes:
@@ -972,22 +972,27 @@ pub const Engine = struct {
     }
 
     /// The texture and the sampler a handle names, from the pools.
-    fn texture(g: *Engine, handle: u32) error{BadStream}!Tex {
+    /// The texture a handle names: its header, and with `sampled` its
+    /// sampler (a fetch, TLD, has none).
+    fn texture(g: *Engine, handle: u32, sampled: bool) error{BadStream}!Tex {
         try g.need(g.reg(gr.SET_TEXTURE_HEADER_VERSION) == 1 and g.reg(gr.SET_SAMPLER_BINDING) == 0, "the texture header version is not 1, or samplers are bound through headers");
         const hi = handle & 0xf_ffff;
         const si = handle >> 20;
         const hp = gr.SET_TEX_HEADER_POOL_A;
         const sp = gr.SET_TEX_SAMPLER_POOL_A;
         try g.need(hi != 0 and hi <= g.reg(hp + 8), "a texture handle names the null header or one past the pool's last");
-        try g.need(si <= g.reg(sp + 8), "a texture handle names a sampler past the pool's last");
+        if (sampled) try g.need(si <= g.reg(sp + 8), "a texture handle names a sampler past the pool's last");
         const hva = (@as(u64, g.reg(hp) & 0x1ff_ffff) << 32 | g.reg(hp + 4)) + @as(u64, hi) * 32;
         const sva = (@as(u64, g.reg(sp) & 0x1ff_ffff) << 32 | g.reg(sp + 4)) + @as(u64, si) * 32;
         const hb = g.host.mem.find(hva, 32) orelse return g.refuse("the texture header pool is not in mapped memory");
-        const sb = g.host.mem.find(sva, 32) orelse return g.refuse("the sampler pool is not in mapped memory");
         var h: [8]u32 = undefined;
-        var s: [8]u32 = undefined;
+        // (a fetch's: point, clamped to the edge, the header's coordinates)
+        var s: [8]u32 = .{ 2 | 2 << 3, 1 | 1 << 4, 0, 0, 0, 0, 0, 0 };
         for (&h, 0..) |*w, k| w.* = std.mem.readInt(u32, hb[k * 4 ..][0..4], .little);
-        for (&s, 0..) |*w, k| w.* = std.mem.readInt(u32, sb[k * 4 ..][0..4], .little);
+        if (sampled) {
+            const sb = g.host.mem.find(sva, 32) orelse return g.refuse("the sampler pool is not in mapped memory");
+            for (&s, 0..) |*w, k| w.* = std.mem.readInt(u32, sb[k * 4 ..][0..4], .little);
+        }
         // The header: a level of two dimensions, rows of bytes (PITCH_V2,
         // TWO_D_NO_MIPMAP) or block linear (BLOCKLINEAR_V2, TWO_D, one
         // GOB wide and deep, one level).
@@ -1048,15 +1053,26 @@ pub const Engine = struct {
     /// TEX: the Stage's callback.
     fn sampleCall(ctx: ?*anyopaque, handle: u32, x: f32, y: f32) emu.Error![4]f32 {
         const g: *Engine = @ptrCast(@alignCast(ctx.?));
-        const t = g.texture(handle) catch return error.Unsupported;
+        const t = g.texture(handle, true) catch return error.Unsupported;
         if (t.compare != null) return error.Unsupported;
         return sample(t, x, y, null);
+    }
+
+    /// TLD.LZ: the Stage's callback: the texel at (x, y) of the header's
+    /// level, through its sources; outside the level (0, 0, 0, 0), as the
+    /// unit's bounds check gives (gfxapi clamps its fetches inside first).
+    fn fetchCall(ctx: ?*anyopaque, handle: u32, x: i32, y: i32, lod: i32) emu.Error![4]f32 {
+        const g: *Engine = @ptrCast(@alignCast(ctx.?));
+        if (lod != 0) return error.Unsupported;
+        const t = g.texture(handle, false) catch return error.Unsupported;
+        if (x < 0 or y < 0 or x >= t.width or y >= t.height) return .{ 0, 0, 0, 0 };
+        return sourced(t, texel(t, @intCast(x), @intCast(y)));
     }
 
     /// TEX.DC: the Stage's callback.
     fn compareCall(ctx: ?*anyopaque, handle: u32, x: f32, y: f32, ref: f32) emu.Error![4]f32 {
         const g: *Engine = @ptrCast(@alignCast(ctx.?));
-        const t = g.texture(handle) catch return error.Unsupported;
+        const t = g.texture(handle, true) catch return error.Unsupported;
         if (t.compare == null) return error.Unsupported;
         return sample(t, x, y, ref);
     }

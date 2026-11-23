@@ -3387,7 +3387,10 @@ test "Direct3D's frame through the emulated RTX's 3D engine: textured B8G8R8A8 d
 /// one (d3d's frame): a 2D array's comparisons, one at a texel offset
 /// (Unigine's cascaded shadows: sample_c_lz, aoffimmi), and a mipmapped
 /// texture at a level between two (sample_l: the levels' blend in the
-/// program, each level's bilinear in the unit).
+/// program, each level's bilinear in the unit), and a texel of its second
+/// level fetched at an offset (ld_aoffimmi: TLD), and a cube map across a
+/// face's edges (each tap a texel fetched on its face, the filter the
+/// program's).
 const unit = struct {
     const gen = gfxapi.dxbc_gen;
     const fx = gfxapi.dxbc_fixtures;
@@ -3407,6 +3410,7 @@ const unit = struct {
     fn tex(_: ?*const anyopaque, t: u32, smp: u32) ?u32 {
         if (t == 0 and (smp == 0 or smp == gen.NO_SAMPLER)) return 0;
         if (t == 1 and (smp == 1 or smp == gen.NO_SAMPLER)) return 1;
+        if (t == 2 and (smp == 1 or smp == gen.NO_SAMPLER)) return 2;
         return null;
     }
     var log: gen.Log = .{};
@@ -3433,7 +3437,7 @@ const unit = struct {
 
     fn frame(e: *engine.Engine, out: *[FW * FH * 4]u8) !void {
         pair = .{ .vs = &fx.vs40, .ps = &fx.ps_unit, .lay = .{ .varying = varying, .cbuffer = cbuffer, .texture = tex, .desc_base = CB_WORDS }, .log = &log };
-        pipe = raster.Pipeline.init(pair.shaders(2, 4, 2));
+        pipe = raster.Pipeline.init(pair.shaders(2, 4, 3));
         defer e.unloadPipeline(&pipe);
         var target = e.newImage(FW, FH, .bgra8) orelse return error.OutOfMemory;
         defer e.freeImage(&target);
@@ -3458,6 +3462,14 @@ const unit = struct {
                 e.writeBytes(&mipped, mipped.level_at[l] + y * mipped.levelStride(lv), row[0 .. w * 4]);
             }
         }
+        // the cube: 4 x 4 RGBA8, its six faces, each its colours
+        var sky = layered(e, 4, 4, .rgba8, 6) orelse return error.OutOfMemory;
+        defer e.freeImage(&sky);
+        for (0..6) |face| for (0..4) |y| {
+            var row: [16]u8 = undefined;
+            for (0..4) |x| row[x * 4 ..][0..4].* = .{ @intCast(40 * face + 10 * x), @intCast(60 * y), @intCast(200 - 30 * face), 255 };
+            e.writeBytes(&sky, (face * 4 + y) * sky.stride, &row);
+        };
         e.fill(&target, target.bounds(), 0xff20_4060, 0);
         // the quad: the colour's x and y the coordinates, 0 .. 1 across
         const q = [6][2]f32{ .{ -1, -1 }, .{ 1, -1 }, .{ -1, 1 }, .{ 1, -1 }, .{ 1, 1 }, .{ -1, 1 } };
@@ -3466,7 +3478,7 @@ const unit = struct {
         var vb = e.newBuffer(@sizeOf(@TypeOf(verts))) orelse return error.OutOfMemory;
         defer e.freeImage(&vb);
         e.writeBytes(&vb, 0, std.mem.asBytes(&verts));
-        var u: [CB_WORDS + 2 * texture.DESC_WORDS]u32 = @splat(0);
+        var u: [CB_WORDS + 3 * texture.DESC_WORDS]u32 = @splat(0);
         for (0..4) |i| u[i * 4 + i] = @bitCast(@as(f32, 1));
         for (0..4) |c| u[16 + c] = @bitCast(@as(f32, 1));
         // (LEQUAL: the reference at or below the texel's depth passes)
@@ -3475,6 +3487,8 @@ const unit = struct {
         @memcpy(u[CB_WORDS..][0..texture.DESC_WORDS], &dw);
         texture.descriptor(.{ .img = &mipped, .wrap_s = .repeat, .wrap_t = .mirror, .linear = true, .min_linear = true, .mip = .linear, .last = 3 }, &dw);
         @memcpy(u[CB_WORDS + texture.DESC_WORDS ..][0..texture.DESC_WORDS], &dw);
+        texture.descriptor(.{ .img = &sky, .layers = 6, .linear = true, .min_linear = true }, &dw);
+        @memcpy(u[CB_WORDS + 2 * texture.DESC_WORDS ..][0..texture.DESC_WORDS], &dw);
         var dr = raster.Draw{
             .pipe = &pipe,
             .color = &target,
@@ -3488,6 +3502,7 @@ const unit = struct {
         dr.attrs[1] = .{ .buf = &vb, .offset = 12, .stride = @sizeOf(DVert), .comps = 4 };
         dr.textures[0] = &shadow;
         dr.textures[1] = &mipped;
+        dr.textures[2] = &sky;
         if (!e.draw(&dr)) return error.DrawRefused;
         if (log.len != 0) {
             std.debug.print("{s}\n", .{log.text()});
@@ -3498,7 +3513,7 @@ const unit = struct {
     }
 };
 
-test "Direct3D through the emulated RTX's texture unit: a 2D array's comparisons (one at a texel offset) and a level between two of a mipmapped texture: the CPU's pixels, within a step" {
+test "Direct3D through the emulated RTX's texture unit: a 2D array's comparisons (one at a texel offset) and a level between two of a mipmapped texture, a texel of it fetched, a cube across its faces' edges: the CPU's pixels, within a step" {
     var want: [unit.FW * unit.FH * 4]u8 = undefined;
     unit.cpu_eng.init(.{ .pool = &unit.cpu_pool, .cpu_work = &cpu_work });
     try unit.frame(&unit.cpu_eng, &want);

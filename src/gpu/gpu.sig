@@ -65,6 +65,7 @@ pub const BlendFactor = device.BlendFactor;
 pub const BlendEquation = device.BlendEquation;
 pub const Error = device.Error;
 pub const Fence = device.Fence;
+pub const Busy = device.Busy;
 pub const Device = device.Device;
 pub const Work = device.Work;
 pub const compile = device.compile;

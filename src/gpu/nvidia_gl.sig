@@ -262,7 +262,7 @@ test "nvidia_gl: a pixel program writing target 2 alone and the depth: its regis
     }
 }
 
-test "nvidia_gl: a pixel program samples through the texture unit: TEX.B.LZ, its coordinates a pair, the handle then a comparison's reference (TEX.B.LZ.DC), the four channels a run" {
+test "nvidia_gl: a pixel program samples through the texture unit: TEX.B.LZ, its coordinates a pair, the handle then a comparison's reference (TEX.B.LZ.DC), a fetch TLD.B.LZ, the four channels a run" {
     var caps = rtx();
     caps.tex = true;
     var k = kir.Kernel.init(.{ .insts = &T.insts, .tys = &T.tys }, "ps", .{ 1, 1, 1 });
@@ -272,7 +272,9 @@ test "nvidia_gl: a pixel program samples through the texture unit: TEX.B.LZ, its
     const handle = k.param(.u32, 0);
     const v = k.tex(r(handle), r(x), r(y), null);
     const c = k.tex(r(k.op2(.iadd, .u32, r(handle), u(1))), r(y), r(x), f(0.5));
-    for (0..4) |j| k.store(.f32, ioMem(io, OUT_AT + 4 * @as(u32, @intCast(j)), false), u(0), r(kir.Kernel.at(v, @intCast(j))));
+    const fx = k.cvt(.f32, .u32, .rz, r(x));
+    const t = k.texFetch(r(k.op2(.iadd, .u32, r(handle), u(2))), r(fx), u(3));
+    for (0..4) |j| k.store(.f32, ioMem(io, OUT_AT + 4 * @as(u32, @intCast(j)), false), u(0), r(k.op2(.fadd, .f32, r(kir.Kernel.at(v, @intCast(j))), r(kir.Kernel.at(t, @intCast(j))))));
     k.store(.f32, ioMem(io, OUT_AT + 16, false), u(0), r(c));
     try k.finish();
     // (without the texture unit's caps the op is refused)
@@ -289,8 +291,12 @@ test "nvidia_gl: a pixel program samples through the texture unit: TEX.B.LZ, its
         std.debug.print("{s}\n", .{text});
         return error.TestUnexpectedResult;
     };
+    const fetch = std.mem.indexOf(u8, text, "TLD.B.LZ R") orelse {
+        std.debug.print("{s}\n", .{text});
+        return error.TestUnexpectedResult;
+    };
     // each: Rd1, Rd0 two apart (the run of four), Ra even (a pair), Rb
-    for ([_]usize{ plain, dc }) |at| {
+    for ([_]usize{ plain, dc, fetch }) |at| {
         var regs: [4]u32 = undefined;
         var i = std.mem.indexOfScalarPos(u8, text, at, ' ').?;
         for (&regs) |*rg| {

@@ -470,6 +470,9 @@ pub const GraphicsBlend = struct {
 pub const Error = error{ OutOfMemory, SubmitFailed, Timeout, DeviceLost, BadProgram, Unsupported };
 pub const Fence = u64;
 
+/// Device.busy's counts.
+pub const Busy = struct { gpu_ns: u64 = 0, blocked: u64 = 0 };
+
 pub const Device = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
@@ -498,7 +501,18 @@ pub const Device = struct {
         dispatchNs: ?*const fn (ctx: *anyopaque, out: []u64) usize = null,
         /// A GPU-clock sample ordered after prior commands.
         timestampNs: ?*const fn (ctx: *anyopaque, timeout_us: u64) Error!u64 = null,
+        /// Where the time goes (null: the device cannot say).
+        busy: ?*const fn (ctx: *anyopaque) Busy = null,
     };
+
+    /// The GPU's time on the runs done so far (ns, each run's own stamps;
+    /// a run's may come in a few runs later), and the runs that had to wait
+    /// for room for themselves (every run the device keeps in flight still
+    /// going: the GPU behind the CPU). Both grow from 0.
+    pub fn busy(d: Device) Busy {
+        const f = d.vtable.busy orelse return .{};
+        return f(d.ctx);
+    }
 
     /// A buffer of `bytes`, or error.OutOfMemory.
     pub fn alloc(d: Device, bytes: u64, kind: Kind) Error!Buffer {

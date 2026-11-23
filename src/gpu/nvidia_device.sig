@@ -200,6 +200,8 @@ const Set = struct {
     profiled: bool = false,
     fence: ?nv.Fence = null,
     dispatches: u32 = 0,
+    /// Its last run's GPU time not yet in Adapter.gpu_ns.
+    uncounted: bool = false,
 };
 
 /// What the 3D engine's draws since its last wait for idle write (their
@@ -331,6 +333,11 @@ pub const Adapter = struct {
     refused: ?[]const u8 = null,
     lost: u64 = 0,
     last_error: ?anyerror = null,
+    /// Device.busy: the GPU's time on the runs done (each run's stamps,
+    /// counted when its set is next used), and the runs that waited for
+    /// their set (all SETS in flight: the GPU behind).
+    gpu_ns: u64 = 0,
+    blocked: u64 = 0,
 
     pub fn device(a: *Adapter) gpu.Device {
         return .{ .ctx = a, .vtable = &vtable, .caps = a.caps };
@@ -391,6 +398,7 @@ pub const Adapter = struct {
         .profile = profile,
         .dispatchNs = dispatchNs,
         .timestampNs = timestampNs,
+        .busy = busy,
     };
 
     fn self(ctx: *anyopaque) *Adapter {
@@ -558,8 +566,15 @@ pub const Adapter = struct {
         const s = &a.sets[si];
         // (a set still in flight is waited for first)
         if (s.fence) |f| {
-            a.vram.wait(f, std.math.maxInt(u64)) catch {};
+            a.vram.wait(f, 0) catch {
+                a.blocked += 1;
+                a.vram.wait(f, std.math.maxInt(u64)) catch {};
+            };
             s.fence = null;
+        }
+        if (s.uncounted) {
+            a.gpu_ns += a.setNs(s);
+            s.uncounted = false;
         }
         try a.setUp(s);
         if (a.profiling and s.ends.cpu.len == 0) s.ends = a.rawOf(true).alloc(16 * MAX_DISPATCHES) catch return error.OutOfMemory;
@@ -678,6 +693,7 @@ pub const Adapter = struct {
         const f = host.submit(s.pb, @intCast(p.len)) catch |e| return mapError(e);
         s.fence = f;
         s.dispatches = @intCast(ds.len);
+        s.uncounted = true;
         a.last_set = si;
         a.next_set = (si + 1) % SETS;
         a.runs += 1;
@@ -893,7 +909,16 @@ pub const Adapter = struct {
     fn lastRunNs(ctx: *anyopaque) u64 {
         const a = self(ctx);
         const si = a.last_set orelse return 0;
-        const s = &a.sets[si];
+        return a.setNs(&a.sets[si]);
+    }
+
+    fn busy(ctx: *anyopaque) gpu.Busy {
+        const a = self(ctx);
+        return .{ .gpu_ns = a.gpu_ns, .blocked = a.blocked };
+    }
+
+    /// Set s's last run's GPU time (its two stamps), 0 when unknown.
+    fn setNs(a: *Adapter, s: *Set) u64 {
         const host = a.rawOf(true);
         host.fromDevice(s.stamps, 0, 32);
         const w = s.stamps.cpu;
@@ -2590,6 +2615,52 @@ test "control flow: divergent ifs, loops with brk and cont, nesting, an early re
         k.store(.f32, m, r(ob), r(h));
         try same(caps, &k, .{ 2, 1, 1 }, &.{}, 2 * NT, null);
     }
+}
+
+test "copies dropped where nothing between needs them (kir_sm120.forward), kept where a value they hold is overwritten first: a swap, a snapshot, a copy across a loop" {
+    const caps = caseCaps(false);
+    fillInts(0xc09);
+    var k = newKernel("copies", .{ 64, 1, 1 });
+    const A = k.binding();
+    const Bb = k.binding();
+    _ = k.binding();
+    const O = k.binding();
+    const t = lin(&k);
+    const off = k.op2(.shl, .u32, r(t), u(2));
+    const a = k.reg(.u32);
+    const b = k.reg(.u32);
+    k.set(a, .mov, r(k.load(.u32, kir.global(A, 32), r(off))), no, no);
+    k.set(b, .mov, r(k.load(.u32, kir.global(Bb, 32), r(off))), no, no);
+    // a swap, as DXBC writes `iadd r0.xy, r0.yx, l(1, 2)`: each value
+    // computed before either copy (forwarding the first would clobber a
+    // before the second reads it)
+    const ta = k.op2(.iadd, .u32, r(b), u(1));
+    const tb = k.op2(.iadd, .u32, r(a), u(2));
+    k.set(a, .mov, r(ta), no, no);
+    k.set(b, .mov, r(tb), no, no);
+    // a snapshot of a, then a written, then the snapshot read
+    const snap = k.mov(.u32, r(a));
+    k.set(a, .imul, r(a), u(3), no);
+    const mix = k.op2(.xor, .u32, r(snap), r(a));
+    // a float result copied into a typeless register (forwarded)
+    const fr = k.reg(.u32);
+    k.set(fr, .mov, r(k.op2(.fmul, .f32, r(k.cvt(.u32, .f32, .rne, r(b))), kir.f(0.5))), no, no);
+    // a copy made before a loop and read after it, its source changed in it
+    const before = k.mov(.u32, r(b));
+    const i = k.mov(.u32, u(0));
+    k.loop();
+    {
+        k.set(b, .iadd, r(b), r(i), no);
+        k.set(i, .iadd, r(i), u(1), no);
+        k.brk(r(k.cmp(.u32, .ge, r(i), r(k.op2(.@"and", .u32, r(a), u(7))))));
+    }
+    k.endloop();
+    const ob = k.op2(.shl, .u32, r(t), u(3));
+    k.store(.u32, kir.global(O, 32), r(ob), r(k.op2(.iadd, .u32, r(mix), r(fr))));
+    var m = kir.global(O, 32);
+    m.imm = 4;
+    k.store(.u32, m, r(ob), r(k.op2(.xor, .u32, r(before), r(b))));
+    try same(caps, &k, .{ 2, 1, 1 }, &.{}, 2 * NT, null);
 }
 
 test "ids, parameters and predicates past the six registers" {

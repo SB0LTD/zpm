@@ -533,6 +533,7 @@ fn compileTextOnce(k: *const kir.Kernel, caps: device.Caps, st: anytype, opts: O
     const gen = genOf(caps.target) orelse SM120;
     var c = CtxOf(@TypeOf(st.*)){ .w = st, .caps = caps, .gen = gen, .k = k, .opts = opts };
     try c.expand();
+    c.forward();
     try c.analyze();
     try c.lower();
     c.dce();
@@ -611,6 +612,123 @@ fn CtxOf(comptime St: type) type {
             c.n = x.n;
             c.nv_kir = x.nv;
             c.w.n_kir = @intCast(x.n);
+        }
+
+        /// Copies of a value made only to be copied (`t = op ...; d = mov
+        /// t`, the copy t's one read and t written once): the op writes d
+        /// itself and the copy goes, when no control flow and nothing that
+        /// reads or writes d is between them. DXBC's destination writes are
+        /// such copies (each component computed first, then moved, in case a
+        /// source is the destination): Superposition's largest pixel program
+        /// was 38% MOVs. Registers of a vector (a 64- or 128-bit load's or
+        /// store's, a sample's coordinates and channels) are left as they
+        /// are. (Scratch here, set anew by `analyze`: reads, writes, def_at;
+        /// `uniform` a register of a vector, `folded` a copy dropped.)
+        fn forward(c: *Ctx) void {
+            const w = c.w;
+            const nv = c.nv_kir;
+            const code = w.insts[0..c.n];
+            @memset(w.reads[0..nv], 0);
+            @memset(w.writes[0..nv], 0);
+            @memset(w.def_at[0..nv], std.math.maxInt(u32));
+            @memset(w.uniform[0..nv], false);
+            @memset(w.folded[0..c.n], false);
+            for (code, 0..) |in, idx| {
+                for (readsOf(in)) |a| {
+                    if (a) |v| w.reads[v] +|= 1;
+                }
+                if (vecWidth(in)) |n| {
+                    const base: ?u16 = if (in.op == .st) readsOf(in)[1] else if (in.dst != .none) @intFromEnum(in.dst) else null;
+                    if (base) |b| for (0..n) |j| {
+                        w.uniform[b + j] = true;
+                    };
+                }
+                if (in.op == .tex) if (readsOf(in)[1]) |b| for (0..kir.texCoords(in.aux)) |j| {
+                    w.uniform[b + j] = true;
+                };
+                if (writesDst(in)) {
+                    const d = @intFromEnum(in.dst);
+                    w.writes[d] +|= 1;
+                    w.def_at[d] = @intCast(idx);
+                }
+            }
+            var dropped: usize = 0;
+            for (code, 0..) |in, j| {
+                if (in.op != .mov or in.a != .reg or in.a.reg == .none or in.dst == .none) continue;
+                const t = @intFromEnum(in.a.reg);
+                const d = @intFromEnum(in.dst);
+                if (t == d or w.uniform[t] or w.uniform[d] or w.reads[t] != 1 or w.writes[t] != 1) continue;
+                if (!sameRegs(w.tys[t], w.tys[d])) continue;
+                const i = w.def_at[t];
+                if (i >= j or j - i > 256) continue;
+                if (!writesDst(code[i]) or vecWidth(code[i]) != null) continue;
+                const clear = scan: for (code[i + 1 .. j], i + 1..) |between, x| {
+                    if (w.folded[x]) continue;
+                    switch (between.op) {
+                        .@"if", .@"else", .endif, .loop, .endloop, .brk, .cont, .ret => break :scan false,
+                        else => {},
+                    }
+                    if (writesDst(between) and @intFromEnum(between.dst) == d) break :scan false;
+                    for (readsOf(between)) |a| {
+                        if (a == d) break :scan false;
+                    }
+                } else true;
+                if (!clear) continue;
+                code[i].dst = in.dst;
+                w.def_at[d] = i;
+                w.folded[j] = true;
+                dropped += 1;
+            }
+            // A copy read in its stretch alone (`d = mov s`, d written
+            // once, every read of d after it with no control flow between,
+            // s not written before the last): those reads read s, and the
+            // copy goes (DXBC's sources read from its registers, copied in
+            // case the instruction writes the register it reads).
+            for (code, 0..) |in, j| {
+                if (w.folded[j] or in.op != .mov or in.a != .reg or in.a.reg == .none or in.dst == .none) continue;
+                const s = @intFromEnum(in.a.reg);
+                const d = @intFromEnum(in.dst);
+                if (s == d or w.uniform[s] or w.uniform[d] or w.writes[d] != 1 or w.reads[d] == 0) continue;
+                if (!sameRegs(w.tys[s], w.tys[d])) continue;
+                var found: u32 = 0;
+                const last = scan: for (code[j + 1 ..], j + 1..) |later, x| {
+                    if (found == w.reads[d]) break :scan x;
+                    if (x - j > 256) break :scan null;
+                    if (w.folded[x]) continue;
+                    switch (later.op) {
+                        .@"if", .@"else", .endif, .loop, .endloop, .brk, .cont, .ret => break :scan null,
+                        else => {},
+                    }
+                    for (readsOf(later)) |a| {
+                        if (a != d) continue;
+                        found += 1;
+                        // (a predicate op's type is its operands': kept)
+                        if (later.ty == .pred and w.tys[s] != w.tys[d]) break :scan null;
+                    }
+                    if (found < w.reads[d] and writesDst(later) and @intFromEnum(later.dst) == s) break :scan null;
+                } else if (found == w.reads[d]) code.len else null;
+                const end = last orelse continue;
+                const sv: kir.V = @enumFromInt(s);
+                for (code[j + 1 .. end], j + 1..) |*later, x| {
+                    if (w.folded[x]) continue;
+                    for ([_]*kir.Arg{ &later.a, &later.b, &later.c }) |arg| {
+                        if (arg.* == .reg and arg.reg == in.dst) arg.* = .{ .reg = sv };
+                    }
+                }
+                w.reads[s] = w.reads[s] - 1 + w.reads[d];
+                w.reads[d] = 0;
+                w.folded[j] = true;
+                dropped += 1;
+            }
+            if (dropped == 0) return;
+            var n: usize = 0;
+            for (0..c.n) |x| {
+                if (w.folded[x]) continue;
+                w.insts[n] = w.insts[x];
+                n += 1;
+            }
+            c.n = n;
+            c.w.n_kir = @intCast(n);
         }
 
         // ── 2. Analysis ─────────────────────────────────────────────────────
@@ -2265,7 +2383,8 @@ fn CtxOf(comptime St: type) type {
         /// the destination's run of four (red and green from Rd0, blue and
         /// alpha from Rd1). Level zero of the header: no derivatives, so a
         /// helper lane's sample matters to nothing. A graphics stage's
-        /// alone (a compute launch has no texture pools).
+        /// alone (a compute launch has no texture pools). A fetch
+        /// (Tex.fetch): TLD.B.LZ, the same operands with the integers.
         fn texture(c: *Ctx, in: kir.Inst) Error!void {
             if (c.opts.stage == .compute) return error.Unsupported;
             const t: kir.Tex = @bitCast(in.aux);
@@ -2274,7 +2393,8 @@ fn CtxOf(comptime St: type) type {
             const hb = try c.newRun(if (t.compare) 2 else 1);
             try c.ins("MOV", 1, &.{ R(hb), c.src(in.a) });
             if (t.compare) try c.ins("MOV", 1, &.{ R(hb + 1), c.src(.{ .reg = @enumFromInt(xy + 2) }) });
-            try c.ins(if (t.compare) "TEX.B.LZ.DC" else "TEX.B.LZ", 2, &.{ R(d + 2), R(d), R(xy), R(hb), .{ .sreg = "2D" } });
+            const name = if (t.fetch) "TLD.B.LZ" else if (t.compare) "TEX.B.LZ.DC" else "TEX.B.LZ";
+            try c.ins(name, 2, &.{ R(d + 2), R(d), R(xy), R(hb), .{ .sreg = "2D" } });
         }
 
         fn stageStore(c: *Ctx, in: kir.Inst, m: kir.Mem) Error!void {
@@ -3211,6 +3331,17 @@ fn findRun(u: *const [4]u64, n: u8) ?u8 {
 
 fn paramAt(bindings: u8, word: u32) u32 {
     return 0x380 + 8 * @as(u32, bindings) + 4 * word;
+}
+
+/// Whether a value of type `a` may live in a register of type `b` and
+/// the reverse (a copy between them dropped): the same, or 32 bits each.
+fn sameRegs(a: kir.Ty, b: kir.Ty) bool {
+    const word = struct {
+        fn is(t: kir.Ty) bool {
+            return t == .u32 or t == .i32 or t == .f32;
+        }
+    }.is;
+    return a == b or (word(a) and word(b));
 }
 
 /// The registers an instruction reads (KIR's).

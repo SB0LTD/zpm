@@ -76,11 +76,15 @@ float4 ps_sbuf(VSOut i) : SV_Target
 }
 
 // The RTX's texture unit's forms: a 2D array's comparisons (one at a
-// texel offset), and a mipmapped texture at a level between two.
+// texel offset), a mipmapped texture at a level between two, a texel of
+// its second level fetched (ld, at an offset), and a cube map across a
+// face's edges (its taps fetched through the unit, the filter the
+// program's).
 Texture2DArray<float> shadow : register(t0);
 SamplerComparisonState cmp : register(s0);
 Texture2D mipped : register(t1);
 SamplerState lin : register(s1);
+TextureCube sky : register(t2);
 
 float4 ps_unit(VSOut i) : SV_Target
 {
@@ -88,5 +92,7 @@ float4 ps_unit(VSOut i) : SV_Target
     float s = shadow.SampleCmpLevelZero(cmp, float3(uv, 1), 0.5);
     s += shadow.SampleCmpLevelZero(cmp, float3(uv, 2), 0.5, int2(1, -1));
     float4 m = mipped.SampleLevel(lin, uv, 0.5);
-    return float4(s * 0.5, m.g, m.b, m.a);
+    float4 t = mipped.Load(int3(uv * 4.0, 1), int2(1, 0));
+    float4 c = sky.SampleLevel(lin, float3(1.0, uv.y * 2.4 - 1.2, uv.x * 2.4 - 1.2), 0);
+    return float4(s * 0.5, m.g, m.b * 0.5 + t.r * 0.5, t.g * 0.5 + c.r * 0.25 + c.b * 0.25);
 }

@@ -1369,6 +1369,11 @@ pub const Stats = struct {
     /// inside Device.wait (the CPU waiting for them), by report.nowUs
     run_us: u64 = 0,
     wait_us: u64 = 0,
+    /// of run_us, the runs that waited for room on the device (the GPU
+    /// behind: Device.busy's blocked), and the GPU's own time on the runs
+    /// done (Device.busy's gpu_ns; 0: the device cannot say)
+    run_blocked_us: u64 = 0,
+    gpu_us: u64 = 0,
     /// draws done on the CPU (cpu_ops counts them too)
     cpu_draws: u64 = 0,
     /// draws through the GPU's graphics pipeline (the 3D engine), and
@@ -2213,6 +2218,7 @@ pub const Engine = struct {
         const sum = &e.sums[e.batch % RING];
         sum.* = .{};
         for (e.ops[0..n]) |op| sum.add(op.prog, op.groups, 1);
+        const blocked = d.busy().blocked;
         const t0 = report.nowUs();
         const f = d.run(e.ops[0..n]) catch |err| {
             e.loseGpu(err);
@@ -2222,7 +2228,11 @@ pub const Engine = struct {
             }
             return;
         };
-        e.stats.run_us += report.nowUs() -| t0;
+        const dt = report.nowUs() -| t0;
+        e.stats.run_us += dt;
+        const bz = d.busy();
+        if (bz.blocked != blocked) e.stats.run_blocked_us += dt;
+        e.stats.gpu_us = bz.gpu_ns / 1000;
         e.fences[e.batch % RING] = f;
         e.ran = e.batch;
         e.batch += 1;
@@ -3398,6 +3408,22 @@ pub const Engine = struct {
                 else => .zero,
             };
         };
+        // (every level and layer inside the image's memory: a header has no
+        // bound, and the unit reading past it faults the GPU, where the
+        // program's own reads stop at the descriptor's last word. A view
+        // can name more layers than its image holds: a cube's six of one)
+        const bytes: u64 = if (img.buf.cpu.len != 0) img.buf.cpu.len else img.buf.bytes;
+        for (0..n) |i| {
+            const lv: u32 = @intCast(i / layers);
+            const z: u64 = i % layers;
+            const ls: u64 = img.levelStride(lv);
+            const rows: u64 = @max(img.levelRows(lv), 1);
+            const row_bytes: u64 = if (img.bc != 0) ls else @min(ls, @as(u64, img.levelWidth(lv)) * img.format.bytes());
+            if (img.level_at[lv] + z * ls * rows + (rows - 1) * ls + row_bytes > bytes) {
+                e.tex_why = "a texture's level or layer past its image's memory (the view names more than the image holds)";
+                return null;
+            }
+        }
         for (0..n) |i| {
             const lv: u32 = @intCast(i / layers);
             const z: u64 = i % layers;
