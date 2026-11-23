@@ -266,7 +266,7 @@ const Region = struct {
 
 /// What a compile works in: State for programs up to the limits above
 /// (Galaxy's gfx_render gives 16 MiB: WORK_BYTES fits), LargeState for
-/// larger ones (a Direct3D program's, Unigine's up to about 22,500 KIR
+/// larger ones (a Direct3D program's: Unigine's largest about 37,000 KIR
 /// instructions: LARGE_WORK_BYTES, for callers whose memory is given a
 /// page at a time as it is touched; only what a program needs is).
 pub const Limits = struct {
@@ -277,9 +277,9 @@ pub const Limits = struct {
     /// Machine instructions the assembler takes.
     instrs: usize = sm120_asm.MAX_INSTRS,
 };
-/// Twice the limits (virtual registers stay below NOV; machine
+/// Three times the limits (virtual registers stay below NOV; machine
 /// instructions below label_at's u16).
-pub const LARGE: Limits = .{ .insts = 2 * MAX_INSTS, .vregs = 2 * MAX_VREGS, .mi = 2 * MAX_MI, .text = 2 * TEXT_BYTES, .instrs = 2 * sm120_asm.MAX_INSTRS };
+pub const LARGE: Limits = .{ .insts = 3 * MAX_INSTS, .vregs = 3 * MAX_VREGS, .mi = 3 * MAX_MI, .text = 3 * TEXT_BYTES, .instrs = 3 * sm120_asm.MAX_INSTRS };
 comptime {
     std.debug.assert(LARGE.vregs < NOV and LARGE.mi < 1 << 16);
 }
@@ -592,7 +592,7 @@ fn CtxOf(comptime St: type) type {
             if (k.err) |e| return e;
             if (k.n > c.w.insts.len or k.nv > c.w.tys.len) {
                 noteSize(k);
-                return tooBig(if (c.w.insts.len > MAX_INSTS) "more than LARGE's instructions or values (twice MAX_INSTS, MAX_VREGS)" else "more than MAX_INSTS instructions or MAX_VREGS values (and no work memory for LargeState)");
+                return tooBig(if (c.w.insts.len > MAX_INSTS) "more than LARGE's instructions or values (three times MAX_INSTS, MAX_VREGS)" else "more than MAX_INSTS instructions or MAX_VREGS values (and no work memory for LargeState)");
             }
             var x = kir.Kernel.init(.{ .insts = &c.w.insts, .tys = &c.w.tys }, k.name, k.group);
             x.shared_bytes = k.shared_bytes;

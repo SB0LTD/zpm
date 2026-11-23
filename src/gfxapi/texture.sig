@@ -640,8 +640,11 @@ pub fn sampleArray(k: *kir.Kernel, slot: Slot, s: Arg, t: Arg, layer: ?Arg, kind
     k.set(wgt, .sel, r(k.op2(.fsub, .f32, f(1), r(frac))), f(1), r(tri));
     const second = k.reg(.pred);
     k.set(second, .mov, u(0), no, no);
+    // (a comparison's result is its first channel alone: the others are
+    // never carried, 0, 0, 1)
+    const nch: usize = if (slot.shadow != null) 1 else 4;
     var outv: [4]V = undefined;
-    for (&outv) |*o| {
+    for (outv[0..nch]) |*o| {
         o.* = k.reg(.f32);
         k.set(o.*, .mov, f(0), no, no);
     }
@@ -649,13 +652,18 @@ pub fn sampleArray(k: *kir.Kernel, slot: Slot, s: Arg, t: Arg, layer: ?Arg, kind
     {
         const cv = sampleLayerLevel(k, slot, d, lvl, slice, s, t, linear, kind, off);
         // (one level: the read itself, not a blend: inf and NaN survive)
-        for (outv, 0..) |o, c| k.set(o, .sel, r(k.op2(.fadd, .f32, r(o), r(k.op2(.fmul, .f32, cv[c], r(wgt))))), cv[c], r(tri));
+        for (outv[0..nch], 0..) |o, c| k.set(o, .sel, r(k.op2(.fadd, .f32, r(o), r(k.op2(.fmul, .f32, cv[c], r(wgt))))), cv[c], r(tri));
         k.brk(r(k.op2(.por, .pred, r(k.op1(.pnot, .pred, r(tri))), r(second))));
         k.set(second, .mov, u(1), no, no);
         k.set(lvl, .mov, r(d2), no, no);
         k.set(wgt, .mov, r(frac), no, no);
     }
     k.endloop();
+    if (slot.shadow != null) {
+        // (an unbound texture's comparison: 0)
+        const valid = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(d.fmt), u(F_VALID))), u(0));
+        return .{ r(k.sel(.f32, r(valid), r(outv[0]), f(0))), f(0), f(0), f(1) };
+    }
     var out: [4]Arg = undefined;
     for (outv, 0..) |o, c| out[c] = r(o);
     return finish(k, d, out, kind);
@@ -809,6 +817,7 @@ fn sampleLevel(k: *kir.Kernel, slot: Slot, d: D, lv: Lvl, s: Arg, t: Arg, linear
             return r(kk.cvt(.f32, .u32, .rz, r(v)));
         }
     }.i;
+    if (kind == .float and cube_face == null) return bilinear(k, slot, d, lv, .{ x0, y0 }, .{ fx, fy }, .{ wf, hf }, .{ ws, wt }, linear);
     const xa = idx(k, wrap(k, x0, wf, ws));
     const ya = idx(k, wrap(k, y0, hf, wt));
     const t00 = if (cube_face) |face| cubeTap(k, slot, d, lv, face, x0, y0, linear, kind) else filteredTexel(k, slot, d, lv, xa, ya, kind, kind != .float);
@@ -818,77 +827,76 @@ fn sampleLevel(k: *kir.Kernel, slot: Slot, d: D, lv: Lvl, s: Arg, t: Arg, linear
         const out_y = outside(k, y0, hf, wt);
         return withBorder(k, t00, borderColor(k, slot), k.op2(.por, .pred, r(out_x), r(out_y)), kind);
     }
+    // (a float cube's level: its four taps through the faces, cubeTap's)
+    const face = cube_face.?;
     const x1 = k.op2(.fadd, .f32, r(x0), f(1));
     const y1 = k.op2(.fadd, .f32, r(y0), f(1));
-    const xb = idx(k, wrap(k, x1, wf, ws));
-    const yb = idx(k, wrap(k, y1, hf, wt));
-    var t10 = if (cube_face) |face| cubeTap(k, slot, d, lv, face, x1, y0, linear, kind) else filteredTexel(k, slot, d, lv, xb, ya, kind, false);
-    var t01 = if (cube_face) |face| cubeTap(k, slot, d, lv, face, x0, y1, linear, kind) else filteredTexel(k, slot, d, lv, xa, yb, kind, false);
-    var t11 = if (cube_face) |face| cubeTap(k, slot, d, lv, face, x1, y1, linear, kind) else filteredTexel(k, slot, d, lv, xb, yb, kind, false);
-    var t00m = t00;
-    if (cube_face == null and slot.shadow == null) {
-        // (a block-compressed image: the four taps decoded in one loop, one
-        // decoder's code in the program, not four: Unigine's shaders, a
-        // decoder a tap, passed the GPU compiler's size)
-        var taps: [4][4]V = undefined;
-        const from = [4][4]Arg{ t00, t10, t01, t11 };
-        for (&taps, from) |*tp, src| for (tp, src) |*g, v| {
-            g.* = k.reg(.f32);
-            k.set(g.*, .mov, v, no, no);
-        };
-        const bck = k.op3(.bfe, .u32, r(d.fmt), u(F_BC_SHIFT), u(3));
-        const srgb = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(d.fmt), u(F_SRGB))), u(0));
-        k.ifp(r(k.cmp(.u32, .ne, r(bck), u(0))));
-        {
-            const n = k.reg(.u32);
-            k.set(n, .mov, u(0), no, no);
-            k.loop();
-            {
-                const tx_ = k.sel(.u32, r(k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(n), u(1))), u(0))), xb, xa);
-                const ty_n = k.sel(.u32, r(k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(n), u(2))), u(0))), yb, ya);
-                const v = bcTexel(k, slot.b, d, lv, r(tx_), r(ty_n), bck, srgb);
-                for (taps, 0..) |tp, ti| {
-                    const here = k.cmp(.u32, .eq, r(n), u(@intCast(ti)));
-                    for (tp, v) |g, val| k.set(g, .sel, r(val), r(g), r(here));
-                }
-                k.set(n, .iadd, r(n), u(1), no);
-                k.brk(r(k.cmp(.u32, .ge, r(n), u(4))));
-            }
-            k.endloop();
-        }
-        k.endif();
-        for (&t00m, taps[0]) |*o, g| o.* = r(g);
-        for (&t10, taps[1]) |*o, g| o.* = r(g);
-        for (&t01, taps[2]) |*o, g| o.* = r(g);
-        for (&t11, taps[3]) |*o, g| o.* = r(g);
-    }
-    var t00b = t00m;
-    var t10b = t10;
-    var t01b = t01;
-    if (cube_face == null) {
-        // CLAMP_TO_BORDER: a tap outside the level on such an axis reads the
-        // border color
-        const out_x0 = outside(k, x0, wf, ws);
-        const out_x1 = outside(k, x1, wf, ws);
-        const out_y0 = outside(k, y0, hf, wt);
-        const out_y1 = outside(k, y1, hf, wt);
-        const bc = borderColor(k, slot);
-        t00b = withBorder(k, t00m, bc, k.op2(.por, .pred, r(out_x0), r(out_y0)), kind);
-        t10b = withBorder(k, t10, bc, k.op2(.por, .pred, r(out_x1), r(out_y0)), kind);
-        t01b = withBorder(k, t01, bc, k.op2(.por, .pred, r(out_x0), r(out_y1)), kind);
-        t11 = withBorder(k, t11, bc, k.op2(.por, .pred, r(out_x1), r(out_y1)), kind);
-    }
+    const t10 = cubeTap(k, slot, d, lv, face, x1, y0, linear, kind);
+    const t01 = cubeTap(k, slot, d, lv, face, x0, y1, linear, kind);
+    const t11 = cubeTap(k, slot, d, lv, face, x1, y1, linear, kind);
     const gx = k.op2(.fsub, .f32, f(1), r(fx));
     const gy = k.op2(.fsub, .f32, f(1), r(fy));
     var out: [4]Arg = undefined;
     for (&out, 0..) |*o, c| {
-        const top = k.op2(.fadd, .f32, r(k.op2(.fmul, .f32, t00b[c], r(gx))), r(k.op2(.fmul, .f32, t10b[c], r(fx))));
-        const bot = k.op2(.fadd, .f32, r(k.op2(.fmul, .f32, t01b[c], r(gx))), r(k.op2(.fmul, .f32, t11[c], r(fx))));
+        const top = k.op2(.fadd, .f32, r(k.op2(.fmul, .f32, t00[c], r(gx))), r(k.op2(.fmul, .f32, t10[c], r(fx))));
+        const bot = k.op2(.fadd, .f32, r(k.op2(.fmul, .f32, t01[c], r(gx))), r(k.op2(.fmul, .f32, t11[c], r(fx))));
         const lerped = k.op2(.fadd, .f32, r(k.op2(.fmul, .f32, r(top), r(gy))), r(k.op2(.fmul, .f32, r(bot), r(fy))));
         // (nearest: the texel itself, not a blend with weight 0: inf and NaN survive)
-        o.* = r(k.sel(.f32, r(linear), r(lerped), t00b[c]));
+        o.* = r(k.sel(.f32, r(linear), r(lerped), t00[c]));
     }
     return out;
+}
+
+/// A float image's level, not a cube's, nearest or bilinear: its four taps
+/// (x0 + i, y0 + j) read in one loop's passes (the first alone when
+/// nearest), so a program has one texel's read and decoder a sample, not
+/// four (Unigine's shaders, forty samples and more, passed the GPU
+/// compiler's size with four). Each tap wrapped, the border color where
+/// CLAMP_TO_BORDER leaves the level; blended by the fractions `fr`.
+fn bilinear(k: *kir.Kernel, slot: Slot, d: D, lv: Lvl, xy0: [2]V, fr: [2]V, dims: [2]V, modes: [2]V, linear: V) [4]Arg {
+    // (a comparison's result is its first channel alone)
+    const nch: usize = if (slot.shadow != null) 1 else 4;
+    var taps: [4][4]V = undefined;
+    for (&taps) |*tp| for (tp[0..nch]) |*g| {
+        g.* = k.reg(.f32);
+        k.set(g.*, .mov, f(0), no, no);
+    };
+    const bc = borderColor(k, slot);
+    const n = k.reg(.u32);
+    k.set(n, .mov, u(0), no, no);
+    k.loop();
+    {
+        var at: [2]Arg = undefined;
+        var out: [2]V = undefined;
+        for (&at, &out, 0..) |*a, *o, axis| {
+            const step = k.op3(.bfe, .u32, r(n), u(@intCast(axis)), u(1));
+            const c = k.op2(.fadd, .f32, r(xy0[axis]), r(k.cvt(.u32, .f32, .rne, r(step))));
+            a.* = r(k.cvt(.f32, .u32, .rz, r(wrap(k, c, dims[axis], modes[axis]))));
+            o.* = outside(k, c, dims[axis], modes[axis]);
+        }
+        const texel_ = filteredTexel(k, slot, d, lv, at[0], at[1], .float, true);
+        const border = k.op2(.por, .pred, r(out[0]), r(out[1]));
+        var tap: [4]Arg = undefined;
+        for (tap[0..nch], 0..) |*v, c| v.* = r(k.sel(.f32, r(border), r(k.mov(.f32, r(bc[c]))), texel_[c]));
+        for (taps, 0..) |tp, ti| {
+            const here = k.cmp(.u32, .eq, r(n), u(@intCast(ti)));
+            for (tp[0..nch], tap[0..nch]) |g, v| k.set(g, .sel, v, r(g), r(here));
+        }
+        k.set(n, .iadd, r(n), u(1), no);
+        k.brk(r(k.op2(.por, .pred, r(k.cmp(.u32, .ge, r(n), u(4))), r(k.op1(.pnot, .pred, r(linear))))));
+    }
+    k.endloop();
+    const gx = k.op2(.fsub, .f32, f(1), r(fr[0]));
+    const gy = k.op2(.fsub, .f32, f(1), r(fr[1]));
+    var res: [4]Arg = .{ f(0), f(0), f(0), f(1) };
+    for (res[0..nch], 0..) |*o, c| {
+        const top = k.op2(.fadd, .f32, r(k.op2(.fmul, .f32, r(taps[0][c]), r(gx))), r(k.op2(.fmul, .f32, r(taps[1][c]), r(fr[0]))));
+        const bot = k.op2(.fadd, .f32, r(k.op2(.fmul, .f32, r(taps[2][c]), r(gx))), r(k.op2(.fmul, .f32, r(taps[3][c]), r(fr[0]))));
+        const lerped = k.op2(.fadd, .f32, r(k.op2(.fmul, .f32, r(top), r(gy))), r(k.op2(.fmul, .f32, r(bot), r(fr[1]))));
+        // (nearest: the texel itself, not a blend with weight 0: inf and NaN survive)
+        o.* = r(k.sel(.f32, r(linear), r(lerped), r(taps[0][c])));
+    }
+    return res;
 }
 
 /// Whether an integer-valued float coordinate is outside [0, n) on an axis
@@ -1077,6 +1085,21 @@ test "texture: a descriptor's words" {
     try std.testing.expectEqual(@as(u32, 15), w[D_LAST]);
     descriptor(.{}, &w);
     try std.testing.expectEqual(@as(u32, 0), w[D_FMT]);
+}
+
+test "texture: a sample is one tap's read and decoder in KIR, not four (a program of forty samples fits the GPU compiler)" {
+    const S = struct {
+        var insts: [4096]kir.Inst = undefined;
+        var tys: [4096]kir.Ty = undefined;
+    };
+    var k = kir.Kernel.init(.{ .insts = &S.insts, .tys = &S.tys }, "k", .{ 1, 1, 1 });
+    const s = k.reg(.f32);
+    const t = k.reg(.f32);
+    const n0 = k.n;
+    _ = sample(&k, .{ .b = 2, .uni = 1, .word = 0 }, r(s), r(t), .float, .{ 0, 0 }, .{ .grad = .{ .dsdx = f(0.01), .dtdx = f(0), .dsdy = f(0), .dtdy = f(0.01), .bias = f(0) } });
+    try std.testing.expect(k.err == null);
+    // (four taps' decoders inline were 1387; one in a loop about 815)
+    try std.testing.expect(k.n - n0 < 900);
 }
 
 test "texture: block-compressed texels read as bc.sig decodes them (every kind, three levels)" {
