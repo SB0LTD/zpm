@@ -688,6 +688,14 @@ fn inference() !void {
     try sync(&s, &db);
     try tags(try query(&s, &db, "SELECT body FROM t ORDER BY id"), "TDDCZ");
     try check(equal(s.result.rows[0].cells[0].text.slice(), "456") and equal(s.result.rows[1].cells[0].text.slice(), "999"));
+    _ = try query(&s, &db, "CREATE SCHEMA \"Archive Names\"");
+    _ = try query(&s, &db, "CREATE TABLE \"Archive Names\".\"Records\" (id INTEGER PRIMARY KEY, \"short\"\"note\" TEXT)");
+    try tags(try parse(&s, &db, "scoped", "INSERT INTO \"Archive Names\".\"Records\" VALUES ($1,$2)", &.{}), "1");
+    try tags(try bind(&s, &db, "", "scoped", &.{ "1", "archived" }, 0, 0), "2");
+    try tags(try execute(&s, &db, "", 0), "C");
+    try sync(&s, &db);
+    try tags(try query(&s, &db, "SELECT \"short\"\"note\" FROM \"Archive Names\".\"Records\""), "TDCZ");
+    try check(equal(s.result.rows[0].cells[0].text.slice(), "archived"));
 }
 /// The unnamed portal's SQL after Bind: the statement with parameters spliced.
 fn portalText(s: *Session) ![]const u8 {
