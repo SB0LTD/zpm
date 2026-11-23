@@ -142,9 +142,11 @@ pub const RwLock=struct {
     }
     pub fn unlockRead(self:*RwLock) void {
         if(builtin.os.tag==.windows) {Win.RtlReleaseSRWLockShared(&self.native);return;}
-        const previous=self.state.fetchSub(1,.release);
+        const previous=self.state.fetchSub(1,.seq_cst);
         if(previous==0 or previous>=exclusive) @panic("invalid shared lock ownership");
-        if(previous==1) self.signal.notify();
+        // With sequentially consistent intent and state operations, either this
+        // sees an announced writer or that writer checks state after the release.
+        if(previous==1 and self.writers.load(.seq_cst)!=0) self.signal.notify();
     }
     pub fn tryLockWrite(self:*RwLock) bool {
         if(builtin.os.tag==.windows) return Win.RtlTryAcquireSRWLockExclusive(&self.native)!=0;
@@ -153,10 +155,10 @@ pub const RwLock=struct {
     }
     pub fn lockWrite(self:*RwLock) void {
         if(builtin.os.tag==.windows) {Win.RtlAcquireSRWLockExclusive(&self.native);return;}
-        if(self.writers.fetchAdd(1,.acq_rel)==std.math.maxInt(u32)) @panic("writer count overflow");
+        if(self.writers.fetchAdd(1,.seq_cst)==std.math.maxInt(u32)) @panic("writer count overflow");
         while(true) {
             const epoch=self.signal.epoch.load(.acquire);
-            if(self.state.cmpxchgStrong(0,exclusive,.acquire,.monotonic)==null) {
+            if(self.state.cmpxchgStrong(0,exclusive,.seq_cst,.seq_cst)==null) {
                 _=self.writers.fetchSub(1,.release);return;
             }
             self.signal.wait(epoch,100);
