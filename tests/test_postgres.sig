@@ -1526,12 +1526,48 @@ fn detachedPrimaryKeys() !void {
     db.running_statement = false;
     try check(s.result.row_count == 1 and s.result.rows[0].cells[0].integer == 7);
 
+    try tags(store_output[0..(try storeSend(&s, &db, &sync_packet)).written], "Z");
+    var fused_bind = Packet.init('B');
+    fused_bind.string("");
+    fused_bind.string("");
+    fused_bind.number16(1);
+    fused_bind.number16(1);
+    fused_bind.number16(1);
+    fused_bind.number32(8);
+    fused_bind.append("\xff\xff\xff\xff\xff\xff\xff\xf7");
+    fused_bind.number16(1);
+    fused_bind.number16(1);
+    var fused_execute = Packet.init('E');
+    fused_execute.string("");
+    fused_execute.number32(0);
+    var exchange_bytes: [128]u8 = undefined;
+    var request_len: usize = 0;
+    for ([_][]const u8{ fused_bind.slice(), fused_execute.slice(), sync_packet.slice() }) |item| {
+        @memcpy(exchange_bytes[request_len..][0..item.len], item);
+        request_len += item.len;
+    }
+    const request = exchange_bytes[0..request_len];
+    try check(s.detachedKeyExchange(request[0 .. request.len - 1]) == null);
+    const exchange = s.detachedKeyExchange(request) orelse return error.MissingPrimaryKeyExchange;
+    db.read_context = &context;
+    db.running_statement = true;
+    const fused = (try s.handleDetachedKeyExchange(&db, exchange, &store_output)) orelse return error.MissedRetainedKeyExchange;
+    db.read_context = null;
+    db.running_statement = false;
+    try check(fused.consumed == request.len and context.primary_key_cache_hits == 2);
+    try tags(store_output[0..fused.written], "2DCZ");
+    var fused_frames: Frames = .{ .bytes = store_output[0..fused.written] };
+    _ = try fused_frames.next();
+    const fused_row = (try fused_frames.next()).?;
+    try check(equal(fused_row.body[6..14], "\xff\xff\xff\xff\xff\xff\xff\xf7"));
+
     _ = try storeQuery(&s, &db, "UPDATE pk SET id=8 WHERE id=7");
     const after: Raw.Snapshot = .{.csn=store.database.csn};
     const old_key: Raw.Cell = .{.integer=7};
+    try check(!try context.runCachedPrimaryKey(&store.database, template, after, .integer, &old_key, &s.result));
     try check(!try context.runPrimaryKey(&store.database, after, &old_key, &s.result));
     try check(try context.preparePrimaryKey(&store.database, template, after, .integer));
-    try check(context.primary_key_cache_hits == 1);
+    try check(context.primary_key_cache_hits == 2);
     try check(try context.runPrimaryKey(&store.database, after, &old_key, &s.result));
     try check(s.result.row_count == 0);
 }
