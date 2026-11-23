@@ -351,6 +351,8 @@ pub fn Binder(comptime config: types.Config) type {
             planning_plan:?*const Plan=null,
             constant_dependencies:?*[config.ctes]bool=null,
             describe_only:bool=false,
+            // A definition without data may refer to an unpopulated relation.
+            require_populated: bool = true,
             /// Binding a data-modifying WITH entry (B11): plans of the
             /// enclosing statement stay in place.
             nested_dml: bool = false,
@@ -4473,7 +4475,7 @@ pub fn Binder(comptime config: types.Config) type {
                 'r', 'm', 'p' => {},
                 else => return error.UnsupportedStatement,
             }
-            if (!context.tables[index].populated) return error.ObjectNotInPrerequisiteState;
+            if (context.require_populated and !context.tables[index].populated) return error.ObjectNotInPrerequisiteState;
             return index;
         }
 
@@ -8972,7 +8974,9 @@ pub fn Binder(comptime config: types.Config) type {
             }
             const plans = context.plans orelse return error.UnsupportedStatement;
             plans.reset();
-            const root = try bindPlan(context, create.query, null, null, false);
+            var definition = context.*;
+            definition.require_populated = create.materialized and create.with_data;
+            const root = try bindPlan(&definition, create.query, null, null, false);
             try resolveUnknown(context, root);
             const plan = &plans.items[root];
             if (create.column_count > plan.count) return error.Syntax;
@@ -9040,7 +9044,9 @@ pub fn Binder(comptime config: types.Config) type {
             if (refresh.query == none) return error.TableNotFound;
             const plans = context.plans orelse return error.UnsupportedStatement;
             plans.reset();
-            const root = try bindPlan(context, refresh.query, null, null, false);
+            var definition = context.*;
+            definition.require_populated = refresh.with_data;
+            const root = try bindPlan(&definition, refresh.query, null, null, false);
             try resolveUnknown(context, root);
             const plan = &plans.items[root];
             if (plan.count != entry.column_count) return error.InvalidObjectDefinition;
@@ -9056,7 +9062,9 @@ pub fn Binder(comptime config: types.Config) type {
             if (create.partition_of != null or create.inherits != null or create.partition_by != .none) return error.Syntax;
             const plans = context.plans orelse return error.UnsupportedStatement;
             plans.reset();
-            const root = try bindPlan(context, create.as_query, null, null, false);
+            var definition = context.*;
+            definition.require_populated = create.with_data;
+            const root = try bindPlan(&definition, create.as_query, null, null, false);
             try resolveUnknown(context, root);
             const plan = &plans.items[root];
             if (create.as_column_count > plan.count) return error.Syntax;
