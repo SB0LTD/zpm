@@ -2173,7 +2173,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             }
         }
 
-        fn dataCell(self: *const Self, w: *Writer, cell: *const @TypeOf(@as(DB.Result, undefined).rows[0].cells[0]), data_type: @TypeOf(@as(DB.Result, undefined).column_types[0]), session: *const T.Session, binary: bool, nominal_column: ?usize) !void {
+        fn dataCell(self: *const Self, w: *Writer, cell: anytype, data_type: @TypeOf(@as(DB.Result, undefined).column_types[0]), session: *const T.Session, binary: bool, nominal_column: ?usize) !void {
             if (cell.* == .null_value) return w.u32be(0xffffffff);
             const length = w.at;
             try w.u32be(0);
