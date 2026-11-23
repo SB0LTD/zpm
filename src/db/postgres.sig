@@ -540,6 +540,11 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             return self.startup and !self.failed and !self.continuingSimpleQuery() and self.copy.mode==.none and self.active_portal==null and
                 self.oversize_remaining==0 and (self.authentication==null or self.authentication.?.state==.complete);
         }
+
+        pub fn idleCommandBoundary(self: *const Self) bool {
+            return self.waiting_for_command and self.detachedReady();
+        }
+
         pub fn detachedCandidate(self:*Self,input:[]const u8) ?DetachedCandidate {
             if(!self.detachedReady()) return null;
             return self.detachedFrame(input) catch null;
@@ -556,7 +561,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
         /// A miss leaves the ordinary decoder in charge of all three frames.
         pub fn detachedKeyExchange(self: *Self, input: []const u8) ?DetachedKeyExchange {
             if (comptime !has_cached_primary_key) return null;
-            if (!self.waiting_for_command or !self.detachedReady() or input.len < 5 or input[0] != 'B') return null;
+            if (!self.idleCommandBoundary() or input.len < 5 or input[0] != 'B') return null;
             if (comptime has_admission) if (self.admission.rejected) return null;
             const size = read32(input[1..5]);
             if (size < 4 or size > max_packet) return null;

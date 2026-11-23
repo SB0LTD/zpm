@@ -161,7 +161,7 @@ pub fn recv(fd: Socket, buf: []u8) Error!?usize {
             if (code == 10004) continue;
             return error.ReceiveFailed;
         } else if (builtin.os.tag == .linux) {
-            const rc = linux.recvfrom(fd, buf.ptr, buf.len, 0, null, null);
+            const rc = linux.recvfrom(fd, buf.ptr, buf.len, linux.MSG.DONTWAIT, null, null);
             switch (linux.errno(rc)) {
                 .SUCCESS => return rc,
                 .AGAIN => return null,
@@ -194,7 +194,7 @@ pub fn send(fd: Socket, buf: []const u8) Error!?usize {
             if (code == 10004) continue;
             return error.SendFailed;
         } else if (builtin.os.tag == .linux) {
-            const rc = linux.sendto(fd, buf.ptr, buf.len, linux.MSG.NOSIGNAL, null, 0);
+            const rc = linux.sendto(fd, buf.ptr, buf.len, linux.MSG.NOSIGNAL | linux.MSG.DONTWAIT, null, 0);
             switch (linux.errno(rc)) {
                 .SUCCESS => return rc,
                 .AGAIN => return null,
@@ -211,6 +211,40 @@ pub fn send(fd: Socket, buf: []const u8) Error!?usize {
             }
         } else return error.UnsupportedPlatform;
     }
+}
+
+pub const timed_receive_available = builtin.os.tag == .linux and @sizeOf(usize) == 8;
+
+/// Enable bounded blocking receive on an exclusively owned Linux socket.
+/// Ordinary recv and send remain nonblocking even on this descriptor.
+pub fn enableTimedReceive(fd: Socket, timeout_ms: u32) Error!void {
+    if (comptime !timed_receive_available) return error.UnsupportedPlatform;
+    if (timeout_ms == 0) return error.ConfigureFailed;
+    const flags = linux.fcntl(fd, linux.F.GETFL, 0);
+    if (linux.errno(flags) != .SUCCESS) return error.ConfigureFailed;
+    const nonblock: u32 = @bitCast(@as(linux.O, .{ .NONBLOCK = true }));
+    if (flags & nonblock == 0) return error.ConfigureFailed;
+    const timeout: linux.timeval = .{
+        .sec = @intCast(timeout_ms / 1000),
+        .usec = @as(i64, timeout_ms % 1000) * 1000,
+    };
+    if (linux.errno(linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.RCVTIMEO,
+        @ptrCast(&timeout), @sizeOf(linux.timeval))) != .SUCCESS) return error.ConfigureFailed;
+    if (linux.errno(linux.fcntl(fd, linux.F.SETFL, flags & ~@as(usize, nonblock))) != .SUCCESS)
+        return error.ConfigureFailed;
+}
+
+/// Only for a descriptor configured by enableTimedReceive. A timeout or
+/// interrupt returns control to the reactor without restarting the wait.
+pub fn recvTimed(fd: Socket, buf: []u8) Error!?usize {
+    if (comptime !timed_receive_available) return error.UnsupportedPlatform;
+    if (buf.len == 0) return 0;
+    const received = linux.recvfrom(fd, buf.ptr, buf.len, 0, null, null);
+    return switch (linux.errno(received)) {
+        .SUCCESS => received,
+        .AGAIN, .INTR => null,
+        else => error.ReceiveFailed,
+    };
 }
 
 pub fn close(fd: Socket) void {
