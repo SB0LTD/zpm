@@ -656,19 +656,19 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
         /// with the caller's existing read ownership. Failed or incomplete
         /// Execute retains the ordinary frame-by-frame recovery path.
         pub fn handleDetachedExecuteSync(self: *Self, db: *DB, input: []const u8, output: []u8) error{BufferTooSmall}!Reply {
-            const execute = try self.handle(db, input, output);
-            if (input.len == 0 or input[0] != 'E' or execute.consumed == 0 or
-                execute.close or execute.blocked or execute.cancel != null or !self.detachedReady()) return execute;
-            const next = input[execute.consumed..];
-            if (next.len < 5 or next[0] != 'S' or read32(next[1..5]) != 4) return execute;
+            const execute_reply = try self.handle(db, input, output);
+            if (input.len == 0 or input[0] != 'E' or execute_reply.consumed == 0 or
+                execute_reply.close or execute_reply.blocked or execute_reply.cancel != null or !self.detachedReady()) return execute_reply;
+            const next = input[execute_reply.consumed..];
+            if (next.len < 5 or next[0] != 'S' or read32(next[1..5]) != 4) return execute_reply;
             // Execute has updated state by this point. If the caller's output
             // cannot hold another handler invocation, keep its completed reply.
-            const remaining = output[execute.written..];
-            if (remaining.len < try self.requiredCapacity()) return execute;
+            const remaining = output[execute_reply.written..];
+            if (remaining.len < try self.requiredCapacity()) return execute_reply;
             const sync = try self.dispatchFrame(db, 'S', next[5..5], remaining, 5);
             return .{
-                .consumed = execute.consumed + sync.consumed,
-                .written = execute.written + sync.written,
+                .consumed = execute_reply.consumed + sync.consumed,
+                .written = execute_reply.written + sync.written,
                 .close = sync.close,
                 .blocked = sync.blocked,
                 .cancel = sync.cancel,
