@@ -3696,7 +3696,7 @@ pub fn Database(comptime config: Config) type {
             if (self.catalog_objects.superuser(role, snap)) return true;
             const key: O.Object = .{ .kind = .member, .target = group, .grantee = role };
             const index = self.catalog_objects.findKey(&key, snap) orelse return false;
-            return self.catalog_objects.items[index].grant_flags & 1 != 0;
+            return self.catalog_objects.items[index].grant_flags & CO.member_admin != 0;
         }
 
         fn objectPark(self: *Self, slot: u16, other: u16) Error {
@@ -4139,15 +4139,19 @@ pub fn Database(comptime config: Config) type {
             const index = try self.objectInsert(slot, &role, true, snap);
             const oid = self.catalog_objects.items[index].oid;
             for (groups[0..spec.in_count]) |group| {
-                var member: O.Object = .{ .kind = .member, .target = group, .grantee = oid, .owner = if (superuser) CO.bootstrap_role else self.session.role };
+                var member: O.Object = .{ .kind = .member, .target = group, .grantee = oid, .flags = CO.membershipFlags(flags & CO.role_inherit != 0, true), .owner = if (superuser) CO.bootstrap_role else self.session.role };
                 _ = try self.objectInsert(slot, &member, true, snap);
             }
         }
 
         fn alterRole(self: *Self, slot: u16, source: []const u8, spec: *const CO.RoleSpec, snap: Snapshot) Error!void {
             const oid = self.catalog_objects.roleByName(objectName(source, spec.name).slice(), snap) orelse return error.UndefinedObject;
-            // The bootstrap superuser is built in.
-            if (oid == CO.bootstrap_role) return error.UnsupportedStatement;
+            if (oid == CO.bootstrap_role) {
+                // A stock archive restates the built-in role's attributes.
+                if (!self.privilegedRole(snap)) return error.InsufficientPrivilege;
+                if (spec.rename or spec.clear != 0 or (spec.connlimit_set and spec.connlimit != -1)) return error.UnsupportedStatement;
+                return;
+            }
             const index = self.catalog_objects.byOid(.role, oid, snap) orelse return error.UndefinedObject;
             const current = &self.catalog_objects.items[index];
             const actor = self.actorFlags(snap);
@@ -4267,6 +4271,10 @@ pub fn Database(comptime config: Config) type {
         fn grantMembership(self: *Self, slot: u16, source: []const u8, grant: *const CO.Grant, revoke: bool, snap: Snapshot) Error!void {
             const actor = self.session.role;
             const superuser = self.privilegedRole(snap);
+            const owner = if (superuser) CO.bootstrap_role else actor;
+            if (grant.grantor) |grantor| {
+                if (try self.objectRole(source, grantor, snap) != owner) return error.UnsupportedStatement;
+            }
             var groups: [CO.list_capacity]u32 = undefined;
             var members: [CO.list_capacity]u32 = undefined;
             for (grant.granted[0..grant.granted_count], 0..) |ident, index| {
@@ -4284,6 +4292,11 @@ pub fn Database(comptime config: Config) type {
                     if (!revoke and (group == member or self.catalog_objects.memberOf(group, member, false, snap))) return error.InvalidGrantOperation;
                     const key: O.Object = .{ .kind = .member, .target = group, .grantee = member };
                     if (self.catalog_objects.pendingConflict(&key, snap)) |other| return self.objectPark(slot, other);
+                    if (grant.grantor != null) {
+                        if (self.catalog_objects.findKey(&key, snap)) |index| {
+                            if (self.catalog_objects.items[index].owner != owner) return error.UnsupportedStatement;
+                        }
+                    }
                     writes += 2;
                 }
             }
@@ -4306,14 +4319,22 @@ pub fn Database(comptime config: Config) type {
                     continue;
                 }
                 if (existing) |index| {
-                    if (!grant.option or self.catalog_objects.items[index].grant_flags & 1 != 0) continue;
                     var next = self.catalog_objects.items[index];
-                    next.grant_flags = 1;
+                    if (grant.admin) |admin| next.grant_flags = if (admin) CO.member_admin else 0;
+                    if (grant.inherit != null or grant.set != null) {
+                        next.flags = CO.membershipFlags(grant.inherit orelse self.catalog_objects.membershipInherits(&next, snap),
+                            grant.set orelse O.membershipCanSet(&next));
+                    }
+                    const current = &self.catalog_objects.items[index];
+                    if (next.grant_flags == current.grant_flags and next.flags == current.flags) continue;
                     self.objectDelete(slot, index, snap);
                     _ = try self.objectInsert(slot, &next, false, snap);
                     continue;
                 }
-                var member_object: O.Object = .{ .kind = .member, .target = group, .grantee = member, .grant_flags = @intFromBool(grant.option), .owner = if (superuser) CO.bootstrap_role else actor };
+                const inherits = (self.catalog_objects.roleFlags(member, snap) orelse 0) & CO.role_inherit != 0;
+                var member_object: O.Object = .{ .kind = .member, .target = group, .grantee = member,
+                    .flags = CO.membershipFlags(grant.inherit orelse inherits, grant.set orelse true),
+                    .grant_flags = if (grant.admin orelse false) CO.member_admin else 0, .owner = owner };
                 _ = try self.objectInsert(slot, &member_object, true, snap);
             }
         }
@@ -5294,7 +5315,8 @@ pub fn Database(comptime config: Config) type {
                     for (&self.catalog_objects.items) |*o| if (o.kind == .role and O.visible(o, snapshot)) try self.roleRow(view, o, sink);
                 },
                 .pg_auth_members => for (&self.catalog_objects.items) |*o| if (o.kind == .member and O.visible(o, snapshot)) {
-                    try sink.add(&.{ intCell(o.oid), intCell(o.target), intCell(o.grantee), intCell(o.owner), boolCell(o.grant_flags & 1 != 0), boolCell(true), boolCell(true) });
+                    try sink.add(&.{ intCell(o.oid), intCell(o.target), intCell(o.grantee), intCell(o.owner),
+                        boolCell(o.grant_flags & CO.member_admin != 0), boolCell(self.catalog_objects.membershipInherits(o, snapshot)), boolCell(O.membershipCanSet(o)) });
                 },
                 .pg_policy, .pg_policies => for (&self.catalog_objects.items) |*o| if (o.kind == .policy and O.visible(o, snapshot)) {
                     const command: CO.Command = @enumFromInt(@as(u8, @truncate(o.flags)));
@@ -10191,7 +10213,7 @@ pub fn Database(comptime config: Config) type {
             const snap = self.settingSnapshot(slot);
             const oid = self.catalog_objects.roleByName(name, snap) orelse return error.InvalidSettingValue;
             const session_role = self.sessionState().session_role;
-            if (!self.catalog_objects.superuser(session_role, snap) and !self.catalog_objects.memberOf(session_role, oid, false, snap)) return error.InsufficientPrivilege;
+            if (!self.catalog_objects.superuser(session_role, snap) and !self.catalog_objects.membershipPath(session_role, oid, .set, snap)) return error.InsufficientPrivilege;
             return oid;
         }
 

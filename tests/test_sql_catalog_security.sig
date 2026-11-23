@@ -842,6 +842,7 @@ fn roles() !void {
     try rejects("ALTER ROLE r_plain RENAME TO r_admin", error.DuplicateObject, count, "4");
     try rejects("ALTER ROLE r_plain RENAME TO pg_x", error.ReservedName, count, "4");
     try rejects("ALTER ROLE ramsql NOLOGIN", error.UnsupportedStatement, count, "4");
+    try run("ALTER ROLE ramsql WITH SUPERUSER INHERIT CREATEROLE CREATEDB LOGIN REPLICATION BYPASSRLS");
     try sameState();
     // Membership: GRANT role TO role, IN ROLE, ADMIN OPTION, cycles (0LP01).
     try run("CREATE ROLE r_group");
@@ -883,6 +884,20 @@ fn roles() !void {
     try commit(local_tx);
     try expect("SELECT current_user", "ramsql");
     try fails("SET ROLE nosuch", error.InvalidSettingValue);
+    const options = "SELECT admin_option, inherit_option, set_option FROM pg_auth_members";
+    try run("GRANT r_group TO r_plain WITH ADMIN TRUE, INHERIT FALSE, SET FALSE GRANTED BY ramsql");
+    try expect(options, "t|f|f");
+    try rejects("GRANT r_plain TO r_group", error.InvalidGrantOperation, options, "t|f|f");
+    try rejects("GRANT r_group TO r_plain WITH SET FALSE, SET TRUE", error.Syntax, options, "t|f|f");
+    try rejects("GRANT r_group TO r_plain WITH ADMIN FALSE GRANTED BY r_member", error.UnsupportedStatement, options, "t|f|f");
+    try sameState();
+    db.default_session_state.session_role = try roleOid("r_plain");
+    try fails("SET ROLE r_group", error.InsufficientPrivilege);
+    db.default_session_state.session_role = 10;
+    try run("GRANT r_group TO r_plain WITH SET TRUE");
+    try expect(options, "t|f|t");
+    try run("GRANT r_group TO r_plain WITH ADMIN FALSE, INHERIT TRUE");
+    try expect(options, "f|t|t");
     // The session user must be a member of the role it becomes.
     db.default_session_state.session_role = try roleOid("r_plain");
     try as("r_group");
