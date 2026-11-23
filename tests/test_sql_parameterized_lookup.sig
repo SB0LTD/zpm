@@ -108,6 +108,15 @@ fn ordinary() !void {
     try rejected(error.TypeMismatch, context.runPrimaryKey(&db, snap(), &.{ .boolean = false }, &result));
 
     try check(try context.runPrimaryKey(&db, snap(), &minus_one, &result));
+    try rejected(error.InvalidParameterValue, context.cachedPrimaryKeyView(&db, lookup, snap(), .integer32, &minus_one, backing[0..1]));
+    try rejected(error.InvalidParameterValue, context.cachedPrimaryKeyView(&db, lookup, snap(), .integer32, &minus_one, std.mem.asBytes(&context)[0..1]));
+    var output: [128]u8 = undefined;
+    const view = (try context.cachedPrimaryKeyView(&db, lookup, snap(), .integer32, &minus_one, &output)) orelse return error.MissingKeyView;
+    var projected: DB.Cell = undefined;
+    try check(view.version != null and view.columns.len == 3);
+    try check(std.mem.eql(u8, view.cell(0, &projected).text.slice(), "older"));
+    try check(view.cell(1, &projected).integer == -1);
+    try check(view.cell(2, &projected).* == .null_value);
     var control: DB.ExecutionControl = .{ .poll = canceled };
     context.session.control = &control;
     try rejected(error.QueryCanceled, context.runPrimaryKey(&db, snap(), &minus_one, &result));
