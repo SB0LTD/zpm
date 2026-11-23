@@ -917,6 +917,9 @@ pub fn Store(comptime Raw: type) type {
                 if (comptime has_engine_session and @hasField(Raw.SessionValues, "synchronize_seqscans")) {
                     session.synchronize_seqscans = self.dialect == .postgres and self.engine_session.values.synchronize_seqscans;
                 }
+                if (comptime has_engine_session and @hasField(Raw.SessionValues, "quote_all_identifiers")) {
+                    session.quote_all_identifiers = self.engine_session.values.quote_all_identifiers;
+                }
                 if (comptime has_engine_session and @hasField(Raw.SessionValues, "restricted_relation_kinds")) {
                     session.restricted_relation_kinds = self.engine_session.values.restricted_relation_kinds;
                 }

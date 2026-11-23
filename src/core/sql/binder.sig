@@ -3623,7 +3623,8 @@ pub fn Binder(comptime config: types.Config) type {
             }
             switch(n.kind) {
                 .scalar_subquery,.exists_subquery,.in_subquery,.aggregate,.default_value,.values_row,.row_constructor,.row_compare,.row_in=>return false,
-                .function=>if(!ast.immutableFunction(n.func)) return false,
+                // Plans may be reused after the session changes identifier quoting.
+                .function=>if(n.func == .quote_ident or !ast.immutableFunction(n.func)) return false,
                 else=>{},
             }
             if(!immutableGenerated(context,id)) return false;

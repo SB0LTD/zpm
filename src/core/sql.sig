@@ -5760,12 +5760,12 @@ pub fn Database(comptime config: Config) type {
         fn postgresNamespaceName(ptr: *anyopaque, oid: u32, out: []u8) Error!?usize {
             const self: *const Self = @ptrCast(@alignCast(ptr));
             for (catalog_module.namespaces) |known| {
-                if (oid == known.oid) return try writeNamespaceName(known.name, out);
+                if (oid == known.oid) return try self.writeNamespaceName(known.name, out);
             }
             var schemas: [K.relation_rows]K.SchemaFound = undefined;
             const count = self.catalog.visibleSchemas(self.seq_snap, &schemas);
             for (schemas[0..count]) |found| {
-                if (oid == found.oid) return try writeNamespaceName(self.schemas[found.slot].name.slice(), out);
+                if (oid == found.oid) return try self.writeNamespaceName(self.schemas[found.slot].name.slice(), out);
             }
             return null;
         }
@@ -5840,7 +5840,7 @@ pub fn Database(comptime config: Config) type {
                 namespace = routine.namespace;
                 break :blk routine.name.slice();
             };
-            var writer: CatalogTextWriter = .{ .out = out };
+            var writer: CatalogTextWriter = .{ .out = out, .quote_all = self.session.quote_all_identifiers };
             const visible = self.routineByName(null, name) catch null;
             if (visible == null or visible.? != oid) {
                 writer.ident(self.namespaceName(namespace));
@@ -5851,8 +5851,8 @@ pub fn Database(comptime config: Config) type {
             return writer.len;
         }
 
-        fn writeNamespaceName(name: []const u8, out: []u8) Error!usize {
-            var text: CatalogTextWriter = .{ .out = out };
+        fn writeNamespaceName(self: *const Self, name: []const u8, out: []u8) Error!usize {
+            var text: CatalogTextWriter = .{ .out = out, .quote_all = self.session.quote_all_identifiers };
             text.ident(name);
             if (text.shortened) return error.TextCapacity;
             return text.len;
@@ -5917,7 +5917,7 @@ pub fn Database(comptime config: Config) type {
             const self: *const Self = @ptrCast(@alignCast(ptr));
             var primary: Name = undefined;
             const identity = self.relationIdentity(oid, &primary) orelse return null;
-            var output: CatalogTextWriter = .{ .out = out };
+            var output: CatalogTextWriter = .{ .out = out, .quote_all = self.session.quote_all_identifiers };
             if (!self.inRelationSearchPath(identity.namespace, identity.name)) {
                 output.ident(self.namespaceName(identity.namespace));
                 output.add(".");
@@ -5991,7 +5991,7 @@ pub fn Database(comptime config: Config) type {
                         out[at] = '.';
                         at += 1;
                     }
-                    at += quoteIdentifier(part, out[at..]);
+                    at += quoteIdentifier(part, out[at..], self.session.quote_all_identifiers);
                 }
                 return at;
             }
@@ -6001,8 +6001,8 @@ pub fn Database(comptime config: Config) type {
         /// quote_identifier: quotes unless the name is lower-case letters,
         /// digits and underscores not starting with a digit. `out` holds at
         /// least 2 * name.len + 2 bytes.
-        fn quoteIdentifier(name: []const u8, out: []u8) usize {
-            var safe = name.len != 0 and !types.digit(name[0]) and !lexer.reserved(lexer.classify(name));
+        fn quoteIdentifier(name: []const u8, out: []u8, quote_all: bool) usize {
+            var safe = !quote_all and name.len != 0 and !types.digit(name[0]) and !lexer.reserved(lexer.classify(name));
             for (name) |byte| {
                 if (!((byte >= 'a' and byte <= 'z') or types.digit(byte) or byte == '_')) safe = false;
             }
@@ -6756,27 +6756,30 @@ pub fn Database(comptime config: Config) type {
                         },
                         .pg_indexes => {
                             var text: [512]u8 = undefined;
-                            if (S.keyed(table)) try sink.add(&.{ nameCell(schema_name), nameCell(name), nameCell(pkey.slice()), .null_value, nameCell(indexDefinition(table, schema_name, pkey.slice(), true, primary_columns, &text)) });
+                            const quote_all = session_values.quote_all_identifiers;
+                            if (S.keyed(table)) try sink.add(&.{ nameCell(schema_name), nameCell(name), nameCell(pkey.slice()), .null_value, nameCell(indexDefinition(table, schema_name, pkey.slice(), true, primary_columns, &text, quote_all)) });
                             for (table.constraints[0..table.constraint_count]) |*constraint| {
                                 if (constraint.kind != .unique) continue;
-                                try sink.add(&.{ nameCell(schema_name), nameCell(name), nameCell(constraint.name.slice()), .null_value, nameCell(indexDefinition(table, schema_name, constraint.name.slice(), true, constraint.keyColumns(), &text)) });
+                                try sink.add(&.{ nameCell(schema_name), nameCell(name), nameCell(constraint.name.slice()), .null_value, nameCell(indexDefinition(table, schema_name, constraint.name.slice(), true, constraint.keyColumns(), &text, quote_all)) });
                             }
                             for (table.indexes[0..table.index_count]) |*index| {
-                                try sink.add(&.{ nameCell(schema_name), nameCell(name), nameCell(index.name.slice()), .null_value, nameCell(secondaryDefinition(table, schema_name, index, &text)) });
+                                try sink.add(&.{ nameCell(schema_name), nameCell(name), nameCell(index.name.slice()), .null_value, nameCell(secondaryDefinition(table, schema_name, index, &text, quote_all)) });
                             }
                             for (table.constraints[0..table.constraint_count]) |*constraint| {
                                 if (constraint.kind != .exclusion) continue;
-                                var definition: CatalogTextWriter = .{ .out = &text };
+                                var definition: CatalogTextWriter = .{ .out = &text, .quote_all = quote_all };
                                 definition.add("CREATE INDEX ");
-                                definition.add(constraint.name.slice());
+                                definition.ident(constraint.name.slice());
                                 definition.add(" ON ");
-                                definition.add(schema_name);
+                                definition.ident(schema_name);
                                 definition.add(".");
-                                definition.add(name);
-                                definition.add(" USING gist (");
+                                definition.ident(name);
+                                definition.add(" USING ");
+                                definition.ident("gist");
+                                definition.add(" (");
                                 for (constraint.keyColumns(), 0..) |column, position| {
                                     if (position != 0) definition.add(", ");
-                                    definition.add(table.columns[column].name.slice());
+                                    definition.ident(table.columns[column].name.slice());
                                 }
                                 definition.add(")");
                                 try sink.add(&.{ nameCell(schema_name), nameCell(name), nameCell(constraint.name.slice()), .null_value, nameCell(definition.slice()) });
@@ -6863,16 +6866,16 @@ pub fn Database(comptime config: Config) type {
         }
 
         /// pg_indexes.indexdef of a primary key or UNIQUE constraint index.
-        fn indexDefinition(table: *const S.Table, schema_name: []const u8, index_name: []const u8, unique: bool, columns: []const u8, out: *[512]u8) []const u8 {
-            var text: CatalogTextWriter = .{ .out = out };
+        fn indexDefinition(table: *const S.Table, schema_name: []const u8, index_name: []const u8, unique: bool, columns: []const u8, out: *[512]u8, quote_all: bool) []const u8 {
+            var text: CatalogTextWriter = .{ .out = out, .quote_all = quote_all };
             writeIndexDefinition(table, schema_name, index_name, unique, columns, null, false, &text);
             return text.slice();
         }
 
         /// pg_indexes.indexdef of a secondary index (expression elements and
         /// the predicate are their stored source texts).
-        fn secondaryDefinition(table: *const S.Table, schema_name: []const u8, index: *const S.Index, out: *[512]u8) []const u8 {
-            var text: CatalogTextWriter = .{ .out = out };
+        fn secondaryDefinition(table: *const S.Table, schema_name: []const u8, index: *const S.Index, out: *[512]u8, quote_all: bool) []const u8 {
+            var text: CatalogTextWriter = .{ .out = out, .quote_all = quote_all };
             writeIndexDefinition(table, schema_name, index.name.slice(), index.unique, index.keyColumns(), index, false, &text);
             return text.slice();
         }
@@ -6886,7 +6889,9 @@ pub fn Database(comptime config: Config) type {
                 text.add(".");
             }
             text.ident(table.name.slice());
-            text.add(" USING btree (");
+            text.add(" USING ");
+            text.ident("btree");
+            text.add(" (");
             var expressions = if (index) |secondary| secondary.expressions.slice() else &.{};
             for (keys, 0..) |column, position| {
                 if (position != 0) text.add(", ");
@@ -7023,7 +7028,7 @@ pub fn Database(comptime config: Config) type {
             const object = &self.catalog_objects.items[index];
             const slot = self.visibleTableSlot(object.grantee, self.seq_snap) orelse return null;
             const table = &self.tables[slot];
-            var text: CatalogTextWriter = .{ .out = out };
+            var text: CatalogTextWriter = .{ .out = out, .quote_all = self.session.quote_all_identifiers };
             for (object.textSlice(), 0..) |column, position| {
                 if (position != 0) text.add(", ");
                 text.ident(table.columns[column].name.slice());
@@ -7041,7 +7046,7 @@ pub fn Database(comptime config: Config) type {
                 .range => "RANGE (",
                 .list => "LIST (",
             };
-            var text: CatalogTextWriter = .{ .out = out };
+            var text: CatalogTextWriter = .{ .out = out, .quote_all = self.session.quote_all_identifiers };
             text.add(prefix);
             text.ident(table.columns[table.partition.key].name.slice());
             text.add(")");
@@ -7147,7 +7152,7 @@ pub fn Database(comptime config: Config) type {
             var aliases: [config.columns]ViewAliasEdit = undefined;
             const alias_count = viewAliasEdits(source, pool, &pool.queries[root], view, &aliases);
             for (aliases[0..alias_count]) |edit| changes.set(edit.start);
-            var text: CatalogTextWriter = .{ .out = out };
+            var text: CatalogTextWriter = .{ .out = out, .quote_all = self.session.quote_all_identifiers };
             var start: usize = 0;
             var alias_index: usize = 0;
             var positions = changes.iterator(.{});
@@ -7164,7 +7169,8 @@ pub fn Database(comptime config: Config) type {
                     start = edit.end;
                     alias_index += 1;
                 } else {
-                    text.add("public.");
+                    text.ident("public");
+                    text.add(".");
                 }
             }
             text.add(source[start..]);
@@ -7182,7 +7188,7 @@ pub fn Database(comptime config: Config) type {
                 const table = &self.tables[slot];
                 const routine_slot = self.objects.routineByOid(trigger.function_oid, snapshot) orelse return null;
                 const routine = &self.objects.routines[routine_slot];
-                var text: CatalogTextWriter = .{ .out = out };
+                var text: CatalogTextWriter = .{ .out = out, .quote_all = self.session.quote_all_identifiers };
                 text.add("CREATE TRIGGER ");
                 text.ident(trigger.name.slice());
                 text.add(if (trigger.tgtype & tg.tg_before != 0) " BEFORE " else " AFTER ");
@@ -7246,7 +7252,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn renderConstraint(self: *const Self, table: *const S.Table, constraint: ?*const S.Constraint, kind: S.ConstraintKind, pretty: bool, out: []u8) Error!usize {
-            var text: CatalogTextWriter = .{ .out = out };
+            var text: CatalogTextWriter = .{ .out = out, .quote_all = self.session.quote_all_identifiers };
             switch (kind) {
                 .primary => {
                     var keys: [config.columns]u8 = undefined;
@@ -7299,7 +7305,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn renderIndex(self: *const Self, table: *const S.Table, name: []const u8, unique: bool, keys: []const u8, index: ?*const S.Index, column: i32, pretty: bool, out: []u8) Error!usize {
-            var text: CatalogTextWriter = .{ .out = out };
+            var text: CatalogTextWriter = .{ .out = out, .quote_all = self.session.quote_all_identifiers };
             if (column == 0) {
                 const schema = if (pretty and self.inRelationSearchPath(table.namespace, table.name.slice())) null else self.namespaceName(table.namespace);
                 writeIndexDefinition(table, schema, name, unique, keys, index, pretty, &text);
@@ -7324,6 +7330,7 @@ pub fn Database(comptime config: Config) type {
             out: []u8,
             len: usize = 0,
             shortened: bool = false,
+            quote_all: bool = false,
 
             fn add(self: *CatalogTextWriter, bytes: []const u8) void {
                 const take = @min(bytes.len, self.out.len - self.len);
@@ -7335,7 +7342,7 @@ pub fn Database(comptime config: Config) type {
             fn ident(self: *CatalogTextWriter, name: []const u8) void {
                 // The catalog limits stored identifiers to 255 bytes.
                 var quoted: [512]u8 = undefined;
-                self.add(quoted[0..quoteIdentifier(name, &quoted)]);
+                self.add(quoted[0..quoteIdentifier(name, &quoted, self.quote_all)]);
             }
 
             fn literal(self: *CatalogTextWriter, value: []const u8) void {
@@ -9829,12 +9836,13 @@ pub fn Database(comptime config: Config) type {
             tx.deferrable = deferrable;
         }
 
-        const SettingKind = enum { search_path, check_function_bodies, row_security, synchronize_seqscans, restrict_nonsystem_relation_kind, default_transaction_isolation, default_transaction_read_only, default_transaction_deferrable, transaction_isolation, transaction_read_only, transaction_deferrable, custom, role };
+        const SettingKind = enum { search_path, check_function_bodies, row_security, synchronize_seqscans, restrict_nonsystem_relation_kind, default_transaction_isolation, default_transaction_read_only, default_transaction_deferrable, transaction_isolation, transaction_read_only, transaction_deferrable, custom, role, quote_all_identifiers };
 
         const SettingDescriptor = struct {
             kind: SettingKind,
             vartype: []const u8,
             description: []const u8,
+            category: []const u8 = "Client Connection Defaults / Statement Behavior",
         };
 
         const setting_descriptors = [_]SettingDescriptor{
@@ -9842,6 +9850,7 @@ pub fn Database(comptime config: Config) type {
             .{ .kind = .default_transaction_deferrable, .vartype = "bool", .description = "Default deferrable mode for new transactions." },
             .{ .kind = .default_transaction_isolation, .vartype = "enum", .description = "Default isolation level for new transactions." },
             .{ .kind = .default_transaction_read_only, .vartype = "bool", .description = "Default read-only mode for new transactions." },
+            .{ .kind = .quote_all_identifiers, .vartype = "bool", .description = "When generating SQL fragments, quote all identifiers.", .category = "Version and Platform Compatibility / Previous PostgreSQL Versions" },
             .{ .kind = .restrict_nonsystem_relation_kind, .vartype = "string", .description = "Disallow access to selected kinds of non-system relations." },
             .{ .kind = .search_path, .vartype = "string", .description = "Schema search order for unqualified names." },
         };
@@ -9857,6 +9866,7 @@ pub fn Database(comptime config: Config) type {
             return switch (kind) {
                 .search_path => values.search_path.slice(),
                 .check_function_bodies => onOff(values.check_function_bodies),
+                .quote_all_identifiers => onOff(values.quote_all_identifiers),
                 .restrict_nonsystem_relation_kind => values.restriction_text.slice(),
                 .default_transaction_isolation => levelName(values.isolation),
                 .default_transaction_read_only => onOff(values.read_only),
@@ -9889,7 +9899,7 @@ pub fn Database(comptime config: Config) type {
                 const enumvals: Cell = if (descriptor.kind == .default_transaction_isolation) try isolationNames() else .null_value;
                 try sink.add(&.{
                     try objectTextCell(@tagName(descriptor.kind)), try objectTextCell(engineSettingValue(&values, descriptor.kind).?), .null_value,
-                    try objectTextCell("Client Connection Defaults / Statement Behavior"), try objectTextCell(descriptor.description), .null_value,
+                    try objectTextCell(descriptor.category), try objectTextCell(descriptor.description), .null_value,
                     nameCell("user"), nameCell(descriptor.vartype), nameCell(source), .null_value, .null_value, enumvals,
                     try objectTextCell(engineSettingValue(&boot, descriptor.kind).?), try objectTextCell(engineSettingValue(&state.startup, descriptor.kind).?),
                     .null_value, .null_value, boolCell(false),
@@ -10068,6 +10078,7 @@ pub fn Database(comptime config: Config) type {
                 .check_function_bodies => into.check_function_bodies = parseBool(value) orelse return error.InvalidSettingValue,
                 .row_security => into.row_security = parseBool(value) orelse return error.InvalidSettingValue,
                 .synchronize_seqscans => into.synchronize_seqscans = parseBool(value) orelse return error.InvalidSettingValue,
+                .quote_all_identifiers => into.quote_all_identifiers = parseBool(value) orelse return error.InvalidSettingValue,
                 .restrict_nonsystem_relation_kind => try assignRelationRestrictions(into, kind, value),
                 .default_transaction_isolation => into.isolation = parseLevel(value) orelse return error.InvalidSettingValue,
                 .default_transaction_read_only => into.read_only = parseBool(value) orelse return error.InvalidSettingValue,
@@ -10096,6 +10107,7 @@ pub fn Database(comptime config: Config) type {
                 .check_function_bodies => into.check_function_bodies = source.check_function_bodies,
                 .row_security => into.row_security = source.row_security,
                 .synchronize_seqscans => into.synchronize_seqscans = source.synchronize_seqscans,
+                .quote_all_identifiers => into.quote_all_identifiers = source.quote_all_identifiers,
                 .restrict_nonsystem_relation_kind => {
                     into.restricted_relation_kinds = source.restricted_relation_kinds;
                     into.restriction_text = source.restriction_text;
@@ -10226,6 +10238,7 @@ pub fn Database(comptime config: Config) type {
             self.session.public_schema_on_path = state.values.publicSchemaOnPath();
             self.session.row_security = state.values.row_security;
             self.session.synchronize_seqscans = self.dialect == .postgres and state.values.synchronize_seqscans;
+            self.session.quote_all_identifiers = state.values.quote_all_identifiers;
             self.session.restricted_relation_kinds = state.values.restricted_relation_kinds;
         }
 
@@ -10310,7 +10323,7 @@ pub fn Database(comptime config: Config) type {
         pub fn sessionStartupSetting(self: *Self, name: []const u8, value: []const u8) Error!bool {
             const setting = settingKind(name) orelse return false;
             switch (setting) {
-                .check_function_bodies, .row_security, .synchronize_seqscans, .restrict_nonsystem_relation_kind => {},
+                .check_function_bodies, .row_security, .synchronize_seqscans, .restrict_nonsystem_relation_kind, .quote_all_identifiers => {},
                 else => return false,
             }
             try self.setSetting(null, false, name, .string, value);

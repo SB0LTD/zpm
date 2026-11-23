@@ -398,12 +398,12 @@ pub fn Eval(comptime config: types.Config) type {
 
         /// format_type(oid, typmod): the SQL spelling with NUMERIC(p,s) and
         /// TIMESTAMP[TZ](p) modifiers; `???` for an unknown OID.
-        fn formatType(oid: i64, typmod: i64) Error!V.Cell {
+        fn formatType(oid: i64, modifier: ?i64, quote_all: bool) Error!V.Cell {
             const data_type = if (oid >= 0 and oid <= 0xffffffff) types.typeFromOid(@intCast(oid)) else null;
             const known = data_type orelse return textCell("???");
             if (types.elementData(known)) |element| {
                 // An array: its element type (with the typmod) and `[]`.
-                var inner = try formatType(types.typeOid(element), typmod);
+                var inner = try formatType(types.typeOid(element), modifier, quote_all);
                 if (inner.text.len + 2 > config.text_bytes) return error.TextCapacity;
                 @memcpy(inner.text.bytes[inner.text.len..][0..2], "[]");
                 inner.text.len += 2;
@@ -411,6 +411,7 @@ pub fn Eval(comptime config: types.Config) type {
             }
             var buffer: [64]u8 = undefined;
             var at: usize = 0;
+            const typmod = modifier orelse -1;
             const append = struct {
                 fn f(out: *[64]u8, position: *usize, bytes: []const u8) void {
                     @memcpy(out[position.*..][0..bytes.len], bytes);
@@ -467,7 +468,21 @@ pub fn Eval(comptime config: types.Config) type {
                 },
                 else => {},
             }
-            return textCell(types.sqlTypeName(known));
+            // The SQL-standard spellings are grammar productions. Other
+            // built-ins use their catalog names, including forced quoting.
+            const catalog_name = switch (known) {
+                .boolean, .smallint, .integer32, .integer, .real, .double, .numeric, .interval, .time, .timetz,
+                .timestamp, .timestamptz, .varbit, .varchar, .json, .pg_internal_char => false,
+                .bit, .bpchar => modifier != null,
+                else => true,
+            };
+            if (!catalog_name) return textCell(types.sqlTypeName(known));
+            const name = types.typeInfo(known).name;
+            if (!quote_all and known != .bit) return textCell(name);
+            append(&buffer, &at, "\"");
+            append(&buffer, &at, name);
+            append(&buffer, &at, "\"");
+            return textCell(buffer[0..at]);
         }
 
         fn aclDefault(ctx: *const Context, kind: u8, owner: u32) Error!V.Cell {
@@ -583,7 +598,7 @@ pub fn Eval(comptime config: types.Config) type {
                 },
                 .regtype_out => {
                     const data_type = if (first.integer >= 0 and first.integer <= 0xffffffff) types.typeFromOid(@intCast(first.integer)) else null;
-                    if (data_type) |known| return textCell(types.sqlTypeName(known));
+                    if (data_type != null) return formatType(first.integer, null, ctx.session.quote_all_identifiers);
                     return digitsCell(first.integer);
                 },
                 .regclass_out => {
@@ -611,7 +626,7 @@ pub fn Eval(comptime config: types.Config) type {
                 },
                 .format_type => {
                     const second = try eval(ctx, ctx.pool.nodes[n.b].next);
-                    return formatType(first.integer, if (second == .null_value) -1 else second.integer);
+                    return formatType(first.integer, if (second == .null_value) null else second.integer, ctx.session.quote_all_identifiers);
                 },
                 .pg_get_expr => return first,
                 .pg_get_indexdef => {
