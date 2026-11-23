@@ -89,7 +89,8 @@
 //!   enc_import.sig, enc_rgb.sig), writes the headers, the setup and
 //!   the pushbuffer, and submits it on the encoder channel (G_ESUBMIT).
 //!   The reconstructed and reference pictures live in their surfaces'
-//!   block-linear buffers, in the engine's own layout.
+//!   block-linear buffers: block linear (H.264's on Turing, HEVC's and
+//!   AV1's) or the engine's tiled 16x16 (H.264's on GB206; encodeTry).
 //! - **SyncSurface** on the input, or **SyncBuffer** on the coded buffer,
 //!   waits for the encode.
 //!
@@ -102,8 +103,11 @@
 //! What Turing's engines have not is not offered: AV1, decode (NVDEC
 //! gained it with Ampere) and encode (NVENC with Ada). H.264, HEVC Main
 //! and Main10, VP8 and VP9 profiles 0 and 2 decode; H.264 and HEVC Main
-//! encode (the encoder's setup magic ASSUMED 0xc4b70006). Proven against
-//! the fake node only.
+//! encode (the encoder's setup magic ASSUMED 0xc4b70006), H.264's
+//! references and reconstructions block linear (encodeTry). On the RTX
+//! 2080 Ti through a Hyper-V GPU partition (galaxy-turing, Windows'
+//! driver 576's engines): H.264 decodes bit-exact against ffmpeg's, and
+//! encodes I and P pictures ffmpeg decodes at 54-71 dB.
 //!
 //! Allocation-free: fixed tables, the kernel's buffers, the reserved pool.
 //! Not thread-safe by itself: libgalaxy_va holds a lock around each call.
@@ -2193,6 +2197,23 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             s.in_flight_max = @max(s.in_flight_max, n);
         }
 
+        /// The encoder's readings for this GPU: GALAXY_VA_NVENC_TRY's, and
+        /// on Turing H.264's references and reconstructions block linear
+        /// unless "h264tiled" says otherwise. TU102's NVENC writes its
+        /// reconstruction block linear (the surface's own layout, 2 GOBs a
+        /// block) whatever the setup says, and reads its reference as the
+        /// setup says: with tiled 16x16 (GB206's, which scored 38.4 dB with
+        /// P pictures, pc-full9) it predicted every P picture from a
+        /// scrambled one (galaxy-turing on the RTX 2080 Ti, 2026-11-23: the
+        /// reconstructions dumped equal ffmpeg's decode only read block
+        /// linear; P pictures 19 dB falling to 9 tiled, 57-71 dB block
+        /// linear). encode.Try.h264_bl.
+        fn encodeTry(d: *const Self) encode.Try {
+            var t = d.opts.nvenc_try;
+            if (d.turing and !t.h264_tiled) t.h264_bl = true;
+            return t;
+        }
+
         /// An encode's picture: the input current, the headers, setup and
         /// pushbuffer made (encode.end), submitted on the encoder channel.
         fn endEncode(d: *Self, ci: u8, c: *Context) va.Status {
@@ -2228,6 +2249,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             const base = c.work.va + f * ENC_FRAME_BYTES;
             const setup_off: usize = if (d.opts.nvenc_try.setup_4k) ENC_SETUP_OFF_4K else ENC_SETUP_OFF;
             var out: encode.EndOut = .{};
+            const t = d.encodeTry();
             st = encode.end(&c.enc, .{
                 .push = words(frame.ptr, ENC_PUSH_OFF, nvenc.PUSH_DWORDS_MAX),
                 .setup = frame[setup_off..][0..nvenc.SETUP_BYTES],
@@ -2243,7 +2265,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 },
                 .picture_index = c.decodes,
                 .magic = d.opts.nvenc_magic orelse if (d.turing) nvenc.MAGIC_TURING else nvenc.MAGIC,
-                .try_ = d.opts.nvenc_try,
+                .try_ = t,
             }, &out);
             if (st != va.SUCCESS) {
                 d.debug("encode picture refused ({x})", .{st});
@@ -2254,7 +2276,6 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 // the boot log)
                 var line: [400]u8 = undefined;
                 d.say("{s}", .{encode.setupLine(&line, c.enc.kind, frame[setup_off..][0..nvenc.SETUP_BYTES])});
-                const t = d.opts.nvenc_try;
                 d.say("readings (GALAXY_VA_NVENC_TRY): hevc co-located {s}, co-located buffers {s}, av1 tiles at 0x{x}, av1 co-located {s}, setup at 0x{x} of its slot, h264 references {s}", .{ @tagName(t.hevc_coloc), if (t.coloc_apart) "apart (1 MiB aligned)" else "tight (after the history)", t.av1_tiles_at, if (t.av1_coloc) "bound" else "none", setup_off, if (t.h264_bl) "block linear" else "tiled 16x16" });
                 d.say("first picture's methods: {s}", .{encode.pushLine(&line, words(frame.ptr, ENC_PUSH_OFF, nvenc.PUSH_DWORDS_MAX)[0..out.dwords])});
             }

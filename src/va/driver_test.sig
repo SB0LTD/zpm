@@ -322,6 +322,69 @@ test "driver on Turing (TU102): NVC4B0 bound in a decode's pushbuffer, no AV1, T
     try testing.expectEqual(@as(u32, 0xc4b7_0006), nvenc.MAGIC_TURING);
 }
 
+test "driver on Turing: H.264's references and reconstructions block linear, as TU102's NVENC writes them; tiled 16x16 when asked" {
+    // TU102's NVENC writes its reconstruction block linear whatever the
+    // setup says and reads its reference as the setup says: tiled 16x16
+    // made every P picture's prediction wrong on the RTX 2080 Ti
+    // (driver.encodeTry). "h264tiled" asks for the engine's tiled layout.
+    for ([_]bool{ false, true }) |tiled| {
+        var k = Fake{ .chip = node.CHIP_TU102, .decoder = fakeDecode, .encoder = fakeEncode };
+        enc_seen = .{};
+        var d: TestDriver = .{ .node = .{ .sys = &k } };
+        var opts: driver.Options = .{};
+        opts.nvenc_try.h264_tiled = tiled;
+        try testing.expectEqual(va.SUCCESS, d.init(3, opts));
+        defer d.terminate();
+        var cfg: u32 = 0;
+        try testing.expectEqual(va.SUCCESS, d.createConfig(va.PROFILE_H264_CONSTRAINED_BASELINE, ve.ENTRYPOINT_ENC_SLICE, &.{}, &cfg));
+        var surfaces: [4]u32 = undefined;
+        try testing.expectEqual(va.SUCCESS, d.createSurfaces(va.RT_FORMAT_YUV420, 40, 24, &surfaces, &.{}));
+        var ctx: u32 = 0;
+        try testing.expectEqual(va.SUCCESS, d.createContext(cfg, 40, 24, &ctx));
+        var coded: u32 = 0;
+        try testing.expectEqual(va.SUCCESS, d.createBuffer(ve.ENC_CODED_BUFFER, 3 * 40 * 24 + (1 << 16), 1, null, &coded));
+        const frame = 40 * 24 * 3 / 2;
+        // an IDR into surfaces[2], then a P picture into surfaces[3] from it
+        try putInput(&d, surfaces[0], 40, 24, 0, enc_yuv[0..frame]);
+        const seq = encSeq();
+        const pic0 = enc_h264.testPic(surfaces[2], coded, true, 0);
+        const s0 = encSlice(2, 0, va.INVALID_ID);
+        try encodeOne(&d, ctx, surfaces[0], &seq, &pic0, &s0, &.{});
+        try testing.expectEqual(va.SUCCESS, d.syncBuffer(coded, std.math.maxInt(i64)));
+        try putInput(&d, surfaces[1], 40, 24, 1, enc_yuv[frame..][0..frame]);
+        var pic1 = enc_h264.testPic(surfaces[3], coded, false, 1);
+        pic1.ReferenceFrames[0] = .{ .picture_id = surfaces[2], .frame_idx = 0, .flags = va.PICTURE_H264_SHORT_TERM_REFERENCE, .TopFieldOrderCnt = 0, .BottomFieldOrderCnt = 0 };
+        const s1 = encSlice(0, 2, surfaces[2]);
+        try encodeOne(&d, ctx, surfaces[1], null, &pic1, &s1, &.{});
+        try testing.expectEqual(va.SUCCESS, d.syncBuffer(coded, std.math.maxInt(i64)));
+        // (NVC4B7 bound, the P picture's setup)
+        const push = k.push(k.esubmits[k.n_esubmits - 1]);
+        try testing.expectEqual(nvenc.CLASS_TURING | nvenc.SET_OBJECT_ENGINE_SW, push[1]);
+        const H = nvenc.H264;
+        const s = &enc_seen.setup;
+        try testing.expectEqual(@as(u64, 0), nvenc.get(s, H.pic_type));
+        const ref = &d.surfaces[surfaces[2] - SURFACE_BASE];
+        const rec = &d.surfaces[surfaces[3] - SURFACE_BASE];
+        try testing.expectEqual(nvenc.shifted(ref.tiled.va), enc_seen.methods[nvenc.SET_IN_REF_PIC0_LUMA >> 2]);
+        try testing.expectEqual(nvenc.shifted(rec.tiled.va), enc_seen.methods[nvenc.SET_OUT_REF_PIC_LUMA >> 2]);
+        // the two configurations alike: the surfaces' own layout (2 GOBs a
+        // block, their pitch), or tiled
+        const bh: u64 = if (tiled) 0 else nvenc.blockHeightField(tiling.BLOCK_GOBS_LOG2);
+        try testing.expectEqual(@as(u64, @intFromBool(tiled)), nvenc.get(s, H.refpic_cfg_tiled_16x16));
+        try testing.expectEqual(@as(u64, @intFromBool(tiled)), nvenc.get(s, H.outputpic_cfg_tiled_16x16));
+        try testing.expectEqual(bh, nvenc.get(s, H.refpic_cfg_block_height));
+        try testing.expectEqual(bh, nvenc.get(s, H.outputpic_cfg_block_height));
+        try testing.expectEqual(@as(u64, rec.layout.luma.pitch), nvenc.get(s, H.refpic_cfg_sfc_pitch));
+        try testing.expectEqual(@as(u64, rec.layout.chroma.pitch), nvenc.get(s, H.outputpic_cfg_sfc_pitch_chroma));
+        // (the input as before: block linear, its own configuration)
+        try testing.expectEqual(@as(u64, 0), nvenc.get(s, H.input_cfg_tiled_16x16));
+        try testing.expectEqual(@as(u32, 0), d.errors);
+        try testing.expectEqual(va.SUCCESS, d.destroyBuffer(coded));
+        try testing.expectEqual(va.SUCCESS, d.destroyContext(ctx));
+        try testing.expectEqual(va.SUCCESS, d.destroySurfaces(&surfaces));
+    }
+}
+
 test "driver: init refuses another GPU and a GPU without a decoder" {
     var k = Fake{ .chip = 0x4303_0c00 };
     var d: TestDriver = .{ .node = .{ .sys = &k } };
@@ -1246,6 +1309,10 @@ test "driver: H.264 through the fake encoder: an IDR then a P picture, the strea
     try testing.expectEqual(@as(u64, nvenc.historyBytes(3, 2)), nvenc.get(&enc_seen.setup, nvenc.H264.hist_buf_size));
     try testing.expectEqual(@as(u64, 3), nvenc.get(&enc_seen.setup, nvenc.H264.pic_type)); // IDR
     try testing.expectEqual(@as(u64, 66), nvenc.get(&enc_seen.setup, nvenc.H264.profile_idc));
+    // (GB206: the reference and the reconstruction in the engine's tiled
+    // 16x16, as its P pictures scored 38.4 dB, pc-full9; Turing's below)
+    try testing.expectEqual(@as(u64, 1), nvenc.get(&enc_seen.setup, nvenc.H264.refpic_cfg_tiled_16x16));
+    try testing.expectEqual(@as(u64, 1), nvenc.get(&enc_seen.setup, nvenc.H264.outputpic_cfg_tiled_16x16));
     try testing.expectEqual(@as(u64, 6), nvenc.get(enc_seen.setup[nvenc.H264_SLICE_OFF..], nvenc.H264Slice.num_mb));
     // (CBR at 500 kb/s: the rate control's QP, an intra picture's at or
     // below the app's initial 28)

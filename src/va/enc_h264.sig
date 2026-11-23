@@ -255,7 +255,7 @@ pub const Planes = struct {
     pitch_luma: u32,
     pitch_chroma: u32,
     /// block linear: log2 of GOBs per block (the input's; references and
-    /// reconstructions are tiled 16x16 and ignore it)
+    /// reconstructions are tiled 16x16 or, recon_bl, INPUT_BLOCK_HEIGHT's)
     block_height: u7 = INPUT_BLOCK_HEIGHT,
 };
 

@@ -606,9 +606,16 @@ pub const Try = struct {
     /// Turing's; only GB206's H.264 engine reads Turing's (driver.nvencInput)
     turing_all: bool = false,
     /// H.264's reference and reconstructed pictures block linear, 2 GOBs a
-    /// block, as HEVC's and AV1's ("h264bl"); by default the engine's
-    /// tiled 16x16 (NVIDIA's Tegra driver's, grc)
+    /// block, as HEVC's and AV1's ("h264bl"), or the engine's tiled 16x16
+    /// (NVIDIA's Tegra driver's, grc: "h264tiled"). By default Turing's
+    /// are block linear and GB206's tiled (driver.endEncode): TU102's
+    /// NVENC writes its reconstruction block linear whatever the setup
+    /// says and reads its reference as the setup says, so tiled there
+    /// made every P picture's prediction wrong (galaxy-turing, 2026-11-23:
+    /// 19 dB falling to 9, block linear 57-71 dB); GB206's P pictures
+    /// scored 38.4 dB tiled (pc-full9)
     h264_bl: bool = false,
+    h264_tiled: bool = false,
 
     /// The words of `v` (others ignored).
     pub fn parse(v: []const u8) Try {
@@ -635,6 +642,7 @@ pub const Try = struct {
             if (std.ascii.eqlIgnoreCase(w, "av1nofilter")) t.av1_nofilter = true;
             if (std.ascii.eqlIgnoreCase(w, "turingall")) t.turing_all = true;
             if (std.ascii.eqlIgnoreCase(w, "h264bl")) t.h264_bl = true;
+            if (std.ascii.eqlIgnoreCase(w, "h264tiled")) t.h264_tiled = true;
         }
         return t;
     }

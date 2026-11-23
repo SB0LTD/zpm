@@ -29,8 +29,12 @@
 //!   PPS (and SEI), HEVC's VPS, SPS and PPS (enc_h264.sig, enc_hevc.sig).
 //!   The setup's sps_data/pps_data only tell the engine what those
 //!   parameter sets said, for the slice headers it writes.
-//! - reference and reconstructed pictures are the engine's own "tiled
-//!   16x16" layout (it writes them, it reads them: the CPU never does);
+//! - reference and reconstructed pictures (the CPU never reads them):
+//!   H.264's in the engine's own "tiled 16x16" layout on GB206, block
+//!   linear (the surface's own, 2 GOBs a block) on Turing, whose engine
+//!   writes its reconstruction block linear whatever the setup says and
+//!   reads its reference as the setup says (driver.encodeTry); HEVC's
+//!   and AV1's block linear on both;
 //! - the input picture is block linear (GPU BL, `input_bl_mode` 0) or the
 //!   engine's tiled 16x16: nvenc_drv.h 1.5 (2) says input pictures are
 //!   "either all in BL format or all in tiled 16x16 format", and its
