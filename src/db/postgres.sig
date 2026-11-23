@@ -351,6 +351,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             sql: [sql_capacity]u8 = @splat(0),
             len: usize = 0,
             count: usize = 0,
+            single_parameter: ?ParameterSpan = null,
             oids: [parameter_capacity]u32 = @splat(0),
             fn source(self: *const Statement) []const u8 {
                 return self.sql[0..self.len];
@@ -1758,7 +1759,8 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             if (count > parameter_capacity) return error.ParameterCapacity;
             for (0..count) |i| next.oids[i] = try r.u32be();
             try r.done();
-            next.count = try parameterCount(source);
+            next.single_parameter = null;
+            next.count = try scan(source, null, null, &next.single_parameter);
             if (count != 0 and count != next.count) return error.ProtocolViolation;
             try self.infer(db, &next);
             var slot: ?*Statement = null;
@@ -1773,7 +1775,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             const s = slot orelse return error.StatementCapacity;
             // SQL tails are never part of a live statement. Publish only the
             // initialized source and bounded metadata, not sql_capacity bytes.
-            s.name=next.name;s.len=next.len;s.count=next.count;s.oids=next.oids;
+            s.name=next.name;s.len=next.len;s.count=next.count;s.single_parameter=next.single_parameter;s.oids=next.oids;
             @memcpy(s.sql[0..next.len],next.sql[0..next.len]);s.live=true;
             try w.empty('1');
         }
@@ -1966,7 +1968,12 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             }
             try r.done();
             var q: Writer = .{ .bytes = &next.sql };
-            try interpolate(s.source(), values[0..count], &q);
+            if (s.single_parameter) |span| {
+                const source = s.source();
+                try q.append(source[0..span.start]);
+                try splice(&q, values[0], source[span.end..]);
+                try q.append(source[span.end..]);
+            } else try interpolate(s.source(), values[0..count], &q);
             next.len = q.at;
             if (@hasDecl(DB, "savepointLevel")) next.level = db.savepointLevel();
             var slot: ?*Portal = null;
@@ -2456,7 +2463,8 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
 // The engine tokenizer owns quote/comment/identifier boundaries. Counting and
 // interpolation visit precisely its parameter tokens; every untouched byte is
 // copied verbatim, including whitespace and nested comments.
-fn scan(source: []const u8, values: ?[]const []const u8, w: ?*Writer) !usize {
+const ParameterSpan = struct { start: usize, end: usize };
+fn scan(source: []const u8, values: ?[]const []const u8, w: ?*Writer, single: ?*?ParameterSpan) !usize {
     var tokenizer: sql.Tokenizer = .{ .source = source, .text_limit = source.len };
     var copied: usize = 0;
     var highest: usize = 0;
@@ -2466,6 +2474,7 @@ fn scan(source: []const u8, values: ?[]const []const u8, w: ?*Writer) !usize {
         if (token.kind != .parameter) continue;
         if (token.integer > parameter_capacity) return error.ParameterCapacity;
         const n: usize = @intCast(token.integer);
+        if (single) |span| span.* = if (highest == 0 and n == 1) .{ .start = token.start, .end = token.end } else null;
         highest = @max(highest, n);
         if (values) |v| {
             if (n > v.len) return error.ProtocolViolation;
@@ -2499,11 +2508,8 @@ fn splice(w: *Writer, value: []const u8, rest: []const u8) !void {
     try w.append(value);
     if (rest.len != 0 and joins(value[value.len - 1], rest[0])) try w.byte(' ');
 }
-fn parameterCount(source: []const u8) !usize {
-    return scan(source, null, null);
-}
 fn interpolate(source: []const u8, values: []const []const u8, w: *Writer) !void {
-    _ = try scan(source, values, w);
+    _ = try scan(source, values, w, null);
 }
 /// `$n`: a dollar-quoted string (`$$x$$`, `$q$x$q$`) is not a parameter.
 fn parameterToken(token: []const u8) bool {
