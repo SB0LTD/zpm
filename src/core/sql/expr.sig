@@ -544,6 +544,17 @@ pub fn Eval(comptime config: types.Config) type {
                     if (owner == .null_value) return .null_value;
                     return aclDefault(ctx, first.pg_internal_char, @intCast(owner.integer));
                 },
+                .pg_get_userbyid => {
+                    const role: u32 = @intCast(first.integer);
+                    const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
+                    const get_name = hook.catalog_text orelse return error.UnsupportedStatement;
+                    var buffer: [64]u8 = undefined;
+                    if (try get_name(hook.ptr, .role_name, role, 0, 0, &buffer)) |used| {
+                        return textCell(buffer[0..used]);
+                    }
+                    const unknown = @import("std").fmt.bufPrint(&buffer, "unknown (OID={d})", .{role}) catch unreachable;
+                    return textCell(unknown);
+                },
                 .pg_table_is_visible => {
                     const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
                     const visible = hook.relation_visible orelse return error.UnsupportedStatement;
@@ -1435,7 +1446,7 @@ pub fn Eval(comptime config: types.Config) type {
                     .nextval, .currval, .setval, .lastval, .identity_next => return sequenceValue(ctx, n),
                     .current_database, .current_schema, .current_schemas, .pg_encoding_to_char, .to_regtype, .to_regclass, .to_regproc, .format_type, .pg_get_expr, .regclass_in, .regtype_in, .regclass_out, .regtype_out,
                     .to_regnamespace, .regnamespace_in, .regnamespace_out,
-                    .acldefault, .pg_table_is_visible, .pg_get_indexdef, .pg_get_constraintdef, .pg_get_triggerdef, .pg_get_viewdef, .pg_get_statisticsobjdef_columns, .pg_relation_is_publishable, .pg_get_partkeydef => return catalogValue(ctx, n),
+                    .acldefault, .pg_get_userbyid, .pg_table_is_visible, .pg_get_indexdef, .pg_get_constraintdef, .pg_get_triggerdef, .pg_get_viewdef, .pg_get_statisticsobjdef_columns, .pg_relation_is_publishable, .pg_get_partkeydef => return catalogValue(ctx, n),
                     .pg_partition_ancestors, .array_subquery => return error.UnsupportedStatement,
                     .obj_description, .col_description, .shobj_description, .current_user, .session_user => return objectText(ctx, n),
                     .to_tsvector, .to_tsquery, .plainto_tsquery, .phraseto_tsquery => {

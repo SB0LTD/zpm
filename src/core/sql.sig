@@ -6434,6 +6434,9 @@ pub fn Database(comptime config: Config) type {
             // This catalog stores explicit ALTER DEFAULT PRIVILEGES entries.
             // Built-in defaults come from acldefault() and do not create rows.
             if (view == .pg_default_acl) return;
+            // Parameter grants have no persisted objects. Stock tools still
+            // discover the typed catalog before exporting global roles.
+            if (view == .pg_parameter_acl) return;
             // UTF-8 is the only client and server encoding. Identity
             // transfer does not invoke a catalog conversion procedure.
             if (view == .pg_conversion) return;

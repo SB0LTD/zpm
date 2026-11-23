@@ -2,6 +2,14 @@
 
 ## Stock PostgreSQL dump and restore candidate
 
+Stock `pg_dumpall --roles-only --no-role-passwords` reached the
+`pg_parameter_acl` catalog query after emitting role memberships on
+PostgreSQL 16 and 18. The candidate exposes the typed catalog and makes
+`pg_get_userbyid(oid)` resolve roles at the statement snapshot. The Sig
+catalog contract covers the stock query, the catalog OID, the name type,
+NULL and missing roles. Parameter grants remain outside the supported SQL
+scope. A role archive fixture in RAMSQL qualifies restore and WAL reopen.
+
 The full ZPM test run on `ab781b39` found five failures outside the
 qualified migration fixture. UNNEST detection now runs in SELECT target
 parsing so VALUES forms never read SELECT target nodes. Inner catalog
