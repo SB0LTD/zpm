@@ -239,6 +239,12 @@ fn defaultAclDiscovery() !void {
     try expect("SELECT oid,tableoid,defaclrole,defaclnamespace,defaclobjtype,defaclacl,"
         ++ baseline ++ " AS acldefault FROM pg_catalog.pg_default_acl", "");
     try expect("SELECT 'pg_catalog.pg_default_acl'::regclass::oid", "826");
+    try expect("SELECT parname,pg_catalog.pg_get_userbyid(10) AS parowner,paracl,"
+        ++ "pg_catalog.acldefault('p',10) AS acldefault FROM pg_catalog.pg_parameter_acl ORDER BY 1", "");
+    try expect("SELECT 'pg_catalog.pg_parameter_acl'::regclass::oid", "6243");
+    try expect("SELECT pg_get_userbyid(10),pg_get_userbyid(0),pg_get_userbyid(424242),"
+        ++ "pg_get_userbyid(NULL) IS NULL,pg_typeof(pg_get_userbyid(10))::text",
+        "ramsql|unknown (OID=0)|unknown (OID=424242)|t|name");
     try expect("SELECT (" ++ baseline ++ ")::text FROM (VALUES "
         ++ "(0::oid,'S'::\"char\",10::oid),(0::oid,'L'::\"char\",10::oid),(11::oid,'f'::\"char\",10::oid)) "
         ++ "AS entries(defaclnamespace,defaclobjtype,defaclrole)", "{ramsql=rwU/ramsql};{ramsql=rw/ramsql};{}");

@@ -1424,6 +1424,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "obj_description", .func = .obj_description },
                 .{ .name = "col_description", .func = .col_description },
                 .{ .name = "shobj_description", .func = .shobj_description },
+                .{ .name = "pg_get_userbyid", .func = .pg_get_userbyid },
                 // Regular expressions (B11 text lane).
                 .{ .name = "regexp_like", .func = .regexp_like },
                 // Full text search (B11 text lane).
@@ -2404,6 +2405,10 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 .shobj_description => {
                     try bindSignature(context, n, &[_]ast.Type{ .oid, .name }, .text, true);
+                    n.constant = false;
+                },
+                .pg_get_userbyid => {
+                    try bindSignature(context, n, &[_]ast.Type{.oid}, .name, true);
                     n.constant = false;
                 },
                 .current_user, .session_user => {
