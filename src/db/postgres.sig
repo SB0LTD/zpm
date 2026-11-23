@@ -651,6 +651,29 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             return self.dispatchFrame(db, input[0], input[5..total], output, total);
         }
 
+        /// Handle a prepared detached Execute and its immediately buffered Sync
+        /// with the caller's existing read ownership. Failed or incomplete
+        /// Execute retains the ordinary frame-by-frame recovery path.
+        pub fn handleDetachedExecuteSync(self: *Self, db: *DB, input: []const u8, output: []u8) error{BufferTooSmall}!Reply {
+            const execute = try self.handle(db, input, output);
+            if (input.len == 0 or input[0] != 'E' or execute.consumed == 0 or
+                execute.close or execute.blocked or execute.cancel != null or !self.detachedReady()) return execute;
+            const next = input[execute.consumed..];
+            if (next.len < 5 or next[0] != 'S' or read32(next[1..5]) != 4) return execute;
+            // Execute has updated state by this point. If the caller's output
+            // cannot hold another handler invocation, keep its completed reply.
+            const remaining = output[execute.written..];
+            if (remaining.len < try self.requiredCapacity()) return execute;
+            const sync = try self.dispatchFrame(db, 'S', next[5..5], remaining, 5);
+            return .{
+                .consumed = execute.consumed + sync.consumed,
+                .written = execute.written + sync.written,
+                .close = sync.close,
+                .blocked = sync.blocked,
+                .cancel = sync.cancel,
+            };
+        }
+
         fn dispatchFrame(self: *Self, db: *DB, tag: u8, body: []const u8, output: []u8, total: usize) error{BufferTooSmall}!Reply {
             self.waiting_for_command = false;
             var w: Writer = .{ .bytes = output };
