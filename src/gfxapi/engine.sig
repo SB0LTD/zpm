@@ -1819,7 +1819,13 @@ pub const Engine = struct {
         if (e.depth_float) {
             const s8_bytes = blocklinear.planeBytes(std.mem.alignForward(u32, width, 64), height, gobs);
             const m = e.allocBytes(@intCast(bytes + s8_bytes), false) orelse return null;
-            return .{ .buf = m.buf, .width = width, .height = height, .stride = pitch, .format = .d24s8, .own = true, .pooled = m.pooled, .layout = layout, .depth_float = true, .s8_at = @intCast(bytes) };
+            var img: Image = .{ .buf = m.buf, .width = width, .height = height, .stride = pitch, .format = .d24s8, .own = true, .pooled = m.pooled, .layout = layout, .depth_float = true, .s8_at = @intCast(bytes) };
+            // (in VRAM, as the colour targets are: Superposition's 8192 x
+            // 8192 sun shadow map, 320 MB with its stencil, was drawn,
+            // cleared (54 ms a clear) and sampled across the bus in system
+            // memory)
+            e.toVram(&img);
+            return img;
         }
         const m = e.allocBytes(@intCast(bytes), true) orelse return null;
         var img: Image = .{ .buf = m.buf, .width = width, .height = height, .stride = pitch, .format = .d24s8, .own = true, .pooled = m.pooled, .layout = layout };
@@ -4461,6 +4467,15 @@ pub const Engine = struct {
     }
 
     // ── Images in VRAM ─────────────────────────────────────────────────────
+
+    /// An image its maker laid out in newBuffer's memory (a texture's
+    /// levels and layers, block-compressed or not: galaxy-pe's) moved to
+    /// VRAM as the engine's own images are, where images go there.
+    /// Superposition's materials (BC-compressed, every one) were sampled
+    /// across the bus in system memory.
+    pub fn intoVram(e: *Engine, img: *Image) void {
+        e.toVram(img);
+    }
 
     /// `img` (just made, the engine's, a buffer of its own) moved to VRAM
     /// where images go there: its memory now the shadow, all of which VRAM

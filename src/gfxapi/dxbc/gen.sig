@@ -33,8 +33,9 @@
 //!   slot's descriptor's (texture.State.compare). A pixel shader's
 //!   implicit level of detail comes from its coordinates' derivatives
 //!   across the quad (so it runs whole quads: needsQuads), inside flow
-//!   too (a quad an if splits reads an undefined one, as Direct3D's
-//!   undefined). Multisampled textures and cube arrays: not yet.
+//!   too (in a quad an if splits, 0 from a neighbour that does not run
+//!   it: Direct3D leaves it undefined). Multisampled textures and cube
+//!   arrays: not yet.
 //!
 //! - **Compute** (`compute`): a compute shader as a KIR kernel of its own
 //!   (its workgroup `threadGroup`'s): vThreadID and the other thread ids;
@@ -1444,8 +1445,9 @@ const Gen = struct {
     /// x's difference across the quad (x: right minus left; up: top minus
     /// bottom); 0 outside whole quads. Inside flow too, as the GPU's and
     /// GLSL's are: a quad that takes an if one way runs it together, so a
-    /// derivative there is right; one split by it reads an undefined one,
-    /// as Direct3D allows (0 there made every sample in an if or a loop
+    /// derivative there is right; in one split by it, a neighbour that
+    /// does not run it gives 0 (Direct3D leaves it undefined). (0 for every
+    /// derivative in flow made every sample in an if or a loop
     /// read its base level: Unigine's materials, minified, sparkled).
     /// The neighbours are the lanes the pipeline's quads put them in
     /// (FragmentIO.quad_x, quad_y): the tile kernel's QUAD_X and QUAD_Y,
@@ -1455,9 +1457,21 @@ const Gen = struct {
         const k = g.k;
         const io = g.fio.?;
         const xv = asF32(k, x);
-        const o = k.shfl(.f32, .xor, r(xv), u(if (up) io.quad_y else io.quad_x));
+        const q: u32 = if (up) io.quad_y else io.quad_x;
+        const o = k.shfl(.f32, .xor, r(xv), u(q));
         const odd = if (up) io.odd_y else io.odd_x;
-        return r(k.sel(.f32, r(odd), r(k.op2(.fsub, .f32, r(xv), r(o))), r(k.op2(.fsub, .f32, r(o), r(xv)))));
+        const d = k.sel(.f32, r(odd), r(k.op2(.fsub, .f32, r(xv), r(o))), r(k.op2(.fsub, .f32, r(o), r(xv))));
+        if (g.depth == 0) return r(d);
+        // (inside flow: a neighbour that does not run it here (the quad
+        // split by it) gave whatever its register last held, an undefined
+        // derivative that could be NaN or huge (a shader that makes a
+        // count or a step of a level of detail could loop for ever on it;
+        // the RTX hung now and then in Superposition's loading with it so):
+        // 0 there, as before)
+        const nb = k.op2(.xor, .u32, r(k.lane()), u(q));
+        const word = k.sel(.u32, r(k.cmp(.u32, .lt, r(nb), u(32))), r(k.ballot(r(k.mov(.pred, u(1))), 0)), r(k.ballot(r(k.mov(.pred, u(1))), 1)));
+        const bit = k.op2(.@"and", .u32, r(k.op2(.shr, .u32, r(word), r(k.op2(.@"and", .u32, r(nb), u(31))))), u(1));
+        return r(k.sel(.f32, r(k.cmp(.u32, .ne, r(bit), u(0))), r(d), f(0)));
     }
 
     // ── Textures ──
