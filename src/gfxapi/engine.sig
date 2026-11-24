@@ -1305,6 +1305,10 @@ pub const Config = struct {
     graphics_depth: bool = true,
     /// Use GPU-local images on discrete GPUs.
     vram_images: bool = true,
+    /// Small images and buffers (in slabs) to VRAM too: each slab a VRAM
+    /// twin of its size, an object at the same place in it (galaxy-pe's
+    /// textures and vertex and index buffers; GL's keep to system memory).
+    vram_slabs: bool = false,
 };
 
 /// A kernel the CPU ran, kept in Config.cpu_kernels: what it was built
@@ -1329,6 +1333,9 @@ const MAX_SLAB_OBJECT = 256 << 10;
 pub const Slab = struct {
     buf: gpu.Buffer = .{},
     pool: Pool = .{},
+    /// its VRAM twin (Config.vram_slabs), made at its first object's move:
+    /// an object in VRAM at its place in the slab
+    vram: gpu.Buffer = .{},
 };
 
 /// GALAXY_GL_CHECK: the GPU's work checked against the CPU's, which is
@@ -1481,6 +1488,8 @@ pub const Engine = struct {
     compute_only: bool = false,
     /// Images go to VRAM (Config.vram_images, a discrete GPU, no check).
     vram_images: bool = false,
+    /// and slabs' objects too (Config.vram_slabs)
+    vram_slabs: bool = false,
     /// Images in VRAM now, and their bytes (stats).
     vram_count: u32 = 0,
     said_graphics: bool = false,
@@ -1597,6 +1606,7 @@ pub const Engine = struct {
         e.depth_float = e.graphics and cfg.depth_float and cfg.graphics_depth;
         e.block_targets = e.graphics and cfg.block_targets;
         if (cfg.dev) |d| e.vram_images = cfg.vram_images and d.caps.memory == .discrete and cfg.check.mem.len == 0;
+        e.vram_slabs = e.vram_images and cfg.vram_slabs;
         for (e.slabs) |*slab| slab.* = .{};
         const d = cfg.dev orelse return;
         e.loadAll(d, cfg.compiler, cfg.work) catch |err| {
@@ -1651,6 +1661,7 @@ pub const Engine = struct {
             if (!e.lost) for (&e.progs) |*p| d.unload(p);
             for (e.slabs) |*slab| {
                 if (slab.buf.cpu.len != 0) d.free(slab.buf);
+                if (slab.vram.gpu != 0) d.free(slab.vram);
                 slab.* = .{};
             }
         }
@@ -1736,7 +1747,10 @@ pub const Engine = struct {
     }
 
     fn freeGpu(e: *Engine, d: gpu.Device, b: gpu.Buffer) void {
-        if (e.slabOf(b)) |slab| slab.pool.free(b.cpu) else d.free(b);
+        if (e.slabOf(b)) |slab| return slab.pool.free(b.cpu);
+        // (a place in a slab's VRAM twin: the slab's own span frees it)
+        for (e.slabs) |*slab| if (slab.vram.gpu != 0 and slab.vram.handle == b.handle) return;
+        d.free(b);
     }
 
     fn freeBytes(e: *Engine, b: gpu.Buffer, pooled: bool, last: u64) void {
@@ -4498,11 +4512,10 @@ pub const Engine = struct {
     /// where images go there: its memory now the shadow, all of which VRAM
     /// takes at its first GPU use. Left where it is when VRAM has no room.
     fn toVram(e: *Engine, img: *Image) void {
-        if (!e.vram_images or !e.onGpu() or img.pooled or img.share != null or !img.own) return;
-        if (e.slabOf(img.buf) != null) return;
+        if (!e.vram_images or !e.onGpu() or img.pooled or img.share != null or !img.own or img.vram != null) return;
         const n = img.buf.cpu.len;
         if (n == 0 or n % 4 != 0) return;
-        const v = e.dev.?.alloc(n, .device) catch return;
+        const v = if (e.slabOf(img.buf)) |slab| e.slabVram(slab, img.buf, n) orelse return else e.dev.?.alloc(n, .device) catch return;
         if (v.gpu == 0) {
             e.dev.?.free(v);
             return;
@@ -4513,6 +4526,22 @@ pub const Engine = struct {
         img.track.dirty_lo = 0;
         img.track.dirty_hi = n;
         e.vram_count += 1;
+    }
+
+    /// A slab object's place in the slab's VRAM twin (made now if it is
+    /// not yet), or null (Config.vram_slabs off, no VRAM for it).
+    fn slabVram(e: *Engine, slab: *Slab, b: gpu.Buffer, n: usize) ?gpu.Buffer {
+        if (!e.vram_slabs) return null;
+        if (slab.vram.gpu == 0) {
+            const v = e.dev.?.alloc(slab.buf.cpu.len, .device) catch return null;
+            if (v.gpu == 0 or v.bytes < slab.buf.cpu.len) {
+                e.dev.?.free(v);
+                return null;
+            }
+            slab.vram = v;
+        }
+        const off = @intFromPtr(b.cpu.ptr) - @intFromPtr(slab.buf.cpu.ptr);
+        return .{ .gpu = slab.vram.gpu + off, .bytes = n, .handle = slab.vram.handle, .kind = slab.vram.kind };
     }
 
     /// `img` back in system memory (its shadow made current): an image
@@ -4591,7 +4620,7 @@ pub const Engine = struct {
                 t.dirty_lo = @min(t.dirty_lo, off);
                 t.dirty_hi = @max(t.dirty_hi, off + len);
             }
-            e.dev.?.toDevice(img.host, off, len);
+            e.hostToDevice(img.host, off, len);
             return;
         }
         if (!e.gpuUsable(img)) return;
@@ -4606,11 +4635,22 @@ pub const Engine = struct {
         } else e.dev.?.toDevice(img.buf, off, len);
     }
 
+    /// An image's shadow handed to (taken from) the device: a slab
+    /// object's as its place in the slab (the device knows the slab).
+    fn hostToDevice(e: *Engine, b: gpu.Buffer, off: usize, len: usize) void {
+        if (e.slabOf(b)) |slab| return e.dev.?.toDevice(slab.buf, @intFromPtr(b.cpu.ptr) - @intFromPtr(slab.buf.cpu.ptr) + off, len);
+        e.dev.?.toDevice(b, off, len);
+    }
+    fn hostFromDevice(e: *Engine, b: gpu.Buffer, off: usize, len: usize) void {
+        if (e.slabOf(b)) |slab| return e.dev.?.fromDevice(slab.buf, @intFromPtr(b.cpu.ptr) - @intFromPtr(slab.buf.cpu.ptr) + off, len);
+        e.dev.?.fromDevice(b, off, len);
+    }
+
     fn fromDevice(e: *Engine, img: *const Image, off: usize, len: usize) void {
         if (!e.gpuUsable(img)) return;
         if (img.vram != null) {
             e.vramOut(@constCast(img));
-            e.dev.?.fromDevice(img.host, off, len);
+            e.hostFromDevice(img.host, off, len);
             return;
         }
         if (e.slabOf(img.buf)) |slab| {
