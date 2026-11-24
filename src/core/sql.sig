@@ -3201,6 +3201,11 @@ pub fn Database(comptime config: Config) type {
                     try self.alterTable(slot, alter, snap);
                     break :blk 0;
                 },
+                .legacy_attribute_options => |options| blk: {
+                    try self.lockTable(slot, options.table, .share_update_exclusive);
+                    if (options.validation) |err| return err;
+                    break :blk 0;
+                },
                 .alter_sequence => |*alter| blk: {
                     try self.alterSequence(slot, alter.slot, alter.options, alter.ownership, snap);
                     break :blk 0;
@@ -3235,7 +3240,8 @@ pub fn Database(comptime config: Config) type {
                 .create_table => |*create| create.plan != ast.none,
                 else => false,
             };
-            self.outcome = .{ .affected = affected, .command = B.command(&bound), .create_query_data = create_query_data, .noop = bound == .noop };
+            self.outcome = .{ .affected = affected, .command = B.command(&bound), .create_query_data = create_query_data,
+                .noop = bound == .noop or bound == .legacy_attribute_options };
             if (bound == .insert) {
                 const tx = &self.txs[slot];
                 self.outcome.mysql_generated_id = tx.mysql_first_generated;
@@ -5177,6 +5183,7 @@ pub fn Database(comptime config: Config) type {
                 .drop_table => |table_slot| try self.needOwner(table_slot, snap),
                 .drop_relation => |*drop| try self.needOwner(drop.slot, snap),
                 .alter_table => |*alter| try self.needOwner(alter.table, snap),
+                .legacy_attribute_options => |options| try self.needOwner(options.table, snap),
                 .refresh_view => |*refresh| try self.needOwner(refresh.slot, snap),
                 .create_table => |*create| if (self.dialect != .postgres or !create.plain_definition) return error.InsufficientPrivilege,
                 .create_sequence, .drop_sequence, .alter_sequence, .create_schema => return error.InsufficientPrivilege,

@@ -987,6 +987,7 @@ pub fn Ast(comptime config: types.Config) type {
             },
             set_not_null: Ident,
             drop_not_null: Ident,
+            legacy_attribute_options: Ident,
             add_constraint: ConstraintDef,
             drop_constraint: struct { name: Ident, if_exists: bool = false },
             rename_table: Ident,
