@@ -130,6 +130,7 @@ const array_module = @import("sql/array.sig");
 pub const Tokenizer = lexer.Tokenizer;
 pub const PostgresStatements = lexer.PostgresStatements;
 pub const Config = types.Config;
+pub const HashLoad = storage.HashLoad;
 /// Per-statement session values (TimeZone, zone resolver, clocks).
 pub const Session = value_module.Session;
 pub const bootstrap_role_name = CO.bootstrap_name;
@@ -1942,6 +1943,8 @@ pub fn Database(comptime config: Config) type {
         pub const TableBudget = struct {
             rows: usize,
             versions: usize,
+            /// Opt in to a higher maximum load for the row and version indexes.
+            hash_load: HashLoad = .half,
             /// Zero selects dense rows. A nonzero integral bank reserves
             /// this many u64 words per version, including the null bitmap.
             /// CREATE uses the first compatible free bank in caller order.
@@ -1978,8 +1981,8 @@ pub fn Database(comptime config: Config) type {
             for (&layout.offsets, &layout.row_index, &layout.key_index, budgets) |*offsets,*row_index,*key_index,budget| {
                 const rows=budget.rows; const versions=budget.versions;
                 if (rows == 0 or rows > 0x7fffffff or versions <= rows or versions > 0x7fffffff or versions > ~@as(usize,0)/4) return error.InvalidParameterValue;
-                var ri:usize=2; while(ri<rows*2) ri*=2;
-                var ki:usize=2; while(ki<versions*2) ki*=2;
+                const ri = try budget.hash_load.slotsFor(rows);
+                const ki = try budget.hash_load.slotsFor(versions);
                 row_index.*=ri; key_index.*=ki;
                 offsets[0] = try appendLayout(&cursor, S.RowSlot, rows);
                 offsets[1] = try appendLayout(&cursor, S.Version, versions);
@@ -2088,6 +2091,7 @@ pub fn Database(comptime config: Config) type {
                     .integral_row_words = if (S.integral_enabled) budget.integral_row_words else {},
                     .row_index = try storageView(u32, bytes, offsets[2], ri),
                     .key_index = try storageView(u32, bytes, offsets[3], ki),
+                    .hash_load = budget.hash_load,
                     .scan_values = try storageView(i64, bytes, offsets[4], scan_rows * config.columns),
                     .scan_nonnull = try storageView(u64, bytes, offsets[5], scan_rows),
                     .scan_live = try storageView(u8, bytes, offsets[6], scan_rows),
