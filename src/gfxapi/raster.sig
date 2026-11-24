@@ -975,11 +975,15 @@ pub fn stageParams(d: *const Draw, out: []u32) []u32 {
 /// the stage's words (0), the uniforms, the element array, each
 /// attribute's buffer, the textures, the buffers.
 const StageBindings = struct { io: u8, uni: u8, idx: u8, attr: [MAX_ATTRS]u8, tex: u8, buf: u8 };
+/// A graphics stage's uniforms binding (stageBindings' second): the one
+/// the engine has the RTX's programs read as constant buffer 1.
+pub const UNI_BINDING: u8 = 1;
 
 fn stageBindings(k: *kir.Kernel, sh: Shaders) StageBindings {
     var b: StageBindings = undefined;
     b.io = k.binding();
     b.uni = k.binding();
+    std.debug.assert(b.uni == UNI_BINDING);
     b.idx = k.binding();
     for (&b.attr) |*x| x.* = k.binding();
     b.tex = k.bindings;

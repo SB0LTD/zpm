@@ -312,6 +312,9 @@ pub fn StateOf(comptime L: Limits) type {
         n_mi: usize = 0,
         /// KIR instructions after the expansions.
         n_kir: u32 = 0,
+        /// Options.uni_bank's bytes the program reads through constant
+        /// buffer 1 (0: none).
+        bank1: u32 = 0,
         nv: u32 = 0,
         cls: [L.vregs]Cls = undefined,
         /// A register's unit (an aligned run it is allocated in) and place.
@@ -394,6 +397,11 @@ pub const Options = struct {
     /// A stage's attribute words and outputs: the binding its loads and
     /// stores name (one the kernel declares, never bound to memory).
     stage_io: u8 = 0xff,
+    /// A graphics stage's binding the draw binds as constant buffer 1
+    /// (raster's uniforms): its loads at a fixed place in the first 32 KiB
+    /// are LDC c[0x1][..], the constant cache's (a word each warp reads
+    /// once, helper lanes too), not LDG; EXTRA_BANK1 says the bytes read.
+    uni_bank: u8 = 0xff,
     /// A compute kernel's straight-line runs list-scheduled (see
     /// Ctx.schedule); off, the machine instructions stay in KIR's order. A
     /// kernel the registers cannot hold scheduled is compiled again
@@ -468,6 +476,9 @@ pub const EXTRA_PARAM_BYTES = 3;
 /// after the expansions (MAX_INSTS), and machine instructions and labels
 /// before the text (MAX_MI) << 16 | virtual registers / 2 (MAX_VREGS).
 pub const EXTRA_KIR = 4;
+/// A graphics stage's bytes of Options.uni_bank's binding it reads as
+/// constant buffer 1 (0: it reads none so; the draw need not bind it).
+pub const EXTRA_BANK1 = 8;
 pub const EXTRA_MI_VREGS = 5;
 
 // ── Compiling ───────────────────────────────────────────────────────────────
@@ -514,6 +525,7 @@ pub fn compileIn(k: *const kir.Kernel, caps: device.Caps, st: anytype, out: []u8
     bin.extra[EXTRA_PARAM_BYTES] = ak.params;
     bin.extra[EXTRA_KIR] = st.n_kir;
     bin.extra[EXTRA_MI_VREGS] = @as(u32, @intCast(st.n_mi)) << 16 | (st.nv >> 1);
+    bin.extra[EXTRA_BANK1] = st.bank1;
     return bin;
 }
 
@@ -531,6 +543,7 @@ pub fn compileText(k: *const kir.Kernel, caps: device.Caps, st: anytype, opts: O
 
 fn compileTextOnce(k: *const kir.Kernel, caps: device.Caps, st: anytype, opts: Options) Error![]const u8 {
     const gen = genOf(caps.target) orelse SM120;
+    st.bank1 = 0;
     var c = CtxOf(@TypeOf(st.*)){ .w = st, .caps = caps, .gen = gen, .k = k, .opts = opts };
     try c.expand();
     c.forward();
@@ -2467,6 +2480,7 @@ fn CtxOf(comptime St: type) type {
             const m: kir.Mem = @bitCast(in.aux);
             if (c.isStageIO(m)) return c.stageLoad(in, m);
             if (m.width_log2 < 3) return error.BadOperand;
+            if (try c.bankLoad(in, m)) return;
             if (m.space == .global) {
                 const ad = try c.gaddr(m, in.a);
                 // A pixel program's helper lanes (a 2x2 quad's pixels the
@@ -2489,6 +2503,34 @@ fn CtxOf(comptime St: type) type {
                 const ad = try c.saddr(m, in.a);
                 try c.ins(sizeName("LDS", m), 1, &.{ c.dst(in), ad });
             }
+        }
+
+        /// A graphics stage's load from Options.uni_bank's binding at a fixed
+        /// place in its first 32 KiB (LDC's offset is 16 bits, signed): LDC
+        /// c[0x1][..] (a 128-bit one two LDC.64), the constant cache's,
+        /// which every lane of a warp reads at once and helper lanes too.
+        /// Superposition's composite pass made 1,055 LDG (its constants and
+        /// its textures' descriptor words, again for each of 72 samples),
+        /// each a load from memory per pixel. False: not such a load.
+        fn bankLoad(c: *Ctx, in: kir.Inst, m: kir.Mem) Error!bool {
+            if (c.opts.stage == .compute or m.space != .global or m.binding != c.opts.uni_bank or in.a != .imm) return false;
+            const off: i64 = @as(i64, m.imm) + in.a.imm;
+            const bytes: i64 = @as(i64, 1) << @intCast(m.width_log2 - 3);
+            if (off < 0 or off + bytes > 0x8000 or m.width_log2 < 5 or @rem(off, @min(bytes, 8)) != 0) return false;
+            const place: u32 = @intCast(off);
+            const d = @intFromEnum(in.dst);
+            const bank: u32 = 1 << 24;
+            switch (m.width_log2) {
+                5 => try c.ins("LDC", 1, &.{ c.dst(in), .{ .cbuf = bank | place } }),
+                6 => try c.ins("LDC.64", 1, &.{ c.dst(in), .{ .cbuf = bank | place } }),
+                7 => {
+                    try c.ins("LDC.64", 1, &.{ R(d), .{ .cbuf = bank | place } });
+                    try c.ins("LDC.64", 1, &.{ R(d + 2), .{ .cbuf = bank | (place + 8) } });
+                },
+                else => return false,
+            }
+            c.w.bank1 = @max(c.w.bank1, place + @as(u32, @intCast(bytes)));
+            return true;
         }
 
         /// A pixel program's uniform global load (its address the same in
@@ -3255,8 +3297,11 @@ fn CtxOf(comptime St: type) type {
                 .pt => |b| t.str(if (b) "PT" else "!PT"),
                 .imm => |x| t.hex(x),
                 .cbuf => |x| {
-                    t.str("c[0x0][");
-                    t.hex(x);
+                    // (the bank in the top byte: Options.uni_bank's 1)
+                    t.str("c[");
+                    t.hex(x >> 24);
+                    t.str("][");
+                    t.hex(x & 0xff_ffff);
                     t.str("]");
                 },
                 .attr => |x| {

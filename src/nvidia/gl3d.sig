@@ -251,6 +251,10 @@ pub const Draw = struct {
     /// Constant buffer 0 of both stages (64-byte aligned, 64 KiB at most).
     cb_va: u64,
     cb_bytes: u32,
+    /// Constant buffer 1 of both stages (the programs' uniforms, read with
+    /// LDC c[0x1][..]: 256-byte aligned, 64 KiB at most); 0 bytes: none.
+    cb1_va: u64 = 0,
+    cb1_bytes: u32 = 0,
     /// A page of zeros (what an attribute with no stream reads, and the
     /// pools' place: the programs sample nothing).
     zero_va: u64,
@@ -731,6 +735,11 @@ fn emitDraw(p: *Push, d: *const Draw, whole: bool) void {
     many(p, gr.SET_CONSTANT_BUFFER_SELECTOR_A, &.{ d.cb_bytes, @truncate(d.cb_va >> 32), @truncate(d.cb_va) });
     one(p, gr.BIND_GROUP_CONSTANT_BUFFER + 32 * gr.GROUP_VERTEX, 1);
     one(p, gr.BIND_GROUP_CONSTANT_BUFFER + 32 * gr.GROUP_PIXEL, 1);
+    if (d.cb1_bytes != 0) {
+        many(p, gr.SET_CONSTANT_BUFFER_SELECTOR_A, &.{ d.cb1_bytes, @truncate(d.cb1_va >> 32), @truncate(d.cb1_va) });
+        one(p, gr.BIND_GROUP_CONSTANT_BUFFER + 32 * gr.GROUP_VERTEX, 1 | 1 << 4);
+        one(p, gr.BIND_GROUP_CONSTANT_BUFFER + 32 * gr.GROUP_PIXEL, 1 | 1 << 4);
+    }
     if (whole) one(p, gr.INVALIDATE_SHADER_CACHES_NO_WFI, 0x1001); // the code and the constants
     // the texture unit's pools (each draw's: a run's draws may name others)
     if (d.tex) |t| {

@@ -1506,6 +1506,10 @@ pub const Engine = struct {
     /// Samples through the GPU's texture unit where the device has one
     /// (off: every pixel program samples in its own code; to compare).
     tex_unit: bool = true,
+    /// The RTX's programs read their uniforms' fixed words as constant
+    /// buffer 1 (LDC; kir_sm120.Options.uni_bank); off, every one an LDG
+    /// (to compare).
+    cbank: bool = true,
     /// The 3D engine's last refusal (graphicsDraw's), and the float
     /// targets' draws not drawn, said once each by refusal and target
     /// shape (the compute raster writes 8-bit pixels).
@@ -2944,6 +2948,10 @@ pub const Engine = struct {
         return true;
     }
 
+    fn uniBank(e: *const Engine) u8 {
+        return if (e.cbank) raster.UNI_BINDING else 0xff;
+    }
+
     /// loadGraphics's compiles and loads, with the compiler's state `st`.
     fn loadStages(e: *Engine, p: *raster.Pipeline, st: anytype) anyerror!void {
         const d = e.dev.?;
@@ -2952,7 +2960,7 @@ pub const Engine = struct {
         st.asm_work.sched = .{};
         var pk = raster.pixelStage(s, p, d.caps.tex and e.tex_unit);
         try pk.finish();
-        const pbin = try gl.compileStage(&pk, d.caps, st, .pixel, 0, &e.pcode);
+        const pbin = try gl.compileStageBank(&pk, d.caps, st, .pixel, 0, e.uniBank(), &e.pcode);
         const reads = st.io.loads;
         const pprog = try d.load(&pbin);
         st.asm_work.sched = .{};
@@ -2961,7 +2969,7 @@ pub const Engine = struct {
             d.unload(&pprog);
             return err;
         };
-        const vbin = gl.compileStage(&vk, d.caps, st, .vertex, 0, &e.pcode) catch |err| {
+        const vbin = gl.compileStageBank(&vk, d.caps, st, .vertex, 0, e.uniBank(), &e.pcode) catch |err| {
             d.unload(&pprog);
             return err;
         };
@@ -2991,12 +2999,12 @@ pub const Engine = struct {
             pk.finish() catch |err| break :blk err;
             if (w.take(K.LargeState, 1)) |large| {
                 large[0].asm_work.sched = .{};
-                const bin = gl.compileStage(&pk, d.caps, &large[0], .pixel, 0, &e.pcode) catch |err| break :blk err;
+                const bin = gl.compileStageBank(&pk, d.caps, &large[0], .pixel, 0, e.uniBank(), &e.pcode) catch |err| break :blk err;
                 break :blk d.load(&bin);
             }
             const st = &(w.take(K.State, 1) orelse break :blk error.OutOfMemory)[0];
             st.asm_work.sched = .{};
-            const bin = gl.compileStage(&pk, d.caps, st, .pixel, 0, &e.pcode) catch |err| break :blk err;
+            const bin = gl.compileStageBank(&pk, d.caps, st, .pixel, 0, e.uniBank(), &e.pcode) catch |err| break :blk err;
             break :blk d.load(&bin);
         };
         p.gfx_soft = loaded catch |err| {
@@ -3095,6 +3103,15 @@ pub const Engine = struct {
         bs[0] = &e.zero;
         var uni = e.uniformsFor(d.uniforms) orelse return false;
         defer e.freeImage(&uni);
+        // (programs that read their uniforms as constant buffer 1 (LDC)
+        // need them on 256 bytes, which the ring's places are; a buffer of
+        // their own may not be)
+        if (uni.buf.gpu % 256 != 0) for ([_]?gpu.Program{ p.gfx[0], p.gfx[1], p.gfx_soft }) |q| {
+            if (q != null and q.?.bin.extra[gpu.nvidia_device.kir_sm120.EXTRA_BANK1] != 0) {
+                e.sayCompute("its uniforms not on 256 bytes, which its programs read as a constant buffer");
+                return null;
+            }
+        };
         bs[1] = &uni;
         bs[2] = d.index orelse &e.zero;
         for (d.attrs, 0..) |a, j| bs[3 + j] = if (a.buf != null and a.comps != 0) a.buf.? else &e.zero;

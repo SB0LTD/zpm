@@ -317,6 +317,9 @@ pub const Adapter = struct {
     runs: u64 = 0,
     /// The waits for idle the last run took between its dispatches.
     barriers: u32 = 0,
+    /// Every run's waits for idle, added up (a trace's: draws that waited
+    /// for each other or for a kernel between them).
+    barriers_all: u64 = 0,
     /// Each dispatch's end timed (Device.profile).
     profiling: bool = false,
     indirect_progs: ?IndirectProgs = null,
@@ -686,6 +689,7 @@ pub const Adapter = struct {
         }
         p.method(push.SUBCH_COMPUTE, WAIT_FOR_IDLE, &.{0});
         p.reportTimestamp(s.stamps.va + 16, 2);
+        a.barriers_all += a.barriers;
         p.check() catch return error.Unsupported;
         a.vram.toDevice(s.slots, 0, (ds.len + extra) * SLOT_BYTES);
         const host = a.rawOf(true);
@@ -774,6 +778,15 @@ pub const Adapter = struct {
         _ = qmd.cbuf0Into(cb, .{ 1, 1, 1 }, .{ 1, 1, 1 }, params[0..n]) catch return error.BadProgram;
     }
 
+    /// The bytes of binding 1 (raster's uniforms) a draw's programs read
+    /// as constant buffer 1 (kir_sm120.EXTRA_BANK1), whole 256s; 0 when
+    /// they read none so, or the buffer cannot be bound (not on 256 bytes).
+    fn bank1Bytes(g: *const gpu.Graphics, d: gpu.Dispatch) u32 {
+        const n = @max(g.vertex.bin.extra[kir_sm120.EXTRA_BANK1], d.prog.bin.extra[kir_sm120.EXTRA_BANK1]);
+        if (n == 0 or d.buffers.len < 2 or d.buffers[1].gpu % 256 != 0) return 0;
+        return @min(std.mem.alignForward(u32, n, 256), 0x1_0000);
+    }
+
     /// A graphics dispatch as the 3D engine's state.
     fn drawOf(a: *const Adapter, s: *const Set, slot: usize, d: gpu.Dispatch, g: *const gpu.Graphics) gl3d.Draw {
         const nw = @max(g.vertex.bin.param_words, d.prog.bin.param_words);
@@ -782,6 +795,10 @@ pub const Adapter = struct {
             .pixel = .{ .va = d.prog.code.gpu, .registers = @max(d.prog.bin.regs, 16), .bytes = d.prog.bin.code.len },
             .cb_va = s.slots.va + slot * SLOT_BYTES + CBUF_AT,
             .cb_bytes = qmd.cbuf0Bytes(8 * d.buffers.len + 4 * nw),
+            // (constant buffer 1: the uniforms binding the programs read
+            // with LDC, as many bytes as they read, whole 256s)
+            .cb1_va = if (bank1Bytes(g, d) != 0) d.buffers[1].gpu else 0,
+            .cb1_bytes = bank1Bytes(g, d),
             .zero_va = a.zero.va,
             .target = .{ .va = g.va, .width = g.width, .height = g.height, .pitch = g.stride },
             .format = formatOf(g.format),

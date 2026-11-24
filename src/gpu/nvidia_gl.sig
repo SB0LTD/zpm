@@ -80,8 +80,15 @@ pub fn ioMem(io: u8, at: u32, flat: bool) kir.Mem {
 /// the Binary's code being both (the 3D engine is given the header's
 /// address). `st` is the compiler's State (or LargeState).
 pub fn compileStage(k: *const kir.Kernel, caps: device.Caps, st: anytype, stage: Stage, io: u8, out: []u8) kir_sm120.Error!device.Binary {
+    return compileStageBank(k, caps, st, stage, io, 0xff, out);
+}
+
+/// compileStage with `uni`'s fixed loads through constant buffer 1
+/// (kir_sm120.Options.uni_bank: raster's uniforms; the draw binds the
+/// binding's buffer there when the binary's EXTRA_BANK1 is not 0).
+pub fn compileStageBank(k: *const kir.Kernel, caps: device.Caps, st: anytype, stage: Stage, io: u8, uni: u8, out: []u8) kir_sm120.Error!device.Binary {
     if (stage == .compute or out.len < sph.BYTES) return error.Unsupported;
-    var bin = try kir_sm120.compileIn(k, caps, st, out[sph.BYTES..], .{ .stage = stage, .stage_io = io });
+    var bin = try kir_sm120.compileIn(k, caps, st, out[sph.BYTES..], .{ .stage = stage, .stage_io = io, .uni_bank = uni });
     const head = header(stage, &st.io);
     for (head, 0..) |w, n| std.mem.writeInt(u32, out[n * 4 ..][0..4], w, .little);
     bin.code = out[0 .. sph.BYTES + bin.code.len];
