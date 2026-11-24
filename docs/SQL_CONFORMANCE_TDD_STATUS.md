@@ -9,6 +9,10 @@ cover overload selection, NULL, timestamp infinity, invalid strides and
 range overflow. PostgreSQL 18 infinite interval values remain open as
 a separate temporal type gap.
 
+Stock restore exposed an incorrect TEXT cast on an untyped function
+argument in a stored bucket expression. The expression writer preserves
+unknown call arguments so native restore resolves the same overload.
+
 ## Temporal `OVERLAPS`
 
 The original date-only inventory query already passed. New cases exposed

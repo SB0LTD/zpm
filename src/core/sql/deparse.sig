@@ -282,9 +282,12 @@ pub fn Deparse(comptime config: types.Config) type {
                     while (item != none) : (item = context.node(item).next) {
                         if (!first) try w.bytes(", ");
                         const argument = context.node(item);
-                        if (first and types.same(name, "nextval") and argument.kind == .text_literal) {
+                        if (argument.kind == .text_literal and !argument.collate_clause) {
+                            // An unbound call argument has type unknown. Keep
+                            // its overload resolution when PostgreSQL reads
+                            // the expression back, instead of forcing TEXT.
                             try quotedLiteral(context, argument, w);
-                            try w.bytes("::regclass");
+                            if (first and types.same(name, "nextval")) try w.bytes("::regclass");
                         } else try expression(context, item, w);
                         first = false;
                     }

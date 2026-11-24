@@ -676,6 +676,11 @@ fn dateBins() void {
     rejects("SELECT date_bin('1000000000 days', TIMESTAMP '2025-01-01', TIMESTAMP '2020-01-01')", error.DatetimeFieldOverflow);
     rejects("SELECT date_bin('1 week', TIMESTAMP '294276-12-30', TIMESTAMP '4713-01-02 BC')", error.DatetimeFieldOverflow);
     rejects("SELECT date_bin('1 day', TIMESTAMP '2025-01-01', TIMESTAMP '-infinity')", error.DatetimeFieldOverflow);
+    _ = run("CREATE TABLE bin_events (happened timestamp, bucket timestamp GENERATED ALWAYS AS " ++
+        "(date_bin('15 minutes', happened, TIMESTAMP '2000-01-01')) STORED)");
+    value("SELECT pg_get_expr(adbin,adrelid) FROM pg_attrdef WHERE adrelid='bin_events'::regclass", 25,
+        "date_bin('15 minutes', happened, '2000-01-01'::timestamp without time zone)");
+    _ = run("DROP TABLE bin_events");
     report("date-bin", before);
 }
 
