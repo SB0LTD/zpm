@@ -2,6 +2,19 @@
 
 ## Stock PostgreSQL dump and restore candidate
 
+PostgreSQL 16 and 18 use `SET quote_all_identifiers = true` for both
+`pg_dump --quote-all-identifiers` and `pg_dumpall --quote-all-identifiers`.
+The candidate tracks the setting per session, including LOCAL, rollback,
+RESET, and startup options. Structured catalog SQL quotes index, constraint,
+partition, trigger and qualified names through the usual writer. Catalog
+type output preserves PostgreSQL's SQL grammar spellings and quotes its
+other identifiers. The parser resolves quoted and pg_catalog-qualified
+built-in types and quoted index methods. PostgreSQL parameter inference
+preserves schema qualification and quoted relation names in its catalog
+probe. The PG16 and PG18 CI lanes passed all 42 stock checks. Stored views
+and expressions emitted from source text still need a PostgreSQL deparser.
+[Stock tooling CI](https://github.com/SB0LTD/ramsql/actions/runs/45282665508)
+
 Stock `pg_dumpall --roles-only --no-role-passwords` reached the
 `pg_parameter_acl` catalog query after emitting role memberships on
 PostgreSQL 16 and 18. The candidate exposes the typed catalog and makes

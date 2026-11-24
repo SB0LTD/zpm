@@ -82,8 +82,8 @@ fn bareIdentifier(text: []const u8) bool {
     return true;
 }
 
-pub fn quoteSql(text: []const u8, identifier: bool, out: *Out, control: Control) Error!void {
-    if (identifier and bareIdentifier(text)) return out.append(text);
+pub fn quoteSql(text: []const u8, identifier: bool, quote_all: bool, out: *Out, control: Control) Error!void {
+    if (identifier and !quote_all and bareIdentifier(text)) return out.append(text);
     const quote: u8 = if (identifier) '"' else '\'';
     const escape = !identifier and @import("std").mem.indexOfScalar(u8, text, '\\') != null;
     if (escape) try out.byte('E');

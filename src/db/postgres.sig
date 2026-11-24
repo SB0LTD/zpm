@@ -1765,32 +1765,36 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             var tokens: Tokens = .{ .source = s.source() };
             const first = try tokens.next();
             if (keyword(first, "select") and try inferExplicitSelectCasts(s, tokens)) return;
-            var table: []const u8 = "";
+            var table: ?Tokens.Relation = null;
             if (keyword(first, "insert")) {
                 if (!keyword(try tokens.next(), "into")) return error.Syntax;
-                table = try tokens.next();
-            } else if (keyword(first, "update")) table = try tokens.next() else if (keyword(first, "select") or keyword(first, "delete")) {
+                table = try tokens.relation();
+            } else if (keyword(first, "update")) table = try tokens.relation() else if (keyword(first, "select") or keyword(first, "delete")) {
                 while (true) {
                     const token = try tokens.next();
                     if (token.len == 0) break;
                     if (keyword(token, "from")) {
-                        table = try tokens.next();
+                        table = try tokens.relation();
                         break;
                     }
                 }
             }
-            if (table.len == 0 and keyword(first, "select")) {
+            if (table == null and keyword(first, "select")) {
                 // A constant SELECT has no relation. Apply the same unknown
                 // text fallback used below; explicit SQL casts still bind in
                 // the engine. This is not general expression type inference.
                 for (s.oids[0..s.count]) |*oid| if (oid.* == 0) { oid.* = 25; };
                 return;
             }
-            if (table.len == 0 or !identifier(table)) return error.UnsupportedStatement;
+            const target = table orelse return error.UnsupportedStatement;
             var text: [sql_capacity]u8 = undefined;
             var q: Writer = .{ .bytes = &text };
             try q.append("SELECT * FROM ");
-            try q.append(table);
+            if (target.schema) |schema| {
+                try q.append(schema);
+                try q.append(".");
+            }
+            try q.append(target.name);
             try q.append(" LIMIT 0");
             if (@hasDecl(DB, "describe")) {
                 db.describe(q.bytes[0..q.at], &self.result) catch |err| {
@@ -2494,8 +2498,26 @@ fn identifier(token: []const u8) bool {
 // Inference and DEALLOCATE use the same tokenizer as execution, while keeping
 // quoted delimiters in their borrowed source spans for existing name handling.
 const Tokens = struct {
+    const Relation = struct { schema: ?[]const u8 = null, name: []const u8 };
+
     source: []const u8,
     at: usize = 0,
+
+    fn name(self: *Tokens) ![]const u8 {
+        const token = try self.next();
+        if (!identifier(token) and !(token.len >= 2 and token[0] == '"')) return error.UnsupportedStatement;
+        return token;
+    }
+
+    fn relation(self: *Tokens) !Relation {
+        const first = try self.name();
+        var rest = self.*;
+        if (!equal(try rest.next(), ".")) return .{ .name = first };
+        const relation_name = try rest.name();
+        self.* = rest;
+        return .{ .schema = first, .name = relation_name };
+    }
+
     fn next(self: *Tokens) ![]const u8 {
         var tokenizer: sql.Tokenizer = .{ .source = self.source, .position = self.at, .text_limit = self.source.len };
         const token = try tokenizer.next();

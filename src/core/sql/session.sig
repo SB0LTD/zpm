@@ -84,6 +84,7 @@ pub fn Sessions(comptime config: types.Config) type {
             check_function_bodies: bool = true,
             row_security: bool = true,
             synchronize_seqscans: bool = true,
+            quote_all_identifiers: bool = false,
             restricted_relation_kinds: RelationKinds = .{},
             restriction_text: SettingText = .{},
             search_path: SettingText = SettingText.literal("\"$user\", public"),

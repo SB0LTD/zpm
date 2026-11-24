@@ -353,7 +353,7 @@ pub fn Parser(comptime config: types.Config) type {
             try self.advance();
             if (self.current.kind == .end) return null;
             const name = try self.identifier();
-            if (!typeWord(self.current) and !self.internalCharName() and !(try self.internalCharQualifier())) {
+            if (!typeWord(self.current) and !(try self.catalogTypeAhead())) {
                 if (self.current.kind == .word or self.current.kind == .quoted_word) return error.UnsupportedStatement;
                 return error.Syntax;
             }
@@ -548,7 +548,7 @@ pub fn Parser(comptime config: types.Config) type {
             out.table = try self.qualifiedName();
             if (try self.takeWord("USING")) {
                 // Hash entries serve btree and hash requests; others are 0A000.
-                if (!try self.takeRaw("btree") and !try self.takeRaw("hash")) return error.UnsupportedStatement;
+                try self.accessMethod(false);
             }
             try self.expectSymbol(.lparen);
             while (true) {
@@ -1678,16 +1678,52 @@ pub fn Parser(comptime config: types.Config) type {
             return (try lookahead.next()).kind == .string;
         }
 
+        fn catalogRegTypmod(name: []const u8) ?i32 {
+            if (types.same(name, "regclass")) return ast.regclass_typmod;
+            if (types.same(name, "regnamespace")) return ast.regnamespace_typmod;
+            if (types.same(name, "regtype")) return ast.regtype_typmod;
+            return null;
+        }
+
+        fn catalogQualifierAhead(self: *Self) Error!bool {
+            if (!(self.rawWord("pg_catalog") or
+                (self.current.kind == .quoted_word and types.same(self.current.raw(self.source), "pg_catalog")))) return false;
+            const next = try self.peek();
+            return next.kind == .symbol and next.symbol == .dot;
+        }
+
+        fn catalogTypeAhead(self: *Self) Error!bool {
+            if (self.mode != .standard or self.tokens.dialect != .postgres) return false;
+            if (try self.catalogQualifierAhead()) return true;
+            if (self.current.kind != .quoted_word) return false;
+            const name = self.current.raw(self.source);
+            return catalogRegTypmod(name) != null or types.typeByCatalogName(name) != null;
+        }
+
+        fn catalogScalarType(self: *Self, name: []const u8) Error!TypeSpec {
+            if (catalogRegTypmod(name)) |typmod| return .{ .ty = .oid, .typmod = typmod };
+            const data_type = types.typeByCatalogName(name) orelse return error.UndefinedObject;
+            const base_type = types.typeOfData(types.elementData(data_type) orelse data_type);
+            const typmod: i32 = switch (base_type) {
+                .numeric => try self.numericModifier(),
+                .varchar, .bpchar => try self.characterLength(false),
+                .bit, .varbit => try self.bitLength(false),
+                .time, .timetz, .timestamp, .timestamptz => try self.precision(),
+                else => -1,
+            };
+            return .{ .ty = types.typeOfData(data_type), .typmod = typmod };
+        }
+
         fn typeName(self: *Self) Error!TypeSpec {
-            if (try self.internalCharQualifier()) {
-                try self.advance();
-                try self.expectSymbol(.dot);
-                try self.advance();
-                return self.typeArraySuffix(.{ .ty = .pg_internal_char });
-            }
-            if (self.internalCharName()) {
-                try self.advance();
-                return self.typeArraySuffix(.{ .ty = .pg_internal_char });
+            if (try self.catalogTypeAhead()) {
+                if (try self.catalogQualifierAhead()) {
+                    try self.advance();
+                    try self.expectSymbol(.dot);
+                }
+                const ident = try self.label();
+                var buffer: [64]u8 = undefined;
+                const name = identText(self.source, ident, &buffer) orelse return error.UndefinedObject;
+                return self.typeArraySuffix(try self.catalogScalarType(name));
             }
             return self.typeArraySuffix(try self.scalarTypeName());
         }
@@ -1712,9 +1748,17 @@ pub fn Parser(comptime config: types.Config) type {
             }
             if (array) {
                 if (ast.regKind(spec.typmod) != .none) return error.UnsupportedStatement;
-                spec.ty = types.arrayType(spec.ty) orelse return error.Syntax;
+                if (!types.isArray(spec.ty)) spec.ty = types.arrayType(spec.ty) orelse return error.Syntax;
             }
             return spec;
+        }
+
+        fn numericModifier(self: *Self) Error!i32 {
+            if (!try self.takeSymbol(.lparen)) return -1;
+            const precision_digits = try self.typmodNumber();
+            const scale = if (try self.takeSymbol(.comma)) try self.typmodNumber() else 0;
+            try self.expectSymbol(.rparen);
+            return numeric.Ops(config.numeric_digits).encodeTypmod(precision_digits, scale);
         }
 
         fn scalarTypeName(self: *Self) Error!TypeSpec {
@@ -1742,14 +1786,7 @@ pub fn Parser(comptime config: types.Config) type {
                     if (bits < 1 or bits > 53) return error.InvalidParameterValue;
                     break :blk .{ .ty = if (bits <= 24) .float4 else .float8 };
                 },
-                .numeric, .decimal => blk: {
-                    if (!try self.takeSymbol(.lparen)) break :blk .{ .ty = .numeric };
-                    const p = try self.typmodNumber();
-                    var s: i32 = 0;
-                    if (try self.takeSymbol(.comma)) s = try self.typmodNumber();
-                    try self.expectSymbol(.rparen);
-                    break :blk .{ .ty = .numeric, .typmod = try numeric.Ops(config.numeric_digits).encodeTypmod(p, s) };
-                },
+                .numeric, .decimal => .{ .ty = .numeric, .typmod = try self.numericModifier() },
                 .date => .{ .ty = .date },
                 .timestamp => blk: {
                     const p = try self.precision();
@@ -2040,7 +2077,7 @@ pub fn Parser(comptime config: types.Config) type {
             if (try self.takeWord("EXCLUDE")) {
                 var out: Ast.ConstraintDef = .{ .name = name, .kind = .exclusion };
                 if (try self.takeWord("USING")) {
-                    if (!try self.takeRaw("gist") and !try self.takeRaw("btree") and !try self.takeRaw("hash")) return error.UnsupportedStatement;
+                    try self.accessMethod(true);
                 }
                 try self.expectSymbol(.lparen);
                 while (true) {
@@ -2141,7 +2178,7 @@ pub fn Parser(comptime config: types.Config) type {
                     break;
                 }
             } else {
-                if (self.mode == .standard and !typeWord(self.current) and !self.internalCharName() and !(try self.internalCharQualifier()) and
+                if (self.mode == .standard and !typeWord(self.current) and !(try self.catalogTypeAhead()) and
                     (self.current.kind == .quoted_word or (self.current.kind == .word and !lexer.reserved(self.current.keyword)))) {
                     return error.UnsupportedStatement;
                 }
@@ -3899,6 +3936,14 @@ pub fn Parser(comptime config: types.Config) type {
             return out[0..ident.len];
         }
 
+        fn accessMethod(self: *Self, allow_gist: bool) Error!void {
+            const ident = try self.identifier();
+            var buffer: [64]u8 = undefined;
+            const method = identText(self.source, ident, &buffer) orelse return error.UnsupportedStatement;
+            if (types.same(method, "btree") or types.same(method, "hash") or (allow_gist and types.same(method, "gist"))) return;
+            return error.UnsupportedStatement;
+        }
+
         fn requireCatalogQualifier(self: *const Self, name: ast.Ident) Error!void {
             var schema: [64]u8 = undefined;
             const spelling = identText(self.source, name, &schema) orelse return error.UndefinedSchema;
@@ -3971,29 +4016,15 @@ pub fn Parser(comptime config: types.Config) type {
         }
 
         fn castTarget(self: *Self, inner: u16) Error!u16 {
-            if (typeWord(self.current) or self.internalCharName()) {
+            if (typeWord(self.current) or try self.catalogTypeAhead()) {
                 const next = try self.peek();
-                if (next.kind != .symbol or next.symbol != .dot) {
+                if (next.kind != .symbol or next.symbol != .dot or
+                    (self.tokens.dialect == .postgres and try self.catalogQualifierAhead())) {
                     const target = try self.typeName();
                     return self.pool.add(.{ .kind = .cast, .cast_type = target.ty, .typmod = target.typmod, .a = inner });
                 }
             }
             const named = try self.qualifiedName();
-            if (self.tokens.dialect == .postgres) if (named.schema) |qualifier| {
-                var schema_buffer: [64]u8 = undefined;
-                var name_buffer: [64]u8 = undefined;
-                const schema = identText(self.source, qualifier, &schema_buffer) orelse "";
-                const name = identText(self.source, named.name, &name_buffer) orelse "";
-                if (types.same(schema, "pg_catalog")) {
-                    const scalar: TypeSpec =
-                        if (types.same(name, "regclass")) .{ .ty = .oid, .typmod = ast.regclass_typmod }
-                        else if (types.same(name, "regnamespace")) .{ .ty = .oid, .typmod = ast.regnamespace_typmod }
-                        else if (types.same(name, "regtype")) .{ .ty = .oid, .typmod = ast.regtype_typmod }
-                        else .{ .ty = types.typeOfData(types.typeByCatalogName(name) orelse return error.UndefinedObject) };
-                    const target = try self.typeArraySuffix(scalar);
-                    return self.pool.add(.{ .kind = .cast, .cast_type = target.ty, .typmod = target.typmod, .a = inner });
-                }
-            };
             if (self.isSymbol(.lbracket) or self.isSymbol(.lparen) or self.rawWord("array")) return error.UnsupportedStatement;
             return self.pool.add(.{ .kind = .cast, .cast_type = .unknown, .a = inner, .name = named.name, .qualifier = named.schema orelse .{} });
         }
