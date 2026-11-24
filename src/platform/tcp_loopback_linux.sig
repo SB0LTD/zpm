@@ -40,6 +40,7 @@ const ingress = 1;
 // port. Use one bank per side and the full u16 port space in each bank.
 const server_bank = 1 << 16;
 const map_entries = 2 * server_bank;
+const reply_verdict_bytes = 1 << 16;
 
 fn field(comptime Context: type, comptime name: []const u8) i16 {
     return @offsetOf(Context, "endpoints") + @offsetOf(Endpoints, name);
@@ -86,8 +87,8 @@ fn registration(map: linux.fd_t, service: u16, netns: u64) [31]Insn {
     };
 }
 
-fn verdict(map: linux.fd_t, service: u16, direction: Direction) [13]Insn {
-    const done = 11;
+fn verdict(map: linux.fd_t, service: u16, direction: Direction) [20]Insn {
+    const done = 18;
     return .{
         // Only registered sockets reach this program. Their endpoint
         // addresses, service port and network namespace are already fixed.
@@ -102,7 +103,16 @@ fn verdict(map: linux.fd_t, service: u16, direction: Direction) [13]Insn {
         Insn.ld_map_fd1(.r2, map),
         Insn.ld_map_fd2(map),
         Insn.mov(.r4, ingress),
+        Insn.mov(.r6, .r1),
         Insn.call(.msg_redirect_map),
+        // Requests resolve their peer for every send. Only successful
+        // server replies retain a bounded verdict.
+        Insn.jne(.r0, sk_pass, skip(12, done)),
+        Insn.ldx(.word, .r2, .r6, field(Message, "local_port")),
+        Insn.jne(.r2, @as(i32, service), skip(14, done)),
+        Insn.mov(.r1, .r6),
+        Insn.mov(.r2, reply_verdict_bytes),
+        Insn.call(.msg_apply_bytes),
         // The helper sets the redirect only if the matching peer exists.
         Insn.mov(.r0, sk_pass),
         Insn.exit(),
