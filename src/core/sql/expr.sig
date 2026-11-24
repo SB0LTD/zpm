@@ -9,6 +9,7 @@
 //! tree, whose depth the parser limits to Config.expr_depth.
 const types = @import("types.sig");
 const lexer = @import("lexer.sig");
+const catalog = @import("catalog.sig");
 const ast = @import("ast.sig");
 const value_module = @import("value.sig");
 const temporal = @import("temporal.sig");
@@ -569,6 +570,10 @@ pub fn Eval(comptime config: types.Config) type {
                     }
                     const unknown = @import("std").fmt.bufPrint(&buffer, "unknown (OID={d})", .{role}) catch unreachable;
                     return textCell(unknown);
+                },
+                .pg_tablespace_location => return switch (first.integer) {
+                    0, catalog.default_tablespace, catalog.global_tablespace => textCell(""),
+                    else => error.UndefinedFile,
                 },
                 .pg_table_is_visible => {
                     const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
@@ -1461,7 +1466,7 @@ pub fn Eval(comptime config: types.Config) type {
                     .nextval, .currval, .setval, .lastval, .identity_next => return sequenceValue(ctx, n),
                     .current_database, .current_schema, .current_schemas, .pg_encoding_to_char, .to_regtype, .to_regclass, .to_regproc, .format_type, .pg_get_expr, .regclass_in, .regtype_in, .regclass_out, .regtype_out,
                     .to_regnamespace, .regnamespace_in, .regnamespace_out,
-                    .acldefault, .pg_get_userbyid, .pg_table_is_visible, .pg_get_indexdef, .pg_get_constraintdef, .pg_get_triggerdef, .pg_get_viewdef, .pg_get_statisticsobjdef_columns, .pg_relation_is_publishable, .pg_get_partkeydef => return catalogValue(ctx, n),
+                    .acldefault, .pg_get_userbyid, .pg_tablespace_location, .pg_table_is_visible, .pg_get_indexdef, .pg_get_constraintdef, .pg_get_triggerdef, .pg_get_viewdef, .pg_get_statisticsobjdef_columns, .pg_relation_is_publishable, .pg_get_partkeydef => return catalogValue(ctx, n),
                     .pg_partition_ancestors, .array_subquery => return error.UnsupportedStatement,
                     .obj_description, .col_description, .shobj_description, .current_user, .session_user => return objectText(ctx, n),
                     .to_tsvector, .to_tsquery, .plainto_tsquery, .phraseto_tsquery => {

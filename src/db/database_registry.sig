@@ -49,6 +49,7 @@ pub fn Registry(comptime Store: type, comptime name_capacity: usize) type {
             oid: u32,
             owner: u32,
             name: []const u8,
+            clients: usize,
         };
 
         pub const Admission = struct {
@@ -159,6 +160,7 @@ pub fn Registry(comptime Store: type, comptime name_capacity: usize) type {
                 .oid = entry.oid,
                 .owner = entry.owner,
                 .name = entry.name[0..entry.name_len],
+                .clients = entry.clients,
             };
         }
 

@@ -61,7 +61,13 @@ pub const View = enum(u8) { pg_type, pg_namespace, pg_class, pg_attribute, pg_in
 pub const sql_language_oid: u32 = 14;
 pub const plpgsql_language_oid: u32 = 13002;
 
-pub const DatabaseCatalogRow = struct { oid: u32, owner: u32, name: []const u8 };
+pub const DatabaseCatalogRow = struct {
+    oid: u32,
+    owner: u32,
+    name: []const u8,
+    is_template: bool = false,
+    allow_connections: bool = true,
+};
 pub const DatabaseCatalogProvider = struct {
     context: ?*const anyopaque = null,
     capacity: usize,
@@ -87,6 +93,7 @@ pub const pg_namespace_acl_column = pg_namespace_columns.len - 1;
 const pg_enum_columns = [_]ViewColumn{ col("oid", .oid), col("enumtypid", .oid), col("enumsortorder", .float4), col("enumlabel", .name) };
 pub const utf8_encoding: i64 = 6;
 pub const default_tablespace: i64 = 1663;
+pub const global_tablespace: i64 = 1664;
 const pg_database_columns = [_]ViewColumn{
     col("oid", .oid), col("datname", .name), col("datdba", .oid), col("encoding", .int4),
     col("datlocprovider", .pg_internal_char), col("datistemplate", .boolean), col("datallowconn", .boolean),
@@ -118,7 +125,7 @@ pub fn builtinRoutineName(oid: u32) ?[]const u8 {
     return null;
 }
 
-const BuiltinCallback = struct { oid: u32, name: []const u8, args: []const u32, result: u32 };
+const BuiltinCallback = struct { oid: u32, name: []const u8, args: []const u32, result: u32, volatility: u8 = 'i' };
 
 /// Catalog identities of the tokenizer used by the simple configuration.
 /// Parser.init and Parser.next own startup and tokenization. End releases
@@ -167,6 +174,7 @@ pub const builtin_callbacks = [_]BuiltinCallback{
     text_parser.start, text_parser.next, text_parser.end, text_parser.lex_type,
     simple_template.init, simple_template.lexize,
     int4range_canonical, int8range_canonical, daterange_canonical,
+    .{ .oid = 3778, .name = "pg_tablespace_location", .args = &.{26}, .result = 25, .volatility = 's' },
 };
 
 const RangeEntry = struct { oid: u32, subtype: u32, multirange: u32, opclass: u32, canonical: u32 };

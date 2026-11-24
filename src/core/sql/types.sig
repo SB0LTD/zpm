@@ -340,6 +340,8 @@ pub const Error = error{
     ReadOnlyTransaction,
     /// SQLSTATE 42704: unrecognized configuration parameter.
     UndefinedSetting,
+    /// SQLSTATE 58P01: the requested tablespace has no location.
+    UndefinedFile,
     /// SQLSTATE 22023: invalid value for a configuration parameter.
     InvalidSettingValue,
     /// SQLSTATE 22003: a NUMERIC, REAL/DOUBLE or SMALLINT value is out of range.

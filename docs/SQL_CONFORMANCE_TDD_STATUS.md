@@ -2,6 +2,45 @@
 
 ## Stock PostgreSQL dump and restore candidate
 
+The database utility parser accepts the stock archive's database creation
+options when they match RAMSQL's empty UTF-8, C-locale database. It retains
+the parsed owner in `ALTER DATABASE ... OWNER TO` for registry validation.
+
+The pristine `template0` identity now carries its template and
+connection flags through the database catalog provider. The PostgreSQL
+wire reports the stock errors for opening a connection to the disabled
+template or dropping it. The parser retains an explicit template choice
+so an existing user database with that name can keep its data and route
+without being chosen in place of the pristine template.
+
+The fixture now also parses a named database template and verifies its
+lease count before copying. The durable log stages its frames from a
+quiescent source, keeps the original sequence and rewrites the cluster
+database identity and prepared record metadata for the copy. A torn
+source fails without repair. The caller publishes only after syncing and
+replaying the destination. Stock PG16 and PG18 each passed all 45 checks
+with the named-template consumer. RAMSQL's next candidate adds writable
+`template1` and a three-database archive fixture.
+[Named-template qualification](https://github.com/SB0LTD/ramsql/actions/runs/45390681198)
+
+The stock global-archive query now binds `pg_tablespace_location(oid)`
+against the two built-in tablespaces. Their locations and the implicit
+database default use PostgreSQL's empty-string convention. An unknown
+OID returns 58P01. The supported tablespaces have catalog rows and the
+location function has PostgreSQL procedure identity and return metadata.
+User-defined tablespaces remain open.
+
+Role defaults for the supported boolean settings are catalog objects with
+MVCC visibility and WAL replay. `ALTER ROLE ... SET`, `FROM CURRENT`,
+`RESET` and `RESET ALL` update the defaults for future PostgreSQL sessions.
+The wire layer applies them after resolving the login role. Startup options
+take precedence, and session RESET returns to the resulting startup value.
+Stock `pg_dumpall` discovers the saved values through
+`unnest(pg_db_role_setting.setconfig)`. The complete set fits the default
+128-byte cell through compact in-memory text array entries. The wire and WAL
+retain the usual text-array representation. Database-specific and non-boolean
+role settings, and shared settings across the database cluster, remain open.
+
 PostgreSQL 16 and 18 use `SET quote_all_identifiers = true` for both
 `pg_dump --quote-all-identifiers` and `pg_dumpall --quote-all-identifiers`.
 The candidate tracks the setting per session, including LOCAL, rollback,
