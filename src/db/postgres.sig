@@ -282,7 +282,11 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
     const has_admission = detects_admission or external_admission;
     const has_primary_key = @hasDecl(DB, "executeDetachedPrimaryKey") and
         (if (@hasDecl(DB, "detached_primary_key")) DB.detached_primary_key else true);
+    const has_cached_primary_key = @hasDecl(DB, "executeCachedDetachedPrimaryKey") and
+        (if (@hasDecl(DB, "detached_cached_primary_key")) DB.detached_cached_primary_key else true);
+    const KeyView = if (@hasDecl(DB, "DetachedKeyView") and @hasDecl(DB, "viewCachedDetachedPrimaryKey")) DB.DetachedKeyView else void;
     const primary_key_sql_capacity = 256;
+    const result_format_capacity = 256;
     const CopyInfo = if (has_copy) DB.CopyInfo else struct {};
     const line_bytes: usize = if (has_copy) DB.copy_line_bytes else 1;
     const field_capacity: usize = if (has_copy) (CopyInfo{}).types.len else 1;
@@ -351,6 +355,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             sql: [sql_capacity]u8 = @splat(0),
             len: usize = 0,
             count: usize = 0,
+            single_parameter: ?ParameterSpan = null,
             oids: [parameter_capacity]u32 = @splat(0),
             fn source(self: *const Statement) []const u8 {
                 return self.sql[0..self.len];
@@ -375,7 +380,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             name: Name = .{},
             sql: [sql_capacity]u8 = @splat(0),
             len: usize = 0,
-            formats: [256]u16 = @splat(0),
+            formats: [result_format_capacity]u16 = @splat(0),
             format_count: usize = 0,
             row: usize = 0,
             complete: bool = false,
@@ -540,6 +545,126 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             return self.detachedFrame(input) catch null;
         }
 
+        pub const DetachedKeyExchange = struct {
+            key: DetachedPrimaryKey,
+            formats: []const u8,
+            consumed: usize,
+        };
+
+        /// Recognize a complete unnamed Bind, unlimited Execute, and Sync.
+        /// Borrow the statement and frame until the caller consumes the input.
+        /// A miss leaves the ordinary decoder in charge of all three frames.
+        pub fn detachedKeyExchange(self: *Self, input: []const u8) ?DetachedKeyExchange {
+            if (comptime !has_cached_primary_key) return null;
+            if (!self.waiting_for_command or !self.detachedReady() or input.len < 5 or input[0] != 'B') return null;
+            if (comptime has_admission) if (self.admission.rejected) return null;
+            const size = read32(input[1..5]);
+            if (size < 4 or size > max_packet) return null;
+            const end = @as(usize, size) + 1;
+            const execute_sync = "E\x00\x00\x00\x09\x00\x00\x00\x00\x00S\x00\x00\x00\x04";
+            if (end + execute_sync.len > input.len or !equal(input[end..][0..execute_sync.len], execute_sync)) return null;
+            return self.detachedBind(input[5..end], end + execute_sync.len) catch null;
+        }
+
+        fn detachedBind(self: *Self, body: []const u8, consumed: usize) !?DetachedKeyExchange {
+            var r: Reader = .{ .bytes = body };
+            if (try r.byte() != 0) return null;
+            const stmt = try self.statement(try r.string());
+            if (stmt.count != 1 or stmt.single_parameter == null or stmt.len > primary_key_sql_capacity or !integralParameter(stmt.oids[0])) return null;
+            const format_count = try r.u16be();
+            if (format_count > 1) return null;
+            const format = if (format_count == 0) 0 else try r.u16be();
+            if (format > 1 or try r.u16be() != 1) return null;
+            const length = try r.u32be();
+            var key: ?i64 = null;
+            if (length != 0xffffffff) {
+                const bytes = try r.take(length);
+                if (format == 0 and (bytes.len > 20 or !integerText(bytes))) return null;
+                key = primaryKeyNumber(bytes, stmt.oids[0], format) orelse return null;
+            }
+            const result_count = try r.u16be();
+            if (result_count > result_format_capacity) return null;
+            const formats = try r.take(@as(usize, result_count) * 2);
+            try r.done();
+            var index: usize = 0;
+            while (index < formats.len) : (index += 2) if (formats[index] != 0 or formats[index + 1] > 1) return null;
+            for (&self.portals) |*portal_value| {
+                if (!portal_value.live or portal_value.name.len == 0) return .{
+                    .key = .{ .source = stmt.source(), .oid = stmt.oids[0], .key = key },
+                    .formats = formats,
+                    .consumed = consumed,
+                };
+            }
+            return null;
+        }
+
+        /// Execute the recognized exchange under the caller's detached-read
+        /// ownership. The DB must leave its result untouched on a cache miss.
+        pub fn handleDetachedKeyExchange(self: *Self, db: *DB, exchange: DetachedKeyExchange, output: []u8) error{BufferTooSmall}!?Reply {
+            if (comptime !has_cached_primary_key) return null;
+            if (output.len < try self.requiredCapacity()) return error.BufferTooSmall;
+            var w: Writer = .{ .bytes = output };
+            var execution_error: ?anyerror = null;
+            const view: ?KeyView = if (comptime KeyView == void) null else
+                db.viewCachedDetachedPrimaryKey(exchange.key.source, exchange.key.oid, exchange.key.key, output) catch |err| failed: {
+                    execution_error = err;
+                    break :failed null;
+                };
+            const found = view != null or execution_error != null or (db.executeCachedDetachedPrimaryKey(exchange.key.source, exchange.key.oid, exchange.key.key, &self.result) catch |err| failed: {
+                execution_error = err;
+                break :failed true;
+            });
+            if (!found) return null;
+            try w.empty('2');
+            const bind_end = w.at;
+            const columns = if (comptime KeyView == void) self.result.column_count else
+                if (view) |projection| projection.columns.len else self.result.column_count;
+            if (execution_error == null and exchange.formats.len > 2 and exchange.formats.len / 2 != columns)
+                execution_error = error.ProtocolViolation;
+            try writeNotice(db, &w);
+            if (execution_error == null) {
+                self.commit_rolled_back = false;
+                self.writeKeyResult(db, &w, exchange.formats, view) catch |err| {
+                    w.at = bind_end;
+                    execution_error = err;
+                };
+            }
+            if (execution_error) |err| {
+                try failure(&w, sqlstate(err), diagnosticMessage(err));
+                if (@hasDecl(DB, "failTransaction")) db.failTransaction();
+            }
+            // A detached read cannot open an implicit extended transaction.
+            self.closeIdlePortals(db);
+            try self.ready(db, &w);
+            return .{ .consumed = exchange.consumed, .written = w.at };
+        }
+
+        fn writeKeyResult(self: *Self, db: *DB, w: *Writer, formats: []const u8, view: ?KeyView) !void {
+            const present = if (comptime KeyView == void) self.result.row_count != 0 else
+                if (view) |projection| projection.version != null else self.result.row_count != 0;
+            if (comptime KeyView != void) {
+                if (view) |projection| {
+                    if (present) try self.projectedKeyRow(db, w, formats, projection);
+                } else try self.rows(db, w, formats, 0, self.result.row_count);
+            } else try self.rows(db, w, formats, 0, self.result.row_count);
+            const tag = try w.begin('C');
+            try w.append(if (present) "SELECT 1\x00" else "SELECT 0\x00");
+            w.end(tag);
+        }
+
+        fn projectedKeyRow(self: *Self, db: *DB, w: *Writer, formats: []const u8, view: KeyView) !void {
+            const session = valueSession(db);
+            const tag = try w.begin('D');
+            try w.u16be(@intCast(view.columns.len));
+            var scratch: @TypeOf(self.result.rows[0].cells[0]) = undefined;
+            for (view.types, 0..) |data_type, index| {
+                const format_index = if (formats.len == 2) 1 else index * 2 + 1;
+                const binary = formats.len != 0 and formats[format_index] == 1;
+                try self.dataCell(w, view.cell(index, &scratch), data_type, session, binary, null);
+            }
+            w.end(tag);
+        }
+
         /// Additional scheduling hint for unlimited Execute. Portal storage
         /// owns the template through the complete handler call. It does not
         /// authorize execution or replace the rendered-SQL fallback.
@@ -649,6 +774,29 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             const total: usize = @as(usize, size) + prefix;
             if (input.len < total) return .{};
             return self.dispatchFrame(db, input[0], input[5..total], output, total);
+        }
+
+        /// Handle a prepared detached Execute and its immediately buffered Sync
+        /// with the caller's existing read ownership. Failed or incomplete
+        /// Execute retains the ordinary frame-by-frame recovery path.
+        pub fn handleDetachedExecuteSync(self: *Self, db: *DB, input: []const u8, output: []u8) error{BufferTooSmall}!Reply {
+            const execute_reply = try self.handle(db, input, output);
+            if (input.len == 0 or input[0] != 'E' or execute_reply.consumed == 0 or
+                execute_reply.close or execute_reply.blocked or execute_reply.cancel != null or !self.detachedReady()) return execute_reply;
+            const next = input[execute_reply.consumed..];
+            if (next.len < 5 or next[0] != 'S' or read32(next[1..5]) != 4) return execute_reply;
+            // Execute has updated state by this point. If the caller's output
+            // cannot hold another handler invocation, keep its completed reply.
+            const remaining = output[execute_reply.written..];
+            if (remaining.len < try self.requiredCapacity()) return execute_reply;
+            const sync = try self.dispatchFrame(db, 'S', next[5..5], remaining, 5);
+            return .{
+                .consumed = execute_reply.consumed + sync.consumed,
+                .written = execute_reply.written + sync.written,
+                .close = sync.close,
+                .blocked = sync.blocked,
+                .cancel = sync.cancel,
+            };
         }
 
         fn dispatchFrame(self: *Self, db: *DB, tag: u8, body: []const u8, output: []u8, total: usize) error{BufferTooSmall}!Reply {
@@ -947,7 +1095,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             try writeNotice(db, w);
             if (self.result.column_count == 0) return;
             try self.description(w, null);
-            try self.rows(db, w, null, 0, self.result.row_count);
+            try self.rows(db, w, @as([]const u16, &.{}), 0, self.result.row_count);
         }
 
         /// Produce one complete command's responses using the same result and
@@ -1085,7 +1233,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                     }
                     if (p.format_count > 1 and p.format_count != self.result.column_count) return error.ProtocolViolation;
                     const end = if (limit == 0) self.result.row_count else @min(self.result.row_count, p.row + limit);
-                    try self.rows(db, w, p, p.row, end);
+                    try self.rows(db, w, @as([]const u16, p.formats[0..p.format_count]), p.row, end);
                     p.row = end;
                     if (end < self.result.row_count) try w.empty('s') else {
                         try self.command(w, p.source());
@@ -1736,7 +1884,8 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             if (count > parameter_capacity) return error.ParameterCapacity;
             for (0..count) |i| next.oids[i] = try r.u32be();
             try r.done();
-            next.count = try parameterCount(source);
+            next.single_parameter = null;
+            next.count = try scan(source, null, null, &next.single_parameter);
             if (count != 0 and count != next.count) return error.ProtocolViolation;
             try self.infer(db, &next);
             var slot: ?*Statement = null;
@@ -1751,7 +1900,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             const s = slot orelse return error.StatementCapacity;
             // SQL tails are never part of a live statement. Publish only the
             // initialized source and bounded metadata, not sql_capacity bytes.
-            s.name=next.name;s.len=next.len;s.count=next.count;s.oids=next.oids;
+            s.name=next.name;s.len=next.len;s.count=next.count;s.single_parameter=next.single_parameter;s.oids=next.oids;
             @memcpy(s.sql[0..next.len],next.sql[0..next.len]);s.live=true;
             try w.empty('1');
         }
@@ -1948,7 +2097,12 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             }
             try r.done();
             var q: Writer = .{ .bytes = &next.sql };
-            try interpolate(s.source(), values[0..count], &q);
+            if (s.single_parameter) |span| {
+                const source = s.source();
+                try q.append(source[0..span.start]);
+                try splice(&q, values[0], source[span.end..]);
+                try q.append(source[span.end..]);
+            } else try interpolate(s.source(), values[0..count], &q);
             next.len = q.at;
             if (@hasDecl(DB, "savepointLevel")) next.level = db.savepointLevel();
             var slot: ?*Portal = null;
@@ -2008,38 +2162,41 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             return null;
         }
 
-        fn rows(self: *Self, db: *DB, w: *Writer, portal_value: ?*const Portal, first: usize, end: usize) !void {
+        fn rows(self: *Self, db: *DB, w: *Writer, formats: anytype, first: usize, end: usize) !void {
             const session = valueSession(db);
+            const stride = if (@TypeOf(formats) == []const u8) 2 else 1;
+            const format_count = formats.len / stride;
             for (first..end) |row| {
                 const p = try w.begin('D');
                 try w.u16be(@intCast(self.result.column_count));
                 for (0..self.result.column_count) |i| {
-                    const cell = self.result.rows[row].cells[i];
-                    if (cell == .null_value) {
-                        try w.u32be(0xffffffff);
-                        continue;
-                    }
-                    const length = w.at;
-                    try w.u32be(0);
-                    const start = w.at;
-                    const binary = if (portal_value) |v| v.format(i) == 1 else false;
-                    switch (cell) {
-                        .null_value => unreachable,
-                        .integer => |n| if (binary) {
-                            w.at += T.sendBinary(&cell, self.result.column_types[i], session, w.bytes[w.at..]) catch return error.BufferTooSmall;
-                        } else try w.number(n),
-                        .boolean => |b| try w.byte(if (binary) @intFromBool(b) else if (b) 't' else 'f'),
-                        .text => |t| try w.append(t.slice()),
-                        else => {
-                            const nominal = if (binary) null else try self.nominalText(i, &cell, w.bytes[w.at..]);
-                            const size = nominal orelse ((if (binary) T.sendBinary(&cell, self.result.column_types[i], session, w.bytes[w.at..]) else T.sendText(&cell, session, w.bytes[w.at..])) catch return error.BufferTooSmall);
-                            w.at += size;
-                        },
-                    }
-                    write32(w.bytes[length..][0..4], @intCast(w.at - start));
+                    const format_index = if (format_count == 1) 0 else i;
+                    const binary = format_count != 0 and formats[format_index * stride + stride - 1] == 1;
+                    try self.dataCell(w, &self.result.rows[row].cells[i], self.result.column_types[i], session, binary, i);
                 }
                 w.end(p);
             }
+        }
+
+        fn dataCell(self: *const Self, w: *Writer, cell: anytype, data_type: @TypeOf(@as(DB.Result, undefined).column_types[0]), session: *const T.Session, binary: bool, nominal_column: ?usize) !void {
+            if (cell.* == .null_value) return w.u32be(0xffffffff);
+            const length = w.at;
+            try w.u32be(0);
+            const start = w.at;
+            switch (cell.*) {
+                .null_value => unreachable,
+                .integer => |n| if (binary) {
+                    w.at += T.sendBinary(cell, data_type, session, w.bytes[w.at..]) catch return error.BufferTooSmall;
+                } else try w.number(n),
+                .boolean => |b| try w.byte(if (binary) @intFromBool(b) else if (b) 't' else 'f'),
+                .text => |*t| try w.append(t.slice()),
+                else => {
+                    const nominal = if (binary) null else if (nominal_column) |i| try self.nominalText(i, cell, w.bytes[w.at..]) else null;
+                    const size = nominal orelse ((if (binary) T.sendBinary(cell, data_type, session, w.bytes[w.at..]) else T.sendText(cell, session, w.bytes[w.at..])) catch return error.BufferTooSmall);
+                    w.at += size;
+                },
+            }
+            write32(w.bytes[length..][0..4], @intCast(w.at - start));
         }
         fn command(self: *Self, w: *Writer, source: []const u8) !void {
             if (self.objectTag()) |tag| {
@@ -2441,7 +2598,8 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
 // The engine tokenizer owns quote/comment/identifier boundaries. Counting and
 // interpolation visit precisely its parameter tokens; every untouched byte is
 // copied verbatim, including whitespace and nested comments.
-fn scan(source: []const u8, values: ?[]const []const u8, w: ?*Writer) !usize {
+const ParameterSpan = struct { start: usize, end: usize };
+fn scan(source: []const u8, values: ?[]const []const u8, w: ?*Writer, single: ?*?ParameterSpan) !usize {
     var tokenizer: sql.Tokenizer = .{ .source = source, .text_limit = source.len };
     var copied: usize = 0;
     var highest: usize = 0;
@@ -2451,6 +2609,7 @@ fn scan(source: []const u8, values: ?[]const []const u8, w: ?*Writer) !usize {
         if (token.kind != .parameter) continue;
         if (token.integer > parameter_capacity) return error.ParameterCapacity;
         const n: usize = @intCast(token.integer);
+        if (single) |span| span.* = if (highest == 0 and n == 1) .{ .start = token.start, .end = token.end } else null;
         highest = @max(highest, n);
         if (values) |v| {
             if (n > v.len) return error.ProtocolViolation;
@@ -2484,11 +2643,8 @@ fn splice(w: *Writer, value: []const u8, rest: []const u8) !void {
     try w.append(value);
     if (rest.len != 0 and joins(value[value.len - 1], rest[0])) try w.byte(' ');
 }
-fn parameterCount(source: []const u8) !usize {
-    return scan(source, null, null);
-}
 fn interpolate(source: []const u8, values: []const []const u8, w: *Writer) !void {
-    _ = try scan(source, values, w);
+    _ = try scan(source, values, w, null);
 }
 /// `$n`: a dollar-quoted string (`$$x$$`, `$q$x$q$`) is not a parameter.
 fn parameterToken(token: []const u8) bool {
