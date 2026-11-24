@@ -2,6 +2,18 @@
 
 ## Stock PostgreSQL dump and restore candidate
 
+Stock `pg_dumpall --roles-only --no-role-passwords` reached the
+`pg_parameter_acl` catalog query after emitting role memberships on
+PostgreSQL 16 and 18. The candidate exposes the typed catalog and makes
+`pg_get_userbyid(oid)` resolve roles at the statement snapshot. The Sig
+catalog contract covers the stock query, the catalog OID, the name type,
+NULL and missing roles. Role archives can restate the built-in superuser's
+attributes and persist per-membership ADMIN, INHERIT, and SET options.
+Explicit GRANTED BY is supported for the actual grantor. Legacy WAL
+memberships continue to derive inheritance from the member role. Parameter
+grants and multiple grantors per role membership remain open. A role archive
+fixture in RAMSQL qualifies restore and WAL reopen.
+
 The full ZPM test run on `ab781b39` found five failures outside the
 qualified migration fixture. UNNEST detection now runs in SELECT target
 parsing so VALUES forms never read SELECT target nodes. Inner catalog
@@ -83,9 +95,19 @@ the stored query resolves its own aliases. It preserves doubled quotes and
 keeps the original name resolution for internal ordering. The dump deparser
 emits catalog aliases on supported simple projections with no top-level
 ORDER BY, GROUP BY or DISTINCT ON. The focused Sig suite passed 1,380
-assertions and replayed 276 records. Local stock PG16 and PG18 both restored
-the new dependent-view fixture in both directions, including quoted names,
-result metadata and WAL reopen. General deparsing remains open.
+assertions and replayed 276 records. The packaged binary passed all 39
+stock checks in PostgreSQL 16 and 18 CI, including quoted names, result
+metadata and WAL reopen. The qualified revisions merged as ZPM #293 and
+RAMSQL #100. General deparsing remains open.
+[Exact release qualification](https://github.com/SB0LTD/ramsql/actions/runs/45051553539)
+
+Stock PG16 and PG18 both restore materialized views with no data before
+creating their dependents, then refresh the objects that had data at dump
+time. RAMSQL now binds these definitions without requiring their source to
+be populated. Queries and refreshes that read rows still enforce the
+55000 error. The local Sig contract passed 1,393 assertions and replayed
+284 records. The stock fixture passed both archive directions on both
+versions locally and checked data, population state and WAL reopen.
 
 The stock archive fixture now restores a two-column primary key after
 loading the rows of a fresh table in a single transaction. The WAL uses

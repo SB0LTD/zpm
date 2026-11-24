@@ -217,6 +217,17 @@ pub const role_replication: u32 = 32;
 pub const role_bypassrls: u32 = 64;
 pub const role_attributes: u32 = 127;
 
+// Memberships written before per-edge options used flags = 0.
+pub const member_configured: u32 = 1;
+pub const member_inherit: u32 = 2;
+pub const member_set: u32 = 4;
+pub const member_admin: u32 = 1;
+pub const MembershipPath = enum { any, inherit, set };
+
+pub fn membershipFlags(inherit: bool, set: bool) u32 {
+    return member_configured | (if (inherit) member_inherit else 0) | (if (set) member_set else 0);
+}
+
 /// Table privileges as PostgreSQL's AclMode bits (aclitem letters arwdDxtm).
 pub const priv_insert: u32 = 1 << 0;
 pub const priv_select: u32 = 1 << 1;
@@ -302,6 +313,10 @@ pub const Grant = struct {
     grantee_count: usize = 0,
     /// WITH GRANT / ADMIN OPTION; for REVOKE, GRANT / ADMIN OPTION FOR.
     option: bool = false,
+    admin: ?bool = null,
+    inherit: ?bool = null,
+    set: ?bool = null,
+    grantor: ?Grantee = null,
     cascade: bool = false,
 };
 
@@ -1061,15 +1076,28 @@ const Parser = struct {
         }
         if (!revoke and try self.take("with")) {
             if (out.membership) {
-                if (!try self.take("admin")) return error.UnsupportedStatement;
-                if (!try self.take("option") and !try self.take("true")) return error.UnsupportedStatement;
+                while (true) {
+                    const option = if (try self.take("admin")) &out.admin
+                        else if (try self.take("inherit")) &out.inherit
+                        else if (try self.take("set")) &out.set
+                        else return error.Syntax;
+                    if (option.* != null) return error.Syntax;
+                    option.* = if (try self.take("false")) false
+                        else if (try self.take("true") or try self.take("option")) true
+                        else return error.Syntax;
+                    if (!try self.takeSymbol(.comma)) break;
+                }
             } else {
                 try self.expect("grant");
                 try self.expect("option");
+                out.option = true;
             }
-            out.option = true;
         }
-        if (self.word("granted")) return error.UnsupportedStatement;
+        if (try self.take("granted")) {
+            if (!out.membership or revoke) return error.UnsupportedStatement;
+            try self.expect("by");
+            out.grantor = try self.grantee();
+        }
         if (revoke) out.cascade = try self.dropBehavior();
         try self.finish();
         return out;
@@ -1619,10 +1647,18 @@ pub fn Objects(comptime config: types.Config) type {
             return flags & role_superuser != 0;
         }
 
-        /// `member` is `group` or (transitively) a member of it. With
-        /// `inherit`, only through roles that inherit privileges
-        /// (has_privs_of_role); without, any membership (SET ROLE).
-        pub fn memberOf(self: *const Self, member: u32, group: u32, inherit: bool, snap: storage.Snapshot) bool {
+        pub fn membershipInherits(self: *const Self, entry: *const Object, snap: storage.Snapshot) bool {
+            if (entry.flags != 0) return entry.flags & member_inherit != 0;
+            return (self.roleFlags(entry.grantee, snap) orelse 0) & role_inherit != 0;
+        }
+
+        pub fn membershipCanSet(entry: *const Object) bool {
+            return entry.flags == 0 or entry.flags & member_set != 0;
+        }
+
+        /// Walk either all edges (cycle detection) or only edges that allow
+        /// the requested use of a membership.
+        pub fn membershipPath(self: *const Self, member: u32, group: u32, path: MembershipPath, snap: storage.Snapshot) bool {
             if (member == group) return true;
             // Breadth-first over at most `capacity` roles.
             var queue: [capacity + 1]u32 = undefined;
@@ -1631,12 +1667,10 @@ pub fn Objects(comptime config: types.Config) type {
             var next: usize = 0;
             while (next < count) : (next += 1) {
                 const current = queue[next];
-                if (inherit) {
-                    const flags = self.roleFlags(current, snap) orelse continue;
-                    if (flags & role_inherit == 0) continue;
-                }
                 for (&self.items) |*o| {
                     if (o.kind != .member or o.grantee != current or !visible(o, snap)) continue;
+                    if (path == .inherit and !self.membershipInherits(o, snap)) continue;
+                    if (path == .set and !membershipCanSet(o)) continue;
                     if (o.target == group) return true;
                     var known = false;
                     for (queue[0..count]) |seen| known = known or seen == o.target;
@@ -1647,6 +1681,10 @@ pub fn Objects(comptime config: types.Config) type {
                 }
             }
             return false;
+        }
+
+        pub fn memberOf(self: *const Self, member: u32, group: u32, inherit: bool, snap: storage.Snapshot) bool {
+            return self.membershipPath(member, group, if (inherit) .inherit else .any, snap);
         }
 
         /// The relation object of a table (owner, RLS flags), if any.
@@ -1898,7 +1936,9 @@ pub fn Objects(comptime config: types.Config) type {
             const check_ok = if (o.flags & policy_check != 0) o.split != o.text_len else o.split == o.text_len;
             const valid = switch (o.kind) {
                 .role => has_name and o.owner == 0 and o.flags & ~role_attributes == 0 and o.role_count == 0 and o.text_len == 0,
-                .member => !has_name and o.owner != 0 and o.flags == 0 and o.grant_flags <= 1 and o.role_count == 0 and o.text_len == 0 and o.target != o.grantee,
+                .member => !has_name and o.owner != 0 and
+                    (o.flags == 0 or (o.flags & member_configured != 0 and o.flags & ~(member_configured | member_inherit | member_set) == 0)) and
+                    o.grant_flags <= member_admin and o.role_count == 0 and o.text_len == 0 and o.target != o.grantee,
                 .acl => !has_name and o.flags != 0 and o.flags & ~table_privileges == 0 and o.grant_flags & ~o.flags == 0 and o.role_count == 0 and o.text_len == 0 and o.owner != 0,
                 .schema_acl => !has_name and o.owner != 0 and o.grant_flags == 0 and o.role_count == 0 and o.text_len == 0 and
                     (o.flags == priv_schema_usage or (o.flags == 0 and o.grantee == o.owner)),
