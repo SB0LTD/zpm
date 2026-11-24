@@ -63,6 +63,18 @@
 //! so have triangles with no depth (pc-full2: step 4a EXACT, several
 //! colour targets EXACT).
 //!
+//! **Turing** (Draw.sm = .sm_75: TURING_A on the RTX 2080 Ti) takes the
+//! same draws with draw.sig's Turing stream (setupFor, a program's address
+//! in two words). Its depth target is one surface: X8Z24, ZF32, or S8Z24
+//! with the stencil in the depth's words (clc597.h has no SET_ST_* and no
+//! STENCIL_IS_SEPARATE; NVK splits depth and stencil on Blackwell only).
+//! A separate stencil plane, or a float depth with a stencil test
+//! (ZF32_X24S8: eight bytes a pixel), is refused (whyNot). Where Turing
+//! keeps a depth word is not public (NIL: FermiZS GOBs for every depth
+//! format), so a Turing depth target is the engine's alone: the GL layer
+//! keeps depth draws on its compute kernels there. Nothing on Turing has
+//! run on a card.
+//!
 //! Allocation-free.
 
 const std = @import("std");
@@ -277,6 +289,8 @@ pub const Draw = struct {
     /// Indexed (the hardware's index buffer and primitive restart), else
     /// the vertices' indices 0 .. count - 1.
     index: ?Index = null,
+    /// The chip's shader model: sm_75 is TURING_A's stream.
+    sm: gr.Sm = .sm_120,
 };
 
 /// A colour target past the first: rows of `pitch` bytes from `va` (128
@@ -373,10 +387,28 @@ pub fn whyNot(d: *const Draw) ?[]const u8 {
     }
     if (d.depth) |z| {
         if (z.gobs_log2 > 5 or z.va % 512 != 0 or z.width == 0 or z.height == 0) return "a depth target not on a GOB, with no size, or its blocks over 32 GOBs high";
+        if (d.sm == .sm_75) {
+            // (one surface: the stencil in the depth's words, S8Z24)
+            if (z.stencil_va != null) return "a stencil plane of its own on Turing (clc597.h has no SET_ST_*: its stencil is in the depth's words, S8Z24)";
+            if (z.float and z.stencil != null) return "a float depth with a stencil test on Turing (ZF32_X24S8, eight bytes a pixel: not modelled)";
+            return null;
+        }
         if (z.stencil != null and z.stencil_va == null) return "a stencil test with no stencil plane (Blackwell keeps stencil apart from depth: STENCIL_IS_SEPARATE)";
         if (z.stencil_va) |sva| if (sva % 512 != 0) return "a stencil plane not on a GOB";
     }
     return null;
+}
+
+/// SET_ZT_FORMAT for a depth target on shader model `sm`'s chips:
+/// Blackwell's (X8Z24 or ZF32 alone; S8Z24 or ZF32_X24S8 with
+/// STENCIL_IS_SEPARATE and the SET_ST_* plane), Turing's (X8Z24 or ZF32;
+/// S8Z24 with the stencil in the word's top byte).
+pub fn ztFormat(sm: gr.Sm, z: Depth) u32 {
+    if (sm == .sm_75) return if (z.float) ZT_ZF32 else if (z.stencil != null) ZT_S8Z24 else ZT_X8Z24;
+    return if (z.float)
+        (if (z.stencil_va != null) ZT_ZF32_X24S8 | ZT_STENCIL_IS_SEPARATE else ZT_ZF32)
+    else
+        (if (z.stencil_va != null) ZT_S8Z24 | ZT_STENCIL_IS_SEPARATE else ZT_X8Z24);
 }
 
 fn one(p: *Push, m: u32, v: u32) void {
@@ -417,7 +449,7 @@ pub fn emitNext(p: *Push, d: *const Draw) void {
 }
 
 fn emitDraw(p: *Push, d: *const Draw, whole: bool) void {
-    if (whole) gr.setup(p, d.zero_va, d.zero_va, d.zero_va, 1) else {
+    if (whole) gr.setupFor(p, d.sm, d.zero_va, d.zero_va, d.zero_va, 1) else {
         one(p, gr.SET_DEPTH_TEST, 0);
         one(p, gr.SET_DEPTH_WRITE, 0);
         one(p, gr.SET_STENCIL_TEST, 0);
@@ -464,21 +496,21 @@ fn emitDraw(p: *Push, d: *const Draw, whole: bool) void {
     } else one(p, gr.OGL_SET_CULL, 0);
     if (d.depth) |z| {
         // (as NVK sends a Blackwell depth image: X8Z24 alone, or S8Z24
-        // with its stencil the SET_ST_* plane; the width in words of a
-        // whole-GOB row; one layer; no compression, no sparse)
-        const fmt = if (z.float)
-            (if (z.stencil_va != null) ZT_ZF32_X24S8 | ZT_STENCIL_IS_SEPARATE else ZT_ZF32)
-        else
-            (if (z.stencil_va != null) ZT_S8Z24 | ZT_STENCIL_IS_SEPARATE else ZT_X8Z24);
+        // with its stencil the SET_ST_* plane; a Turing one: the stencil in
+        // the depth's words; the width in words of a whole-GOB row; one
+        // layer; no compression, no sparse)
+        const fmt = ztFormat(d.sm, z);
         many(p, SET_ZT_A, &.{ @truncate(z.va >> 32), @truncate(z.va), fmt, @as(u32, z.gobs_log2) << 4, 0 });
         many(p, SET_ZT_SIZE_A, &.{ (z.width * 4 + 63) / 64 * 16, z.height, 1 });
         one(p, SET_ZT_LAYER, 0);
         one(p, SET_Z_COMPRESSION, 0);
         one(p, SET_STENCIL_COMPRESSION, 0);
         one(p, SET_ZT_SPARSE, 0);
-        if (z.stencil_va) |sva| {
-            many(p, SET_ST_A, &.{ @truncate(sva >> 32), @truncate(sva), @as(u32, z.gobs_log2) << 4, 0 });
-            many(p, SET_ST_SIZE_A, &.{ stencilPitch(z.width), z.height });
+        if (d.sm != .sm_75) {
+            if (z.stencil_va) |sva| {
+                many(p, SET_ST_A, &.{ @truncate(sva >> 32), @truncate(sva), @as(u32, z.gobs_log2) << 4, 0 });
+                many(p, SET_ST_SIZE_A, &.{ stencilPitch(z.width), z.height });
+            }
         }
         one(p, gr.SET_ZT_SELECT, 1);
         one(p, gr.SET_DEPTH_TEST, @intFromBool(z.tested));
@@ -505,7 +537,7 @@ fn emitDraw(p: *Push, d: *const Draw, whole: bool) void {
     // the programs, constant buffer 0 of both stages
     for ([_]struct { u32, u32, Prog }{ .{ gr.STAGE_VERTEX, gr.GROUP_VERTEX, d.vertex }, .{ gr.STAGE_PIXEL, gr.GROUP_PIXEL, d.pixel } }) |s| {
         one(p, gr.SET_PIPELINE_SHADER + 64 * s[0], 1 | s[0] << 4);
-        many(p, gr.SET_PIPELINE_PROGRAM_ADDRESS_A + 64 * s[0], &.{ @truncate(s[2].va >> 32), @truncate(s[2].va), @intCast(@min((s[2].bytes + 255) / 256, 127)) });
+        gr.programAddress(p, d.sm, s[0], s[2].va, @intCast(@min((s[2].bytes + 255) / 256, 127)));
         many(p, gr.SET_PIPELINE_REGISTER_COUNT + 64 * s[0], &.{ s[2].registers, s[1] });
     }
     many(p, gr.SET_CONSTANT_BUFFER_SELECTOR_A, &.{ d.cb_bytes, @truncate(d.cb_va >> 32), @truncate(d.cb_va) });
@@ -631,4 +663,49 @@ test "gl3d: what the Legion refused (depth beside pitch colour, a combined depth
     // (a target off a GOB is refused as block linear)
     d.target.va += 128;
     try testing.expect(whyNot(&d) != null);
+}
+
+test "gl3d on Turing: TURING_A's stream, one depth-stencil surface (S8Z24), no SET_ST_*, a program's address in two words" {
+    var d = Draw{
+        .vertex = .{ .va = 0x10_0000_0000, .registers = 24, .bytes = 0x300 },
+        .pixel = .{ .va = 0x10_0000_1000, .registers = 32, .bytes = 0x200 },
+        .cb_va = 0x10_0000_2000,
+        .cb_bytes = 0x400,
+        .zero_va = 0x10_0000_3000,
+        .target = .{ .va = 0x10_0001_0000, .width = 64, .height = 32, .pitch = 256 },
+        .format = .rgba8,
+        .scale = .{ 32, 16, 0.5 },
+        .offset = .{ 32, 16, 0.5 },
+        .scissor = .{ 0, 0, 64, 32 },
+        .count = 6,
+        .color_gobs = 2,
+        .sm = .sm_75,
+        .depth = .{ .va = 0x10_0003_0000, .width = 64, .height = 32, .gobs_log2 = 2, .tested = true, .write = true },
+    };
+    try testing.expectEqual(@as(?[]const u8, null), whyNot(&d));
+    var buf: [MAX_DWORDS]u32 = undefined;
+    var p = Push{ .buf = &buf };
+    emit(&p, &d);
+    try p.check();
+    try testing.expectEqualSlices(u32, &.{ push.header(SUBCH, push.SET_OBJECT, 1), gr.TURING_A }, p.words()[0..2]);
+    try testing.expect(std.mem.indexOf(u32, p.words(), &[_]u32{ push.header(SUBCH, SET_ZT_A, 5), 0x10, 0x0003_0000, ZT_X8Z24, 0x20, 0 }) != null);
+    // a stencil test: the stencil in the depth's words, no plane of its own
+    d.depth.?.stencil = .{};
+    try testing.expectEqual(@as(?[]const u8, null), whyNot(&d));
+    p = Push{ .buf = &buf };
+    emit(&p, &d);
+    try testing.expect(std.mem.indexOf(u32, p.words(), &[_]u32{ push.header(SUBCH, SET_ZT_A, 5), 0x10, 0x0003_0000, ZT_S8Z24, 0x20, 0 }) != null);
+    try testing.expect(std.mem.indexOf(u32, p.words(), &[_]u32{push.header(SUBCH, SET_ST_A, 4)}) == null);
+    // the programs' addresses: two words each, the vertex's and the pixel's
+    try testing.expect(std.mem.indexOf(u32, p.words(), &[_]u32{ push.header(SUBCH, gr.SET_PIPELINE_PROGRAM_ADDRESS_A + 64 * gr.STAGE_VERTEX, 2), 0x10, 0 }) != null);
+    try testing.expect(std.mem.indexOf(u32, p.words(), &[_]u32{ push.header(SUBCH, gr.SET_PIPELINE_PROGRAM_ADDRESS_A + 64 * gr.STAGE_PIXEL, 2), 0x10, 0x1000 }) != null);
+    // what Turing has not is refused before it is sent
+    d.depth.?.stencil_va = 0x10_0004_0000;
+    try testing.expect(std.mem.indexOf(u8, whyNot(&d).?, "Turing") != null);
+    d.depth.?.stencil_va = null;
+    d.depth.?.float = true;
+    try testing.expect(std.mem.indexOf(u8, whyNot(&d).?, "ZF32_X24S8") != null);
+    d.depth.?.stencil = null;
+    try testing.expectEqual(@as(?[]const u8, null), whyNot(&d));
+    try testing.expectEqual(ZT_ZF32, ztFormat(.sm_75, d.depth.?));
 }

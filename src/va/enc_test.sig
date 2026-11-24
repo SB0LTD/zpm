@@ -112,8 +112,9 @@ fn at(k: *Fake, m: []const u32, method: u32, len: usize) []u8 {
 /// The pretend NVENC: reads the methods and the setup, writes a slice
 /// (H.264: I_PCM macroblocks of the block-linear input, in an I, P or B
 /// slice as the setup says; HEVC, AV1: a few bytes) where the setup says,
-/// with its size in the status.
-fn fakeEncode(k: *Fake, sub: Fake.Submit) void {
+/// with its size in the status. (H.264's pictures at most 64x64: pcmSlice's
+/// buffers.)
+pub fn fakeEncode(k: *Fake, sub: Fake.Submit) void {
     const m = methodsOf(k.push(sub));
     if (m[nvenc.SET_IN_DRV_PIC_SETUP >> 2] == 0) return;
     seen.methods = m;

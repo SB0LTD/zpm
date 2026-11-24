@@ -24,6 +24,14 @@
 //! (with `gpu_view`) every CPU write handed over with toDevice and every
 //! GPU write fetched with fromDevice.
 //!
+//! `EmuDevice.sm` makes it a Turing GPU instead (sm_75): it then takes
+//! TURING_COMPUTE_A and its way of scheduling a QMD and of reporting,
+//! reads QMD version 02_02, decodes the code as sm_75 and checks it with
+//! sm_75's timing, with Turing's SM splits for shared memory. A stream, a
+//! QMD or a kernel made for the other generation fails on either; its 3D
+//! engine (with `gr3d`) is TURING_A, emu3d as Turing's (the class, the
+//! texture headers, the depth target, the methods Turing has not).
+//!
 //! Allocation-free: buffers come from memory the device owner provides, and
 //! so does the emulator's Work.
 
@@ -148,6 +156,9 @@ pub const EmuDevice = struct {
     sms_per_tpc: u32 = 2,
     tpcs: u32 = 24,
     sass: u32 = qmd.SASS_SM120,
+    /// The shader model of the GPU emulated: its compute class, its QMD's
+    /// version, its instructions' forms and timing.
+    sm: push.Sm = .sm_120,
     /// Kernels given as instructions, for words sm120.decode does not
     /// read yet: a launch whose code matches one's words runs its
     /// instructions (a test hook).
@@ -163,8 +174,9 @@ pub const EmuDevice = struct {
     /// The program in the emulator now.
     loaded: ?struct { va: u64, sum: u64, n: usize } = null,
     /// The 3D engine (the caller's storage), or none: the class is then
-    /// not on this device, as on a channel no BLACKWELL_B object was
-    /// allocated for, and binding it is a refused stream.
+    /// not on this device, as on a channel no 3D object (BLACKWELL_B, or
+    /// TURING_A on sm_75) was allocated for, and binding it is a refused
+    /// stream.
     gr3d: ?*emu3d.Engine = null,
 
     pub fn device(e: *EmuDevice) Device {
@@ -340,6 +352,10 @@ pub const EmuDevice = struct {
 
     /// Run `dwords` of pushbuffer at `va` (the GPU's view of it).
     pub fn execute(e: *EmuDevice, va: u64, dwords: u32) anyerror!void {
+        // (the emulator's shader model is this device's, for every path a
+        // stream takes: a launch, and the 3D engine's stages, whose Work
+        // the caller may have left undefined but for its controls)
+        e.work.sm = e.sm;
         const raw = e.bytesAt(va, @as(usize, dwords) * 4) orelse return error.BadStream;
         var i: usize = 0;
         while (i < dwords) {
@@ -369,21 +385,23 @@ pub const EmuDevice = struct {
 
     fn method(e: *EmuDevice, subch: u3, m: u32, v: u32) anyerror!void {
         if (m == push.SET_OBJECT) {
-            // (compute, and the 3D engine where the device has one)
-            if (v != push.BLACKWELL_COMPUTE_B and !(v == gr.BLACKWELL_B and e.gr3d != null)) return error.BadStream;
+            // (compute, and the 3D engine of the device's generation where
+            // it has one)
+            if (v != push.computeClass(e.sm) and !(v == gr.classFor(e.sm) and e.gr3d != null)) return error.BadStream;
             e.subch[subch] = v;
             return;
         }
         if (m < 0x100) return e.host(m, v);
-        if (e.subch[subch] == gr.BLACKWELL_B) {
+        if (e.subch[subch] == gr.classFor(e.sm)) {
             const g = e.gr3d orelse return error.BadStream;
             // (a draw runs its programs in the emulator: a kernel's is
             // loaded again at its next launch)
             e.loaded = null;
             return g.method(.{ .mem = e.memory(), .work = e.work }, m, v);
         }
-        if (e.subch[subch] != push.BLACKWELL_COMPUTE_B or m / 4 >= METHODS) return error.BadStream;
+        if (e.subch[subch] != push.computeClass(e.sm) or m / 4 >= METHODS) return error.BadStream;
         e.methods[m / 4] = v;
+        if (e.sm == .sm_75) return e.turingMethod(m, v);
         switch (m) {
             push.SEND_SIGNALING_PCAS2_B => switch (v & 0xf) {
                 push.PCAS_SCHEDULE, push.PCAS_PREFETCH_SCHEDULE, 3, 0xa => try e.launch(@as(u64, e.methods[push.SEND_PCAS_A / 4]) << 8),
@@ -394,6 +412,35 @@ pub const EmuDevice = struct {
                 e.n_icache = 0;
             },
             push.REPORT_SEMAPHORE_EXECUTE => try e.report(v),
+            else => {},
+        }
+    }
+
+    /// TURING_COMPUTE_A's methods that do something here: a QMD scheduled
+    /// (SEND_SIGNALING_PCAS_B's SCHEDULE bit), the caches invalidated, the
+    /// report. Blackwell's own (SEND_SIGNALING_PCAS2_B, REPORT_SEMAPHORE_*)
+    /// are not methods of this class.
+    fn turingMethod(e: *EmuDevice, m: u32, v: u32) anyerror!void {
+        switch (m) {
+            push.SEND_SIGNALING_PCAS_B => if (v & 2 != 0) try e.launch(@as(u64, e.methods[push.SEND_PCAS_A / 4]) << 8),
+            push.SEND_SIGNALING_PCAS2_B, push.REPORT_SEMAPHORE_PAYLOAD_LOWER, push.REPORT_SEMAPHORE_EXECUTE => return error.BadStream,
+            push.INVALIDATE_SHADER_CACHES => if (v & 1 != 0) {
+                e.n_icache = 0;
+            },
+            push.SET_REPORT_SEMAPHORE_D => {
+                const r = &e.methods;
+                const va = @as(u64, r[push.SET_REPORT_SEMAPHORE_A / 4] & 0xff) << 32 | r[(push.SET_REPORT_SEMAPHORE_A + 4) / 4];
+                const payload = r[(push.SET_REPORT_SEMAPHORE_A + 8) / 4];
+                if (v & 3 != push.REPORT_RELEASE) return error.BadStream;
+                if (v & push.REPORT_D_ONE_WORD != 0) {
+                    const b = e.bytesAt(va, 4) orelse return error.BadStream;
+                    std.mem.writeInt(u32, b[0..4], payload, .little);
+                } else {
+                    const b = e.bytesAt(va, 16) orelse return error.BadStream;
+                    std.mem.writeInt(u64, b[0..8], payload, .little);
+                    std.mem.writeInt(u64, b[8..16], e.clock_ns, .little);
+                }
+            },
             else => {},
         }
     }
@@ -479,8 +526,11 @@ pub const EmuDevice = struct {
         const raw = e.bytesAt(qmd_va, qmd.QMD_BYTES) orelse return error.BadStream;
         var q: [qmd.QMD_WORDS]u32 = undefined;
         for (&q, 0..) |*x, k| x.* = std.mem.readInt(u32, raw[k * 4 ..][0..4], .little);
-        const d = qmd.decode(&q) catch return error.BadStream;
-        if (d.sass != e.sass) return error.BadStream;
+        const d = qmd.decodeFor(e.sm, &q) catch return error.BadStream;
+        // (version 02_02 has the field, and NAK leaves it 0: not checked)
+        if (e.sm == .sm_120 and d.sass != e.sass) return error.BadStream;
+        // (the code is decoded, and its timing checked, as this GPU's)
+        e.work.sm = e.sm;
         var l = emu.Launch{
             .grid = d.grid,
             .block = d.block,
@@ -498,7 +548,7 @@ pub const EmuDevice = struct {
         }
         // Shared memory within the SM's split for it.
         const cfg = d.sm_config;
-        if (cfg.min > cfg.target or cfg.target > cfg.max or cfg.max > qmd.SM_CONFIG_MAX or d.shared_bytes > qmd.smConfigBytes(cfg.target)) return error.BadStream;
+        if (cfg.min > cfg.target or cfg.target > cfg.max or cfg.max > qmd.smConfigMax(e.sm) or d.shared_bytes > qmd.smConfigBytes(cfg.target)) return error.BadStream;
         // Local memory: set up, and enough for every TPC's warps.
         const per_thread = d.local_low + d.local_high;
         if (per_thread > 0) {

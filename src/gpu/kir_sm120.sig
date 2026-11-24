@@ -67,10 +67,28 @@
 //! Selection reads `Gen`, what a generation has; the lowering above it is
 //! the same for every SM from Volta on (one 128-bit format, the control
 //! fields in 105..125, BSSY/BSYNC, SHFL, IDP.4A, the uniform datapath from
-//! sm_75). Only sm_120 has an encoder in zpm (src/nvidia/sm120.sig). A
-//! generation joins as: its encoder (NAK's sm70_encode.rs documents each
-//! field by `e.sm`), its latency tables for sm120_sched, a Gen, and its
-//! constant buffer 0 (QMD and cbuf0 in nvidia_device). What differs:
+//! sm_75). sm_120 and sm_75 (Turing: the RTX 20 series) have encoders in
+//! zpm (src/nvidia/sm120.sig, by shader model). A generation joins as: its
+//! encoder (NAK's sm70_encode.rs documents each field by `e.sm`), its
+//! latency tables for sm120_sched, a Gen, and its constant buffer 0 (QMD
+//! and cbuf0 in nvidia_device). What differs:
+//!
+//! For sm_75, selection is the same and `emit` respells what Turing has
+//! another form for, with only forms NAK emits for it: IADD3 for the
+//! two-source add, IMNMX, plain BSSY and BSYNC, BAR.SYNC, F2F for a half's
+//! rounding to nearest, global addresses without a descriptor (and so no
+//! descriptor loaded), ptxas's .SYS scope on global loads and stores. A
+//! collective (a shuffle, vote or ballot) in divergent control flow stands
+//! where it is, as NAK compiles Vulkan's subgroup operations (from_nir.rs:
+//! OpVote and OpShfl pushed with nothing before them; NVK passes the
+//! conformance tests on Turing so): the convergence barriers of structured
+//! flow keep a region's lanes together, and the collective is among them.
+//! sm_120 adds ptxas's WARPSYNC on the active mask first; sm_75 does not,
+//! because NAK never emits one and its encoder's has the mask register in
+//! bits 32..39 where ptxas's sm_120 word (sm120.sig's) has it in 24..31.
+//! Constant buffer 0 keeps Galaxy's
+//! layout on both (parameters from 0x380: it is this compiler's own
+//! convention, not CUDA's for the chip). Nothing sm_75 has run on a card.
 //!
 //! (read off ptxas 13.4's output for sm_75, 80, 89, 90 and 120, and NAK)
 //!
@@ -178,14 +196,37 @@ pub const Gen = struct {
     warp: u32 = 32,
     /// Shared memory reserved before a kernel's own (sm_90 and later: 1 KiB).
     shared_base: u32,
+    /// Global addresses go through a memory descriptor, desc[UR4][R.64]
+    /// (sm_90 and later; else plain [R.64], and none is loaded).
+    desc: bool = true,
+    /// F2FP for a half rounded to nearest (sm_80 and later; else F2F).
+    f2fp: bool = true,
+    /// BSSY and BSYNC carry .RECONVERGENT, BAR.SYNC .DEFER_BLOCKING, and a
+    /// collective in divergent flow is made safe with WARPSYNC (ptxas's
+    /// forms on sm_120; NAK's for Turing have none of the three).
+    ptxas_sync: bool = true,
+    /// Global loads and stores name the system scope, .SYS (ptxas's on
+    /// sm_75, where the scope is a field of its own).
+    global_sys: bool = false,
+    /// IMAD.HI for a product's high word (ptxas's on sm_120; NAK has no
+    /// such form: the wide product's high register instead).
+    imad_hi: bool = true,
+
+    /// The shader model's name in zpm's encoder.
+    pub fn smOf(g: Gen) nvidia.sm120.Sm {
+        return if (g.sm == 75) .sm_75 else .sm_120;
+    }
 };
 
 pub const SM120 = Gen{ .sm = 120, .iadd2 = true, .vimnmx = true, .i2fp = true, .ldcu = true, .shared_base = 0x400 };
+/// Turing (the RTX 20 series; TU102 is the RTX 2080 Ti).
+pub const SM75 = Gen{ .sm = 75, .iadd2 = false, .vimnmx = false, .i2fp = false, .ldcu = false, .shared_base = 0, .desc = false, .f2fp = false, .ptxas_sync = false, .global_sys = true, .imad_hi = false };
 
-/// The generations the backend could select for. Only sm_120 assembles.
+/// The generations the backend selects and assembles for.
 pub fn genOf(t: device.Target) ?Gen {
     return switch (t) {
         .sm_120 => SM120,
+        .sm_75 => SM75,
         else => null,
     };
 }
@@ -493,14 +534,15 @@ pub fn compile(k: *const kir.Kernel, caps: device.Caps, work: *device.Work, out:
 /// The same with a State of the caller's (tests, and callers that keep one).
 pub fn compileIn(k: *const kir.Kernel, caps: device.Caps, st: anytype, out: []u8, opts: Options) Error!device.Binary {
     const text = try compileText(k, caps, st, opts);
-    const ak = try sm120_asm.assemble(text, &st.words, &st.asm_work);
+    const gen = genOf(caps.target) orelse SM120;
+    const ak = try sm120_asm.assembleFor(gen.smOf(), text, &st.words, &st.asm_work);
     const bytes = ak.code.len * 8;
     if (out.len < bytes) return error.BufferTooSmall;
     @memcpy(out[0..bytes], std.mem.sliceAsBytes(ak.code));
     st.stats.instructions = ak.count;
     st.stats.registers = ak.registers;
     var bin = device.Binary{
-        .target = .sm_120,
+        .target = if (gen.sm == 75) .sm_75 else .sm_120,
         .code = out[0..bytes],
         .regs = ak.registers,
         .shared_bytes = k.shared_bytes,
@@ -959,15 +1001,48 @@ fn CtxOf(comptime St: type) type {
         }
 
         fn ins(c: *Ctx, name: []const u8, nd: u8, ops: []const Opd) Error!void {
-            var m = MI{ .op = name, .nd = nd, .n = @intCast(ops.len) };
-            for (ops, 0..) |o, i| m.o[i] = o;
-            try c.put(m);
+            return c.emit(name, nd, ops, .none);
         }
 
         fn eff(c: *Ctx, name: []const u8, nd: u8, ops: []const Opd) Error!void {
-            var m = MI{ .op = name, .nd = nd, .n = @intCast(ops.len), .effect = .effect };
+            return c.emit(name, nd, ops, .effect);
+        }
+
+        /// One machine instruction, as selection named it for sm_120; for a
+        /// generation that spells it another way (sm_75: Gen's flags), that
+        /// spelling.
+        fn emit(c: *Ctx, name0: []const u8, nd: u8, ops: []const Opd, effect: Effect) Error!void {
+            var name = name0;
+            var m = MI{ .nd = nd, .n = @intCast(ops.len), .effect = effect };
             for (ops, 0..) |o, i| m.o[i] = o;
+            if (!c.gen.iadd2 and eq(name, "IADD")) {
+                // IADD d, a, b is IADD3 d, PT, PT, a, b, RZ (no carries out)
+                name = "IADD3";
+                m.o[1] = .{ .pt = true };
+                m.o[2] = .{ .pt = true };
+                m.o[3] = ops[1];
+                m.o[4] = ops[2];
+                m.o[5] = .rz;
+                m.n = 6;
+            } else if (!c.gen.vimnmx and eq(name, "VIMNMX.S32")) {
+                name = "IMNMX.S32";
+            } else if (!c.gen.vimnmx and eq(name, "VIMNMX.U32")) {
+                name = "IMNMX.U32";
+            } else if (!c.gen.ptxas_sync and eq(name, "BSSY.RECONVERGENT")) {
+                name = "BSSY";
+            } else if (!c.gen.ptxas_sync and eq(name, "BSYNC.RECONVERGENT")) {
+                name = "BSYNC";
+            } else if (!c.gen.ptxas_sync and eq(name, "BAR.SYNC.DEFER_BLOCKING")) {
+                name = "BAR.SYNC";
+            } else if (!c.gen.ptxas_sync and eq(name, "WARPSYNC")) {
+                return error.Unsupported;
+            }
+            m.op = name;
             try c.put(m);
+        }
+
+        fn eq(a: []const u8, b: []const u8) bool {
+            return std.mem.eql(u8, a, b);
         }
 
         fn at(c: *Ctx, l: u16) Error!void {
@@ -1223,7 +1298,8 @@ fn CtxOf(comptime St: type) type {
                     else => {},
                 }
             }
-            if (c.global) try c.ins(if (c.gen.ldcu) "LDCU.64" else "ULDC.64", 1, &.{ .ur4, .{ .cbuf = 0x358 } });
+            // (the memory descriptor, where the generation has one)
+            if (c.global and c.gen.desc) try c.ins(if (c.gen.ldcu) "LDCU.64" else "ULDC.64", 1, &.{ .ur4, .{ .cbuf = 0x358 } });
             for (0..256) |b| {
                 if (!used[b]) continue;
                 if (b >= c.k.bindings) return error.BadBinding;
@@ -1452,6 +1528,11 @@ fn CtxOf(comptime St: type) type {
                     var b = in.b;
                     if (!isReg(a)) std.mem.swap(kir.Arg, &a, &b);
                     const ra = try c.reg(a);
+                    if (!c.gen.imad_hi) {
+                        const p = try c.newRun(2);
+                        try c.ins(if (c.signed(in)) "IMAD.WIDE" else "IMAD.WIDE.U32", 1, &.{ R(p), ra, c.src(b), .rz });
+                        return c.ins("MOV", 1, &.{ c.dst(in), R(p + 1) });
+                    }
                     try c.ins(if (c.signed(in)) "IMAD.HI" else "IMAD.HI.U32", 1, &.{ c.dst(in), ra, c.src(b), .rz });
                 },
                 .imad => {
@@ -1738,6 +1819,9 @@ fn CtxOf(comptime St: type) type {
             if (c.nobar > 0) c.w.stats.nobar_collectives += 1;
             if (c.div_depth == 0) return;
             c.w.stats.div_collectives += 1;
+            // (sm_75, NAK's way: the collective where it stands, among the
+            // lanes the region's convergence barrier keeps together)
+            if (!c.gen.ptxas_sync) return;
             const next = c.label();
             try c.bra(.none, next);
             try c.at(next);
@@ -1976,12 +2060,14 @@ fn CtxOf(comptime St: type) type {
                 return c.ins(name, 1, &.{ d, try c.reg(in.a) });
             }
             if (from == .f32 and to == .f16) {
-                if (cv.round == .rne) return c.ins("F2FP.F16.F32.PACK_AB", 1, &.{ d, .rz, try c.reg(in.a) });
+                if (cv.round == .rne and c.gen.f2fp) return c.ins("F2FP.F16.F32.PACK_AB", 1, &.{ d, .rz, try c.reg(in.a) });
                 const fz = c.ftz();
                 const name: []const u8 = switch (cv.round) {
                     .rz => if (fz) "F2F.FTZ.F16.F32.RZ" else "F2F.F16.F32.RZ",
                     .rd => if (fz) "F2F.FTZ.F16.F32.RM" else "F2F.F16.F32.RM",
-                    else => if (fz) "F2F.FTZ.F16.F32.RP" else "F2F.F16.F32.RP",
+                    .ru => if (fz) "F2F.FTZ.F16.F32.RP" else "F2F.F16.F32.RP",
+                    // (before sm_80: F2F rounds to nearest even by default)
+                    .rne => if (fz) "F2F.FTZ.F16.F32" else "F2F.F16.F32",
                 };
                 return c.ins(name, 1, &.{ d, try c.reg(in.a) });
             }
@@ -2048,12 +2134,12 @@ fn CtxOf(comptime St: type) type {
             const imm: i64 = m.imm;
             if (a == .imm) {
                 const off = imm + a.imm;
-                if (off < (1 << 23)) return .{ .mem = .{ .base = base, .wide = true, .desc = true, .off = @intCast(off) } };
+                if (off < (1 << 23)) return .{ .mem = .{ .base = base, .wide = true, .desc = c.gen.desc, .off = @intCast(off) } };
                 const t = try c.newV(.r);
                 try c.ins("MOV", 1, &.{ R(t), .{ .imm = a.imm } });
                 const p = try c.newRun(2);
                 try c.ins("IMAD.WIDE.U32", 1, &.{ R(p), R(t), .{ .imm = 1 }, R(base) });
-                return .{ .mem = .{ .base = p, .wide = true, .desc = true, .off = @intCast(imm) } };
+                return .{ .mem = .{ .base = p, .wide = true, .desc = c.gen.desc, .off = @intCast(imm) } };
             }
             var x = vOf(a);
             var scale: u32 = 1;
@@ -2070,7 +2156,7 @@ fn CtxOf(comptime St: type) type {
                 }
             }
             for (c.addrs[0..c.n_addrs]) |e| {
-                if (e.b == b and e.a == x and e.scale == scale) return .{ .mem = .{ .base = e.pair, .wide = true, .desc = true, .off = @intCast(imm) } };
+                if (e.b == b and e.a == x and e.scale == scale) return .{ .mem = .{ .base = e.pair, .wide = true, .desc = c.gen.desc, .off = @intCast(imm) } };
             }
             // (pure arithmetic: made unguarded in a predicated region, so the
             // address serves after it too)
@@ -2085,13 +2171,25 @@ fn CtxOf(comptime St: type) type {
                 c.addrs[c.n_addrs] = .{ .b = b, .a = x, .scale = scale, .pair = p, .depth = c.rdepth };
                 c.n_addrs += 1;
             }
-            return .{ .mem = .{ .base = p, .wide = true, .desc = true, .off = @intCast(imm) } };
+            return .{ .mem = .{ .base = p, .wide = true, .desc = c.gen.desc, .off = @intCast(imm) } };
         }
 
         fn saddr(c: *Ctx, m: kir.Mem, a: kir.Arg) Error!Opd {
             const off: i64 = @as(i64, m.imm) + c.gen.shared_base;
             if (a == .imm) return .{ .mem = .{ .off = @intCast(off + a.imm) } };
             return .{ .mem = .{ .base = vOf(a), .off = @intCast(off) } };
+        }
+
+        /// sizeName with the system scope after the size (sm_75's global
+        /// memory: its scope is a field of its own, and ptxas names SYS).
+        fn sizeNameSys(comptime pre: []const u8, m: kir.Mem) []const u8 {
+            return switch (m.width_log2) {
+                3 => if (m.signed) pre ++ ".S8.SYS" else pre ++ ".U8.SYS",
+                4 => if (m.signed) pre ++ ".S16.SYS" else pre ++ ".U16.SYS",
+                6 => pre ++ ".64.SYS",
+                7 => pre ++ ".128.SYS",
+                else => pre ++ ".SYS",
+            };
         }
 
         fn sizeName(comptime pre: []const u8, m: kir.Mem) []const u8 {
@@ -2237,7 +2335,7 @@ fn CtxOf(comptime St: type) type {
             if (m.width_log2 < 3) return error.BadOperand;
             if (m.space == .global) {
                 const ad = try c.gaddr(m, in.a);
-                try c.ins(sizeName("LDG.E", m), 1, &.{ c.dst(in), ad });
+                try c.ins(if (c.gen.global_sys) sizeNameSys("LDG.E", m) else sizeName("LDG.E", m), 1, &.{ c.dst(in), ad });
             } else {
                 const ad = try c.saddr(m, in.a);
                 try c.ins(sizeName("LDS", m), 1, &.{ c.dst(in), ad });
@@ -2252,7 +2350,7 @@ fn CtxOf(comptime St: type) type {
             const v: Opd = if (m.width_log2 >= 6) R(vOf(in.b)) else try c.reg(in.b);
             if (m.space == .global) {
                 const ad = try c.gaddr(m, in.a);
-                try c.eff(sizeName("STG.E", m), 0, &.{ ad, v });
+                try c.eff(if (c.gen.global_sys) sizeNameSys("STG.E", m) else sizeName("STG.E", m), 0, &.{ ad, v });
             } else {
                 const ad = try c.saddr(m, in.a);
                 try c.eff(sizeName("STS", m), 0, &.{ ad, v });

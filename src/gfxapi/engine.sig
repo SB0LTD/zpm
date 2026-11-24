@@ -1477,9 +1477,19 @@ pub const Engine = struct {
     /// loaded for cfg.dev; if any fails, everything runs on the CPU.
     pub fn init(e: *Engine, cfg: Config) void {
         e.* = .{ .pool = Pool.init(cfg.pool), .slabs = cfg.slabs, .slab_bytes = cfg.slab_bytes, .slab_object = cfg.slab_object, .scratch_len = @min(cfg.scratch_ring / SCRATCH_CHUNK * SCRATCH_CHUNK, SCRATCH_RING_BYTES), .scratch_min = cfg.scratch_min orelse cfg.slab_object, .compiler = cfg.compiler, .work = cfg.work, .cpu_work = cfg.cpu_work, .cpu_insts = cfg.cpu_kernels, .check = cfg.check };
-        if (cfg.dev) |d| e.graphics = cfg.graphics and d.caps.graphics and d.caps.target == .sm_120;
+        if (cfg.dev) |d| e.graphics = cfg.graphics and d.caps.graphics and (d.caps.target == .sm_120 or d.caps.target == .sm_75);
+        // (a Turing card's depth draws too: Mesa's NIL gives its depth
+        // targets FermiZS GOBs, not public, but the 2080 Ti puts float
+        // depth (ZF32) where Turing2D's GOBs put 32-bit words, as the
+        // compute raster keeps them: its draw test through Windows' driver,
+        // step 4c within 3 ulps, 4d exact. Its 24-bit depth is another
+        // layout (4f lost the channel), but the 3D engine draws only the
+        // float form (Image.depth_float); Turing has no stencil plane of
+        // its own, so graphicsDraw keeps its stencil draws on the compute
+        // kernels. With every depth draw there, Might and Magic VII ran at
+        // 7 frames a second in Hyper-V.)
         e.graphics_depth = cfg.graphics_depth;
-        e.depth_float = e.graphics and cfg.depth_float and cfg.graphics_depth;
+        e.depth_float = e.graphics and cfg.depth_float and e.graphics_depth;
         e.block_targets = e.graphics and cfg.block_targets;
         if (cfg.dev) |d| e.vram_images = cfg.vram_images and d.caps.memory == .discrete and cfg.check.mem.len == 0;
         for (e.slabs) |*slab| slab.* = .{};
@@ -2887,6 +2897,14 @@ pub const Engine = struct {
                 e.sayCompute("a depth image not on a GOB (512 bytes)");
                 return null;
             }
+            // (Turing keeps stencil in the depth's words, S8Z24, with no
+            // plane of its own, and ZF32_X24S8 is not modelled: gl3d.whyNot
+            // refuses it, which would fail the whole batch)
+            if (d.stencil != null and e.dev.?.caps.target == .sm_75) {
+                e.stats.compute_draws += 1;
+                e.sayCompute("a stencil test on Turing (no stencil plane of its own, clc597.h has no SET_ST_*; ZF32_X24S8 not modelled)");
+                return null;
+            }
         }
         if (!d.color_off and d.color.layout.block and !d.color.blockFits()) {
             e.stats.compute_draws += 1;
@@ -3033,7 +3051,7 @@ pub const Engine = struct {
         e.stats.graphics_draws += 1;
         if (!e.said_graphics) {
             e.said_graphics = true;
-            report.say(.pipeline, "draws through the GPU's 3D engine (the RTX's BLACKWELL_B: its rasterizer and blender), the compute kernels for what it does not take yet", .{});
+            report.say(.pipeline, "draws through the GPU's 3D engine (the RTX's {s}: its rasterizer and blender), the compute kernels for what it does not take yet", .{if (e.dev.?.caps.target == .sm_75) "TURING_A" else "BLACKWELL_B"});
         }
         return true;
     }

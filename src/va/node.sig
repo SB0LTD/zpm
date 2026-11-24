@@ -50,6 +50,8 @@ pub const G_VRAM: u32 = 2;
 /// The RTX 5070 Laptop GPU (GB206): NVIDIA's vendor id over nouveau's
 /// chipset number.
 pub const CHIP_GB206: u32 = 0x10de_01b6;
+/// The RTX 2080 Ti (TU102, Turing): nv_dev's id for it.
+pub const CHIP_TU102: u32 = 0x10de_0162;
 /// nv_drm's buffers come in whole 2 MiB units.
 pub const UNIT: usize = 2 << 20;
 

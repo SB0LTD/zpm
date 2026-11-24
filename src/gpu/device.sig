@@ -20,8 +20,10 @@ const std = @import("std");
 const kir = @import("kir.sig");
 
 pub const Vendor = enum { nvidia, qualcomm, amd, intel, apple, emulated };
-/// grows: sm_75..sm_90, ir3_a6xx, rdna3, xe, agx ...
-pub const Target = enum { interp, ir3_a7xx, sm_120, gcn4_gfx803 };
+/// grows: sm_80..sm_90, ir3_a6xx, rdna3, xe, agx ...
+/// (sm_75: NVIDIA's Turing, the RTX 20 series; kir_sm120 compiles for it
+/// as for sm_120, with Turing's forms.)
+pub const Target = enum { interp, ir3_a7xx, sm_120, gcn4_gfx803, sm_75 };
 pub const MemoryModel = enum { unified, discrete };
 
 pub const Caps = struct {
@@ -637,7 +639,7 @@ fn compileOne(comptime t: Target, k: *const kir.Kernel, caps: Caps, work: *Work,
     return switch (t) {
         .interp => interpBinary(k, out),
         .ir3_a7xx => backend_ir3_a7xx.compile(k, caps, work, out),
-        .sm_120 => backend_sm_120.compile(k, caps, work, out),
+        .sm_120, .sm_75 => backend_sm_120.compile(k, caps, work, out),
         .gcn4_gfx803 => backend_gcn4_gfx803.compile(k, caps, work, out),
     };
 }

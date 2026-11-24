@@ -15,6 +15,14 @@ template or dropping it. The parser retains an explicit template choice
 so an existing user database with that name can keep its data and route
 without being chosen in place of the pristine template.
 
+The fixture now also parses a named database template and verifies its
+lease count before copying. The durable log stages its frames from a
+quiescent source, keeps the original sequence and rewrites the cluster
+database identity and prepared record metadata for the copy. A torn
+source fails without repair. The caller publishes only after syncing and
+replaying the destination. The built-in writable `template1` lifecycle
+and full cluster archive remain open.
+
 The stock global-archive query now binds `pg_tablespace_location(oid)`
 against the two built-in tablespaces. Their locations and the implicit
 database default use PostgreSQL's empty-string convention. An unknown
@@ -42,8 +50,9 @@ type output preserves PostgreSQL's SQL grammar spellings and quotes its
 other identifiers. The parser resolves quoted and pg_catalog-qualified
 built-in types and quoted index methods. PostgreSQL parameter inference
 preserves schema qualification and quoted relation names in its catalog
-probe. Stored view and expression trees
-that are emitted from source text still need a full PostgreSQL deparser.
+probe. The PG16 and PG18 CI lanes passed all 42 stock checks. Stored views
+and expressions emitted from source text still need a PostgreSQL deparser.
+[Stock tooling CI](https://github.com/SB0LTD/ramsql/actions/runs/45282665508)
 
 Stock `pg_dumpall --roles-only --no-role-passwords` reached the
 `pg_parameter_acl` catalog query after emitting role memberships on

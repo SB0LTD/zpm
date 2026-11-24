@@ -381,6 +381,14 @@ pub const Cache = struct {
     kv: Buffer,
     /// (host) The executor's KV rows when `kv` has no CPU view.
     kv_host: ?Buffer = null,
+    /// The executor's KV rows when `kv` has no CPU view and the caller gave
+    /// memory of its own for them (newCacheWith): plain memory, no GPU's;
+    /// the rows cross to and from it through the backend's stage, a piece
+    /// at a time, only when the CPU takes the cache (toCpu) and gives it
+    /// back. (A host mirror of every slot's KV cache held 512 MiB of the
+    /// guest RAM a Hyper-V GPU partition lets the GPU map, about 1.25 GiB
+    /// in all: galaxy-turing, 2026-11-22.)
+    kv_cpu: []u8 = &.{},
     conv: Buffer,
     /// The CPU holds the KV rows (toCpu): they go to the GPU before its next
     /// call on this cache.
@@ -388,6 +396,11 @@ pub const Cache = struct {
 };
 
 const MatrixInfo = struct { offset: u32, row_bytes: u32, rows: u32, blocks: u32, q4: bool, tensor: u16 };
+
+/// The KV rows' trip between a cache with no CPU view and the caller's
+/// memory (Cache.kv_cpu): pieces of this many bytes through the backend's
+/// stage.
+const KV_STAGE_BYTES: u64 = 4 << 20;
 
 /// What a dispatch is, for diagnose mode's lines.
 pub const Desc = struct {
@@ -503,6 +516,9 @@ pub fn Backend(comptime tensor_capacity: usize) type {
         /// (host) residualRows' rows, where `hidden` has no CPU view (a
         /// backend for long passes only: max_batch over WHOLE_TOKENS).
         out_rows: Buffer = .{},
+        /// (host) The KV rows' stage for caches whose rows the caller holds
+        /// (Cache.kv_cpu): made the first time one crosses.
+        kv_stage: Buffer = .{},
         /// The pass under way is forwardSees': who reads whom on the
         /// full-attention layers.
         sees: ?*const executor.Sees = null,
@@ -564,6 +580,7 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             const bufs = [_]*Buffer{ &s.hidden, &s.normalized, &s.mixed, &s.query, &s.key, &s.value, &s.gate, &s.mixer, &s.projected, &s.ffn_gate, &s.ffn_up, &s.act_q, &s.act_d, &s.act_sums, &s.scores, &s.partial, &s.rope_full, &s.rope_swa, &s.input, &self.out_hidden, &self.out_logits, &self.conv_snapshot };
             for (bufs) |b| self.release(b);
             self.release(&self.out_rows);
+            self.release(&self.kv_stage);
             if (!self.imported) self.release(&self.weights) else self.weights = .{};
             const k = &self.k;
             for (&k.q4k) |*p| self.unload(p);
@@ -764,6 +781,50 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             return @as(f64, @floatFromInt(n)) / @as(f64, @floatFromInt(ns));
         }
 
+        /// The KV stage (made the first time).
+        fn stage(self: *Self) Error!Buffer {
+            if (self.kv_stage.bytes == 0) self.kv_stage = try self.dev.alloc(KV_STAGE_BYTES, .host);
+            return self.kv_stage;
+        }
+
+        /// The KV rows from the GPU into the caller's memory, a piece at a
+        /// time through the stage.
+        fn kvDown(self: *Self, c: *Cache) Error!void {
+            const st = try self.stage();
+            var at: u64 = 0;
+            while (at < c.kv_cpu.len) {
+                const n = @min(c.kv_cpu.len - at, KV_STAGE_BYTES);
+                var l = List{ .work = self.work };
+                try self.copyInto(&l, c.kv, @intCast(at), st, 0, @intCast(n / 16));
+                try self.runNow(&l);
+                self.dev.fromDevice(st, 0, n);
+                @memcpy(c.kv_cpu[@intCast(at)..][0..@intCast(n)], st.cpu[0..@intCast(n)]);
+                at += n;
+            }
+        }
+
+        /// The caller's KV rows back to the GPU, a piece at a time.
+        fn kvUp(self: *Self, c: *Cache) Error!void {
+            const st = try self.stage();
+            var at: u64 = 0;
+            while (at < c.kv_cpu.len) {
+                const n = @min(c.kv_cpu.len - at, KV_STAGE_BYTES);
+                @memcpy(st.cpu[0..@intCast(n)], c.kv_cpu[@intCast(at)..][0..@intCast(n)]);
+                self.dev.toDevice(st, 0, n);
+                var l = List{ .work = self.work };
+                try self.copyInto(&l, st, 0, c.kv, @intCast(at), @intCast(n / 16));
+                try self.runNow(&l);
+                at += n;
+            }
+        }
+
+        /// The bytes a cache of `context` positions keeps its KV rows in
+        /// (what newCacheWith's kv_cpu holds at least).
+        pub fn kvBytes(self: *const Self, context: u32) Error!u64 {
+            const kv_n = if (self.plan.attention_layer_count > 0) try executor.requiredKvElements(self.plan, context) else 0;
+            return @max(kv_n * 2, 16);
+        }
+
         fn runNow(self: *Self, l: *const List) Error!void {
             if (l.n == 0) return;
             const fence = try self.dev.run(l.slice());
@@ -849,6 +910,13 @@ pub fn Backend(comptime tensor_capacity: usize) type {
 
         /// A sequence's state for `context` positions, zeroed (position 0).
         pub fn newCache(self: *Self, context: u32) Error!Cache {
+            return self.newCacheWith(context, null);
+        }
+
+        /// The same, the executor's KV rows in `kv_cpu` (the caller's
+        /// memory, at least kvBytes(context)) when the device's KV cache has
+        /// no CPU view, instead of a host mirror the GPU maps.
+        pub fn newCacheWith(self: *Self, context: u32, kv_cpu: ?[]u8) Error!Cache {
             const kv_n = if (self.plan.attention_layer_count > 0) try executor.requiredKvElements(self.plan, context) else 0;
             const conv_n = try executor.requiredConvElements(self.plan);
             const kv_bytes: u64 = @max(kv_n * 2, 16);
@@ -859,7 +927,13 @@ pub fn Backend(comptime tensor_capacity: usize) type {
             errdefer self.dev.free(conv);
             var c = Cache{ .cpu = undefined, .kv = kv, .conv = conv };
             var view: []u8 = kv.cpu;
-            if (kv.cpu.len == 0) {
+            if (kv.cpu.len == 0 and kv_cpu != null and kv_cpu.?.len >= kv_bytes and kv_bytes % 16 == 0) {
+                // (the caller's memory: fresh device memory reads as zeros,
+                // and so does this)
+                c.kv_cpu = kv_cpu.?[0..@intCast(kv_bytes)];
+                view = c.kv_cpu;
+                @memset(view, 0);
+            } else if (kv.cpu.len == 0) {
                 const mirror = try self.dev.alloc(kv_bytes, .host);
                 c.kv_host = mirror;
                 view = mirror.cpu;
@@ -893,6 +967,8 @@ pub fn Backend(comptime tensor_capacity: usize) type {
                 self.copyInto(&l, c.kv, 0, m, 0, @intCast(c.kv.bytes / 16)) catch return;
                 self.runNow(&l) catch return;
                 self.dev.fromDevice(m, 0, m.bytes);
+            } else if (c.kv_cpu.len != 0) {
+                self.kvDown(c) catch return;
             } else {
                 self.dev.fromDevice(c.kv, 0, c.kv.bytes);
             }
@@ -1003,6 +1079,9 @@ pub fn Backend(comptime tensor_capacity: usize) type {
                 if (c.kv_host) |m| {
                     self.dev.toDevice(m, 0, m.bytes);
                     try self.copyInto(&l, m, 0, c.kv, 0, @intCast(c.kv.bytes / 16));
+                } else if (c.kv_cpu.len != 0) {
+                    // (before the call's own dispatches: its list is empty)
+                    try self.kvUp(c);
                 } else self.dev.toDevice(c.kv, 0, c.kv.bytes);
             }
             const conv_bytes = cache.conv.len * 4;
@@ -1161,6 +1240,9 @@ pub fn Backend(comptime tensor_capacity: usize) type {
                 if (c.kv_host) |m| {
                     self.dev.toDevice(m, 0, m.bytes);
                     try self.copyInto(&l, m, 0, c.kv, 0, @intCast(c.kv.bytes / 16));
+                } else if (c.kv_cpu.len != 0) {
+                    // (before the call's own dispatches: its list is empty)
+                    try self.kvUp(c);
                 } else self.dev.toDevice(c.kv, 0, c.kv.bytes);
             }
             const conv_bytes = cache.conv.len * 4;

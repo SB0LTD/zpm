@@ -124,3 +124,35 @@ test "video_enc: H.264's IDR comes with an SPS and a PPS of the picture's size (
     const pps_nal = it.next() orelse return error.NoPps;
     try std.testing.expectEqual(@as(u8, h264.NAL_PPS), pps_nal[0] & 0x1f);
 }
+
+test "video_enc: H.264's SPS and PPS only ahead of its IDRs (the first, every 5, the one asked for), though every picture sends the sequence" {
+    // (enc_test's pretend NVENC writes the slices: 64x32, its most is 64x64)
+    var k = Fake{ .encoder = enc_test.fakeEncode };
+    var d: D = .{ .node = .{ .sys = &k } };
+    try std.testing.expectEqual(va.SUCCESS, d.init(3, .{}));
+    defer d.terminate();
+    try std.testing.expectEqual(video_enc.Status.ok, enc.init(&d, .{ .codec = .h264, .width = 64, .height = 32, .gop = 5, .qp = 30, .profile = 100 }));
+    defer enc.deinit();
+    var keys: u32 = 0;
+    for (0..12) |n| {
+        frame(@intCast(n));
+        try std.testing.expectEqual(video_enc.Status.ok, enc.encode(&pic, W, @intCast(n * 100), 100, n == 7));
+        var need: u32 = 0;
+        const len = enc.take(&out, &need);
+        try std.testing.expect(len > 0);
+        var it = h264.NalIter.init(out[0..len]);
+        var types: [4]u8 = .{ 0, 0, 0, 0 };
+        var count: usize = 0;
+        while (it.next()) |nal| : (count += 1) {
+            if (count < types.len) types[count] = nal[0] & 0x1f;
+            try std.testing.expect(enc.key or (nal[0] & 0x1f != h264.NAL_SPS and nal[0] & 0x1f != h264.NAL_PPS));
+        }
+        if (enc.key) {
+            keys |= @as(u32, 1) << @intCast(n);
+            try std.testing.expectEqualSlices(u8, &.{ h264.NAL_SPS, h264.NAL_PPS, 5 }, types[0..3]);
+        } else {
+            try std.testing.expectEqual(@as(u8, 1), types[0]);
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 1 << 0 | 1 << 5 | 1 << 7), keys);
+}
