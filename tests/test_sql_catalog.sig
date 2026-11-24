@@ -242,6 +242,14 @@ fn defaultAclDiscovery() !void {
     try expect("SELECT parname,pg_catalog.pg_get_userbyid(10) AS parowner,paracl,"
         ++ "pg_catalog.acldefault('p',10) AS acldefault FROM pg_catalog.pg_parameter_acl ORDER BY 1", "");
     try expect("SELECT 'pg_catalog.pg_parameter_acl'::regclass::oid", "6243");
+    try expect("SELECT oid,spcname,pg_get_userbyid(spcowner),pg_tablespace_location(oid),spcacl,"
+        ++ "acldefault('t',spcowner),array_to_string(spcoptions,', '),shobj_description(oid,'pg_tablespace') "
+        ++ "FROM pg_catalog.pg_tablespace WHERE spcname !~ '^pg_' ORDER BY 1", "");
+    try expect("SELECT pg_tablespace_location(0)='',pg_tablespace_location(1663)='',"
+        ++ "pg_tablespace_location(1664)='',pg_tablespace_location(NULL) IS NULL", "t|t|t|t");
+    try expect("SELECT oid,provolatile,prorettype,pronargs FROM pg_proc WHERE proname='pg_tablespace_location'", "3778|s|25|1");
+    try expect("SELECT 'pg_tablespace_location'::regproc::oid", "3778");
+    try rejects("SELECT pg_tablespace_location(424242)", error.UndefinedFile);
     try expect("SELECT pg_get_userbyid(10),pg_get_userbyid(0),pg_get_userbyid(424242),"
         ++ "pg_get_userbyid(NULL) IS NULL,pg_typeof(pg_get_userbyid(10))::text",
         "ramsql|unknown (OID=0)|unknown (OID=424242)|t|name");

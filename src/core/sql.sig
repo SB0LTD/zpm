@@ -6645,8 +6645,8 @@ pub fn Database(comptime config: Config) type {
             if (view == .pg_tablespace) {
                 // Only the implicit database and shared catalog placements
                 // are supported. Relations use the implicit placement.
-                try sink.add(&.{ intCell(1663), nameCell("pg_default"), intCell(CO.bootstrap_role), .null_value, .null_value });
-                try sink.add(&.{ intCell(1664), nameCell("pg_global"), intCell(CO.bootstrap_role), .null_value, .null_value });
+                try sink.add(&.{ intCell(catalog_module.default_tablespace), nameCell("pg_default"), intCell(CO.bootstrap_role), .null_value, .null_value });
+                try sink.add(&.{ intCell(catalog_module.global_tablespace), nameCell("pg_global"), intCell(CO.bootstrap_role), .null_value, .null_value });
                 return;
             }
             // SQL cannot install foreign tables. FDWs and foreign servers
@@ -12223,7 +12223,7 @@ pub fn Database(comptime config: Config) type {
                         }
                         try sink.add(&.{
                             intCell(callback.oid), nameCell(callback.name), intCell(catalog_module.catalog_namespace),
-                            .{ .pg_internal_char = 'f' }, intCell(operator_catalog.internal_language_oid), .{ .pg_internal_char = 'i' },
+                            .{ .pg_internal_char = 'f' }, intCell(operator_catalog.internal_language_oid), .{ .pg_internal_char = callback.volatility },
                             boolCell(true), intCell(@intCast(callback.args.len)), intCell(callback.result), nameCell(argtypes.slice()),
                             nameCell(callback.name), intCell(CO.bootstrap_role), .null_value,
                         });

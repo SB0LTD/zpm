@@ -2,6 +2,13 @@
 
 ## Stock PostgreSQL dump and restore candidate
 
+The stock global-archive query now binds `pg_tablespace_location(oid)`
+against the two built-in tablespaces. Their locations and the implicit
+database default use PostgreSQL's empty-string convention. An unknown
+OID returns 58P01. The supported tablespaces have catalog rows and the
+location function has PostgreSQL procedure identity and return metadata.
+User-defined tablespaces and full cluster restore remain open.
+
 Role defaults for the supported boolean settings are catalog objects with
 MVCC visibility and WAL replay. `ALTER ROLE ... SET`, `FROM CURRENT`,
 `RESET` and `RESET ALL` update the defaults for future PostgreSQL sessions.
