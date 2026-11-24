@@ -683,6 +683,16 @@ fn overlapsPredicate() void {
     value("SELECT (DATE '2001-01-05', NULL) OVERLAPS (DATE '2001-01-06', DATE '2001-01-07')",16,null);
     value("SELECT (DATE '2001-01-05', DATE '2001-01-06') OVERLAPS (DATE '2001-01-05', NULL::date)",16,null);
     value("SELECT (DATE '2001-01-05', NULL::interval) OVERLAPS (DATE '2001-01-01', DATE '2001-01-02')",16,null);
+    value("SELECT (TIME '09:00', TIME '10:00') OVERLAPS (TIME '09:30', TIME '11:00')",16,"t");
+    value("SELECT (TIME '09:00', INTERVAL '90 minutes') OVERLAPS (TIME '10:30', TIME '11:00')",16,"f");
+    value("SELECT (TIME '09:00', INTERVAL '-1 hour') OVERLAPS (TIME '08:30', TIME '09:00')",16,"t");
+    value("SELECT (TIME '23:30', INTERVAL '1 hour') OVERLAPS (TIME '12:00', TIME '13:00')",16,"t");
+    value("SELECT (TIME '11:00', NULL::time) OVERLAPS (TIME '09:30', TIME '11:30')",16,"t");
+    value("SELECT (TIME '11:00', TIME '11:30') OVERLAPS (TIME '11:30', NULL::time)",16,null);
+    value("SELECT (TIMETZ '10:00+02', TIMETZ '10:00+02') OVERLAPS (TIMETZ '09:00+01', TIMETZ '09:00+01')",16,"f");
+    value("SELECT (TIMETZ '09:00+02', TIMETZ '11:00+02') OVERLAPS (TIMETZ '10:00+03', TIMETZ '12:00+03')",16,"t");
+    value("SELECT (TIME '09:00', TIME '10:00') OVERLAPS (TIMETZ '09:00+00', TIMETZ '10:00+00')",16,"t");
+    value("SELECT (TIMESTAMP '2020-01-01', '2020-01-03') OVERLAPS (TIMESTAMP '2020-01-02', TIMESTAMP '2020-01-04')",16,"t");
     setup(&.{"CREATE TABLE ov_t(id INT PRIMARY KEY,s DATE,e DATE)","INSERT INTO ov_t VALUES(1,'2025-01-01','2025-01-10'),(2,'2025-02-01','2025-02-10'),(3,NULL,NULL)"});
     rowsOf("SELECT id FROM ov_t WHERE (s,e) OVERLAPS (DATE '2025-01-05',DATE '2025-01-06') ORDER BY id",23,&.{"1"});
     rowsOf("SELECT (s,e) OVERLAPS (DATE '2025-02-05',INTERVAL '1 day') FROM ov_t ORDER BY id",16,&.{"f","t",null});
@@ -694,6 +704,11 @@ fn overlapsPredicate() void {
     rejects("SELECT (1, 2) OVERLAPS (3, 4)",error.UndefinedFunction);
     rejects("SELECT (INTERVAL '1 day', DATE '2001-01-02') OVERLAPS (DATE '2001-01-02', DATE '2001-01-03')",error.UndefinedFunction);
     rejects("SELECT ('2001-01-01', '2001-02-01') OVERLAPS ('2001-01-15', '2001-03-01')",error.AmbiguousFunction);
+    rejects("SELECT (NULL,NULL) OVERLAPS (NULL,NULL)",error.AmbiguousFunction);
+    rejects("SELECT (TIME '09:00', '11:00') OVERLAPS (TIME '09:30', TIME '10:30')",error.AmbiguousFunction);
+    rejects("SELECT (TIME '11:00', NULL) OVERLAPS (TIME '09:30', TIME '11:30')",error.AmbiguousFunction);
+    rejects("SELECT (DATE '2020-01-01', '2020-01-03') OVERLAPS (DATE '2020-01-02', TIMESTAMP '2020-01-04')",error.AmbiguousFunction);
+    rejects("SELECT (TIMETZ '10:00+02', INTERVAL '1 hour') OVERLAPS (TIMETZ '09:00+01', TIMETZ '11:00+01')",error.UndefinedFunction);
     report("overlaps",before);
 }
 

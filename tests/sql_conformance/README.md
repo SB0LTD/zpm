@@ -45,7 +45,7 @@ component is missing. The annotations below separate those cases.
 | PG.PRED.DISTINCT | NULL-safe equality | pass; closure incomplete |
 | PG.PRED.QUANTIFIED | ANY/SOME/ALL, scalar subqueries with six ordinary comparison operators | pass; array/row/custom-operator forms and closure remain incomplete |
 | PG.PRED.SYMMETRIC | Symmetric BETWEEN | pass; scalar/flat-row range contracts, broader closure incomplete |
-| PG.PRED.OVERLAPS | Temporal overlaps | Syntax |
+| PG.PRED.OVERLAPS | Temporal overlaps | Original DATE smoke case passes. The follow-up covers DATE/TIMESTAMP/TIMESTAMPTZ/TIME/TIMETZ endpoints, supported durations, NULL logic and overload diagnostics. |
 | PG.PRED.REGEX | Regular expressions | pass (B11 candidate); ARE operators, SIMILAR TO, regexp_like; back references, BREs and positional regexp_* functions open |
 | PG.PRED.ESCAPE | LIKE escape clause | pass; UTF-8 LIKE/ASCII ILIKE contracts, collations and planner closure incomplete |
 | PG.QUERY.WINDOW | Ranking/offset windows | qualified smoke pass; LAG/LEAD finite coverage, demand/other window closure incomplete |
