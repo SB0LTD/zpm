@@ -29,8 +29,12 @@
 //!   PPS (and SEI), HEVC's VPS, SPS and PPS (enc_h264.sig, enc_hevc.sig).
 //!   The setup's sps_data/pps_data only tell the engine what those
 //!   parameter sets said, for the slice headers it writes.
-//! - reference and reconstructed pictures are the engine's own "tiled
-//!   16x16" layout (it writes them, it reads them: the CPU never does);
+//! - reference and reconstructed pictures (the CPU never reads them):
+//!   H.264's in the engine's own "tiled 16x16" layout on GB206, block
+//!   linear (the surface's own, 2 GOBs a block) on Turing, whose engine
+//!   writes its reconstruction block linear whatever the setup says and
+//!   reads its reference as the setup says (driver.encodeTry); HEVC's
+//!   and AV1's block linear on both;
 //! - the input picture is block linear (GPU BL, `input_bl_mode` 0) or the
 //!   engine's tiled 16x16: nvenc_drv.h 1.5 (2) says input pictures are
 //!   "either all in BL format or all in tiled 16x16 format", and its
@@ -67,6 +71,9 @@ const nvdec = @import("nvdec.sig");
 /// NVCFB7_VIDEO_ENCODER: GB20x's encoder class as NVIDIA's open kernel
 /// module lists it (clcfb7.h); its methods ASSUMED NVC9B7's.
 pub const CLASS: u32 = 0xcfb7;
+/// NVC4B7_VIDEO_ENCODER: TU102's NVENC (nouveau's rm/tu1xx.c). Its
+/// methods ASSUMED NVC9B7's, as the header above says of Turing's.
+pub const CLASS_TURING: u32 = 0xc4b7;
 /// SET_OBJECT's ENGINE field, as the decoder's (nvdec.sig).
 pub const SET_OBJECT_ENGINE_SW: u32 = nvdec.SET_OBJECT_ENGINE_SW;
 
@@ -145,6 +152,9 @@ pub const ENC_ERROR_H264_BAD_MAGIC: u32 = 0x3000_0004;
 /// 6, as every generation's NV_NVENC_DRV_MAGIC_VALUE (Ada's 0xc9b70006).
 /// GB206's is ASSUMED to follow (GALAXY_VA_NVENC_MAGIC overrides it).
 pub const MAGIC: u32 = (CLASS << 16) | 0x0006;
+/// TU102's, by the same rule: 0xc4b70006, ASSUMED (Turing's nvenc_drv.h
+/// revision is not public; the status says BAD_MAGIC when it differs).
+pub const MAGIC_TURING: u32 = (CLASS_TURING << 16) | 0x0006;
 /// The watchdog's timeout, the decoder's (nvdec.GPTIMER_TIMEOUT).
 pub const GPTIMER_TIMEOUT: u32 = nvdec.GPTIMER_TIMEOUT;
 

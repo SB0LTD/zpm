@@ -96,6 +96,12 @@ pub const QueryAdapterInfo = extern struct {
 
 /// KMTQAITYPE 31: the adapter's PCI ids (what each u32 of the answer is).
 pub const QUERY_PCI_IDS: u32 = 31;
+/// KMTQAITYPE 70: WDDM 2.7's caps (a u32): bit 0 the GPU can have its work
+/// scheduled in hardware, bit 1 Windows does so (the owner's "hardware-
+/// accelerated GPU scheduling", applied at the next restart), bit 2 it
+/// does by default. An RTX 2080 Ti with it off answers 0x9.
+pub const QUERY_WDDM_2_7_CAPS: u32 = 70;
+pub const CAPS_HW_SCHEDULING_ON: u32 = 1 << 1;
 pub const PciIds = extern struct {
     reserved: u32 = 0,
     vendor: u32 = 0,

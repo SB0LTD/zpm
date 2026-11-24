@@ -89,9 +89,25 @@
 //!   enc_import.sig, enc_rgb.sig), writes the headers, the setup and
 //!   the pushbuffer, and submits it on the encoder channel (G_ESUBMIT).
 //!   The reconstructed and reference pictures live in their surfaces'
-//!   block-linear buffers, in the engine's own layout.
+//!   block-linear buffers: block linear (H.264's on Turing, HEVC's and
+//!   AV1's) or the engine's tiled 16x16 (H.264's on GB206; encodeTry).
 //! - **SyncSurface** on the input, or **SyncBuffer** on the coded buffer,
 //!   waits for the encode.
+//!
+//! **Turing** (the RTX 2080 Ti, node.CHIP_TU102): the same driver with
+//! TU102's decoder and encoder classes (NVC4B0, NVC4B7) bound where each
+//! pushbuffer binds its class, every picture in Turing2D's GOBs
+//! (tiling.Gob.turing: NIL's TuringColor2D for every colour format below
+//! Blackwell, exported with sector layout 1), no Blackwell additions (the
+//! decoder's buffer at 0x4dc and its setup fields: codec.Blackwell.off).
+//! What Turing's engines have not is not offered: AV1, decode (NVDEC
+//! gained it with Ampere) and encode (NVENC with Ada). H.264, HEVC Main
+//! and Main10, VP8 and VP9 profiles 0 and 2 decode; H.264 and HEVC Main
+//! encode (the encoder's setup magic ASSUMED 0xc4b70006), H.264's
+//! references and reconstructions block linear (encodeTry). On the RTX
+//! 2080 Ti through a Hyper-V GPU partition (galaxy-turing, Windows'
+//! driver 576's engines): H.264 decodes bit-exact against ffmpeg's, and
+//! encodes I and P pictures ffmpeg decodes at 54-71 dB.
 //!
 //! Allocation-free: fixed tables, the kernel's buffers, the reserved pool.
 //! Not thread-safe by itself: libgalaxy_va holds a lock around each call.
@@ -276,6 +292,90 @@ pub const Options = struct {
     vpx_gpu: bool = true,
 };
 
+/// GALAXY_VA_DEBUG (set and not "0": say things on stderr, each decode
+/// context's pipeline at its end), GALAXY_VA_SERIAL ("1": a module's step
+/// after a decode at its EndPicture, as before the pipeline),
+/// GALAXY_VA_SCRATCH ("vram": H.264's decoder-only buffers in VRAM),
+/// GALAXY_VA_GOB
+/// ("turing": Turing's GOB layout instead of Blackwell's; "b8", "b16",
+/// "swapped": test readings of the encoder's input, tiling.Gob), GALAXY_VA_PROBE
+/// ("0": no decoder probe at init), GALAXY_VA_BLACKWELL and
+/// GALAXY_VA_{HEVC,VP9,AV1}_BLACKWELL (Blackwell's additions, codec.Blackwell:
+/// "full" or "1" the default, "buffer", "fields", "off" or "0"; a codec's own
+/// wins over the common one), GALAXY_VA_CONTROL (HEVC's, VP9's and AV1's
+/// control word: "nvk" the default, "prod", "nvidia"), GALAXY_VA_VP9_INTRA_TOP
+/// ("0": no intra-top buffer), GALAXY_VA_VP9_STREAM_LEN ("frame" the
+/// default, "tiles"), GALAXY_VA_ENCODE ("0": no
+/// encode entrypoints), GALAXY_VA_NVENC_MAGIC (hex: the encoder setup's
+/// magic word), GALAXY_VA_NVENC_RC ("firmware": the encoder's own rate
+/// control), GALAXY_VA_NVENC_B ("1": B pictures on the encoder),
+/// GALAXY_VA_NVENC_TRY (readings of the encoder's setups: encode.Try),
+/// GALAXY_VA_NVENC_DUMP (its setups, methods and reconstructions), from an
+/// environment block. Values not understood leave the
+/// default.
+pub fn optionsOf(block: []const u8) Options {
+    var o: Options = .{};
+    var all_bw: ?codec.Blackwell = null;
+    var hevc_bw: ?codec.Blackwell = null;
+    var vp9_bw: ?codec.Blackwell = null;
+    var av1_bw: ?codec.Blackwell = null;
+    var it = std.mem.splitScalar(u8, block, 0);
+    while (it.next()) |kv| {
+        const eq = std.mem.indexOfScalar(u8, kv, '=') orelse continue;
+        const k = kv[0..eq];
+        const v = kv[eq + 1 ..];
+        if (std.mem.eql(u8, k, "GALAXY_VA_DEBUG")) {
+            o.debug = v.len != 0 and !std.mem.eql(u8, v, "0");
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_GOB")) {
+            o.gob = tiling.Gob.named(v);
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_PROBE")) {
+            o.probe = !std.mem.eql(u8, v, "0");
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_SERIAL")) {
+            o.serial_after = std.mem.eql(u8, v, "1");
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_SCRATCH")) {
+            o.h264_scratch_vram = std.ascii.eqlIgnoreCase(v, "vram");
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_BLACKWELL")) {
+            all_bw = codec.Blackwell.parse(v);
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_HEVC_BLACKWELL")) {
+            hevc_bw = codec.Blackwell.parse(v);
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_VP9_BLACKWELL")) {
+            vp9_bw = codec.Blackwell.parse(v);
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_AV1_BLACKWELL")) {
+            av1_bw = codec.Blackwell.parse(v);
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_CONTROL")) {
+            o.control = codec.Control.parse(v) orelse o.control;
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_VP9_INTRA_TOP")) {
+            o.vp9_intra_top = !std.mem.eql(u8, v, "0");
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_VP9_STREAM_LEN")) {
+            o.vp9_stream_len = vp9.StreamLen.parse(v) orelse o.vp9_stream_len;
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_ENCODE")) {
+            o.encode = !std.mem.eql(u8, v, "0");
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_NVENC_MAGIC")) {
+            const hex = if (std.mem.startsWith(u8, v, "0x") or std.mem.startsWith(u8, v, "0X")) v[2..] else v;
+            o.nvenc_magic = std.fmt.parseInt(u32, hex, 16) catch null;
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_NVENC_B")) {
+            // ("1": B pictures offered and taken, encode.MAX_REFS)
+            o.nvenc_b_frames = std.mem.eql(u8, v, "1");
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_NVENC_RC")) {
+            // ("firmware": the encoder's own CBR/VBR, enc_rc.sig)
+            o.nvenc_rc_firmware = std.ascii.eqlIgnoreCase(v, "firmware");
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_NVENC_DUMP")) {
+            o.nvenc_dump = v.len != 0 and !std.mem.eql(u8, v, "0");
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_NVENC_TRY")) {
+            // (readings of HEVC's and AV1's setups for a test boot)
+            o.nvenc_try = encode.Try.parse(v);
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_VPX_ENCODE")) {
+            o.vpx_encode = !std.mem.eql(u8, v, "0");
+        } else if (std.mem.eql(u8, k, "GALAXY_VA_VPX_GPU")) {
+            o.vpx_gpu = !std.mem.eql(u8, v, "0");
+        }
+    }
+    o.hevc_blackwell = hevc_bw orelse all_bw orelse o.hevc_blackwell;
+    o.vp9_blackwell = vp9_bw orelse all_bw orelse o.vp9_blackwell;
+    o.av1_blackwell = av1_bw orelse all_bw orelse o.av1_blackwell;
+    return o;
+}
+
 const Config = struct {
     used: bool = false,
     profile: va.Profile = 0,
@@ -296,6 +396,11 @@ const Coded = struct {
     header_bytes: u32 = 0,
     /// what the picture was (encode.finish's rate control and filler)
     done: encode.Done = .{},
+    /// its reconstructed picture's surface (GALAXY_VA_NVENC_DUMP prints
+    /// it once the encode is done; NONE otherwise), and its first
+    /// reference's
+    recon: u16 = NONE,
+    ref0: u16 = NONE,
 };
 
 const Surface = struct {
@@ -544,6 +649,30 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
         errors: u32 = 0,
         /// the video channel's loss said (once)
         told_lost: bool = false,
+        /// the node's GPU is the RTX 2080 Ti (TU102, Turing)
+        turing: bool = false,
+
+        /// The chip's decoder class, bound as each pushbuffer starts.
+        fn decoderClass(d: *const Self) u32 {
+            return (if (d.turing) nvdec.CLASS_TURING else nvdec.CLASS) | nvdec.SET_OBJECT_ENGINE_SW;
+        }
+
+        fn encoderClass(d: *const Self) u32 {
+            return (if (d.turing) nvenc.CLASS_TURING else nvenc.CLASS) | nvenc.SET_OBJECT_ENGINE_SW;
+        }
+
+        /// A pushbuffer the codecs made (each starts with SET_OBJECT of
+        /// Blackwell's class) bound to the chip's class instead.
+        fn bindChip(d: *const Self, push: []u32, class: u32) void {
+            if (!d.turing or push.len < 2) return;
+            std.debug.assert(push[0] == nvdec.header(0, nvdec.SET_OBJECT, 1));
+            push[1] = class;
+        }
+
+        /// Whether `profile` decodes on this GPU (Turing's NVDEC has no AV1).
+        pub fn decodes(d: *const Self, profile: va.Profile) bool {
+            return supported(profile) and !(d.turing and codecOf(profile) == .av1);
+        }
 
         // ── Saying things ───────────────────────────────────────────────
 
@@ -584,9 +713,19 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 d.say("the render node does not answer G_INFO: no VA-API", .{});
                 return va.ERROR_UNIMPLEMENTED;
             };
-            if (i.version != node.G_VERSION or i.chip != node.CHIP_GB206) {
+            if (i.version != node.G_VERSION or (i.chip != node.CHIP_GB206 and i.chip != node.CHIP_TU102)) {
                 d.say("GPU {x} (node version {d}) has no decoder this driver knows: no VA-API", .{ i.chip, i.version });
                 return va.ERROR_UNIMPLEMENTED;
+            }
+            if (i.chip == node.CHIP_TU102) {
+                // (Turing: its classes, Turing2D's GOBs, no Blackwell
+                // additions, whatever the environment asked)
+                d.turing = true;
+                d.opts.gob = .turing;
+                d.opts.hevc_blackwell = .off;
+                d.opts.vp9_blackwell = .off;
+                d.opts.av1_blackwell = .off;
+                d.debug("the RTX 2080 Ti (TU102): NVC4B0 and NVC4B7, Turing2D's GOBs, no AV1", .{});
             }
             if (i.lost) {
                 d.say("the GPU is lost: no VA-API", .{});
@@ -611,7 +750,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             defer d.node.free(&b);
             const w = words(b.cpu, 0, 4);
             w[0] = nvenc.header(0, nvenc.SET_OBJECT, 1);
-            w[1] = nvenc.CLASS | nvenc.SET_OBJECT_ENGINE_SW;
+            w[1] = d.encoderClass();
             w[2] = nvenc.header(0, nvenc.NOP, 1);
             w[3] = 0;
             const f = d.node.esubmit(b, 0, 4) catch |e| {
@@ -635,7 +774,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             defer d.node.free(&b);
             const w = words(b.cpu, 0, 4);
             w[0] = nvdec.header(0, nvdec.SET_OBJECT, 1);
-            w[1] = nvdec.CLASS | nvdec.SET_OBJECT_ENGINE_SW;
+            w[1] = d.decoderClass();
             w[2] = nvdec.header(0, nvdec.NOP, 1);
             w[3] = 0;
             const f = d.node.vsubmit(b, 0, 4) catch |e| {
@@ -679,21 +818,28 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
 
         // ── Configs ─────────────────────────────────────────────────────
 
-        pub fn queryConfigProfiles(_: *Self, list: [*]va.Profile, n: *i32) va.Status {
-            for (PROFILES, 0..) |p, i| list[i] = p;
-            n.* = PROFILES.len;
+        pub fn queryConfigProfiles(d: *Self, list: [*]va.Profile, n: *i32) va.Status {
+            var k: usize = 0;
+            for (PROFILES) |p| {
+                if (!d.decodes(p)) continue;
+                list[k] = p;
+                k += 1;
+            }
+            n.* = @intCast(k);
             return va.SUCCESS;
         }
 
-        /// Whether `profile` encodes here (and the encoder is there).
+        /// Whether `profile` encodes here (and the encoder is there; no AV1
+        /// on Turing's NVENC).
         pub fn encodes(d: *const Self, profile: va.Profile) bool {
             // (VP8 and VP9: the kernels' encoder, not NVENC's)
             if (enc_vpx.supported(profile) != null) return d.opts.encode and d.opts.vpx_encode;
-            return d.has_encoder and encode.supported(profile) != null;
+            const kind = encode.supported(profile) orelse return false;
+            return d.has_encoder and !(d.turing and kind == .av1);
         }
 
         pub fn queryConfigEntrypoints(d: *Self, profile: va.Profile, list: [*]va.Entrypoint, n: *i32) va.Status {
-            if (!supported(profile)) {
+            if (!d.decodes(profile)) {
                 n.* = 0;
                 return va.ERROR_UNSUPPORTED_PROFILE;
             }
@@ -707,7 +853,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
         }
 
         pub fn getConfigAttributes(d: *Self, profile: va.Profile, ep: va.Entrypoint, attribs: []va.ConfigAttrib) va.Status {
-            if (!supported(profile)) return va.ERROR_UNSUPPORTED_PROFILE;
+            if (!d.decodes(profile)) return va.ERROR_UNSUPPORTED_PROFILE;
             if (ep == ve.ENTRYPOINT_ENC_SLICE and d.encodes(profile)) {
                 for (attribs) |*a| a.value = encodeAttribute(profile, a.type);
                 // (HEVC: the driver's own parameter sets unless "apppps":
@@ -738,7 +884,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
         }
 
         pub fn createConfig(d: *Self, profile: va.Profile, ep: va.Entrypoint, attribs: []const va.ConfigAttrib, out: *u32) va.Status {
-            if (!supported(profile)) return va.ERROR_UNSUPPORTED_PROFILE;
+            if (!d.decodes(profile)) return va.ERROR_UNSUPPORTED_PROFILE;
             const enc = ep == ve.ENTRYPOINT_ENC_SLICE and d.encodes(profile);
             if (ep != va.ENTRYPOINT_VLD and !enc) return va.ERROR_UNSUPPORTED_ENTRYPOINT;
             var rc_mode: u32 = ve.RC_CQP;
@@ -1588,7 +1734,34 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 if (say_it) d.say("encode done: {s}", .{encode.reportLine(&line, cb.done, f.result)});
                 d.debug("encode done: {d} bytes ({d} of headers), {d} slices, average QP {d}{s}", .{ f.bytes, cb.header_bytes, f.result.slices, f.result.avg_qp, if (f.overflow) ", cut: the coded buffer is too small" else "" });
             }
+            if (cb.recon != NONE) d.dumpRecon(cb.done, cb.recon, "recon");
+            if (cb.ref0 != NONE) d.dumpRecon(cb.done, cb.ref0, "ref0");
             return va.SUCCESS;
+        }
+
+        /// GALAXY_VA_NVENC_DUMP: the reconstructed picture the engine wrote
+        /// (its surface's buffer, as bytes: what the next picture reads as
+        /// its reference), or the picture's first reference after it (the
+        /// engine is not to write it: set against the picture before's
+        /// reconstruction), 64 bytes a line; lines still as makeSurface
+        /// filled them (luma 16, chroma 128) and zero lines past the planes
+        /// left out. Past the planes too, to the buffer's end or 16 KiB.
+        fn dumpRecon(d: *Self, done: encode.Done, si: u16, what: []const u8) void {
+            const s = &d.surfaces[si];
+            if (!s.used) return;
+            const b = s.tiled.bytes();
+            const planes: usize = @intCast(s.layout.bytes);
+            const chroma_at: usize = @intCast(s.layout.chroma_offset);
+            const end = @min(b.len, planes + (16 << 10));
+            d.say("dump {s} {d} {s}: surface {d}, {d}x{d}, luma pitch {d}, chroma at 0x{x} pitch {d}, planes 0x{x}, buffer 0x{x}", .{ @tagName(done.kind), done.picture_index, what, si, s.width, s.height, s.layout.luma.pitch, chroma_at, s.layout.chroma.pitch, planes, b.len });
+            var at: usize = 0;
+            while (at + 64 <= end) : (at += 64) {
+                const r = b[at..][0..64];
+                const fill: u8 = if (at < chroma_at) 16 else if (at < planes) 128 else 0;
+                if (std.mem.allEqual(u8, r, fill)) continue;
+                const hex = std.fmt.bytesToHex(r.*, .lower);
+                d.say("dump {s} {d} {s} {x:0>5}: {s}", .{ @tagName(done.kind), done.picture_index, what, at, &hex });
+            }
         }
 
         /// The encode reading surface `s`'s block-linear copy done.
@@ -1852,6 +2025,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 if (!nvdec.addressable(a.luma[k]) or !nvdec.addressable(a.chroma[k])) return va.ERROR_INVALID_SURFACE;
             }
             const n = nvdec.h264Push(words(frame.ptr, PUSH_OFF, nvdec.PUSH_DWORDS), a);
+            d.bindChip(words(frame.ptr, PUSH_OFF, n), d.decoderClass());
             const fence = d.node.vsubmit(c.work, @intCast(f * FRAME_BYTES + PUSH_OFF), @intCast(n)) catch |e| {
                 if (e == error.Lost) {
                     d.loseSurface(si);
@@ -1908,6 +2082,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 return st;
             }
             std.debug.assert(e.dwords <= PUSH_DWORDS_MAX);
+            d.bindChip(slot.push[0..e.dwords], d.decoderClass());
             const fence = d.node.vsubmit(c.work, @intCast(f * FRAME_BYTES + PUSH_OFF), @intCast(e.dwords)) catch |err| {
                 if (err == error.Lost) {
                     d.loseSurface(si);
@@ -2022,6 +2197,23 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             s.in_flight_max = @max(s.in_flight_max, n);
         }
 
+        /// The encoder's readings for this GPU: GALAXY_VA_NVENC_TRY's, and
+        /// on Turing H.264's references and reconstructions block linear
+        /// unless "h264tiled" says otherwise. TU102's NVENC writes its
+        /// reconstruction block linear (the surface's own layout, 2 GOBs a
+        /// block) whatever the setup says, and reads its reference as the
+        /// setup says: with tiled 16x16 (GB206's, which scored 38.4 dB with
+        /// P pictures, pc-full9) it predicted every P picture from a
+        /// scrambled one (galaxy-turing on the RTX 2080 Ti, 2026-11-23: the
+        /// reconstructions dumped equal ffmpeg's decode only read block
+        /// linear; P pictures 19 dB falling to 9 tiled, 57-71 dB block
+        /// linear). encode.Try.h264_bl.
+        fn encodeTry(d: *const Self) encode.Try {
+            var t = d.opts.nvenc_try;
+            if (d.turing and !t.h264_tiled) t.h264_bl = true;
+            return t;
+        }
+
         /// An encode's picture: the input current, the headers, setup and
         /// pushbuffer made (encode.end), submitted on the encoder channel.
         fn endEncode(d: *Self, ci: u8, c: *Context) va.Status {
@@ -2057,6 +2249,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
             const base = c.work.va + f * ENC_FRAME_BYTES;
             const setup_off: usize = if (d.opts.nvenc_try.setup_4k) ENC_SETUP_OFF_4K else ENC_SETUP_OFF;
             var out: encode.EndOut = .{};
+            const t = d.encodeTry();
             st = encode.end(&c.enc, .{
                 .push = words(frame.ptr, ENC_PUSH_OFF, nvenc.PUSH_DWORDS_MAX),
                 .setup = frame[setup_off..][0..nvenc.SETUP_BYTES],
@@ -2071,8 +2264,8 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                     .sizes = c.enc_scratch,
                 },
                 .picture_index = c.decodes,
-                .magic = d.opts.nvenc_magic orelse nvenc.MAGIC,
-                .try_ = d.opts.nvenc_try,
+                .magic = d.opts.nvenc_magic orelse if (d.turing) nvenc.MAGIC_TURING else nvenc.MAGIC,
+                .try_ = t,
             }, &out);
             if (st != va.SUCCESS) {
                 d.debug("encode picture refused ({x})", .{st});
@@ -2083,8 +2276,7 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                 // the boot log)
                 var line: [400]u8 = undefined;
                 d.say("{s}", .{encode.setupLine(&line, c.enc.kind, frame[setup_off..][0..nvenc.SETUP_BYTES])});
-                const t = d.opts.nvenc_try;
-                d.say("readings (GALAXY_VA_NVENC_TRY): hevc co-located {s}, co-located buffers {s}, av1 tiles at 0x{x}, av1 co-located {s}, setup at 0x{x} of its slot", .{ @tagName(t.hevc_coloc), if (t.coloc_apart) "apart (1 MiB aligned)" else "tight (after the history)", t.av1_tiles_at, if (t.av1_coloc) "bound" else "none", setup_off });
+                d.say("readings (GALAXY_VA_NVENC_TRY): hevc co-located {s}, co-located buffers {s}, av1 tiles at 0x{x}, av1 co-located {s}, setup at 0x{x} of its slot, h264 references {s}", .{ @tagName(t.hevc_coloc), if (t.coloc_apart) "apart (1 MiB aligned)" else "tight (after the history)", t.av1_tiles_at, if (t.av1_coloc) "bound" else "none", setup_off, if (t.h264_bl) "block linear" else "tiled 16x16" });
                 d.say("first picture's methods: {s}", .{encode.pushLine(&line, words(frame.ptr, ENC_PUSH_OFF, nvenc.PUSH_DWORDS_MAX)[0..out.dwords])});
             }
             if (d.opts.nvenc_dump and c.decodes < DUMP_PICTURES) {
@@ -2104,12 +2296,16 @@ pub fn DriverWith(comptime Sys: type, comptime Conv: type) type {
                     d.say("dump {s} {d} methods {d}: {s}", .{ @tagName(c.enc.kind), c.decodes, at / 2, encode.pushLine(&mline, all[at..@min(all.len, at + 20)]) });
                 }
             }
+            d.bindChip(words(frame.ptr, ENC_PUSH_OFF, out.dwords), d.encoderClass());
             const fence = d.node.esubmit(c.work, @intCast(f * ENC_FRAME_BYTES + ENC_PUSH_OFF), @intCast(out.dwords)) catch |e| {
                 d.say("an encode was not submitted ({s})", .{@errorName(e)});
                 return if (e == error.NoEncoder) va.ERROR_UNIMPLEMENTED else va.ERROR_OPERATION_FAILED;
             };
             const kept = cb.buf;
-            cb.* = .{ .used = true, .buf = kept, .pending = true, .fence = fence, .ctx = ci, .header_bytes = out.header_bytes, .done = out.done };
+            const dump = d.opts.nvenc_dump and c.decodes < DUMP_PICTURES;
+            const recon: u16 = if (dump) (d.surfaceIndex(encode.reconSurface(&c.enc)) orelse NONE) else NONE;
+            const ref0: u16 = if (dump) (d.surfaceIndex(encode.firstRefSurface(&c.enc)) orelse NONE) else NONE;
+            cb.* = .{ .used = true, .buf = kept, .pending = true, .fence = fence, .ctx = ci, .header_bytes = out.header_bytes, .done = out.done, .recon = recon, .ref0 = ref0 };
             s.enc_pending = true;
             s.enc_fence = fence;
             c.frame_fence[f] = fence;

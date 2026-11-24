@@ -31,6 +31,11 @@ const va = @import("vaapi.sig");
 /// NVCFB0_VIDEO_DECODER, bound on subchannel 0 at the start of each
 /// pushbuffer (the kernel's video channel runs nothing else).
 pub const CLASS: u32 = 0xcfb0;
+/// NVC4B0_VIDEO_DECODER: TU102's NVDEC (nouveau's rm/tu1xx.c; Galaxy's
+/// nvidia chip table). NVK drives the decoder with the same methods on
+/// Turing and later (clc5b0.h's offsets are clc9b0.h's), and with no
+/// generation gate but the chip having a decoder class.
+pub const CLASS_TURING: u32 = 0xc4b0;
 /// SET_OBJECT's ENGINE field (cl906f.h, 20:16): NVK binds the decoder with
 /// ENGINE_SW (0x1f); Galaxy's kernel probe binds it with 0. NVK's is taken.
 pub const SET_OBJECT_ENGINE_SW: u32 = 0x1f << 16;

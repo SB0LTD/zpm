@@ -15,6 +15,16 @@
 //! (device.sig) launches from it as the engine would, so a QMD that is
 //! wrong in what it says fails on the CPU too.
 //!
+//! A Turing GPU (TURING_COMPUTE_A, as Volta) reads QMD version 02_02
+//! (clc3c0qmd.h): 64 words, other bit positions, addresses not shifted,
+//! shared memory in bytes with Turing's two SM splits (32 and 64 KiB) and
+//! no reserved KiB. `buildFor`, `decodeFor` and the release setters take
+//! the shader model; the fields set are the ones Mesa's NAK sets for it
+//! (compiler/nak/qmd.rs: MIT, read as documentation), with the caches
+//! invalidated as on Blackwell. Constant buffer 0 is laid out the same on
+//! both (it is Galaxy's own kernels' convention, not the hardware's).
+//! Nothing of version 02_02 has run on a card yet.
+//!
 //! Allocation-free: the caller owns the words.
 
 const std = @import("std");
@@ -96,6 +106,33 @@ pub const CB_STACK_TOP: u32 = 0x37c;
 
 /// The 8 constant buffers a QMD can name.
 pub const CBUFS = 8;
+
+/// The shader model a QMD is for (sm_75: version 02_02; sm_120: 05_00).
+pub const Sm = @import("chips.sig").Sm;
+
+/// QMD version 02_02 is 64 words (the rest of a QMD_WORDS record is zero).
+pub const QMD2_WORDS = 0x40;
+/// Turing's SMs split their 96 KiB as 32 KiB of shared memory and 64 of
+/// L1, or 64 and 32 (the tuning guide); a CTA may use all 64.
+pub const MAX_SHARED_SM75: u32 = 64 * 1024;
+const SM75_SPLITS_KIB = [_]u32{ 32, 64 };
+pub const SM75_CONFIG_MAX: u32 = 64 / 4 + 1;
+
+/// The kernel's shared memory starts this far into a CTA's (sm_90 and
+/// later keep the first KiB).
+pub fn reservedShared(sm: Sm) u32 {
+    return if (sm == .sm_75) 0 else RESERVED_SHARED;
+}
+
+/// The most shared memory of its own a kernel can ask for.
+pub fn maxKernelShared(sm: Sm) u32 {
+    return if (sm == .sm_75) MAX_SHARED_SM75 else MAX_SHARED - RESERVED_SHARED;
+}
+
+/// The highest SM config value a QMD may name.
+pub fn smConfigMax(sm: Sm) u32 {
+    return if (sm == .sm_75) SM75_CONFIG_MAX else SM_CONFIG_MAX;
+}
 
 // ── Bit fields (clcec0qmd.h's MW(hi:lo)) ────────────────────────────────────
 
@@ -188,6 +225,60 @@ fn at(q: *const [QMD_WORDS]u32, f: anytype) u64 {
     return get(q, f[0], f[1]);
 }
 
+/// Version 02_02's fields (clc3c0qmd.h's NVC3C0_QMDV02_02_*).
+pub const F2 = struct {
+    pub const QMD_GROUP_ID = .{ 133, 128 };
+    pub const SM_GLOBAL_CACHING_ENABLE = .{ 134, 134 };
+    pub const SEMAPHORE_RELEASE_ENABLE0 = .{ 138, 138 };
+    /// INVALIDATE_TEXTURE_HEADER_CACHE, _SAMPLER_, _DATA_, _SHADER_DATA_,
+    /// _INSTRUCTION_ and _SHADER_CONSTANT_CACHE, a bit each.
+    pub const INVALIDATES = .{ 191, 186 };
+    pub const CWD_MEMBAR_TYPE = .{ 369, 368 };
+    pub const API_VISIBLE_CALL_LIMIT = .{ 378, 378 };
+    pub const SAMPLER_INDEX = .{ 382, 382 };
+    pub const CTA_RASTER_WIDTH = .{ 415, 384 };
+    pub const CTA_RASTER_HEIGHT = .{ 431, 416 };
+    pub const CTA_RASTER_DEPTH = .{ 463, 448 };
+    pub const SHARED_MEMORY_SIZE = .{ 561, 544 };
+    pub const MIN_SM_CONFIG_SHARED_MEM_SIZE = .{ 568, 562 };
+    pub const MAX_SM_CONFIG_SHARED_MEM_SIZE = .{ 575, 569 };
+    pub const QMD_VERSION = .{ 579, 576 };
+    pub const QMD_MAJOR_VERSION = .{ 583, 580 };
+    pub const CTA_THREAD_DIMENSION0 = .{ 607, 592 };
+    pub const CTA_THREAD_DIMENSION1 = .{ 623, 608 };
+    pub const CTA_THREAD_DIMENSION2 = .{ 639, 624 };
+    pub const REGISTER_COUNT_V = .{ 656, 648 };
+    pub const TARGET_SM_CONFIG_SHARED_MEM_SIZE = .{ 663, 657 };
+    pub const RELEASE0_ADDRESS_LOWER = .{ 767, 736 };
+    pub const RELEASE0_ADDRESS_UPPER = .{ 775, 768 };
+    /// 0: four words (the payload, then the timestamp); 1: one word.
+    pub const RELEASE0_STRUCTURE_SIZE = .{ 799, 799 };
+    pub const RELEASE0_PAYLOAD = .{ 831, 800 };
+    pub const SHADER_LOCAL_MEMORY_LOW_SIZE = .{ 951, 928 };
+    pub const BARRIER_COUNT = .{ 959, 955 };
+    pub const SHADER_LOCAL_MEMORY_HIGH_SIZE = .{ 983, 960 };
+    pub const SHADER_LOCAL_MEMORY_CRS_SIZE = .{ 1015, 992 };
+    pub const SASS_VERSION = .{ 1023, 1016 };
+    pub const PROGRAM_ADDRESS_LOWER = .{ 1567, 1536 };
+    pub const PROGRAM_ADDRESS_UPPER = .{ 1584, 1568 };
+
+    pub fn cbValid(i: u32) [2]u32 {
+        return .{ 640 + i, 640 + i };
+    }
+    pub fn cbAddrLower(i: u32) [2]u32 {
+        return .{ 1055 + i * 64, 1024 + i * 64 };
+    }
+    pub fn cbAddrUpper(i: u32) [2]u32 {
+        return .{ 1072 + i * 64, 1056 + i * 64 };
+    }
+    pub fn cbInvalidate(i: u32) [2]u32 {
+        return .{ 1074 + i * 64, 1074 + i * 64 };
+    }
+    pub fn cbSize(i: u32) [2]u32 {
+        return .{ 1087 + i * 64, 1075 + i * 64 };
+    }
+};
+
 const QMD_TYPE_GRID_CTA = 2;
 const CWD_MEMBAR_L1_SYSMEMBAR = 1;
 
@@ -231,6 +322,67 @@ pub fn smConfig(total: u32) Error!u32 {
 /// Shared memory bytes the SM config value `cfg` gives the SM.
 pub fn smConfigBytes(cfg: u32) u32 {
     return (cfg -| 1) * 4096;
+}
+
+/// A CTA's shared memory as shader model `sm`'s QMD has it. Turing's: the
+/// kernel's own, to 256 bytes (NAK's set_smem_size), nothing reserved.
+pub fn sharedTotalFor(sm: Sm, kernel_bytes: u32) Error!u32 {
+    if (sm != .sm_75) return sharedTotal(kernel_bytes);
+    if (kernel_bytes > MAX_SHARED_SM75) return error.OutOfRange;
+    return alignUp32(kernel_bytes, 256);
+}
+
+/// The SM's split for `total` bytes a CTA on `sm` (Turing: 32 or 64 KiB).
+pub fn smConfigFor(sm: Sm, total: u32) Error!u32 {
+    if (sm != .sm_75) return smConfig(total);
+    for (SM75_SPLITS_KIB) |kib| {
+        if (kib * 1024 >= total) return kib / 4 + 1;
+    }
+    return error.OutOfRange;
+}
+
+/// A QMD for shader model `sm`: version 05_00 as `build` makes it, or
+/// version 02_02 for Turing.
+pub fn buildFor(sm: Sm, q: *[QMD_WORDS]u32, s: Shape) Error!void {
+    if (sm != .sm_75) return build(q, s);
+    if (s.block[0] == 0 or s.block[1] == 0 or s.block[2] == 0 or s.block[0] > 1024 or s.block[1] > 1024 or s.block[2] > 64 or
+        @as(u64, s.block[0]) * s.block[1] * s.block[2] > 1024) return error.OutOfRange;
+    if (s.grid[0] == 0 or s.grid[1] == 0 or s.grid[2] == 0 or s.grid[0] > 0x7fff_ffff or s.grid[1] > 0xffff or s.grid[2] > 0xffff) return error.OutOfRange;
+    if (s.registers == 0 or s.registers > 255) return error.OutOfRange;
+    if (s.cbuf_bytes & 0xf != 0 or s.cbuf_bytes < PARAMS_OFFSET or s.cbuf_bytes > CBUF0_MAX_BYTES) return error.OutOfRange;
+    if (s.local_bytes & 0xf != 0 or s.local_bytes >> 24 != 0) return error.OutOfRange;
+    // (49 bits of address; the engine is given the QMD's own >> 8)
+    if (s.prog_va & 0xff != 0 or s.cbuf_va & 0x3f != 0 or s.prog_va >> 49 != 0 or s.cbuf_va >> 49 != 0) return error.OutOfRange;
+    const shared = try sharedTotalFor(.sm_75, s.shared_bytes);
+    const cfg = try smConfigFor(.sm_75, shared);
+    var t: [QMD_WORDS]u32 = @splat(0);
+    put(&t, F2.QMD_MAJOR_VERSION, 2);
+    put(&t, F2.QMD_VERSION, 2);
+    put(&t, F2.API_VISIBLE_CALL_LIMIT, 1); // NO_CHECK
+    // (SAMPLER_INDEX INDEPENDENTLY: 0, as NAK leaves it)
+    put(&t, F2.SM_GLOBAL_CACHING_ENABLE, 1);
+    put(&t, F2.INVALIDATES, 0x3f);
+    put(&t, F2.PROGRAM_ADDRESS_LOWER, s.prog_va & 0xffff_ffff);
+    put(&t, F2.PROGRAM_ADDRESS_UPPER, s.prog_va >> 32);
+    put(&t, F2.CTA_THREAD_DIMENSION0, s.block[0]);
+    put(&t, F2.CTA_THREAD_DIMENSION1, s.block[1]);
+    put(&t, F2.CTA_THREAD_DIMENSION2, s.block[2]);
+    put(&t, F2.REGISTER_COUNT_V, s.registers);
+    put(&t, F2.BARRIER_COUNT, 1);
+    put(&t, F2.SHARED_MEMORY_SIZE, shared);
+    put(&t, F2.MIN_SM_CONFIG_SHARED_MEM_SIZE, cfg);
+    put(&t, F2.MAX_SM_CONFIG_SHARED_MEM_SIZE, SM75_CONFIG_MAX);
+    put(&t, F2.TARGET_SM_CONFIG_SHARED_MEM_SIZE, cfg);
+    put(&t, F2.SHADER_LOCAL_MEMORY_HIGH_SIZE, s.local_bytes);
+    put(&t, F2.CTA_RASTER_WIDTH, s.grid[0]);
+    put(&t, F2.CTA_RASTER_HEIGHT, s.grid[1]);
+    put(&t, F2.CTA_RASTER_DEPTH, s.grid[2]);
+    put(&t, F2.cbAddrLower(0), s.cbuf_va & 0xffff_ffff);
+    put(&t, F2.cbAddrUpper(0), s.cbuf_va >> 32);
+    put(&t, F2.cbSize(0), s.cbuf_bytes >> 4);
+    put(&t, F2.cbValid(0), 1);
+    put(&t, F2.cbInvalidate(0), 1);
+    q.* = t;
 }
 
 /// A QMD (Queue Meta Data 05_00, clcec0qmd.h): tinygrad's Blackwell
@@ -310,6 +462,27 @@ pub fn releaseStamp(q: *[QMD_WORDS]u32, va: u64, payload: u32) void {
     put(q, F.RELEASE_SEMAPHORE0_PAYLOAD_LOWER, payload);
 }
 
+/// `release` for shader model `sm`'s QMD (version 02_02's RELEASE0: a
+/// 40-bit address, a 32-bit payload).
+pub fn releaseFor(sm: Sm, q: *[QMD_WORDS]u32, va: u64, payload: u32) void {
+    if (sm != .sm_75) return release(q, va, payload);
+    put(q, F2.SEMAPHORE_RELEASE_ENABLE0, 1);
+    put(q, F2.RELEASE0_STRUCTURE_SIZE, 1); // ONE_WORD
+    put(q, F2.RELEASE0_ADDRESS_LOWER, va & 0xffff_ffff);
+    put(q, F2.RELEASE0_ADDRESS_UPPER, va >> 32);
+    put(q, F2.RELEASE0_PAYLOAD, payload);
+}
+
+/// `releaseStamp` for shader model `sm`'s QMD.
+pub fn releaseStampFor(sm: Sm, q: *[QMD_WORDS]u32, va: u64, payload: u32) void {
+    if (sm != .sm_75) return releaseStamp(q, va, payload);
+    put(q, F2.SEMAPHORE_RELEASE_ENABLE0, 1);
+    put(q, F2.RELEASE0_STRUCTURE_SIZE, 0); // FOUR_WORDS
+    put(q, F2.RELEASE0_ADDRESS_LOWER, va & 0xffff_ffff);
+    put(q, F2.RELEASE0_ADDRESS_UPPER, va >> 32);
+    put(q, F2.RELEASE0_PAYLOAD, payload);
+}
+
 // ── Reading one back ────────────────────────────────────────────────────────
 
 pub const ConstBuf = struct { va: u64 = 0, bytes: u32 = 0, valid: bool = false };
@@ -375,6 +548,49 @@ pub fn decode(q: *const [QMD_WORDS]u32) Error!Launch {
             .va = (at(q, F.RELEASE_SEMAPHORE0_ADDR_UPPER) << 32) | at(q, F.RELEASE_SEMAPHORE0_ADDR_LOWER),
             .payload = at(q, F.RELEASE_SEMAPHORE0_PAYLOAD_LOWER) | (if (wide) at(q, F.RELEASE_SEMAPHORE0_PAYLOAD_UPPER) << 32 else 0),
             .structure = structure,
+        };
+    }
+    return l;
+}
+
+/// What shader model `sm`'s compute engine reads from a QMD: version
+/// 05_00 as `decode` reads it, or version 02_02 (anything else is BadQmd:
+/// a QMD made for the other generation).
+pub fn decodeFor(sm: Sm, q: *const [QMD_WORDS]u32) Error!Launch {
+    if (sm != .sm_75) return decode(q);
+    if (at(q, F2.QMD_MAJOR_VERSION) != 2 or at(q, F2.QMD_VERSION) != 2) return error.BadQmd;
+    var l = Launch{
+        .prog_va = (at(q, F2.PROGRAM_ADDRESS_UPPER) << 32) | at(q, F2.PROGRAM_ADDRESS_LOWER),
+        .prefetch_bytes = 0,
+        .block = .{ @intCast(at(q, F2.CTA_THREAD_DIMENSION0)), @intCast(at(q, F2.CTA_THREAD_DIMENSION1)), @intCast(at(q, F2.CTA_THREAD_DIMENSION2)) },
+        .grid = .{ @intCast(at(q, F2.CTA_RASTER_WIDTH)), @intCast(at(q, F2.CTA_RASTER_HEIGHT)), @intCast(at(q, F2.CTA_RASTER_DEPTH)) },
+        .registers = @intCast(at(q, F2.REGISTER_COUNT_V)),
+        .barriers = @intCast(at(q, F2.BARRIER_COUNT)),
+        .shared_bytes = @intCast(at(q, F2.SHARED_MEMORY_SIZE)),
+        .sm_config = .{
+            .min = @intCast(at(q, F2.MIN_SM_CONFIG_SHARED_MEM_SIZE)),
+            .max = @intCast(at(q, F2.MAX_SM_CONFIG_SHARED_MEM_SIZE)),
+            .target = @intCast(at(q, F2.TARGET_SM_CONFIG_SHARED_MEM_SIZE)),
+        },
+        .local_low = @intCast(at(q, F2.SHADER_LOCAL_MEMORY_LOW_SIZE)),
+        .local_high = @intCast(at(q, F2.SHADER_LOCAL_MEMORY_HIGH_SIZE)),
+        .sass = @intCast(at(q, F2.SASS_VERSION)),
+        .cbufs = undefined,
+        .release = null,
+    };
+    for (0..CBUFS) |k| {
+        const i: u32 = @intCast(k);
+        l.cbufs[k] = .{
+            .va = (at(q, F2.cbAddrUpper(i)) << 32) | at(q, F2.cbAddrLower(i)),
+            .bytes = @intCast(at(q, F2.cbSize(i)) << 4),
+            .valid = at(q, F2.cbValid(i)) != 0,
+        };
+    }
+    if (at(q, F2.SEMAPHORE_RELEASE_ENABLE0) != 0) {
+        l.release = .{
+            .va = (at(q, F2.RELEASE0_ADDRESS_UPPER) << 32) | at(q, F2.RELEASE0_ADDRESS_LOWER),
+            .payload = at(q, F2.RELEASE0_PAYLOAD),
+            .structure = @intCast(at(q, F2.RELEASE0_STRUCTURE_SIZE)),
         };
     }
     return l;
@@ -598,4 +814,77 @@ test "bit fields: set and get agree, across words" {
     try testing.expectEqual(@as(u64, 0x1f_ffff), get(&q, 1076, 1056));
     set(&q, 1919, 1888, 0xdead_beef);
     try testing.expectEqual(@as(u32, 0xdead_beef), q[59]);
+}
+
+test "Turing's QMD (version 02_02), word by word from clc3c0qmd.h's bit ranges; decoded back" {
+    var q: [QMD_WORDS]u32 = undefined;
+    try buildFor(.sm_75, &q, .{
+        .prog_va = 0x20_0004_0000,
+        .prog_bytes = 256,
+        .cbuf_va = 0x20_0003_0200,
+        .registers = 8,
+        .block = .{ 32, 1, 1 },
+        .local_bytes = 0x1240,
+        .shared_bytes = 0x300,
+    });
+    var want = [_]u32{0} ** QMD_WORDS;
+    want[4] = 1 << 6; // SM_GLOBAL_CACHING_ENABLE (bit 134)
+    want[5] = 0x3f << 26; // the six caches invalidated (186..191)
+    want[11] = 1 << 26; // API_VISIBLE_CALL_LIMIT NO_CHECK (378)
+    want[12] = 1; // grid width (384)
+    want[13] = 1; // height (416)
+    want[14] = 1; // depth (448)
+    want[17] = 0x300 | (9 << 18) | (17 << 25); // shared bytes (544), min config (562), max config (569)
+    want[18] = 2 | (2 << 4) | (32 << 16); // version 2 (576), major 2 (580), block x (592)
+    want[19] = 1 | (1 << 16); // block y (608), z (624)
+    want[20] = 1 | (8 << 8) | (9 << 17); // constant buffer 0 valid (640), registers (648), target config (657)
+    want[29] = 1 << 27; // barrier count (955)
+    want[30] = 0x1240; // local memory, high size (960)
+    want[32] = 0x0003_0200; // constant buffer 0's address (1024)
+    want[33] = 0x20 | (1 << 18) | (0x40 << 19); // its upper bits, invalidate (1074), size >> 4 (1075)
+    want[48] = 0x0004_0000; // the program's address (1536)
+    want[49] = 0x20;
+    try testing.expectEqualSlices(u32, &want, &q);
+    // (nothing past its 64 words)
+    for (q[QMD2_WORDS..]) |w| try testing.expectEqual(@as(u32, 0), w);
+    const l = try decodeFor(.sm_75, &q);
+    try testing.expectEqual(@as(u64, 0x20_0004_0000), l.prog_va);
+    try testing.expectEqual([3]u32{ 32, 1, 1 }, l.block);
+    try testing.expectEqual([3]u32{ 1, 1, 1 }, l.grid);
+    try testing.expectEqual(@as(u32, 8), l.registers);
+    try testing.expectEqual(@as(u32, 0x300), l.shared_bytes);
+    try testing.expectEqual(@as(u32, 9), l.sm_config.target);
+    try testing.expectEqual(@as(u32, 17), l.sm_config.max);
+    try testing.expectEqual(@as(u32, 0x1240), l.local_high);
+    try testing.expectEqual(@as(u32, 0), l.local_low);
+    try testing.expect(l.cbufs[0].valid and !l.cbufs[1].valid);
+    try testing.expectEqual(@as(u64, 0x20_0003_0200), l.cbufs[0].va);
+    try testing.expectEqual(@as(u32, 0x400), l.cbufs[0].bytes);
+    try testing.expect(l.release == null);
+    // each generation refuses the other's QMD
+    try testing.expectError(error.BadQmd, decode(&q));
+    var q5: [QMD_WORDS]u32 = undefined;
+    try build(&q5, .{ .prog_va = 0x20_0004_0000, .prog_bytes = 256, .cbuf_va = 0x20_0003_0200, .registers = 8 });
+    try testing.expectError(error.BadQmd, decodeFor(.sm_75, &q5));
+}
+
+test "Turing's shared memory: 32 or 64 KiB a CTA, nothing reserved; its release" {
+    try testing.expectEqual(@as(u32, 0), try sharedTotalFor(.sm_75, 0));
+    try testing.expectEqual(@as(u32, 0x100), try sharedTotalFor(.sm_75, 1));
+    try testing.expectEqual(@as(u32, 9), try smConfigFor(.sm_75, 32 * 1024));
+    try testing.expectEqual(@as(u32, 17), try smConfigFor(.sm_75, 32 * 1024 + 1));
+    try testing.expectError(error.OutOfRange, sharedTotalFor(.sm_75, 64 * 1024 + 1));
+    try testing.expectEqual(@as(u32, 0), reservedShared(.sm_75));
+    try testing.expectEqual(RESERVED_SHARED, reservedShared(.sm_120));
+    try testing.expectEqual(try sharedTotal(0x300), try sharedTotalFor(.sm_120, 0x300));
+    var q: [QMD_WORDS]u32 = undefined;
+    try buildFor(.sm_75, &q, .{ .prog_va = 0x20_0004_0000, .prog_bytes = 256, .cbuf_va = 0x20_0003_0200, .registers = 8 });
+    releaseStampFor(.sm_75, &q, 0x20_0002_0010, 7);
+    var l = try decodeFor(.sm_75, &q);
+    try testing.expectEqual(Release{ .va = 0x20_0002_0010, .payload = 7, .structure = 0 }, l.release.?);
+    releaseFor(.sm_75, &q, 0x20_0002_0020, 9);
+    l = try decodeFor(.sm_75, &q);
+    try testing.expectEqual(Release{ .va = 0x20_0002_0020, .payload = 9, .structure = 1 }, l.release.?);
+    // (a program past 49 bits of address has no QMD)
+    try testing.expectError(error.OutOfRange, buildFor(.sm_75, &q, .{ .prog_va = @as(u64, 1) << 49, .prog_bytes = 256, .cbuf_va = 0x200, .registers = 8 }));
 }

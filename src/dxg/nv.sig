@@ -56,6 +56,59 @@ pub fn context(b: *[CONTEXT_BYTES]u8, name: []const u8, client: u32) void {
     put(b, 0xc74, 1);
 }
 
+// ── A legacy context (no hardware queue) ────────────────────────────────────
+//
+// With Windows' hardware-accelerated GPU scheduling off, NVIDIA's WSL driver
+// makes no hardware queues: each context is fed by submit_command, its
+// GPFIFO entries in the call's private data, and Windows' scheduler runs
+// them (traced on this PC's RTX 2080 Ti, NVIDIA's driver 576.28, WDDM 2.7
+// caps 0x9: scheduling in hardware supported, not on; cudaprobe's contexts
+// and submissions, tools/dxgtrace.sig).
+
+pub const LEGACY_CONTEXT_BYTES = 3569;
+
+/// A legacy context's data, as cudaprobe's first (node 0, flags 4: no
+/// hardware queue): the client's kind, the process's name (ASCII at 0x134,
+/// UTF-16 at 0x234, up to 63 characters) and NVIDIA's constant fields.
+pub fn legacyContext(b: *[LEGACY_CONTEXT_BYTES]u8, name: []const u8, client: u32) void {
+    head(b, KIND_ALLOCATION);
+    put(b, 0x10, client);
+    put(b, 0x14, 0x0400_600c);
+    put(b, 0x128, 0xc);
+    const n = @min(name.len, 63);
+    @memcpy(b[0x134..][0..n], name[0..n]);
+    for (name[0..n], 0..) |c, i| b[0x234 + 2 * i] = c;
+    put(b, 0xd4c, 0x4ec);
+    @memset(b[0xdc1..0xdd9], 0xff);
+    put(b, 0xdec, 0x100);
+}
+
+/// A legacy submission's data: a 0x354-byte head, then the GPFIFO entries
+/// (as NVIDIA's driver writes them: no subroutine level); the call's
+/// command buffer is a dummy 1, its length this data's.
+pub const LEGACY_SUBMIT_HEAD = 0x354;
+pub const LEGACY_MAX_ENTRIES = 64;
+pub const LEGACY_SUBMIT_MAX = LEGACY_SUBMIT_HEAD + 8 * LEGACY_MAX_ENTRIES;
+pub const LEGACY_COMMAND_BUFFER: u64 = 1;
+
+/// Fills `b` for `entries`; the data's length.
+pub fn legacySubmit(b: *[LEGACY_SUBMIT_MAX]u8, entries: []const u64) u32 {
+    const n = @min(entries.len, LEGACY_MAX_ENTRIES);
+    @memset(b[0..LEGACY_SUBMIT_HEAD], 0);
+    put(b, 0, MAGIC);
+    put(b, 4, KIND_ALLOCATION);
+    put(b, 0x0c, LEGACY_SUBMIT_HEAD);
+    put(b, 0x18, 1);
+    for (entries[0..n], 0..) |e, i| put64(b, LEGACY_SUBMIT_HEAD + 8 * i, e);
+    return @intCast(LEGACY_SUBMIT_HEAD + 8 * @as(u32, @intCast(n)));
+}
+
+/// The field NVIDIA's driver 576 adds to every allocation's data (0xec;
+/// 592's has none there).
+pub fn legacyAllocation(b: *[ALLOCATION_BYTES]u8) void {
+    put(b, 0xec, 0x1_0000);
+}
+
 // ── A video engine's context (NVDEC, NVENC) ─────────────────────────────────
 
 /// NVIDIA's video engines on WSL: each a legacy context of its own (no
@@ -71,6 +124,30 @@ pub fn videoNode(e: VideoEngine) u32 {
         .encoder => 5,
     };
 }
+
+/// Their nodes on a host whose GPU's work Windows schedules in software
+/// (`legacy`): the RTX 2080 Ti's, NVIDIA's driver 576.28. Windows' GPU
+/// engine counters name its nodes: 0 3D, 1 Compute_0, 2 LegacyOverlay,
+/// 3 VideoDecode, 4-6 Copy, 7 Security, 8 and 9 VideoEncode, 10
+/// Graphics_1, 11 Cuda, 12 Compute_1, 13 VR, 14-17 Copy. ffmpeg's
+/// h264_nvenc made its encoder's context on node 8 and a copy context on
+/// node 5, with the context data and submissions zpm writes for 592
+/// (traced 2026-11-22). (The node metadata query, which would name each
+/// node's engine to a program, is not answered there.)
+pub fn videoNodeOn(e: VideoEngine, legacy: bool) u32 {
+    if (!legacy) return videoNode(e);
+    return switch (e) {
+        .decoder => 3,
+        .encoder => 8,
+    };
+}
+
+/// The context data's engine word (0x20, low bits) on such a host: 0 for
+/// the encoder on node 8, as NVIDIA's driver gave it (1 on its copy
+/// context); 592's decoder's 0 for the decoder.
+pub fn videoEngineWordOn(e: VideoEngine, legacy: bool) u32 {
+    return if (legacy) 0 else @intFromEnum(e);
+}
 pub const VIDEO_SUBCH: u32 = 4;
 pub const VIDEO_CONTEXT_BYTES = 3569;
 
@@ -83,6 +160,13 @@ pub fn videoContext(b: *[VIDEO_CONTEXT_BYTES]u8, e: VideoEngine) void {
     put(b, 0x1c, 0x200);
     put(b, 0x20, 0x8000_0000 | @intFromEnum(e));
     @memset(b[0xdc1..0xdd9], 0xff);
+}
+
+/// The same on a host that schedules in software (`legacy`: the engine's
+/// word as there, videoEngineWordOn).
+pub fn videoContextOn(b: *[VIDEO_CONTEXT_BYTES]u8, e: VideoEngine, legacy: bool) void {
+    videoContext(b, e);
+    put(b, 0x20, 0x8000_0000 | videoEngineWordOn(e, legacy));
 }
 
 pub const VIDEO_SUBMIT_BYTES = 868;
@@ -244,6 +328,73 @@ test "an allocation's data: memory kinds and sizes as NVIDIA's" {
     try testing.expectEqual(@as(u32, 0x800), word(&b, 0x10));
     try testing.expectEqual(@as(u32, 0x160), word(&b, 0x118));
     try testing.expectEqual(@as(u32, 0), word(&b, 0x20));
+}
+
+test "a legacy context's data is cudaprobe's on driver 576 (its node-0 context)" {
+    var b: [LEGACY_CONTEXT_BYTES]u8 = undefined;
+    legacyContext(&b, "cudaprobe", 5);
+    const want = [_][2]u32{
+        .{ 0, MAGIC },          .{ 4, 0x10004 },        .{ 8, 0xdf1 },          .{ 0xc, MAGIC2 },
+        .{ 0x10, 5 },           .{ 0x14, 0x400600c },   .{ 0x128, 0xc },        .{ 0x134, 0x61647563 },
+        .{ 0x138, 0x626f7270 }, .{ 0x13c, 0x65 },       .{ 0x234, 0x750063 },   .{ 0x238, 0x610064 },
+        .{ 0x23c, 0x720070 },   .{ 0x240, 0x62006f },   .{ 0x244, 0x65 },       .{ 0xd4c, 0x4ec },
+        .{ 0xdc0, 0xffffff00 }, .{ 0xdc4, 0xffffffff }, .{ 0xdd4, 0xffffffff }, .{ 0xdd8, 0xff },
+        .{ 0xdec, 0x100 },
+    };
+    var nonzero: usize = 0;
+    var off: usize = 0;
+    while (off + 4 <= b.len) : (off += 4) nonzero += @intFromBool(word(&b, off) != 0);
+    for (want) |w| try testing.expectEqual(w[1], word(&b, w[0]));
+    try testing.expectEqual(@as(usize, 24), nonzero);
+}
+
+test "a legacy submission's data is cudaprobe's on driver 576 (one entry, 6 dwords)" {
+    var b: [LEGACY_SUBMIT_MAX]u8 = undefined;
+    const n = legacySubmit(&b, &.{push.gpEntry(0x2_0220_0000, 6)});
+    try testing.expectEqual(@as(u32, 0x35c), n);
+    try testing.expectEqual(@as(u32, 0x10004), word(&b, 4));
+    try testing.expectEqual(@as(u32, 0), word(&b, 8));
+    try testing.expectEqual(@as(u32, 0x354), word(&b, 0xc));
+    try testing.expectEqual(@as(u32, 1), word(&b, 0x18));
+    try testing.expectEqual(@as(u32, 0x0220_0000), word(&b, 0x354));
+    try testing.expectEqual(@as(u32, 0x1802), word(&b, 0x358));
+}
+
+test "the video contexts and submissions are h264_nvenc's on driver 576 (its decoder and encoder contexts, a decoder submission)" {
+    // (2026-11-22, this PC's RTX 2080 Ti: the decoder's context on node 8,
+    // the encoder's on node 5; every nonzero dword of each)
+    for ([_]VideoEngine{ .decoder, .encoder }) |e| {
+        var b: [VIDEO_CONTEXT_BYTES]u8 = undefined;
+        videoContext(&b, e);
+        const want = [_][2]u32{
+            .{ 0, MAGIC },          .{ 4, 0x10004 },                            .{ 8, 0xdf1 },          .{ 0xc, MAGIC2 },
+            .{ 0x10, 5 },           .{ 0x14, 0x400f },                          .{ 0x1c, 0x200 },       .{ 0x20, 0x8000_0000 | @as(u32, @intFromEnum(e)) },
+            .{ 0xdc0, 0xffffff00 }, .{ 0xdc4, 0xffffffff },                     .{ 0xdd4, 0xffffffff }, .{ 0xdd8, 0xff },
+        };
+        var nonzero: usize = 0;
+        var off: usize = 0;
+        while (off + 4 <= b.len) : (off += 4) nonzero += @intFromBool(word(&b, off) != 0);
+        for (want) |w| try testing.expectEqual(w[1], word(&b, w[0]));
+        try testing.expectEqual(@as(usize, 15), nonzero);
+    }
+    try testing.expectEqual(@as(u32, 3), videoNodeOn(.decoder, true));
+    try testing.expectEqual(@as(u32, 8), videoNodeOn(.encoder, true));
+    try testing.expectEqual(@as(u32, 1), videoNodeOn(.decoder, false));
+    // (the encoder's context on node 8 as h264_nvenc made it: engine word 0)
+    var enc: [VIDEO_CONTEXT_BYTES]u8 = undefined;
+    videoContextOn(&enc, .encoder, true);
+    try testing.expectEqual(@as(u32, 0x8000_0000), word(&enc, 0x20));
+    videoContextOn(&enc, .encoder, false);
+    try testing.expectEqual(@as(u32, 0x8000_0001), word(&enc, 0x20));
+    // the decoder's first submission: 32 dwords at 0xf_0002_8000
+    var s: [VIDEO_SUBMIT_BYTES]u8 = undefined;
+    videoSubmit(&s, 0xf_0002_8000, 32);
+    const want = [_][2]u32{ .{ 0, MAGIC }, .{ 4, 0x10004 }, .{ 0xc, 0x354 }, .{ 0x14, 1 }, .{ 0x18, 2 }, .{ 0x1c, 8 }, .{ 0x358, 4 }, .{ 0x35c, 0x0002_8000 }, .{ 0x360, 0x820f } };
+    var nonzero: usize = 0;
+    var off: usize = 0;
+    while (off + 4 <= s.len) : (off += 4) nonzero += @intFromBool(word(&s, off) != 0);
+    for (want) |w| try testing.expectEqual(w[1], word(&s, w[0]));
+    try testing.expectEqual(want.len, nonzero);
 }
 
 test "a submission's data" {
