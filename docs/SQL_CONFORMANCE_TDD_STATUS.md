@@ -11,8 +11,9 @@ type output preserves PostgreSQL's SQL grammar spellings and quotes its
 other identifiers. The parser resolves quoted and pg_catalog-qualified
 built-in types and quoted index methods. PostgreSQL parameter inference
 preserves schema qualification and quoted relation names in its catalog
-probe. Stored view and expression trees
-that are emitted from source text still need a full PostgreSQL deparser.
+probe. The PG16 and PG18 CI lanes passed all 42 stock checks. Stored views
+and expressions emitted from source text still need a PostgreSQL deparser.
+[Stock tooling CI](https://github.com/SB0LTD/ramsql/actions/runs/45282665508)
 
 Stock `pg_dumpall --roles-only --no-role-passwords` reached the
 `pg_parameter_acl` catalog query after emitting role memberships on
