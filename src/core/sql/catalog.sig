@@ -61,7 +61,13 @@ pub const View = enum(u8) { pg_type, pg_namespace, pg_class, pg_attribute, pg_in
 pub const sql_language_oid: u32 = 14;
 pub const plpgsql_language_oid: u32 = 13002;
 
-pub const DatabaseCatalogRow = struct { oid: u32, owner: u32, name: []const u8 };
+pub const DatabaseCatalogRow = struct {
+    oid: u32,
+    owner: u32,
+    name: []const u8,
+    is_template: bool = false,
+    allow_connections: bool = true,
+};
 pub const DatabaseCatalogProvider = struct {
     context: ?*const anyopaque = null,
     capacity: usize,

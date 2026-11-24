@@ -2298,6 +2298,8 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "DuplicateDatabase")) return "42P04";
     if (equal(name, "InvalidDatabaseName")) return "42602";
     if (equal(name, "DatabaseBusy")) return "55006";
+    if (equal(name, "DatabaseConnectionsDisabled")) return "55000";
+    if (equal(name, "DropTemplateDatabase")) return "42809";
     if (equal(name, "AdmissionDenied")) return "42501";
     if (equal(name, "LeaseCapacity")) return "53300";
     if (equal(name, "UndefinedFunction")) return "42883";

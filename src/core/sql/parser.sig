@@ -77,7 +77,7 @@ pub fn Parser(comptime config: types.Config) type {
 
         const DatabaseName = types.Values(config).Name;
         pub const DatabaseCommand = union(enum) {
-            create: DatabaseName,
+            create: struct { name: DatabaseName, use_pristine_template: bool },
             drop: struct { name: DatabaseName, if_exists: bool },
             alter_owner: struct { name: DatabaseName, owner: DatabaseName },
         };
@@ -104,8 +104,9 @@ pub fn Parser(comptime config: types.Config) type {
             var end = try tokens.next();
             var command: DatabaseCommand = .{ .drop = .{ .name = name, .if_exists = if_exists } };
             if (is_create) {
-                end = try pristineDatabaseOptions(&tokens, source, end);
-                command = .{ .create = name };
+                const declaration = try pristineDatabaseOptions(&tokens, source, end);
+                end = declaration.end;
+                command = .{ .create = .{ .name = name, .use_pristine_template = declaration.use_template } };
             } else if (is_alter) {
                 if (!wordIs(source, end, "owner")) return error.UnsupportedStatement;
                 if (!wordIs(source, try tokens.next(), "to")) return error.Syntax;
@@ -133,7 +134,7 @@ pub fn Parser(comptime config: types.Config) type {
         /// These options describe the empty UTF-8 database the store creates.
         /// Reject alternatives that require copying a database, another
         /// filesystem placement or a different locale implementation.
-        fn pristineDatabaseOptions(tokens: *lexer.Tokenizer, source: []const u8, first: Token) Error!Token {
+        fn pristineDatabaseOptions(tokens: *lexer.Tokenizer, source: []const u8, first: Token) Error!struct { end: Token, use_template: bool } {
             var key = if (wordIs(source, first, "with")) try tokens.next() else first;
             var seen: u8 = 0;
             while (key.kind == .word) : (key = try tokens.next()) {
@@ -171,7 +172,7 @@ pub fn Parser(comptime config: types.Config) type {
                 };
                 if (!supported) return error.UnsupportedStatement;
             }
-            return key;
+            return .{ .end = key, .use_template = seen & (@as(u8, 1) << @intFromEnum(DatabaseOption.template)) != 0 };
         }
 
         fn databaseOption(source: []const u8, token: Token) ?DatabaseOption {

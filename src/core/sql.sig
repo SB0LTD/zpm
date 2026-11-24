@@ -6676,7 +6676,7 @@ pub fn Database(comptime config: Config) type {
                     // Rows do not have PostgreSQL physical transaction freeze horizons.
                     try sink.add(&.{
                         intCell(entry.oid), try objectTextCell(name), intCell(entry.owner), intCell(catalog_module.utf8_encoding),
-                        .{ .pg_internal_char = 'c' }, boolCell(false), boolCell(true),
+                        .{ .pg_internal_char = 'c' }, boolCell(entry.is_template), boolCell(entry.allow_connections),
                         intCell(-1), intCell(0), intCell(0), intCell(catalog_module.default_tablespace),
                         nameCell("C"), nameCell("C"), .null_value, .null_value,
                         .null_value, .null_value, .null_value,

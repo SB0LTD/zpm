@@ -14,7 +14,9 @@ fn admit(principal: u32) Registry.Admission {
 
 fn clusterGrammar() !void {
     const Raw = sql.Database(.{ .tables = 1, .columns = 2, .rows_per_table = 2 });
-    try std.testing.expectEqualStrings("mydb", (try Raw.parseDatabaseCommand("/* owned */ CREATE DATABASE MyDB;", .{})).?.create.slice());
+    const ordinary = (try Raw.parseDatabaseCommand("/* owned */ CREATE DATABASE MyDB;", .{})).?.create;
+    try std.testing.expectEqualStrings("mydb", ordinary.name.slice());
+    try std.testing.expect(!ordinary.use_pristine_template);
     const drop = (try Raw.parseDatabaseCommand("DROP DATABASE IF EXISTS \"Two\"\"Words\"", .{})).?.drop;
     try std.testing.expect(drop.if_exists);
     try std.testing.expectEqualStrings("Two\"Words", drop.name.slice());
@@ -25,7 +27,9 @@ fn clusterGrammar() !void {
     try std.testing.expectError(error.Syntax, Raw.parseDatabaseCommand("DROP DATABASE IF alpha", .{}));
     try std.testing.expectError(error.UnsupportedStatement, Raw.parseDatabaseCommand("CREATE DATABASE alpha OWNER bob", .{}));
     const pristine = (try Raw.parseDatabaseCommand("CREATE DATABASE \"Archive Child\" WITH TEMPLATE = template0 ENCODING = 'UTF8' LOCALE_PROVIDER = libc LOCALE = 'C'", .{})).?.create;
-    try std.testing.expectEqualStrings("Archive Child", pristine.slice());
+    try std.testing.expectEqualStrings("Archive Child", pristine.name.slice());
+    try std.testing.expect(pristine.use_pristine_template);
+    try std.testing.expectError(error.UnsupportedStatement, Raw.parseDatabaseCommand("CREATE DATABASE alpha TEMPLATE \"TEMPLATE0\"", .{}));
     const owner = (try Raw.parseDatabaseCommand("ALTER DATABASE \"Archive Child\" OWNER TO \"ramsql\"", .{})).?.alter_owner;
     try std.testing.expectEqualStrings("Archive Child", owner.name.slice());
     try std.testing.expectEqualStrings("ramsql", owner.owner.slice());

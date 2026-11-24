@@ -8,6 +8,13 @@ the parsed owner in `ALTER DATABASE ... OWNER TO` for registry validation.
 Connecting to PostgreSQL's templates and cloning their contents remain
 separate cluster work.
 
+The pristine `template0` identity now carries its template and
+connection flags through the database catalog provider. The PostgreSQL
+wire reports the stock errors for opening a connection to the disabled
+template or dropping it. The parser retains an explicit template choice
+so an existing user database with that name can keep its data and route
+without being chosen in place of the pristine template.
+
 The stock global-archive query now binds `pg_tablespace_location(oid)`
 against the two built-in tablespaces. Their locations and the implicit
 database default use PostgreSQL's empty-string convention. An unknown
