@@ -312,6 +312,15 @@ and option fields have no overrides. RamSQL materializes added column
 values, so `atthasmissing` is false and `attmissingval` is a typed
 `anyarray` NULL. That pseudo-type is available for catalog output.
 
+PostgreSQL 18.0's dump client can export the internal `pg_attver` column
+option. The restore path accepts unqualified SET and RESET for that
+reserved option, matching the later PostgreSQL 18 handler. It checks the
+relation, owner, column and transaction mode and takes a SHARE UPDATE
+EXCLUSIVE lock for an options-only command. The command leaves attributes,
+rows and WAL unchanged. The DDL contract covers replay, compound ALTER,
+bad syntax and two transactions contending for the lock.
+User-configurable attribute options such as `n_distinct` remain open.
+
 RAMSQL `9e4bfa6` with ZPM `7a160f13` passed the column discovery
 projection against PostgreSQL 16 and 18, including inherited and
 local columns, type formatting and the missing-value result OID.

@@ -253,6 +253,7 @@ pub fn Binder(comptime config: types.Config) type {
             control: ast.Control,
             truncate: Truncate,
             alter_table: AlterTable,
+            legacy_attribute_options: struct { table: usize, validation: ?Error },
             alter_sequence: AlterSequence,
             create_schema: V.Name,
             drop_schema: DropSchema,
@@ -702,6 +703,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .delete => .delete,
                 .truncate => .truncate,
                 .alter_table => |*alter| alter.command,
+            .legacy_attribute_options => .alter_table,
                 .alter_sequence => .alter_sequence,
                 .create_schema => .create_schema,
                 .drop_schema => .drop_schema,
@@ -8433,6 +8435,18 @@ pub fn Binder(comptime config: types.Config) type {
             return false;
         }
 
+        fn checkLegacyAttributeColumns(context: *const Context, alter: *const Ast.AlterTable, columns: []const V.Column) Error!void {
+            actions: for (alter.actions[0..alter.count]) |*action| {
+                if (action.* != .legacy_attribute_options) continue;
+                const name = toName(context, action.legacy_attribute_options);
+                for (columns) |*column| if (types.same(column.name.slice(), name.slice())) continue :actions;
+                for ([_][]const u8{ "ctid", "xmin", "xmax", "cmin", "cmax", "tableoid" }) |system| {
+                    if (types.same(name.slice(), system)) return error.UnsupportedStatement;
+                }
+                return error.ColumnNotFound;
+            }
+        }
+
         fn bindAlter(context: *const Context, alter: *const Ast.AlterTable) Error!Bound {
             const wanted = toName(context, alter.table.name);
             const namespace = qualifierNamespace(context, alter.table.schema) catch |err| {
@@ -8443,17 +8457,36 @@ pub fn Binder(comptime config: types.Config) type {
                 if (alter.if_exists) return .{ .noop = .alter_table };
                 return error.TableNotFound;
             };
-            if (found.kind != 'r') return error.WrongObjectType;
             const index = found.slot;
+            var only_legacy_options = true;
+            var sets_defaults = alter.count != 0;
+            var has_legacy_options = false;
+            for (alter.actions[0..alter.count]) |*action| {
+                const legacy = action.* == .legacy_attribute_options;
+                has_legacy_options = has_legacy_options or legacy;
+                only_legacy_options = only_legacy_options and legacy;
+                sets_defaults = sets_defaults and (legacy or action.* == .set_default);
+            }
+            if (has_legacy_options and context.dialect != .postgres) return error.UnsupportedStatement;
+            if (has_legacy_options and only_legacy_options) {
+                switch (found.kind) {
+                    'r', 'p', 'm', 'f' => {},
+                    else => return error.WrongObjectType,
+                }
+                const entry = &context.tables[index];
+                const validation: ?Error = blk: {
+                    checkLegacyAttributeColumns(context, alter, entry.columns[0..entry.column_count]) catch |err| break :blk err;
+                    break :blk null;
+                };
+                return .{ .legacy_attribute_options = .{ .table = index, .validation = validation } };
+            }
+            if (found.kind != 'r') return error.WrongObjectType;
             const entry = &context.tables[index];
             if (entry.relkind != 'r') return error.WrongObjectType;
             for (entry.columns[0..entry.column_count]) |column| if (column.default_kind == .mysql_auto_increment)
                 return error.UnsupportedStatement;
             var out = alterOf(context, index, .alter_table);
-            out.sets_defaults = alter.count != 0;
-            for (alter.actions[0..alter.count]) |*action| {
-                out.sets_defaults = out.sets_defaults and action.* == .set_default;
-            }
+            out.sets_defaults = sets_defaults;
             // Inheritance and partition definitions keep their column lists.
             if (entry.parent != 0 or hasChildren(context, entry.oid)) for (alter.actions[0..alter.count]) |*action| switch (action.*) {
                 .add_column, .drop_column, .rename_column => return error.UnsupportedStatement,
@@ -8644,6 +8677,7 @@ pub fn Binder(comptime config: types.Config) type {
                     out.columns[position].not_null = false;
                     out.check_not_null[position] = false;
                 },
+                .legacy_attribute_options => {},
                 .add_constraint => |*definition| {
                     if (definition.kind == .primary) {
                         if (context.dialect != .postgres or alter.count != 1 or
@@ -8710,6 +8744,7 @@ pub fn Binder(comptime config: types.Config) type {
                     out.name = name;
                 },
             };
+            if (has_legacy_options) try checkLegacyAttributeColumns(context, alter, out.columns[0..out.count]);
             return .{ .alter_table = out };
         }
 
