@@ -220,6 +220,8 @@ pub const builtin_callbacks = [_]BuiltinCallback{
     simple_template.init, simple_template.lexize,
     int4range_canonical, int8range_canonical, daterange_canonical,
     .{ .oid = 3778, .name = "pg_tablespace_location", .args = &.{26}, .result = 25, .volatility = 's' },
+    .{ .oid = 6177, .name = "date_bin", .args = &.{ 1186, 1114, 1114 }, .result = 1114, .source = "timestamp_bin" },
+    .{ .oid = 6178, .name = "date_bin", .args = &.{ 1186, 1184, 1184 }, .result = 1184, .source = "timestamptz_bin" },
 } ++ overlap_callbacks;
 
 const RangeEntry = struct { oid: u32, subtype: u32, multirange: u32, opclass: u32, canonical: u32 };

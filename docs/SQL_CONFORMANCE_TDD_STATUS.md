@@ -1,5 +1,14 @@
 # SQL conformance TDD checkpoint
 
+## PostgreSQL time bucketing candidate
+
+`date_bin` supports both stock timestamp signatures and their `pg_proc`
+identities. It bins finite strides on the microsecond timeline, including
+negative offsets from the origin and exact boundaries. The contracts
+cover overload selection, NULL, timestamp infinity, invalid strides and
+range overflow. PostgreSQL 18 infinite interval values remain open as
+a separate temporal type gap.
+
 ## Temporal `OVERLAPS`
 
 The original date-only inventory query already passed. New cases exposed

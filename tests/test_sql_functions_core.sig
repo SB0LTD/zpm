@@ -657,6 +657,28 @@ fn temporals() void {
     report("temporal",before);
 }
 
+fn dateBins() void {
+    const before = begin("date-bin");
+    value("SELECT date_bin('15 minutes', TIMESTAMP '2020-02-11 15:44:17', TIMESTAMP '2001-01-01 00:02:30')", 1114, "2020-02-11 15:32:30");
+    value("SELECT date_bin('15 minutes', TIMESTAMP '1999-12-31 23:45', TIMESTAMP '2000-01-01')", 1114, "1999-12-31 23:45:00");
+    value("SELECT date_bin('15 minutes', TIMESTAMP '1999-12-31 23:44:59.999999', TIMESTAMP '2000-01-01')", 1114, "1999-12-31 23:30:00");
+    value("SELECT date_bin('3 microseconds', TIMESTAMP '1999-12-31 23:59:59.999998', TIMESTAMP '2000-01-01')", 1114, "1999-12-31 23:59:59.999997");
+    value("SELECT date_bin('1 day', DATE '2000-01-02', DATE '2000-01-01')", 1184, "2000-01-02 00:00:00+00");
+    value("SELECT date_bin('1 day', DATE '2000-01-02', TIMESTAMP '2000-01-01')", 1114, "2000-01-02 00:00:00");
+    value("SELECT pg_catalog.date_bin('1 day', '2000-01-02', '2000-01-01')", 1184, "2000-01-02 00:00:00+00");
+    value("SELECT date_bin('1 day', TIMESTAMPTZ '2000-01-02', TIMESTAMP '2000-01-01')", 1184, "2000-01-02 00:00:00+00");
+    value("SELECT date_bin('1 month', TIMESTAMP 'infinity', TIMESTAMP 'infinity')", 1114, "infinity");
+    value("SELECT date_bin(NULL::interval, TIMESTAMP 'infinity', TIMESTAMP 'infinity')", 1114, null);
+    rejects("SELECT date_bin('1 day', TIME '12:00', TIME '11:00')", error.UndefinedFunction);
+    rejects("SELECT date_bin('1 month', TIMESTAMP '2025-01-01', TIMESTAMP '2020-01-01')", error.UnsupportedStatement);
+    rejects("SELECT date_bin('0 seconds', TIMESTAMP '2025-01-01', TIMESTAMP '2020-01-01')", error.DatetimeFieldOverflow);
+    rejects("SELECT date_bin('-1 days', TIMESTAMP '2025-01-01', TIMESTAMP '2020-01-01')", error.DatetimeFieldOverflow);
+    rejects("SELECT date_bin('1000000000 days', TIMESTAMP '2025-01-01', TIMESTAMP '2020-01-01')", error.DatetimeFieldOverflow);
+    rejects("SELECT date_bin('1 week', TIMESTAMP '294276-12-30', TIMESTAMP '4713-01-02 BC')", error.DatetimeFieldOverflow);
+    rejects("SELECT date_bin('1 day', TIMESTAMP '2025-01-01', TIMESTAMP '-infinity')", error.DatetimeFieldOverflow);
+    report("date-bin", before);
+}
+
 // ---- PG.PRED.OVERLAPS --------------------------------------------------------
 
 fn overlapsPredicate() void {
@@ -929,6 +951,7 @@ pub fn main(init:std.process.Init) !void {
     numerics();
     bitwise();
     temporals();
+    dateBins();
     overlapsPredicate();
     formatting();
     statistical();

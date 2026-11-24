@@ -1367,6 +1367,7 @@ pub fn Binder(comptime config: types.Config) type {
                 // Date/time functions (B11).
                 .{ .name = "extract", .func = .extract },           .{ .name = "date_part", .func = .date_part },
                 .{ .name = "date_trunc", .func = .date_trunc },     .{ .name = "age", .func = .age },
+                .{ .name = "date_bin", .func = .date_bin },
                 .{ .name = "overlaps", .func = .overlaps },
                 .{ .name = "justify_days", .func = .justify_days }, .{ .name = "justify_hours", .func = .justify_hours },
                 .{ .name = "justify_interval", .func = .justify_interval }, .{ .name = "make_date", .func = .make_date },
@@ -2322,7 +2323,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .concat, .concat_ws, .quote_ident, .quote_literal,
                 .overlay, .to_hex => try typeStringFunction(context, n, count),
                 .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .sind, .cosd, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => try typeMathFunction(context, n, count),
-                .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => try typeTemporalFunction(context, n, count),
+                .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .date_bin, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => try typeTemporalFunction(context, n, count),
                 .tds_dateadd => {
                     if (context.dialect != .tds or count != 2) return error.UnsupportedStatement;
                     const number = context.node(n.b);
@@ -2876,6 +2877,17 @@ pub fn Binder(comptime config: types.Config) type {
                     };
                     try bindSignature(context, n, &[_]T{ .text, ty }, ty, true);
                     n.func = if (ty == .timestamptz) .date_trunc_tz else .date_trunc;
+                },
+                .date_bin => {
+                    if (count != 3 or context.dialect != .postgres) return error.UndefinedFunction;
+                    const source = argumentType(context, n, 1);
+                    const origin = argumentType(context, n, 2);
+                    // A zoned argument requires the zoned overload. Otherwise
+                    // an exact timestamp match wins before the preferred type.
+                    const zoned = source == .timestamptz or origin == .timestamptz;
+                    const exact_plain = source == .timestamp or origin == .timestamp;
+                    const ty: T = if (!zoned and exact_plain) .timestamp else .timestamptz;
+                    try bindSignature(context, n, &[_]T{ .interval, ty, ty }, ty, true);
                 },
                 .age, .age_tz => {
                     if (count != 1 and count != 2) return error.UndefinedFunction;

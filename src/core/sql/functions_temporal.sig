@@ -1,5 +1,5 @@
 //! PostgreSQL date/time functions (Layer 0, B11): EXTRACT/date_part field
-//! decoding and values, date_trunc, age, justify_*, make_date and
+//! decoding and values, date_trunc, date_bin, age, justify_*, make_date and
 //! make_timestamp, following timestamp.c/date.c of PostgreSQL 18.
 //!
 //! Units decode as DecodeUnits/DecodeSpecial do (lower-cased, tokens
@@ -335,6 +335,24 @@ pub fn intervalPart(field: Field, value: temporal.Interval, numeric: bool) Error
         .unknown => error.InvalidParameterValue,
         else => error.UnsupportedStatement,
     };
+}
+
+/// Fixed-width bucketing on the stored microsecond timeline. A positive
+/// remainder gives the distance from the preceding boundary on either side
+/// of the origin, so exact boundaries are preserved without a correction.
+pub fn dateBin(stride: temporal.Interval, input: i64, origin: i64) Error!i64 {
+    if (!temporal.finiteTimestamp(input)) return input;
+    if (!temporal.finiteTimestamp(origin)) return error.DatetimeFieldOverflow;
+    if (stride.months != 0) return error.UnsupportedStatement;
+    const days = @mulWithOverflow(@as(i64, stride.days), temporal.usecs_per_day);
+    if (days[1] != 0) return error.DatetimeFieldOverflow;
+    const width = @addWithOverflow(days[0], stride.us);
+    if (width[1] != 0 or width[0] <= 0) return error.DatetimeFieldOverflow;
+    const delta = @subWithOverflow(input, origin);
+    if (delta[1] != 0) return error.DatetimeFieldOverflow;
+    const bucket = @subWithOverflow(input, @mod(delta[0], width[0]));
+    if (bucket[1] != 0 or !temporal.validTimestamp(bucket[0])) return error.DatetimeFieldOverflow;
+    return bucket[0];
 }
 
 /// date_trunc on local fields (timestamp_trunc / timestamptz_trunc_internal).
