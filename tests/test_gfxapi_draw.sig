@@ -3640,7 +3640,89 @@ const unit = struct {
         e.read(&target, 0, 0, FW, FH, out, FW * 4, .bgra8);
         e.finish();
     }
+
+    /// ps_grad's frame: an 8 x 8 texture of four levels, each level's red
+    /// 30 times its number, repeated 16 times across the target (four
+    /// texels a pixel: level 2, red 60), sampled with implicit levels in
+    /// straight code (red) and under an if (green).
+    fn gradFrame(e: *engine.Engine, out: *[FW * FH * 4]u8) !void {
+        pair = .{ .vs = &fx.vs40, .ps = &fx.ps_grad, .lay = .{ .varying = varying, .cbuffer = cbuffer, .texture = tex, .desc_base = CB_WORDS }, .log = &log };
+        pipe = raster.Pipeline.init(pair.shaders(2, 4, 3));
+        defer e.unloadPipeline(&pipe);
+        var target = e.newImage(FW, FH, .bgra8) orelse return error.OutOfMemory;
+        defer e.freeImage(&target);
+        var mipped = e.newImageChain(8, 8, .rgba8, 4) orelse return error.OutOfMemory;
+        defer e.freeImage(&mipped);
+        for (0..4) |l| {
+            const lv: u32 = @intCast(l);
+            const w = mipped.levelWidth(lv);
+            for (0..mipped.levelHeight(lv)) |y| {
+                var row: [32]u8 = undefined;
+                for (0..w) |x| row[x * 4 ..][0..4].* = .{ @intCast(30 * l), @intCast(20 * x), @intCast(25 * y), 255 };
+                e.writeBytes(&mipped, mipped.level_at[l] + y * mipped.levelStride(lv), row[0 .. w * 4]);
+            }
+        }
+        e.fill(&target, target.bounds(), 0xff20_4060, 0);
+        const q = [6][2]f32{ .{ -1, -1 }, .{ 1, -1 }, .{ -1, 1 }, .{ 1, -1 }, .{ 1, 1 }, .{ -1, 1 } };
+        var verts: [6]DVert = undefined;
+        for (q, 0..) |pt, j| verts[j] = .{ .pos = .{ pt[0], pt[1], 0.5 }, .color = .{ (pt[0] + 1) / 2, (pt[1] + 1) / 2, 0, 1 } };
+        var vb = e.newBuffer(@sizeOf(@TypeOf(verts))) orelse return error.OutOfMemory;
+        defer e.freeImage(&vb);
+        e.writeBytes(&vb, 0, std.mem.asBytes(&verts));
+        var u: [CB_WORDS + 3 * texture.DESC_WORDS]u32 = @splat(0);
+        for (0..4) |i| u[i * 4 + i] = @bitCast(@as(f32, 1));
+        // (tint.w 1: the if taken by every quad)
+        for (0..4) |c| u[16 + c] = @bitCast(@as(f32, 1));
+        var dw: [texture.DESC_WORDS]u32 = undefined;
+        texture.descriptor(.{ .img = &mipped, .linear = true, .min_linear = true, .mip = .linear, .last = 3 }, &dw);
+        @memcpy(u[CB_WORDS + texture.DESC_WORDS ..][0..texture.DESC_WORDS], &dw);
+        var dr = raster.Draw{ .pipe = &pipe, .color = &target, .count = 6, .center = .{ FW / 2, FH / 2 }, .half = .{ FW / 2, FH / 2 }, .rect = target.bounds(), .uniforms = &u };
+        dr.attrs[0] = .{ .buf = &vb, .offset = 0, .stride = @sizeOf(DVert), .comps = 3 };
+        dr.attrs[1] = .{ .buf = &vb, .offset = 12, .stride = @sizeOf(DVert), .comps = 4 };
+        dr.textures[1] = &mipped;
+        if (!e.draw(&dr)) return error.DrawRefused;
+        if (log.len != 0) {
+            std.debug.print("{s}\n", .{log.text()});
+            return error.Generation;
+        }
+        e.read(&target, 0, 0, FW, FH, out, FW * 4, .bgra8);
+        e.finish();
+    }
+
+    /// Pixels whose red or green (ps_grad's two samples) is not level 2's
+    /// red, 60, within a step.
+    fn notLevel2(pix: *const [FW * FH * 4]u8, what: []const u8) u32 {
+        var bad: u32 = 0;
+        for (0..FW * FH) |i| {
+            const red = pix[i * 4 + 2];
+            const green = pix[i * 4 + 1];
+            if (@abs(@as(i32, red) - 60) > 1 or @abs(@as(i32, green) - 60) > 1) {
+                if (bad < 4) std.debug.print("{s}: pixel ({d},{d}): straight {d}, under the if {d} (level 2's 60)\n", .{ what, i % FW, i / FW, red, green });
+                bad += 1;
+            }
+        }
+        return bad;
+    }
 };
+
+test "Direct3D's implicit levels of detail, in straight code and under an if every quad takes, on the CPU and through the emulated RTX's 3D engine (its quads' lanes 1 and 2): the level the derivatives say, both" {
+    var want: [unit.FW * unit.FH * 4]u8 = undefined;
+    unit.cpu_eng.init(.{ .pool = &unit.cpu_pool, .cpu_work = &cpu_work });
+    try unit.gradFrame(&unit.cpu_eng, &want);
+    try std.testing.expectEqual(@as(u32, 0), unit.notLevel2(&want, "the CPU"));
+    Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+    Rtx.dev.withEngine(&Rtx3d.engine3d);
+    eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs, .graphics = true });
+    defer eng_rtx.deinit();
+    var got: [unit.FW * unit.FH * 4]u8 = undefined;
+    unit.gradFrame(&eng_rtx, &got) catch |err| {
+        std.debug.print("levels frame: {s}; the 3D engine: {s}\n", .{ @errorName(err), Rtx3d.engine3d.why });
+        return err;
+    };
+    for (eng_rtx.said_compute) |w| if (w.len != 0) std.debug.print("levels frame: on the compute kernels: {s}\n", .{w});
+    try std.testing.expectEqual(@as(u64, 1), eng_rtx.stats.graphics_draws);
+    try std.testing.expectEqual(@as(u32, 0), unit.notLevel2(&got, "the RTX's 3D engine"));
+}
 
 test "Direct3D through the emulated RTX's texture unit: a 2D array's comparisons (one at a texel offset) and a level between two of a mipmapped texture, a texel of it fetched, a cube across its faces' edges: the CPU's pixels, within a step" {
     var want: [unit.FW * unit.FH * 4]u8 = undefined;

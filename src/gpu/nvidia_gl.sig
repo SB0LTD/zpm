@@ -238,6 +238,35 @@ test "nvidia_gl: a pixel program's global loads write 0 first (a helper lane's l
     }
 }
 
+test "nvidia_gl: a pixel program's uniform loads reach its helper lanes (loaded again over a 1, a lane whose load landed picked, each register shuffled from it); a pixel's own load does not" {
+    var k = kir.Kernel.init(.{ .insts = &T.insts, .tys = &T.tys }, "ps", .{ 1, 1, 1 });
+    const io = k.binding();
+    const uni = k.binding();
+    // (a uniform's 128 bits at a fixed place; a word at the pixel's own)
+    const v = k.load(.u32, kir.global(uni, 128), u(16));
+    const x = k.load(.f32, ioMem(io, generic(0, 0), false), u(0));
+    const own = k.load(.u32, kir.global(uni, 32), r(k.op2(.shl, .u32, r(k.cvt(.f32, .u32, .rz, r(x))), u(2))));
+    var sum = own;
+    for (0..4) |j| sum = k.op2(.iadd, .u32, r(sum), r(kir.Kernel.at(v, @intCast(j))));
+    k.store(.f32, ioMem(io, OUT_AT + 0, false), u(0), r(k.cvt(.u32, .f32, .rne, r(sum))));
+    try k.finish();
+    T.st.asm_work.sched = .{};
+    _ = try compileStage(&k, rtx(), &T.st, .pixel, io, &T.out);
+    const text = try kir_sm120.compileText(&k, rtx(), &T.st, .{ .stage = .pixel, .stage_io = io });
+    const count = struct {
+        fn of(t: []const u8, what: []const u8) usize {
+            return std.mem.count(u8, t, what);
+        }
+    }.of;
+    // (the 128-bit load, then its first word again; the pixel's own word once)
+    const ok = count(text, "LDG.E.128 R") == 1 and count(text, "LDG.E R") == 2 and
+        count(text, "VOTE.ANY") == 1 and count(text, "FLO.U32") == 1 and count(text, "SHFL.IDX") == 4;
+    if (!ok) {
+        std.debug.print("{s}\n", .{text});
+        return error.TestUnexpectedResult;
+    }
+}
+
 test "nvidia_gl: a pixel program writing target 2 alone and the depth: its registers packed (R0..R3, then the depth in R5)" {
     var k = kir.Kernel.init(.{ .insts = &T.insts, .tys = &T.tys }, "ps", .{ 1, 1, 1 });
     const io = k.binding();

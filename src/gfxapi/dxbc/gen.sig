@@ -32,9 +32,9 @@
 //!   texture slot (Layout.texture); a comparison sampler's function is the
 //!   slot's descriptor's (texture.State.compare). A pixel shader's
 //!   implicit level of detail comes from its coordinates' derivatives
-//!   across the quad (so it runs whole quads: needsQuads); inside an if or
-//!   a loop, where some pixels of a quad may not run, derivatives are 0
-//!   (as GLSL's are). Multisampled textures and cube arrays: not yet.
+//!   across the quad (so it runs whole quads: needsQuads), inside flow
+//!   too (a quad an if splits reads an undefined one, as Direct3D's
+//!   undefined). Multisampled textures and cube arrays: not yet.
 //!
 //! - **Compute** (`compute`): a compute shader as a KIR kernel of its own
 //!   (its workgroup `threadGroup`'s): vThreadID and the other thread ids;
@@ -1442,13 +1442,20 @@ const Gen = struct {
     }
 
     /// x's difference across the quad (x: right minus left; up: top minus
-    /// bottom); 0 outside whole quads or inside flow.
+    /// bottom); 0 outside whole quads. Inside flow too, as the GPU's and
+    /// GLSL's are: a quad that takes an if one way runs it together, so a
+    /// derivative there is right; one split by it reads an undefined one,
+    /// as Direct3D allows (0 there made every sample in an if or a loop
+    /// read its base level: Unigine's materials, minified, sparkled).
+    /// The neighbours are the lanes the pipeline's quads put them in
+    /// (FragmentIO.quad_x, quad_y): the tile kernel's QUAD_X and QUAD_Y,
+    /// the 3D engine's 1 and 2 (QUAD_Y there was another quad's pixel).
     fn deriv(g: *Gen, x: Arg, up: bool) Arg {
-        if (!g.quads or g.depth != 0 or x == .imm) return f(0);
+        if (!g.quads or x == .imm) return f(0);
         const k = g.k;
         const io = g.fio.?;
         const xv = asF32(k, x);
-        const o = k.shfl(.f32, .xor, r(xv), u(if (up) raster.QUAD_Y else raster.QUAD_X));
+        const o = k.shfl(.f32, .xor, r(xv), u(if (up) io.quad_y else io.quad_x));
         const odd = if (up) io.odd_y else io.odd_x;
         return r(k.sel(.f32, r(odd), r(k.op2(.fsub, .f32, r(xv), r(o))), r(k.op2(.fsub, .f32, r(o), r(xv)))));
     }

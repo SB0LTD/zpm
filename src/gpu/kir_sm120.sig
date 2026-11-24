@@ -2484,9 +2484,41 @@ fn CtxOf(comptime St: type) type {
                     for (0..vecWidth(in) orelse 1) |j| try c.eff("MOV", 1, &.{ R(d + @as(u16, @intCast(j))), .rz });
                 }
                 try c.ins(sizeName("LDG.E", m), 1, &.{ c.dst(in), ad });
+                if (c.opts.stage == .pixel and c.w.uniform[@intFromEnum(in.dst)]) try c.helpersGet(in, ad);
             } else {
                 const ad = try c.saddr(m, in.a);
                 try c.ins(sizeName("LDS", m), 1, &.{ c.dst(in), ad });
+            }
+        }
+
+        /// A pixel program's uniform global load (its address the same in
+        /// every lane, so the analysis takes its value as uniform) made so
+        /// for the helper lanes too: they load nothing (`load`), so a
+        /// uniform's 0 sent them the other way at an if or out of a loop on
+        /// it while the pixels went on: the region not reconverged (taken as
+        /// uniform), a derivative there read a helper that never ran it
+        /// (Unigine's materials under an if on a constant: their quads on a
+        /// triangle's edge read the wrong level), and a loop with a
+        /// derivative in it hung the RTX. So each lane learns whether its
+        /// load landed (the first word loaded again over a 1: a helper keeps
+        /// 0 and 1, a pixel the word twice), the warp picks a lane whose did
+        /// (VOTE, FLO), and every lane takes the value from it (SHFL.IDX):
+        /// a lane demoted by a discard since is a helper here too.
+        fn helpersGet(c: *Ctx, in: kir.Inst, ad: Opd) Error!void {
+            const d = @intFromEnum(in.dst);
+            const again = try c.newV(.r);
+            try c.eff("MOV", 1, &.{ R(again), .{ .imm = 1 } });
+            try c.ins("LDG.E", 1, &.{ R(again), ad });
+            const p = try c.newV(.p);
+            try c.ins("ISETP.EQ.U32.AND", 2, &.{ .{ .pred = .{ .v = p } }, .{ .pt = true }, R(d), R(again), .{ .pt = true } });
+            try c.drainIfDivergent();
+            const landed = try c.newV(.r);
+            try c.eff("VOTE.ANY", 2, &.{ R(landed), .{ .pt = true }, .{ .pred = .{ .v = p } } });
+            const from = try c.newV(.r);
+            try c.ins("FLO.U32", 1, &.{ R(from), R(landed) });
+            for (0..vecWidth(in) orelse 1) |j| {
+                const v = R(d + @as(u16, @intCast(j)));
+                try c.eff("SHFL.IDX", 2, &.{ .{ .pt = true }, v, v, R(from), .{ .imm = 0x1f } });
             }
         }
 

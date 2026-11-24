@@ -96,3 +96,16 @@ float4 ps_unit(VSOut i) : SV_Target
     float4 c = sky.SampleLevel(lin, float3(1.0, uv.y * 2.4 - 1.2, uv.x * 2.4 - 1.2), 0);
     return float4(s * 0.5, m.g, m.b * 0.5 + t.r * 0.5, t.g * 0.5 + c.r * 0.25 + c.b * 0.25);
 }
+
+// Implicit levels of detail (derivatives across the quad): the mipmapped
+// texture minified (16 repeats over the target: four texels a pixel, level
+// 2), once in straight code and once under an if (a constant's, every quad
+// one way): both read level 2.
+float4 ps_grad(VSOut i) : SV_Target
+{
+    float a = mipped.Sample(lin, i.color.xy * 16.0).r;
+    float b = 0;
+    [branch] if (tint.w > 0.5)
+        b = mipped.Sample(lin, i.color.yx * 16.0).r;
+    return float4(a, b, 0, 1);
+}
