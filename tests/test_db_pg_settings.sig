@@ -130,6 +130,12 @@ pub fn main() !void {
     }
     try one.execute("ROLLBACK", &result);
 
+    // All supported defaults must fit even with this 128-byte SQL cell.
+    try one.execute("ALTER ROLE settings_login SET synchronize_seqscans TO off", &result);
+    try one.execute("ALTER ROLE settings_login SET default_transaction_read_only TO off", &result);
+    try one.execute("ALTER ROLE settings_login SET default_transaction_deferrable TO on", &result);
+    try one.execute("SELECT unnest(setconfig) FROM pg_db_role_setting", &result);
+    if (result.row_count != 6) return error.MissingRoleDefaults;
     try one.execute("DROP ROLE settings_login", &result);
     try one.execute("SELECT setrole FROM pg_db_role_setting", &result);
     if (result.row_count != 0) return error.OrphanRoleDefaults;

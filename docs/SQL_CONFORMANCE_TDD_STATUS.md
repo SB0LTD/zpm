@@ -8,7 +8,9 @@ MVCC visibility and WAL replay. `ALTER ROLE ... SET`, `FROM CURRENT`,
 The wire layer applies them after resolving the login role. Startup options
 take precedence, and session RESET returns to the resulting startup value.
 Stock `pg_dumpall` discovers the saved values through
-`unnest(pg_db_role_setting.setconfig)`. Database-specific and non-boolean
+`unnest(pg_db_role_setting.setconfig)`. The complete set fits the default
+128-byte cell through compact in-memory text array entries. The wire and WAL
+retain the usual text-array representation. Database-specific and non-boolean
 role settings, and shared settings across the database cluster, remain open.
 
 PostgreSQL 16 and 18 use `SET quote_all_identifiers = true` for both

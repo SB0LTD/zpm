@@ -57,6 +57,7 @@
 const types = @import("types.sig");
 const storage = @import("storage.sig");
 const lexer = @import("lexer.sig");
+const role_defaults = @import("role_defaults.sig");
 const Error = types.Error;
 
 pub const bootstrap_role: u32 = 10;
@@ -283,20 +284,8 @@ pub const Ident = struct { span: Span = .{}, quoted: bool = false, len: usize = 
 pub const Qualified = struct { has_schema: bool = false, schema: Ident = .{}, name: Ident = .{} };
 
 pub const RoleKind = enum { role, user, group };
-/// Stable bit positions in the catalog and WAL.
-pub const RoleBoolean = enum(u3) {
-    check_function_bodies,
-    quote_all_identifiers,
-    row_security,
-    synchronize_seqscans,
-    default_transaction_read_only,
-    default_transaction_deferrable,
-
-    pub fn bit(self: RoleBoolean) u32 {
-        return @as(u32, 1) << @as(u5, @intFromEnum(self));
-    }
-};
-pub const role_boolean_mask: u32 = (1 << @typeInfo(RoleBoolean).@"enum".field_names.len) - 1;
+pub const RoleBoolean = role_defaults.Boolean;
+pub const role_boolean_mask = role_defaults.mask;
 
 pub const RoleDefaults = union(enum) {
     reset_all,
