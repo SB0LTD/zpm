@@ -663,6 +663,11 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     });
     // WAV (PCM16 RIFF/WAVE) container writer — pure, std-only.
     _ = try addTest(ctx, test_all, "test-wav", "src/core/wav.sig", &.{});
+    // AAC-LC encoder, and the live path it feeds: FLV bodies, an RTMP
+    // publisher (tools/livepush.sig drives all three against a server).
+    _ = try addTest(ctx, test_all, "test-aac", "src/core/aac.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-flv", "src/live/flv.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-rtmp", "src/live/rtmp.sig", &.{importEntry("flv", "src/live/flv.sig")});
     // Phoneme → PCM16 narrator synthesizer (source-filter TTS voice).
     const tts_voice = try ctx.addModule("tts_voice", "src/core/tts_voice.sig");
     try wire(ctx, tts_voice, "math", "src/core/math.sig");
