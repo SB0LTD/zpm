@@ -12289,9 +12289,9 @@ pub fn Database(comptime config: Config) type {
                         }
                         try sink.add(&.{
                             intCell(callback.oid), nameCell(callback.name), intCell(catalog_module.catalog_namespace),
-                            .{ .pg_internal_char = 'f' }, intCell(operator_catalog.internal_language_oid), .{ .pg_internal_char = callback.volatility },
-                            boolCell(true), intCell(@intCast(callback.args.len)), intCell(callback.result), nameCell(argtypes.slice()),
-                            nameCell(callback.name), intCell(CO.bootstrap_role), .null_value,
+                            .{ .pg_internal_char = 'f' }, intCell(callback.language), .{ .pg_internal_char = callback.volatility },
+                            boolCell(callback.strict), intCell(@intCast(callback.args.len)), intCell(callback.result), nameCell(argtypes.slice()),
+                            nameCell(callback.source orelse callback.name), intCell(CO.bootstrap_role), .null_value,
                         });
                     }
                     for (catalog_module.access_methods) |am| {

@@ -1367,6 +1367,7 @@ pub fn Binder(comptime config: types.Config) type {
                 // Date/time functions (B11).
                 .{ .name = "extract", .func = .extract },           .{ .name = "date_part", .func = .date_part },
                 .{ .name = "date_trunc", .func = .date_trunc },     .{ .name = "age", .func = .age },
+                .{ .name = "overlaps", .func = .overlaps },
                 .{ .name = "justify_days", .func = .justify_days }, .{ .name = "justify_hours", .func = .justify_hours },
                 .{ .name = "justify_interval", .func = .justify_interval }, .{ .name = "make_date", .func = .make_date },
                 .{ .name = "make_timestamp", .func = .make_timestamp }, .{ .name = "isfinite", .func = .isfinite },
@@ -2758,24 +2759,6 @@ pub fn Binder(comptime config: types.Config) type {
             }
         }
 
-        // The timestamp, timestamptz and time families accept durations.
-        // PostgreSQL supplies only the endpoint signature for timetz.
-        const overlap_signatures = [_][4]ast.Type{
-            .{ .timestamp, .timestamp, .timestamp, .timestamp },
-            .{ .timestamp, .interval, .timestamp, .timestamp },
-            .{ .timestamp, .timestamp, .timestamp, .interval },
-            .{ .timestamp, .interval, .timestamp, .interval },
-            .{ .timestamptz, .timestamptz, .timestamptz, .timestamptz },
-            .{ .timestamptz, .interval, .timestamptz, .timestamptz },
-            .{ .timestamptz, .timestamptz, .timestamptz, .interval },
-            .{ .timestamptz, .interval, .timestamptz, .interval },
-            .{ .time, .time, .time, .time },
-            .{ .time, .interval, .time, .time },
-            .{ .time, .time, .time, .interval },
-            .{ .time, .interval, .time, .interval },
-            .{ .timetz, .timetz, .timetz, .timetz },
-        };
-
         fn overlapSignatureScore(input: [4]ast.Type, params: [4]ast.Type) ?u8 {
             var score: u8 = 0;
             for (input, params) |arg, target| {
@@ -2798,10 +2781,10 @@ pub fn Binder(comptime config: types.Config) type {
                 var datetime: u16 = 0;
                 var duration: u16 = 0;
                 var zoned: u16 = 0;
-                for (overlap_signatures, 0..) |params, index| {
+                for (catalog.overlap_routines, 0..) |routine, index| {
                     const bit = @as(u16, 1) << @intCast(index);
                     if (candidates & bit == 0) continue;
-                    switch (params[position]) {
+                    switch (routine.args[position]) {
                         .timestamptz => {
                             datetime |= bit;
                             zoned |= bit;
@@ -2827,9 +2810,9 @@ pub fn Binder(comptime config: types.Config) type {
             }
             if (common == .unknown) return 0;
             var inferred: u16 = 0;
-            for (overlap_signatures, 0..) |params, index| {
+            for (catalog.overlap_routines, 0..) |routine, index| {
                 const bit = @as(u16, 1) << @intCast(index);
-                if (candidates & bit != 0 and overlapSignatureScore(@splat(common), params) != null) inferred |= bit;
+                if (candidates & bit != 0 and overlapSignatureScore(@splat(common), routine.args) != null) inferred |= bit;
             }
             return inferred;
         }
@@ -2844,8 +2827,8 @@ pub fn Binder(comptime config: types.Config) type {
             }
             var candidates: u16 = 0;
             var best: u8 = 0;
-            for (overlap_signatures, 0..) |params, index| {
-                const score = overlapSignatureScore(input, params) orelse continue;
+            for (catalog.overlap_routines, 0..) |routine, index| {
+                const score = overlapSignatureScore(input, routine.args) orelse continue;
                 if (score < best) continue;
                 if (score > best) {
                     candidates = 0;
@@ -2857,7 +2840,7 @@ pub fn Binder(comptime config: types.Config) type {
             if (@popCount(candidates) != 1) candidates = preferOverlapUnknowns(input, candidates);
             if (@popCount(candidates) != 1) candidates = inferOverlapUnknowns(input, candidates);
             if (@popCount(candidates) != 1) return error.AmbiguousFunction;
-            const params = overlap_signatures[@ctz(candidates)];
+            const params = catalog.overlap_routines[@ctz(candidates)].args;
             try bindSignature(context, n, &params, .boolean, false);
             const zoned_duration = params[0] == .timestamptz and (params[1] == .interval or params[3] == .interval);
             const local_time_cast = params[0] == .timetz and std.mem.indexOfScalar(ast.Type, &input, .time) != null;

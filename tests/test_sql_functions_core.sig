@@ -693,6 +693,18 @@ fn overlapsPredicate() void {
     value("SELECT (TIMETZ '09:00+02', TIMETZ '11:00+02') OVERLAPS (TIMETZ '10:00+03', TIMETZ '12:00+03')",16,"t");
     value("SELECT (TIME '09:00', TIME '10:00') OVERLAPS (TIMETZ '09:00+00', TIMETZ '10:00+00')",16,"t");
     value("SELECT (TIMESTAMP '2020-01-01', '2020-01-03') OVERLAPS (TIMESTAMP '2020-01-02', TIMESTAMP '2020-01-04')",16,"t");
+    shaped("SELECT pg_catalog.overlaps(TIME '09:00', TIME '10:00', TIME '09:30', TIME '11:00')",
+        &.{.{.name="overlaps",.oid=16}},&.{"t"});
+    value("SELECT overlaps(TIME '09:00', INTERVAL '1 hour', TIME '10:00', TIME '11:00')",16,"f");
+    value("SELECT \"overlaps\"(TIMETZ '10:00+02', NULL::timetz, TIMETZ '08:30+01', TIMETZ '10:00+01')",16,"t");
+    rowsOf("SELECT oid FROM pg_proc WHERE proname='overlaps' ORDER BY oid",26,
+        &.{"1271","1304","1305","1306","1307","1308","1309","1310","1311","2041","2042","2043","2044"});
+    value("SELECT count(*) FROM pg_proc WHERE proname='overlaps' AND pronargs=4 AND prorettype=16 AND NOT proisstrict",20,"13");
+    shaped("SELECT prolang,provolatile,prosrc FROM pg_proc WHERE oid=1305",
+        &.{.{.name="prolang",.oid=26},.{.name="provolatile",.oid=18},.{.name="prosrc",.oid=25}},
+        &.{"14","s",""});
+    value("SELECT prosrc FROM pg_proc WHERE oid=1308",25,"overlaps_time");
+    value("SELECT to_regproc('overlaps')",24,null);
     setup(&.{"CREATE TABLE ov_t(id INT PRIMARY KEY,s DATE,e DATE)","INSERT INTO ov_t VALUES(1,'2025-01-01','2025-01-10'),(2,'2025-02-01','2025-02-10'),(3,NULL,NULL)"});
     rowsOf("SELECT id FROM ov_t WHERE (s,e) OVERLAPS (DATE '2025-01-05',DATE '2025-01-06') ORDER BY id",23,&.{"1"});
     rowsOf("SELECT (s,e) OVERLAPS (DATE '2025-02-05',INTERVAL '1 day') FROM ov_t ORDER BY id",16,&.{"f","t",null});
@@ -709,6 +721,7 @@ fn overlapsPredicate() void {
     rejects("SELECT (TIME '11:00', NULL) OVERLAPS (TIME '09:30', TIME '11:30')",error.AmbiguousFunction);
     rejects("SELECT (DATE '2020-01-01', '2020-01-03') OVERLAPS (DATE '2020-01-02', TIMESTAMP '2020-01-04')",error.AmbiguousFunction);
     rejects("SELECT (TIMETZ '10:00+02', INTERVAL '1 hour') OVERLAPS (TIMETZ '09:00+01', TIMETZ '11:00+01')",error.UndefinedFunction);
+    rejects("SELECT pg_catalog.overlaps(TIME '09:00', TIME '10:00', TIME '09:30')",error.UndefinedFunction);
     report("overlaps",before);
 }
 

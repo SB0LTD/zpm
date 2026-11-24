@@ -19,6 +19,14 @@ The closure concerns the predicate and the temporal values already
 supported by the engine. The wider type and catalog inventory remains
 open.
 
+The follow-up makes the same signatures callable through
+`pg_catalog.overlaps` and exposes their 13 native `pg_proc` identities.
+The binder and catalog share the signature list. The local PG16 wire
+run passed all 19 boundary cases and the full 2,401-case combination
+matrix. It also passed the 47 stock-tooling checks, including a stored
+TIME predicate verified after restoring an archive and reopening its
+WAL. The versioned CI suite uses the same checks on PG16 and PG18.
+
 ## Stock PostgreSQL dump and restore candidate
 
 The database utility parser accepts the stock archive's database creation

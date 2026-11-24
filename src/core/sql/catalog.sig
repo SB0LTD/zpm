@@ -125,7 +125,16 @@ pub fn builtinRoutineName(oid: u32) ?[]const u8 {
     return null;
 }
 
-const BuiltinCallback = struct { oid: u32, name: []const u8, args: []const u32, result: u32, volatility: u8 = 'i' };
+const BuiltinCallback = struct {
+    oid: u32,
+    name: []const u8,
+    args: []const u32,
+    result: u32,
+    volatility: u8 = 'i',
+    strict: bool = true,
+    language: u32 = @import("operator_catalog.sig").internal_language_oid,
+    source: ?[]const u8 = null,
+};
 
 /// Catalog identities of the tokenizer used by the simple configuration.
 /// Parser.init and Parser.next own startup and tokenization. End releases
@@ -170,12 +179,48 @@ const int4range_canonical = canonicalCallback(.int4range, 3914);
 const int8range_canonical = canonicalCallback(.int8range, 3928);
 const daterange_canonical = canonicalCallback(.daterange, 3915);
 
+pub const overlap_routines = [_]struct { oid: u32, args: [4]types.Type, internal: ?[]const u8 = null, volatility: u8 = 'i' }{
+    .{ .oid = 1271, .args = @splat(.timetz), .internal = "overlaps_timetz" },
+    .{ .oid = 1304, .args = @splat(.timestamptz), .internal = "overlaps_timestamp" },
+    .{ .oid = 1305, .args = .{ .timestamptz, .interval, .timestamptz, .interval }, .volatility = 's' },
+    .{ .oid = 1306, .args = .{ .timestamptz, .timestamptz, .timestamptz, .interval }, .volatility = 's' },
+    .{ .oid = 1307, .args = .{ .timestamptz, .interval, .timestamptz, .timestamptz }, .volatility = 's' },
+    .{ .oid = 1308, .args = @splat(.time), .internal = "overlaps_time" },
+    .{ .oid = 1309, .args = .{ .time, .interval, .time, .interval } },
+    .{ .oid = 1310, .args = .{ .time, .time, .time, .interval } },
+    .{ .oid = 1311, .args = .{ .time, .interval, .time, .time } },
+    .{ .oid = 2041, .args = @splat(.timestamp), .internal = "overlaps_timestamp" },
+    .{ .oid = 2042, .args = .{ .timestamp, .interval, .timestamp, .interval } },
+    .{ .oid = 2043, .args = .{ .timestamp, .timestamp, .timestamp, .interval } },
+    .{ .oid = 2044, .args = .{ .timestamp, .interval, .timestamp, .timestamp } },
+};
+
+const overlap_argument_oids = blk: {
+    var oids: [overlap_routines.len][4]u32 = undefined;
+    for (overlap_routines, &oids) |routine, *arguments| {
+        for (routine.args, arguments) |parameter, *oid| oid.* = types.typeOid(types.dataTypeOf(parameter));
+    }
+    break :blk oids;
+};
+
+const overlap_callbacks = blk: {
+    var rows: [overlap_routines.len]BuiltinCallback = undefined;
+    for (overlap_routines, &overlap_argument_oids, &rows) |routine, *arguments, *callback| {
+        const internal_language = @import("operator_catalog.sig").internal_language_oid;
+        callback.* = .{ .oid = routine.oid, .name = "overlaps", .args = arguments, .result = 16,
+            .volatility = routine.volatility, .strict = false,
+            .language = if (routine.internal == null) 14 else internal_language,
+            .source = routine.internal orelse "" };
+    }
+    break :blk rows;
+};
+
 pub const builtin_callbacks = [_]BuiltinCallback{
     text_parser.start, text_parser.next, text_parser.end, text_parser.lex_type,
     simple_template.init, simple_template.lexize,
     int4range_canonical, int8range_canonical, daterange_canonical,
     .{ .oid = 3778, .name = "pg_tablespace_location", .args = &.{26}, .result = 25, .volatility = 's' },
-};
+} ++ overlap_callbacks;
 
 const RangeEntry = struct { oid: u32, subtype: u32, multirange: u32, opclass: u32, canonical: u32 };
 
