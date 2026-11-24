@@ -125,6 +125,42 @@ const EndOfAddressSpace = struct {
     }
 };
 
+fn rewriteIdentity(_: void, frame: log.Frame, payload: []u8) !void {
+    if (frame.sequence == 1) payload[0] = 'z';
+}
+
+fn testClone() !void {
+    var source: Mock = .{};
+    try log.append(&source, 1, "aaa");
+    try log.append(&source, 2, "bbb");
+    var scratch: [64]u8 = undefined;
+    var cloned: Mock = .{};
+    const all = @as(u32, 1) << 1;
+    try log.cloneFrames(&source, &cloned, &scratch, 2, all, {}, rewriteIdentity);
+    const first: log.Frame = .{ .offset = 0, .sequence = 1, .kind = 1, .payload_len = 3 };
+    try check(std.mem.eql(u8, try log.readFrame(&source, &scratch, first), "aaa"));
+    try check(std.mem.eql(u8, try log.readFrame(&cloned, &scratch, first), "zaa"));
+    try check(cloned.sync_calls == 1 and cloned.stable == cloned.len and cloned.len == source.len);
+    if (log.cloneFrames(&source, &cloned, &scratch, 2, all, {}, rewriteIdentity)) return error.InvalidFrameAccepted else |err|
+        try check(err == error.DestinationNotEmpty and !cloned.poisoned);
+    source.len -= 1;
+    const original = source;
+    cloned = .{};
+    if (log.cloneFrames(&source, &cloned, &scratch, 2, all, {}, rewriteIdentity)) return error.InvalidFrameAccepted else |err|
+        try check(err == error.UnexpectedEndOfLog and cloned.poisoned and cloned.sync_calls == 0);
+    try check(source.len == original.len and source.stable == original.stable and
+        std.mem.eql(u8, source.bytes[0..], original.bytes[0..]) and !source.poisoned);
+    source.len += 1;
+    source.bytes[source.len - 1] ^= 1;
+    cloned = .{};
+    if (log.cloneFrames(&source, &cloned, &scratch, 2, all, {}, rewriteIdentity)) return error.InvalidFrameAccepted else |err|
+        try check(err == error.CorruptLogRecord and cloned.poisoned and cloned.sync_calls == 0);
+    source.bytes[source.len - 1] ^= 1;
+    cloned = .{ .fail_sync = true };
+    if (log.cloneFrames(&source, &cloned, &scratch, 2, all, {}, rewriteIdentity)) return error.InvalidFrameAccepted else |err|
+        try check(err == error.InjectedSyncFailure and cloned.poisoned and cloned.stable == 0);
+}
+
 fn testPositionedFrames() !void {
     var original: Mock = .{};
     for (positioned_payloads, positioned_kinds, 1..) |payload, kind, seq| try log.appendKind(&original, seq, payload, kind);
@@ -376,6 +412,7 @@ fn testCheckpointSuffix() !void {
 pub fn main(init: std.process.Init) !void {
     try check(log.checksum("123456789") == 0xcbf43926);
     try testPositionedFrames();
+    try testClone();
     try testAppendBatch();
     try testCheckpointSuffix();
     // Exact staging boundary and streaming fallback retain identical framing,

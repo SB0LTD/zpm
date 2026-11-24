@@ -77,7 +77,7 @@ pub fn Parser(comptime config: types.Config) type {
 
         const DatabaseName = types.Values(config).Name;
         pub const DatabaseCommand = union(enum) {
-            create: struct { name: DatabaseName, use_pristine_template: bool },
+            create: struct { name: DatabaseName, template: ?DatabaseName },
             drop: struct { name: DatabaseName, if_exists: bool },
             alter_owner: struct { name: DatabaseName, owner: DatabaseName },
         };
@@ -104,9 +104,9 @@ pub fn Parser(comptime config: types.Config) type {
             var end = try tokens.next();
             var command: DatabaseCommand = .{ .drop = .{ .name = name, .if_exists = if_exists } };
             if (is_create) {
-                const declaration = try pristineDatabaseOptions(&tokens, source, end);
+                const declaration = try databaseOptions(&tokens, source, end);
                 end = declaration.end;
-                command = .{ .create = .{ .name = name, .use_pristine_template = declaration.use_template } };
+                command = .{ .create = .{ .name = name, .template = declaration.template } };
             } else if (is_alter) {
                 if (!wordIs(source, end, "owner")) return error.UnsupportedStatement;
                 if (!wordIs(source, try tokens.next(), "to")) return error.Syntax;
@@ -131,12 +131,12 @@ pub fn Parser(comptime config: types.Config) type {
 
         const DatabaseOption = enum(u3) { template, encoding, locale, locale_provider, lc_collate, lc_ctype, tablespace };
 
-        /// These options describe the empty UTF-8 database the store creates.
-        /// Reject alternatives that require copying a database, another
-        /// filesystem placement or a different locale implementation.
-        fn pristineDatabaseOptions(tokens: *lexer.Tokenizer, source: []const u8, first: Token) Error!struct { end: Token, use_template: bool } {
+        /// The cluster resolves the source. Each database uses UTF-8, the C
+        /// locale and the default tablespace.
+        fn databaseOptions(tokens: *lexer.Tokenizer, source: []const u8, first: Token) Error!struct { end: Token, template: ?DatabaseName } {
             var key = if (wordIs(source, first, "with")) try tokens.next() else first;
             var seen: u8 = 0;
+            var template: ?DatabaseName = null;
             while (key.kind == .word) : (key = try tokens.next()) {
                 const option = databaseOption(source, key) orelse return error.UnsupportedStatement;
                 const bit = @as(u8, 1) << @intFromEnum(option);
@@ -144,6 +144,10 @@ pub fn Parser(comptime config: types.Config) type {
                 seen |= bit;
                 var value = try tokens.next();
                 if (value.kind == .symbol and value.symbol == .eq) value = try tokens.next();
+                if (option == .template) {
+                    template = try databaseTemplateName(source, value);
+                    continue;
+                }
                 if (value.kind == .integer and option == .encoding) {
                     if (value.integer != 6) return error.UnsupportedStatement;
                     continue;
@@ -164,7 +168,7 @@ pub fn Parser(comptime config: types.Config) type {
                     else => return error.Syntax,
                 };
                 const supported = switch (option) {
-                    .template => types.same(setting, "template0"),
+                    .template => unreachable,
                     .encoding => types.keyword(setting, "utf8") or types.keyword(setting, "utf-8"),
                     .locale, .lc_collate, .lc_ctype => types.same(setting, "C"),
                     .locale_provider => types.same(setting, "libc"),
@@ -172,7 +176,16 @@ pub fn Parser(comptime config: types.Config) type {
                 };
                 if (!supported) return error.UnsupportedStatement;
             }
-            return .{ .end = key, .use_template = seen & (@as(u8, 1) << @intFromEnum(DatabaseOption.template)) != 0 };
+            return .{ .end = key, .template = template };
+        }
+
+        fn databaseTemplateName(source: []const u8, value: Token) Error!DatabaseName {
+            if (value.kind != .string) return databaseName(source, value);
+            var name: DatabaseName = .{ .len = value.len };
+            if (name.len == 0) return error.Syntax;
+            if (name.len > name.bytes.len) return error.NameCapacity;
+            lexer.decodeQuoted(source, value.quoted(), name.bytes[0..name.len]);
+            return name;
         }
 
         fn databaseOption(source: []const u8, token: Token) ?DatabaseOption {
