@@ -5,8 +5,6 @@
 The database utility parser accepts the stock archive's database creation
 options when they match RAMSQL's empty UTF-8, C-locale database. It retains
 the parsed owner in `ALTER DATABASE ... OWNER TO` for registry validation.
-Connecting to PostgreSQL's templates and cloning their contents remain
-separate cluster work.
 
 The pristine `template0` identity now carries its template and
 connection flags through the database catalog provider. The PostgreSQL
@@ -20,15 +18,17 @@ lease count before copying. The durable log stages its frames from a
 quiescent source, keeps the original sequence and rewrites the cluster
 database identity and prepared record metadata for the copy. A torn
 source fails without repair. The caller publishes only after syncing and
-replaying the destination. The built-in writable `template1` lifecycle
-and full cluster archive remain open.
+replaying the destination. Stock PG16 and PG18 each passed all 45 checks
+with the named-template consumer. RAMSQL's next candidate adds writable
+`template1` and a three-database archive fixture.
+[Named-template qualification](https://github.com/SB0LTD/ramsql/actions/runs/45390681198)
 
 The stock global-archive query now binds `pg_tablespace_location(oid)`
 against the two built-in tablespaces. Their locations and the implicit
 database default use PostgreSQL's empty-string convention. An unknown
 OID returns 58P01. The supported tablespaces have catalog rows and the
 location function has PostgreSQL procedure identity and return metadata.
-User-defined tablespaces and full cluster restore remain open.
+User-defined tablespaces remain open.
 
 Role defaults for the supported boolean settings are catalog objects with
 MVCC visibility and WAL replay. `ALTER ROLE ... SET`, `FROM CURRENT`,
