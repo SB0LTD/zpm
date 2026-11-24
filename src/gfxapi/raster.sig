@@ -555,6 +555,10 @@ pub const Draw = struct {
     depth_bias: f32 = 0.5,
     zmin: f32 = 0,
     zmax: f32 = 1,
+    /// Depth clamped, not clipped (Direct3D's DepthClipEnable off, GL's
+    /// DEPTH_CLAMP): no fragment dropped for its depth, which is written
+    /// and tested clamped into 0 .. 1 (depthWord's clamp).
+    depth_clamp: bool = false,
     /// the pixels drawn may be in (viewport, framebuffer, scissor met)
     rect: engine.Rect = .{ .x0 = 0, .y0 = 0, .x1 = 0, .y1 = 0 },
     /// bit 0: cull front faces, bit 1: back faces
@@ -3082,8 +3086,9 @@ pub fn rasterParams(d: *const Draw, bins: Bins, out: []u32) []u32 {
     }
     out[R_DFUNC] = d.depth_func;
     out[R_DWRITE] = @intFromBool(d.depth_write);
-    out[R_ZMIN] = fbits(d.zmin);
-    out[R_ZMAX] = fbits(d.zmax);
+    // (a depth clamp: every depth in range, depthWord clamping it)
+    out[R_ZMIN] = fbits(if (d.depth_clamp) -std.math.inf(f32) else d.zmin);
+    out[R_ZMAX] = fbits(if (d.depth_clamp) std.math.inf(f32) else d.zmax);
     if (d.stencil) |stencil| {
         out[R_STENCIL] = 1;
         out[R_S_TOPDOWN] = @intFromBool(stencil.top_down);

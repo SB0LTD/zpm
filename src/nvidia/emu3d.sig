@@ -171,6 +171,9 @@ pub const Engine = struct {
     /// depth range for the pixels (window units).
     zlo: f64 = 0,
     zhi: f64 = 1,
+    /// SET_VIEWPORT_CLIP_CONTROL's depth not clipped (a clamp): no pixel
+    /// dropped for its depth (depthIn), which is kept clamped to 0 .. 1.
+    zclamp: bool = false,
     zscale: f64 = 1,
     zoffset: f64 = 0,
     vhead: [sph.WORDS]u32 = undefined,
@@ -578,6 +581,9 @@ pub const Engine = struct {
         g.zoffset = g.float(gr.SET_VIEWPORT_SCALE_X + 20);
         g.zlo = if (g.reg(gr.SET_VIEWPORT_Z_CLIP) == 0) -1 else 0;
         g.zhi = 1;
+        // (a depth clamp, GEOMETRY_CLIP FRUSTUM_XY_CLIP: no pixel dropped
+        // for its depth, which floatDepth and depthWord clamp to 0 .. 1)
+        g.zclamp = !gl3d.clipsDepth(g.reg(gr.SET_VIEWPORT_CLIP_CONTROL));
         const last = g.reg(gr.SET_PROVOKING_VERTEX) == 1;
         const dc = DrawCtx{ .t = t, .clip = clip, .vcb = vcb, .pcb = pcb, .vp = .{ sx, sy, ox, oy }, .topo = topo, .last = last, .ib = ib };
         const restart = indexed and g.reg(gr.SET_DA_PRIMITIVE_RESTART) & 1 != 0;
@@ -838,6 +844,7 @@ pub const Engine = struct {
     /// Whether a pixel's depth (window units) is in the viewport's depth
     /// range, as gfxapi's raster keeps a pixel (depthInRange).
     fn depthIn(g: *const Engine, z: f32) bool {
+        if (g.zclamp) return true;
         return depthInRange(z, @floatCast(g.zlo), @floatCast(g.zhi), @floatCast(g.zscale), @floatCast(g.zoffset));
     }
 

@@ -3210,6 +3210,11 @@ pub const Engine = struct {
             .front_ccw = d.front_ccw != flip,
             // (the slopes' sizes, so the bias, the same flipped or not)
             .bias = .{ d.bias_factor, d.bias_units, d.bias_clamp },
+            .depth_clamp = d.depth_clamp,
+            // (the clip volume whose depths the viewport maps onto its
+            // range [zmin, zmax], as the compute raster keeps a pixel: NDC 0
+            // at one end, Direct3D's 0 <= z <= w; else GL's -w <= z <= w)
+            .clip_zero = d.depth_scale != 0 and (d.depth_bias == d.zmin or d.depth_bias == d.zmax),
             .tex = tex_pools,
         };
         if (d.stencil) |st| if (st != zimg) e.vramIn(st);

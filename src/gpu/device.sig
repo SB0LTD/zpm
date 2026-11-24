@@ -372,6 +372,13 @@ pub const Graphics = struct {
     /// Depth bias of filled triangles: factor, units (2^-24 each), clamp
     /// (gfxapi raster.Draw's bias_factor, bias_units, bias_clamp).
     bias: [3]f32 = .{ 0, 0, 0 },
+    /// Depths clamped into the window's 0 .. 1, not clipped (Direct3D's
+    /// DepthClipEnable off, GL's DEPTH_CLAMP: gfxapi raster.Draw's
+    /// depth_clamp).
+    depth_clamp: bool = false,
+    /// The depth's clip volume 0 <= z <= w (Direct3D's), else GL's
+    /// -w <= z <= w: the NDC depths the viewport maps into its range.
+    clip_zero: bool = false,
     /// Colour targets 1 .. 7 (the pixel program's output t into target
     /// t; null: none): as wide and high as target 0, rows of `stride`
     /// bytes from `va`.

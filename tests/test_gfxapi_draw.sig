@@ -2749,6 +2749,78 @@ test "draw: the compute raster's float depth is the 3D engine's within 3 ulps (p
     }
 }
 
+/// A quad whose depths run past both ends of the window's 0 .. 1 (Direct3D's
+/// depth mapping: window depth = NDC depth), drawn depth only with ALWAYS
+/// into `depth` cleared to 0.5, its depth clipped or clamped
+/// (Draw.depth_clamp); on the 3D engine or the compute raster.
+fn clampPass(e: *engine.Engine, depth: *engine.Image, ab: *engine.Image, engine3d: bool, clamp: bool) !void {
+    e.fillDepth(depth, depth.bounds(), 0.5, 0, 0xff);
+    const pts = [4][2]f32{ .{ 5.37, 3.11 }, .{ 58.93, 6.71 }, .{ 52.18, 29.42 }, .{ 9.66, 26.05 } };
+    const zs = [4]f32{ -0.6, 0.4, 1.7, 0.2 };
+    const tris = [2][3]usize{ .{ 0, 1, 2 }, .{ 0, 2, 3 } };
+    var verts: [6][4]f32 = undefined;
+    for (tris, 0..) |t, n| {
+        for (t, 0..) |c, j| verts[n * 3 + j] = .{ nx(pts[c][0], W), nx(pts[c][1], H), zs[c], 1 };
+    }
+    e.writeBytes(ab, 0, std.mem.sliceAsBytes(&verts));
+    const quarter = [_]u32{ @bitCast(@as(f32, 0.25)), 0, 0, 0 };
+    e.compute_only = !engine3d;
+    defer e.compute_only = false;
+    const before = e.stats.graphics_draws;
+    var d = raster.Draw{ .pipe = &solid, .color = depth, .color_off = true, .depth = depth, .depth_test = true, .depth_write = true, .depth_func = 0b111, .rect = .{ .x0 = 0, .y0 = 0, .x1 = W, .y1 = H }, .count = 6, .center = .{ W / 2, H / 2 }, .half = .{ W / 2, H / 2 }, .depth_scale = 1, .depth_bias = 0, .uniforms = &quarter, .depth_clamp = clamp };
+    d.attrs[0] = .{ .buf = ab, .stride = 16, .comps = 4 };
+    if (!e.draw(&d)) return error.NotDrawn;
+    e.finish();
+    if (e.lost or e.why_pipe != null) return error.EngineLost;
+    if (e.stats.graphics_draws - before != @intFromBool(engine3d)) {
+        for (e.said_compute) |w| if (w.len != 0) std.debug.print("clamp pass: on the compute kernels: {s}\n", .{w});
+        return error.WrongRasterizer;
+    }
+}
+
+test "draw: a depth clamp (Direct3D's DepthClipEnable off, a sun's shadow map's) on the RTX's 3D engine: the depths past 0 .. 1 kept clamped, as the compute raster keeps them; clipped without it" {
+    Rtx3d.engine3d = .{};
+    Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+    Rtx.dev.withEngine(&Rtx3d.engine3d);
+    eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs, .graphics = true });
+    defer eng_rtx.deinit();
+    defer eng_rtx.unloadPipeline(&solid);
+    const e = &eng_rtx;
+    var zd: [2]engine.Image = undefined;
+    for (&zd) |*z| z.* = e.newImageSamples(W, H, .d24s8, 1) orelse return error.OutOfMemory;
+    defer for (&zd) |*z| e.freeImage(z);
+    var ab = e.newBuffer(6 * 16) orelse return error.OutOfMemory;
+    defer e.freeImage(&ab);
+    var words: [2][W * H]u32 = undefined;
+    const half: u32 = @bitCast(@as(f32, 0.5));
+    const zero: u32 = 0;
+    const one: u32 = @bitCast(@as(f32, 1.0));
+    var counts: [2][3]u32 = undefined;
+    for ([_]bool{ false, true }, 0..) |clamp, ci| {
+        for (0..2) |n| {
+            clampPass(e, &zd[n], &ab, n == 1, clamp) catch |err| {
+                std.debug.print("depth clamp {} (engine {}): {s}; the 3D engine: {s}\n", .{ clamp, n == 1, @errorName(err), Rtx3d.engine3d.why });
+                return err;
+            };
+            e.readDepthBits(&zd[n], 0, 0, W, H, &words[n], null);
+        }
+        // the same depths on both rasterizers
+        try std.testing.expectEqualSlices(u32, &words[0], &words[1]);
+        // written, clamped to 0 and to 1 (none without the clamp)
+        var c = [3]u32{ 0, 0, 0 };
+        for (words[1]) |w| {
+            c[0] += @intFromBool(w != half);
+            c[1] += @intFromBool(w == zero);
+            c[2] += @intFromBool(w == one);
+        }
+        counts[ci] = c;
+    }
+    std.debug.print("depth clamp: clipped {d} written, clamped {d} written ({d} at 0, {d} at 1)\n", .{ counts[0][0], counts[1][0], counts[1][1], counts[1][2] });
+    try std.testing.expectEqual(@as(u32, 0), counts[0][1] + counts[0][2]);
+    try std.testing.expect(counts[1][1] > 20 and counts[1][2] > 20);
+    try std.testing.expect(counts[1][0] > counts[0][0] + 40);
+}
+
 test "draw: depth bias (a slope's factor, units, a clamp of either sign) on the RTX's 3D engine: the compute raster's biased float depths within 3 ulps, the same pixels; each path's EQUAL pass meets its own biased LESS pass" {
     Rtx3d.engine3d = .{};
     Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);

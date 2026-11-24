@@ -292,6 +292,15 @@ pub const Draw = struct {
     /// whatever the depth's format (SET_DEPTH_BIAS_CONTROL's
     /// DEPTH_FORMAT_DEPENDENT off, NVK's FORCE_UNORM representation).
     bias: [3]f32 = .{ 0, 0, 0 },
+    /// Depth clamped, not clipped (Direct3D's DepthClipEnable off, GL's
+    /// DEPTH_CLAMP): SET_VIEWPORT_CLIP_CONTROL clips x and y alone, and the
+    /// pixels' depth is clamped into 0 .. 1 (PIXEL_MIN_Z, PIXEL_MAX_Z
+    /// CLAMP; the range MIN_Z_ZERO_MAX_Z_ONE's), as NVK sets it for a depth
+    /// clamp without the clip.
+    depth_clamp: bool = false,
+    /// The depth's clip volume 0 <= z <= w (Direct3D's: SET_VIEWPORT_Z_CLIP
+    /// ZERO_TO_POSITIVE_W), else GL's -w <= z <= w.
+    clip_zero: bool = false,
     /// Colour targets 1 .. 7 (null: none; one inside the highest is sent
     /// off: format 0): as wide and high as target 0.
     more: [7]?More = @splat(null),
@@ -500,6 +509,18 @@ pub const SET_DEPTH_BIAS_CONTROL: u32 = 0x1110;
 pub const SET_SLOPE_SCALE_DEPTH_BIAS: u32 = 0x156c;
 pub const SET_DEPTH_BIAS: u32 = 0x15bc;
 pub const SET_DEPTH_BIAS_CLAMP: u32 = 0x187c;
+/// SET_VIEWPORT_CLIP_CONTROL (clc797.h) as draw.sig's setup leaves it:
+/// MIN_Z_ZERO_MAX_Z_ONE, GEOMETRY_GUARDBAND_Z SCALE_1, PIXEL_MIN_Z and
+/// PIXEL_MAX_Z CLAMP, GEOMETRY_CLIP FRUSTUM_XYZ_CLIP (depth clipped); and
+/// for a depth clamp: GEOMETRY_CLIP FRUSTUM_XY_CLIP and
+/// GEOMETRY_GUARDBAND_Z SCALE_256 (NVK's for a clamp without the clip),
+/// the pixels' depth clamped into 0 .. 1.
+pub const CLIP_CONTROL_CLIP: u32 = 0x181d;
+pub const CLIP_CONTROL_CLAMP: u32 = 0x101b;
+/// GEOMETRY_CLIP (bits 13:11): FRUSTUM_XY_CLIP, depth not clipped.
+pub fn clipsDepth(clip_control: u32) bool {
+    return (clip_control >> 11) & 7 != 2;
+}
 pub const CULL_FRONT: u32 = 0x404;
 pub const CULL_BACK: u32 = 0x405;
 pub const CULL_FRONT_AND_BACK: u32 = 0x408;
@@ -575,8 +596,10 @@ fn bits(x: f32) u32 {
     return @bitCast(x);
 }
 
-/// SET_VIEWPORT_Z_CLIP for GL's clip volume.
-pub const SET_VIEWPORT_SCALE_Z_CLIP_GL: u32 = 0; // SET_VIEWPORT_Z_CLIP: NEGATIVE_W_TO_POSITIVE_W
+/// SET_VIEWPORT_Z_CLIP for GL's clip volume (NEGATIVE_W_TO_POSITIVE_W) and
+/// Direct3D's (ZERO_TO_POSITIVE_W).
+pub const SET_VIEWPORT_SCALE_Z_CLIP_GL: u32 = 0;
+pub const SET_VIEWPORT_Z_CLIP_ZERO: u32 = 1;
 pub const SET_BLEND_CONST: u32 = gr.SET_BLEND_CONST_RED;
 pub const SET_CONSTANT_BUFFER_SELECTOR_A = gr.SET_CONSTANT_BUFFER_SELECTOR_A;
 pub const INVALIDATE_TEXTURE_DATA_CACHE_NO_WFI = gr.INVALIDATE_TEXTURE_DATA_CACHE_NO_WFI;
@@ -633,9 +656,10 @@ fn emitDraw(p: *Push, d: *const Draw, whole: bool) void {
         count = t + 1;
     }
     many(p, gr.SET_CT_SELECT, &.{ctSelect(count)});
-    // the viewport: x, y and depth; GL's clip volume (-w <= z <= w)
+    // the viewport: x, y and depth; the clip volume (GL's -w <= z <= w, or
+    // Direct3D's 0 <= z <= w)
     many(p, gr.SET_VIEWPORT_SCALE_X, &.{ bits(d.scale[0]), bits(d.scale[1]), bits(d.scale[2]), bits(d.offset[0]), bits(d.offset[1]), bits(d.offset[2]) });
-    one(p, gr.SET_VIEWPORT_Z_CLIP, SET_VIEWPORT_SCALE_Z_CLIP_GL);
+    one(p, gr.SET_VIEWPORT_Z_CLIP, if (d.clip_zero) SET_VIEWPORT_Z_CLIP_ZERO else SET_VIEWPORT_SCALE_Z_CLIP_GL);
     gr.setScissor(p, d.scissor[0], d.scissor[1], d.scissor[2], d.scissor[3]);
     one(p, gr.SET_PROVOKING_VERTEX, PROVOKING_LAST);
     one(p, gr.OGL_SET_FRONT_FACE, frontFaceWord(d.front_ccw));
@@ -647,6 +671,8 @@ fn emitDraw(p: *Push, d: *const Draw, whole: bool) void {
         });
         one(p, gr.OGL_SET_CULL, 1);
     } else one(p, gr.OGL_SET_CULL, 0);
+    // (the depth clipped or clamped: every draw's own, as the cull's)
+    one(p, gr.SET_VIEWPORT_CLIP_CONTROL, if (d.depth_clamp) CLIP_CONTROL_CLAMP else CLIP_CONTROL_CLIP);
     // (the depth bias: every draw's own, as the cull's)
     const biased = d.bias[0] != 0 or d.bias[1] != 0;
     one(p, SET_POLY_OFFSET_FILL, @intFromBool(biased));
