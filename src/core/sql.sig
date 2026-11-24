@@ -132,6 +132,7 @@ pub const PostgresStatements = lexer.PostgresStatements;
 pub const Config = types.Config;
 /// Per-statement session values (TimeZone, zone resolver, clocks).
 pub const Session = value_module.Session;
+pub const bootstrap_role_name = CO.bootstrap_name;
 pub const DatabaseCatalogRow = catalog_module.DatabaseCatalogRow;
 pub const DatabaseCatalogProvider = catalog_module.DatabaseCatalogProvider;
 pub const Zone = temporal_module.Zone;

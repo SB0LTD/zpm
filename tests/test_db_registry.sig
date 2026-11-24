@@ -24,6 +24,14 @@ fn clusterGrammar() !void {
     try std.testing.expectError(error.Syntax, Raw.parseDatabaseCommand("CREATE DATABASE alpha; SELECT 1", .{}));
     try std.testing.expectError(error.Syntax, Raw.parseDatabaseCommand("DROP DATABASE IF alpha", .{}));
     try std.testing.expectError(error.UnsupportedStatement, Raw.parseDatabaseCommand("CREATE DATABASE alpha OWNER bob", .{}));
+    const pristine = (try Raw.parseDatabaseCommand("CREATE DATABASE \"Archive Child\" WITH TEMPLATE = template0 ENCODING = 'UTF8' LOCALE_PROVIDER = libc LOCALE = 'C'", .{})).?.create;
+    try std.testing.expectEqualStrings("Archive Child", pristine.slice());
+    const owner = (try Raw.parseDatabaseCommand("ALTER DATABASE \"Archive Child\" OWNER TO \"ramsql\"", .{})).?.alter_owner;
+    try std.testing.expectEqualStrings("Archive Child", owner.name.slice());
+    try std.testing.expectEqualStrings("ramsql", owner.owner.slice());
+    try std.testing.expectError(error.UnsupportedStatement, Raw.parseDatabaseCommand("CREATE DATABASE alpha TEMPLATE template1", .{}));
+    try std.testing.expectError(error.UnsupportedStatement, Raw.parseDatabaseCommand("CREATE DATABASE alpha ENCODING 'LATIN1'", .{}));
+    try std.testing.expectError(error.Syntax, Raw.parseDatabaseCommand("CREATE DATABASE alpha ENCODING 'UTF8' ENCODING 6", .{}));
 }
 
 pub fn main() !void {

@@ -2,6 +2,12 @@
 
 ## Stock PostgreSQL dump and restore candidate
 
+The database utility parser accepts the stock archive's database creation
+options when they match RAMSQL's empty UTF-8, C-locale database. It retains
+the parsed owner in `ALTER DATABASE ... OWNER TO` for registry validation.
+Connecting to PostgreSQL's templates and cloning their contents remain
+separate cluster work.
+
 The stock global-archive query now binds `pg_tablespace_location(oid)`
 against the two built-in tablespaces. Their locations and the implicit
 database default use PostgreSQL's empty-string convention. An unknown

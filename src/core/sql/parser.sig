@@ -79,6 +79,7 @@ pub fn Parser(comptime config: types.Config) type {
         pub const DatabaseCommand = union(enum) {
             create: DatabaseName,
             drop: struct { name: DatabaseName, if_exists: bool },
+            alter_owner: struct { name: DatabaseName, owner: DatabaseName },
         };
 
         /// A cluster owner can recognize these utility statements without
@@ -88,26 +89,96 @@ pub fn Parser(comptime config: types.Config) type {
             var tokens: lexer.Tokenizer = .{ .source = source, .text_limit = config.text_bytes };
             const first = try tokens.next();
             const is_create = wordIs(source, first, "create");
-            if (!is_create and !wordIs(source, first, "drop")) return null;
+            const is_drop = wordIs(source, first, "drop");
+            const is_alter = wordIs(source, first, "alter");
+            if (!is_create and !is_drop and !is_alter) return null;
             if (!wordIs(source, try tokens.next(), "database")) return null;
 
             var token = try tokens.next();
-            const if_exists = !is_create and wordIs(source, token, "if");
+            const if_exists = is_drop and wordIs(source, token, "if");
             if (if_exists) {
                 if (!wordIs(source, try tokens.next(), "exists")) return error.Syntax;
                 token = try tokens.next();
             }
-            const ident = try identToken(token, .standard);
-            var name: DatabaseName = .{ .len = ident.len };
-            identBytes(source, ident, &name.bytes);
+            const name = try databaseName(source, token);
             var end = try tokens.next();
+            var command: DatabaseCommand = .{ .drop = .{ .name = name, .if_exists = if_exists } };
+            if (is_create) {
+                end = try pristineDatabaseOptions(&tokens, source, end);
+                command = .{ .create = name };
+            } else if (is_alter) {
+                if (!wordIs(source, end, "owner")) return error.UnsupportedStatement;
+                if (!wordIs(source, try tokens.next(), "to")) return error.Syntax;
+                command = .{ .alter_owner = .{ .name = name, .owner = try databaseName(source, try tokens.next()) } };
+                end = try tokens.next();
+            }
             if (end.kind == .symbol and end.symbol == .semicolon) {
                 end = try tokens.next();
                 if (end.kind != .end) return error.Syntax;
             }
             if (end.kind == .word) return error.UnsupportedStatement;
             if (end.kind != .end) return error.Syntax;
-            return if (is_create) .{ .create = name } else .{ .drop = .{ .name = name, .if_exists = if_exists } };
+            return command;
+        }
+
+        fn databaseName(source: []const u8, token: Token) Error!DatabaseName {
+            const ident = try identToken(token, .standard);
+            var name: DatabaseName = .{ .len = ident.len };
+            identBytes(source, ident, &name.bytes);
+            return name;
+        }
+
+        const DatabaseOption = enum(u3) { template, encoding, locale, locale_provider, lc_collate, lc_ctype, tablespace };
+
+        /// These options describe the empty UTF-8 database the store creates.
+        /// Reject alternatives that require copying a database, another
+        /// filesystem placement or a different locale implementation.
+        fn pristineDatabaseOptions(tokens: *lexer.Tokenizer, source: []const u8, first: Token) Error!Token {
+            var key = if (wordIs(source, first, "with")) try tokens.next() else first;
+            var seen: u8 = 0;
+            while (key.kind == .word) : (key = try tokens.next()) {
+                const option = databaseOption(source, key) orelse return error.UnsupportedStatement;
+                const bit = @as(u8, 1) << @intFromEnum(option);
+                if (seen & bit != 0) return error.Syntax;
+                seen |= bit;
+                var value = try tokens.next();
+                if (value.kind == .symbol and value.symbol == .eq) value = try tokens.next();
+                if (value.kind == .integer and option == .encoding) {
+                    if (value.integer != 6) return error.UnsupportedStatement;
+                    continue;
+                }
+                var buffer: [32]u8 = undefined;
+                const setting = switch (value.kind) {
+                    .word, .quoted_word => blk: {
+                        const ident = try identToken(value, .standard);
+                        if (ident.len > buffer.len) return error.UnsupportedStatement;
+                        identBytes(source, ident, &buffer);
+                        break :blk buffer[0..ident.len];
+                    },
+                    .string => blk: {
+                        if (value.len > buffer.len) return error.UnsupportedStatement;
+                        lexer.decodeQuoted(source, value.quoted(), buffer[0..value.len]);
+                        break :blk buffer[0..value.len];
+                    },
+                    else => return error.Syntax,
+                };
+                const supported = switch (option) {
+                    .template => types.same(setting, "template0"),
+                    .encoding => types.keyword(setting, "utf8") or types.keyword(setting, "utf-8"),
+                    .locale, .lc_collate, .lc_ctype => types.same(setting, "C"),
+                    .locale_provider => types.same(setting, "libc"),
+                    .tablespace => types.same(setting, "pg_default"),
+                };
+                if (!supported) return error.UnsupportedStatement;
+            }
+            return key;
+        }
+
+        fn databaseOption(source: []const u8, token: Token) ?DatabaseOption {
+            inline for (@typeInfo(DatabaseOption).@"enum".field_names) |name| {
+                if (wordIs(source, token, name)) return @field(DatabaseOption, name);
+            }
+            return null;
         }
 
         pub const Explain = struct { analyze: bool = false };
