@@ -841,6 +841,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             return false;
         }
         fn authenticationComplete(self: *Self, db: *DB, w: *Writer) !void {
+            if (comptime @hasDecl(DB, "finalizePostgresLogin")) db.finalizePostgresLogin();
             const auth = try w.begin('R');
             try w.u32be(0);
             w.end(auth);

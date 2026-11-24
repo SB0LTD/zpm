@@ -86,7 +86,54 @@ pub fn main() !void {
     try two.execute("RESET ALL", &result);
     try two.execute("SHOW quote_all_identifiers", &result);
     try wantText(&result, 0, "off");
+    try one.execute("CREATE ROLE settings_login LOGIN", &result);
+    try one.execute("ALTER ROLE settings_login SET quote_all_identifiers TO 'on'", &result);
+    try one.execute("ALTER ROLE settings_login SET check_function_bodies = false", &result);
+    try one.execute("SET row_security = off", &result);
+    try one.execute("ALTER ROLE settings_login SET row_security FROM CURRENT", &result);
+    try one.execute("BEGIN", &result);
+    try one.execute("ALTER ROLE settings_login RESET ALL", &result);
+    try one.execute("ROLLBACK", &result);
+
+    var role_login: Store.Connection = .{ .store = &store, .id = 3 };
+    try role_login.bindAuthenticatedRole("settings_login");
+    role_login.finalizePostgresLogin();
+    try role_login.execute("SELECT quote_ident('plain'), current_setting('row_security')", &result);
+    try wantText(&result, 0, "\"plain\"");
+    try wantText(&result, 1, "off");
+    try role_login.execute("SELECT setting, source, reset_val FROM pg_settings WHERE name = 'quote_all_identifiers'", &result);
+    try wantText(&result, 0, "on");
+    try wantText(&result, 1, "user");
+    try wantText(&result, 2, "on");
+    try role_login.execute("SET quote_all_identifiers TO off", &result);
+    try role_login.execute("RESET quote_all_identifiers", &result);
+    try role_login.execute("SHOW quote_all_identifiers", &result);
+    try wantText(&result, 0, "on");
+
+    var overridden: Store.Connection = .{ .store = &store, .id = 4 };
+    try overridden.startupParameter("options", "-c quote_all_identifiers=off -c row_security=on");
+    try overridden.bindAuthenticatedRole("settings_login");
+    overridden.finalizePostgresLogin();
+    try overridden.execute("SELECT quote_ident('plain'), current_setting('row_security')", &result);
+    try wantText(&result, 0, "plain");
+    try wantText(&result, 1, "on");
+    try overridden.execute("SHOW check_function_bodies", &result);
+    try wantText(&result, 0, "off");
+
+    try one.execute("BEGIN ISOLATION LEVEL REPEATABLE READ", &result);
+    try one.execute("SELECT setrole FROM pg_db_role_setting", &result);
+    try two.execute("ALTER ROLE settings_login SET row_security = on", &result);
+    if (one.execute("ALTER ROLE settings_login RESET row_security", &result)) |_| {
+        return error.LostRoleDefaultsUpdate;
+    } else |err| {
+        if (err != error.SerializationFailure) return err;
+    }
+    try one.execute("ROLLBACK", &result);
+
+    try one.execute("DROP ROLE settings_login", &result);
+    try one.execute("SELECT setrole FROM pg_db_role_setting", &result);
+    if (result.row_count != 0) return error.OrphanRoleDefaults;
     try one.execute("SELECT name FROM pg_settings WHERE name = 'unsupported_setting'", &result);
     if (result.row_count != 0) return error.SyntheticSetting;
-    std.debug.print("pg_settings: columns, sources, setter and session isolation passed\n", .{});
+    std.debug.print("pg_settings: columns, sources, role defaults, startup precedence and session isolation passed\n", .{});
 }

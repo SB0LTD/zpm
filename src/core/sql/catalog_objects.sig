@@ -78,7 +78,7 @@ pub const class_policy: u32 = 3256;
 /// database). PostgreSQL assigns its OID at initdb; ZPM fixes it.
 pub const plpgsql_extension_oid: u32 = 13001;
 
-pub const Kind = enum(u8) { role = 1, member = 2, acl = 3, relation = 4, policy = 5, comment = 6, fdw = 7, server = 8, publication = 9, domain = 10, enum_type = 11, composite_type = 12, statistics = 13, publication_table = 14, publication_schema = 15, schema_acl = 16, schema_acl_state = 17, schema_owner = 18, _ };
+pub const Kind = enum(u8) { role = 1, member = 2, acl = 3, relation = 4, policy = 5, comment = 6, fdw = 7, server = 8, publication = 9, domain = 10, enum_type = 11, composite_type = 12, statistics = 13, publication_table = 14, publication_schema = 15, schema_acl = 16, schema_acl_state = 17, schema_owner = 18, role_settings = 19, _ };
 
 pub fn publicationMembership(kind: Kind) bool {
     return kind == .publication_table or kind == .publication_schema;
@@ -283,6 +283,28 @@ pub const Ident = struct { span: Span = .{}, quoted: bool = false, len: usize = 
 pub const Qualified = struct { has_schema: bool = false, schema: Ident = .{}, name: Ident = .{} };
 
 pub const RoleKind = enum { role, user, group };
+/// Stable bit positions in the catalog and WAL.
+pub const RoleBoolean = enum(u3) {
+    check_function_bodies,
+    quote_all_identifiers,
+    row_security,
+    synchronize_seqscans,
+    default_transaction_read_only,
+    default_transaction_deferrable,
+
+    pub fn bit(self: RoleBoolean) u32 {
+        return @as(u32, 1) << @as(u5, @intFromEnum(self));
+    }
+};
+pub const role_boolean_mask: u32 = (1 << @typeInfo(RoleBoolean).@"enum".field_names.len) - 1;
+
+pub const RoleDefaults = union(enum) {
+    reset_all,
+    reset: RoleBoolean,
+    from_current: RoleBoolean,
+    set: struct { setting: RoleBoolean, spelling: Span = .{}, quoted: ?lexer.Quoted = null },
+};
+
 pub const RoleSpec = struct {
     kind: RoleKind = .role,
     name: Ident = .{},
@@ -295,6 +317,7 @@ pub const RoleSpec = struct {
     /// CREATE ROLE ... IN ROLE a, b: the new role becomes a member of each.
     in_roles: [list_capacity]Ident = @splat(.{}),
     in_count: usize = 0,
+    defaults: ?RoleDefaults = null,
 };
 
 pub const GranteeKind = enum(u8) { name, public, current_user, session_user, current_role };
@@ -820,7 +843,15 @@ const Parser = struct {
                 try self.finish();
                 return out;
             }
-            if (self.word("set") or self.word("reset") or self.word("in")) return error.UnsupportedStatement;
+            if (try self.take("set")) {
+                out.defaults = try self.roleDefaults(false);
+                return out;
+            }
+            if (try self.take("reset")) {
+                out.defaults = try self.roleDefaults(true);
+                return out;
+            }
+            if (self.word("in")) return error.UnsupportedStatement;
         }
         _ = try self.take("with");
         var seen: u32 = 0;
@@ -882,6 +913,41 @@ const Parser = struct {
         }
         try self.finish();
         return out;
+    }
+
+    fn roleDefaults(self: *Parser, reset: bool) Error!RoleDefaults {
+        if (reset and try self.take("all")) {
+            try self.finish();
+            return .reset_all;
+        }
+        const token = self.current;
+        if (token.kind != .word and token.kind != .quoted_word) return error.Syntax;
+        const name = token.raw(self.source);
+        const setting = inline for (@typeInfo(RoleBoolean).@"enum".field_names) |field| {
+            const matches = if (token.kind == .quoted_word) types.same(name, field) else types.keyword(name, field);
+            if (matches) break @field(RoleBoolean, field);
+        } else return error.UnsupportedStatement;
+        try self.advance();
+        if (reset) {
+            try self.finish();
+            return .{ .reset = setting };
+        }
+        if (try self.take("from")) {
+            try self.expect("current");
+            try self.finish();
+            return .{ .from_current = setting };
+        }
+        if (!try self.take("to") and !try self.takeSymbol(.eq)) return error.Syntax;
+        if (try self.take("default")) {
+            try self.finish();
+            return .{ .reset = setting };
+        }
+        const value = self.current;
+        if (value.kind != .word and value.kind != .string and value.kind != .integer) return error.Syntax;
+        const spelling: Span = .{ .start = value.start, .len = value.end - value.start };
+        try self.advance();
+        try self.finish();
+        return .{ .set = .{ .setting = setting, .spelling = spelling, .quoted = if (value.kind == .string) value.quoted() else null } };
     }
 
     const PolicyForm = enum { create, alter, drop };
@@ -1475,7 +1541,7 @@ pub fn Objects(comptime config: types.Config) type {
                 .publication_table, .publication_schema => a.oid == b.oid and a.target == b.target and a.grantee == b.grantee,
                 .domain, .enum_type, .composite_type => a.oid == b.oid and a.target == b.target,
                 .member, .acl, .schema_acl => a.target == b.target and a.grantee == b.grantee,
-                .relation, .schema_acl_state, .schema_owner => a.target == b.target,
+                .relation, .schema_acl_state, .schema_owner, .role_settings => a.target == b.target,
                 .comment => a.grantee == b.grantee and a.target == b.target and a.sub == b.sub,
                 _ => false,
             };
@@ -1867,7 +1933,7 @@ pub fn Objects(comptime config: types.Config) type {
 
         fn decodeKind(cursor: Cursor) Error!Kind {
             const raw = try cursor.int(u8);
-            if (raw < 1 or raw > @intFromEnum(Kind.schema_owner)) return error.InvalidChangeRecord;
+            if (raw < 1 or raw > @intFromEnum(Kind.role_settings)) return error.InvalidChangeRecord;
             return @enumFromInt(raw);
         }
 
@@ -1892,7 +1958,7 @@ pub fn Objects(comptime config: types.Config) type {
                 .publication_table, .publication_schema => o.oid != 0 and o.target != 0 and o.grantee != 0 and o.sub == 0,
                 .member => o.oid != 0 and o.target != 0 and o.grantee != 0 and o.sub == 0,
                 .acl, .schema_acl => o.oid == 0 and o.target != 0 and o.sub == 0,
-                .relation, .schema_acl_state, .schema_owner => o.oid == 0 and o.target != 0 and o.grantee == 0 and o.sub == 0,
+                .relation, .schema_acl_state, .schema_owner, .role_settings => o.oid == 0 and o.target != 0 and o.grantee == 0 and o.sub == 0,
                 .comment => o.oid == 0 and o.target != 0 and o.sub >= 0 and switch (o.grantee) {
                     class_relation => true,
                     class_namespace, class_authid, class_fdw, class_server, class_publication, class_policy => o.sub == 0,
@@ -1943,6 +2009,8 @@ pub fn Objects(comptime config: types.Config) type {
                 .schema_acl => !has_name and o.owner != 0 and o.grant_flags == 0 and o.role_count == 0 and o.text_len == 0 and
                     (o.flags == priv_schema_usage or (o.flags == 0 and o.grantee == o.owner)),
                 .schema_acl_state, .schema_owner => !has_name and o.owner != 0 and o.flags == 0 and o.grant_flags == 0 and o.role_count == 0 and o.text_len == 0,
+                .role_settings => !has_name and o.owner == 0 and o.flags != 0 and o.flags & ~role_boolean_mask == 0 and
+                    o.grant_flags & ~o.flags == 0 and o.role_count == 0 and o.text_len == 0,
                 .relation => !has_name and o.flags & ~(rls_enabled | rls_forced) == 0 and o.grant_flags == 0 and o.role_count == 0 and o.text_len == 0 and o.owner != 0,
                 .policy => has_name and o.flags & ~@as(u32, 0x7ff) == 0 and (o.flags & 0xff) <= 4 and o.grant_flags == 0 and o.role_count != 0 and o.owner == 0 and using_ok and check_ok,
                 .comment => !has_name and o.owner == 0 and o.flags == 0 and o.grant_flags == 0 and o.role_count == 0 and o.text_len != 0 and o.split == 0,
@@ -2212,6 +2280,7 @@ pub fn Objects(comptime config: types.Config) type {
                         if (self.schemaOwner(target, original) != v.owner) return error.ChangeRecordConflict;
                     },
                     .schema_owner => if (ctx.objectPrivateSchemaOwner(target) == null) return error.ChangeRecordConflict,
+                    .role_settings => if (!self.roleExists(target)) return error.ChangeRecordConflict,
                     .relation => {
                         if (!ctx.objectTableLive(target)) return error.ChangeRecordConflict;
                     },

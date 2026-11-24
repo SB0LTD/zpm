@@ -777,6 +777,14 @@ pub fn Store(comptime Raw: type) type {
                 self.engine_session.session_role = self.store.database.authenticatedRole(username) orelse return error.AuthenticationFailed;
             }
 
+            /// Startup parameters have been parsed and the wire identity is
+            /// final. Install the role's defaults before the first query.
+            pub fn finalizePostgresLogin(self: *Connection) void {
+                if (comptime has_engine_session and @hasDecl(Raw, "applyRoleDefaults")) {
+                    self.store.database.applyRoleDefaults(&self.engine_session);
+                }
+            }
+
             /// Backend pid reported with this session's NOTIFY (codec-set).
             pub fn setBackendPid(self: *Connection, pid: u32) void {
                 if (comptime has_engine_session) self.engine_session.pid = pid;

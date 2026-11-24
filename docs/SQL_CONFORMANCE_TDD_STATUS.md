@@ -2,6 +2,15 @@
 
 ## Stock PostgreSQL dump and restore candidate
 
+Role defaults for the supported boolean settings are catalog objects with
+MVCC visibility and WAL replay. `ALTER ROLE ... SET`, `FROM CURRENT`,
+`RESET` and `RESET ALL` update the defaults for future PostgreSQL sessions.
+The wire layer applies them after resolving the login role. Startup options
+take precedence, and session RESET returns to the resulting startup value.
+Stock `pg_dumpall` discovers the saved values through
+`unnest(pg_db_role_setting.setconfig)`. Database-specific and non-boolean
+role settings, and shared settings across the database cluster, remain open.
+
 PostgreSQL 16 and 18 use `SET quote_all_identifiers = true` for both
 `pg_dump --quote-all-identifiers` and `pg_dumpall --quote-all-identifiers`.
 The candidate tracks the setting per session, including LOCAL, rollback,

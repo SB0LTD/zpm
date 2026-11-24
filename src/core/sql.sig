@@ -4146,6 +4146,7 @@ pub fn Database(comptime config: Config) type {
 
         fn alterRole(self: *Self, slot: u16, source: []const u8, spec: *const CO.RoleSpec, snap: Snapshot) Error!void {
             const oid = self.catalog_objects.roleByName(objectName(source, spec.name).slice(), snap) orelse return error.UndefinedObject;
+            if (spec.defaults) |defaults| return self.alterRoleDefaults(slot, source, oid, defaults, snap);
             if (oid == CO.bootstrap_role) {
                 // A stock archive restates the built-in role's attributes.
                 if (!self.privilegedRole(snap)) return error.InsufficientPrivilege;
@@ -4177,6 +4178,57 @@ pub fn Database(comptime config: Config) type {
             try self.reserveWrites(slot, 2);
             self.objectDelete(slot, index, snap);
             _ = try self.objectInsert(slot, &next, false, snap);
+        }
+
+        fn alterRoleDefaults(self: *Self, slot: u16, source: []const u8, role: u32, change: CO.RoleDefaults, snap: Snapshot) Error!void {
+            if (!self.privilegedRole(snap) and role != self.session.role and
+                (self.catalog_objects.superuser(role, snap) or self.actorFlags(snap) & CO.role_createrole == 0 or
+                    !self.roleAdmin(self.session.role, role, snap))) return error.InsufficientPrivilege;
+            var latest = snap;
+            latest.csn = self.csn;
+            if (role != CO.bootstrap_role) {
+                const role_key: O.Object = .{ .kind = .role, .oid = role };
+                if (self.catalog_objects.pendingConflict(&role_key, snap)) |other| return self.objectPark(slot, other);
+                if (self.catalog_objects.byOid(.role, role, latest) == null) return error.SerializationFailure;
+            }
+            var next: O.Object = .{ .kind = .role_settings, .target = role };
+            if (self.catalog_objects.pendingConflict(&next, snap)) |other| return self.objectPark(slot, other);
+            const existing = self.catalog_objects.findKey(&next, snap);
+            if (self.catalog_objects.findKey(&next, latest) != existing) return error.SerializationFailure;
+            if (existing) |index| {
+                next.flags = self.catalog_objects.items[index].flags;
+                next.grant_flags = self.catalog_objects.items[index].grant_flags;
+            }
+            switch (change) {
+                .reset_all => next.flags = 0,
+                .reset => |setting| next.flags &= ~setting.bit(),
+                .from_current => |setting| storeRoleBoolean(&next, setting, roleBoolean(&self.sessionState().values, setting).*),
+                .set => |entry| {
+                    var buffer: [16]u8 = undefined;
+                    const spelling = if (entry.quoted) |quoted| blk: {
+                        if (quoted.len > buffer.len) return error.InvalidSettingValue;
+                        lexer.decodeQuoted(source, quoted, buffer[0..quoted.len]);
+                        break :blk buffer[0..quoted.len];
+                    } else source[entry.spelling.start..][0..entry.spelling.len];
+                    storeRoleBoolean(&next, entry.setting, parseBool(spelling) orelse return error.InvalidSettingValue);
+                },
+            }
+            next.grant_flags &= next.flags;
+            if (existing) |index| {
+                const current = &self.catalog_objects.items[index];
+                if (current.flags == next.flags and current.grant_flags == next.grant_flags) return;
+            }
+            const writes = @as(usize, @intFromBool(existing != null)) + @as(usize, @intFromBool(next.flags != 0));
+            if (writes == 0) return;
+            try self.reserveWrites(slot, writes);
+            if (existing) |index| self.objectDelete(slot, index, snap);
+            if (next.flags != 0) _ = try self.objectInsert(slot, &next, false, snap);
+        }
+
+        fn storeRoleBoolean(entry: *O.Object, setting: CO.RoleBoolean, enabled: bool) void {
+            const bit = setting.bit();
+            entry.flags |= bit;
+            if (enabled) entry.grant_flags |= bit else entry.grant_flags &= ~bit;
         }
 
         /// DROP ROLE: never the current, session or bootstrap user (55006 /
@@ -4224,7 +4276,8 @@ pub fn Database(comptime config: Config) type {
                 }
                 for (&self.catalog_objects.items) |*o| {
                     const affected = (CO.userType(o.kind) or o.kind == .statistics or o.kind == .relation) and o.owner == oid or
-                        o.kind == .schema_acl and (o.owner == oid or o.grantee == oid);
+                        o.kind == .schema_acl and (o.owner == oid or o.grantee == oid) or
+                        o.kind == .role_settings and o.target == oid;
                     if (affected and O.visible(o, latest) != O.visible(o, snap)) return error.SerializationFailure;
                     if (!O.visible(o, snap)) continue;
                     switch (o.kind) {
@@ -4236,6 +4289,7 @@ pub fn Database(comptime config: Config) type {
                         .comment => if (o.grantee == CO.class_authid and o.target == oid) {
                             writes += 1;
                         },
+                        .role_settings => if (o.target == oid) { writes += 1; },
                         .acl, .schema_acl => if (o.grantee == oid or o.owner == oid) return error.DependentObjects,
                         .policy => {
                             for (o.roleList()) |listed| {
@@ -4258,6 +4312,7 @@ pub fn Database(comptime config: Config) type {
                         .role => o.oid == oid,
                         .member => o.target == oid or o.grantee == oid,
                         .comment => o.grantee == CO.class_authid and o.target == oid,
+                        .role_settings => o.target == oid,
                         else => false,
                     };
                     if (dies) self.objectDelete(slot, index, snap);
@@ -5317,6 +5372,20 @@ pub fn Database(comptime config: Config) type {
                 .pg_auth_members => for (&self.catalog_objects.items) |*o| if (o.kind == .member and O.visible(o, snapshot)) {
                     try sink.add(&.{ intCell(o.oid), intCell(o.target), intCell(o.grantee), intCell(o.owner),
                         boolCell(o.grant_flags & CO.member_admin != 0), boolCell(self.catalog_objects.membershipInherits(o, snapshot)), boolCell(O.membershipCanSet(o)) });
+                },
+                .pg_db_role_setting => for (&self.catalog_objects.items) |*o| if (o.kind == .role_settings and O.visible(o, snapshot)) {
+                    var array: Text = .{};
+                    var shape: array_module.Shape = .{ .element = .text, .ndim = 1 };
+                    shape.dims[0] = @popCount(o.flags);
+                    var writer = try V.Arrays.Writer.begin(&array, &shape);
+                    inline for (@typeInfo(CO.RoleBoolean).@"enum".field_names) |name| {
+                        const bit = @field(CO.RoleBoolean, name).bit();
+                        if (o.flags & bit != 0) {
+                            const cell = nameCell(if (o.grant_flags & bit != 0) name ++ "=on" else name ++ "=off");
+                            try writer.append(&cell);
+                        }
+                    }
+                    try sink.add(&.{ intCell(0), intCell(o.target), .{ .array = array } });
                 },
                 .pg_policy, .pg_policies => for (&self.catalog_objects.items) |*o| if (o.kind == .policy and O.visible(o, snapshot)) {
                     const command: CO.Command = @enumFromInt(@as(u8, @truncate(o.flags)));
@@ -6468,8 +6537,8 @@ pub fn Database(comptime config: Config) type {
             if (view == .pg_subscription) return;
             // bytea values are stored inline and do not create OID-addressed large objects.
             if (view == .pg_largeobject or view == .pg_largeobject_metadata) return;
-            // There are no security label providers or persistent role/database settings.
-            if (view == .pg_seclabel or view == .pg_shseclabel or view == .pg_seclabels or view == .pg_db_role_setting) return;
+            // There are no security label providers.
+            if (view == .pg_seclabel or view == .pg_shseclabel or view == .pg_seclabels) return;
             // Index comparisons use the store's typed comparator, with no
             // separately registered support-procedure routines.
             if (view == .pg_amproc) return;
@@ -6661,7 +6730,7 @@ pub fn Database(comptime config: Config) type {
                         try sink.add(&.{ intCell(object.oid + 1 + order), intCell(object.oid), .{ .float4 = @floatFromInt(order) }, nameCell(label) });
                     }
                 },
-                .pg_roles, .pg_authid, .pg_auth_members, .pg_policy, .pg_policies, .pg_description, .pg_shdescription, .pg_foreign_data_wrapper, .pg_foreign_server, .pg_publication, .pg_publication_rel, .pg_publication_namespace, .pg_statistic_ext, .pg_extension, .pg_tables, .table_privileges => return self.catalogObjectRows(session_values, snapshot, view, sink),
+                .pg_roles, .pg_authid, .pg_auth_members, .pg_db_role_setting, .pg_policy, .pg_policies, .pg_description, .pg_shdescription, .pg_foreign_data_wrapper, .pg_foreign_server, .pg_publication, .pg_publication_rel, .pg_publication_namespace, .pg_statistic_ext, .pg_extension, .pg_tables, .table_privileges => return self.catalogObjectRows(session_values, snapshot, view, sink),
                 .pg_namespace, .schemata => {
                     const include_acl = view == .pg_namespace and sink.referencesColumn(catalog_module.pg_namespace_acl_column);
                     for (catalog_module.namespaces) |namespace| {
@@ -9719,6 +9788,17 @@ pub fn Database(comptime config: Config) type {
             return if (value) "on" else "off";
         }
 
+        fn roleBoolean(values: *Sess.Values, setting: CO.RoleBoolean) *bool {
+            return switch (setting) {
+                .check_function_bodies => &values.check_function_bodies,
+                .quote_all_identifiers => &values.quote_all_identifiers,
+                .row_security => &values.row_security,
+                .synchronize_seqscans => &values.synchronize_seqscans,
+                .default_transaction_read_only => &values.read_only,
+                .default_transaction_deferrable => &values.deferrable,
+            };
+        }
+
         fn sessionState(self: *Self) *Sess.State {
             const state = self.session_state orelse &self.default_session_state;
             if (state.id == 0) {
@@ -9895,7 +9975,7 @@ pub fn Database(comptime config: Config) type {
             const values = state.values;
             for (setting_descriptors, 0..) |descriptor, index| {
                 const bit = @as(u8, 1) << @as(u3, @intCast(index));
-                const source: []const u8 = if (values.session_settings & bit != 0) "session" else if (values.client_settings & bit != 0) "client" else "default";
+                const source: []const u8 = if (values.session_settings & bit != 0) "session" else if (values.client_settings & bit != 0) "client" else if (values.role_settings & bit != 0) "user" else "default";
                 const enumvals: Cell = if (descriptor.kind == .default_transaction_isolation) try isolationNames() else .null_value;
                 try sink.add(&.{
                     try objectTextCell(@tagName(descriptor.kind)), try objectTextCell(engineSettingValue(&values, descriptor.kind).?), .null_value,
@@ -10129,6 +10209,7 @@ pub fn Database(comptime config: Config) type {
             const bit = settingOriginBit(which);
             into.client_settings = (into.client_settings & ~bit) | (source.client_settings & bit);
             into.session_settings = (into.session_settings & ~bit) | (source.session_settings & bit);
+            into.role_settings = (into.role_settings & ~bit) | (source.role_settings & bit);
         }
 
         /// SET [LOCAL] name {TO|=} value | DEFAULT, and set_config. `slot`
@@ -10323,7 +10404,8 @@ pub fn Database(comptime config: Config) type {
         pub fn sessionStartupSetting(self: *Self, name: []const u8, value: []const u8) Error!bool {
             const setting = settingKind(name) orelse return false;
             switch (setting) {
-                .check_function_bodies, .row_security, .synchronize_seqscans, .restrict_nonsystem_relation_kind, .quote_all_identifiers => {},
+                .check_function_bodies, .row_security, .synchronize_seqscans, .restrict_nonsystem_relation_kind, .quote_all_identifiers,
+                .default_transaction_read_only, .default_transaction_deferrable => {},
                 else => return false,
             }
             try self.setSetting(null, false, name, .string, value);
@@ -10331,9 +10413,31 @@ pub fn Database(comptime config: Config) type {
             const bit = settingOriginBit(setting);
             state.values.session_settings &= ~bit;
             state.values.client_settings |= bit;
+            inline for (@typeInfo(CO.RoleBoolean).@"enum".field_names) |field| {
+                if (setting == @field(SettingKind, field)) state.client_role_booleans |= @field(CO.RoleBoolean, field).bit();
+            }
             state.base = state.values;
             state.startup = state.values;
             return true;
+        }
+
+        /// Apply committed defaults once the PostgreSQL session's role is known.
+        /// Explicit startup options already in the state have higher priority.
+        pub fn applyRoleDefaults(self: *const Self, state: *Sess.State) void {
+            const key: O.Object = .{ .kind = .role_settings, .target = state.session_role };
+            const found = self.catalog_objects.findKey(&key, .{ .csn = self.csn }) orelse return;
+            const row = &self.catalog_objects.items[found];
+            const applicable = row.flags & ~state.client_role_booleans;
+            inline for (@typeInfo(CO.RoleBoolean).@"enum".field_names) |field| {
+                const setting = @field(CO.RoleBoolean, field);
+                const bit = setting.bit();
+                if (applicable & bit != 0) {
+                    roleBoolean(&state.values, setting).* = row.grant_flags & bit != 0;
+                    state.values.role_settings |= settingOriginBit(@field(SettingKind, field));
+                }
+            }
+            state.base = state.values;
+            state.startup = state.values;
         }
 
         pub fn sessionShow(self: *Self, slot: ?u16, name: []const u8, result: *Result) Error!void {
