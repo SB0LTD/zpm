@@ -277,17 +277,18 @@ pub fn Deparse(comptime config: types.Config) type {
                     }
                     try w.bytes(name);
                     try w.bytes("(");
+                    const infer_date_bin = types.same(name, "date_bin");
                     var item = n.b;
                     var first = true;
                     while (item != none) : (item = context.node(item).next) {
                         if (!first) try w.bytes(", ");
                         const argument = context.node(item);
-                        if (argument.kind == .text_literal and !argument.collate_clause) {
-                            // An unbound call argument has type unknown. Keep
-                            // its overload resolution when PostgreSQL reads
-                            // the expression back, instead of forcing TEXT.
+                        const nextval_literal = first and types.same(name, "nextval");
+                        // DATE_BIN arguments can infer interval or a timestamp
+                        // overload. Keep their original literal typing.
+                        if (argument.kind == .text_literal and (nextval_literal or (infer_date_bin and !argument.collate_clause))) {
                             try quotedLiteral(context, argument, w);
-                            if (first and types.same(name, "nextval")) try w.bytes("::regclass");
+                            if (nextval_literal) try w.bytes("::regclass");
                         } else try expression(context, item, w);
                         first = false;
                     }
