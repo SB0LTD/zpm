@@ -879,7 +879,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 var may_have_removed_pages = false;
                 for (&db.catalog_objects.items) |*object| {
                     if (object.kind != .large_object or !O.visible(object, snapshot)) continue;
-                    if ((catalog_overlay.largeObjectLength(object.target) orelse 0) < object.largeObjectLength()) {
+                    const after = catalog_overlay.largeObjectLength(object.target);
+                    if (after == null or after.? < object.largeObjectLength()) {
                         may_have_removed_pages = true;
                         break;
                     }
@@ -2327,8 +2328,13 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     },
                     @intFromEnum(Op.object_drop) => {
                         const key = try O.decodeDrop(record, &reader.position);
-                        if (key.kind == .large_object and (scratch.object_overlay.largeObjectLength(key.target) orelse 0) != 0)
-                            scratch.large_pages.audit = true;
+                        if (key.kind == .large_object) {
+                            if (db.large_pages) |*pages| {
+                                if ((scratch.object_overlay.largeObjectLength(key.target) orelse 0) != 0 or
+                                    pages.page(.{ .oid = key.target, .page = 0 }, .{ .csn = db.csn }) != null)
+                                    scratch.large_pages.audit = true;
+                            }
+                        }
                         try scratch.object_overlay.drop(&key);
                         check_schema_owners = check_schema_owners or key.kind == .role;
                     },

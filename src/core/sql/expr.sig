@@ -1464,6 +1464,14 @@ pub fn Eval(comptime config: types.Config) type {
                         return .{ .text = text };
                     },
                     .nextval, .currval, .setval, .lastval, .identity_next => return sequenceValue(ctx, n),
+                    .lo_truncate, .lo_truncate64 => {
+                        const descriptor = try eval(ctx, n.b);
+                        const length = try eval(ctx, node(ctx, n.b).next);
+                        if (descriptor == .null_value or length == .null_value) return .null_value;
+                        const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
+                        const call = hook.large_object_truncate orelse return error.UnsupportedStatement;
+                        return .{ .integer = try call(hook.ptr, @intCast(descriptor.integer), length.integer) };
+                    },
                     .lo_from_bytea, .lo_get => {
                         const a = try eval(ctx, n.b);
                         if (a == .null_value) return .null_value;

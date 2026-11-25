@@ -1389,7 +1389,7 @@ pub fn Database(comptime config: Config) type {
                 if(!describe_only) for(self.workspace.nodes.nodes[0..self.workspace.nodes.len]) |node| {
                     if (node.ty == .regproc or types.elementType(node.ty) == .regproc) return error.UnsupportedStatement;
                     switch(node.func) {
-                        .nextval,.currval,.setval,.lastval,.identity_next,.lo_create,.lo_creat,.lo_unlink,.lo_from_bytea,.lo_get=>return error.UnsupportedStatement,
+                        .nextval,.currval,.setval,.lastval,.identity_next,.lo_create,.lo_creat,.lo_unlink,.lo_from_bytea,.lo_get,.lo_truncate,.lo_truncate64=>return error.UnsupportedStatement,
                         // These catalog lookups use the serialized database hook.
                         .to_regclass,.regclass_in,.regclass_out,.pg_get_serial_sequence,.pg_table_is_visible,.pg_get_indexdef,.pg_get_constraintdef,.pg_get_triggerdef,.pg_get_viewdef,.pg_partition_ancestors,
                         .to_regnamespace,.regnamespace_in,.regnamespace_out,.to_regproc=>return error.UnsupportedStatement,
@@ -4122,6 +4122,7 @@ pub fn Database(comptime config: Config) type {
                     if (!args.wide and offset > 0x7fff_ffff) return error.NumericValueOutOfRange;
                     return if (args.wide) .{ .int8 = @intCast(offset) } else .{ .int4 = @intCast(offset) };
                 },
+                .truncate => |args| return .{ .int4 = try truncateLargeObject(self, args.fd, args.length) },
                 .from_bytes => |args| {
                     const count = try args.bytes.length();
                     const oid = try largeObjectCall(self, true, args.oid);
@@ -4225,12 +4226,53 @@ pub fn Database(comptime config: Config) type {
             return try pages.read(oid, length, at, output[0..@intCast(count)], snap);
         }
 
-        fn unlinkLargeObjectPages(self: *Self, slot: u16, oid: u32, original_snap: Snapshot, snap: Snapshot) Error!void {
+        fn truncateLargeObject(ptr: *anyopaque, fd: i32, length: i64) Error!i32 {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            const slot = self.seq_slot;
+            const tx = &self.txs[slot];
+            if (tx.read_only) return error.ReadOnlyTransaction;
+            const descriptor = tx.large_objects.find(fd) catch return error.UndefinedObject;
+            if (descriptor.snapshot != null) return error.ObjectNotInPrerequisiteState;
+            if (length < 0 or length > large_object_pages.max_size) return error.InvalidParameterValue;
+
+            var original_snap = self.seq_snap;
+            original_snap.csn = self.csn;
+            const snap = try largeObjectView(original_snap);
+            const oid = descriptor.oid;
+            const index = (try self.lockLargeObject(slot, oid, snap)) orelse return error.UndefinedObject;
+            const pages = if (self.large_pages) |*value| value else return error.UnsupportedStatement;
+            var object = self.catalog_objects.items[index];
+            const previous = object.largeObjectLength();
+            const end: u64 = @intCast(length);
+            const size = large_object_pages.page_bytes;
+            const key: large_object_pages.Key = .{ .oid = oid, .page = @intCast(end / size) };
+            const tail: usize = @intCast(end % size);
+            const before = pages.page(key, snap);
+            if (previous == end and before != null and before.?.len == tail) return 0;
+
+            // Authoritative EOF lives in the catalog. Match pg_largeobject's
+            // physical end marker as well, including at exact page boundaries.
+            try self.reserveWrites(slot, 3);
+            try object.setLargeObjectLength(end);
+            self.objectDelete(slot, index, original_snap);
+            _ = try self.objectInsert(slot, &object, false, original_snap);
+
+            var page: [size]u8 = undefined;
+            const prefix = if (before) |bytes| @min(bytes.len, tail) else 0;
+            if (prefix != 0) @memcpy(page[0..prefix], before.?[0..prefix]);
+            @memset(page[prefix..tail], 0);
+            const mutation = self.largePageMutation(slot, original_snap, snap);
+            self.addLargePageChange(slot, (try pages.stagePage(key, page[0..tail], mutation)).?);
+            if (end < previous) try self.removeLargeObjectPages(slot, oid, key.page, original_snap, snap);
+            return 0;
+        }
+
+        fn removeLargeObjectPages(self: *Self, slot: u16, oid: u32, keep_through: ?u32, original_snap: Snapshot, snap: Snapshot) Error!void {
             const pages = if (self.large_pages) |*value| value else return;
             const mutation = self.largePageMutation(slot, original_snap, snap);
             var cursor: large_object_pages.Pages.Cursor = .{};
             while (cursor.next(pages, snap)) |page| {
-                if (page.key.oid != oid) continue;
+                if (page.key.oid != oid or (keep_through != null and page.key.page <= keep_through.?)) continue;
                 try self.reserveWrites(slot, 1);
                 if (try pages.stagePage(page.key, null, mutation)) |change| self.addLargePageChange(slot, change);
             }
@@ -4276,7 +4318,10 @@ pub fn Database(comptime config: Config) type {
             for (&self.catalog_objects.items) |*entry| {
                 if (O.visible(entry, snap) and isLargeObjectChild(entry, oid)) writes += 1;
             }
-            if (self.catalog_objects.items[index].largeObjectLength() != 0) try self.unlinkLargeObjectPages(slot, oid, original_snap, snap);
+            if (self.large_pages) |*pages| {
+                if (self.catalog_objects.items[index].largeObjectLength() != 0 or pages.page(.{ .oid = oid, .page = 0 }, snap) != null)
+                    try self.removeLargeObjectPages(slot, oid, null, original_snap, snap);
+            }
             try self.reserveWrites(slot, writes);
             for (&self.catalog_objects.items, 0..) |*entry, child| {
                 if (O.visible(entry, snap) and isLargeObjectChild(entry, oid)) self.objectDelete(slot, child, original_snap);
@@ -9866,7 +9911,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn statementHooks(self: *Self, slot: u16, snap: Snapshot) void {
-            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .large_object = &largeObjectCall, .large_object_data = &largeObjectDataCall, .relation_name = &relationName, .relation_display_name = &relationDisplayName, .catalog_text = &catalogText, .schema_path = &catalogSchemaPath, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .view_definition = &postgresViewDefinition, .trigger_definition = &postgresTriggerDefinition, .statistics_columns = &postgresStatisticsColumns, .relation_publishable = &relationPublishable, .partition_key_definition = &postgresPartitionKey, .partition_ancestors = &postgresPartitionAncestors, .namespace_lookup = &postgresNamespaceLookup, .namespace_name = &postgresNamespaceName, .routine_lookup = &postgresRoutineLookup, .routine_name = &postgresRoutineName };
+            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .large_object = &largeObjectCall, .large_object_data = &largeObjectDataCall, .large_object_truncate = &truncateLargeObject, .relation_name = &relationName, .relation_display_name = &relationDisplayName, .catalog_text = &catalogText, .schema_path = &catalogSchemaPath, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .view_definition = &postgresViewDefinition, .trigger_definition = &postgresTriggerDefinition, .statistics_columns = &postgresStatisticsColumns, .relation_publishable = &relationPublishable, .partition_key_definition = &postgresPartitionKey, .partition_ancestors = &postgresPartitionAncestors, .namespace_lookup = &postgresNamespaceLookup, .namespace_name = &postgresNamespaceName, .routine_lookup = &postgresRoutineLookup, .routine_name = &postgresRoutineName };
             self.session.sequences = &self.seq_hook;
             self.seq_slot = slot;
             self.seq_snap = snap;
