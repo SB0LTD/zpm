@@ -15,7 +15,8 @@ references, the live large-object identity, and the generated OID
 high-water mark. Tests exercise duplicate OIDs, failed authorization,
 same-statement effects, savepoint rollback, competing creators, and
 malformed records. Native PostgreSQL 16.15 and 18.7 agree on the
-ownership transfer, ACL output, comments and unlink results.
+ownership transfer, ACL output, comments and unlink results. Duplicate
+explicit OIDs return 23505, matching the native metadata primary key.
 
 Page bytes still need a database-owned arena, transaction write-set
 entries, a WAL page-record validator, and checkpoint/export integration.

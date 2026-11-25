@@ -1609,9 +1609,9 @@ fn largeObjectMetadata() !void {
     try expect("SELECT oid,provolatile FROM pg_proc WHERE proname='lo_unlink'", "964|v");
     try same(try renderResult(DB, &(try replicate("SELECT pg_catalog.lo_create('55000')"))), "55000");
     try expect(snapshot, "55000|ramsql|NULL|NULL");
-    try fails("SELECT lo_create(55000)", error.DuplicateObject);
+    try fails("SELECT lo_create(55000)", error.PrimaryKeyViolation);
     try fails("SELECT lo_unlink(55001)", error.UndefinedObject);
-    try fails("SELECT lo_create(55001),lo_create(55001)", error.DuplicateObject);
+    try fails("SELECT lo_create(55001),lo_create(55001)", error.PrimaryKeyViolation);
     try expect("SELECT COUNT(*) FROM pg_largeobject_metadata WHERE oid=55001", "0");
 
     try run("GRANT SELECT ON LARGE OBJECT 55000 TO blobreader");
@@ -1661,6 +1661,9 @@ fn largeObjectMetadata() !void {
     try run("SELECT lo_unlink(lo_creat(-1))");
     try check(replica.oid_counter == db.oid_counter and replica.oid_counter > before_auto);
 
+    try run("SELECT lo_create('4294967295')");
+    try expect("SELECT oid FROM pg_largeobject_metadata WHERE oid='4294967295'", "4294967295");
+    try run("SELECT lo_unlink('4294967295')");
     try run("SELECT lo_create(CAST('tdd_b'::regclass AS oid))");
     try run("COMMENT ON LARGE OBJECT 55000 IS NULL");
     try run("DROP TABLE tdd_b");

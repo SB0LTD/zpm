@@ -3963,7 +3963,7 @@ pub fn Database(comptime config: Config) type {
                         if (self.catalog_objects.findKey(&key, latest) == null and
                             self.catalog_objects.pendingConflict(&key, snap) == null) break;
                     }
-                } else if (try self.lockLargeObject(slot, oid, snap) != null) return error.DuplicateObject;
+                } else if (try self.lockLargeObject(slot, oid, snap) != null) return error.PrimaryKeyViolation;
                 try self.reserveWrites(slot, 1);
                 var item: O.Object = .{
                     .kind = .large_object,
