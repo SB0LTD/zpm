@@ -633,7 +633,13 @@ pub const Adapter = struct {
                 // (the 3D engine's whole state at the run's first draw; a
                 // later one's own state alone, but each whole with serial_draws)
                 if (graphics == 1 or a.serial_draws) gl3d.emit(&p, &draw) else gl3d.emitNext(&p, &draw);
-                drawn.add(d, g);
+                // (a profiled run: the draw alone, done, its end stamped as
+                // a dispatch's is; the next draw starts on an idle engine)
+                if (s.profiled) {
+                    p.method(gl3dSubch(), WAIT_FOR_IDLE, &.{0});
+                    p.reportTimestamp(s.ends.va + i * 16, @intCast(i));
+                    a.barriers += 1;
+                } else drawn.add(d, g);
                 after_draw = true;
                 hz = .{};
                 a.draws += 1;

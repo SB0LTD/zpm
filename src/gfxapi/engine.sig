@@ -1473,6 +1473,14 @@ pub const Engine = struct {
     op_cpu: [MAX_OPS]?CpuOp = undefined,
     /// each op's draw through the graphics pipeline (Dispatch.graphics)
     op_gfx: [MAX_OPS]gpu.Graphics = undefined,
+    /// GPU profiling (a diagnosis): set, each batch is waited for after it
+    /// runs and each op's GPU time (its end less the one before's; a
+    /// draw's, alone on the 3D engine) handed to it with the op's tag,
+    /// `tag` when it was recorded (the caller's: a draw's programs, say).
+    gpu_prof: ?*const fn (tag: u32, ns: u64) void = null,
+    tag: u32 = 0,
+    op_tag: [MAX_OPS]u32 = undefined,
+    gpu_prof_on: bool = false,
     /// graphics dispatches in the open batch (Caps.max_graphics a run)
     n_gfx: u32 = 0,
     /// Draws go through the GPU's graphics pipeline where they may
@@ -1927,12 +1935,14 @@ pub const Engine = struct {
             e.freeImage(&blk);
             return false;
         }
-        e.fromVram(img);
+        e.moveVram(img, &blk);
         blk.top_down = img.top_down;
         blk.no_alpha = img.no_alpha;
         e.copy(img, 0, 0, &blk, 0, 0, img.width, img.height);
-        e.freeBytes(img.buf, img.pooled, img.lastBatch());
+        e.dropMemory(img);
         img.buf = blk.buf;
+        img.host = blk.host;
+        img.vram = blk.vram;
         img.stride = blk.stride;
         img.layout = blk.layout;
         img.track = blk.track;
@@ -1955,12 +1965,14 @@ pub const Engine = struct {
         // readers take its layout from the modifier)
         if (img.share != null or img.layered) return false;
         var rows = e.allocImage(img.width, img.height, img.format, true) orelse return false;
-        e.fromVram(img);
+        e.moveVram(img, &rows);
         rows.top_down = img.top_down;
         rows.no_alpha = img.no_alpha;
         e.copy(img, 0, 0, &rows, 0, 0, img.width, img.height);
-        e.freeBytes(img.buf, img.pooled, img.lastBatch());
+        e.dropMemory(img);
         img.buf = rows.buf;
+        img.host = rows.host;
+        img.vram = rows.vram;
         img.stride = rows.stride;
         img.pooled = rows.pooled;
         img.layout = .{};
@@ -1969,6 +1981,34 @@ pub const Engine = struct {
         e.stats.demoted += 1;
         e.sayRows(why);
         return true;
+    }
+
+    /// The image `img` moves into (promote, toRows: `fresh`, just made, its
+    /// pixels about to be copied from img on the GPU) in VRAM too, where
+    /// img is: render targets were made block linear in system memory at
+    /// their first depth-tested draw, and every full-screen pass of
+    /// Unigine Superposition's then read and wrote its G-buffer across the
+    /// bus (a pass 24 ms on the RTX). Its shadow, never written, is not
+    /// taken up to VRAM: the copy writes all of it.
+    fn moveVram(e: *Engine, img: *const Image, fresh: *Image) void {
+        if (img.vram == null) return;
+        e.toVram(fresh);
+        if (fresh.vram == null) return;
+        fresh.track.dirty_lo = 0;
+        fresh.track.dirty_hi = 0;
+    }
+
+    /// An image's memory (VRAM and its shadow, or its one buffer) freed
+    /// once the batches using it are done: promote's and toRows' old
+    /// memory, the image taking the new.
+    fn dropMemory(e: *Engine, img: *Image) void {
+        if (img.vram) |v| {
+            e.freeBytes(v, false, img.lastBatch());
+            e.freeBytes(img.host, false, img.lastBatch());
+            e.vram_count -|= 1;
+        } else e.freeBytes(img.buf, img.pooled, img.lastBatch());
+        img.vram = null;
+        img.host = .{};
     }
 
     fn sayRows(e: *Engine, why: []const u8) void {
@@ -2250,6 +2290,11 @@ pub const Engine = struct {
         const sum = &e.sums[e.batch % RING];
         sum.* = .{};
         for (e.ops[0..n]) |op| sum.add(op.prog, op.groups, 1);
+        if (e.gpu_prof != null and !e.gpu_prof_on) e.gpu_prof_on = d.profile(true);
+        if (e.gpu_prof == null and e.gpu_prof_on) {
+            _ = d.profile(false);
+            e.gpu_prof_on = false;
+        }
         const blocked = d.busy().blocked;
         const t0 = report.nowUs();
         const f = d.run(e.ops[0..n]) catch |err| {
@@ -2270,6 +2315,16 @@ pub const Engine = struct {
         e.batch += 1;
         e.stats.batches += 1;
         e.reap(false);
+        if (e.gpu_prof) |cb| if (e.gpu_prof_on) {
+            e.waitBatch(e.ran);
+            var ns: [MAX_OPS]u64 = undefined;
+            const got = d.dispatchNs(ns[0..n]);
+            var prev: u64 = 0;
+            for (ns[0..got], e.op_tag[0..got]) |t, tag| {
+                cb(tag, t -| prev);
+                prev = @max(prev, t);
+            }
+        };
     }
 
     /// Run what is recorded and wait until the GPU is done.
@@ -2449,6 +2504,7 @@ pub const Engine = struct {
         }
         @memcpy(e.op_params[i][0..params.len], params);
         e.ops[i] = .{ .prog = prog, .groups = groups, .buffers = e.op_bufs[i][0..bufs.len], .params = e.op_params[i][0..params.len] };
+        e.op_tag[i] = e.tag;
         e.op_cpu[i] = cpu;
         e.n_ops += 1;
         e.stats.dispatches += 1;
@@ -3651,6 +3707,7 @@ pub const Engine = struct {
         @memcpy(e.op_params[i][0..params.len], params);
         e.op_gfx[i] = g;
         e.ops[i] = .{ .prog = pixel, .groups = .{ 1, 1, 1 }, .buffers = e.op_bufs[i][0..bufs.len], .params = e.op_params[i][0..params.len], .graphics = &e.op_gfx[i] };
+        e.op_tag[i] = e.tag;
         e.op_cpu[i] = null;
         e.n_ops += 1;
         e.n_gfx += 1;
@@ -4602,6 +4659,7 @@ pub const Engine = struct {
         const p = [_]u32{ @intCast(soff), @intCast(doff), n, gx };
         @memcpy(e.op_params[i][0..p.len], &p);
         e.ops[i] = .{ .prog = &e.progs[@backingInt(Prog.words)], .groups = .{ gx, gy, 1 }, .buffers = e.op_bufs[i][0..2], .params = e.op_params[i][0..p.len] };
+        e.op_tag[i] = e.tag;
         e.op_cpu[i] = null;
         e.n_ops += 1;
         e.stats.dispatches += 1;
