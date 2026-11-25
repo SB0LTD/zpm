@@ -2437,7 +2437,7 @@ test "draw: depth- and stencil-tested draws into block-linear colour with a floa
 /// float depth image `depth`, then EQUAL (another quarter where the
 /// depth is the pass's own): all on the 3D engine or all on the compute
 /// raster, as `engine3d` says.
-fn slopedPasses(e: *engine.Engine, img: *engine.Image, depth: *engine.Image, ab: *engine.Image, pts: [4][2]f32, engine3d: bool) !void {
+fn slopedPasses(e: *engine.Engine, img: *engine.Image, depth: *engine.Image, ab: *engine.Image, pts: [4][2]f32, engine3d: bool, bias: [3]f32) !void {
     e.fill(img, img.bounds(), 0, 0);
     e.fillDepth(depth, depth.bounds(), 1.0, 0, 0xff);
     var verts: [6][4]f32 = undefined;
@@ -2455,6 +2455,9 @@ fn slopedPasses(e: *engine.Engine, img: *engine.Image, depth: *engine.Image, ab:
         const before = e.stats.graphics_draws;
         var d = raster.Draw{ .pipe = &solid, .color = img, .depth = depth, .depth_test = true, .depth_write = pass == 0, .depth_func = if (pass == 0) 0b001 else 0b010, .rect = .{ .x0 = 0, .y0 = 0, .x1 = W, .y1 = H }, .count = 6, .center = .{ W / 2, H / 2 }, .half = .{ W / 2, H / 2 }, .uniforms = &quarter, .blend = add };
         d.attrs[0] = .{ .buf = ab, .stride = 16, .comps = 4 };
+        d.bias_factor = bias[0];
+        d.bias_units = bias[1];
+        d.bias_clamp = bias[2];
         if (!e.draw(&d)) return error.NotDrawn;
         e.finish();
         if (e.lost or e.why_pipe != null) return error.EngineLost;
@@ -2603,11 +2606,109 @@ test "draw: colour targets of both layouts (a block-linear target 0, targets of 
     }
 }
 
+test "draw: float colour targets (RGBA32F, R32F: Direct3D's float targets) beside a depth image go to the RTX's 3D engine, made block linear, cleared word by word, written unclamped and blended in floats; off the 3D engine they are not drawn" {
+    Rtx3d.engine3d = .{};
+    Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+    Rtx.dev.withEngine(&Rtx3d.engine3d);
+    eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs, .graphics = true });
+    defer eng_rtx.deinit();
+    defer eng_rtx.unloadPipeline(&mrt_pipe);
+    const e = &eng_rtx;
+    var t0 = e.newImage(W, H, .rgba32f) orelse return error.OutOfMemory;
+    defer e.freeImage(&t0);
+    var t1 = e.newImage(W, H, .r32f) orelse return error.OutOfMemory;
+    defer e.freeImage(&t1);
+    var zd = e.newImageSamples(W, H, .d24s8, 1) orelse return error.OutOfMemory;
+    defer e.freeImage(&zd);
+    var ab = e.newBuffer(12 * 16) orelse return error.OutOfMemory;
+    defer e.freeImage(&ab);
+    // (rows first, then block linear in Turing2D's GOBs, as galaxy-pe's
+    // depth-tested draws make them)
+    try std.testing.expect(e.promote(&t0));
+    try std.testing.expect(e.promote(&t1));
+    try std.testing.expect(t0.layout.block and t1.layout.block and t0.layout.swizzle == .turing2d);
+    const f = struct {
+        fn w(x: f32) u32 {
+            return @bitCast(x);
+        }
+    }.w;
+    e.fillWords(&t0, t0.bounds(), .{ f(0.5), f(-1), f(2), f(1) });
+    e.fillWords(&t1, t1.bounds(), .{ f(3), 0, 0, 0 });
+    e.fillDepth(&zd, zd.bounds(), 1.0, 0, 0xff);
+    const add = raster.Blend{ .dst_rgb = .{ .c = .{ 1, 1, 1, 1 } }, .dst_a = .{ .c = .{ 1, 1, 1, 1 } }, .gl = .{ g.ONE, g.ONE, g.ONE, g.ONE } };
+    const col = rgba(.{ 4, -2, 0.5, 1 });
+    const before = e.stats.graphics_draws;
+    const computed = e.stats.compute_draws;
+    var d = raster.Draw{ .pipe = &mrt_pipe, .color = &t0, .depth = &zd, .depth_test = true, .depth_write = true, .depth_func = 0b001, .uniforms = &col, .blend = add };
+    d.targets[1] = .{ .img = &t1 };
+    const q = fullQuad(0);
+    featDraw(e, d, &ab, &q) catch |err| {
+        std.debug.print("float targets: {s}; the 3D engine: {s}\n", .{ @errorName(err), Rtx3d.engine3d.why });
+        return err;
+    };
+    if (e.stats.graphics_draws - before != 1 or e.stats.compute_draws != computed) {
+        for (e.said_compute) |w| if (w.len != 0) std.debug.print("float targets: on the compute kernels: {s}\n", .{w});
+        return error.WrongRasterizer;
+    }
+    var p0: [W * H * 4]f32 = undefined;
+    var p1: [W * H]f32 = undefined;
+    e.read(&t0, 0, 0, W, H, std.mem.sliceAsBytes(&p0), W * 16, .rgba32f);
+    e.read(&t1, 0, 0, W, H, std.mem.sliceAsBytes(&p1), W * 4, .r32f);
+    // every pixel: the fill plus the colour, past 0..1; target 1 the
+    // fill plus x / 64 at the pixel's centre
+    for (0..H) |y| for (0..W) |x| {
+        const at = y * W + x;
+        try std.testing.expectEqualSlices(f32, &.{ 4.5, -3, 2.5, 2 }, p0[at * 4 ..][0..4]);
+        try std.testing.expectEqual(@as(f32, 3) + (@as(f32, @floatFromInt(x)) + 0.5) / 64, p1[at]);
+    };
+    // off the 3D engine: not drawn (the compute raster writes 8-bit
+    // pixels), counted, the target as it was
+    e.compute_only = true;
+    defer e.compute_only = false;
+    const not_drawn = e.stats.float_not_drawn;
+    try featDraw(e, d, &ab, &q);
+    try std.testing.expectEqual(not_drawn + 1, e.stats.float_not_drawn);
+    e.read(&t0, 0, 0, W, H, std.mem.sliceAsBytes(&p0), W * 16, .rgba32f);
+    try std.testing.expectEqualSlices(f32, &.{ 4.5, -3, 2.5, 2 }, p0[0..4]);
+}
+
 /// The RTX's compiler, but a tile kernel (gl_raster...) too big for it, as
 /// a large program's is (kir_sm120's MAX_INSTS): those draws run on the CPU.
 fn noRaster(k: *const gpu.kir.Kernel, caps: gpu.Caps, work: *gpu.Work, out: []u8) anyerror!gpu.Binary {
     if (std.mem.startsWith(u8, k.name, "gl_raster")) return error.TooBig;
     return engine.compileAny(k, caps, work, out);
+}
+
+test "draw: a layered texture (its layers in one memory) is never made block linear: promote would copy its first layer and free the rest" {
+    Rtx3d.engine3d = .{};
+    Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+    Rtx.dev.withEngine(&Rtx3d.engine3d);
+    eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs, .graphics = true });
+    defer eng_rtx.deinit();
+    const e = &eng_rtx;
+    // two layers of RGBA32F, W x H each, one after the other (as
+    // galaxy-pe's and gles' layered textures are)
+    const plane: usize = W * H * 16;
+    var img = e.newBuffer(2 * plane) orelse return error.OutOfMemory;
+    defer e.freeImage(&img);
+    img.width = W;
+    img.height = H;
+    img.stride = W * 16;
+    img.format = .rgba32f;
+    img.levels = 1;
+    img.layered = true;
+    @memset(img.buf.cpu[plane..][0..16], 0x5a);
+    const before = img.buf;
+    try std.testing.expect(e.promoteWhyNot(&img, "") != null);
+    try std.testing.expect(!e.promote(&img));
+    try std.testing.expect(img.layout.linear());
+    try std.testing.expectEqual(before.gpu, img.buf.gpu);
+    try std.testing.expectEqual(2 * plane, img.buf.cpu.len);
+    try std.testing.expectEqual(@as(u8, 0x5a), img.buf.cpu[plane]);
+    // the same image as one layer's alone moves
+    var one = e.newImage(W, H, .rgba32f) orelse return error.OutOfMemory;
+    defer e.freeImage(&one);
+    try std.testing.expect(e.promote(&one));
 }
 
 test "draw: draws whose tile kernel is too big for the GPU run on the CPU and leave a block-linear target block linear: the CPU's kernels take its layout" {
@@ -2698,7 +2799,7 @@ test "draw: the compute raster's float depth is the 3D engine's within 3 ulps (p
         for (&zd) |*z| z.top_down = top_down;
         for (shapes, 0..) |s, si| {
             for (0..2) |n| {
-                slopedPasses(e, &img, &zd[n], &ab, s, n == 1) catch |err| {
+                slopedPasses(e, &img, &zd[n], &ab, s, n == 1, .{ 0, 0, 0 }) catch |err| {
                     std.debug.print("float depth ulps: shape {d} (top down {}, engine {}): {s}; the 3D engine: {s}\n", .{ si, top_down, n == 1, @errorName(err), Rtx3d.engine3d.why });
                     if (e.why_pipe) |w| std.debug.print("float depth ulps: the engine's pipeline: {s}, lost {}\n", .{ @errorName(w), e.lost });
                     return err;
@@ -2729,6 +2830,132 @@ test "draw: the compute raster's float depth is the 3D engine's within 3 ulps (p
             std.debug.print("float depth ulps: shape {d} (top down {}): {d} pixels apart, at most {d} ulps\n", .{ si, top_down, differ, most });
             try std.testing.expect(most <= 3);
         }
+    }
+}
+
+/// A quad whose depths run past both ends of the window's 0 .. 1 (Direct3D's
+/// depth mapping: window depth = NDC depth), drawn depth only with ALWAYS
+/// into `depth` cleared to 0.5, its depth clipped or clamped
+/// (Draw.depth_clamp); on the 3D engine or the compute raster.
+fn clampPass(e: *engine.Engine, depth: *engine.Image, ab: *engine.Image, engine3d: bool, clamp: bool) !void {
+    e.fillDepth(depth, depth.bounds(), 0.5, 0, 0xff);
+    const pts = [4][2]f32{ .{ 5.37, 3.11 }, .{ 58.93, 6.71 }, .{ 52.18, 29.42 }, .{ 9.66, 26.05 } };
+    const zs = [4]f32{ -0.6, 0.4, 1.7, 0.2 };
+    const tris = [2][3]usize{ .{ 0, 1, 2 }, .{ 0, 2, 3 } };
+    var verts: [6][4]f32 = undefined;
+    for (tris, 0..) |t, n| {
+        for (t, 0..) |c, j| verts[n * 3 + j] = .{ nx(pts[c][0], W), nx(pts[c][1], H), zs[c], 1 };
+    }
+    e.writeBytes(ab, 0, std.mem.sliceAsBytes(&verts));
+    const quarter = [_]u32{ @bitCast(@as(f32, 0.25)), 0, 0, 0 };
+    e.compute_only = !engine3d;
+    defer e.compute_only = false;
+    const before = e.stats.graphics_draws;
+    var d = raster.Draw{ .pipe = &solid, .color = depth, .color_off = true, .depth = depth, .depth_test = true, .depth_write = true, .depth_func = 0b111, .rect = .{ .x0 = 0, .y0 = 0, .x1 = W, .y1 = H }, .count = 6, .center = .{ W / 2, H / 2 }, .half = .{ W / 2, H / 2 }, .depth_scale = 1, .depth_bias = 0, .uniforms = &quarter, .depth_clamp = clamp };
+    d.attrs[0] = .{ .buf = ab, .stride = 16, .comps = 4 };
+    if (!e.draw(&d)) return error.NotDrawn;
+    e.finish();
+    if (e.lost or e.why_pipe != null) return error.EngineLost;
+    if (e.stats.graphics_draws - before != @intFromBool(engine3d)) {
+        for (e.said_compute) |w| if (w.len != 0) std.debug.print("clamp pass: on the compute kernels: {s}\n", .{w});
+        return error.WrongRasterizer;
+    }
+}
+
+test "draw: a depth clamp (Direct3D's DepthClipEnable off, a sun's shadow map's) on the RTX's 3D engine: the depths past 0 .. 1 kept clamped, as the compute raster keeps them; clipped without it" {
+    Rtx3d.engine3d = .{};
+    Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+    Rtx.dev.withEngine(&Rtx3d.engine3d);
+    eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs, .graphics = true });
+    defer eng_rtx.deinit();
+    defer eng_rtx.unloadPipeline(&solid);
+    const e = &eng_rtx;
+    var zd: [2]engine.Image = undefined;
+    for (&zd) |*z| z.* = e.newImageSamples(W, H, .d24s8, 1) orelse return error.OutOfMemory;
+    defer for (&zd) |*z| e.freeImage(z);
+    var ab = e.newBuffer(6 * 16) orelse return error.OutOfMemory;
+    defer e.freeImage(&ab);
+    var words: [2][W * H]u32 = undefined;
+    const half: u32 = @bitCast(@as(f32, 0.5));
+    const zero: u32 = 0;
+    const one: u32 = @bitCast(@as(f32, 1.0));
+    var counts: [2][3]u32 = undefined;
+    for ([_]bool{ false, true }, 0..) |clamp, ci| {
+        for (0..2) |n| {
+            clampPass(e, &zd[n], &ab, n == 1, clamp) catch |err| {
+                std.debug.print("depth clamp {} (engine {}): {s}; the 3D engine: {s}\n", .{ clamp, n == 1, @errorName(err), Rtx3d.engine3d.why });
+                return err;
+            };
+            e.readDepthBits(&zd[n], 0, 0, W, H, &words[n], null);
+        }
+        // the same depths on both rasterizers
+        try std.testing.expectEqualSlices(u32, &words[0], &words[1]);
+        // written, clamped to 0 and to 1 (none without the clamp)
+        var c = [3]u32{ 0, 0, 0 };
+        for (words[1]) |w| {
+            c[0] += @intFromBool(w != half);
+            c[1] += @intFromBool(w == zero);
+            c[2] += @intFromBool(w == one);
+        }
+        counts[ci] = c;
+    }
+    std.debug.print("depth clamp: clipped {d} written, clamped {d} written ({d} at 0, {d} at 1)\n", .{ counts[0][0], counts[1][0], counts[1][1], counts[1][2] });
+    try std.testing.expectEqual(@as(u32, 0), counts[0][1] + counts[0][2]);
+    try std.testing.expect(counts[1][1] > 20 and counts[1][2] > 20);
+    try std.testing.expect(counts[1][0] > counts[0][0] + 40);
+}
+
+test "draw: depth bias (a slope's factor, units, a clamp of either sign) on the RTX's 3D engine: the compute raster's biased float depths within 3 ulps, the same pixels; each path's EQUAL pass meets its own biased LESS pass" {
+    Rtx3d.engine3d = .{};
+    Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+    Rtx.dev.withEngine(&Rtx3d.engine3d);
+    eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs, .graphics = true });
+    defer eng_rtx.deinit();
+    defer eng_rtx.unloadPipeline(&solid);
+    const e = &eng_rtx;
+    var img = e.newBlockImage(W, H, .rgba8) orelse return error.OutOfMemory;
+    defer e.freeImage(&img);
+    var zd: [2]engine.Image = undefined;
+    for (&zd) |*z| z.* = e.newImageSamples(W, H, .d24s8, 1) orelse return error.OutOfMemory;
+    defer for (&zd) |*z| e.freeImage(z);
+    var ab = e.newBuffer(6 * 16) orelse return error.OutOfMemory;
+    defer e.freeImage(&ab);
+    const shape = [4][2]f32{ .{ 5.37, 3.11 }, .{ 58.93, 6.71 }, .{ 52.18, 29.42 }, .{ 9.66, 26.05 } };
+    // (units alone, a slope's factor with units, each clamped: a clamp
+    // that bites (under the raw offset) and a negative bias's)
+    const biases = [_][3]f32{ .{ 0, 4000, 0 }, .{ 1.5, 400, 0 }, .{ 2.5, 60000, 0.004 }, .{ -1, -3000, -0.0001 } };
+    var words: [2][W * H]u32 = undefined;
+    var plain: [W * H]u32 = undefined;
+    var pic: [W * H * 4]u8 = undefined;
+    const one: u32 = @bitCast(@as(f32, 1.0));
+    try slopedPasses(e, &img, &zd[0], &ab, shape, false, .{ 0, 0, 0 });
+    e.readDepthBits(&zd[0], 0, 0, W, H, &plain, null);
+    for (biases, 0..) |b, bi| {
+        for (0..2) |n| {
+            slopedPasses(e, &img, &zd[n], &ab, shape, n == 1, b) catch |err| {
+                std.debug.print("depth bias {d} (engine {}): {s}; the 3D engine: {s}\n", .{ bi, n == 1, @errorName(err), Rtx3d.engine3d.why });
+                return err;
+            };
+            e.readDepthBits(&zd[n], 0, 0, W, H, &words[n], null);
+            e.read(&img, 0, 0, W, H, &pic, W * 4, .rgba8);
+            for (0..W * H) |p| {
+                if (words[n][p] == one) continue;
+                try std.testing.expectEqual(@as(u32, 2), hits(pic[p * 4]));
+            }
+        }
+        var most: u32 = 0;
+        var moved: u32 = 0;
+        for (0..W * H) |p| {
+            const a = words[0][p];
+            const c = words[1][p];
+            try std.testing.expectEqual(a == one, c == one);
+            const ulps = if (a > c) a - c else c - a;
+            most = @max(most, ulps);
+            moved += @intFromBool(a != one and a != plain[p]);
+        }
+        std.debug.print("depth bias {d}: at most {d} ulps apart, {d} pixels moved by it\n", .{ bi, most, moved });
+        try std.testing.expect(most <= 3);
+        try std.testing.expect(moved > 100);
     }
 }
 
@@ -3335,7 +3562,7 @@ const d3d = struct {
     }
 };
 
-test "Direct3D's frame through the emulated RTX's 3D engine: textured B8G8R8A8 draws batched (their uniforms in the ring, the draws overlapping), the target read back as begun and finished: the CPU's pixels" {
+test "Direct3D's frame through the emulated RTX's 3D engine: textured B8G8R8A8 draws batched, sampled through its texture unit (their uniforms in the ring, the draws overlapping), the target read back as begun and finished: the CPU's pixels" {
     var want: [d3d.FW * d3d.FH * 4]u8 = undefined;
     var want2: [d3d.FW * d3d.FH * 4]u8 = undefined;
     d3d.cpu_eng.init(.{ .pool = &d3d.cpu_pool, .cpu_work = &cpu_work });
@@ -3359,8 +3586,254 @@ test "Direct3D's frame through the emulated RTX's 3D engine: textured B8G8R8A8 d
     for (eng_rtx.said_compute) |w| if (w.len != 0) std.debug.print("Direct3D frame: on the compute kernels: {s}\n", .{w});
     try std.testing.expectEqual(@as(u64, d3d.DRAWS), s.graphics_draws);
     try std.testing.expectEqual(@as(u64, 0), s.compute_draws);
+    // (their textures through the RTX's texture unit: TEX.B.LZ, the
+    // emulated unit's taps and filter texture.sig's, the CPU's bytes)
+    try std.testing.expectEqual(@as(u64, d3d.DRAWS), s.tex_unit_draws);
+    try std.testing.expectEqual(@as(u64, 0), s.tex_soft_draws);
     // (one run for the draws: they and the reads wait for the GPU once each)
     try std.testing.expect(eng_rtx.uni_ring.cpu.len != 0);
     try std.testing.expectEqual(@as(u32, 0), apart(&want, &got, d3d.FW, 0, "Direct3D frame: the CPU against the RTX (read)"));
     try std.testing.expectEqual(@as(u32, 0), apart(&want, &got2, d3d.FW, 0, "Direct3D frame: the CPU against the RTX (readStart, readFinish)"));
+}
+
+/// Direct3D's samples the RTX's texture unit takes beside the plain 2D
+/// one (d3d's frame): a 2D array's comparisons, one at a texel offset
+/// (Unigine's cascaded shadows: sample_c_lz, aoffimmi), and a mipmapped
+/// texture at a level between two (sample_l: the levels' blend in the
+/// program, each level's bilinear in the unit), and a texel of its second
+/// level fetched at an offset (ld_aoffimmi: TLD), and a cube map across a
+/// face's edges (each tap a texel fetched on its face, the filter the
+/// program's).
+const unit = struct {
+    const gen = gfxapi.dxbc_gen;
+    const fx = gfxapi.dxbc_fixtures;
+    const texture = gfxapi.texture;
+    const FW = 32;
+    const FH = 32;
+    const CB_WORDS = 20;
+    const DVert = extern struct { pos: [3]f32, color: [4]f32 };
+
+    fn varying(_: ?*const anyopaque, name: []const u8, index: u32) ?u32 {
+        if (std.ascii.eqlIgnoreCase(name, "COLOR") and index == 0) return 0;
+        return null;
+    }
+    fn cbuffer(_: ?*const anyopaque, slot: u32) ?gen.CBuffer {
+        return if (slot == 0) .{ .word = 0, .vecs = 5 } else null;
+    }
+    fn tex(_: ?*const anyopaque, t: u32, smp: u32) ?u32 {
+        if (t == 0 and (smp == 0 or smp == gen.NO_SAMPLER)) return 0;
+        if (t == 1 and (smp == 1 or smp == gen.NO_SAMPLER)) return 1;
+        if (t == 2 and (smp == 1 or smp == gen.NO_SAMPLER)) return 2;
+        return null;
+    }
+    var log: gen.Log = .{};
+    var pair: gen.Pair = undefined;
+    var pipe: raster.Pipeline = undefined;
+    var cpu_eng: engine.Engine = undefined;
+    var cpu_pool: [4 << 20]u8 align(64) = undefined;
+
+    /// An image of `layers` layers of one level, each after the one before
+    /// (as galaxy-pe's and GL's layered textures), rows on the engine's
+    /// alignment.
+    fn layered(e: *engine.Engine, w: u32, h: u32, f: engine.Format, layers: u32) ?engine.Image {
+        const ra = e.rowAlign();
+        const stride = std.mem.alignForward(u32, w * f.bytes(), ra);
+        var img = e.newBuffer(@as(usize, stride) * h * layers) orelse return null;
+        img.width = w;
+        img.height = h;
+        img.stride = stride;
+        img.format = f;
+        img.row_align = ra;
+        img.layered = true;
+        return img;
+    }
+
+    fn frame(e: *engine.Engine, out: *[FW * FH * 4]u8) !void {
+        pair = .{ .vs = &fx.vs40, .ps = &fx.ps_unit, .lay = .{ .varying = varying, .cbuffer = cbuffer, .texture = tex, .desc_base = CB_WORDS }, .log = &log };
+        pipe = raster.Pipeline.init(pair.shaders(2, 4, 3));
+        defer e.unloadPipeline(&pipe);
+        var target = e.newImage(FW, FH, .bgra8) orelse return error.OutOfMemory;
+        defer e.freeImage(&target);
+        // the shadow maps: 8 x 8 floats, three layers, a ramp across each
+        // (layer z: x / 8 + z / 4)
+        var shadow = layered(e, 8, 8, .r32f, 3) orelse return error.OutOfMemory;
+        defer e.freeImage(&shadow);
+        for (0..3) |z| for (0..8) |y| {
+            var row: [8]f32 = undefined;
+            for (&row, 0..) |*texel_v, x| texel_v.* = @as(f32, @floatFromInt(x)) / 8 + @as(f32, @floatFromInt(z)) / 4 - @as(f32, @floatFromInt(y)) / 32;
+            e.writeBytes(&shadow, (z * 8 + y) * shadow.stride, std.mem.asBytes(&row));
+        };
+        // the mipmapped texture: 8 x 8 RGBA8, four levels, each its colours
+        var mipped = e.newImageChain(8, 8, .rgba8, 4) orelse return error.OutOfMemory;
+        defer e.freeImage(&mipped);
+        for (0..4) |l| {
+            const lv: u32 = @intCast(l);
+            const w = mipped.levelWidth(lv);
+            for (0..mipped.levelHeight(lv)) |y| {
+                var row: [32]u8 = undefined;
+                for (0..w) |x| row[x * 4 ..][0..4].* = .{ @intCast(30 * l), @intCast(20 * x + 60 * l), @intCast(25 * y + 9 * l), 255 };
+                e.writeBytes(&mipped, mipped.level_at[l] + y * mipped.levelStride(lv), row[0 .. w * 4]);
+            }
+        }
+        // the cube: 4 x 4 RGBA8, its six faces, each its colours
+        var sky = layered(e, 4, 4, .rgba8, 6) orelse return error.OutOfMemory;
+        defer e.freeImage(&sky);
+        for (0..6) |face| for (0..4) |y| {
+            var row: [16]u8 = undefined;
+            for (0..4) |x| row[x * 4 ..][0..4].* = .{ @intCast(40 * face + 10 * x), @intCast(60 * y), @intCast(200 - 30 * face), 255 };
+            e.writeBytes(&sky, (face * 4 + y) * sky.stride, &row);
+        };
+        e.fill(&target, target.bounds(), 0xff20_4060, 0);
+        // the quad: the colour's x and y the coordinates, 0 .. 1 across
+        const q = [6][2]f32{ .{ -1, -1 }, .{ 1, -1 }, .{ -1, 1 }, .{ 1, -1 }, .{ 1, 1 }, .{ -1, 1 } };
+        var verts: [6]DVert = undefined;
+        for (q, 0..) |pt, j| verts[j] = .{ .pos = .{ pt[0], pt[1], 0.5 }, .color = .{ (pt[0] + 1) / 2, (pt[1] + 1) / 2, 0, 1 } };
+        var vb = e.newBuffer(@sizeOf(@TypeOf(verts))) orelse return error.OutOfMemory;
+        defer e.freeImage(&vb);
+        e.writeBytes(&vb, 0, std.mem.asBytes(&verts));
+        var u: [CB_WORDS + 3 * texture.DESC_WORDS]u32 = @splat(0);
+        for (0..4) |i| u[i * 4 + i] = @bitCast(@as(f32, 1));
+        for (0..4) |c| u[16 + c] = @bitCast(@as(f32, 1));
+        // (LEQUAL: the reference at or below the texel's depth passes)
+        var dw: [texture.DESC_WORDS]u32 = undefined;
+        texture.descriptor(.{ .img = &shadow, .layers = 3, .wrap_s = .clamp, .wrap_t = .clamp, .compare = 0b011, .linear = true, .min_linear = true }, &dw);
+        @memcpy(u[CB_WORDS..][0..texture.DESC_WORDS], &dw);
+        texture.descriptor(.{ .img = &mipped, .wrap_s = .repeat, .wrap_t = .mirror, .linear = true, .min_linear = true, .mip = .linear, .last = 3 }, &dw);
+        @memcpy(u[CB_WORDS + texture.DESC_WORDS ..][0..texture.DESC_WORDS], &dw);
+        texture.descriptor(.{ .img = &sky, .layers = 6, .linear = true, .min_linear = true }, &dw);
+        @memcpy(u[CB_WORDS + 2 * texture.DESC_WORDS ..][0..texture.DESC_WORDS], &dw);
+        var dr = raster.Draw{
+            .pipe = &pipe,
+            .color = &target,
+            .count = 6,
+            .center = .{ FW / 2, FH / 2 },
+            .half = .{ FW / 2, FH / 2 },
+            .rect = target.bounds(),
+            .uniforms = &u,
+        };
+        dr.attrs[0] = .{ .buf = &vb, .offset = 0, .stride = @sizeOf(DVert), .comps = 3 };
+        dr.attrs[1] = .{ .buf = &vb, .offset = 12, .stride = @sizeOf(DVert), .comps = 4 };
+        dr.textures[0] = &shadow;
+        dr.textures[1] = &mipped;
+        dr.textures[2] = &sky;
+        if (!e.draw(&dr)) return error.DrawRefused;
+        if (log.len != 0) {
+            std.debug.print("{s}\n", .{log.text()});
+            return error.Generation;
+        }
+        e.read(&target, 0, 0, FW, FH, out, FW * 4, .bgra8);
+        e.finish();
+    }
+
+    /// ps_grad's frame: an 8 x 8 texture of four levels, each level's red
+    /// 30 times its number, repeated 16 times across the target (four
+    /// texels a pixel: level 2, red 60), sampled with implicit levels in
+    /// straight code (red) and under an if (green).
+    fn gradFrame(e: *engine.Engine, out: *[FW * FH * 4]u8) !void {
+        pair = .{ .vs = &fx.vs40, .ps = &fx.ps_grad, .lay = .{ .varying = varying, .cbuffer = cbuffer, .texture = tex, .desc_base = CB_WORDS }, .log = &log };
+        pipe = raster.Pipeline.init(pair.shaders(2, 4, 3));
+        defer e.unloadPipeline(&pipe);
+        var target = e.newImage(FW, FH, .bgra8) orelse return error.OutOfMemory;
+        defer e.freeImage(&target);
+        var mipped = e.newImageChain(8, 8, .rgba8, 4) orelse return error.OutOfMemory;
+        defer e.freeImage(&mipped);
+        for (0..4) |l| {
+            const lv: u32 = @intCast(l);
+            const w = mipped.levelWidth(lv);
+            for (0..mipped.levelHeight(lv)) |y| {
+                var row: [32]u8 = undefined;
+                for (0..w) |x| row[x * 4 ..][0..4].* = .{ @intCast(30 * l), @intCast(20 * x), @intCast(25 * y), 255 };
+                e.writeBytes(&mipped, mipped.level_at[l] + y * mipped.levelStride(lv), row[0 .. w * 4]);
+            }
+        }
+        e.fill(&target, target.bounds(), 0xff20_4060, 0);
+        const q = [6][2]f32{ .{ -1, -1 }, .{ 1, -1 }, .{ -1, 1 }, .{ 1, -1 }, .{ 1, 1 }, .{ -1, 1 } };
+        var verts: [6]DVert = undefined;
+        for (q, 0..) |pt, j| verts[j] = .{ .pos = .{ pt[0], pt[1], 0.5 }, .color = .{ (pt[0] + 1) / 2, (pt[1] + 1) / 2, 0, 1 } };
+        var vb = e.newBuffer(@sizeOf(@TypeOf(verts))) orelse return error.OutOfMemory;
+        defer e.freeImage(&vb);
+        e.writeBytes(&vb, 0, std.mem.asBytes(&verts));
+        var u: [CB_WORDS + 3 * texture.DESC_WORDS]u32 = @splat(0);
+        for (0..4) |i| u[i * 4 + i] = @bitCast(@as(f32, 1));
+        // (tint.w 1: the if taken by every quad)
+        for (0..4) |c| u[16 + c] = @bitCast(@as(f32, 1));
+        var dw: [texture.DESC_WORDS]u32 = undefined;
+        texture.descriptor(.{ .img = &mipped, .linear = true, .min_linear = true, .mip = .linear, .last = 3 }, &dw);
+        @memcpy(u[CB_WORDS + texture.DESC_WORDS ..][0..texture.DESC_WORDS], &dw);
+        var dr = raster.Draw{ .pipe = &pipe, .color = &target, .count = 6, .center = .{ FW / 2, FH / 2 }, .half = .{ FW / 2, FH / 2 }, .rect = target.bounds(), .uniforms = &u };
+        dr.attrs[0] = .{ .buf = &vb, .offset = 0, .stride = @sizeOf(DVert), .comps = 3 };
+        dr.attrs[1] = .{ .buf = &vb, .offset = 12, .stride = @sizeOf(DVert), .comps = 4 };
+        dr.textures[1] = &mipped;
+        if (!e.draw(&dr)) return error.DrawRefused;
+        if (log.len != 0) {
+            std.debug.print("{s}\n", .{log.text()});
+            return error.Generation;
+        }
+        e.read(&target, 0, 0, FW, FH, out, FW * 4, .bgra8);
+        e.finish();
+    }
+
+    /// Pixels whose red or green (ps_grad's two samples) is not level 2's
+    /// red, 60, within a step.
+    fn notLevel2(pix: *const [FW * FH * 4]u8, what: []const u8) u32 {
+        var bad: u32 = 0;
+        for (0..FW * FH) |i| {
+            const red = pix[i * 4 + 2];
+            const green = pix[i * 4 + 1];
+            if (@abs(@as(i32, red) - 60) > 1 or @abs(@as(i32, green) - 60) > 1) {
+                if (bad < 4) std.debug.print("{s}: pixel ({d},{d}): straight {d}, under the if {d} (level 2's 60)\n", .{ what, i % FW, i / FW, red, green });
+                bad += 1;
+            }
+        }
+        return bad;
+    }
+};
+
+test "Direct3D's implicit levels of detail, in straight code and under an if every quad takes, on the CPU and through the emulated RTX's 3D engine (its quads' lanes 1 and 2): the level the derivatives say, both" {
+    var want: [unit.FW * unit.FH * 4]u8 = undefined;
+    unit.cpu_eng.init(.{ .pool = &unit.cpu_pool, .cpu_work = &cpu_work });
+    try unit.gradFrame(&unit.cpu_eng, &want);
+    try std.testing.expectEqual(@as(u32, 0), unit.notLevel2(&want, "the CPU"));
+    Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+    Rtx.dev.withEngine(&Rtx3d.engine3d);
+    eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs, .graphics = true });
+    defer eng_rtx.deinit();
+    var got: [unit.FW * unit.FH * 4]u8 = undefined;
+    unit.gradFrame(&eng_rtx, &got) catch |err| {
+        std.debug.print("levels frame: {s}; the 3D engine: {s}\n", .{ @errorName(err), Rtx3d.engine3d.why });
+        return err;
+    };
+    for (eng_rtx.said_compute) |w| if (w.len != 0) std.debug.print("levels frame: on the compute kernels: {s}\n", .{w});
+    try std.testing.expectEqual(@as(u64, 1), eng_rtx.stats.graphics_draws);
+    try std.testing.expectEqual(@as(u32, 0), unit.notLevel2(&got, "the RTX's 3D engine"));
+}
+
+test "Direct3D through the emulated RTX's texture unit: a 2D array's comparisons (one at a texel offset) and a level between two of a mipmapped texture, a texel of it fetched, a cube across its faces' edges: the CPU's pixels, within a step" {
+    var want: [unit.FW * unit.FH * 4]u8 = undefined;
+    unit.cpu_eng.init(.{ .pool = &unit.cpu_pool, .cpu_work = &cpu_work });
+    try unit.frame(&unit.cpu_eng, &want);
+    // (the comparisons' half steps, the levels' colours: neither all one
+    // value nor the clear's)
+    var reds = [_]bool{false} ** 256;
+    for (0..unit.FW * unit.FH) |i| reds[want[i * 4 + 2]] = true;
+    var distinct: u32 = 0;
+    for (reds) |x| distinct += @intFromBool(x);
+    try std.testing.expect(distinct >= 3);
+    Rtx.dev.init(&Rtx.arena, &Rtx.view, &Rtx.emu_work);
+    Rtx.dev.withEngine(&Rtx3d.engine3d);
+    eng_rtx.init(.{ .dev = Rtx.dev.device(), .work = &Rtx.work, .cpu_work = &cpu_work, .slabs = &rtx_slabs, .graphics = true });
+    defer eng_rtx.deinit();
+    var got: [unit.FW * unit.FH * 4]u8 = undefined;
+    unit.frame(&eng_rtx, &got) catch |err| {
+        std.debug.print("texture unit frame: {s}; the 3D engine: {s}\n", .{ @errorName(err), Rtx3d.engine3d.why });
+        return err;
+    };
+    const s = eng_rtx.stats;
+    for (eng_rtx.said_compute) |w| if (w.len != 0) std.debug.print("texture unit frame: on the compute kernels: {s}\n", .{w});
+    try std.testing.expectEqual(@as(u64, 1), s.graphics_draws);
+    try std.testing.expectEqual(@as(u64, 1), s.tex_unit_draws);
+    try std.testing.expectEqual(@as(u64, 0), s.tex_soft_draws);
+    // (a texel offset's coordinate is the reciprocal's: within a step of
+    // 255 where it meets a texel's edge)
+    try std.testing.expectEqual(@as(u32, 0), apart(&want, &got, unit.FW, 1, "texture unit frame: the CPU against the RTX"));
 }

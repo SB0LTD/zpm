@@ -57,6 +57,9 @@ pub const Caps = struct {
     /// stage programs: nvidia_gl's), at most `max_graphics` a run.
     graphics: bool = false,
     max_graphics: u32 = 0,
+    /// The graphics pipeline's programs may sample through the GPU's
+    /// texture unit (KIR's tex: Graphics.tex's pools; the RTX's 3D engine).
+    tex: bool = false,
 };
 
 /// The interpreter's default: an ideal GPU (fused, denormals kept, a
@@ -368,6 +371,16 @@ pub const Graphics = struct {
     /// count (x right, y as its rows grow: the window's after the
     /// viewport).
     front_ccw: bool = true,
+    /// Depth bias of filled triangles: factor, units (2^-24 each), clamp
+    /// (gfxapi raster.Draw's bias_factor, bias_units, bias_clamp).
+    bias: [3]f32 = .{ 0, 0, 0 },
+    /// Depths clamped into the window's 0 .. 1, not clipped (Direct3D's
+    /// DepthClipEnable off, GL's DEPTH_CLAMP: gfxapi raster.Draw's
+    /// depth_clamp).
+    depth_clamp: bool = false,
+    /// The depth's clip volume 0 <= z <= w (Direct3D's), else GL's
+    /// -w <= z <= w: the NDC depths the viewport maps into its range.
+    clip_zero: bool = false,
     /// Colour targets 1 .. 7 (the pixel program's output t into target
     /// t; null: none): as wide and high as target 0, rows of `stride`
     /// bytes from `va`.
@@ -377,10 +390,20 @@ pub const Graphics = struct {
     /// program reads; with `restart`, the type's largest begins a strip
     /// or a fan anew. Null: the vertices' indices 0 .. count - 1.
     index: ?Index = null,
+    /// The texture unit's pools the programs' KIR tex handles name
+    /// (Caps.tex; null: they sample nothing through it).
+    tex: ?TexPools = null,
 
     pub const Index = struct { va: u64, bytes: u32, size: u8, first: u32, restart: bool = false };
+    /// `headers` texture headers from `headers_va` (index 0 the null
+    /// texture), `samplers` samplers from `samplers_va`, 32 bytes each, as
+    /// the GPU's texture unit reads them (nvidia/gl3d.headerWords,
+    /// samplerWords); `fresh`: entries written since the last draw.
+    pub const TexPools = struct { headers_va: u64, headers: u32, samplers_va: u64, samplers: u32, fresh: bool = false };
 
-    pub const TargetFormat = enum(u8) { rgba8, bgra8, r8, rg8 };
+    /// (the float ones: 32-bit float channels, drawn unclamped and blended
+    /// in floats; Direct3D's 16-bit and packed float targets stored so)
+    pub const TargetFormat = enum(u8) { rgba8, bgra8, r8, rg8, r32f, rg32f, rgba32f };
     pub const ColorTarget = struct {
         va: u64,
         stride: u32,
@@ -459,6 +482,9 @@ pub const GraphicsBlend = struct {
 pub const Error = error{ OutOfMemory, SubmitFailed, Timeout, DeviceLost, BadProgram, Unsupported };
 pub const Fence = u64;
 
+/// Device.busy's counts.
+pub const Busy = struct { gpu_ns: u64 = 0, blocked: u64 = 0 };
+
 pub const Device = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
@@ -487,7 +513,18 @@ pub const Device = struct {
         dispatchNs: ?*const fn (ctx: *anyopaque, out: []u64) usize = null,
         /// A GPU-clock sample ordered after prior commands.
         timestampNs: ?*const fn (ctx: *anyopaque, timeout_us: u64) Error!u64 = null,
+        /// Where the time goes (null: the device cannot say).
+        busy: ?*const fn (ctx: *anyopaque) Busy = null,
     };
+
+    /// The GPU's time on the runs done so far (ns, each run's own stamps;
+    /// a run's may come in a few runs later), and the runs that had to wait
+    /// for room for themselves (every run the device keeps in flight still
+    /// going: the GPU behind the CPU). Both grow from 0.
+    pub fn busy(d: Device) Busy {
+        const f = d.vtable.busy orelse return .{};
+        return f(d.ctx);
+    }
 
     /// A buffer of `bytes`, or error.OutOfMemory.
     pub fn alloc(d: Device, bytes: u64, kind: Kind) Error!Buffer {

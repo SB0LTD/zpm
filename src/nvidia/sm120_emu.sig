@@ -273,6 +273,10 @@ pub const Stage = struct {
     /// the texture header's index in bits 19..0, the sampler's in 31..20)
     /// sampled at (x, y): red, green, blue, alpha. Null: TEX traps.
     sample: ?*const fn (ctx: ?*anyopaque, handle: u32, x: f32, y: f32) Error![4]f32 = null,
+    /// TEX.DC: the same sample's depth comparison against `ref` (the
+    /// register after the handle, NAK's order): the result in red. Null:
+    /// TEX.DC traps.
+    compare: ?*const fn (ctx: ?*anyopaque, handle: u32, x: f32, y: f32, ref: f32) Error![4]f32 = null,
     /// TLD: texel (x, y) of level `lod` of the texture `handle` names.
     /// Null: TLD traps.
     fetch: ?*const fn (ctx: ?*anyopaque, handle: u32, x: i32, y: i32, lod: i32) Error![4]f32 = null,
@@ -1658,9 +1662,12 @@ fn stageOp(op: *Op, in: *const Instr, name: []const u8, o: []const Operand) Erro
 /// coordinates and nothing of the pixels beside this one, so .LZ, .NDV,
 /// .DXY and .NODEP change nothing here.
 ///
+/// - TEX.B(.LZ).DC ...: the Stage's `compare` called with the reference
+///   in the register after the handle (NAK's order).
+///
 /// Not run: another dimension than 2D; a level from a register for TEX
 /// (.LB, .LL, .LC and the U ones) and TLD's .ULL; texel offsets (.AOFFI,
-/// .UAOFFI); .UAI; a depth comparison (.DC); .SCR; the .F16 pair; an
+/// .UAOFFI); .UAI; .DC with derivatives (not .LZ); .SCR; the .F16 pair; an
 /// eviction priority (what one does is not known); .MS, .UMS and .CL; a
 /// fault predicate; a uniform register; registers past R254.
 fn texture(op: *Op, in: *const Instr, name: []const u8, o: []const Operand) Error!void {
@@ -1700,8 +1707,13 @@ fn texture(op: *Op, in: *const Instr, name: []const u8, o: []const Operand) Erro
     if (!in.has("B")) not_run = true;
     for (in.mods[0..in.n_mods]) |m| {
         const taken = eql(m, "B") or eql(m, "NODEP") or eql(m, "LZ") or
-            (if (fetch) eql(m, "LL") else (eql(m, "NDV") or eql(m, "DXY")));
+            (if (fetch) eql(m, "LL") else (eql(m, "NDV") or eql(m, "DXY") or eql(m, "DC")));
         if (!taken) not_run = true;
+    }
+    // (a comparison: op.sub 2, its reference after the handle; level zero)
+    if (!fetch and in.has("DC")) {
+        op.sub = 2;
+        if (!in.has("LZ")) not_run = true;
     }
     // (a fetch always names its level)
     if (fetch) {
@@ -1709,7 +1721,7 @@ fn texture(op: *Op, in: *const Instr, name: []const u8, o: []const Operand) Erro
     }
     // Registers past R254: the coordinates' second, the level's, a result's.
     const channels: u8 = @popCount(op.lut[0]);
-    if (op.s[0].n > RZ - 2 or (op.sub == 1 and op.s[1].n > RZ - 2)) not_run = true;
+    if (op.s[0].n > RZ - 2 or (op.sub != 0 and op.s[1].n > RZ - 2)) not_run = true;
     if (op.d[0].n != RZ and @as(u32, op.d[0].n) + @min(channels, 2) > RZ) not_run = true;
     if (op.d[1].n != RZ and @as(u32, op.d[1].n) + (channels -| 2) > RZ) not_run = true;
     if (not_run) op.refuse = .form;
@@ -1732,7 +1744,7 @@ fn textureUses(op: *const Op) sched.Uses {
     add(&u, false, .gpr, op.s[0].n, cat);
     add(&u, false, .gpr, op.s[0].n +| 1, cat);
     add(&u, false, .gpr, op.s[1].n, cat);
-    if (op.kind == .tld and op.sub == 1) add(&u, false, .gpr, op.s[1].n +| 1, cat);
+    if (op.sub != 0) add(&u, false, .gpr, op.s[1].n +| 1, cat);
     if (op.guard.n != PT) add(&u, false, .pred, op.guard.n, @intFromEnum(lat.Pred.guard));
     return u;
 }
@@ -2193,7 +2205,7 @@ fn belongs(c: *Ctx, op: *const Op, pc: u32, t: u32) Error!void {
         .ldl, .stl => return refuse(c, pc, t, .unsupported, .no_data, 0),
         .ald, .ast => if (s.kind != .vertex) return refuse(c, pc, t, .bad_instruction, .wrong_stage, 0),
         .ipa, .pixld, .kill => if (s.kind != .pixel) return refuse(c, pc, t, .bad_instruction, .wrong_stage, 0),
-        .tex => if (s.sample == null and op.refuse == .none) return refuse(c, pc, t, .unsupported, .no_callback, 0),
+        .tex => if ((if (op.sub == 2) s.compare == null else s.sample == null) and op.refuse == .none) return refuse(c, pc, t, .unsupported, .no_callback, 0),
         .tld => if (s.fetch == null and op.refuse == .none) return refuse(c, pc, t, .unsupported, .no_callback, 0),
         else => {},
     }
@@ -2315,7 +2327,10 @@ fn stageLane(c: *Ctx, wi: u32, t: u32, op: *const Op) Error!void {
             const x = w.regs[t][op.s[0].n];
             const y = w.regs[t][op.s[0].n + 1];
             var rgba: [4]f32 = undefined;
-            if (op.kind == .tex) {
+            if (op.kind == .tex and op.sub == 2) {
+                const ref = w.regs[t][op.s[1].n + 1];
+                rgba = s.compare.?(s.ctx, handle, f32of(x), f32of(y), f32of(ref)) catch |e| return callbackFailed(c, t, e);
+            } else if (op.kind == .tex) {
                 rgba = s.sample.?(s.ctx, handle, f32of(x), f32of(y)) catch |e| return callbackFailed(c, t, e);
             } else {
                 const xi: i32 = @bitCast(x);

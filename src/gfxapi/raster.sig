@@ -217,6 +217,9 @@ pub const FragmentIO = struct {
     discard: V = .none,
     /// the code takes derivatives (set by the fragment emitter)
     derivatives: bool = false,
+    /// a GPU's pixel program's (pixelStage with the texture unit): its 2D
+    /// samples go through the unit (texture.Slot.hw)
+    tex_hw: ?*texture.HwTex = null,
 };
 
 /// The shaders: KIR emitters (what GLSL compiles to, or Sig code).
@@ -362,6 +365,13 @@ pub const Pipeline = struct {
     /// pixel), loaded by `owner` at the first draw that may use them; the
     /// engine that could not compile or load them.
     gfx: [2]?gpu.Program = .{ null, null },
+    /// the pixel program with every sample in its own code (pixelStage
+    /// without the texture unit), for a draw whose textures the unit
+    /// cannot read: made at the first such draw
+    gfx_soft: ?gpu.Program = null,
+    gfx_soft_refused: bool = false,
+    /// what its pixel program samples through the texture unit (pixelStage)
+    tex_hw: texture.HwTex = .{ .param = P_TEX, .first = 0 },
     gfx_owner: ?*anyopaque = null,
     gfx_refused_by: ?*anyopaque = null,
     /// draws of it checked against the CPU (the engine's Check)
@@ -459,6 +469,14 @@ pub const Attr = struct {
     normalized: bool = false,
     /// glVertexAttribIPointer's: the bits, unconverted
     integer: bool = false,
+    /// (float with size 2: halves, widened)
+    /// One 32-bit word holding all four: 10-bit R, G, B and a 2-bit A from
+    /// bit 0 up (GL's *INT_2_10_10_10_REV, Direct3D's R10G10B10A2; size 1,
+    /// comps 4: the word's four bytes)
+    rgb10a2: bool = false,
+    /// Components 0 and 2 read from each other's place (Direct3D's
+    /// B8G8R8A8 and B8G8R8X8 vertex colours, GL's BGRA size)
+    bgra: bool = false,
     /// 0: per vertex; 1: per instance
     divisor: u32 = 0,
     /// the value where comps is 0 (glVertexAttrib*'s)
@@ -537,6 +555,10 @@ pub const Draw = struct {
     depth_bias: f32 = 0.5,
     zmin: f32 = 0,
     zmax: f32 = 1,
+    /// Depth clamped, not clipped (Direct3D's DepthClipEnable off, GL's
+    /// DEPTH_CLAMP): no fragment dropped for its depth, which is written
+    /// and tested clamped into 0 .. 1 (depthWord's clamp).
+    depth_clamp: bool = false,
     /// the pixels drawn may be in (viewport, framebuffer, scissor met)
     rect: engine.Rect = .{ .x0 = 0, .y0 = 0, .x1 = 0, .y1 = 0 },
     /// bit 0: cull front faces, bit 1: back faces
@@ -759,6 +781,8 @@ const F_FLOAT = 1 << 8;
 const F_SIGNED = 1 << 9;
 const F_NORM = 1 << 10;
 const F_INT = 1 << 11;
+const F_PACKED = 1 << 12;
+const F_BGRA = 1 << 13;
 
 /// bindings: 0 vertex records (written), 1 uniforms, 2 the element array,
 /// 3.. each attribute's buffer, then the textures
@@ -875,7 +899,9 @@ fn vertexOf(k: *kir.Kernel, b_idx: u8, x: V) V {
 /// flipped (a top-down image: GL's y = height - the engine's).
 const P_HEIGHT = VERTEX_PARAMS;
 const P_FLIP = VERTEX_PARAMS + 1;
-pub const STAGE_PARAMS = VERTEX_PARAMS + 2;
+/// Texture j's handle base for the texture unit (texture.HwTex), P_TEX + j.
+pub const P_TEX = VERTEX_PARAMS + 2;
+pub const STAGE_PARAMS = P_TEX + texture.MAX_TEX;
 
 /// Why a draw is not one the 3D engine draws yet (its pipeline's or its
 /// own), or null: the compute kernels draw those.
@@ -916,7 +942,6 @@ pub fn stageWhyNot(d: *const Draw) ?[]const u8 {
     }
     if (d.query != null) return "an occlusion query";
     if (d.alpha_to_coverage or d.sample_mask & 1 == 0) return "alpha to coverage or a sample mask";
-    if (d.bias_factor != 0 or d.bias_units != 0) return "depth bias";
     if (!d.color_off and !d.color.gpuDrawable()) return "a target the engine does not draw into";
     if (d.blend) |b| {
         if (b.gl[0] == 0xffff) return "a blend not given as GL's factors";
@@ -950,11 +975,15 @@ pub fn stageParams(d: *const Draw, out: []u32) []u32 {
 /// the stage's words (0), the uniforms, the element array, each
 /// attribute's buffer, the textures, the buffers.
 const StageBindings = struct { io: u8, uni: u8, idx: u8, attr: [MAX_ATTRS]u8, tex: u8, buf: u8 };
+/// A graphics stage's uniforms binding (stageBindings' second): the one
+/// the engine has the RTX's programs read as constant buffer 1.
+pub const UNI_BINDING: u8 = 1;
 
 fn stageBindings(k: *kir.Kernel, sh: Shaders) StageBindings {
     var b: StageBindings = undefined;
     b.io = k.binding();
     b.uni = k.binding();
+    std.debug.assert(b.uni == UNI_BINDING);
     b.idx = k.binding();
     for (&b.attr) |*x| x.* = k.binding();
     b.tex = k.bindings;
@@ -1003,10 +1032,14 @@ pub fn vertexStage(s: kir.Storage, p: *const Pipeline, reads: *const [8]u32) kir
 /// bits, the rest carried in perspective), gl_FragCoord (y flipped back
 /// to GL's for a top-down target), the shader's fragment code; its colour
 /// into the target (the engine clamps and blends), a discard a KILL.
-pub fn pixelStage(s: kir.Storage, p: *const Pipeline) kir.Kernel {
+pub fn pixelStage(s: kir.Storage, p: *Pipeline, tex_unit: bool) kir.Kernel {
     var k = kir.Kernel.init(s, "gl_pixel_stage", .{ 1, 1, 1 });
     const sh = p.shaders;
     const b = stageBindings(&k, sh);
+    // (its 2D samples through the GPU's texture unit, the draw filling
+    // each texture's handle: P_TEX + j; without it, the record the
+    // pipeline's other pixel program made stays)
+    if (tex_unit) p.tex_hw = .{ .param = P_TEX, .first = b.tex };
     const io_m = struct {
         fn at(bb: u8, a: u32) kir.Mem {
             return nvidia_gl.ioMem(bb, a, false);
@@ -1014,7 +1047,7 @@ pub fn pixelStage(s: kir.Storage, p: *const Pipeline) kir.Kernel {
     };
     const iw = k.load(.f32, io_m.at(b.io, nvidia_gl.POSITION + 12), u(0));
     const wv = k.div(f(1), r(iw));
-    var io = FragmentIO{ .uniforms = b.uni, .textures = b.tex, .buffers = b.buf };
+    var io = FragmentIO{ .uniforms = b.uni, .textures = b.tex, .buffers = b.buf, .tex_hw = if (tex_unit) &p.tex_hw else null };
     if (sh.quads) {
         // A pixel warp's quads: lanes 4q .. 4q + 3 are a 2 x 2 block, x
         // across in bit 0, the target's rows down in bit 1 (GL's up, unless
@@ -1124,6 +1157,9 @@ fn fetch(k: *kir.Kernel, b: u8, pw: u16, v: V, inst: V) [4]V {
     const float = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(fmt), u(F_FLOAT))), u(0));
     const signed = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(fmt), u(F_SIGNED))), u(0));
     const norm = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(fmt), u(F_NORM))), u(0));
+    const pk = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(fmt), u(F_PACKED))), u(0));
+    const bgra = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(fmt), u(F_BGRA))), u(0));
+    const half = k.op2(.pand, .pred, r(float), r(k.cmp(.u32, .eq, r(size), u(2))));
     const per_inst = k.cmp(.u32, .ne, r(k.param(.u32, pw + 3)), u(0));
     const ai = k.sel(.u32, r(per_inst), r(inst), r(v));
     const base = k.op3(.imad, .u32, r(ai), r(k.param(.u32, pw + 1)), r(k.param(.u32, pw)));
@@ -1141,16 +1177,26 @@ fn fetch(k: *kir.Kernel, b: u8, pw: u16, v: V, inst: V) [4]V {
         k.els();
         k.ifp(r(k.cmp(.u32, .gt, r(comps), u(@intCast(c)))));
         {
-            const at = k.op3(.imad, .u32, r(size), u(@intCast(c)), r(base));
+            // (BGRA: component 0 from 2's place, 2 from 0's)
+            const src: Arg = if (c == 0) r(k.sel(.u32, r(bgra), u(2), u(0))) else if (c == 2) r(k.sel(.u32, r(bgra), u(0), u(2))) else u(@intCast(c));
+            // (packed: every component in the one word at the base)
+            const at = k.sel(.u32, r(pk), r(base), r(k.op3(.imad, .u32, r(size), src, r(base))));
             // (inside the buffer whatever the app asks: its last word at most)
             const wat = k.op2(.imin, .u32, r(k.op2(.@"and", .u32, r(at), u(0xffff_fffc))), r(k.param(.u32, pw + 5)));
             const word = k.load(.u32, kir.global(b, 32), r(wat));
+            const byte_shift = k.op2(.shl, .u32, r(k.op2(.@"and", .u32, r(at), u(3))), u(3));
             k.ifp(r(float));
-            k.set(o, .mov, r(word), no, no);
+            {
+                // (a half: its 16 bits widened; else the word)
+                const hbits = k.op3(.bfe, .u32, r(word), r(byte_shift), u(16));
+                const wide = k.mov(.u32, r(k.cvt(.f16, .f32, .rne, r(k.mov(.f16, r(hbits))))));
+                k.set(o, .sel, r(wide), r(word), r(half));
+            }
             k.els();
             {
-                const shift = k.op2(.shl, .u32, r(k.op2(.@"and", .u32, r(at), u(3))), u(3));
-                const bits = k.op2(.shl, .u32, r(size), u(3));
+                // (packed: 10 bits at 10c, alpha's 2 at 30)
+                const shift = k.sel(.u32, r(pk), u(10 * @as(u32, @intCast(c))), r(byte_shift));
+                const bits = k.sel(.u32, r(pk), u(if (c == 3) 2 else 10), r(k.op2(.shl, .u32, r(size), u(3))));
                 const uraw = k.op3(.bfe, .u32, r(word), r(shift), r(bits));
                 const sraw = k.op3(.bfe, .i32, r(word), r(shift), r(bits));
                 k.ifp(r(integer));
@@ -1160,8 +1206,12 @@ fn fetch(k: *kir.Kernel, b: u8, pw: u16, v: V, inst: V) [4]V {
                     const fu = k.cvt(.u32, .f32, .rne, r(uraw));
                     const fs = k.cvt(.i32, .f32, .rne, r(sraw));
                     const fv = k.sel(.f32, r(signed), r(fs), r(fu));
-                    // (normalized: c / (2^b - 1), or c / (2^(b-1) - 1) at least -1)
-                    const nv = k.div(r(fv), r(k.param(.f32, pw + 4)));
+                    // (normalized: c / (2^b - 1), or c / (2^(b-1) - 1) at least -1;
+                    // a packed one's from its own bits)
+                    const pbits = k.op2(.isub, .u32, r(bits), r(k.sel(.u32, r(signed), u(1), u(0))));
+                    const pdiv = k.cvt(.u32, .f32, .rne, r(k.op2(.isub, .u32, r(k.op2(.shl, .u32, u(1), r(pbits))), u(1))));
+                    const div = k.sel(.f32, r(pk), r(pdiv), r(k.param(.f32, pw + 4)));
+                    const nv = k.div(r(fv), r(div));
                     const ns = k.sel(.f32, r(signed), r(k.op2(.fmax, .f32, r(nv), f(-1))), r(nv));
                     // (f32 bits into the attribute's register: mov reinterprets)
                     k.set(o, .sel, r(k.mov(.u32, r(ns))), r(k.mov(.u32, r(fv))), r(norm));
@@ -2914,6 +2964,8 @@ pub fn vertexParams(d: *const Draw, out: []u32) []u32 {
         if (a.signed) fmt |= F_SIGNED;
         if (a.normalized and !a.integer and !a.float) fmt |= F_NORM;
         if (a.integer) fmt |= F_INT;
+        if (a.rgb10a2) fmt |= F_PACKED;
+        if (a.bgra) fmt |= F_BGRA;
         const bits: u6 = @intCast(@as(u32, a.size) * 8 - @intFromBool(a.signed));
         const div: f32 = if (bits >= 32) 4294967295.0 else @floatFromInt((@as(u64, 1) << bits) - 1);
         w.* = .{ a.offset, a.stride, fmt, @intFromBool(a.divisor != 0), fbits(div), lastWord(a.buf.?), 0, 0 };
@@ -3038,8 +3090,9 @@ pub fn rasterParams(d: *const Draw, bins: Bins, out: []u32) []u32 {
     }
     out[R_DFUNC] = d.depth_func;
     out[R_DWRITE] = @intFromBool(d.depth_write);
-    out[R_ZMIN] = fbits(d.zmin);
-    out[R_ZMAX] = fbits(d.zmax);
+    // (a depth clamp: every depth in range, depthWord clamping it)
+    out[R_ZMIN] = fbits(if (d.depth_clamp) -std.math.inf(f32) else d.zmin);
+    out[R_ZMAX] = fbits(if (d.depth_clamp) std.math.inf(f32) else d.zmax);
     if (d.stencil) |stencil| {
         out[R_STENCIL] = 1;
         out[R_S_TOPDOWN] = @intFromBool(stencil.top_down);

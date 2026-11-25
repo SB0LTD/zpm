@@ -98,3 +98,53 @@ void cs_sample(uint3 id : SV_DispatchThreadID)
     float2 uv = (float2(id.xy) + 1.0) / float2(w, h);
     cs_sample_out[id.y * 4 + id.x] = cs_sample_tex.SampleLevel(cs_sample_smp, uv, 0);
 }
+
+// Bits, halves and a switch: each thread's word through countbits,
+// firstbithigh and firstbitlow (unsigned and signed), reversebits,
+// f32tof16 and f16tof32, a bit field put in, and a switch on its low bits
+// (kept a switch: [forcecase]).
+ByteAddressBuffer cs_bits_in : register(t0);
+RWByteAddressBuffer cs_bits_out : register(u0);
+
+[numthreads(32, 1, 1)]
+void cs_bits(uint3 id : SV_DispatchThreadID)
+{
+    uint x = cs_bits_in.Load(id.x * 4);
+    int sx = (int)x;
+    uint sw;
+    [forcecase] switch (x & 3) {
+        case 0: sw = 10; break;
+        case 1: case 2: sw = 20 + (x & 3); break;
+        default: sw = 99; break;
+    }
+    uint bf = (x & ~0xff0u) | ((sw << 4) & 0xff0u);
+    cs_bits_out.Store4(id.x * 32, uint4(countbits(x), firstbithigh(x), firstbitlow(x), reversebits(x)));
+    cs_bits_out.Store4(id.x * 32 + 16, uint4(f32tof16(asfloat(x & 0x3fffffffu)), asuint(f16tof32(x)), (uint)firstbithigh(sx), sw + bf * 0 + (bf << 0) - bf + bf));
+}
+
+// A local array indexed at run time (an indexable temp, x0[]): filled,
+// one entry changed by the thread's index, two read back.
+RWByteAddressBuffer cs_xarr_out : register(u0);
+
+[numthreads(16, 1, 1)]
+void cs_xarr(uint3 id : SV_DispatchThreadID)
+{
+    uint a[8];
+    [unroll] for (uint i = 0; i < 8; i++) a[i] = i * i + id.x;
+    a[id.x & 7] += 100;
+    cs_xarr_out.Store(id.x * 4, a[(id.x * 3) & 7] + a[id.x & 7]);
+}
+
+// Gather: the four texels around each point, red, then green with an
+// offset of -1 across.
+Texture2D<float4> cs_gather_tex : register(t0);
+SamplerState cs_gather_smp : register(s0);
+RWBuffer<float4> cs_gather_out : register(u0);
+
+[numthreads(4, 4, 1)]
+void cs_gather(uint3 id : SV_DispatchThreadID)
+{
+    float2 uv = (float2(id.xy) + 1.0) / 4.0;
+    cs_gather_out[(id.y * 4 + id.x) * 2] = cs_gather_tex.GatherRed(cs_gather_smp, uv);
+    cs_gather_out[(id.y * 4 + id.x) * 2 + 1] = cs_gather_tex.GatherGreen(cs_gather_smp, uv, int2(-1, 0));
+}

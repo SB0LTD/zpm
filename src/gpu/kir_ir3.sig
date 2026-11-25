@@ -1491,6 +1491,7 @@ fn lowerOne(w: *Work, i: u32) Error!void {
         .shfl => try lowerShfl(&l),
         .vote => try lowerVote(&l),
         .ballot => return error.BadOperand, // (kir.expand made it votes)
+        .tex => return error.BadOperand, // (the RTX's texture unit alone: Caps.tex)
         .@"if", .@"else", .endif, .loop, .brk, .cont, .endloop, .ret => try lowerControl(&l),
     }
     _ = isF;

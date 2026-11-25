@@ -204,6 +204,7 @@ pub fn withGraphics(c: gpu.Caps) gpu.Caps {
     var x = c;
     x.graphics = true;
     x.max_graphics = MAX_GRAPHICS;
+    x.tex = true;
     return x;
 }
 
@@ -236,6 +237,8 @@ const Set = struct {
     profiled: bool = false,
     fence: ?nv.Fence = null,
     dispatches: u32 = 0,
+    /// Its last run's GPU time not yet in Adapter.gpu_ns.
+    uncounted: bool = false,
 };
 
 /// What the 3D engine's draws since its last wait for idle write (their
@@ -351,6 +354,9 @@ pub const Adapter = struct {
     runs: u64 = 0,
     /// The waits for idle the last run took between its dispatches.
     barriers: u32 = 0,
+    /// Every run's waits for idle, added up (a trace's: draws that waited
+    /// for each other or for a kernel between them).
+    barriers_all: u64 = 0,
     /// Each dispatch's end timed (Device.profile).
     profiling: bool = false,
     indirect_progs: ?IndirectProgs = null,
@@ -367,6 +373,11 @@ pub const Adapter = struct {
     refused: ?[]const u8 = null,
     lost: u64 = 0,
     last_error: ?anyerror = null,
+    /// Device.busy: the GPU's time on the runs done (each run's stamps,
+    /// counted when its set is next used), and the runs that waited for
+    /// their set (all SETS in flight: the GPU behind).
+    gpu_ns: u64 = 0,
+    blocked: u64 = 0,
 
     pub fn device(a: *Adapter) gpu.Device {
         return .{ .ctx = a, .vtable = &vtable, .caps = a.caps };
@@ -432,6 +443,7 @@ pub const Adapter = struct {
         .profile = profile,
         .dispatchNs = dispatchNs,
         .timestampNs = timestampNs,
+        .busy = busy,
     };
 
     fn self(ctx: *anyopaque) *Adapter {
@@ -527,7 +539,12 @@ pub const Adapter = struct {
             a.codeFree(ctx, code);
             return error.BadProgram;
         }
-        return .{ .bin = bin.*, .code = code };
+        // (its code the copy loaded, as amd_device's and emu_device's: the
+        // caller's bytes may be a compiler buffer it reuses, as
+        // Engine.loadStages's for the vertex stage after the pixel one)
+        var b = bin.*;
+        b.code = code.cpu[0..bin.code.len];
+        return .{ .bin = b, .code = code };
     }
 
     fn unload(ctx: *anyopaque, p: *const gpu.Program) void {
@@ -597,8 +614,15 @@ pub const Adapter = struct {
         const s = &a.sets[si];
         // (a set still in flight is waited for first)
         if (s.fence) |f| {
-            a.vram.wait(f, std.math.maxInt(u64)) catch {};
+            a.vram.wait(f, 0) catch {
+                a.blocked += 1;
+                a.vram.wait(f, std.math.maxInt(u64)) catch {};
+            };
             s.fence = null;
+        }
+        if (s.uncounted) {
+            a.gpu_ns += a.setNs(s);
+            s.uncounted = false;
         }
         try a.setUp(s);
         if (a.profiling and s.ends.cpu.len == 0) s.ends = a.rawOf(true).alloc(16 * MAX_DISPATCHES) catch return error.OutOfMemory;
@@ -645,13 +669,22 @@ pub const Adapter = struct {
                 } else if (a.serial_draws or drawn.hazard(d, g) or writesMemory(d, g)) {
                     p.method(gl3dSubch(), WAIT_FOR_IDLE, &.{0});
                     p.invalidateShaderCaches();
+                    // (a texture the draws before drew into, sampled by
+                    // this one through the texture unit: its cache too)
+                    if (g.tex != null) p.method(gl3dSubch(), gl3d.INVALIDATE_TEXTURE_DATA_CACHE_NO_WFI, &.{0});
                     a.barriers += 1;
                     drawn = .{};
                 }
                 // (the 3D engine's whole state at the run's first draw; a
                 // later one's own state alone, but each whole with serial_draws)
                 if (graphics == 1 or a.serial_draws) gl3d.emit(&p, &draw) else gl3d.emitNext(&p, &draw);
-                drawn.add(d, g);
+                // (a profiled run: the draw alone, done, its end stamped as
+                // a dispatch's is; the next draw starts on an idle engine)
+                if (s.profiled) {
+                    p.method(gl3dSubch(), WAIT_FOR_IDLE, &.{0});
+                    p.reportTimestamp(s.ends.va + i * 16, @intCast(i));
+                    a.barriers += 1;
+                } else drawn.add(d, g);
                 after_draw = true;
                 hz = .{};
                 a.draws += 1;
@@ -713,6 +746,7 @@ pub const Adapter = struct {
         }
         p.method(push.SUBCH_COMPUTE, WAIT_FOR_IDLE, &.{0});
         p.reportTimestamp(s.stamps.va + 16, 2);
+        a.barriers_all += a.barriers;
         p.check() catch return error.Unsupported;
         a.vram.toDevice(s.slots, 0, (ds.len + extra) * SLOT_BYTES);
         const host = a.rawOf(true);
@@ -720,6 +754,7 @@ pub const Adapter = struct {
         const f = host.submit(s.pb, @intCast(p.len)) catch |e| return mapError(e);
         s.fence = f;
         s.dispatches = @intCast(ds.len);
+        s.uncounted = true;
         a.last_set = si;
         a.next_set = (si + 1) % SETS;
         a.runs += 1;
@@ -800,6 +835,15 @@ pub const Adapter = struct {
         _ = qmd.cbuf0Into(cb, .{ 1, 1, 1 }, .{ 1, 1, 1 }, params[0..n]) catch return error.BadProgram;
     }
 
+    /// The bytes of binding 1 (raster's uniforms) a draw's programs read
+    /// as constant buffer 1 (kir_sm120.EXTRA_BANK1), whole 256s; 0 when
+    /// they read none so, or the buffer cannot be bound (not on 256 bytes).
+    fn bank1Bytes(g: *const gpu.Graphics, d: gpu.Dispatch) u32 {
+        const n = @max(g.vertex.bin.extra[kir_sm120.EXTRA_BANK1], d.prog.bin.extra[kir_sm120.EXTRA_BANK1]);
+        if (n == 0 or d.buffers.len < 2 or d.buffers[1].gpu % 256 != 0) return 0;
+        return @min(std.mem.alignForward(u32, n, 256), 0x1_0000);
+    }
+
     /// A graphics dispatch as the 3D engine's state.
     fn drawOf(a: *const Adapter, s: *const Set, slot: usize, d: gpu.Dispatch, g: *const gpu.Graphics) gl3d.Draw {
         const nw = @max(g.vertex.bin.param_words, d.prog.bin.param_words);
@@ -808,12 +852,17 @@ pub const Adapter = struct {
             .pixel = .{ .va = d.prog.code.gpu, .registers = @max(d.prog.bin.regs, 16), .bytes = d.prog.bin.code.len },
             .cb_va = s.slots.va + slot * SLOT_BYTES + CBUF_AT,
             .cb_bytes = qmd.cbuf0Bytes(8 * d.buffers.len + 4 * nw),
+            // (constant buffer 1: the uniforms binding the programs read
+            // with LDC, as many bytes as they read, whole 256s)
+            .cb1_va = if (bank1Bytes(g, d) != 0) d.buffers[1].gpu else 0,
+            .cb1_bytes = bank1Bytes(g, d),
             .zero_va = a.zero.va,
             .target = .{ .va = g.va, .width = g.width, .height = g.height, .pitch = g.stride },
             .format = formatOf(g.format),
             .color_gobs = g.gobs_log2,
             .color_off = g.color_off,
             .index = if (g.index) |ix| .{ .va = ix.va, .bytes = ix.bytes, .size = ix.size, .first = ix.first, .restart = ix.restart } else null,
+            .tex = if (g.tex) |t| .{ .headers_va = t.headers_va, .headers = t.headers, .samplers_va = t.samplers_va, .samplers = t.samplers, .fresh = t.fresh } else null,
             .more = more: {
                 var m: [7]?gl3d.More = @splat(null);
                 for (g.more, 0..) |x, t| {
@@ -843,6 +892,9 @@ pub const Adapter = struct {
             .instances = g.instances,
             .cull = g.cull,
             .front_ccw = g.front_ccw,
+            .bias = g.bias,
+            .depth_clamp = g.depth_clamp,
+            .clip_zero = g.clip_zero,
             .sm = a.sm(),
             .depth = if (g.depth) |z| .{
                 .va = z.va,
@@ -935,7 +987,16 @@ pub const Adapter = struct {
     fn lastRunNs(ctx: *anyopaque) u64 {
         const a = self(ctx);
         const si = a.last_set orelse return 0;
-        const s = &a.sets[si];
+        return a.setNs(&a.sets[si]);
+    }
+
+    fn busy(ctx: *anyopaque) gpu.Busy {
+        const a = self(ctx);
+        return .{ .gpu_ns = a.gpu_ns, .blocked = a.blocked };
+    }
+
+    /// Set s's last run's GPU time (its two stamps), 0 when unknown.
+    fn setNs(a: *Adapter, s: *Set) u64 {
         const host = a.rawOf(true);
         host.fromDevice(s.stamps, 0, 32);
         const w = s.stamps.cpu;
@@ -1013,6 +1074,9 @@ fn formatOf(f: gpu.Graphics.TargetFormat) gl3d.Format {
         .bgra8 => .bgra8,
         .r8 => .r8,
         .rg8 => .rg8,
+        .r32f => .r32f,
+        .rg32f => .rg32f,
+        .rgba32f => .rgba32f,
     };
 }
 
@@ -1223,6 +1287,72 @@ fn glPixel(k: *kir.Kernel) void {
         const x = k.op2(.fmul, .f32, r(k.load(.f32, gl.ioMem(io, gl.generic(0, @intCast(c)), false), u(0))), r(w));
         k.store(.f32, gl.ioMem(io, gl.OUT_AT + 4 * @as(u32, @intCast(c)), false), u(0), r(x));
     }
+}
+
+test "a pixel program's branches on its inputs diverge: their regions reconverge, and the whole program reconverges before its KILL and EXIT" {
+    // (an input, a load through the stage's IO binding, is each pixel's
+    // own: taken as uniform, no branch on it reconverged, and a warp
+    // still split at the 3D engine's EXIT hung the RTX: Unigine's light
+    // loop, its continue inside an if)
+    const gl = @import("nvidia_gl.sig");
+    const S = struct {
+        var st: kir_sm120.State = .{};
+        var insts: [1024]kir.Inst = undefined;
+        var tys: [1024]kir.Ty = undefined;
+    };
+    const caps = rtx5070(1 << 30);
+    var k = kir.Kernel.init(.{ .insts = &S.insts, .tys = &S.tys }, "ps", .{ 1, 1, 1 });
+    const io = k.binding();
+    _ = k.binding();
+    const x = k.load(.f32, gl.ioMem(io, gl.generic(0, 0), false), u(0));
+    // a divergent if (with a loop in it: not predicated)
+    const acc = k.reg(.f32);
+    k.set(acc, .mov, kf(0), kir.no, kir.no);
+    k.ifp(r(k.cmp(.f32, .gt, r(x), kf(0.5))));
+    {
+        const j = k.reg(.u32);
+        k.set(j, .mov, u(0), kir.no, kir.no);
+        k.loop();
+        k.set(acc, .fadd, r(acc), kf(0.125), kir.no);
+        k.set(j, .iadd, r(j), u(1), kir.no);
+        k.brk(r(k.cmp(.u32, .ge, r(j), u(2))));
+        k.endloop();
+    }
+    k.endif();
+    // a loop a continue in a divergent if leaves (it desyncs: no BSSY of
+    // its own)
+    const i = k.reg(.u32);
+    k.set(i, .mov, u(0), kir.no, kir.no);
+    k.loop();
+    {
+        k.brk(r(k.cmp(.u32, .ge, r(i), u(3))));
+        const fi = k.cvt(.u32, .f32, .rne, r(i));
+        k.ifp(r(k.cmp(.f32, .gt, r(x), r(k.op2(.fmul, .f32, r(fi), kf(0.25))))));
+        k.set(i, .iadd, r(i), u(1), kir.no);
+        k.cont(u(1));
+        k.endif();
+        k.set(acc, .fadd, r(acc), r(x), kir.no);
+        k.set(i, .iadd, r(i), u(1), kir.no);
+    }
+    k.endloop();
+    // a discard, then the colour
+    k.ifp(r(k.cmp(.f32, .lt, r(acc), kf(0.1))));
+    k.store(.u32, gl.ioMem(io, gl.KILL_AT, false), u(0), u(0));
+    k.endif();
+    for (0..4) |c| k.store(.f32, gl.ioMem(io, gl.OUT_AT + 4 * @as(u32, @intCast(c)), false), u(0), r(acc));
+    try k.finish();
+    S.st.asm_work.sched = .{};
+    const text = try kir_sm120.compileText(&k, caps, &S.st, .{ .stage = .pixel, .stage_io = 0 });
+    // the whole program's region: opened first, closed before KILL and EXIT
+    const open = std.mem.indexOf(u8, text, "BSSY.RECONVERGENT B0,") orelse return error.NoTopRegion;
+    const close = std.mem.indexOf(u8, text, "BSYNC.RECONVERGENT B0") orelse return error.NoTopRegion;
+    const kill = std.mem.indexOf(u8, text, "KILL") orelse return error.NoKill;
+    const exit = std.mem.lastIndexOf(u8, text, "EXIT") orelse return error.NoExit;
+    try testing.expect(open < close and close < kill and close < exit);
+    try testing.expect(std.mem.indexOf(u8, text[0..open], "BRA") == null);
+    // the divergent if, a region of its own inside it
+    try testing.expect(std.mem.indexOf(u8, text, "BSSY.RECONVERGENT B1,") != null);
+    try testing.expect(S.st.stats.bssy >= 2);
 }
 
 test "graphics dispatches: a quad's colors carried across it by the emulated 3D engine, then blended over" {
@@ -2638,6 +2768,52 @@ fn controlFlow() !void {
         k.store(.f32, m, r(ob), r(h));
         try same(caps, &k, .{ 2, 1, 1 }, &.{}, 2 * NT, null);
     }
+}
+
+test "copies dropped where nothing between needs them (kir_sm120.forward), kept where a value they hold is overwritten first: a swap, a snapshot, a copy across a loop" {
+    const caps = caseCaps(false);
+    fillInts(0xc09);
+    var k = newKernel("copies", .{ 64, 1, 1 });
+    const A = k.binding();
+    const Bb = k.binding();
+    _ = k.binding();
+    const O = k.binding();
+    const t = lin(&k);
+    const off = k.op2(.shl, .u32, r(t), u(2));
+    const a = k.reg(.u32);
+    const b = k.reg(.u32);
+    k.set(a, .mov, r(k.load(.u32, kir.global(A, 32), r(off))), no, no);
+    k.set(b, .mov, r(k.load(.u32, kir.global(Bb, 32), r(off))), no, no);
+    // a swap, as DXBC writes `iadd r0.xy, r0.yx, l(1, 2)`: each value
+    // computed before either copy (forwarding the first would clobber a
+    // before the second reads it)
+    const ta = k.op2(.iadd, .u32, r(b), u(1));
+    const tb = k.op2(.iadd, .u32, r(a), u(2));
+    k.set(a, .mov, r(ta), no, no);
+    k.set(b, .mov, r(tb), no, no);
+    // a snapshot of a, then a written, then the snapshot read
+    const snap = k.mov(.u32, r(a));
+    k.set(a, .imul, r(a), u(3), no);
+    const mix = k.op2(.xor, .u32, r(snap), r(a));
+    // a float result copied into a typeless register (forwarded)
+    const fr = k.reg(.u32);
+    k.set(fr, .mov, r(k.op2(.fmul, .f32, r(k.cvt(.u32, .f32, .rne, r(b))), kir.f(0.5))), no, no);
+    // a copy made before a loop and read after it, its source changed in it
+    const before = k.mov(.u32, r(b));
+    const i = k.mov(.u32, u(0));
+    k.loop();
+    {
+        k.set(b, .iadd, r(b), r(i), no);
+        k.set(i, .iadd, r(i), u(1), no);
+        k.brk(r(k.cmp(.u32, .ge, r(i), r(k.op2(.@"and", .u32, r(a), u(7))))));
+    }
+    k.endloop();
+    const ob = k.op2(.shl, .u32, r(t), u(3));
+    k.store(.u32, kir.global(O, 32), r(ob), r(k.op2(.iadd, .u32, r(mix), r(fr))));
+    var m = kir.global(O, 32);
+    m.imm = 4;
+    k.store(.u32, m, r(ob), r(k.op2(.xor, .u32, r(before), r(b))));
+    try same(caps, &k, .{ 2, 1, 1 }, &.{}, 2 * NT, null);
 }
 
 test "ids, parameters and predicates past the six registers" {
