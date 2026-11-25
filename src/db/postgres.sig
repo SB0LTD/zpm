@@ -1231,6 +1231,12 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
 
         fn largeResult(db: *DB, request: ?LargeObject.Request, binary: bool, extended: bool, fastpath: bool, w: *Writer) !void {
             if (comptime !@hasDecl(DB, "largeObject")) return error.UnsupportedStatement;
+            if (comptime @hasDecl(DB, "transactionStatus")) {
+                if (db.transactionStatus() == 'E') return error.TransactionFailed;
+            }
+            if (comptime @hasDecl(DB, "beginExtendedGroup")) {
+                if (request == null and extended) try db.beginExtendedGroup();
+            }
             const frame = try w.begin(if (fastpath) 'V' else 'D');
             if (!fastpath) try w.u16be(1);
             const length_at = w.at;
