@@ -1464,6 +1464,32 @@ pub fn Eval(comptime config: types.Config) type {
                         return .{ .text = text };
                     },
                     .nextval, .currval, .setval, .lastval, .identity_next => return sequenceValue(ctx, n),
+                    .lo_from_bytea, .lo_get => {
+                        const a = try eval(ctx, n.b);
+                        if (a == .null_value) return .null_value;
+                        const oid = @import("std").math.cast(u32, a.integer) orelse return error.NumericValueOutOfRange;
+                        const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
+                        const call = hook.large_object_data orelse return error.UnsupportedStatement;
+                        const b = node(ctx, n.b).next;
+                        if (n.func == .lo_from_bytea) {
+                            const data = try eval(ctx, b);
+                            if (data == .null_value) return .null_value;
+                            return .{ .integer = @intCast(try call(hook.ptr, .create, oid, 0, data.bytea.slice(), &.{}, null)) };
+                        }
+                        var offset: i64 = 0;
+                        var requested: ?usize = null;
+                        if (b != ast.none) {
+                            const start = try eval(ctx, b);
+                            const length = try eval(ctx, node(ctx, b).next);
+                            if (start == .null_value or length == .null_value) return .null_value;
+                            offset = start.integer;
+                            if (length.integer < 0) return error.InvalidParameterValue;
+                            requested = @intCast(length.integer);
+                        }
+                        var result: V.Cell = .{ .bytea = .{} };
+                        result.bytea.len = try call(hook.ptr, .read, oid, offset, &.{}, &result.bytea.bytes, requested);
+                        return result;
+                    },
                     .lo_create, .lo_creat, .lo_unlink => {
                         const arg = try eval(ctx, n.b);
                         if (arg == .null_value) return .null_value;

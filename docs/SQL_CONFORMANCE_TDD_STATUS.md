@@ -1,5 +1,24 @@
 # SQL conformance TDD checkpoint
 
+## PostgreSQL large-object pages and WAL
+
+The SQL database can attach disjoint caller-owned page buffers. Ordinary
+table cells and large-object pages use independent storage spans.
+`lo_from_bytea` and both `lo_get` signatures use snapshot-visible pages.
+The SQL forms in this slice use the existing inline `bytea` capacity.
+Catalog readers can inspect `pg_largeobject` with superuser privileges.
+
+Page writes and unlink operations participate in statement rollback,
+savepoints, durable commit, and version reclamation. WAL opcode 72
+stores a complete page image or a page removal. Replay validates the
+whole frame, including object existence, logical EOF, peak capacity,
+and references that would outlive metadata. The page bytes and their
+catalog length publish at the same commit boundary.
+
+Prepared binary streaming, descriptor operations, sparse writes from
+SQL, and compact page checkpoints remain open. The stock large-object
+archive gate still exercises those paths.
+
 ## PostgreSQL large-object SQL metadata and ACLs
 
 ZPM implements `lo_create(oid)`, `lo_creat(int4)`, `lo_unlink(oid)`,

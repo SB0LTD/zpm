@@ -1386,7 +1386,7 @@ pub fn Database(comptime config: Config) type {
                 if(!describe_only) for(self.workspace.nodes.nodes[0..self.workspace.nodes.len]) |node| {
                     if (node.ty == .regproc or types.elementType(node.ty) == .regproc) return error.UnsupportedStatement;
                     switch(node.func) {
-                        .nextval,.currval,.setval,.lastval,.identity_next,.lo_create,.lo_creat,.lo_unlink=>return error.UnsupportedStatement,
+                        .nextval,.currval,.setval,.lastval,.identity_next,.lo_create,.lo_creat,.lo_unlink,.lo_from_bytea,.lo_get=>return error.UnsupportedStatement,
                         // These catalog lookups use the serialized database hook.
                         .to_regclass,.regclass_in,.regclass_out,.pg_get_serial_sequence,.pg_table_is_visible,.pg_get_indexdef,.pg_get_constraintdef,.pg_get_triggerdef,.pg_get_viewdef,.pg_partition_ancestors,
                         .to_regnamespace,.regnamespace_in,.regnamespace_out,.to_regproc=>return error.UnsupportedStatement,
@@ -1827,6 +1827,7 @@ pub fn Database(comptime config: Config) type {
         /// Roles, grants, policies, comments, wrappers, servers and
         /// publications (catalog_objects.sig, B11 wave 3).
         catalog_objects: O = .{},
+        large_pages: ?large_object_pages.Pages = null,
         /// Sequence slots (Config.sequences); values are non-transactional.
         seqs: [config.sequences]Q.Seq = @splat(.{}),
         /// Globally pending log-ahead values, including live owners. Any
@@ -2054,6 +2055,9 @@ pub fn Database(comptime config: Config) type {
                     if (part.start < part.end and region.start < part.end and part.start < region.end) return error.InvalidParameterValue;
                 };
             }
+            if (self.large_pages) |*pages| {
+                for (try largePageSpans(pages.backing())) |part| if (region.overlaps(part)) return error.InvalidParameterValue;
+            }
             self.workspace.query.cells = cells;
             self.workspace.query.cell_high = cells.len;
         }
@@ -2130,7 +2134,7 @@ pub fn Database(comptime config: Config) type {
         /// Validation completes before any binding is changed.
         pub fn bindStorage(self: *Self, backings: [config.tables]StorageBacking, refs: []u32) Error!void {
             if (comptime !config.external_storage) @compileError("bindStorage requires external_storage");
-            if (self.csn != 0 or refs.len == 0 or refs.len > 0x7fffffff) return error.InvalidParameterValue;
+            if (self.csn != 0 or self.large_pages != null or refs.len == 0 or refs.len > 0x7fffffff) return error.InvalidParameterValue;
             for (&self.tables) |*table| if (table.live) return error.InvalidParameterValue;
             for (&self.txs) |*tx| if (tx.active) return error.InvalidParameterValue;
             var spans: [config.tables * storage_fields.len + 3]StorageSpan = undefined;
@@ -2150,6 +2154,35 @@ pub fn Database(comptime config: Config) type {
             self.workspace.query.refs = refs;
             self.workspace.query.ref_high = refs.len;
             self.contiguous_backing = null;
+        }
+
+        fn largePageSpans(backing: large_object_pages.Pages.Backing) Error![5]StorageSpan {
+            return .{
+                try StorageSpan.of(backing.rows), try StorageSpan.of(backing.versions),
+                try StorageSpan.of(backing.version_rows), try StorageSpan.of(backing.row_index), try StorageSpan.of(backing.key_index),
+            };
+        }
+
+        /// Attach caller-owned sparse page storage after the ordinary banks
+        /// and workspace have been bound. The buffers must stay disjoint.
+        pub fn bindLargeObjectPages(self: *Self, backing: large_object_pages.Pages.Backing) Error!void {
+            if (comptime !config.external_storage) @compileError("large objects require caller-owned external storage");
+            if (self.csn != 0 or !self.replayQuiescent() or self.large_pages != null) return error.InvalidParameterValue;
+            const spans = try largePageSpans(backing);
+            const instance = StorageSpan{ .start = @intFromPtr(self), .end = @intFromPtr(self) + @sizeOf(Self) };
+            const refs = try StorageSpan.of(self.workspace.query.refs);
+            const workspace = if (comptime config.external_workspace) try StorageSpan.of(self.workspace.query.cells) else StorageSpan{ .start = 0, .end = 0 };
+            for (spans, 0..) |span, i| {
+                if (span.overlaps(instance) or span.overlaps(refs) or span.overlaps(workspace)) return error.InvalidParameterValue;
+                for (spans[i + 1 ..]) |other| if (span.overlaps(other)) return error.InvalidParameterValue;
+                for (&self.tables) |*table| {
+                    const bank = S.backingOf(table);
+                    inline for (storage_fields) |field| {
+                        if (span.overlaps(try StorageSpan.of(@field(bank, field)))) return error.InvalidParameterValue;
+                    }
+                }
+            }
+            self.large_pages = try large_object_pages.Pages.init(backing);
         }
 
         /// The startup owner holds exclusive access across replay, including
@@ -2264,10 +2297,35 @@ pub fn Database(comptime config: Config) type {
             if (self == source) return;
             for (&self.txs) |*tx| if (tx.active) return error.InvalidParameterValue;
             for (&source.txs) |*tx| if (tx.active) return error.InvalidParameterValue;
+            if (source.large_pages) |*pages| {
+                if (pages.committed_count != 0 and (self.large_pages == null or self.large_pages.?.capacity() < pages.committed_count))
+                    return error.WorkspaceCapacity;
+                const destination = try self.boundCopySpans();
+                const source_parts = try largePageSpans(pages.backing());
+                for (source_parts) |part| for (destination) |other| {
+                    if (part.overlaps(other)) return error.InvalidParameterValue;
+                };
+                if (self.large_pages) |*target_pages| {
+                    for (source_parts) |part| for (try largePageSpans(target_pages.backing())) |other| {
+                        if (part.overlaps(other)) return error.InvalidParameterValue;
+                    };
+                }
+            }
+            if (self.large_pages) |*pages| {
+                const origin = try source.boundCopySpans();
+                for (try largePageSpans(pages.backing())) |part| for (origin) |other| {
+                    if (part.overlaps(other)) return error.InvalidParameterValue;
+                };
+            }
             if (comptime S.integral_enabled) {
                 try self.rebindCopyBanks(source);
             } else for (&self.tables, &source.tables) |*dst, *src| {
                 if (src.live and !copyBankFits(dst, src)) return error.WorkspaceCapacity;
+            }
+            if (self.large_pages) |*pages| {
+                if (source.large_pages) |*origin| {
+                    pages.copyCommitted(origin, source.csn);
+                } else pages.clear();
             }
             self.copyState(source);
         }
@@ -3940,14 +3998,103 @@ pub fn Database(comptime config: Config) type {
             return self.privilegedRole(snap) or self.catalog_objects.memberOf(self.session.role, owner, true, snap);
         }
 
+        fn largeObjectView(original_snap: Snapshot) Error!Snapshot {
+            var visible = original_snap;
+            visible.cid = std.math.add(u32, visible.cid, 1) catch return error.ProgramLimitExceeded;
+            return visible;
+        }
+
+        fn addLargePageChange(self: *Self, slot: u16, page_change: large_object_pages.Pages.Change) void {
+            const missing = large_object_pages.Pages.no_version;
+            self.txs[slot].push(.{
+                .kind = .large_object_page, .table = 0,
+                .old = page_change.previous orelse missing, .new = page_change.replacement orelse missing,
+            }) catch unreachable;
+        }
+
+        fn largePageMutation(self: *const Self, slot: u16, original_snap: Snapshot, snap: Snapshot) large_object_pages.Mutation {
+            return .{
+                .snapshot = snap, .command = original_snap.cid,
+                .owner = self.txs[slot].ref(slot), .horizon = self.horizon(),
+            };
+        }
+
+        fn stageLargeObjectWrite(self: *Self, slot: u16, oid: u32, offset: u64, input: []const u8, original_snap: Snapshot) Error!void {
+            if (self.txs[slot].read_only) return error.ReadOnlyTransaction;
+            if (offset > large_object_pages.max_size or input.len > large_object_pages.max_size - offset) return error.InvalidParameterValue;
+            const snap = try largeObjectView(original_snap);
+            const index = (try self.lockLargeObject(slot, oid, snap)) orelse return error.UndefinedObject;
+            var object = self.catalog_objects.items[index];
+            if (self.largeObjectPrivileges(&object, self.session.role, snap) & CO.priv_update == 0) return error.InsufficientPrivilege;
+            if (input.len == 0) return;
+            const pages = if (self.large_pages) |*value| value else return error.UnsupportedStatement;
+            const size = large_object_pages.page_bytes;
+            const end = offset + input.len;
+            const previous = object.largeObjectLength();
+            const already_locked = object.xmin_csn == 0 and snap.own(object.xmin);
+            const replace_metadata = end > previous or !already_locked;
+            const touched: usize = @intCast((end - 1) / size - offset / size + 1);
+            try self.reserveWrites(slot, touched + if (replace_metadata) @as(usize, 2) else 0);
+            if (replace_metadata) {
+                try object.setLargeObjectLength(@max(previous, end));
+                self.objectDelete(slot, index, original_snap);
+                _ = try self.objectInsert(slot, &object, false, original_snap);
+            }
+
+            const mutation = self.largePageMutation(slot, original_snap, snap);
+            var used: usize = 0;
+            while (used < input.len) {
+                const position = offset + used;
+                const chunk = @min(size - @as(usize, @intCast(position % size)), input.len - used);
+                var change: [1]large_object_pages.Pages.Change = undefined;
+                _ = try pages.stageWrite(oid, position, input[used..][0..chunk], mutation, &change);
+                self.addLargePageChange(slot, change[0]);
+                used += chunk;
+            }
+        }
+
+        fn largeObjectDataCall(ptr: *anyopaque, operation: value_module.LargeObjectData, oid: u32, offset: i64, input: []const u8, output: []u8, requested: ?usize) Error!usize {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            const slot = self.seq_slot;
+            const original_snap = self.seq_snap;
+            if (operation == .create) {
+                const object = try largeObjectCall(ptr, true, oid);
+                try self.stageLargeObjectWrite(slot, object, 0, input, original_snap);
+                return object;
+            }
+            if (offset < 0 or offset > large_object_pages.max_size) return error.InvalidParameterValue;
+            const snap = try largeObjectView(original_snap);
+            const key: O.Object = .{ .kind = .large_object, .target = oid };
+            const index = self.catalog_objects.findKey(&key, snap) orelse return error.UndefinedObject;
+            const object = &self.catalog_objects.items[index];
+            if (self.largeObjectPrivileges(object, self.session.role, snap) & CO.priv_select == 0) return error.InsufficientPrivilege;
+            const at: u64 = @intCast(offset);
+            const length = object.largeObjectLength();
+            const count = if (requested) |limit| @min(length -| at, limit) else length -| at;
+            if (count > output.len) return error.TextCapacity;
+            if (count == 0) return 0;
+            const pages = if (self.large_pages) |*value| value else return error.UnsupportedStatement;
+            return try pages.read(oid, length, at, output[0..@intCast(count)], snap);
+        }
+
+        fn unlinkLargeObjectPages(self: *Self, slot: u16, oid: u32, original_snap: Snapshot, snap: Snapshot) Error!void {
+            const pages = if (self.large_pages) |*value| value else return;
+            const mutation = self.largePageMutation(slot, original_snap, snap);
+            var cursor: large_object_pages.Pages.Cursor = .{};
+            while (cursor.next(pages, snap)) |page| {
+                if (page.key.oid != oid) continue;
+                try self.reserveWrites(slot, 1);
+                if (try pages.stagePage(page.key, null, mutation)) |change| self.addLargePageChange(slot, change);
+            }
+        }
+
         fn largeObjectCall(ptr: *anyopaque, create: bool, oid: u32) Error!u32 {
             const self: *Self = @ptrCast(@alignCast(ptr));
             const slot = self.seq_slot;
             const original_snap = self.seq_snap;
             if (self.txs[slot].read_only) return error.ReadOnlyTransaction;
             // VOLATILE calls see writes from earlier calls in the same statement.
-            var snap = original_snap;
-            snap.cid = std.math.add(u32, snap.cid, 1) catch return error.ProgramLimitExceeded;
+            const snap = try largeObjectView(original_snap);
             if (create) {
                 const role = self.session.role;
                 const owner_key: O.Object = .{ .kind = .role, .oid = role };
@@ -3981,6 +4128,7 @@ pub fn Database(comptime config: Config) type {
             for (&self.catalog_objects.items) |*entry| {
                 if (O.visible(entry, snap) and isLargeObjectChild(entry, oid)) writes += 1;
             }
+            if (self.catalog_objects.items[index].largeObjectLength() != 0) try self.unlinkLargeObjectPages(slot, oid, original_snap, snap);
             try self.reserveWrites(slot, writes);
             for (&self.catalog_objects.items, 0..) |*entry, child| {
                 if (O.visible(entry, snap) and isLargeObjectChild(entry, oid)) self.objectDelete(slot, child, original_snap);
@@ -6841,7 +6989,24 @@ pub fn Database(comptime config: Config) type {
             if (view == .pg_event_trigger) return;
             // Publication metadata does not create logical replication subscriptions.
             if (view == .pg_subscription) return;
-            if (view == .pg_largeobject) return;
+            if (view == .pg_largeobject) {
+                if (!self.catalog_objects.superuser(session_values.role, snapshot)) return error.InsufficientPrivilege;
+                const pages = if (self.large_pages) |*store| store else return;
+                const include_data = sink.referencesColumn(2);
+                var cursor: large_object_pages.Pages.Cursor = .{};
+                while (cursor.next(pages, snapshot)) |item| {
+                    var data: Cell = .null_value;
+                    if (include_data) {
+                        data = .{ .bytea = .{} };
+                        const bytes = pages.versionBytes(item.version);
+                        if (bytes.len > data.bytea.bytes.len) return error.TextCapacity;
+                        data.bytea.len = bytes.len;
+                        @memcpy(data.bytea.bytes[0..bytes.len], bytes);
+                    }
+                    try sink.add(&.{ intCell(item.key.oid), intCell(item.key.page), data });
+                }
+                return;
+            }
             // There are no security label providers.
             if (view == .pg_seclabel or view == .pg_shseclabel or view == .pg_seclabels) return;
             // Index comparisons use the store's typed comparator, with no
@@ -9552,7 +9717,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn statementHooks(self: *Self, slot: u16, snap: Snapshot) void {
-            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .large_object = &largeObjectCall, .relation_name = &relationName, .relation_display_name = &relationDisplayName, .catalog_text = &catalogText, .schema_path = &catalogSchemaPath, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .view_definition = &postgresViewDefinition, .trigger_definition = &postgresTriggerDefinition, .statistics_columns = &postgresStatisticsColumns, .relation_publishable = &relationPublishable, .partition_key_definition = &postgresPartitionKey, .partition_ancestors = &postgresPartitionAncestors, .namespace_lookup = &postgresNamespaceLookup, .namespace_name = &postgresNamespaceName, .routine_lookup = &postgresRoutineLookup, .routine_name = &postgresRoutineName };
+            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .large_object = &largeObjectCall, .large_object_data = &largeObjectDataCall, .relation_name = &relationName, .relation_display_name = &relationDisplayName, .catalog_text = &catalogText, .schema_path = &catalogSchemaPath, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .view_definition = &postgresViewDefinition, .trigger_definition = &postgresTriggerDefinition, .statistics_columns = &postgresStatisticsColumns, .relation_publishable = &relationPublishable, .partition_key_definition = &postgresPartitionKey, .partition_ancestors = &postgresPartitionAncestors, .namespace_lookup = &postgresNamespaceLookup, .namespace_name = &postgresNamespaceName, .routine_lookup = &postgresRoutineLookup, .routine_name = &postgresRoutineName };
             self.session.sequences = &self.seq_hook;
             self.seq_slot = slot;
             self.seq_snap = snap;
@@ -10011,6 +10176,11 @@ pub fn Database(comptime config: Config) type {
                     .object_delete => {
                         try writer.op(.object_drop);
                         try O.encodeDrop(writer, &self.catalog_objects.items[entry.old]);
+                    },
+                    .large_object_page => {
+                        const pages = &self.large_pages.?;
+                        const change = pages.changeFromVersions(entry.old, entry.new);
+                        try change_log.encodeLargeObjectPage(writer, change.key, if (change.replacement) |version| pages.versionBytes(version) else null);
                     },
                 }
             }
@@ -12974,6 +13144,7 @@ pub fn Database(comptime config: Config) type {
             };
             self.reclaimTables(at);
             freed += self.catalog_objects.vacuum(at);
+            if (self.large_pages) |*pages| freed += pages.reclaim(at);
             return freed + self.catalog.vacuum(at);
         }
 

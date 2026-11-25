@@ -1497,6 +1497,19 @@ pub fn Objects(comptime config: types.Config) type {
             enum_label_count: u16 = 0,
             composite_field_count: u16 = 0,
 
+            pub fn largeObjectLength(self: *const Object) u64 {
+                if (comptime text_capacity < 8) return 0;
+                return if (self.text_len == 8) @import("std").mem.readInt(u64, self.text[0..8], .little) else 0;
+            }
+
+            pub fn setLargeObjectLength(self: *Object, length: u64) Error!void {
+                self.text_len = 0;
+                if (length == 0) return;
+                if (comptime text_capacity < 8) return error.TextCapacity;
+                @import("std").mem.writeInt(u64, self.text[0..8], length, .little);
+                self.text_len = 8;
+            }
+
             pub fn oidWidth(self: *const Object) u32 {
                 if (self.kind == .composite_type) return 3;
                 if (userType(self.kind)) return 2 + @as(u32, self.enum_label_count);
@@ -2043,7 +2056,8 @@ pub fn Objects(comptime config: types.Config) type {
                     (o.flags == 0 or (o.flags & member_configured != 0 and o.flags & ~(member_configured | member_inherit | member_set) == 0)) and
                     o.grant_flags <= member_admin and o.role_count == 0 and o.text_len == 0 and o.target != o.grantee,
                 .acl => !has_name and o.flags != 0 and o.flags & ~table_privileges == 0 and o.grant_flags & ~o.flags == 0 and o.role_count == 0 and o.text_len == 0 and o.owner != 0,
-                .large_object => !has_name and o.owner != 0 and o.role_count == 0 and o.text_len == 0 and
+                .large_object => !has_name and o.owner != 0 and o.role_count == 0 and
+                    (o.text_len == 0 or (o.text_len == 8 and o.largeObjectLength() != 0 and o.largeObjectLength() <= @import("large_object_pages.sig").max_size)) and o.split == 0 and
                     (o.grant_flags == 0 or (o.grant_flags == large_object_generated_oid and o.target >= first_oid and o.target < 0xffff_ffff)) and
                     (o.flags == 0 or (o.flags & large_object_explicit_acl != 0 and o.flags & ~(large_object_explicit_acl | large_object_privileges) == 0)),
                 .large_object_acl => !has_name and o.owner != 0 and o.role_count == 0 and o.text_len == 0 and o.grant_flags == 0 and
@@ -2165,6 +2179,7 @@ pub fn Objects(comptime config: types.Config) type {
             owner: u32 = 0,
             publication_all_tables: bool = false,
             large_object_explicit_acl: bool = false,
+            large_object_length: u64 = 0,
             roles: [role_capacity]u32 = @splat(0),
             role_count: u8 = 0,
             name: V.Name = .{},
@@ -2181,6 +2196,7 @@ pub fn Objects(comptime config: types.Config) type {
                 out.oid_width = o.oidWidth();
                 out.publication_all_tables = o.kind == .publication and o.flags & pub_all_tables != 0;
                 out.large_object_explicit_acl = o.kind == .large_object and o.flags & large_object_explicit_acl != 0;
+                if (o.kind == .large_object) out.large_object_length = o.largeObjectLength();
                 if (o.kind == .statistics) out.last_statistics_column = o.text[o.text_len - 1];
                 if (userType(o.kind)) {
                     const name = o.arrayName();
@@ -2210,6 +2226,13 @@ pub fn Objects(comptime config: types.Config) type {
                     if (@as(u64, v.oid) < @as(u64, oid) + width and @as(u64, oid) < @as(u64, v.oid) + v.oid_width) return true;
                 }
                 return false;
+            }
+
+            pub fn largeObjectLength(self: *const Overlay, oid: u32) ?u64 {
+                for (&self.items) |*item| {
+                    if (item.live and item.kind == .large_object and item.target == oid) return item.large_object_length;
+                }
+                return null;
             }
 
             pub fn roleExists(self: *const Overlay, oid: u32) bool {

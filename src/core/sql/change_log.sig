@@ -128,6 +128,7 @@ const range = @import("range.sig");
 const network = @import("network.sig");
 const routine_catalog = @import("routine_catalog.sig");
 const catalog_objects = @import("catalog_objects.sig");
+const LargePages = @import("large_object_pages.sig");
 const text_search = @import("text_search.sig");
 const Error = types.Error;
 
@@ -153,7 +154,7 @@ pub const constraint_identity_format_version: u16 = 4;
 pub const primary_index_identity_format_version: u16 = 5;
 pub const default_identity_format_version: u16 = 6;
 
-pub const Op = enum(u8) { create_table = 1, drop_table = 2, insert = 3, update = 4, delete = 5, catalog_counters = 6, create_sequence = 7, drop_sequence = 8, sequence = 9, truncate = 11, alter_table = 12, create_sequence_cached = 13, alter_sequence = 14, create_schema = 15, drop_schema = 16, catalog_counters_with_constraints = 17, create_owned_schema = 18, create_private_schema = 19, catalog_counters_with_defaults = 20, create_scoped_identity_sequence = 21, create_scoped_sequence = 22, alter_sequence_ownership = 23, create_scoped_serial_sequence = 24, create_routine = 60, drop_routine = 61, create_trigger = 62, drop_trigger = 63, create_rule = 64, drop_rule = 65, object_create = 70, object_drop = 71 };
+pub const Op = enum(u8) { create_table = 1, drop_table = 2, insert = 3, update = 4, delete = 5, catalog_counters = 6, create_sequence = 7, drop_sequence = 8, sequence = 9, truncate = 11, alter_table = 12, create_sequence_cached = 13, alter_sequence = 14, create_schema = 15, drop_schema = 16, catalog_counters_with_constraints = 17, create_owned_schema = 18, create_private_schema = 19, catalog_counters_with_defaults = 20, create_scoped_identity_sequence = 21, create_scoped_sequence = 22, alter_sequence_ownership = 23, create_scoped_serial_sequence = 24, create_routine = 60, drop_routine = 61, create_trigger = 62, drop_trigger = 63, create_rule = 64, drop_rule = 65, object_create = 70, object_drop = 71, large_object_page = 72 };
 
 fn Unsigned(comptime T: type) type {
     return switch (T) {
@@ -238,6 +239,32 @@ pub const Writer = struct {
         return self.used;
     }
 };
+
+const LargePageRecord = struct { key: LargePages.Key, bytes: ?[]const u8 };
+
+/// Version 1, op 72: object OID, page number, and a complete page image.
+/// The 0xffff length represents removal of a present page.
+pub fn encodeLargeObjectPage(writer: *Writer, key: LargePages.Key, bytes: ?[]const u8) Error!void {
+    if (key.oid == 0 or key.page > LargePages.end_page) return error.InvalidParameterValue;
+    if (bytes) |data| {
+        if (data.len > LargePages.page_bytes or (key.page == LargePages.end_page and data.len != 0))
+            return error.InvalidParameterValue;
+    }
+    try writer.op(.large_object_page);
+    try writer.int(u32, key.oid);
+    try writer.int(u32, key.page);
+    try writer.int(u16, if (bytes) |data| @intCast(data.len) else 0xffff);
+    if (bytes) |data| try writer.bytes(data);
+}
+
+fn decodeLargeObjectPage(reader: *Reader) Error!LargePageRecord {
+    const key: LargePages.Key = .{ .oid = try reader.int(u32), .page = try reader.int(u32) };
+    const size = try reader.int(u16);
+    if (key.oid == 0 or key.page > LargePages.end_page) return error.InvalidChangeRecord;
+    if (size == 0xffff) return .{ .key = key, .bytes = null };
+    if (size > LargePages.page_bytes or (key.page == LargePages.end_page and size != 0)) return error.InvalidChangeRecord;
+    return .{ .key = key, .bytes = try reader.take(size) };
+}
 
 const Reader = struct {
     bytes: []const u8,
@@ -795,6 +822,88 @@ pub fn ChangeLog(comptime config: types.Config) type {
         };
         const VSchema = struct { live: bool = false, oid: u32 = 0, owner: u32 = catalog_objects.bootstrap_role, private_usage: bool = false, name: V.Name = .{} };
 
+        const PageOverlay = struct {
+            const write_capacity: usize = if (config.tx_writes == 0) @max(config.rows_per_table * 2, 64) else config.tx_writes;
+            const cap = @as(usize, write_capacity) * @as(usize, 2);
+            const Entry = struct { key: u64 = 0, size: ?u16 = null };
+            items: [cap]Entry = undefined,
+            active: bool = false,
+            live: usize = 0,
+            audit: bool = false,
+
+            fn position(self: *const PageOverlay, key: LargePages.Key) Error!usize {
+                const id = key.rowId();
+                var at: usize = @intCast((id *% 0x9e3779b97f4a7c15 ^ (id >> 29)) % cap);
+                for (0..cap) |_| {
+                    if (self.items[at].key == 0 or self.items[at].key == id) return at;
+                    at = (at + 1) % cap;
+                }
+                return error.ChangeRecordConflict;
+            }
+
+            fn validate(self: *PageOverlay, page: LargePageRecord, pages: *const LargePages.Pages, catalog_overlay: *const O.Overlay, at: u64) Error!void {
+                if (!self.active) {
+                    self.items = @splat(.{});
+                    self.live = pages.committed_count;
+                    self.active = true;
+                }
+                const length = catalog_overlay.largeObjectLength(page.key.oid) orelse return error.ChangeRecordConflict;
+                const found = try self.position(page.key);
+                const entry = &self.items[found];
+                const existed = if (entry.key == 0) pages.page(page.key, .{ .csn = at }) != null else entry.size != null;
+                if (page.bytes) |data| {
+                    if (!pageFits(page.key, data.len, length)) return error.ChangeRecordConflict;
+                    if (!existed) {
+                        if (self.live == pages.capacity()) return error.ChangeRecordConflict;
+                        self.live += 1;
+                    }
+                } else {
+                    if (!existed) return error.ChangeRecordConflict;
+                    self.live -= 1;
+                }
+                entry.* = .{ .key = page.key.rowId(), .size = if (page.bytes) |data| @intCast(data.len) else null };
+            }
+
+            fn finish(self: *const PageOverlay, db: anytype, catalog_overlay: *const O.Overlay) Error!void {
+                if (self.active) {
+                    for (&self.items) |*entry| {
+                        const size = entry.size orelse continue;
+                        const key: LargePages.Key = .{ .oid = @truncate(entry.key >> 32), .page = @truncate(entry.key) };
+                        const length = catalog_overlay.largeObjectLength(key.oid) orelse return error.ChangeRecordConflict;
+                        if (!pageFits(key, size, length)) return error.ChangeRecordConflict;
+                    }
+                }
+                if (!self.audit) return;
+                const pages = &db.large_pages.?;
+                const snapshot: storage.Snapshot = .{ .csn = db.csn };
+                var may_have_removed_pages = false;
+                for (&db.catalog_objects.items) |*object| {
+                    if (object.kind != .large_object or !O.visible(object, snapshot)) continue;
+                    if ((catalog_overlay.largeObjectLength(object.target) orelse 0) < object.largeObjectLength()) {
+                        may_have_removed_pages = true;
+                        break;
+                    }
+                }
+                if (!may_have_removed_pages) return;
+                var cursor: LargePages.Pages.Cursor = .{};
+                var previous_oid: u32 = 0;
+                var length: ?u64 = null;
+                while (cursor.next(pages, snapshot)) |item| {
+                    if (self.active and self.items[try self.position(item.key)].key != 0) continue;
+                    if (item.key.oid != previous_oid) {
+                        previous_oid = item.key.oid;
+                        length = catalog_overlay.largeObjectLength(item.key.oid);
+                    }
+                    if (!pageFits(item.key, pages.versionBytes(item.version).len, length orelse return error.ChangeRecordConflict))
+                        return error.ChangeRecordConflict;
+                }
+            }
+        };
+
+        fn pageFits(key: LargePages.Key, size: usize, length: u64) bool {
+            return @as(u64, key.page) * LargePages.page_bytes + size <= length;
+        }
+
         /// Caller-owned replay overlay. Bounded by 2 x rows x tables live
         /// entries (rows touched from the database plus rows created by the
         /// record that are still alive) at <= 50% load. Reset is O(1).
@@ -809,6 +918,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
             objects: RC.Overlay = .{},
             /// Catalog objects (catalog-security lane, catalog_objects.sig).
             object_overlay: O.Overlay = .{},
+            large_pages: PageOverlay = .{},
         };
 
         /// What object ops (routine_catalog.validateOp) may ask the overlay.
@@ -1846,6 +1956,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
             }
             RC.beginOverlay(&scratch.objects, &db.objects);
             scratch.object_overlay.init(&db.catalog_objects);
+            scratch.large_pages.active = false;
+            scratch.large_pages.audit = false;
             var next_oid: u32 = first_oid + db.oid_counter;
             var next_constraint_oid = db.next_constraint_oid;
             var next_default_oid = db.next_default_oid;
@@ -2203,12 +2315,21 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     },
                     @intFromEnum(Op.object_create) => {
                         const object = try O.decodeCreate(record, &reader.position);
+                        if (object.kind == .large_object and object.largeObjectLength() != 0 and db.large_pages == null)
+                            return error.ChangeRecordConflict;
                         try scratch.object_overlay.create(&object, &object_check);
                     },
                     @intFromEnum(Op.object_drop) => {
                         const key = try O.decodeDrop(record, &reader.position);
+                        if (key.kind == .large_object and (scratch.object_overlay.largeObjectLength(key.target) orelse 0) != 0)
+                            scratch.large_pages.audit = true;
                         try scratch.object_overlay.drop(&key);
                         check_schema_owners = check_schema_owners or key.kind == .role;
+                    },
+                    @intFromEnum(Op.large_object_page) => {
+                        const page = try decodeLargeObjectPage(&reader);
+                        if (!db.replayQuiescent() or db.large_pages == null) return error.ChangeRecordConflict;
+                        try scratch.large_pages.validate(page, &db.large_pages.?, &scratch.object_overlay, db.csn);
                     },
                     else => return error.UnsupportedLogVersion,
                 }
@@ -2225,6 +2346,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
             }
             // Objects never outlive the tables, roles and objects they name.
             try scratch.object_overlay.finish(&object_check);
+            try scratch.large_pages.finish(db, &scratch.object_overlay);
             if (check_routine_references or check_schema_owners) try RC.finishOverlay(&scratch.objects, &scratch.object_overlay);
             if (check_schema_owners) for (&scratch.schemas) |*schema| {
                 if (schema.live and !scratch.object_overlay.roleExists(scratch.object_overlay.schemaOwner(schema.oid, schema.owner))) return error.ChangeRecordConflict;
@@ -2328,9 +2450,20 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 const bank = table.key_index;
                 if (rangesOverlap(scratch_start, @sizeOf(Scratch), @intFromPtr(bank.ptr), bank.len * @sizeOf(u32))) return error.InvalidParameterValue;
             };
+            if (db.large_pages) |*pages| {
+                const backing = pages.backing();
+                inline for (.{ "rows", "versions", "version_rows", "row_index", "key_index" }) |field| {
+                    const bank = @field(backing, field);
+                    const bytes = bank.len * @sizeOf(@TypeOf(bank[0]));
+                    if (rangesOverlap(scratch_start, @sizeOf(Scratch), @intFromPtr(bank.ptr), bytes) or
+                        rangesOverlap(@intFromPtr(record.ptr), record.len, @intFromPtr(bank.ptr), bytes))
+                        return error.InvalidParameterValue;
+                }
+            }
             try validate(db, record, scratch, image);
             // Validated: the remaining errors are unreachable invariants.
             const csn = if (comptime @TypeOf(image) == BaseImageRecord) image.csn else db.csn + 1;
+            if (scratch.large_pages.active) db.large_pages.?.replayStart(db.csn);
             db.epoch +%= 1;
             if (db.epoch == 0) db.epoch = 1;
             db.cid +%= 1;
@@ -2505,6 +2638,10 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     @intFromEnum(Op.object_drop) => {
                         const key = try O.decodeDrop(record, &reader.position);
                         db.catalog_objects.applyDrop(&key);
+                    },
+                    @intFromEnum(Op.large_object_page) => {
+                        const page = try decodeLargeObjectPage(&reader);
+                        db.large_pages.?.replay(page.key, page.bytes, csn);
                     },
                     else => return error.UnsupportedLogVersion,
                 }

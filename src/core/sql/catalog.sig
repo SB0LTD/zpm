@@ -223,6 +223,9 @@ pub const builtin_callbacks = [_]BuiltinCallback{
     .{ .oid = 715, .name = "lo_create", .args = &.{26}, .result = 26, .volatility = 'v', .source = "be_lo_create" },
     .{ .oid = 957, .name = "lo_creat", .args = &.{23}, .result = 26, .volatility = 'v', .source = "be_lo_creat" },
     .{ .oid = 964, .name = "lo_unlink", .args = &.{26}, .result = 23, .volatility = 'v', .source = "be_lo_unlink" },
+    .{ .oid = 3457, .name = "lo_from_bytea", .args = &.{ 26, 17 }, .result = 26, .volatility = 'v', .source = "be_lo_from_bytea" },
+    .{ .oid = 3458, .name = "lo_get", .args = &.{26}, .result = 17, .volatility = 'v', .source = "be_lo_get" },
+    .{ .oid = 3459, .name = "lo_get", .args = &.{ 26, 20, 23 }, .result = 17, .volatility = 'v', .source = "be_lo_get_fragment" },
     .{ .oid = 6177, .name = "date_bin", .args = &.{ 1186, 1114, 1114 }, .result = 1114, .source = "timestamp_bin" },
     .{ .oid = 6178, .name = "date_bin", .args = &.{ 1186, 1184, 1184 }, .result = 1184, .source = "timestamptz_bin" },
 } ++ overlap_callbacks;

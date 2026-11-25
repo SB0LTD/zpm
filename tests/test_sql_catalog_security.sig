@@ -1370,7 +1370,7 @@ fn changeRecords() !void {
     const comment_tail = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } ++ [_]u8{ 0, 0, 1, 0, 'c', 0, 0 };
     try replayFails(objectRecord(&buffer, 70, 6, 0, 16384, 1259, 9, &comment_tail), error.ChangeRecordConflict);
     // Ops 72..79 are reserved for this lane: unknown today.
-    try replayFails(objectRecord(&buffer, 72, 1, 20000, 0, 0, 0, &tail_ok), error.UnsupportedLogVersion);
+    try replayFails(objectRecord(&buffer, 73, 1, 20000, 0, 0, 0, &tail_ok), error.UnsupportedLogVersion);
     try check(replica.oid_counter == before);
     try sameState();
     // A record that is valid applies (a role created by a crafted op).
