@@ -10,6 +10,40 @@ const std = @import("std");
 
 pub const Error = error{ NotDxbc, Truncated, NoShader, BadToken };
 
+// ── The empty pixel shader ─────────────────────────────────────────────────
+
+/// A ps_5_0 with no inputs, no outputs and one `ret`: what a draw with no
+/// pixel shader bound runs (Direct3D draws it: depth and stencil only, no
+/// colour written), so the pipeline of such a draw is one more pair.
+pub const empty_pixel_shader: [96]u8 = blk: {
+    var b = [_]u8{0} ** 96;
+    const W = struct {
+        fn put(x: *[96]u8, at: usize, v: u32) void {
+            std.mem.writeInt(u32, x[at..][0..4], v, .little);
+        }
+    };
+    @memcpy(b[0..4], "DXBC");
+    W.put(&b, 20, 1); // version
+    W.put(&b, 24, 96); // total size
+    W.put(&b, 28, 3); // chunks: ISGN, OSGN, SHEX
+    W.put(&b, 32, 44);
+    W.put(&b, 36, 60);
+    W.put(&b, 40, 76);
+    // the signatures: no elements (count 0, then 8 as every one says)
+    for ([_]struct { at: usize, tag: *const [4]u8 }{ .{ .at = 44, .tag = "ISGN" }, .{ .at = 60, .tag = "OSGN" } }) |s| {
+        @memcpy(b[s.at..][0..4], s.tag);
+        W.put(&b, s.at + 4, 8);
+        W.put(&b, s.at + 12, 8);
+    }
+    // the program: ps_5_0 (type 0, 5.0), 3 tokens long, ret
+    @memcpy(b[76..80], "SHEX");
+    W.put(&b, 80, 12);
+    W.put(&b, 84, 0x50);
+    W.put(&b, 88, 3);
+    W.put(&b, 92, 0x0100003e);
+    break :blk b;
+};
+
 // ── The container ──────────────────────────────────────────────────────────
 
 /// "DXBC", a 16-byte checksum, version 1, the total size, the chunk count,
@@ -731,6 +765,19 @@ test "Shader Model 5 (SHEX, the same tokens)" {
     try testing.expect(n > 10);
     const c = try Container.parse(&fixtures.vs50);
     try testing.expectEqual(@as(u8, 5), (try c.program()).major);
+}
+
+test "the empty pixel shader: a ps_5_0 with no signature elements and one ret" {
+    const c = try Container.parse(&empty_pixel_shader);
+    const p = try c.program();
+    try testing.expectEqual(Stage.pixel, p.stage);
+    try testing.expectEqual(@as(u8, 5), p.major);
+    try testing.expectEqual(@as(u32, 0), c.signature(false).?.count);
+    try testing.expectEqual(@as(u32, 0), c.signature(true).?.count);
+    var o: [4]Op = undefined;
+    const n = try ops(&empty_pixel_shader, &o);
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expectEqual(Op.ret, o[0]);
 }
 
 test "damaged blobs are refused, never read past" {

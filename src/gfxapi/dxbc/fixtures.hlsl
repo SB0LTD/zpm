@@ -51,3 +51,61 @@ float4 ps_int(VSOut i) : SV_Target
     int d = y / 3;
     return float4(m / 255.0, d / 127.0, abs(y) / 128.0, (x & 1u) ? 1.0 : 0.0);
 }
+
+// Early returns: inside an if, and inside a loop (ret inside flow).
+float4 ps_early(VSOut i) : SV_Target
+{
+    if (i.color.r > 0.75)
+        return float4(1, 0, 0, 1);
+    float4 acc = 0;
+    [loop] for (int k = 0; k < 8; k++) {
+        acc += i.color * 0.125;
+        if (acc.g > i.color.b * 0.5)
+            return acc;
+    }
+    return float4(0, 0, 1, 1);
+}
+
+// A pixel shader reading a structured buffer (t1): the entry the colour's
+// red names, times the tint.
+StructuredBuffer<float4> sb : register(t1);
+
+float4 ps_sbuf(VSOut i) : SV_Target
+{
+    return sb[(uint)(i.color.x * 3.0 + 0.5)] * tint;
+}
+
+// The RTX's texture unit's forms: a 2D array's comparisons (one at a
+// texel offset), a mipmapped texture at a level between two, a texel of
+// its second level fetched (ld, at an offset), and a cube map across a
+// face's edges (its taps fetched through the unit, the filter the
+// program's).
+Texture2DArray<float> shadow : register(t0);
+SamplerComparisonState cmp : register(s0);
+Texture2D mipped : register(t1);
+SamplerState lin : register(s1);
+TextureCube sky : register(t2);
+
+float4 ps_unit(VSOut i) : SV_Target
+{
+    float2 uv = i.color.xy;
+    float s = shadow.SampleCmpLevelZero(cmp, float3(uv, 1), 0.5);
+    s += shadow.SampleCmpLevelZero(cmp, float3(uv, 2), 0.5, int2(1, -1));
+    float4 m = mipped.SampleLevel(lin, uv, 0.5);
+    float4 t = mipped.Load(int3(uv * 4.0, 1), int2(1, 0));
+    float4 c = sky.SampleLevel(lin, float3(1.0, uv.y * 2.4 - 1.2, uv.x * 2.4 - 1.2), 0);
+    return float4(s * 0.5, m.g, m.b * 0.5 + t.r * 0.5, t.g * 0.5 + c.r * 0.25 + c.b * 0.25);
+}
+
+// Implicit levels of detail (derivatives across the quad): the mipmapped
+// texture minified (16 repeats over the target: four texels a pixel, level
+// 2), once in straight code and once under an if (a constant's, every quad
+// one way): both read level 2.
+float4 ps_grad(VSOut i) : SV_Target
+{
+    float a = mipped.Sample(lin, i.color.xy * 16.0).r;
+    float b = 0;
+    [branch] if (tint.w > 0.5)
+        b = mipped.Sample(lin, i.color.yx * 16.0).r;
+    return float4(a, b, 0, 1);
+}

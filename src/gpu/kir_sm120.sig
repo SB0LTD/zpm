@@ -307,7 +307,7 @@ const Region = struct {
 
 /// What a compile works in: State for programs up to the limits above
 /// (Galaxy's gfx_render gives 16 MiB: WORK_BYTES fits), LargeState for
-/// larger ones (a Direct3D program's, Unigine's up to about 22,500 KIR
+/// larger ones (a Direct3D program's: Unigine's largest about 37,000 KIR
 /// instructions: LARGE_WORK_BYTES, for callers whose memory is given a
 /// page at a time as it is touched; only what a program needs is).
 pub const Limits = struct {
@@ -318,9 +318,9 @@ pub const Limits = struct {
     /// Machine instructions the assembler takes.
     instrs: usize = sm120_asm.MAX_INSTRS,
 };
-/// Twice the limits (virtual registers stay below NOV; machine
+/// Three times the limits (virtual registers stay below NOV; machine
 /// instructions below label_at's u16).
-pub const LARGE: Limits = .{ .insts = 2 * MAX_INSTS, .vregs = 2 * MAX_VREGS, .mi = 2 * MAX_MI, .text = 2 * TEXT_BYTES, .instrs = 2 * sm120_asm.MAX_INSTRS };
+pub const LARGE: Limits = .{ .insts = 3 * MAX_INSTS, .vregs = 3 * MAX_VREGS, .mi = 3 * MAX_MI, .text = 3 * TEXT_BYTES, .instrs = 3 * sm120_asm.MAX_INSTRS };
 comptime {
     std.debug.assert(LARGE.vregs < NOV and LARGE.mi < 1 << 16);
 }
@@ -353,6 +353,9 @@ pub fn StateOf(comptime L: Limits) type {
         n_mi: usize = 0,
         /// KIR instructions after the expansions.
         n_kir: u32 = 0,
+        /// Options.uni_bank's bytes the program reads through constant
+        /// buffer 1 (0: none).
+        bank1: u32 = 0,
         nv: u32 = 0,
         cls: [L.vregs]Cls = undefined,
         /// A register's unit (an aligned run it is allocated in) and place.
@@ -435,6 +438,11 @@ pub const Options = struct {
     /// A stage's attribute words and outputs: the binding its loads and
     /// stores name (one the kernel declares, never bound to memory).
     stage_io: u8 = 0xff,
+    /// A graphics stage's binding the draw binds as constant buffer 1
+    /// (raster's uniforms): its loads at a fixed place in the first 32 KiB
+    /// are LDC c[0x1][..], the constant cache's (a word each warp reads
+    /// once, helper lanes too), not LDG; EXTRA_BANK1 says the bytes read.
+    uni_bank: u8 = 0xff,
     /// A compute kernel's straight-line runs list-scheduled (see
     /// Ctx.schedule); off, the machine instructions stay in KIR's order. A
     /// kernel the registers cannot hold scheduled is compiled again
@@ -509,6 +517,9 @@ pub const EXTRA_PARAM_BYTES = 3;
 /// after the expansions (MAX_INSTS), and machine instructions and labels
 /// before the text (MAX_MI) << 16 | virtual registers / 2 (MAX_VREGS).
 pub const EXTRA_KIR = 4;
+/// A graphics stage's bytes of Options.uni_bank's binding it reads as
+/// constant buffer 1 (0: it reads none so; the draw need not bind it).
+pub const EXTRA_BANK1 = 8;
 pub const EXTRA_MI_VREGS = 5;
 
 // ── Compiling ───────────────────────────────────────────────────────────────
@@ -556,6 +567,7 @@ pub fn compileIn(k: *const kir.Kernel, caps: device.Caps, st: anytype, out: []u8
     bin.extra[EXTRA_PARAM_BYTES] = ak.params;
     bin.extra[EXTRA_KIR] = st.n_kir;
     bin.extra[EXTRA_MI_VREGS] = @as(u32, @intCast(st.n_mi)) << 16 | (st.nv >> 1);
+    bin.extra[EXTRA_BANK1] = st.bank1;
     return bin;
 }
 
@@ -573,8 +585,10 @@ pub fn compileText(k: *const kir.Kernel, caps: device.Caps, st: anytype, opts: O
 
 fn compileTextOnce(k: *const kir.Kernel, caps: device.Caps, st: anytype, opts: Options) Error![]const u8 {
     const gen = genOf(caps.target) orelse SM120;
+    st.bank1 = 0;
     var c = CtxOf(@TypeOf(st.*)){ .w = st, .caps = caps, .gen = gen, .k = k, .opts = opts };
     try c.expand();
+    c.forward();
     try c.analyze();
     try c.lower();
     c.dce();
@@ -634,7 +648,7 @@ fn CtxOf(comptime St: type) type {
             if (k.err) |e| return e;
             if (k.n > c.w.insts.len or k.nv > c.w.tys.len) {
                 noteSize(k);
-                return tooBig(if (c.w.insts.len > MAX_INSTS) "more than LARGE's instructions or values (twice MAX_INSTS, MAX_VREGS)" else "more than MAX_INSTS instructions or MAX_VREGS values (and no work memory for LargeState)");
+                return tooBig(if (c.w.insts.len > MAX_INSTS) "more than LARGE's instructions or values (three times MAX_INSTS, MAX_VREGS)" else "more than MAX_INSTS instructions or MAX_VREGS values (and no work memory for LargeState)");
             }
             var x = kir.Kernel.init(.{ .insts = &c.w.insts, .tys = &c.w.tys }, k.name, k.group);
             x.shared_bytes = k.shared_bytes;
@@ -653,6 +667,123 @@ fn CtxOf(comptime St: type) type {
             c.n = x.n;
             c.nv_kir = x.nv;
             c.w.n_kir = @intCast(x.n);
+        }
+
+        /// Copies of a value made only to be copied (`t = op ...; d = mov
+        /// t`, the copy t's one read and t written once): the op writes d
+        /// itself and the copy goes, when no control flow and nothing that
+        /// reads or writes d is between them. DXBC's destination writes are
+        /// such copies (each component computed first, then moved, in case a
+        /// source is the destination): Superposition's largest pixel program
+        /// was 38% MOVs. Registers of a vector (a 64- or 128-bit load's or
+        /// store's, a sample's coordinates and channels) are left as they
+        /// are. (Scratch here, set anew by `analyze`: reads, writes, def_at;
+        /// `uniform` a register of a vector, `folded` a copy dropped.)
+        fn forward(c: *Ctx) void {
+            const w = c.w;
+            const nv = c.nv_kir;
+            const code = w.insts[0..c.n];
+            @memset(w.reads[0..nv], 0);
+            @memset(w.writes[0..nv], 0);
+            @memset(w.def_at[0..nv], std.math.maxInt(u32));
+            @memset(w.uniform[0..nv], false);
+            @memset(w.folded[0..c.n], false);
+            for (code, 0..) |in, idx| {
+                for (readsOf(in)) |a| {
+                    if (a) |v| w.reads[v] +|= 1;
+                }
+                if (vecWidth(in)) |n| {
+                    const base: ?u16 = if (in.op == .st) readsOf(in)[1] else if (in.dst != .none) @intFromEnum(in.dst) else null;
+                    if (base) |b| for (0..n) |j| {
+                        w.uniform[b + j] = true;
+                    };
+                }
+                if (in.op == .tex) if (readsOf(in)[1]) |b| for (0..kir.texCoords(in.aux)) |j| {
+                    w.uniform[b + j] = true;
+                };
+                if (writesDst(in)) {
+                    const d = @intFromEnum(in.dst);
+                    w.writes[d] +|= 1;
+                    w.def_at[d] = @intCast(idx);
+                }
+            }
+            var dropped: usize = 0;
+            for (code, 0..) |in, j| {
+                if (in.op != .mov or in.a != .reg or in.a.reg == .none or in.dst == .none) continue;
+                const t = @intFromEnum(in.a.reg);
+                const d = @intFromEnum(in.dst);
+                if (t == d or w.uniform[t] or w.uniform[d] or w.reads[t] != 1 or w.writes[t] != 1) continue;
+                if (!sameRegs(w.tys[t], w.tys[d])) continue;
+                const i = w.def_at[t];
+                if (i >= j or j - i > 256) continue;
+                if (!writesDst(code[i]) or vecWidth(code[i]) != null) continue;
+                const clear = scan: for (code[i + 1 .. j], i + 1..) |between, x| {
+                    if (w.folded[x]) continue;
+                    switch (between.op) {
+                        .@"if", .@"else", .endif, .loop, .endloop, .brk, .cont, .ret => break :scan false,
+                        else => {},
+                    }
+                    if (writesDst(between) and @intFromEnum(between.dst) == d) break :scan false;
+                    for (readsOf(between)) |a| {
+                        if (a == d) break :scan false;
+                    }
+                } else true;
+                if (!clear) continue;
+                code[i].dst = in.dst;
+                w.def_at[d] = i;
+                w.folded[j] = true;
+                dropped += 1;
+            }
+            // A copy read in its stretch alone (`d = mov s`, d written
+            // once, every read of d after it with no control flow between,
+            // s not written before the last): those reads read s, and the
+            // copy goes (DXBC's sources read from its registers, copied in
+            // case the instruction writes the register it reads).
+            for (code, 0..) |in, j| {
+                if (w.folded[j] or in.op != .mov or in.a != .reg or in.a.reg == .none or in.dst == .none) continue;
+                const s = @intFromEnum(in.a.reg);
+                const d = @intFromEnum(in.dst);
+                if (s == d or w.uniform[s] or w.uniform[d] or w.writes[d] != 1 or w.reads[d] == 0) continue;
+                if (!sameRegs(w.tys[s], w.tys[d])) continue;
+                var found: u32 = 0;
+                const last = scan: for (code[j + 1 ..], j + 1..) |later, x| {
+                    if (found == w.reads[d]) break :scan x;
+                    if (x - j > 256) break :scan null;
+                    if (w.folded[x]) continue;
+                    switch (later.op) {
+                        .@"if", .@"else", .endif, .loop, .endloop, .brk, .cont, .ret => break :scan null,
+                        else => {},
+                    }
+                    for (readsOf(later)) |a| {
+                        if (a != d) continue;
+                        found += 1;
+                        // (a predicate op's type is its operands': kept)
+                        if (later.ty == .pred and w.tys[s] != w.tys[d]) break :scan null;
+                    }
+                    if (found < w.reads[d] and writesDst(later) and @intFromEnum(later.dst) == s) break :scan null;
+                } else if (found == w.reads[d]) code.len else null;
+                const end = last orelse continue;
+                const sv: kir.V = @enumFromInt(s);
+                for (code[j + 1 .. end], j + 1..) |*later, x| {
+                    if (w.folded[x]) continue;
+                    for ([_]*kir.Arg{ &later.a, &later.b, &later.c }) |arg| {
+                        if (arg.* == .reg and arg.reg == in.dst) arg.* = .{ .reg = sv };
+                    }
+                }
+                w.reads[s] = w.reads[s] - 1 + w.reads[d];
+                w.reads[d] = 0;
+                w.folded[j] = true;
+                dropped += 1;
+            }
+            if (dropped == 0) return;
+            var n: usize = 0;
+            for (0..c.n) |x| {
+                if (w.folded[x]) continue;
+                w.insts[n] = w.insts[x];
+                n += 1;
+            }
+            c.n = n;
+            c.w.n_kir = @intCast(n);
         }
 
         // ── 2. Analysis ─────────────────────────────────────────────────────
@@ -828,7 +959,12 @@ fn CtxOf(comptime St: type) type {
 
         fn uniformOp(c: *const Ctx, in: kir.Inst) bool {
             switch (in.op) {
-                .tid, .lane, .atom, .cas => return false,
+                .tid, .lane, .atom, .cas, .tex => return false,
+                // (a graphics stage's input, a load through its IO binding
+                // at a fixed word: each lane's own vertex or pixel; taken as
+                // uniform, a pixel program's branches never diverged, so
+                // none reconverged)
+                .ld => if (c.isStageIO(@bitCast(in.aux))) return false,
                 .gid, .gsize, .subgroup, .param => return true,
                 .vote, .ballot => return true,
                 .shfl => return @as(kir.Shfl, @enumFromInt(in.aux)) == .idx and c.uniformArg(in.b),
@@ -1184,10 +1320,38 @@ fn CtxOf(comptime St: type) type {
             try c.stageOutputs();
             var regions: [MAX_DEPTH * 2]Region = undefined;
             var sp: usize = 0;
+            // A pixel program whose control flow diverges: the whole of it
+            // in one convergence region (B0, the others one deeper), its
+            // BSYNC right after the last control flow at the top, so the
+            // outputs, a KILL and EXIT run with the warp whole again. A
+            // loop a brk or cont leaves from an if gets no BSSY of its own
+            // (it desyncs), and the 3D engine's EXIT of a warp still split
+            // by one never came back (Unigine's light loop: the RTX hung
+            // until Windows reset it, 20 s, nvlddmkm 153).
+            const top_sync: ?usize = if (c.opts.stage == .pixel) topSyncAt(w, c.n) else null;
+            var l_top: u16 = 0;
+            if (top_sync != null) {
+                l_top = c.label();
+                c.depth = 1;
+                w.stats.bssy += 1;
+                try c.eff("BSSY.RECONVERGENT", 0, &.{ .{ .bar = 0 }, .{ .label = l_top } });
+            }
+            var top_open = top_sync != null;
             var idx: usize = 0;
             while (idx < c.n) : (idx += 1) {
                 const in = w.insts[idx];
                 if (w.folded[idx]) continue;
+                // (a KILL in straight-line code, every open region a
+                // predicated one: the top region closed before it, the warp
+                // whole when it discards)
+                if (top_open and in.op == .st and c.isKill(in) and allPredicated(regions[0..sp])) {
+                    const g = c.guard;
+                    c.guard = .none;
+                    try c.at(l_top);
+                    try c.eff("BSYNC.RECONVERGENT", 0, &.{.{ .bar = 0 }});
+                    c.guard = g;
+                    top_open = false;
+                }
                 switch (in.op) {
                     .@"if" => {
                         if (sp == regions.len) return tooBig("regions past their room");
@@ -1237,9 +1401,50 @@ fn CtxOf(comptime St: type) type {
                     .ret => try c.eff("EXIT", 0, &.{}),
                     else => try c.op(idx, in),
                 }
+                // (the top region's end: the last control flow closed, at
+                // the top; an endif or endloop, never a branch's continue)
+                if (top_sync == idx) {
+                    if (sp != 0) return error.Unbalanced;
+                    if (top_open) {
+                        try c.at(l_top);
+                        try c.eff("BSYNC.RECONVERGENT", 0, &.{.{ .bar = 0 }});
+                        top_open = false;
+                    }
+                    c.depth = 0;
+                }
             }
             if (sp != 0) return error.Unbalanced;
             try c.eff("EXIT", 0, &.{});
+        }
+
+        /// A store that discards the pixel (a pixel program's KILL).
+        fn isKill(c: *const Ctx, in: kir.Inst) bool {
+            const m: kir.Mem = @bitCast(in.aux);
+            return c.isStageIO(m) and m.imm >= KILL_AT;
+        }
+
+        fn allPredicated(rs: []const Region) bool {
+            for (rs) |r| if (r.mode != .predicate) return false;
+            return true;
+        }
+
+        /// Where a pixel program's top convergence region ends: its last
+        /// control-flow op (lowered at the top, outside every region), or
+        /// null when no region diverges (the warp never splits).
+        fn topSyncAt(w: anytype, n: usize) ?usize {
+            var last: ?usize = null;
+            var diverges = false;
+            for (w.insts[0..n], 0..) |in, i| {
+                if (w.folded[i]) continue;
+                switch (in.op) {
+                    .@"if", .@"else", .endif, .loop, .endloop, .brk, .cont => {
+                        last = i;
+                        if (w.diverge[i]) diverges = true;
+                    },
+                    else => {},
+                }
+            }
+            return if (diverges) last else null;
         }
 
         fn negate(p: Opd) Opd {
@@ -1254,9 +1459,11 @@ fn CtxOf(comptime St: type) type {
         fn groups(c: *Ctx) Error!void {
             const w = c.w;
             for (c.insts()) |in| {
+                // (a texture sample: its coordinates a pair too, TEX's Ra)
+                if (in.op == .tex) try c.group(if (isReg(in.b)) vOf(in.b) else return error.BadOperand, 2);
                 const n = vecWidth(in) orelse continue;
                 const v: u16 = switch (in.op) {
-                    .ld => @intFromEnum(in.dst),
+                    .ld, .tex => @intFromEnum(in.dst),
                     .st => if (isReg(in.b)) vOf(in.b) else return error.BadOperand,
                     else => continue,
                 };
@@ -1279,6 +1486,23 @@ fn CtxOf(comptime St: type) type {
                     w.lead[x] = v;
                     w.off[x] = @intCast(j);
                 }
+            }
+        }
+
+        /// Registers v .. v + n - 1 as an aligned run (none of them in
+        /// another).
+        fn group(c: *Ctx, v: u16, n: u8) Error!void {
+            const w = c.w;
+            if (@as(usize, v) + n > c.nv_kir) return error.BadOperand;
+            for (0..n) |j| {
+                const x = v + @as(u16, @intCast(j));
+                if (w.lead[x] != x or w.size[x] != 1) return error.Unsupported;
+            }
+            w.size[v] = n;
+            for (1..n) |j| {
+                const x = v + @as(u16, @intCast(j));
+                w.lead[x] = v;
+                w.off[x] = @intCast(j);
             }
         }
 
@@ -1320,7 +1544,7 @@ fn CtxOf(comptime St: type) type {
             if (to - from > limit) return false;
             for (c.w.insts[from..to]) |in| {
                 switch (in.op) {
-                    .@"if", .@"else", .endif, .loop, .endloop, .brk, .cont, .ret, .barrier, .shfl, .vote, .ballot, .fdiv, .fsqrt => return false,
+                    .@"if", .@"else", .endif, .loop, .endloop, .brk, .cont, .ret, .barrier, .shfl, .vote, .ballot, .fdiv, .fsqrt, .tex => return false,
                     .sel, .pand, .por, .pnot, .icmp, .fcmp => return false,
                     else => {},
                 }
@@ -1714,6 +1938,7 @@ fn CtxOf(comptime St: type) type {
                     try c.eff("VOTE.ANY", 2, &.{ c.dst(in), .{ .pt = true }, p });
                 },
                 .fsqrt => try c.sqrtNative(in),
+                .tex => try c.texture(in),
                 .fdiv => return error.Unsupported,
                 .@"if", .@"else", .endif, .loop, .brk, .cont, .endloop, .ret => unreachable,
             }
@@ -2263,6 +2488,26 @@ fn CtxOf(comptime St: type) type {
             }
         }
 
+        /// A hardware sample: TEX.B.LZ (.DC: a comparison), NAK's operands
+        /// on sm_120: Ra the coordinates' pair (KIR's b, b + 1), Rb the
+        /// handle and then the reference (b + 2), the four channels into
+        /// the destination's run of four (red and green from Rd0, blue and
+        /// alpha from Rd1). Level zero of the header: no derivatives, so a
+        /// helper lane's sample matters to nothing. A graphics stage's
+        /// alone (a compute launch has no texture pools). A fetch
+        /// (Tex.fetch): TLD.B.LZ, the same operands with the integers.
+        fn texture(c: *Ctx, in: kir.Inst) Error!void {
+            if (c.opts.stage == .compute) return error.Unsupported;
+            const t: kir.Tex = @bitCast(in.aux);
+            const xy = vOf(in.b);
+            const d = @intFromEnum(in.dst);
+            const hb = try c.newRun(if (t.compare) 2 else 1);
+            try c.ins("MOV", 1, &.{ R(hb), c.src(in.a) });
+            if (t.compare) try c.ins("MOV", 1, &.{ R(hb + 1), c.src(.{ .reg = @enumFromInt(xy + 2) }) });
+            const name = if (t.fetch) "TLD.B.LZ" else if (t.compare) "TEX.B.LZ.DC" else "TEX.B.LZ";
+            try c.ins(name, 2, &.{ R(d + 2), R(d), R(xy), R(hb), .{ .sreg = "2D" } });
+        }
+
         fn stageStore(c: *Ctx, in: kir.Inst, m: kir.Mem) Error!void {
             if (m.width_log2 != 5 or isReg(in.a)) return error.Unsupported;
             const addr: u32 = m.imm + switch (in.a) {
@@ -2333,12 +2578,87 @@ fn CtxOf(comptime St: type) type {
             const m: kir.Mem = @bitCast(in.aux);
             if (c.isStageIO(m)) return c.stageLoad(in, m);
             if (m.width_log2 < 3) return error.BadOperand;
+            if (try c.bankLoad(in, m)) return;
             if (m.space == .global) {
                 const ad = try c.gaddr(m, in.a);
+                // A pixel program's helper lanes (a 2x2 quad's pixels the
+                // triangle does not cover, along its edges) do no global
+                // load on the RTX's 3D engine: the register keeps what an
+                // earlier warp left there. Unigine Superposition's light
+                // loop, whose count is a uniform, then ran for ever on the
+                // edge of its screen quad (the RTX hung, 20 s, until
+                // Windows reset it; one triangle past the target's edges
+                // never did). So the destination is 0 first, each register
+                // of a 64- or 128-bit load's: what a helper lane reads (its
+                // results only feed derivatives).
+                if (c.opts.stage == .pixel) {
+                    const d = @intFromEnum(in.dst);
+                    for (0..vecWidth(in) orelse 1) |j| try c.eff("MOV", 1, &.{ R(d + @as(u16, @intCast(j))), .rz });
+                }
                 try c.ins(if (c.gen.global_sys) sizeNameSys("LDG.E", m) else sizeName("LDG.E", m), 1, &.{ c.dst(in), ad });
+                if (c.opts.stage == .pixel and c.w.uniform[@intFromEnum(in.dst)]) try c.helpersGet(in, ad);
             } else {
                 const ad = try c.saddr(m, in.a);
                 try c.ins(sizeName("LDS", m), 1, &.{ c.dst(in), ad });
+            }
+        }
+
+        /// A graphics stage's load from Options.uni_bank's binding at a fixed
+        /// place in its first 32 KiB (LDC's offset is 16 bits, signed): LDC
+        /// c[0x1][..] (a 128-bit one two LDC.64), the constant cache's,
+        /// which every lane of a warp reads at once and helper lanes too.
+        /// Superposition's composite pass made 1,055 LDG (its constants and
+        /// its textures' descriptor words, again for each of 72 samples),
+        /// each a load from memory per pixel. False: not such a load.
+        fn bankLoad(c: *Ctx, in: kir.Inst, m: kir.Mem) Error!bool {
+            if (c.opts.stage == .compute or m.space != .global or m.binding != c.opts.uni_bank or in.a != .imm) return false;
+            const off: i64 = @as(i64, m.imm) + in.a.imm;
+            const bytes: i64 = @as(i64, 1) << @intCast(m.width_log2 - 3);
+            if (off < 0 or off + bytes > 0x8000 or m.width_log2 < 5 or @rem(off, @min(bytes, 8)) != 0) return false;
+            const place: u32 = @intCast(off);
+            const d = @intFromEnum(in.dst);
+            const bank: u32 = 1 << 24;
+            switch (m.width_log2) {
+                5 => try c.ins("LDC", 1, &.{ c.dst(in), .{ .cbuf = bank | place } }),
+                6 => try c.ins("LDC.64", 1, &.{ c.dst(in), .{ .cbuf = bank | place } }),
+                7 => {
+                    try c.ins("LDC.64", 1, &.{ R(d), .{ .cbuf = bank | place } });
+                    try c.ins("LDC.64", 1, &.{ R(d + 2), .{ .cbuf = bank | (place + 8) } });
+                },
+                else => return false,
+            }
+            c.w.bank1 = @max(c.w.bank1, place + @as(u32, @intCast(bytes)));
+            return true;
+        }
+
+        /// A pixel program's uniform global load (its address the same in
+        /// every lane, so the analysis takes its value as uniform) made so
+        /// for the helper lanes too: they load nothing (`load`), so a
+        /// uniform's 0 sent them the other way at an if or out of a loop on
+        /// it while the pixels went on: the region not reconverged (taken as
+        /// uniform), a derivative there read a helper that never ran it
+        /// (Unigine's materials under an if on a constant: their quads on a
+        /// triangle's edge read the wrong level), and a loop with a
+        /// derivative in it hung the RTX. So each lane learns whether its
+        /// load landed (the first word loaded again over a 1: a helper keeps
+        /// 0 and 1, a pixel the word twice), the warp picks a lane whose did
+        /// (VOTE, FLO), and every lane takes the value from it (SHFL.IDX):
+        /// a lane demoted by a discard since is a helper here too.
+        fn helpersGet(c: *Ctx, in: kir.Inst, ad: Opd) Error!void {
+            const d = @intFromEnum(in.dst);
+            const again = try c.newV(.r);
+            try c.eff("MOV", 1, &.{ R(again), .{ .imm = 1 } });
+            try c.ins("LDG.E", 1, &.{ R(again), ad });
+            const p = try c.newV(.p);
+            try c.ins("ISETP.EQ.U32.AND", 2, &.{ .{ .pred = .{ .v = p } }, .{ .pt = true }, R(d), R(again), .{ .pt = true } });
+            try c.drainIfDivergent();
+            const landed = try c.newV(.r);
+            try c.eff("VOTE.ANY", 2, &.{ R(landed), .{ .pt = true }, .{ .pred = .{ .v = p } } });
+            const from = try c.newV(.r);
+            try c.ins("FLO.U32", 1, &.{ R(from), R(landed) });
+            for (0..vecWidth(in) orelse 1) |j| {
+                const v = R(d + @as(u16, @intCast(j)));
+                try c.eff("SHFL.IDX", 2, &.{ .{ .pt = true }, v, v, R(from), .{ .imm = 0x1f } });
             }
         }
 
@@ -3075,8 +3395,11 @@ fn CtxOf(comptime St: type) type {
                 .pt => |b| t.str(if (b) "PT" else "!PT"),
                 .imm => |x| t.hex(x),
                 .cbuf => |x| {
-                    t.str("c[0x0][");
-                    t.hex(x);
+                    // (the bank in the top byte: Options.uni_bank's 1)
+                    t.str("c[");
+                    t.hex(x >> 24);
+                    t.str("][");
+                    t.hex(x & 0xff_ffff);
                     t.str("]");
                 },
                 .attr => |x| {
@@ -3185,6 +3508,17 @@ fn paramAt(bindings: u8, word: u32) u32 {
     return 0x380 + 8 * @as(u32, bindings) + 4 * word;
 }
 
+/// Whether a value of type `a` may live in a register of type `b` and
+/// the reverse (a copy between them dropped): the same, or 32 bits each.
+fn sameRegs(a: kir.Ty, b: kir.Ty) bool {
+    const word = struct {
+        fn is(t: kir.Ty) bool {
+            return t == .u32 or t == .i32 or t == .f32;
+        }
+    }.is;
+    return a == b or (word(a) and word(b));
+}
+
 /// The registers an instruction reads (KIR's).
 fn readsOf(in: kir.Inst) [4]?u16 {
     var out = [4]?u16{ null, null, null, null };
@@ -3199,6 +3533,13 @@ fn readsOf(in: kir.Inst) [4]?u16 {
         .st => {
             out[0] = S.of(in.a);
             out[1] = S.of(in.b);
+        },
+        // (a sample's coordinates, and a comparison's reference)
+        .tex => {
+            out[0] = S.of(in.a);
+            if (S.of(in.b)) |b| {
+                for (0..kir.texCoords(in.aux)) |j| out[1 + j] = b + @as(u16, @intCast(j));
+            }
         },
         else => {
             out[0] = S.of(in.a);
@@ -3218,6 +3559,8 @@ fn writesDst(in: kir.Inst) bool {
 
 /// A 64- or 128-bit load's or store's registers.
 fn vecWidth(in: kir.Inst) ?usize {
+    // (a texture sample's four channels)
+    if (in.op == .tex) return 4;
     if (in.op != .ld and in.op != .st) return null;
     const m: kir.Mem = @bitCast(in.aux);
     return switch (m.width_log2) {

@@ -13,6 +13,16 @@
 //! instructions sample through the header and the sampler its handle
 //! names, and the color is blended into the target's bytes.
 //!
+//! Textures (TEX, TEX.DC): a header's level as rows of bytes or block
+//! linear (Turing2D's GOBs; Blackwell8's and Blackwell16's for 8- and
+//! 16-bit texels), unsigned normalized or float components (A8B8G8R8,
+//! R8, G8R8, R16, R16_G16, R16_G16_B16_A16, R32, R32_G32,
+//! R32_G32_B32_A32, ZF32), the sampler's coordinates (unnormalized, or
+//! normalized as the header says), each axis wrapped (repeat, mirror,
+//! clamp to the edge, the border colour), one filter (nearest or
+//! bilinear) and a depth comparison of each texel before the filter
+//! (TEXSAMP's ZC_ codes, GL's bits less 1, equal 2, greater 4).
+//!
 //! The arithmetic is gpu/draw.sig's (the rules every GPU's pipeline is
 //! held to): centres at halves, unnormalized texels clamped to the edge,
 //! a blend in floats rounded to the nearest of 256 steps.
@@ -101,7 +111,7 @@ const Target = struct {
 };
 
 /// A colour target's pixels: the renderer's three, and GL's RG8.
-const Fmt = enum { rgba8, bgra8, r8, rg8 };
+const Fmt = enum { rgba8, bgra8, r8, rg8, r32f, rg32f, rgba32f };
 
 const Clip = struct { x0: i64, y0: i64, x1: i64, y1: i64 };
 
@@ -132,16 +142,30 @@ const STENCIL_TWO_SIDE = gl3d.SET_TWO_SIDED_STENCIL_TEST;
 /// A texture as its header and its sampler describe it.
 const Tex = struct {
     bytes: []const u8,
+    /// Rows `pitch` bytes apart, or (block) block linear, `pitch` bytes
+    /// across (the width's texels in whole GOBs), blocks 2^block GOBs high.
     /// Where its texels are (the header's address).
     va: u64 = 0,
     pitch: u32,
+    block: ?u3 = null,
     width: u32,
     height: u32,
-    /// Bytes a texel: 4 (A8B8G8R8) or 1 (R8).
+    /// The header's components and data type (gl3d.Components, DataType).
+    comps: u7,
+    data: u4,
+    /// Bytes a texel.
     size: u32,
     /// Where each of x, y, z, w comes from (the header's sources).
     source: [4]u3,
     linear: bool,
+    /// The coordinates are the level's [0, 1] (else texels).
+    normalized: bool,
+    /// u's and v's wrap modes (gl3d.Wrap).
+    wrap: [2]u3 = .{ 2, 2 },
+    /// A depth comparison (ZC_ code), when TEX.DC's sampler has one.
+    compare: ?u3 = null,
+    /// The border colour (components' order).
+    border: [4]f32 = .{ 0, 0, 0, 0 },
 };
 
 pub const Engine = struct {
@@ -181,6 +205,9 @@ pub const Engine = struct {
     /// depth range for the pixels (window units).
     zlo: f64 = 0,
     zhi: f64 = 1,
+    /// SET_VIEWPORT_CLIP_CONTROL's depth not clipped (a clamp): no pixel
+    /// dropped for its depth (depthIn), which is kept clamped to 0 .. 1.
+    zclamp: bool = false,
     zscale: f64 = 1,
     zoffset: f64 = 0,
     vhead: [sph.WORDS]u32 = undefined,
@@ -274,6 +301,7 @@ pub const Engine = struct {
             else => false,
         }, "a culled face other than FRONT, BACK or FRONT_AND_BACK");
         try g.need(g.reg(gr.OGL_SET_FRONT_FACE) == gl3d.FRONT_CW or g.reg(gr.OGL_SET_FRONT_FACE) == gl3d.FRONT_CCW, "a front face other than CW or CCW");
+        try g.need(g.reg(gl3d.SET_POLY_OFFSET_FILL) == 0 or g.reg(gl3d.SET_DEPTH_BIAS_CONTROL) == 0, "a depth bias whose unit follows the depth's format: not modelled");
         const topo = g.reg(gr.SET_PRIMITIVE_TOPOLOGY);
         try g.need(g.reg(gr.SET_PRIMITIVE_TOPOLOGY_CONTROL) == 1 and topo >= 4 and topo <= 6, "not triangles, a strip or a fan by SET_PRIMITIVE_TOPOLOGY");
         try g.need(g.reg(gr.SET_DRAW_CONTROL_A) == gr.DRAW_CONTROL and g.reg(gr.SET_DRAW_CONTROL_A + 4) >= 1, "SET_DRAW_CONTROL is not instances from the first");
@@ -312,6 +340,9 @@ pub const Engine = struct {
             0xd5 => .rgba8,
             0xf3 => .r8,
             0xea => .rg8,
+            0xe5 => .r32f,
+            0xcb => .rg32f,
+            0xc0 => .rgba32f,
             else => return g.refuse("a color target format the renderer does not use"),
         };
         try g.need(g.reg(a + 24) == 1 and g.reg(a + 28) == 0 and g.reg(a + 32) == 0, "the color target is not one layer");
@@ -600,6 +631,9 @@ pub const Engine = struct {
         g.zoffset = g.float(gr.SET_VIEWPORT_SCALE_X + 20);
         g.zlo = if (g.reg(gr.SET_VIEWPORT_Z_CLIP) == 0) -1 else 0;
         g.zhi = 1;
+        // (a depth clamp, GEOMETRY_CLIP FRUSTUM_XY_CLIP: no pixel dropped
+        // for its depth, which floatDepth and depthWord clamp to 0 .. 1)
+        g.zclamp = !gl3d.clipsDepth(g.reg(gr.SET_VIEWPORT_CLIP_CONTROL));
         const last = g.reg(gr.SET_PROVOKING_VERTEX) == 1;
         const dc = DrawCtx{ .t = t, .clip = clip, .vcb = vcb, .pcb = pcb, .vp = .{ sx, sy, ox, oy }, .topo = topo, .last = last, .ib = ib };
         const restart = indexed and g.reg(gr.SET_DA_PRIMITIVE_RESTART) & 1 != 0;
@@ -837,7 +871,16 @@ pub const Engine = struct {
             w[k] = @floatCast(g.vfloat(v, POSITION + 3));
             win[k] = g.win[v];
         }
-        return planeOf(zc, w, win, @floatCast(g.zscale), @floatCast(g.zoffset), area);
+        var p = planeOf(zc, w, win, @floatCast(g.zscale), @floatCast(g.zoffset), area);
+        // depth bias (POLY_OFFSET_FILL, the unit a 24-bit depth's step,
+        // SET_DEPTH_BIAS in those steps): the compute raster's, op for op
+        if (g.reg(gl3d.SET_POLY_OFFSET_FILL) != 0) {
+            const slope: f32 = @bitCast(g.reg(gl3d.SET_SLOPE_SCALE_DEPTH_BIAS));
+            const units: f32 = @bitCast(g.reg(gl3d.SET_DEPTH_BIAS));
+            const clamp: f32 = @bitCast(g.reg(gl3d.SET_DEPTH_BIAS_CLAMP));
+            p.z0 = biased(p.z0, p.gx, p.gy, slope, units, clamp);
+        }
+        return p;
     }
 
     /// Whether a triangle whose grid places give `area` (edge(v0, v1, v2):
@@ -851,6 +894,7 @@ pub const Engine = struct {
     /// Whether a pixel's depth (window units) is in the viewport's depth
     /// range, as gfxapi's raster keeps a pixel (depthInRange).
     fn depthIn(g: *const Engine, z: f32) bool {
+        if (g.zclamp) return true;
         return depthInRange(z, @floatCast(g.zlo), @floatCast(g.zhi), @floatCast(g.zscale), @floatCast(g.zoffset));
     }
 
@@ -901,7 +945,7 @@ pub const Engine = struct {
         const n = g.queued;
         g.queued = 0;
         if (n == 0) return;
-        var ps = emu.Stage{ .kind = .pixel, .header = &g.phead, .in = g.pin[0..n], .front = g.front[0..n], .killed = g.killed[0..n], .cbufs = cb, .ctx = g, .sample = &sampleCall };
+        var ps = emu.Stage{ .kind = .pixel, .header = &g.phead, .in = g.pin[0..n], .front = g.front[0..n], .killed = g.killed[0..n], .cbufs = cb, .ctx = g, .sample = &sampleCall, .compare = &compareCall, .fetch = &fetchCall };
         try emu.stageBegin(g.host.work, n);
         try emu.stageRun(g.host.work, &g.host.mem, &ps, n, stats);
         // Each colour target SET_CT_SELECT counts that the program writes:
@@ -1000,8 +1044,9 @@ pub const Engine = struct {
         return s_pass and d_pass;
     }
 
-    /// The texture and the sampler a handle names, from the pools.
-    fn texture(g: *Engine, handle: u32) error{BadStream}!Tex {
+    /// The texture a handle names: its header, and with `sampled` its
+    /// sampler (a fetch, TLD, has none).
+    fn texture(g: *Engine, handle: u32, sampled: bool) error{BadStream}!Tex {
         const on_turing = g.turing();
         // (Turing's headers are Maxwell's: the version method is Hopper's)
         try g.need(on_turing or g.reg(gr.SET_TEXTURE_HEADER_VERSION) == 1, "the texture header version is not 1");
@@ -1011,48 +1056,90 @@ pub const Engine = struct {
         const hp = gr.SET_TEX_HEADER_POOL_A;
         const sp = gr.SET_TEX_SAMPLER_POOL_A;
         try g.need(hi != 0 and hi <= g.reg(hp + 8), "a texture handle names the null header or one past the pool's last");
-        try g.need(si <= g.reg(sp + 8), "a texture handle names a sampler past the pool's last");
+        if (sampled) try g.need(si <= g.reg(sp + 8), "a texture handle names a sampler past the pool's last");
         // (the pools' upper address: 8 bits on Turing, 25 on Blackwell)
         const upper: u32 = if (on_turing) 0xff else 0x1ff_ffff;
         const hva = (@as(u64, g.reg(hp) & upper) << 32 | g.reg(hp + 4)) + @as(u64, hi) * 32;
         const sva = (@as(u64, g.reg(sp) & upper) << 32 | g.reg(sp + 4)) + @as(u64, si) * 32;
         const hb = g.host.mem.find(hva, 32) orelse return g.refuse("the texture header pool is not in mapped memory");
-        const sb = g.host.mem.find(sva, 32) orelse return g.refuse("the sampler pool is not in mapped memory");
         var h: [8]u32 = undefined;
-        var s: [8]u32 = undefined;
+        // (a fetch's: point, clamped to the edge, the header's coordinates)
+        var s: [8]u32 = .{ 2 | 2 << 3, 1 | 1 << 4, 0, 0, 0, 0, 0, 0 };
         for (&h, 0..) |*w, k| w.* = std.mem.readInt(u32, hb[k * 4 ..][0..4], .little);
-        for (&s, 0..) |*w, k| w.* = std.mem.readInt(u32, sb[k * 4 ..][0..4], .little);
-        var t = if (on_turing) try g.texheadPitch(&h) else try g.texheadV2(&h);
-        for (t.source) |src| try g.need(src == 0 or src == 7 or (src >= 2 and src <= 5), "a texture channel's source the renderer does not use");
-        try g.need(t.pitch >= t.width * t.size, "a texture's rows are shorter than its width");
-        t.bytes = g.host.mem.find(t.va, @as(usize, t.pitch) * (t.height - 1) + @as(usize, t.width) * t.size) orelse return g.refuse("a texture's memory is not mapped");
-        // The sampler: clamped to the edge, unnormalized, one filter.
-        try g.need(s[0] & 7 == 2 and (s[0] >> 3) & 7 == 2, "a sampler that does not clamp to the edge: not modelled");
-        try g.need(s[1] & (1 << 25) != 0, "a sampler with normalized coordinates: not modelled");
+        if (sampled) {
+            const sb = g.host.mem.find(sva, 32) orelse return g.refuse("the sampler pool is not in mapped memory");
+            for (&s, 0..) |*w, k| w.* = std.mem.readInt(u32, sb[k * 4 ..][0..4], .little);
+        }
+        var t: Tex = undefined;
+        if (on_turing) {
+            // (Turing's header: Maxwell's TEXHEAD_PITCH, rows of bytes, its
+            // sampler clamped to the edge with unnormalized coordinates)
+            t = try g.texheadPitch(&h);
+            for (t.source) |src| try g.need(src == 0 or src == 7 or (src >= 2 and src <= 5), "a texture channel's source the renderer does not use");
+            try g.need(t.pitch >= t.width * t.size, "a texture's rows are shorter than its width");
+            t.bytes = g.host.mem.find(t.va, @as(usize, t.pitch) * (t.height - 1) + @as(usize, t.width) * t.size) orelse return g.refuse("a texture's memory is not mapped");
+            if (sampled) {
+                try g.need(s[0] & 7 == 2 and (s[0] >> 3) & 7 == 2, "a sampler that does not clamp to the edge: not modelled");
+                try g.need(s[1] & (1 << 25) != 0, "a sampler with normalized coordinates: not modelled");
+            }
+        } else {
+            // The header: a level of two dimensions, rows of bytes (PITCH_V2,
+            // TWO_D_NO_MIPMAP) or block linear (BLOCKLINEAR_V2, TWO_D, one
+            // GOB wide and deep, one level).
+            const version = h[3] >> 28;
+            const kind = (h[4] >> 22) & 0xf;
+            try g.need((version == 2 and kind == 7) or (version == 3 and kind == 1), "a texture header that is not one level of two dimensions, rows of bytes (PITCH_V2) or block linear (BLOCKLINEAR_V2)");
+            try g.need(h[4] & (1 << 21) == 0, "an sRGB texture: not modelled");
+            const comps: u7 = @truncate(h[3] >> 16);
+            const data: u4 = @truncate(h[3] >> 12);
+            const size = texelBytes(comps, data) orelse return g.refuse("a texture's components or data type are not modelled (unsigned normalized or float: A8B8G8R8, R8, G8R8, R16, R16_G16, R16_G16_B16_A16, R32, R32_G32, R32_G32_B32_A32, ZF32)");
+            t = Tex{
+                .bytes = &.{},
+                .pitch = (h[2] & 0x1_ffff) << 5,
+                .width = (h[4] & 0x1_ffff) + 1,
+                .height = (h[5] & 0x1_ffff) + 1,
+                .comps = comps,
+                .data = data,
+                .size = size,
+                .source = .{ @truncate(h[3]), @truncate(h[3] >> 3), @truncate(h[3] >> 6), @truncate(h[3] >> 9) },
+                .linear = false,
+                .normalized = (h[4] >> 17) & 1 != 0 and s[1] & (1 << 25) == 0,
+            };
+            for (t.source) |src| try g.need(src == 0 or src == 7 or (src >= 2 and src <= 5), "a texture channel's source the renderer does not use");
+            var va: u64 = undefined;
+            var bytes: usize = undefined;
+            if (version == 3) {
+                try g.need((h[2] >> 0) & 7 == 0 and (h[2] >> 6) & 7 == 0 and (h[2] >> 10) & 7 == 0 and (h[2] >> 13) & 1 == 0, "a block-linear texture more than a GOB wide or deep");
+                try g.need((h[6] >> 0) & 1 == 0 and (h[3] >> 28) != 0 and (h[2] >> 28) == 0 and (h[3] >> 27) & 1 == 0, "a block-linear texture header of more levels or another depth");
+                const n: u3 = @truncate(h[2] >> 3);
+                try g.need(n <= 5, "a block-linear texture's blocks over 32 GOBs high");
+                t.block = n;
+                t.pitch = (t.width * t.size + 63) / 64 * 64;
+                va = @as(u64, h[1] & 0x1ff_ffff) << 32 | (h[0] & 0xffff_fe00);
+                const rows_of_blocks = (t.height + (@as(u32, 8) << n) - 1) >> (@as(u5, n) + 3);
+                bytes = @as(usize, rows_of_blocks) * (t.pitch / 64) << (@as(u6, n) + 9);
+            } else {
+                try g.need(t.pitch >= t.width * t.size, "a texture's rows are shorter than its width");
+                va = @as(u64, h[1] & 0x1ff_ffff) << 32 | (h[0] & 0xffff_ffe0);
+                bytes = @as(usize, t.pitch) * (t.height - 1) + @as(usize, t.width) * t.size;
+            }
+            t.va = va;
+            t.bytes = g.host.mem.find(va, bytes) orelse return g.refuse("a texture's memory is not mapped");
+            // The sampler: each axis's wrap, one filter (point or linear), a
+            // depth comparison, the border colour.
+            const wu: u3 = @truncate(s[0]);
+            const wv: u3 = @truncate(s[0] >> 3);
+            try g.need(wu <= 3 and wv <= 3, "a sampler's wrap mode is not wrap, mirror, clamp to the edge or the border");
+            try g.need(t.normalized or (wu == 2 and wv == 2), "unnormalized coordinates not clamped to the edge: not modelled");
+            t.wrap = .{ wu, wv };
+        }
         const mag = s[1] & 7;
         const min = (s[1] >> 4) & 3;
         try g.need(mag == min and (mag == 1 or mag == 2), "a sampler whose two filters differ, or are neither point nor linear");
         t.linear = mag == 2;
+        if (s[0] & (1 << 9) != 0) t.compare = @truncate(s[0] >> 10);
+        for (&t.border, 0..) |*b, k| b.* = @bitCast(s[4 + k]);
         return t;
-    }
-
-    /// Blackwell's header (TEXHEAD_V2_PITCH, draw.headerWords): rows of
-    /// bytes, one level, two dimensions.
-    fn texheadV2(g: *Engine, h: *const [8]u32) error{BadStream}!Tex {
-        try g.need(h[3] >> 28 == 2 and (h[4] >> 22) & 0xf == 7 and h[2] >> 28 == 0, "a texture header that is not rows of bytes (PITCH_V2), one level, TWO_D_NO_MIPMAP");
-        try g.need((h[3] >> 12) & 0xf == 0 and h[4] & (1 << 21) == 0, "a texture that is not unsigned normalized, or is sRGB: not modelled");
-        const components = (h[3] >> 16) & 0x7f;
-        try g.need(components == 0x08 or components == 0x1d, "a texture's components are not A8B8G8R8 or R8");
-        return .{
-            .bytes = &.{},
-            .va = @as(u64, h[1] & 0x1ff_ffff) << 32 | (h[0] & 0xffff_ffe0),
-            .pitch = (h[2] & 0x1_ffff) << 5,
-            .width = (h[4] & 0x1_ffff) + 1,
-            .height = (h[5] & 0x1_ffff) + 1,
-            .size = if (components == 0x08) 4 else 1,
-            .source = .{ @truncate(h[3]), @truncate(h[3] >> 3), @truncate(h[3] >> 6), @truncate(h[3] >> 9) },
-            .linear = false,
-        };
     }
 
     /// Turing's header (Maxwell's TEXHEAD_PITCH, clb097tex.h;
@@ -1069,17 +1156,40 @@ pub const Engine = struct {
             .pitch = (h[3] & 0xffff) << 5,
             .width = (h[4] & 0xffff) + 1,
             .height = (h[5] & 0xffff) + 1,
+            .comps = @truncate(components),
+            .data = 0, // (unsigned normalized: the rule above)
             .size = if (components == 0x08) 4 else 1,
             .source = .{ @truncate(h[0] >> 19), @truncate(h[0] >> 22), @truncate(h[0] >> 25), @truncate(h[0] >> 28) },
             .linear = false,
+            .normalized = false,
         };
     }
 
     /// TEX: the Stage's callback.
     fn sampleCall(ctx: ?*anyopaque, handle: u32, x: f32, y: f32) emu.Error![4]f32 {
         const g: *Engine = @ptrCast(@alignCast(ctx.?));
-        const t = g.texture(handle) catch return error.Unsupported;
-        return sample(t, x, y);
+        const t = g.texture(handle, true) catch return error.Unsupported;
+        if (t.compare != null) return error.Unsupported;
+        return sample(t, x, y, null);
+    }
+
+    /// TLD.LZ: the Stage's callback: the texel at (x, y) of the header's
+    /// level, through its sources; outside the level (0, 0, 0, 0), as the
+    /// unit's bounds check gives (gfxapi clamps its fetches inside first).
+    fn fetchCall(ctx: ?*anyopaque, handle: u32, x: i32, y: i32, lod: i32) emu.Error![4]f32 {
+        const g: *Engine = @ptrCast(@alignCast(ctx.?));
+        if (lod != 0) return error.Unsupported;
+        const t = g.texture(handle, false) catch return error.Unsupported;
+        if (x < 0 or y < 0 or x >= t.width or y >= t.height) return .{ 0, 0, 0, 0 };
+        return sourced(t, texel(t, @intCast(x), @intCast(y)));
+    }
+
+    /// TEX.DC: the Stage's callback.
+    fn compareCall(ctx: ?*anyopaque, handle: u32, x: f32, y: f32, ref: f32) emu.Error![4]f32 {
+        const g: *Engine = @ptrCast(@alignCast(ctx.?));
+        const t = g.texture(handle, true) catch return error.Unsupported;
+        if (t.compare == null) return error.Unsupported;
+        return sample(t, x, y, ref);
     }
 };
 
@@ -1234,6 +1344,18 @@ pub fn shaderDepth(z: f32) f32 {
 }
 
 /// x rounded to the nearest whole number, ties to even (as cvt's .rne).
+/// z0 moved by a depth bias as gfxapi's compute raster moves it (raster.sig's
+/// setup): factor * max(|gx|, |gy|) + units * 2^-24, clamped to `clamp`'s
+/// side (0: not clamped); no bias (factor and units 0): z0 as it is.
+pub fn biased(z0: f32, gx: f32, gy: f32, slope: f32, units: f32, clamp: f32) f32 {
+    if (slope == 0 and units == 0) return z0;
+    const dz = @max(@abs(gx), @abs(gy));
+    const raw = slope * dz + units * (1.0 / 16777216.0);
+    var off = if (clamp > 0) @min(raw, clamp) else raw;
+    if (clamp < 0) off = @max(off, clamp);
+    return z0 + off;
+}
+
 pub fn rne(x: f32) f32 {
     return if (@abs(x - @trunc(x)) == 0.5) 2 * @round(x / 2) else @round(x);
 }
@@ -1271,13 +1393,51 @@ pub fn inside(e: i64, a: [2]i64, b: [2]i64) bool {
     return (dy == 0 and dx > 0) or dy < 0;
 }
 
-/// A texel's four floats after the header's sources: its bytes over 255.
+/// Bytes a texel of components `comps` (gl3d.Components) and data type
+/// `data` (gl3d.DataType: unsigned normalized 0, float 2) the model reads,
+/// or null.
+fn texelBytes(comps: u7, data: u4) ?u32 {
+    if (data != 0 and data != 2) return null;
+    return switch (comps) {
+        0x08 => if (data == 0) 4 else null, // A8B8G8R8
+        0x1d => if (data == 0) 1 else null, // R8
+        0x18 => if (data == 0) 2 else null, // G8R8
+        0x1b => 2, // R16
+        0x0c => 4, // R16_G16
+        0x03 => 8, // R16_G16_B16_A16
+        0x0f, 0x2f => if (data == 2) 4 else null, // R32, ZF32
+        0x04 => if (data == 2) 8 else null, // R32_G32
+        0x01 => if (data == 2) 16 else null, // R32_G32_B32_A32
+        else => null,
+    };
+}
+
+/// A texel's components (R the first in memory; missing ones 0, 0, 0, 1)
+/// before the header's sources.
 fn texel(t: Tex, x: u32, y: u32) [4]f32 {
-    const at = @as(usize, y) * t.pitch + @as(usize, x) * t.size;
-    const one: f32 = 1.0 / 255.0;
-    // (the components as the layout names them: R the first byte)
-    var comp = [4]f32{ 0, 0, 0, 0 };
-    for (0..t.size) |k| comp[k] = @as(f32, @floatFromInt(t.bytes[at + k])) * one;
+    const at = if (t.block) |n| blTexel(t.pitch, n, t.size, x, y) else @as(usize, y) * t.pitch + @as(usize, x) * t.size;
+    const b = t.bytes[at..][0..t.size];
+    var comp = [4]f32{ 0, 0, 0, 1 };
+    const channels: u32 = switch (t.comps) {
+        0x08, 0x03, 0x01 => 4,
+        0x18, 0x0c, 0x04 => 2,
+        else => 1,
+    };
+    const each = t.size / channels;
+    for (0..channels) |k| {
+        const c = b[k * each ..][0..each];
+        // (unorm: times 1/255 and 1/65535, gfxapi texture.sig's arithmetic)
+        comp[k] = switch (each) {
+            1 => @as(f32, @floatFromInt(c[0])) * (1.0 / 255.0),
+            2 => if (t.data == 2) @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, c[0..2], .little)))) else @as(f32, @floatFromInt(std.mem.readInt(u16, c[0..2], .little))) * (1.0 / 65535.0),
+            else => @bitCast(std.mem.readInt(u32, c[0..4], .little)),
+        };
+    }
+    return comp;
+}
+
+/// The header's sources over a texel's (or the border's) components.
+fn sourced(t: Tex, comp: [4]f32) [4]f32 {
     var out: [4]f32 = undefined;
     for (&out, t.source) |*o, src| o.* = switch (src) {
         2...5 => comp[src - 2],
@@ -1287,34 +1447,81 @@ fn texel(t: Tex, x: u32, y: u32) [4]f32 {
     return out;
 }
 
+/// Integer coordinate `i` on an axis of `n` texels wrapped as `mode` says
+/// (repeat, mirror, clamp to the edge), or null: outside, the border.
+fn wrapTexel(i: i64, n: u32, mode: u3) ?u32 {
+    const m: i64 = n;
+    return switch (mode) {
+        0 => @intCast(@mod(i, m)),
+        1 => blk: {
+            const k = @mod(i, 2 * m);
+            break :blk @intCast(if (k < m) k else 2 * m - 1 - k);
+        },
+        3 => if (i < 0 or i >= m) null else @intCast(i),
+        else => @intCast(std.math.clamp(i, 0, m - 1)),
+    };
+}
+
+/// A tap: texel (x, y) wrapped, or the border colour; compared with the
+/// reference when the sampler compares (1 where it passes, else 0, in red).
+fn tap(t: Tex, x: i64, y: i64, ref: ?f32) [4]f32 {
+    const xi = wrapTexel(x, t.width, t.wrap[0]);
+    const yi = wrapTexel(y, t.height, t.wrap[1]);
+    const comp = if (xi != null and yi != null) texel(t, xi.?, yi.?) else t.border;
+    const r = ref orelse return comp;
+    const d = comp[0];
+    // (neither less nor greater, NaN too, is equal: texture.sig's)
+    const rel: u3 = if (r < d) 1 else if (r > d) 4 else 2;
+    return .{ if (rel & t.compare.? != 0) 1 else 0, 0, 0, 1 };
+}
+
 fn clampTexel(v: f32, size: u32) u32 {
     const top: f32 = @floatFromInt(size - 1);
     if (v != v) return 0;
     return @intFromFloat(std.math.clamp(v, 0, top));
 }
 
-/// The texture at (u, v), in texels (gpu/draw.sig's rule): the texel the
-/// point is in, or the four around it weighed by how near their centres
-/// are; past the edge, the edge's.
-fn sample(t: Tex, u: f32, v: f32) [4]f32 {
-    if (!t.linear) return texel(t, clampTexel(@floor(u), t.width), clampTexel(@floor(v), t.height));
-    const fu = u - 0.5;
-    const fv = v - 0.5;
+/// The texture at (u, v): in texels (gpu/draw.sig's rule), or the level's
+/// [0, 1] when normalized. The texel the point is in, or the four around
+/// it weighed by how near their centres are; each wrapped as the sampler
+/// says (unnormalized: clamped to the edge), and compared first with TEX.DC.
+fn sample(t: Tex, uin: f32, vin: f32, ref: ?f32) [4]f32 {
+    const u = if (t.normalized) uin * @as(f32, @floatFromInt(t.width)) else uin;
+    const v = if (t.normalized) vin * @as(f32, @floatFromInt(t.height)) else vin;
+    const big: f32 = 1 << 24;
+    if (u != u or v != v) return sourced(t, tap(t, 0, 0, ref));
+    if (!t.linear) return sourced(t, tap(t, @intFromFloat(@floor(std.math.clamp(u, -big, big))), @intFromFloat(@floor(std.math.clamp(v, -big, big))), ref));
+    const fu = std.math.clamp(u, -big, big) - 0.5;
+    const fv = std.math.clamp(v, -big, big) - 0.5;
     const x0f = @floor(fu);
     const y0f = @floor(fv);
     const wx = fu - x0f;
     const wy = fv - y0f;
-    const a = texel(t, clampTexel(x0f, t.width), clampTexel(y0f, t.height));
-    const b = texel(t, clampTexel(x0f + 1, t.width), clampTexel(y0f, t.height));
-    const c = texel(t, clampTexel(x0f, t.width), clampTexel(y0f + 1, t.height));
-    const d = texel(t, clampTexel(x0f + 1, t.width), clampTexel(y0f + 1, t.height));
+    const x0: i64 = @intFromFloat(x0f);
+    const y0: i64 = @intFromFloat(y0f);
+    const a = tap(t, x0, y0, ref);
+    const b = tap(t, x0 + 1, y0, ref);
+    const c = tap(t, x0, y0 + 1, ref);
+    const d = tap(t, x0 + 1, y0 + 1, ref);
+    // (the arithmetic each sampler's callers are held to: unnormalized,
+    // the compositor's, gpu/draw.sig's rule; normalized, gfxapi
+    // texture.sig's bilinear, each weight's product rounded and then the
+    // sum, op for op)
+    const gx = 1 - wx;
+    const gy = 1 - wy;
     var out: [4]f32 = undefined;
     for (&out, 0..) |*o, i| {
-        const top = a[i] + (b[i] - a[i]) * wx;
-        const bottom = c[i] + (d[i] - c[i]) * wx;
-        o.* = top + (bottom - top) * wy;
+        if (!t.normalized) {
+            const top = a[i] + (b[i] - a[i]) * wx;
+            const bottom = c[i] + (d[i] - c[i]) * wx;
+            o.* = top + (bottom - top) * wy;
+            continue;
+        }
+        const top = a[i] * gx + b[i] * wx;
+        const bottom = c[i] * gx + d[i] * wx;
+        o.* = top * gy + bottom * wy;
     }
-    return out;
+    return sourced(t, out);
 }
 
 /// A channel as the target keeps it: not a number is 0, then [0, 1], then
@@ -1442,6 +1649,8 @@ fn pixelBytes(f: Fmt) u32 {
     return switch (f) {
         .r8 => 1,
         .rg8 => 2,
+        .rg32f => 8,
+        .rgba32f => 16,
         else => 4,
     };
 }
@@ -1452,12 +1661,36 @@ fn pixelBytes(f: Fmt) u32 {
 fn write(t: Target, x: u32, y: u32, src0: [4]f32, bl: ?Blend, mask: u4) void {
     const one: f32 = 1.0 / 255.0;
     const at = if (t.gobs) |n| blTexel(t.pitch, n, pixelBytes(t.format), x, y) else @as(usize, y) * t.pitch + @as(usize, x) * pixelBytes(t.format);
+    // (float channels, 32 bits each: the colour unclamped, blended in
+    // floats; the channels the format lacks not kept)
+    const floats: u32 = switch (t.format) {
+        .r32f => 1,
+        .rg32f => 2,
+        .rgba32f => 4,
+        else => 0,
+    };
+    if (floats != 0) {
+        var dst: [4]f32 = .{ 0, 0, 0, 1 };
+        for (0..floats) |ch| dst[ch] = @bitCast(std.mem.readInt(u32, t.bytes[at + 4 * ch ..][0..4], .little));
+        for (0..floats) |ch| {
+            if ((mask >> @intCast(ch)) & 1 == 0) continue;
+            const v = if (bl) |bx| blk: {
+                const base: usize = if (ch == 3) 3 else 0;
+                const fs = factor(bx.ops[base + 1], ch, src0, dst, bx.constant);
+                const fd = factor(bx.ops[base + 2], ch, src0, dst, bx.constant);
+                break :blk equation(bx.ops[base], src0[ch], fs, dst[ch], fd);
+            } else src0[ch];
+            std.mem.writeInt(u32, t.bytes[at + 4 * ch ..][0..4], @bitCast(v), .little);
+        }
+        return;
+    }
     // (where each of r, g, b, a is among the pixel's bytes; none: not kept)
     const order: [4]?u8 = switch (t.format) {
         .bgra8 => .{ 2, 1, 0, 3 },
         .rgba8 => .{ 0, 1, 2, 3 },
         .rg8 => .{ 0, 1, null, null },
         .r8 => .{ 0, null, null, null },
+        else => unreachable,
     };
     var src: [4]f32 = undefined;
     for (&src, src0) |*o, v| o.* = if (v != v) 0 else std.math.clamp(v, 0, 1);
@@ -1516,19 +1749,19 @@ fn expectColor(want: [4]f32, got: [4]f32) !void {
 test "a texel through the header's sources, the filter at a centre and between two" {
     // two BGRA texels: (b, g, r, a) = (0, 51, 102, 255) and (255, 204, 153, 0)
     const bytes = [_]u8{ 0, 51, 102, 255, 255, 204, 153, 0 };
-    var t = Tex{ .bytes = &bytes, .pitch = 32, .width = 2, .height = 1, .size = 4, .source = .{ 4, 3, 2, 5 }, .linear = false };
-    try expectColor(.{ 0.4, 0.2, 0, 1 }, texel(t, 0, 0));
-    try expectColor(.{ 0.6, 0.8, 1, 0 }, sample(t, 1.9, 0.2));
+    var t = Tex{ .bytes = &bytes, .pitch = 32, .width = 2, .height = 1, .comps = 0x08, .data = 0, .size = 4, .source = .{ 4, 3, 2, 5 }, .linear = false, .normalized = false };
+    try expectColor(.{ 0.4, 0.2, 0, 1 }, sourced(t, texel(t, 0, 0)));
+    try expectColor(.{ 0.6, 0.8, 1, 0 }, sample(t, 1.9, 0.2, null));
     // (past the edge: the edge's)
-    try expectColor(.{ 0.6, 0.8, 1, 0 }, sample(t, 7, -3));
+    try expectColor(.{ 0.6, 0.8, 1, 0 }, sample(t, 7, -3, null));
     t.linear = true;
-    try expectColor(.{ 0.4, 0.2, 0, 1 }, sample(t, 0.5, 0.5));
-    const mid = sample(t, 1, 0.5);
+    try expectColor(.{ 0.4, 0.2, 0, 1 }, sample(t, 0.5, 0.5, null));
+    const mid = sample(t, 1, 0.5, null);
     try testing.expectApproxEqAbs(@as(f32, 0.5), mid[0], 1e-6);
     try testing.expectApproxEqAbs(@as(f32, 0.5), mid[3], 1e-6);
     // alpha read as one
     t.source[3] = 7;
-    try testing.expectEqual(@as(f32, 1), sample(t, 1.5, 0.5)[3]);
+    try testing.expectEqual(@as(f32, 1), sample(t, 1.5, 0.5, null)[3]);
 }
 
 test "a pixel written: replaced, and premultiplied source over" {
@@ -1582,4 +1815,40 @@ test "a block-linear target's pixel lands where its GOB puts it" {
     const at = blAddress(64, 1, 20, 9);
     try testing.expectEqual(@as(usize, 512 + 64 + 16 + 4), at);
     try testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, bytes[at..][0..4]);
+}
+
+test "a texture unit's sample: normalized coordinates, each axis wrapped (repeat, mirror, the border), a block-linear float level, a depth comparison of each tap before the filter" {
+    // a 4 x 2 R32 float level, rows of 32 bytes: x + 10 y
+    var words: [16]f32 = @splat(0);
+    for (0..2) |y| for (0..4) |x| {
+        words[y * 8 + x] = @floatFromInt(x + 10 * y);
+    };
+    const bytes = std.mem.sliceAsBytes(&words);
+    var t = Tex{ .bytes = bytes, .pitch = 32, .width = 4, .height = 2, .comps = 0x0f, .data = 2, .size = 4, .source = .{ 2, 0, 0, 7 }, .linear = false, .normalized = true, .wrap = .{ 0, 2 } };
+    // (texel 1, row 1: the centre of (1, 1) is (1.5 / 4, 1.5 / 2))
+    try expectColor(.{ 11, 0, 0, 1 }, sample(t, 1.5 / 4.0, 1.5 / 2.0, null));
+    // repeat: x = 5.5 is texel 1; mirror: x = 4.5 is texel 3, 5.5 texel 2
+    try expectColor(.{ 1, 0, 0, 1 }, sample(t, 5.5 / 4.0, 0.25, null));
+    t.wrap[0] = 1;
+    try expectColor(.{ 3, 0, 0, 1 }, sample(t, 4.5 / 4.0, 0.25, null));
+    try expectColor(.{ 2, 0, 0, 1 }, sample(t, 5.5 / 4.0, 0.25, null));
+    // the border: past the left edge, the sampler's colour
+    t.wrap[0] = 3;
+    t.border = .{ 7, 0, 0, 0 };
+    try expectColor(.{ 7, 0, 0, 1 }, sample(t, -0.1, 0.25, null));
+    // bilinear between (0, 0) and (1, 0): a half
+    t.wrap = .{ 2, 2 };
+    t.linear = true;
+    try expectColor(.{ 0.5, 0, 0, 1 }, sample(t, 1.0 / 4.0, 0.25, null));
+    // a comparison (LEQUAL: 3) of each tap: ref 0.5 against 0 and 1 is
+    // fail, pass; filtered, a half
+    t.compare = 3;
+    try expectColor(.{ 0.5, 0, 0, 1 }, sample(t, 1.0 / 4.0, 0.25, 0.5));
+    // block linear: one GOB (64 bytes across, 8 rows), Turing2D's place of
+    // texel (1, 1): byte 4 of the row's 16 bytes in the second half-row
+    var gob: [512]u8 = @splat(0);
+    const at = blAddress(64, 0, 4, 1);
+    std.mem.writeInt(u32, gob[at..][0..4], @bitCast(@as(f32, 42)), .little);
+    const b = Tex{ .bytes = &gob, .pitch = 64, .block = 0, .width = 4, .height = 2, .comps = 0x2f, .data = 2, .size = 4, .source = .{ 2, 0, 0, 7 }, .linear = false, .normalized = true };
+    try expectColor(.{ 42, 0, 0, 1 }, sample(b, 1.5 / 4.0, 1.5 / 2.0, null));
 }

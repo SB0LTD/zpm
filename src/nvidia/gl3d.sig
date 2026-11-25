@@ -23,6 +23,14 @@
 //!   vertex's index 0 .. count - 1 (the programs fetch their attributes
 //!   and the element array themselves), `instances` times.
 //!
+//! - the texture unit's pools, when the programs sample through it (KIR's
+//!   tex: TEX.B.LZ): texture headers (TEXHEAD_V2: a level's rows of
+//!   bytes, or its block-linear GOBs; normalized coordinates) and samplers
+//!   (TEXSAMP: the wrap modes, one filter, a depth comparison, the border
+//!   colour), 32 bytes each, the handle a header's index and a sampler's
+//!   (`headerWords`, `samplerWords`: NIL's fields for clcb97, Hopper's
+//!   class headers, which Blackwell's texture unit reads).
+//!
 //! Not yet (the GL layer keeps such draws on its compute kernels): points
 //! and lines, multisampling, depth textures, depth bias, clip distances.
 //!
@@ -84,7 +92,8 @@ const gr = @import("draw.sig");
 const Push = push.Push;
 const SUBCH = gr.SUBCH;
 
-pub const Format = enum(u8) { rgba8, bgra8, r8, rg8 };
+/// (the float ones 32 bits a channel: written unclamped, blended in floats)
+pub const Format = enum(u8) { rgba8, bgra8, r8, rg8, r32f, rg32f, rgba32f };
 
 /// SET_COLOR_TARGET_FORMAT's values.
 pub fn targetFormat(f: Format) u32 {
@@ -93,6 +102,9 @@ pub fn targetFormat(f: Format) u32 {
         .rgba8 => 0xd5, // A8B8G8R8
         .rg8 => 0xea, // R8G8
         .r8 => 0xf3,
+        .r32f => 0xe5, // RF32
+        .rg32f => 0xcb, // RF32_GF32
+        .rgba32f => 0xc0, // RF32_GF32_BF32_AF32
     };
 }
 
@@ -100,6 +112,8 @@ pub fn formatBytes(f: Format) u32 {
     return switch (f) {
         .r8 => 1,
         .rg8 => 2,
+        .rg32f => 8,
+        .rgba32f => 16,
         else => 4,
     };
 }
@@ -249,6 +263,10 @@ pub const Draw = struct {
     /// Constant buffer 0 of both stages (64-byte aligned, 64 KiB at most).
     cb_va: u64,
     cb_bytes: u32,
+    /// Constant buffer 1 of both stages (the programs' uniforms, read with
+    /// LDC c[0x1][..]: 256-byte aligned, 64 KiB at most); 0 bytes: none.
+    cb1_va: u64 = 0,
+    cb1_bytes: u32 = 0,
     /// A page of zeros (what an attribute with no stream reads, and the
     /// pools' place: the programs sample nothing).
     zero_va: u64,
@@ -283,15 +301,180 @@ pub const Draw = struct {
     /// Front faces counter-clockwise in the window's coordinates (x
     /// right, y as the rows grow).
     front_ccw: bool = true,
+    /// Depth bias (polygon offset) of filled triangles: factor, units,
+    /// clamp. A triangle's depth moves by factor * max(|dz/dx|, |dz/dy|) +
+    /// units * 2^-24, at most |clamp| toward its sign (0: no clamp), as
+    /// gfxapi's compute raster moves it: the unit a 24-bit depth's step
+    /// whatever the depth's format (SET_DEPTH_BIAS_CONTROL's
+    /// DEPTH_FORMAT_DEPENDENT off, NVK's FORCE_UNORM representation).
+    bias: [3]f32 = .{ 0, 0, 0 },
+    /// Depth clamped, not clipped (Direct3D's DepthClipEnable off, GL's
+    /// DEPTH_CLAMP): SET_VIEWPORT_CLIP_CONTROL clips x and y alone, and the
+    /// pixels' depth is clamped into 0 .. 1 (PIXEL_MIN_Z, PIXEL_MAX_Z
+    /// CLAMP; the range MIN_Z_ZERO_MAX_Z_ONE's), as NVK sets it for a depth
+    /// clamp without the clip.
+    depth_clamp: bool = false,
+    /// The depth's clip volume 0 <= z <= w (Direct3D's: SET_VIEWPORT_Z_CLIP
+    /// ZERO_TO_POSITIVE_W), else GL's -w <= z <= w.
+    clip_zero: bool = false,
     /// Colour targets 1 .. 7 (null: none; one inside the highest is sent
     /// off: format 0): as wide and high as target 0.
     more: [7]?More = @splat(null),
     /// Indexed (the hardware's index buffer and primitive restart), else
     /// the vertices' indices 0 .. count - 1.
     index: ?Index = null,
+    /// The texture unit's pools the programs' TEX handles name (null: the
+    /// programs sample nothing through it).
+    tex: ?TexPools = null,
     /// The chip's shader model: sm_75 is TURING_A's stream.
     sm: gr.Sm = .sm_120,
 };
+
+/// The texture header and sampler pools: `headers` headers from
+/// `headers_va` (the first, index 0, the null texture), `samplers` samplers
+/// from `samplers_va` (both 32 bytes an entry, on 32 bytes). `fresh`:
+/// entries were written since the engine last read either pool, so its
+/// caches of both are invalidated before the draw.
+pub const TexPools = struct { headers_va: u64, headers: u32, samplers_va: u64, samplers: u32, fresh: bool = false };
+
+// ── Textures ────────────────────────────────────────────────────────────────
+
+/// A texture header's components (TEXHEAD_V2_BL_COMPONENTS, NIL's table).
+pub const Components = enum(u7) {
+    r32_g32_b32_a32 = 0x01,
+    r16_g16_b16_a16 = 0x03,
+    r32_g32 = 0x04,
+    a8b8g8r8 = 0x08,
+    a2b10g10r10 = 0x09,
+    r16_g16 = 0x0c,
+    r32 = 0x0f,
+    b5g6r5 = 0x15,
+    g8r8 = 0x18,
+    r16 = 0x1b,
+    r8 = 0x1d,
+    bf10gf11rf11 = 0x21,
+    dxt1 = 0x24,
+    dxt23 = 0x25,
+    dxt45 = 0x26,
+    dxn1 = 0x27,
+    dxn2 = 0x28,
+    bc6h_sf16 = 0x10,
+    bc6h_uf16 = 0x11,
+    bc7u = 0x17,
+    zf32 = 0x2f,
+    _,
+};
+
+/// A header's data type (TEXHEAD_V2_BL_DATA_TYPE: one for every channel).
+pub const DataType = enum(u4) { unorm = 0, snorm = 1, float = 2, uint = 6, sint = 7 };
+
+/// A header's channel source (X_SOURCE ..): zero, a component, one.
+pub const Source = enum(u3) { zero = 0, r = 2, g = 3, b = 4, a = 5, one_int = 6, one_float = 7 };
+
+/// One level of an image as the texture unit reads it.
+pub const Header = struct {
+    va: u64,
+    width: u32,
+    height: u32,
+    components: Components,
+    data: DataType,
+    /// Rows of `pitch` bytes (whole 32 bytes), or (block) block linear:
+    /// one GOB wide and deep, blocks of 2^block GOBs high, as wide as the
+    /// width's texels in whole GOBs (64 bytes).
+    pitch: u32 = 0,
+    block: ?u3 = null,
+    /// The four channels' sources: the components in order.
+    sources: [4]Source = .{ .r, .g, .b, .a },
+    srgb: bool = false,
+};
+
+/// Whether `h` is a header the texture unit takes: its address on 32
+/// bytes (block linear: a GOB, 512), rows on 32 bytes under 4 MiB, its
+/// size within 1 .. 2^17.
+pub fn headerFits(h: Header) bool {
+    if (h.width == 0 or h.height == 0 or h.width > 0x2_0000 or h.height > 0x2_0000) return false;
+    if (h.va >> 57 != 0) return false;
+    if (h.block) |n| return h.va % 512 == 0 and n <= 5;
+    return h.va % 32 == 0 and h.pitch % 32 == 0 and h.pitch != 0 and h.pitch < (1 << 22);
+}
+
+fn putBits(w: *[8]u32, lo: u32, width: u5, v: u32) void {
+    const word = lo / 32;
+    const at: u5 = @intCast(lo % 32);
+    const mask: u32 = (@as(u32, 1) << width) - 1;
+    w[word] = (w[word] & ~(mask << at)) | ((v & mask) << at);
+}
+
+/// The 8 words of header `h`: TEXHEAD_V2_PITCH or _BL, two dimensions, one
+/// level (TWO_D_NO_MIPMAP for rows), normalized coordinates (the
+/// sampler's USE_HEADER_SETTING), the border from the sampler, NIL's
+/// qualities and spreads.
+pub fn headerWords(h: Header) [8]u32 {
+    var w: [8]u32 = @splat(0);
+    // the format: its sources, data type and components (word 3)
+    for (h.sources, 0..) |src, c| putBits(&w, 96 + 3 * @as(u32, @intCast(c)), 3, @intFromEnum(src));
+    putBits(&w, 108, 4, @intFromEnum(h.data));
+    putBits(&w, 112, 7, @intFromEnum(h.components));
+    if (h.block) |n| {
+        putBits(&w, 124, 4, 3); // SELECT_BLOCKLINEAR_V2
+        putBits(&w, 9, 23, @truncate(h.va >> 9));
+        putBits(&w, 32, 25, @truncate(h.va >> 32));
+        // (one GOB wide and deep: 0; the block's height)
+        putBits(&w, 67, 3, n);
+        putBits(&w, 150, 4, 1); // TWO_D
+        putBits(&w, 80, 1, 1); // LOD_ANISO_QUALITY2
+        putBits(&w, 81, 1, 1); // LOD_ANISO_QUALITY: high
+        putBits(&w, 82, 1, 1); // LOD_ISO_QUALITY: high
+    } else {
+        putBits(&w, 124, 4, 2); // SELECT_PITCH_V2
+        putBits(&w, 5, 27, @truncate(h.va >> 5));
+        putBits(&w, 32, 25, @truncate(h.va >> 32));
+        putBits(&w, 64, 17, h.pitch >> 5);
+        putBits(&w, 150, 4, 7); // TWO_D_NO_MIPMAP
+        putBits(&w, 81, 1, 1); // LOD_ANISO_QUALITY2
+        putBits(&w, 82, 1, 1); // LOD_ANISO_QUALITY: high
+        putBits(&w, 83, 1, 1); // LOD_ISO_QUALITY: high
+    }
+    putBits(&w, 128, 17, h.width - 1);
+    putBits(&w, 160, 17, h.height - 1);
+    putBits(&w, 145, 1, 1); // NORMALIZED_COORDS
+    putBits(&w, 149, 1, @intFromBool(h.srgb));
+    putBits(&w, 156, 1, 1); // BORDER_SOURCE: the sampler's colour
+    putBits(&w, 215, 2, 2); // ANISO_FINE_SPREAD_FUNC: TWO
+    putBits(&w, 217, 2, 1); // ANISO_COARSE_SPREAD_FUNC: ONE
+    return w;
+}
+
+/// A sampler's wrap mode on an axis (TEXSAMP0_ADDRESS_U ..).
+pub const Wrap = enum(u3) { wrap = 0, mirror = 1, clamp_to_edge = 2, border = 3 };
+
+/// A sampler: each axis's wrap mode (u, v, p), nearest or linear (both
+/// filters; the first level), a depth comparison (GL's NEVER .. ALWAYS as
+/// less 1, equal 2, greater 4: TEXSAMP's ZC_ codes are the same numbers),
+/// the border colour's four words (the components' order, a float's bits).
+pub const Sampler = struct {
+    wrap: [3]Wrap = .{ .clamp_to_edge, .clamp_to_edge, .clamp_to_edge },
+    linear: bool = false,
+    compare: ?u3 = null,
+    border: [4]u32 = @splat(0),
+};
+
+/// The 8 words of sampler `s` (NVK's fields and its legacy font-filter
+/// bits; normalized coordinates as the header says; the first level).
+pub fn samplerWords(s: Sampler) [8]u32 {
+    var w0: u32 = @as(u32, @intFromEnum(s.wrap[0])) | @as(u32, @intFromEnum(s.wrap[1])) << 3 | @as(u32, @intFromEnum(s.wrap[2])) << 6;
+    if (s.compare) |c| w0 |= 1 << 9 | @as(u32, c) << 10;
+    w0 |= 1 << 13 | 1 << 14 | 1 << 17;
+    const f: u32 = if (s.linear) 2 else 1;
+    // (MAG, MIN, MIP_POINT; the cube seams AUTO_SPAN_SEAM, as NVK's)
+    const w1: u32 = f | f << 4 | 2 << 6 | 2 << 8;
+    return .{ w0, w1, 0, 0, s.border[0], s.border[1], s.border[2], s.border[3] };
+}
+
+/// The word a TEX instruction is handed: header `h`, sampler `s`.
+pub fn handleOf(h: u32, s: u32) u32 {
+    return (h & 0xf_ffff) | s << 20;
+}
 
 /// A colour target past the first: rows of `pitch` bytes from `va` (128
 /// bytes apart, as the first's; block linear as the first is, with
@@ -334,6 +517,28 @@ fn ctWrite(mask: u4) u32 {
 
 /// OGL_SET_CULL_FACE (cl9097.h): the faces culled when OGL_SET_CULL is on.
 pub const OGL_SET_CULL_FACE: u32 = 0x1920;
+/// Depth bias (clcb97.h): filled triangles' offset on, its constant (with
+/// DEPTH_FORMAT_DEPENDENT off, in 24-bit steps as the API gives it: the
+/// real RTX's depths moved by twice as much when it was sent doubled, as
+/// nouveau's nvc0 sends it for the format-dependent unit), its slope
+/// factor, its clamp, and whether the unit follows the depth's format.
+pub const SET_POLY_OFFSET_FILL: u32 = 0x0dc8;
+pub const SET_DEPTH_BIAS_CONTROL: u32 = 0x1110;
+pub const SET_SLOPE_SCALE_DEPTH_BIAS: u32 = 0x156c;
+pub const SET_DEPTH_BIAS: u32 = 0x15bc;
+pub const SET_DEPTH_BIAS_CLAMP: u32 = 0x187c;
+/// SET_VIEWPORT_CLIP_CONTROL (clc797.h) as draw.sig's setup leaves it:
+/// MIN_Z_ZERO_MAX_Z_ONE, GEOMETRY_GUARDBAND_Z SCALE_1, PIXEL_MIN_Z and
+/// PIXEL_MAX_Z CLAMP, GEOMETRY_CLIP FRUSTUM_XYZ_CLIP (depth clipped); and
+/// for a depth clamp: GEOMETRY_CLIP FRUSTUM_XY_CLIP and
+/// GEOMETRY_GUARDBAND_Z SCALE_256 (NVK's for a clamp without the clip),
+/// the pixels' depth clamped into 0 .. 1.
+pub const CLIP_CONTROL_CLIP: u32 = 0x181d;
+pub const CLIP_CONTROL_CLAMP: u32 = 0x101b;
+/// GEOMETRY_CLIP (bits 13:11): FRUSTUM_XY_CLIP, depth not clipped.
+pub fn clipsDepth(clip_control: u32) bool {
+    return (clip_control >> 11) & 7 != 2;
+}
 pub const CULL_FRONT: u32 = 0x404;
 pub const CULL_BACK: u32 = 0x405;
 pub const CULL_FRONT_AND_BACK: u32 = 0x408;
@@ -360,6 +565,10 @@ pub fn targetWords(va: u64, pitch: u32, height: u32, f: Format, gobs: ?u3) [9]u3
 /// Why the engine would refuse `d` (a class error: GSP-RM recovers the
 /// channel, Xid 69), or null. Checked before a draw is sent.
 pub fn whyNot(d: *const Draw) ?[]const u8 {
+    if (d.tex) |t| {
+        if (t.headers == 0 or t.samplers == 0 or t.headers > 1 << 20 or t.samplers > 1 << 12 or t.headers_va % 32 != 0 or t.samplers_va % 32 != 0)
+            return "texture pools not on 32 bytes, empty, or past the handle's indices";
+    }
     if (d.color_off) {
         if (d.depth == null) return "no colour target and no depth target: nothing to draw into";
         for (d.more) |m| if (m != null) return "colour targets past the first with target 0 off";
@@ -423,10 +632,13 @@ fn bits(x: f32) u32 {
     return @bitCast(x);
 }
 
-/// SET_VIEWPORT_Z_CLIP for GL's clip volume.
-pub const SET_VIEWPORT_SCALE_Z_CLIP_GL: u32 = 0; // SET_VIEWPORT_Z_CLIP: NEGATIVE_W_TO_POSITIVE_W
+/// SET_VIEWPORT_Z_CLIP for GL's clip volume (NEGATIVE_W_TO_POSITIVE_W) and
+/// Direct3D's (ZERO_TO_POSITIVE_W).
+pub const SET_VIEWPORT_SCALE_Z_CLIP_GL: u32 = 0;
+pub const SET_VIEWPORT_Z_CLIP_ZERO: u32 = 1;
 pub const SET_BLEND_CONST: u32 = gr.SET_BLEND_CONST_RED;
 pub const SET_CONSTANT_BUFFER_SELECTOR_A = gr.SET_CONSTANT_BUFFER_SELECTOR_A;
+pub const INVALIDATE_TEXTURE_DATA_CACHE_NO_WFI = gr.INVALIDATE_TEXTURE_DATA_CACHE_NO_WFI;
 /// SET_PROVOKING_VERTEX: GL's flat varyings are the last vertex's.
 pub const PROVOKING_LAST: u32 = 1;
 
@@ -480,9 +692,10 @@ fn emitDraw(p: *Push, d: *const Draw, whole: bool) void {
         count = t + 1;
     }
     many(p, gr.SET_CT_SELECT, &.{ctSelect(count)});
-    // the viewport: x, y and depth; GL's clip volume (-w <= z <= w)
+    // the viewport: x, y and depth; the clip volume (GL's -w <= z <= w, or
+    // Direct3D's 0 <= z <= w)
     many(p, gr.SET_VIEWPORT_SCALE_X, &.{ bits(d.scale[0]), bits(d.scale[1]), bits(d.scale[2]), bits(d.offset[0]), bits(d.offset[1]), bits(d.offset[2]) });
-    one(p, gr.SET_VIEWPORT_Z_CLIP, SET_VIEWPORT_SCALE_Z_CLIP_GL);
+    one(p, gr.SET_VIEWPORT_Z_CLIP, if (d.clip_zero) SET_VIEWPORT_Z_CLIP_ZERO else SET_VIEWPORT_SCALE_Z_CLIP_GL);
     gr.setScissor(p, d.scissor[0], d.scissor[1], d.scissor[2], d.scissor[3]);
     one(p, gr.SET_PROVOKING_VERTEX, PROVOKING_LAST);
     one(p, gr.OGL_SET_FRONT_FACE, frontFaceWord(d.front_ccw));
@@ -494,6 +707,17 @@ fn emitDraw(p: *Push, d: *const Draw, whole: bool) void {
         });
         one(p, gr.OGL_SET_CULL, 1);
     } else one(p, gr.OGL_SET_CULL, 0);
+    // (the depth clipped or clamped: every draw's own, as the cull's)
+    one(p, gr.SET_VIEWPORT_CLIP_CONTROL, if (d.depth_clamp) CLIP_CONTROL_CLAMP else CLIP_CONTROL_CLIP);
+    // (the depth bias: every draw's own, as the cull's)
+    const biased = d.bias[0] != 0 or d.bias[1] != 0;
+    one(p, SET_POLY_OFFSET_FILL, @intFromBool(biased));
+    if (biased) {
+        one(p, SET_DEPTH_BIAS_CONTROL, 0);
+        one(p, SET_DEPTH_BIAS, bits(d.bias[1]));
+        one(p, SET_SLOPE_SCALE_DEPTH_BIAS, bits(d.bias[0]));
+        one(p, SET_DEPTH_BIAS_CLAMP, bits(d.bias[2]));
+    }
     if (d.depth) |z| {
         // (as NVK sends a Blackwell depth image: X8Z24 alone, or S8Z24
         // with its stencil the SET_ST_* plane; a Turing one: the stencil in
@@ -543,7 +767,21 @@ fn emitDraw(p: *Push, d: *const Draw, whole: bool) void {
     many(p, gr.SET_CONSTANT_BUFFER_SELECTOR_A, &.{ d.cb_bytes, @truncate(d.cb_va >> 32), @truncate(d.cb_va) });
     one(p, gr.BIND_GROUP_CONSTANT_BUFFER + 32 * gr.GROUP_VERTEX, 1);
     one(p, gr.BIND_GROUP_CONSTANT_BUFFER + 32 * gr.GROUP_PIXEL, 1);
+    if (d.cb1_bytes != 0) {
+        many(p, gr.SET_CONSTANT_BUFFER_SELECTOR_A, &.{ d.cb1_bytes, @truncate(d.cb1_va >> 32), @truncate(d.cb1_va) });
+        one(p, gr.BIND_GROUP_CONSTANT_BUFFER + 32 * gr.GROUP_VERTEX, 1 | 1 << 4);
+        one(p, gr.BIND_GROUP_CONSTANT_BUFFER + 32 * gr.GROUP_PIXEL, 1 | 1 << 4);
+    }
     if (whole) one(p, gr.INVALIDATE_SHADER_CACHES_NO_WFI, 0x1001); // the code and the constants
+    // the texture unit's pools (each draw's: a run's draws may name others)
+    if (d.tex) |t| {
+        many(p, gr.SET_TEX_HEADER_POOL_A, &.{ @truncate(t.headers_va >> 32), @truncate(t.headers_va), t.headers - 1 });
+        many(p, gr.SET_TEX_SAMPLER_POOL_A, &.{ @truncate(t.samplers_va >> 32), @truncate(t.samplers_va), t.samplers - 1 });
+        if (t.fresh or whole) {
+            many(p, gr.INVALIDATE_SAMPLER_CACHE_NO_WFI, &.{ 0, 0 }); // and the headers'
+            one(p, gr.INVALIDATE_TEXTURE_DATA_CACHE_NO_WFI, 0);
+        }
+    }
     if (d.index) |ix| {
         many(p, SET_INDEX_BUFFER_A, &.{ @truncate(ix.va >> 32), @truncate(ix.va) });
         many(p, SET_INDEX_BUFFER_SIZE_A, &.{ 0, ix.bytes });
@@ -572,7 +810,7 @@ pub fn restartIndex(size: u8) u32 {
 
 /// Dwords emit takes at most (draw.sig's state, and the draw's own: 26
 /// a colour target past the first).
-pub const MAX_DWORDS = 1100;
+pub const MAX_DWORDS = 1120;
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 
@@ -662,6 +900,78 @@ test "gl3d: what the Legion refused (depth beside pitch colour, a combined depth
     try testing.expect(frontCcwOf(frontFaceWord(true)) and !frontCcwOf(frontFaceWord(false)));
     // (a target off a GOB is refused as block linear)
     d.target.va += 128;
+    try testing.expect(whyNot(&d) != null);
+}
+
+test "gl3d: texture headers and samplers: a level of RGBA8 rows is the renderer's own header (draw.sig's) word for word; a block-linear ZF32 level; a sampler's wraps, comparison and border; the pools sent with their caches invalidated" {
+    // rows: the compositor's header, the same words (normalized in the
+    // header both: the compositor's sampler forces texels)
+    const t = gr.Texture{ .va = 0x12_3456_7800, .width = 50, .height = 20, .pitch = 256, .format = .rgba8 };
+    try testing.expectEqualSlices(u32, &gr.headerWords(t), &headerWords(.{ .va = t.va, .width = 50, .height = 20, .components = .a8b8g8r8, .data = .unorm, .pitch = 256 }));
+    try testing.expect(headerFits(.{ .va = t.va, .width = 50, .height = 20, .components = .a8b8g8r8, .data = .unorm, .pitch = 256 }));
+    try testing.expect(!headerFits(.{ .va = t.va + 4, .width = 50, .height = 20, .components = .a8b8g8r8, .data = .unorm, .pitch = 256 }));
+    try testing.expect(!headerFits(.{ .va = t.va, .width = 50, .height = 20, .components = .a8b8g8r8, .data = .unorm, .pitch = 200 }));
+    // block linear: BLOCKLINEAR_V2 (3), the address's bits 9.. in word 0,
+    // blocks 2^4 GOBs high, TWO_D, ZF32 floats, its sources
+    const z = headerWords(.{ .va = 0x2_0000_4200, .width = 640, .height = 360, .components = .zf32, .data = .float, .block = 4, .sources = .{ .r, .zero, .zero, .one_float } });
+    try testing.expectEqual(@as(u32, 3), z[3] >> 28);
+    try testing.expectEqual(@as(u32, 0x4200), z[0]);
+    try testing.expectEqual(@as(u32, 2), z[1]);
+    try testing.expectEqual(@as(u32, 4), (z[2] >> 3) & 7);
+    try testing.expectEqual(@as(u32, 1), (z[4] >> 22) & 0xf);
+    try testing.expectEqual(@as(u32, 0x2f), (z[3] >> 16) & 0x7f);
+    try testing.expectEqual(@as(u32, 2), (z[3] >> 12) & 0xf);
+    try testing.expectEqual(@as(u32, 0b111_000_000_010), z[3] & 0xfff);
+    try testing.expectEqual(@as(u32, 639), z[4] & 0x1_ffff);
+    try testing.expectEqual(@as(u32, 359), z[5] & 0x1_ffff);
+    try testing.expect(z[4] & (1 << 17) != 0); // normalized
+    try testing.expect(!headerFits(.{ .va = 0x2_0000_4100, .width = 640, .height = 360, .components = .zf32, .data = .float, .block = 4 }));
+    // samplers: the compositor's linear one but for normalized coordinates
+    const lin = samplerWords(.{ .linear = true });
+    const want = gr.samplerWords(.linear);
+    try testing.expectEqual(want[0], lin[0]);
+    try testing.expectEqual(want[1] & ~@as(u32, 1 << 25), lin[1]);
+    const near = samplerWords(.{ .wrap = .{ .wrap, .mirror, .border }, .compare = 3, .border = .{ 1, 2, 3, 4 } });
+    try testing.expectEqual(@as(u32, 0 | 1 << 3 | 3 << 6), near[0] & 0x1ff);
+    try testing.expect(near[0] & (1 << 9) != 0);
+    try testing.expectEqual(@as(u32, 3), (near[0] >> 10) & 7);
+    try testing.expectEqual(@as(u32, 1), near[1] & 7);
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4 }, near[4..8]);
+    try testing.expectEqual(@as(u32, 0x0030_0007), handleOf(7, 3));
+    // a draw naming pools: sent, its caches invalidated when fresh
+    var buf: [MAX_DWORDS]u32 = undefined;
+    var p = Push{ .buf = &buf };
+    var d = Draw{
+        .vertex = .{ .va = 0x10_0000_0000, .registers = 24, .bytes = 0x300 },
+        .pixel = .{ .va = 0x10_0000_1000, .registers = 32, .bytes = 0x200 },
+        .cb_va = 0x10_0000_2000,
+        .cb_bytes = 0x400,
+        .zero_va = 0x10_0000_3000,
+        .target = .{ .va = 0x10_0001_0000, .width = 64, .height = 32, .pitch = 256 },
+        .format = .rgba8,
+        .scale = .{ 32, 16, 0.5 },
+        .offset = .{ 32, 16, 0.5 },
+        .scissor = .{ 0, 0, 64, 32 },
+        .count = 6,
+    };
+    d.tex = .{ .headers_va = 0x30_0000_0000, .headers = 1 << 17, .samplers_va = 0x30_0040_0000, .samplers = 1 << 12, .fresh = true };
+    try testing.expectEqual(@as(?[]const u8, null), whyNot(&d));
+    emitNext(&p, &d);
+    try p.check();
+    try testing.expect(std.mem.indexOf(u32, p.words(), &[_]u32{ push.header(SUBCH, gr.SET_TEX_HEADER_POOL_A, 3), 0x30, 0, (1 << 17) - 1 }) != null);
+    try testing.expect(std.mem.indexOf(u32, p.words(), &[_]u32{ push.header(SUBCH, gr.SET_TEX_SAMPLER_POOL_A, 3), 0x30, 0x0040_0000, (1 << 12) - 1 }) != null);
+    try testing.expect(std.mem.indexOf(u32, p.words(), &[_]u32{ push.header(SUBCH, gr.INVALIDATE_SAMPLER_CACHE_NO_WFI, 2), 0, 0 }) != null);
+    // (the whole state, every target, depth and stencil, and the pools: fits)
+    var all = d;
+    for (&all.more) |*m| m.* = .{ .va = 0x10_0002_0000, .pitch = 256, .format = .bgra8 };
+    all.color_gobs = 2;
+    all.target.va = 0x10_0001_0000;
+    all.depth = .{ .va = 0x10_0003_0000, .stencil_va = 0x10_0004_0000, .width = 64, .height = 32, .gobs_log2 = 2, .tested = true, .write = true, .stencil = .{}, .back = .{} };
+    p = Push{ .buf = &buf };
+    emit(&p, &all);
+    try p.check();
+    try testing.expect(p.words().len < MAX_DWORDS);
+    d.tex.?.headers_va += 16;
     try testing.expect(whyNot(&d) != null);
 }
 

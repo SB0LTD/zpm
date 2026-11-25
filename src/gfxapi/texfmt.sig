@@ -45,6 +45,8 @@ pub const Conv = enum {
     /// snorm16s to f32 (max(v / 32767, -1)), and RGB ones with alpha 1
     snorm16,
     snorm16_rgb,
+    /// snorm8s to f32 (max(v / 127, -1)): Direct3D's R8 to R8G8B8A8_SNORM
+    snorm8,
     /// 8- and 16-bit ints widened
     int8,
     uint8,
@@ -269,6 +271,10 @@ pub fn convert(up: Upload, src: []const u8, dst: []u8, n: u32) void {
                 }
             }
         },
+        .snorm8 => for (0..n * ch) |j| {
+            const v = @max(@as(f32, @floatFromInt(@as(i8, @bitCast(src[j])))) / 127.0, -1);
+            std.mem.writeInt(u32, dst[j * 4 ..][0..4], @bitCast(v), .little);
+        },
         .rgb10a2, .r11g11b10f, .rgb9e5 => for (0..n) |i| {
             const v = std.mem.readInt(u32, src[i * 4 ..][0..4], .little);
             const px = packed32(up.conv, v);
@@ -380,6 +386,15 @@ test "texfmt: uploads and their conversions" {
 
 fn f32At(b: []const u8, i: usize) f32 {
     return @bitCast(std.mem.readInt(u32, b[i * 4 ..][0..4], .little));
+}
+
+test "texfmt: snorm8 texels widen to -1..1 (-128 and -127 both -1)" {
+    const up = Upload{ .store = .rgba32f, .conv = .snorm8, .client_bytes = 4 };
+    const src = [4]u8{ 127, 0x81, 0x80, 0 };
+    var dst: [16]u8 = undefined;
+    convert(up, &src, &dst, 1);
+    const want = [4]f32{ 1, -1, -1, 0 };
+    for (want, 0..) |w, c| try std.testing.expectEqual(w, @as(f32, @bitCast(std.mem.readInt(u32, dst[c * 4 ..][0..4], .little))));
 }
 
 test "texfmt: EXT_texture_norm16's uploads, normalised to floats" {

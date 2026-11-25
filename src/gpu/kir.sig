@@ -35,6 +35,7 @@
 //!   shfl          ty       x         lane/mask  -        Shfl
 //!   vote          pred     p         -          -        Vote
 //!   ballot        u32      p         -          -        word      bit i: lane 32*word+i active with p
+//!   tex           f32      handle    x (vec)    -        Tex       dst: 4 (vec) red, green, blue, alpha
 //!   if            -        p         -          -        -
 //!   brk cont      -        p         -          -        -
 //!   else endif loop endloop ret: no operands.
@@ -140,10 +141,21 @@ pub const Op = enum(u8) {
     // (later ops: after ret, so the earlier ones keep their numbers)
     cas, // aux: Mem (32 bits); dst = old; c stored where old == b; u32/i32
     ballot, // aux: word 0..3; dst (u32) = the active lanes 32*aux.. where a (pred) holds
+    /// A hardware texture sample (Caps.tex: the RTX's texture unit): the
+    /// texture header and sampler handle `a` names (the header's index
+    /// in bits 0..19, the sampler's from 20), its first level at the
+    /// normalized coordinates b, b + 1 (a vec of f32), and with Tex.compare
+    /// the depth reference b + 2: dst .. dst + 3 (a vec of f32) the four
+    /// channels the header's sources give (a comparison's in the first).
+    /// The texture unit filters, wraps and compares as the sampler says.
+    /// With Tex.fetch: the texel at the integer coordinates b, b + 1 (a vec
+    /// of u32, inside the header's level: what is outside is the unit's)
+    /// as it is, no sampler (the handle's sampler bits ignored).
+    tex,
 };
 
 /// The last op (the binary form's bound).
-pub const LAST_OP = Op.ballot;
+pub const LAST_OP = Op.tex;
 
 /// (Not `extern`: Arg is a tagged union, which an extern struct cannot
 /// hold. A Binary for the interpreter carries instructions in the fixed
@@ -165,6 +177,15 @@ pub const Mem = packed struct(u32) {
 pub const Shfl = enum(u8) { idx, xor, up, down };
 pub const Atom = enum(u8) { add, min, max, xchg, @"and", @"or", xor };
 pub const Vote = enum(u8) { any, all };
+/// tex's aux: a depth comparison (b + 2 the reference), or a texel's
+/// fetch (b, b + 1 integers); not both.
+pub const Tex = packed struct(u32) { compare: bool = false, fetch: bool = false, _: u30 = 0 };
+
+/// The registers tex reads from b: x, y and a comparison's reference.
+pub fn texCoords(aux: u32) u8 {
+    const t: Tex = @bitCast(aux);
+    return if (t.compare) 3 else 2;
+}
 
 pub const Error = error{
     TooManyInsts,
@@ -477,6 +498,30 @@ pub const Kernel = struct {
     pub fn ballot(k: *Kernel, p: Arg, word: u2) V {
         return k.opAux(.ballot, .u32, p, no, no, word);
     }
+    /// A hardware sample (the op `tex`): its four channels' first register
+    /// (Kernel.at for the others). `ref`: a depth comparison's reference.
+    pub fn tex(k: *Kernel, handle: Arg, x: Arg, y: Arg, ref: ?Arg) V {
+        const t = Tex{ .compare = ref != null };
+        const src = k.vec(.f32, texCoords(@bitCast(t)));
+        k.set(src, .mov, x, no, no);
+        k.set(at(src, 1), .mov, y, no, no);
+        if (ref) |rf| k.set(at(src, 2), .mov, rf, no, no);
+        const d = k.vec(.f32, 4);
+        k.emit(.{ .op = .tex, .ty = .f32, .dst = d, .a = handle, .b = r(src), .c = no, .aux = @bitCast(t) });
+        return d;
+    }
+    /// A texel fetched through the texture unit (tex with Tex.fetch): (x,
+    /// y) integers inside the handle's header's level; its four channels'
+    /// first register.
+    pub fn texFetch(k: *Kernel, handle: Arg, x: Arg, y: Arg) V {
+        const t = Tex{ .fetch = true };
+        const src = k.vec(.u32, 2);
+        k.set(src, .mov, x, no, no);
+        k.set(at(src, 1), .mov, y, no, no);
+        const d = k.vec(.f32, 4);
+        k.emit(.{ .op = .tex, .ty = .f32, .dst = d, .a = handle, .b = r(src), .c = no, .aux = @bitCast(t) });
+        return d;
+    }
     pub fn barrier(k: *Kernel) void {
         k.emit(.{ .op = .barrier, .ty = .u32, .dst = .none, .a = no, .b = no, .c = no, .aux = 0 });
     }
@@ -562,6 +607,7 @@ fn shape(op: Op) Shape {
         .st => .{ .dst = .none, .a = .int, .b = .ty },
         .atom, .cas => .{ .dst = .int, .a = .int, .b = .int, .c = .int },
         .ballot => .{ .dst = .int, .a = .pred },
+        .tex => .{ .dst = .f32, .a = .int }, // (b: a vec, checked below)
         .barrier => .{ .dst = .none },
         .shfl => .{ .dst = .ty, .a = .ty, .b = .int },
         .vote => .{ .dst = .pred, .a = .pred },
@@ -664,6 +710,21 @@ fn verifyKernel(k: *const Kernel, caps: ?Caps) Error!void {
                 if (in.aux > 3) return error.BadOperand;
                 if (in.ty != .u32) return error.BadType;
             },
+            .tex => {
+                const t: Tex = @bitCast(in.aux);
+                if (in.aux >> 2 != 0 or (t.compare and t.fetch)) return error.BadOperand;
+                if (caps) |cp| if (!cp.tex) return error.BadOperand;
+                const v = switch (in.b) {
+                    .reg => |v| v,
+                    .imm => return error.BadOperand,
+                };
+                const n = texCoords(in.aux);
+                if (v == .none or @as(usize, @intFromEnum(v)) + n > k.nv) return error.BadOperand;
+                for (0..n) |ix| {
+                    const have = k.tys[@intFromEnum(v) + ix];
+                    if (if (t.fetch) !isInt(have) else have != .f32) return error.BadType;
+                }
+            },
             .ffma => if (caps) |cp| if (!cp.fused_fma) return error.NeedsFusedFma,
             .ld, .st, .atom, .cas => try checkMem(k, in),
             .@"if" => {
@@ -709,7 +770,7 @@ fn verifyKernel(k: *const Kernel, caps: ?Caps) Error!void {
         // the destination
         if (s.dst != .none) {
             if (!regOk(k, in.dst)) return error.BadOperand;
-            const n = if (in.op == .ld) memRegs(@bitCast(in.aux)) else 1;
+            const n: usize = if (in.op == .ld) memRegs(@bitCast(in.aux)) else if (in.op == .tex) 4 else 1;
             if (@as(usize, @intFromEnum(in.dst)) + n > k.nv) return error.BadOperand;
             const want: Want = switch (s.dst) {
                 .pred => .pred,
@@ -1283,4 +1344,40 @@ test "kir: the verifier rejects" {
         for (0..65) |_| k.barrier();
         try std.testing.expectError(error.TooManyInsts, k.finish());
     }
+}
+
+test "kir: tex: four f32 results and its coordinates a vec (a comparison's reference after them); refused without Caps.tex, or with a coordinate of another type" {
+    var insts: [64]Inst = undefined;
+    var tys: [64]Ty = undefined;
+    var k = Kernel.init(.{ .insts = &insts, .tys = &tys }, "t", .{ 1, 1, 1 });
+    const v = k.tex(u(7), f(0.5), f(0.25), f(1));
+    try std.testing.expectEqual(@as(u32, 3), @as(u32, texCoords(k.insts[k.n - 1].aux)));
+    _ = k.op2(.fadd, .f32, r(v), r(Kernel.at(v, 3)));
+    try k.finish();
+    var caps = device.interp_caps;
+    try std.testing.expectError(error.BadOperand, verify(&k, caps));
+    caps.tex = true;
+    try verify(&k, caps);
+    // (a coordinate that is not a float)
+    k.tys[@intFromEnum(k.insts[k.n - 2].b.reg) + 1] = .u32;
+    try std.testing.expectError(error.BadType, verify(&k, caps));
+}
+
+test "kir: tex's fetch: integer coordinates, four f32 results; a float coordinate, or a fetch that compares, refused" {
+    var insts: [64]Inst = undefined;
+    var tys: [64]Ty = undefined;
+    var k = Kernel.init(.{ .insts = &insts, .tys = &tys }, "t", .{ 1, 1, 1 });
+    const v = k.texFetch(u(7), u(3), u(5));
+    const at_ = k.n - 1;
+    try std.testing.expect(@as(Tex, @bitCast(k.insts[at_].aux)).fetch);
+    _ = k.op2(.fadd, .f32, r(v), r(Kernel.at(v, 3)));
+    try k.finish();
+    var caps = device.interp_caps;
+    caps.tex = true;
+    try verify(&k, caps);
+    k.tys[@intFromEnum(k.insts[at_].b.reg)] = .f32;
+    try std.testing.expectError(error.BadType, verify(&k, caps));
+    k.tys[@intFromEnum(k.insts[at_].b.reg)] = .u32;
+    k.insts[at_].aux = @bitCast(Tex{ .fetch = true, .compare = true });
+    try std.testing.expectError(error.BadOperand, verify(&k, caps));
 }

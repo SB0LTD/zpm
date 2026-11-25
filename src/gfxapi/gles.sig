@@ -2539,7 +2539,8 @@ pub const Context = struct {
             .height = @intCast(h),
             .format = format,
             .levels = @intCast(levels),
-            .stride = std.mem.alignForward(u32, @as(u32, @intCast(w)) * format.bytes(), 4),
+            .stride = std.mem.alignForward(u32, @as(u32, @intCast(w)) * format.bytes(), c.eng.rowAlign()),
+            .row_align = c.eng.rowAlign(),
         };
         var bytes: usize = 0;
         for (0..@intCast(levels)) |at| {
@@ -2555,6 +2556,8 @@ pub const Context = struct {
         img.format = layout.format;
         img.levels = layout.levels;
         img.level_at = layout.level_at;
+        img.row_align = layout.row_align;
+        img.layered = true;
         return img;
     }
 
@@ -4376,8 +4379,8 @@ pub const Context = struct {
                 d.attrs[j] = .{ .constant = c.generic[j], .integer = c.generic_int[j] };
                 continue;
             }
-            // (arrays in client memory, divisors past 1, half floats and
-            // packed types: not drawn yet)
+            // (arrays in client memory, divisors past 1 and FIXED: not
+            // drawn yet)
             const b = madeIn(Buf, &c.objs.bufs, a.buffer) orelse return c.fail(g.INVALID_OPERATION);
             if (!b.store.live() and b.store.buf.cpu.len == 0) return c.fail(g.INVALID_OPERATION);
             if (!c.notMapped(b)) return;
@@ -4386,13 +4389,14 @@ pub const Context = struct {
             d.attrs[j] = .{
                 .buf = &b.store,
                 .offset = @intCast(a.offset),
-                .stride = if (a.stride != 0) a.stride else @as(u32, a.size) * t.size,
+                .stride = if (a.stride != 0) a.stride else if (t.rgb10a2) 4 else @as(u32, a.size) * t.size,
                 .comps = a.size,
                 .size = t.size,
                 .float = t.float,
                 .signed = t.signed,
                 .normalized = a.normalized,
                 .integer = a.integer,
+                .rgb10a2 = t.rgb10a2,
                 .divisor = a.divisor,
             };
         }
@@ -4587,9 +4591,13 @@ fn equationOf(e: u32) ?raster.Equation {
 }
 
 /// An attribute type's bytes a component, and whether it is signed or a
-/// float; null: not one draws take yet (HALF_FLOAT, FIXED, the packed ones).
-fn attrType(ty: u32) ?struct { size: u8, signed: bool, float: bool } {
+/// float (a half: size 2), or the four in one word (packed); null: not
+/// one draws take yet (FIXED).
+fn attrType(ty: u32) ?struct { size: u8, signed: bool, float: bool, rgb10a2: bool = false } {
     return switch (ty) {
+        g.HALF_FLOAT, 0x8D61 => .{ .size = 2, .signed = true, .float = true },
+        0x8D9F => .{ .size = 1, .signed = true, .float = false, .rgb10a2 = true },
+        0x8368 => .{ .size = 1, .signed = false, .float = false, .rgb10a2 = true },
         g.BYTE => .{ .size = 1, .signed = true, .float = false },
         g.UNSIGNED_BYTE => .{ .size = 1, .signed = false, .float = false },
         g.SHORT => .{ .size = 2, .signed = true, .float = false },

@@ -28,6 +28,20 @@ const nvidia = @import("nvidia");
 const sph = nvidia.sph;
 
 pub const Stage = kir_sm120.Stage;
+/// The texture unit's headers and samplers (KIR's tex: the pools a draw
+/// names, device.Graphics.tex).
+pub const tex = struct {
+    pub const Header = nvidia.gl3d.Header;
+    pub const Components = nvidia.gl3d.Components;
+    pub const DataType = nvidia.gl3d.DataType;
+    pub const Source = nvidia.gl3d.Source;
+    pub const Wrap = nvidia.gl3d.Wrap;
+    pub const Sampler = nvidia.gl3d.Sampler;
+    pub const headerWords = nvidia.gl3d.headerWords;
+    pub const headerFits = nvidia.gl3d.headerFits;
+    pub const samplerWords = nvidia.gl3d.samplerWords;
+    pub const handleOf = nvidia.gl3d.handleOf;
+};
 pub const StageIO = kir_sm120.StageIO;
 pub const OUT_AT = kir_sm120.OUT_AT;
 pub const KILL_AT = kir_sm120.KILL_AT;
@@ -66,8 +80,15 @@ pub fn ioMem(io: u8, at: u32, flat: bool) kir.Mem {
 /// the Binary's code being both (the 3D engine is given the header's
 /// address). `st` is the compiler's State (or LargeState).
 pub fn compileStage(k: *const kir.Kernel, caps: device.Caps, st: anytype, stage: Stage, io: u8, out: []u8) kir_sm120.Error!device.Binary {
+    return compileStageBank(k, caps, st, stage, io, 0xff, out);
+}
+
+/// compileStage with `uni`'s fixed loads through constant buffer 1
+/// (kir_sm120.Options.uni_bank: raster's uniforms; the draw binds the
+/// binding's buffer there when the binary's EXTRA_BANK1 is not 0).
+pub fn compileStageBank(k: *const kir.Kernel, caps: device.Caps, st: anytype, stage: Stage, io: u8, uni: u8, out: []u8) kir_sm120.Error!device.Binary {
     if (stage == .compute or out.len < sph.BYTES) return error.Unsupported;
-    var bin = try kir_sm120.compileIn(k, caps, st, out[sph.BYTES..], .{ .stage = stage, .stage_io = io });
+    var bin = try kir_sm120.compileIn(k, caps, st, out[sph.BYTES..], .{ .stage = stage, .stage_io = io, .uni_bank = uni });
     const head = header(stage, &st.io);
     for (head, 0..) |w, n| std.mem.writeInt(u32, out[n * 4 ..][0..4], w, .little);
     bin.code = out[0 .. sph.BYTES + bin.code.len];
@@ -188,6 +209,71 @@ test "nvidia_gl: a pixel program reads a varying in perspective and one flat, wr
     try testing.expect(!sph.bit(head, 609));
 }
 
+test "nvidia_gl: a pixel program's global loads write 0 first (a helper lane's load does nothing on the RTX)" {
+    var k = kir.Kernel.init(.{ .insts = &T.insts, .tys = &T.tys }, "ps", .{ 1, 1, 1 });
+    const io = k.binding();
+    const uni = k.binding();
+    const n = k.load(.u32, kir.global(uni, 32), u(0x81d0));
+    const v = k.load(.u32, kir.global(uni, 128), u(16));
+    var sum = n;
+    for (0..4) |j| sum = k.op2(.iadd, .u32, r(sum), r(kir.Kernel.at(v, @intCast(j))));
+    k.store(.f32, ioMem(io, OUT_AT + 0, false), u(0), r(k.cvt(.u32, .f32, .rne, r(sum))));
+    try k.finish();
+    T.st.asm_work.sched = .{};
+    _ = try compileStage(&k, rtx(), &T.st, .pixel, io, &T.out);
+    const text = try kir_sm120.compileText(&k, rtx(), &T.st, .{ .stage = .pixel, .stage_io = io });
+    // each LDG's registers zeroed before it: the 32-bit load's one, the
+    // 128-bit load's four (Rn..Rn+3)
+    for ([_][]const u8{ "LDG.E R", "LDG.E.128 R" }, [_]u32{ 1, 4 }) |ld, regs| {
+        const at = std.mem.indexOf(u8, text, ld) orelse {
+            std.debug.print("{s}\n", .{text});
+            return error.TestUnexpectedResult;
+        };
+        const num_at = at + ld.len;
+        var num_end = num_at;
+        while (num_end < text.len and std.ascii.isDigit(text[num_end])) num_end += 1;
+        const first = try std.fmt.parseInt(u32, text[num_at..num_end], 10);
+        for (0..regs) |j| {
+            var want: [32]u8 = undefined;
+            const w = try std.fmt.bufPrint(&want, "MOV R{d}, RZ", .{first + @as(u32, @intCast(j))});
+            const z = std.mem.indexOf(u8, text, w) orelse {
+                std.debug.print("no '{s}' in\n{s}\n", .{ w, text });
+                return error.TestUnexpectedResult;
+            };
+            try testing.expect(z < at);
+        }
+    }
+}
+
+test "nvidia_gl: a pixel program's uniform loads reach its helper lanes (loaded again over a 1, a lane whose load landed picked, each register shuffled from it); a pixel's own load does not" {
+    var k = kir.Kernel.init(.{ .insts = &T.insts, .tys = &T.tys }, "ps", .{ 1, 1, 1 });
+    const io = k.binding();
+    const uni = k.binding();
+    // (a uniform's 128 bits at a fixed place; a word at the pixel's own)
+    const v = k.load(.u32, kir.global(uni, 128), u(16));
+    const x = k.load(.f32, ioMem(io, generic(0, 0), false), u(0));
+    const own = k.load(.u32, kir.global(uni, 32), r(k.op2(.shl, .u32, r(k.cvt(.f32, .u32, .rz, r(x))), u(2))));
+    var sum = own;
+    for (0..4) |j| sum = k.op2(.iadd, .u32, r(sum), r(kir.Kernel.at(v, @intCast(j))));
+    k.store(.f32, ioMem(io, OUT_AT + 0, false), u(0), r(k.cvt(.u32, .f32, .rne, r(sum))));
+    try k.finish();
+    T.st.asm_work.sched = .{};
+    _ = try compileStage(&k, rtx(), &T.st, .pixel, io, &T.out);
+    const text = try kir_sm120.compileText(&k, rtx(), &T.st, .{ .stage = .pixel, .stage_io = io });
+    const count = struct {
+        fn of(t: []const u8, what: []const u8) usize {
+            return std.mem.count(u8, t, what);
+        }
+    }.of;
+    // (the 128-bit load, then its first word again; the pixel's own word once)
+    const ok = count(text, "LDG.E.128 R") == 1 and count(text, "LDG.E R") == 2 and
+        count(text, "VOTE.ANY") == 1 and count(text, "FLO.U32") == 1 and count(text, "SHFL.IDX") == 4;
+    if (!ok) {
+        std.debug.print("{s}\n", .{text});
+        return error.TestUnexpectedResult;
+    }
+}
+
 test "nvidia_gl: a pixel program writing target 2 alone and the depth: its registers packed (R0..R3, then the depth in R5)" {
     var k = kir.Kernel.init(.{ .insts = &T.insts, .tys = &T.tys }, "ps", .{ 1, 1, 1 });
     const io = k.binding();
@@ -210,4 +296,62 @@ test "nvidia_gl: a pixel program writing target 2 alone and the depth: its regis
             return error.TestUnexpectedResult;
         }
     }
+}
+
+test "nvidia_gl: a pixel program samples through the texture unit: TEX.B.LZ, its coordinates a pair, the handle then a comparison's reference (TEX.B.LZ.DC), a fetch TLD.B.LZ, the four channels a run" {
+    var caps = rtx();
+    caps.tex = true;
+    var k = kir.Kernel.init(.{ .insts = &T.insts, .tys = &T.tys }, "ps", .{ 1, 1, 1 });
+    const io = k.binding();
+    const x = k.load(.f32, ioMem(io, generic(0, 0), false), u(0));
+    const y = k.load(.f32, ioMem(io, generic(0, 1), false), u(0));
+    const handle = k.param(.u32, 0);
+    const v = k.tex(r(handle), r(x), r(y), null);
+    const c = k.tex(r(k.op2(.iadd, .u32, r(handle), u(1))), r(y), r(x), f(0.5));
+    const fx = k.cvt(.f32, .u32, .rz, r(x));
+    const t = k.texFetch(r(k.op2(.iadd, .u32, r(handle), u(2))), r(fx), u(3));
+    for (0..4) |j| k.store(.f32, ioMem(io, OUT_AT + 4 * @as(u32, @intCast(j)), false), u(0), r(k.op2(.fadd, .f32, r(kir.Kernel.at(v, @intCast(j))), r(kir.Kernel.at(t, @intCast(j))))));
+    k.store(.f32, ioMem(io, OUT_AT + 16, false), u(0), r(c));
+    try k.finish();
+    // (without the texture unit's caps the op is refused)
+    try testing.expectError(error.BadOperand, kir.verify(&k, rtx()));
+    try kir.verify(&k, caps);
+    T.st.asm_work.sched = .{};
+    _ = try compileStage(&k, caps, &T.st, .pixel, io, &T.out);
+    const text = try kir_sm120.compileText(&k, caps, &T.st, .{ .stage = .pixel, .stage_io = io });
+    const plain = std.mem.indexOf(u8, text, "TEX.B.LZ R") orelse {
+        std.debug.print("{s}\n", .{text});
+        return error.TestUnexpectedResult;
+    };
+    const dc = std.mem.indexOf(u8, text, "TEX.B.LZ.DC R") orelse {
+        std.debug.print("{s}\n", .{text});
+        return error.TestUnexpectedResult;
+    };
+    const fetch = std.mem.indexOf(u8, text, "TLD.B.LZ R") orelse {
+        std.debug.print("{s}\n", .{text});
+        return error.TestUnexpectedResult;
+    };
+    // each: Rd1, Rd0 two apart (the run of four), Ra even (a pair), Rb
+    for ([_]usize{ plain, dc, fetch }) |at| {
+        var regs: [4]u32 = undefined;
+        var i = std.mem.indexOfScalarPos(u8, text, at, ' ').?;
+        for (&regs) |*rg| {
+            i = std.mem.indexOfScalarPos(u8, text, i, 'R').? + 1;
+            var e = i;
+            while (std.ascii.isDigit(text[e])) e += 1;
+            rg.* = try std.fmt.parseInt(u32, text[i..e], 10);
+            i = e;
+        }
+        try testing.expectEqual(regs[1] + 2, regs[0]);
+        try testing.expectEqual(@as(u32, 0), regs[1] % 4);
+        try testing.expectEqual(@as(u32, 0), regs[2] % 2);
+        if (at == dc) {
+            // (the reference moved into the register after the handle)
+            var want: [24]u8 = undefined;
+            const mv = try std.fmt.bufPrint(&want, "MOV R{d}, ", .{regs[3] + 1});
+            try testing.expect(std.mem.lastIndexOf(u8, text[0..at], mv) != null);
+        }
+    }
+    // (a compute kernel has no texture pools)
+    try testing.expectError(error.Unsupported, kir_sm120.compileText(&k, caps, &T.st, .{ .stage = .compute }));
 }
