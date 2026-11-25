@@ -25,8 +25,10 @@ custom archives in both directions, savepoint rollback, forced-crash
 recovery, and revocation across checkpoint WAL replay.
 
 Server-side file import/export and large-object default-privilege DDL
-remain open. The current catalog capacity covers roles, large-object
-metadata and ACL versions together.
+remain open. Roles, large-object metadata and ACL versions use the
+shared catalog budget. Displaying or dumping an ACL still uses the
+configured inline cell size (`Config.text_bytes`). Large ACLs can
+require a wider text profile even when their grants fit the catalog.
 [PostgreSQL large-object permissions](https://www.postgresql.org/docs/18/lo-implementation.html)
 [PostgreSQL ownership transfers](https://www.postgresql.org/docs/18/sql-alterlargeobject.html)
 
