@@ -104,7 +104,11 @@ pub const SequenceCall = enum { nextval, currval, setval, lastval, identity, reg
 /// argument is a regclass); identity passes the table slot in `oid` and the
 /// column in `value`; regclass resolves a relation name to its OID (-1 when
 /// missing unless `called`, which raises 42P01).
+pub const LargeObjectData = enum { create, read };
+
 pub const SequenceHook = struct {
+    large_object: ?*const fn (ptr: *anyopaque, create: bool, oid: u32) Error!u32 = null,
+    large_object_data: ?*const fn (ptr: *anyopaque, operation: LargeObjectData, oid: u32, offset: i64, input: []const u8, output: []u8, requested: ?usize) Error!usize = null,
     ptr: *anyopaque,
     call: *const fn (ptr: *anyopaque, kind: SequenceCall, name: []const u8, oid: u32, value: i64, called: bool) Error!i64,
     /// regclass output: the relation named by `oid`, if any.

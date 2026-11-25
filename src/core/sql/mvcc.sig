@@ -49,7 +49,7 @@ pub fn Mvcc(comptime config: types.Config) type {
         /// `object_insert` / `object_delete`: catalog object entry `new` /
         /// `old` (catalog_objects.sig, B11 wave 3); an insert's `table` is 1
         /// when the version took a fresh OID.
-        pub const WriteKind = enum(u8) { insert, update, delete, create_table, drop_table, catalog_insert, catalog_delete, create_sequence, drop_sequence, truncate, alter_table, alter_sequence, create_schema, drop_schema, create_object, drop_object, object_insert, object_delete, refresh_rows };
+        pub const WriteKind = enum(u8) { insert, update, delete, create_table, drop_table, catalog_insert, catalog_delete, create_sequence, drop_sequence, truncate, alter_table, alter_sequence, create_schema, drop_schema, create_object, drop_object, object_insert, object_delete, refresh_rows, large_object_page };
 
         /// `table` is the table slot (catalog relation, sequence slot);
         /// `old`/`new` are version indices.
@@ -73,6 +73,7 @@ pub fn Mvcc(comptime config: types.Config) type {
         pub const Level = enum(u8) { read_committed, repeatable_read, serializable, read_uncommitted };
 
         pub const Tx = struct {
+            large_objects: @import("large_object_command.sig").Descriptors = .{},
             active: bool = false,
             prepared: bool = false,
             epoch: u32 = 0,
@@ -249,6 +250,10 @@ pub fn Mvcc(comptime config: types.Config) type {
                         db.catalog_objects.undoInsert(entry.new);
                     },
                     .object_delete => db.catalog_objects.undoDelete(entry.old),
+                    .large_object_page => {
+                        const pages = &db.large_pages.?;
+                        pages.rollback(&.{pages.changeFromVersions(entry.old, entry.new)});
+                    },
                 }
             }
             tx.write_len = start;
@@ -375,6 +380,10 @@ pub fn Mvcc(comptime config: types.Config) type {
                     .create_object, .drop_object => db.stampObject(entry.kind == .create_object, entry.new, entry.table, csn),
                     .object_insert => db.catalog_objects.stampInsert(entry.new, csn),
                     .object_delete => db.catalog_objects.stampDelete(entry.old, csn),
+                    .large_object_page => {
+                        const pages = &db.large_pages.?;
+                        pages.publish(&.{pages.changeFromVersions(entry.old, entry.new)}, csn);
+                    },
                 }
             }
         }
@@ -392,6 +401,11 @@ pub fn Mvcc(comptime config: types.Config) type {
                     continue;
                 }
                 if (budget == 0) break;
+                if (entry.kind == .large_object_page) {
+                    db.large_pages.?.reclaimPrevious(entry.old, horizon);
+                    budget -= 1;
+                    continue;
+                }
                 if (entry.kind != .update and entry.kind != .delete) continue;
                 const table = &db.tables[entry.table];
                 if (!table.live or table.dead_csn != 0) continue;

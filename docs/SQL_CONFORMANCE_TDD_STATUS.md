@@ -1,5 +1,94 @@
 # SQL conformance TDD checkpoint
 
+## PostgreSQL large-object transfers and compact checkpoints
+
+Transaction-owned descriptor calls share one store path for SQL and
+libpq FunctionCall messages. A read-only descriptor pins the snapshot
+taken at open. Release reparents descriptor ownership, and rollback
+closes handles opened within the affected savepoint. Commit and abort
+release the transaction's handles. SQL and wire transfers use bounded
+page and response buffers independently of inline `bytea` cells.
+The transaction handle table has 64 entries. Standalone literal calls
+and prepared scalar transfer calls use the ordinary packet and response
+budgets. Larger objects can use repeated descriptor reads and writes.
+
+Compact image format RSBASE06 includes supported large-object
+metadata, role ownership, SELECT/UPDATE grants, comments and page
+payloads. Restore validates page identity, length, duplicates and
+capacity before installing each image into the unpublished startup
+store. Earlier image formats remain readable. WAL suffix replay
+can add or remove pages after the checkpoint.
+
+The PG16/PG18 stock tooling gate requires plain and custom archives in
+both directions, plus role checks, transaction rollback, forced-crash
+recovery and compact checkpoint reopen. Server-side file imports,
+file exports and LO truncation are outside this slice.
+[PostgreSQL large-object client behavior](https://www.postgresql.org/docs/18/lo-interfaces.html)
+
+## PostgreSQL large-object pages and WAL
+
+The SQL database can attach disjoint caller-owned page buffers. Ordinary
+table cells and large-object pages use independent storage spans.
+`lo_from_bytea` and both `lo_get` signatures use snapshot-visible pages.
+The SQL forms in this slice use the existing inline `bytea` capacity.
+Catalog readers can inspect `pg_largeobject` with superuser privileges.
+
+Page writes and unlink operations participate in statement rollback,
+savepoints, durable commit, and version reclamation. WAL opcode 72
+stores a complete page image or a page removal. Replay validates the
+whole frame, including object existence, logical EOF, peak capacity,
+and references that would outlive metadata. The page bytes and their
+catalog length publish at the same commit boundary.
+
+Prepared binary streaming, descriptor operations, sparse writes from
+SQL, and compact page checkpoints remain open. The stock large-object
+archive gate still exercises those paths.
+
+## PostgreSQL large-object SQL metadata and ACLs
+
+ZPM implements `lo_create(oid)`, `lo_creat(int4)`, `lo_unlink(oid)`,
+`ALTER LARGE OBJECT ... OWNER TO`, comments, and owner-issued SELECT
+and UPDATE grants and revocations for large-object identities. The
+PostgreSQL catalog exposes typed metadata, procedure identities,
+comments and ACLs, including the default ACL used by PG16 and PG18
+`pg_dump`. Explicit large-object OIDs can coexist with relation OIDs.
+
+Metadata, ACLs and comments use the existing transactional catalog and
+validated object WAL records. Replay checks owner and grantee
+references, the live large-object identity, and the generated OID
+high-water mark. Tests exercise duplicate OIDs, failed authorization,
+same-statement effects, savepoint rollback, competing creators, and
+malformed records. Native PostgreSQL 16.15 and 18.7 agree on the
+ownership transfer, ACL output, comments and unlink results. Duplicate
+explicit OIDs return 23505, matching the native metadata primary key.
+
+Page bytes still need a database-owned arena, transaction write-set
+entries, a WAL page-record validator, and checkpoint/export integration.
+Descriptor operations and the full byte-stream archive path remain
+open. Delegated grant options and PostgreSQL's warning for a grant
+that conveys no permissions also remain open.
+[PostgreSQL large-object permissions](https://www.postgresql.org/docs/18/lo-implementation.html)
+
+## PostgreSQL large-object substrate
+
+The SQL layer now has a caller-backed 2 KiB page store that reuses the
+ordinary hashed row directory and MVCC version arena. Sparse writes
+consume backing only for touched pages. Reads fill gaps with zeros and
+stop at the snapshot-visible length supplied by the caller.
+The page contract covers competing writers, savepoint rollback,
+capacity failure across a page boundary and snapshot-safe reclamation.
+
+The PostgreSQL codec parses FunctionCall frames and encodes scalar
+responses, including binary payloads, NULL and the empty result. An error
+on a standalone FunctionCall ends with ReadyForQuery. Native PostgreSQL
+16.15 and 18.7 verified an actual 16 KiB large-object call, the sparse page
+layout and an offset at the native size boundary.
+
+Large-object SQL routines, catalog owners and grants, transaction-scoped
+descriptors, host capacity admission, WAL replay, and checkpoint/export
+integration remain open. The stock archive gate stays partial.
+[PostgreSQL large-object API](https://www.postgresql.org/docs/18/lo-interfaces.html)
+
 ## PostgreSQL time bucketing candidate
 
 `date_bin` supports both stock timestamp signatures and their `pg_proc`

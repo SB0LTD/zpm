@@ -6,6 +6,7 @@
 const std = @import("std");
 const scram = @import("scram");
 const sql = @import("sql");
+const LargeObject = sql.large_object_command;
 const pg_types = @import("pg_types.sig");
 const pg_copy = @import("pg_copy.sig");
 /// COPY data formats (text, csv, binary framing and escaping).
@@ -161,6 +162,96 @@ const Reader = struct {
         if (self.at != self.bytes.len) return error.ProtocolViolation;
     }
 };
+
+/// FunctionCall body without the frame header. Arguments borrow the input
+/// until the caller finishes dispatch. Scalar result formats are independent.
+pub const FunctionCall = struct {
+    const Self = @This();
+    pub const Format = enum(u16) { text = 0, binary = 1 };
+    pub const Argument = struct {
+        format: Format,
+        value: ?[]const u8,
+    };
+
+    oid: u32,
+    count: u16,
+    result_format: Format,
+    formats: []const u8,
+    values: []const u8,
+
+    fn format(code: u16) error{ProtocolViolation}!Format {
+        return switch (code) {
+            0 => .text,
+            1 => .binary,
+            else => error.ProtocolViolation,
+        };
+    }
+
+    fn value(reader: *Reader) error{ProtocolViolation}!?[]const u8 {
+        const len = try reader.u32be();
+        if (len == 0xffff_ffff) return null;
+        if (len > 0x7fff_ffff) return error.ProtocolViolation;
+        return try reader.take(len);
+    }
+
+    pub fn decode(body: []const u8) error{ProtocolViolation}!Self {
+        var reader: Reader = .{ .bytes = body };
+        const oid = try reader.u32be();
+        const format_count = try reader.u16be();
+        const format_start = reader.at;
+        for (0..format_count) |_| _ = try format(try reader.u16be());
+        const formats = body[format_start..reader.at];
+        const count = try reader.u16be();
+        if (format_count > 1 and format_count != count) return error.ProtocolViolation;
+        const value_start = reader.at;
+        for (0..count) |_| _ = try value(&reader);
+        const values = body[value_start..reader.at];
+        const result_format = try format(try reader.u16be());
+        try reader.done();
+        return .{ .oid = oid, .count = count, .result_format = result_format, .formats = formats, .values = values };
+    }
+
+    pub const Arguments = struct {
+        formats: []const u8,
+        reader: Reader,
+        index: usize = 0,
+        count: usize,
+
+        pub fn next(self: *Arguments) ?Argument {
+            if (self.index == self.count) return null;
+            const code: u8 = switch (self.formats.len) {
+                0 => 0,
+                2 => self.formats[1],
+                else => self.formats[2 * self.index + 1],
+            };
+            self.index += 1;
+            return .{
+                .format = if (code == 0) .text else .binary,
+                .value = value(&self.reader) catch unreachable,
+            };
+        }
+    };
+
+    pub fn arguments(self: Self) Arguments {
+        return .{ .formats = self.formats, .reader = .{ .bytes = self.values }, .count = self.count };
+    }
+};
+
+/// Emit a complete FunctionCallResponse. A null result and an empty result
+/// are distinct. Capacity is checked before modifying output.
+pub fn encodeFunctionCallResponse(output: []u8, result: ?[]const u8) error{BufferTooSmall}!usize {
+    const length = if (result) |bytes| bytes.len else 0;
+    const header = 9;
+    if (output.len < header or length > output.len - header or length > 0x7fff_fff7)
+        return error.BufferTooSmall;
+    var writer: Writer = .{ .bytes = output };
+    const at = try writer.begin('V');
+    try writer.u32be(if (result != null) @intCast(length) else 0xffff_ffff);
+    if (result) |bytes| try writer.append(bytes);
+    writer.end(at);
+    return writer.at;
+}
+
 pub const StartupMethod = enum { trusted, scram };
 pub const routed_startup_capacity = 10000;
 
@@ -825,7 +916,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                     try failure(&w, sqlstate(err), diagnosticMessage(err));
                     if (tag == 'Q') try self.abortSimpleBatch(db);
                     if (@hasDecl(DB, "failTransaction")) db.failTransaction();
-                    if (tag == 'Q' or tag == 'S') {
+                    if (tag == 'Q' or tag == 'S' or tag == 'F') {
                         if (comptime @hasDecl(DB, "abortExtended")) db.abortExtended();
                         self.failed = false;
                         self.closeIdlePortals(db);
@@ -1091,6 +1182,117 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             self.simple_batch = .{ .remaining = count, .source_length = source.len };
         }
 
+        fn largeFunctionCall(db: *DB, call: FunctionCall, w: *Writer) !void {
+            const function = LargeObject.Function.fromOid(call.oid) orelse return error.UnsupportedStatement;
+            const types = function.argumentTypes();
+            if (call.count != types.len) return error.ProtocolViolation;
+            var args = call.arguments();
+            var decoded: [3]LargeObject.Argument = undefined;
+            var null_value = false;
+            for (types, 0..) |oid, index| {
+                const arg = args.next().?;
+                const data = arg.value orelse {
+                    decoded[index] = .null_value;
+                    null_value = true;
+                    continue;
+                };
+                if (oid == 17) {
+                    decoded[index] = if (arg.format == .binary) .{ .bytes = .{ .raw = data } }
+                        else if (std.mem.startsWith(u8, data, &.{ '\\', 'x' })) .{ .bytes = .{ .hex = data[2..] } }
+                        else return error.InvalidTextRepresentation;
+                    continue;
+                }
+                const number: i64 = if (arg.format == .text) try LargeObject.argumentNumber(oid, data) else switch (oid) {
+                    26 => if (data.len == 4) std.mem.readInt(u32, data[0..4], .big) else return error.ProtocolViolation,
+                    23 => if (data.len == 4) std.mem.readInt(i32, data[0..4], .big) else return error.ProtocolViolation,
+                    20 => if (data.len == 8) std.mem.readInt(i64, data[0..8], .big) else return error.ProtocolViolation,
+                    else => return error.ProtocolViolation,
+                };
+                decoded[index] = .{ .number = number };
+            }
+            const request = if (null_value) null else function.request(decoded[0..types.len]);
+            try largeResult(db, request, call.result_format == .binary, false, true, w);
+        }
+
+        fn largeDescription(w: *Writer, function: LargeObject.Function, binary: bool) !void {
+            const frame = try w.begin('T');
+            try w.u16be(1);
+            try w.string(function.name());
+            try w.u32be(0);
+            try w.u16be(0);
+            const oid = function.resultType();
+            try w.u32be(oid);
+            const length: u16 = switch (oid) { 20 => 8, 17 => 0xffff, else => 4 };
+            try w.u16be(length);
+            try w.u32be(0xffff_ffff);
+            try w.u16be(@intFromBool(binary));
+            w.end(frame);
+        }
+
+        fn largeResult(db: *DB, request: ?LargeObject.Request, binary: bool, extended: bool, fastpath: bool, w: *Writer) !void {
+            if (comptime !@hasDecl(DB, "largeObject")) return error.UnsupportedStatement;
+            if (comptime @hasDecl(DB, "transactionStatus")) {
+                if (db.transactionStatus() == 'E') return error.TransactionFailed;
+            }
+            if (comptime @hasDecl(DB, "beginExtendedGroup")) {
+                if (request == null and extended) try db.beginExtendedGroup();
+            }
+            const frame = try w.begin(if (fastpath) 'V' else 'D');
+            if (!fastpath) try w.u16be(1);
+            const length_at = w.at;
+            try w.u32be(0xffff_ffff);
+            if (request) |operation| {
+                // Leave room for CommandComplete and ReadyForQuery. Raw
+                // bytes are written into the response region itself.
+                const remaining = w.bytes.len - w.at;
+                if (remaining < 64) return error.BufferTooSmall;
+                const available = remaining - 32;
+                const buffer = if (binary) w.bytes[w.at..][0..available] else w.bytes[w.at + 2 ..][0..(available - 2) / 2];
+                const response = try db.largeObject(operation, buffer, extended);
+                const start = w.at;
+                switch (response) {
+                    .bytes => |count| if (binary) {
+                        w.at += count;
+                    } else {
+                        const hex = "0123456789abcdef";
+                        var cursor = count;
+                        while (cursor != 0) {
+                            cursor -= 1;
+                            const value = buffer[cursor];
+                            w.bytes[start + 2 + cursor * 2] = hex[value >> 4];
+                            w.bytes[start + 3 + cursor * 2] = hex[value & 15];
+                        }
+                        w.bytes[start..][0..2].* = .{ '\\', 'x' };
+                        w.at += 2 + count * 2;
+                    },
+                    .oid => |value| if (binary) try w.u32be(value) else try w.number(value),
+                    .int4 => |value| if (binary) try w.u32be(@bitCast(value)) else try w.number(value),
+                    .int8 => |value| if (binary) {
+                        var encoded: [8]u8 = undefined;
+                        std.mem.writeInt(i64, &encoded, value, .big);
+                        try w.append(&encoded);
+                    } else try w.number(value),
+                    .empty => {},
+                }
+                write32(w.bytes[length_at..][0..4], @intCast(w.at - start));
+            }
+            w.end(frame);
+        }
+
+        fn largeCompletion(w: *Writer) !void {
+            const frame = try w.begin('C');
+            try w.string("SELECT 1");
+            w.end(frame);
+        }
+
+        fn simpleLargeObject(db: *DB, source: []const u8, w: *Writer) !bool {
+            if (comptime !@hasDecl(DB, "largeObject")) return false;
+            const call = (try LargeObject.parseSql(source)) orelse return false;
+            try largeDescription(w, call.function, false);
+            try largeResult(db, call.request, false, false, false, w);
+            return true;
+        }
+
         fn simpleResult(self: *Self, db: *DB, w: *Writer) !void {
             try writeNotice(db, w);
             if (self.result.column_count == 0) return;
@@ -1109,9 +1311,10 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             try db.beginSimpleQueryStep();
             try DB.checkSimpleQueryUtility(command_source);
             const copying = has_copy and word(command_source, "copy");
+            const large = if (!copying) try simpleLargeObject(db, command_source, w) else false;
             if (copying) {
                 try self.startCopy(db, command_source, w, null, .{ .source = source, .command_start = span.start });
-            } else {
+            } else if (!large) {
                 try self.execute(db, command_source);
                 try self.simpleResult(db, w);
             }
@@ -1120,7 +1323,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             if (self.copy.mode == .in) return;
             const final = self.simple_batch.remaining == 0;
             if (final) try db.finishSimpleQueryBatch(true);
-            if (!copying) try self.command(w, command_source);
+            if (large) try largeCompletion(w) else if (!copying) try self.command(w, command_source);
             if (final) {
                 self.simple_batch = .{};
                 self.closeIdlePortals(db);
@@ -1158,11 +1361,17 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                         const completion = try w.begin('C');
                         try w.string(command_tag);
                         w.end(completion);
+                    } else if (try simpleLargeObject(db, source, w)) {
+                        try largeCompletion(w);
                     } else {
                         try self.execute(db, source);
                         try self.simpleResult(db, w);
                         try self.command(w, source);
                     }
+                    try self.ready(db, w);
+                },
+                'F' => {
+                    try largeFunctionCall(db, try FunctionCall.decode(body), w);
                     try self.ready(db, w);
                 },
                 'P' => try self.parse(db, &r, w),
@@ -1182,6 +1391,12 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                         var q: Writer = .{ .bytes = &query };
                         var nulls: [parameter_capacity][]const u8 = @splat("NULL");
                         try interpolate(s.source(), nulls[0..s.count], &q);
+                        if (comptime @hasDecl(DB, "largeObject")) {
+                            if (try LargeObject.parseSql(q.bytes[0..q.at])) |call| {
+                                try largeDescription(w, call.function, false);
+                                return false;
+                            }
+                        }
                         if (@hasDecl(DB, "describe")) {
                             // Parse and bind only: never executes or locks.
                             try self.describeOnly(db, q.bytes[0..q.at]);
@@ -1192,6 +1407,13 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                         } else try w.empty('n');
                     } else if (kind == 'P') {
                         const p = try self.portal(name);
+                        if (comptime @hasDecl(DB, "largeObject")) {
+                            if (try LargeObject.parseSql(p.source())) |call| {
+                                if (p.format_count > 1) return error.ProtocolViolation;
+                                try largeDescription(w, call.function, p.format_count == 1 and p.formats[0] == 1);
+                                return false;
+                            }
+                        }
                         if (@hasDecl(DB, "describe")) {
                             try self.describeOnly(db, p.source());
                             if (self.result.column_count != 0) try self.description(w, p) else try w.empty('n');
@@ -1220,6 +1442,17 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                         try db.beginExtendedGroup();
                         try self.startCopy(db, p.source(), w, index, null);
                         return false;
+                    };
+                    if (comptime @hasDecl(DB, "largeObject")) if (self.active_portal == null) {
+                        if (try LargeObject.parseSql(p.source())) |call| {
+                            if (p.format_count > 1) return error.ProtocolViolation;
+                            try largeResult(db, call.request, p.format_count == 1 and p.formats[0] == 1, true, false, w);
+                            try largeCompletion(w);
+                            p.result_rows = 1;
+                            p.command = "SELECT";
+                            p.complete = true;
+                            return false;
+                        }
                     };
                     if (self.active_portal == null) {
                         try self.executePortal(db, p, limit);
@@ -2232,6 +2465,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                 .create_statistics => "CREATE STATISTICS",
                 .alter_statistics => "ALTER STATISTICS",
                 .alter_schema => "ALTER SCHEMA",
+                .alter_large_object => "ALTER LARGE OBJECT",
                 .drop_statistics => "DROP STATISTICS",
                 .create_extension => "CREATE EXTENSION",
                 .create_domain => "CREATE DOMAIN",
