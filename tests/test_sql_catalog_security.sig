@@ -1721,6 +1721,13 @@ fn largeObjectDelegation() !void {
     db.default_session_state.session_role = 10;
     try run("RESET SESSION AUTHORIZATION");
     try expect("SELECT current_user,session_user", "ramsql|ramsql");
+
+    // A valid role can have more than 64 bytes in its SQL-quoted form.
+    const quoted = "\"q" ++ "\"\"" ** 31 ++ "\"";
+    try run("CREATE ROLE " ++ quoted);
+    try run("SET SESSION AUTHORIZATION " ++ quoted);
+    try expect("SELECT session_user", "q" ++ "\"" ** 31);
+    try run("RESET SESSION AUTHORIZATION");
 }
 
 pub fn main() !void {

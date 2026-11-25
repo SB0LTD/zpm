@@ -11089,18 +11089,19 @@ pub fn Database(comptime config: Config) type {
         /// user may not become 42501.
         fn roleSetting(self: *Self, slot: ?u16, kind: SettingValueKind, value: []const u8, authorization: bool) Error!u32 {
             var folded: [64]u8 = undefined;
-            if (value.len > folded.len) return error.InvalidSettingValue;
             var length: usize = 0;
             if (kind == .word and value.len >= 2 and value[0] == '"') {
                 // A quoted identifier keeps its case; "" is one quote.
                 var index: usize = 1;
                 while (index + 1 < value.len) : (index += 1) {
+                    if (length == folded.len) return error.InvalidSettingValue;
                     folded[length] = value[index];
                     length += 1;
                     if (value[index] == '"') index += 1;
                 }
                 if (length == 0) return error.InvalidSettingValue;
             } else {
+                if (value.len > folded.len) return error.InvalidSettingValue;
                 for (value, 0..) |byte, index| folded[index] = if (kind == .word) types.lower(byte) else byte;
                 length = value.len;
                 if (!authorization and kind == .word and types.same(folded[0..length], "none")) return 0;
