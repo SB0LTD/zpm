@@ -161,6 +161,96 @@ const Reader = struct {
         if (self.at != self.bytes.len) return error.ProtocolViolation;
     }
 };
+
+/// FunctionCall body without the frame header. Arguments borrow the input
+/// until the caller finishes dispatch. Scalar result formats are independent.
+pub const FunctionCall = struct {
+    const Self = @This();
+    pub const Format = enum(u16) { text = 0, binary = 1 };
+    pub const Argument = struct {
+        format: Format,
+        value: ?[]const u8,
+    };
+
+    oid: u32,
+    count: u16,
+    result_format: Format,
+    formats: []const u8,
+    values: []const u8,
+
+    fn format(code: u16) error{ProtocolViolation}!Format {
+        return switch (code) {
+            0 => .text,
+            1 => .binary,
+            else => error.ProtocolViolation,
+        };
+    }
+
+    fn value(reader: *Reader) error{ProtocolViolation}!?[]const u8 {
+        const len = try reader.u32be();
+        if (len == 0xffff_ffff) return null;
+        if (len > 0x7fff_ffff) return error.ProtocolViolation;
+        return try reader.take(len);
+    }
+
+    pub fn decode(body: []const u8) error{ProtocolViolation}!Self {
+        var reader: Reader = .{ .bytes = body };
+        const oid = try reader.u32be();
+        const format_count = try reader.u16be();
+        const format_start = reader.at;
+        for (0..format_count) |_| _ = try format(try reader.u16be());
+        const formats = body[format_start..reader.at];
+        const count = try reader.u16be();
+        if (format_count > 1 and format_count != count) return error.ProtocolViolation;
+        const value_start = reader.at;
+        for (0..count) |_| _ = try value(&reader);
+        const values = body[value_start..reader.at];
+        const result_format = try format(try reader.u16be());
+        try reader.done();
+        return .{ .oid = oid, .count = count, .result_format = result_format, .formats = formats, .values = values };
+    }
+
+    pub const Arguments = struct {
+        formats: []const u8,
+        reader: Reader,
+        index: usize = 0,
+        count: usize,
+
+        pub fn next(self: *Arguments) ?Argument {
+            if (self.index == self.count) return null;
+            const code: u8 = switch (self.formats.len) {
+                0 => 0,
+                2 => self.formats[1],
+                else => self.formats[2 * self.index + 1],
+            };
+            self.index += 1;
+            return .{
+                .format = if (code == 0) .text else .binary,
+                .value = value(&self.reader) catch unreachable,
+            };
+        }
+    };
+
+    pub fn arguments(self: Self) Arguments {
+        return .{ .formats = self.formats, .reader = .{ .bytes = self.values }, .count = self.count };
+    }
+};
+
+/// Emit a complete FunctionCallResponse. A null result and an empty result
+/// are distinct. Capacity is checked before modifying output.
+pub fn encodeFunctionCallResponse(output: []u8, result: ?[]const u8) error{BufferTooSmall}!usize {
+    const length = if (result) |bytes| bytes.len else 0;
+    const header = 9;
+    if (output.len < header or length > output.len - header or length > 0x7fff_fff7)
+        return error.BufferTooSmall;
+    var writer: Writer = .{ .bytes = output };
+    const at = try writer.begin('V');
+    try writer.u32be(if (result != null) @intCast(length) else 0xffff_ffff);
+    if (result) |bytes| try writer.append(bytes);
+    writer.end(at);
+    return writer.at;
+}
+
 pub const StartupMethod = enum { trusted, scram };
 pub const routed_startup_capacity = 10000;
 
@@ -825,7 +915,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                     try failure(&w, sqlstate(err), diagnosticMessage(err));
                     if (tag == 'Q') try self.abortSimpleBatch(db);
                     if (@hasDecl(DB, "failTransaction")) db.failTransaction();
-                    if (tag == 'Q' or tag == 'S') {
+                    if (tag == 'Q' or tag == 'S' or tag == 'F') {
                         if (comptime @hasDecl(DB, "abortExtended")) db.abortExtended();
                         self.failed = false;
                         self.closeIdlePortals(db);
@@ -1164,6 +1254,10 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                         try self.command(w, source);
                     }
                     try self.ready(db, w);
+                },
+                'F' => {
+                    _ = try FunctionCall.decode(body);
+                    return error.UnsupportedStatement;
                 },
                 'P' => try self.parse(db, &r, w),
                 'B' => try self.bind(db, &r, w),

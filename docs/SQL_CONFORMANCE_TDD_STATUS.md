@@ -1,5 +1,25 @@
 # SQL conformance TDD checkpoint
 
+## PostgreSQL large-object substrate
+
+The SQL layer now has a caller-backed 2 KiB page store that reuses the
+ordinary hashed row directory and MVCC version arena. Sparse writes
+consume backing only for touched pages. Reads fill gaps with zeros and
+stop at the snapshot-visible length supplied by the caller.
+The page contract covers competing writers, savepoint rollback,
+capacity failure across a page boundary and snapshot-safe reclamation.
+
+The PostgreSQL codec parses FunctionCall frames and encodes scalar
+responses, including binary payloads, NULL and the empty result. An error
+on a standalone FunctionCall ends with ReadyForQuery. Native PostgreSQL
+16.15 and 18.7 verified an actual 16 KiB large-object call, the sparse page
+layout and an offset at the native size boundary.
+
+Large-object SQL routines, catalog owners and grants, transaction-scoped
+descriptors, host capacity admission, WAL replay, and checkpoint/export
+integration remain open. The stock archive gate stays partial.
+[PostgreSQL large-object API](https://www.postgresql.org/docs/18/lo-interfaces.html)
+
 ## Temporal `OVERLAPS`
 
 The original date-only inventory query already passed. New cases exposed

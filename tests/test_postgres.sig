@@ -2092,7 +2092,123 @@ fn initializedProtocolPrefixes() !void {
     try sync(&session,&db);
 }
 
+fn rejectsFunctionCall(body: []const u8) !void {
+    if (pg.FunctionCall.decode(body)) |_| return error.MalformedFunctionCallAccepted else |err|
+        try check(err == error.ProtocolViolation);
+}
+
+fn functionCallFrames() !void {
+    var request = Packet.init('F');
+    request.number32(12345);
+    request.number16(3);
+    request.number16(0);
+    request.number16(1);
+    request.number16(0);
+    request.number16(3);
+    request.number32(0xffff_ffff);
+    request.number32(0);
+    request.number32(2);
+    request.append("ok");
+    request.number16(1);
+    const body = request.slice()[5..];
+    const call = try pg.FunctionCall.decode(body);
+    try check(call.oid == 12345 and call.count == 3 and call.result_format == .binary);
+    var args = call.arguments();
+    const first = args.next().?;
+    try check(first.format == .text and first.value == null);
+    const second = args.next().?;
+    try check(second.format == .binary and second.value.?.len == 0);
+    const third = args.next().?;
+    try check(third.format == .text and equal(third.value.?, "ok") and args.next() == null);
+    for (0..body.len) |len| try rejectsFunctionCall(body[0..len]);
+
+    request.bytes[12] = 2;
+    try rejectsFunctionCall(body);
+    request.bytes[12] = 0;
+    request.bytes[18] = 2;
+    try rejectsFunctionCall(body);
+    request.bytes[18] = 3;
+    request.bytes[22] = 0xfe;
+    try rejectsFunctionCall(body);
+    request.bytes[22] = 0xff;
+    request.bytes[request.len - 1] = 2;
+    try rejectsFunctionCall(body);
+    request.bytes[request.len - 1] = 1;
+    request.byte(0);
+    try rejectsFunctionCall(request.slice()[5..]);
+
+    var transfer = Packet.init('F');
+    transfer.number32(12345);
+    transfer.number16(1);
+    transfer.number16(1);
+    transfer.number16(2);
+    transfer.number32(4);
+    transfer.number32(7);
+    var data: [16384]u8 = @splat(42);
+    data[data.len - 1] = 127;
+    transfer.number32(data.len);
+    transfer.append(&data);
+    transfer.number16(1);
+    const binary = try pg.FunctionCall.decode(transfer.slice()[5..]);
+    var binary_args = binary.arguments();
+    const descriptor = binary_args.next().?;
+    try check(descriptor.format == .binary and u32be(descriptor.value.?) == 7);
+    const payload = binary_args.next().?;
+    try check(payload.format == .binary and equal(payload.value.?, &data));
+
+    var defaults = Packet.init('F');
+    defaults.number32(12345);
+    defaults.number16(0);
+    defaults.number16(1);
+    defaults.number32(3);
+    defaults.append("123");
+    defaults.number16(0);
+    const text = try pg.FunctionCall.decode(defaults.slice()[5..]);
+    var text_args = text.arguments();
+    const argument = text_args.next().?;
+    try check(argument.format == .text and equal(argument.value.?, "123") and text.result_format == .text);
+
+    var response: [24]u8 = @splat(0xa5);
+    if (pg.encodeFunctionCallResponse(response[0..10], "ok")) |_| return error.TruncatedFunctionResponseAccepted else |err|
+        try check(err == error.BufferTooSmall and response[0] == 0xa5);
+    const null_len = try pg.encodeFunctionCallResponse(&response, null);
+    try check(null_len == 9 and response[0] == 'V' and u32be(response[1..5]) == 8 and u32be(response[5..9]) == 0xffff_ffff);
+    const empty_len = try pg.encodeFunctionCallResponse(&response, "");
+    try check(empty_len == 9 and u32be(response[5..9]) == 0);
+    const binary_len = try pg.encodeFunctionCallResponse(&response, &.{ 0, 0xff });
+    try check(binary_len == 11 and u32be(response[1..5]) == 10 and u32be(response[5..9]) == 2);
+    try check(equal(response[9..11], &.{ 0, 0xff }) and response[11] == 0xa5);
+}
+
+fn functionCallRecovery() !void {
+    var db: DB = .{};
+    var session: Session = .{};
+    try startup(&session, &db);
+    var call = Packet.init('F');
+    call.number32(715);
+    call.number16(1);
+    call.number16(1);
+    call.number16(1);
+    call.number32(4);
+    call.number32(55000);
+    call.number16(1);
+    const rejected = try send(&session, &db, &call);
+    try state(rejected, "0A000");
+    try tags(rejected, "EZ");
+    try check(rejected[rejected.len - 1] == 'I');
+    try tags(try query(&session, &db, "BEGIN"), "CZ");
+    call.len -= 1;
+    const bad_call = try send(&session, &db, &call);
+    try state(bad_call, "08P01");
+    try tags(bad_call, "EZ");
+    try check(bad_call[bad_call.len - 1] == 'E');
+    try tags(try query(&session, &db, "ROLLBACK"), "CZ");
+    try tags(try query(&session, &db, "SELECT 1"), "TDCZ");
+}
+
 pub fn main(init: std.process.Init) !void {
+    try functionCallFrames();
+    try functionCallRecovery();
     try startupFraming();
     try initializedProtocolPrefixes();
     try detachedCandidates();

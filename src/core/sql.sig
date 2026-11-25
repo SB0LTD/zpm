@@ -131,6 +131,8 @@ pub const Tokenizer = lexer.Tokenizer;
 pub const PostgresStatements = lexer.PostgresStatements;
 pub const Config = types.Config;
 pub const HashLoad = storage.HashLoad;
+/// Caller-backed MVCC storage for PostgreSQL large-object payload pages.
+pub const large_object_pages = @import("sql/large_object_pages.sig");
 /// Per-statement session values (TimeZone, zone resolver, clocks).
 pub const Session = value_module.Session;
 pub const bootstrap_role_name = CO.bootstrap_name;
