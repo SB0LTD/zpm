@@ -1369,6 +1369,8 @@ pub fn Binder(comptime config: types.Config) type {
                 // Date/time functions (B11).
                 .{ .name = "extract", .func = .extract },           .{ .name = "date_part", .func = .date_part },
                 .{ .name = "date_trunc", .func = .date_trunc },     .{ .name = "age", .func = .age },
+                .{ .name = "date_bin", .func = .date_bin },
+                .{ .name = "overlaps", .func = .overlaps },
                 .{ .name = "justify_days", .func = .justify_days }, .{ .name = "justify_hours", .func = .justify_hours },
                 .{ .name = "justify_interval", .func = .justify_interval }, .{ .name = "make_date", .func = .make_date },
                 .{ .name = "make_timestamp", .func = .make_timestamp }, .{ .name = "isfinite", .func = .isfinite },
@@ -2323,7 +2325,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .concat, .concat_ws, .quote_ident, .quote_literal,
                 .overlay, .to_hex => try typeStringFunction(context, n, count),
                 .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .sind, .cosd, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => try typeMathFunction(context, n, count),
-                .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => try typeTemporalFunction(context, n, count),
+                .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .date_bin, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => try typeTemporalFunction(context, n, count),
                 .tds_dateadd => {
                     if (context.dialect != .tds or count != 2) return error.UnsupportedStatement;
                     const number = context.node(n.b);
@@ -2760,24 +2762,6 @@ pub fn Binder(comptime config: types.Config) type {
             }
         }
 
-        // The timestamp, timestamptz and time families accept durations.
-        // PostgreSQL supplies only the endpoint signature for timetz.
-        const overlap_signatures = [_][4]ast.Type{
-            .{ .timestamp, .timestamp, .timestamp, .timestamp },
-            .{ .timestamp, .interval, .timestamp, .timestamp },
-            .{ .timestamp, .timestamp, .timestamp, .interval },
-            .{ .timestamp, .interval, .timestamp, .interval },
-            .{ .timestamptz, .timestamptz, .timestamptz, .timestamptz },
-            .{ .timestamptz, .interval, .timestamptz, .timestamptz },
-            .{ .timestamptz, .timestamptz, .timestamptz, .interval },
-            .{ .timestamptz, .interval, .timestamptz, .interval },
-            .{ .time, .time, .time, .time },
-            .{ .time, .interval, .time, .time },
-            .{ .time, .time, .time, .interval },
-            .{ .time, .interval, .time, .interval },
-            .{ .timetz, .timetz, .timetz, .timetz },
-        };
-
         fn overlapSignatureScore(input: [4]ast.Type, params: [4]ast.Type) ?u8 {
             var score: u8 = 0;
             for (input, params) |arg, target| {
@@ -2800,10 +2784,10 @@ pub fn Binder(comptime config: types.Config) type {
                 var datetime: u16 = 0;
                 var duration: u16 = 0;
                 var zoned: u16 = 0;
-                for (overlap_signatures, 0..) |params, index| {
+                for (catalog.overlap_routines, 0..) |routine, index| {
                     const bit = @as(u16, 1) << @intCast(index);
                     if (candidates & bit == 0) continue;
-                    switch (params[position]) {
+                    switch (routine.args[position]) {
                         .timestamptz => {
                             datetime |= bit;
                             zoned |= bit;
@@ -2829,9 +2813,9 @@ pub fn Binder(comptime config: types.Config) type {
             }
             if (common == .unknown) return 0;
             var inferred: u16 = 0;
-            for (overlap_signatures, 0..) |params, index| {
+            for (catalog.overlap_routines, 0..) |routine, index| {
                 const bit = @as(u16, 1) << @intCast(index);
-                if (candidates & bit != 0 and overlapSignatureScore(@splat(common), params) != null) inferred |= bit;
+                if (candidates & bit != 0 and overlapSignatureScore(@splat(common), routine.args) != null) inferred |= bit;
             }
             return inferred;
         }
@@ -2846,8 +2830,8 @@ pub fn Binder(comptime config: types.Config) type {
             }
             var candidates: u16 = 0;
             var best: u8 = 0;
-            for (overlap_signatures, 0..) |params, index| {
-                const score = overlapSignatureScore(input, params) orelse continue;
+            for (catalog.overlap_routines, 0..) |routine, index| {
+                const score = overlapSignatureScore(input, routine.args) orelse continue;
                 if (score < best) continue;
                 if (score > best) {
                     candidates = 0;
@@ -2859,7 +2843,7 @@ pub fn Binder(comptime config: types.Config) type {
             if (@popCount(candidates) != 1) candidates = preferOverlapUnknowns(input, candidates);
             if (@popCount(candidates) != 1) candidates = inferOverlapUnknowns(input, candidates);
             if (@popCount(candidates) != 1) return error.AmbiguousFunction;
-            const params = overlap_signatures[@ctz(candidates)];
+            const params = catalog.overlap_routines[@ctz(candidates)].args;
             try bindSignature(context, n, &params, .boolean, false);
             const zoned_duration = params[0] == .timestamptz and (params[1] == .interval or params[3] == .interval);
             const local_time_cast = params[0] == .timetz and std.mem.indexOfScalar(ast.Type, &input, .time) != null;
@@ -2895,6 +2879,17 @@ pub fn Binder(comptime config: types.Config) type {
                     };
                     try bindSignature(context, n, &[_]T{ .text, ty }, ty, true);
                     n.func = if (ty == .timestamptz) .date_trunc_tz else .date_trunc;
+                },
+                .date_bin => {
+                    if (count != 3 or context.dialect != .postgres) return error.UndefinedFunction;
+                    const source = argumentType(context, n, 1);
+                    const origin = argumentType(context, n, 2);
+                    // A zoned argument requires the zoned overload. Otherwise
+                    // an exact timestamp match wins before the preferred type.
+                    const zoned = source == .timestamptz or origin == .timestamptz;
+                    const exact_plain = source == .timestamp or origin == .timestamp;
+                    const ty: T = if (!zoned and exact_plain) .timestamp else .timestamptz;
+                    try bindSignature(context, n, &[_]T{ .interval, ty, ty }, ty, true);
                 },
                 .age, .age_tz => {
                     if (count != 1 and count != 2) return error.UndefinedFunction;

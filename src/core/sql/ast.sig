@@ -69,7 +69,7 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     power, ln, log, log10, exp, mod, div, pi, degrees, radians, cbrt, sin, cos, tan, cot, asin, acos, atan, atan2, gcd, lcm, scale, min_scale, trim_scale,
     // Date/time functions (B11, functions_temporal.sig); *_tz are the STABLE
     // timestamptz (session time zone) overloads chosen by the binder.
-    extract, extract_tz, date_part, date_part_tz, date_trunc, date_trunc_tz, age, age_tz, justify_days, justify_hours, justify_interval, make_date, make_timestamp, isfinite, tds_dateadd, tds_isnull,
+    extract, extract_tz, date_part, date_part_tz, date_trunc, date_trunc_tz, date_bin, age, age_tz, justify_days, justify_hours, justify_interval, make_date, make_timestamp, isfinite, tds_dateadd, tds_isnull,
     // (a, b) OVERLAPS (c, d); overlaps_tz includes session-dependent zone arithmetic or coercion.
     overlaps, overlaps_tz,
     // Internal: the (Y, X) input of a two-argument aggregate, NULL when either is.
@@ -209,7 +209,7 @@ pub fn immutableBuiltin(func: Func) bool {
         .lower, .upper, .initcap, .char_length, .octet_length, .bit_length, .substring, .btrim, .ltrim, .rtrim, .strpos, .replace,
         .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .overlay, .to_hex => true,
         .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .sind, .cosd, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => true,
-        .extract, .date_part, .date_trunc, .age, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => true,
+        .extract, .date_part, .date_trunc, .date_bin, .age, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => true,
         .overlaps, .aggregate_pair, .normalize, .is_normalized, .mysql_date_add => true,
         .array_constructor, .array_subscript, .array_any, .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper,
         .array_append, .array_prepend, .array_cat, .array_remove => true,
@@ -237,7 +237,7 @@ pub fn strictFunction(func: Func) bool {
         .lower, .upper, .initcap, .char_length, .octet_length, .bit_length, .substring, .btrim, .ltrim, .rtrim, .strpos, .replace,
         .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .overlay, .to_hex => true,
         .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .sind, .cosd, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => true,
-        .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => true,
+        .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .date_bin, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => true,
         .to_date, .to_number, .to_timestamp, .aggregate_pair, .normalize, .is_normalized => true,
         .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper => true,
         .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => true,

@@ -109,7 +109,7 @@ pub fn Builtins(comptime config: types.Config, comptime E: type) type {
                 .to_hex => try strings.toHex(cells[0].integer, if (node(ctx, n.b).ty == .int8) 64 else 32, &out),
                 .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .sind, .cosd, .tan, .cot, .asin, .acos, .atan, .atan2,
                 .gcd, .lcm, .scale, .min_scale, .trim_scale => return mathematical(n, &cells, count, control),
-                .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .age, .age_tz, .justify_days, .justify_hours,
+                .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .date_bin, .age, .age_tz, .justify_days, .justify_hours,
                 .justify_interval, .make_date, .make_timestamp, .isfinite => return temporalValue(ctx, n, &cells, count),
                 .to_date, .to_number, .to_timestamp => return formatValue(ctx, n, &cells, count),
                 .normalize, .is_normalized => {
@@ -389,6 +389,11 @@ pub fn Builtins(comptime config: types.Config, comptime E: type) type {
                         },
                         else => unreachable,
                     }
+                },
+                .date_bin => return switch (cells[1]) {
+                    .timestamp => |stamp| .{ .timestamp = try times.dateBin(cells[0].interval, stamp, cells[2].timestamp) },
+                    .timestamptz => |stamp| .{ .timestamptz = try times.dateBin(cells[0].interval, stamp, cells[2].timestamptz) },
+                    else => unreachable,
                 },
                 .age, .age_tz => {
                     const zoned = n.func == .age_tz and (cells[0] == .timestamptz);

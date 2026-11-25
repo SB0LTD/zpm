@@ -1526,7 +1526,7 @@ pub fn Eval(comptime config: types.Config) type {
                     .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .concat, .concat_ws, .quote_ident, .quote_literal,
                     .overlay, .to_hex => return builtins.Builtins(config, @This()).call(ctx, n),
                     .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .sind, .cosd, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => return builtins.Builtins(config, @This()).call(ctx, n),
-                    .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => return builtins.Builtins(config, @This()).call(ctx, n),
+                    .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .date_bin, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => return builtins.Builtins(config, @This()).call(ctx, n),
                     .tds_dateadd => {
                         const number = try eval(ctx, n.b);
                         const date = try eval(ctx, node(ctx, n.b).next);

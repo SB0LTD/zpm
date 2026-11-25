@@ -1,5 +1,18 @@
 # SQL conformance TDD checkpoint
 
+## PostgreSQL time bucketing candidate
+
+`date_bin` supports both stock timestamp signatures and their `pg_proc`
+identities. It bins finite strides on the microsecond timeline, including
+negative offsets from the origin and exact boundaries. The contracts
+cover overload selection, NULL, timestamp infinity, invalid strides and
+range overflow. PostgreSQL 18 infinite interval values remain open as
+a separate temporal type gap.
+
+Stock restore exposed an incorrect TEXT cast on an untyped function
+argument in a stored bucket expression. The expression writer preserves
+unknown call arguments so native restore resolves the same overload.
+
 ## Temporal `OVERLAPS`
 
 The original date-only inventory query already passed. New cases exposed
@@ -18,6 +31,14 @@ distinction between a calendar day and 24 hours across a DST boundary.
 The closure concerns the predicate and the temporal values already
 supported by the engine. The wider type and catalog inventory remains
 open.
+
+The follow-up makes the same signatures callable through
+`pg_catalog.overlaps` and exposes their 13 native `pg_proc` identities.
+The binder and catalog share the signature list. The local PG16 wire
+run passed all 19 boundary cases and the full 2,401-case combination
+matrix. It also passed the 47 stock-tooling checks, including a stored
+TIME predicate verified after restoring an archive and reopening its
+WAL. The versioned CI suite uses the same checks on PG16 and PG18.
 
 ## Stock PostgreSQL dump and restore candidate
 
