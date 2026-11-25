@@ -233,16 +233,24 @@ pub fn parseSql(source: []const u8) types.Error!?SqlCall {
             }
             token = try tokens.next();
         }
-        if (token.symbol == .cast) {
+        while (token.symbol == .cast) {
             const cast = try tokens.next();
+            const small = tokenName(cast, source, "int2") or tokenName(cast, source, "smallint");
+            const regular = tokenName(cast, source, "int4") or tokenName(cast, source, "integer") or tokenName(cast, source, "int");
+            const wide = tokenName(cast, source, "int8") or tokenName(cast, source, "bigint");
             const matches_cast = switch (oid) {
                 17 => tokenName(cast, source, "bytea"),
-                20 => tokenName(cast, source, "int8") or tokenName(cast, source, "bigint"),
-                23 => tokenName(cast, source, "int4") or tokenName(cast, source, "integer") or tokenName(cast, source, "int"),
-                26 => tokenName(cast, source, "oid"),
+                20 => small or regular or wide,
+                23 => small or regular,
+                26 => small or regular or wide or tokenName(cast, source, "oid"),
                 else => false,
             };
             if (!matches_cast) return null;
+            if (arguments[count] == .number) {
+                const number = arguments[count].number;
+                if ((small and (number < -32768 or number > 32767)) or (regular and (number < -2147483648 or number > 2147483647)))
+                    return error.NumericValueOutOfRange;
+            }
             token = try tokens.next();
         }
         count += 1;

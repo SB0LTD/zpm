@@ -193,7 +193,7 @@ fn distantPages() !void {
 const DB = @import("sql").Database(.{
     .external_storage = true, .tables = 1, .columns = 8, .text_bytes = 4096,
     .rows_per_table = 4, .work_rows = 16, .result_rows = 16, .transactions = 4,
-    .catalog_objects = 32,
+    .catalog_objects = 32, .tx_writes = 64,
 });
 const layout = large.Layout.plan(2) catch unreachable;
 const Arena = struct {
@@ -208,9 +208,11 @@ const Arena = struct {
 var primary: DB = .{};
 var replica: DB = .{};
 var copied: DB = .{};
+var checkpointed: DB = .{};
 var primary_arena: Arena = .{};
 var replica_arena: Arena = .{};
 var copy_arena: Arena = .{};
+var checkpoint_arena: Arena = .{};
 var replay_scratch: DB.ReplayScratch = .{};
 
 fn queryBytes(db: *DB, sql: []const u8, expected: []const u8) !void {
@@ -324,6 +326,52 @@ fn sqlPageRecovery() !void {
     try expect(result.rows[0].cells[0].integer == 0);
 }
 
+const ImageBuffer = struct {
+    bytes: [16384]u8 = undefined,
+    used: usize = 0,
+
+    pub fn appendAll(self: *ImageBuffer, bytes: []const u8) !void {
+        if (bytes.len > self.bytes.len - self.used) return error.BufferTooSmall;
+        @memcpy(self.bytes[self.used..][0..bytes.len], bytes);
+        self.used += bytes.len;
+    }
+
+    pub fn length(self: *const ImageBuffer) !u64 {
+        return self.used;
+    }
+
+    pub fn readAt(self: *const ImageBuffer, offset: u64, output: []u8) !usize {
+        if (offset > self.used) return 0;
+        const at: usize = @intCast(offset);
+        const count = @min(output.len, self.used - at);
+        @memcpy(output[0..count], self.bytes[at..][0..count]);
+        return count;
+    }
+};
+
+fn compactRoundTrip() !void {
+    var image: ImageBuffer = .{};
+    var bytes: [4096]u8 = undefined;
+    var result: DB.Result = .{};
+    try primary.execute("GRANT SELECT ON LARGE OBJECT 55000 TO page_reader", &result);
+    try primary.execute("COMMENT ON LARGE OBJECT 55000 IS 'compact bytes'", &result);
+    try DB.BaseSnapshot.write(&primary, &image, &bytes);
+    try expect(std.mem.eql(u8, image.bytes[0..8], "RSBASE06"));
+    try expect(image.used < 3072);
+
+    try checkpoint_arena.bind(&checkpointed);
+    try DB.BaseSnapshot.restore(&checkpointed, &image, primary.csn, &bytes, &replay_scratch);
+    try checkpointed.execute("SET ROLE page_reader", &result);
+    try queryBytes(&checkpointed, "SELECT lo_get(55000,2047,4)", "ABCD");
+    try checkpointed.execute("RESET ROLE", &result);
+    try checkpointed.execute("SELECT obj_description(oid,'pg_largeobject') FROM pg_largeobject_metadata WHERE oid=55000", &result);
+    try expect(std.mem.eql(u8, result.rows[0].cells[0].text.slice(), "compact bytes"));
+    const suffix = try executeWAL(&primary, "SELECT lo_unlink(55000)", &bytes);
+    try checkpointed.applyChangeRecord(suffix, &replay_scratch);
+    try checkpointed.execute("SELECT COUNT(*) FROM pg_largeobject WHERE loid=55000", &result);
+    try expect(result.rows[0].cells[0].integer == 0);
+}
+
 pub fn main(init: std.process.Init) !void {
     try snapshotAndSparseRead();
     try atomicCapacityFailure();
@@ -331,6 +379,7 @@ pub fn main(init: std.process.Init) !void {
     try alignedTransfer();
     try distantPages();
     try sqlPageRecovery();
+    try compactRoundTrip();
     var line: [160]u8 = undefined;
     const report = try std.fmt.bufPrint(&line, "{{\"suite\":\"sql-large-object-pages\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, report);

@@ -7,6 +7,7 @@ const storage = @import("storage.sig");
 const catalog = @import("catalog.sig");
 const objects = @import("catalog_objects.sig");
 const change_log = @import("change_log.sig");
+const large = @import("large_object_pages.sig");
 
 const single_magic = "RSBASE01";
 const multi_magic = "RSBASE02";
@@ -14,6 +15,7 @@ const sequence_magic = "RSBASE03";
 const defaults_magic = "RSBASE04";
 // Version 5 inserts a schema count and checked definitions before tables.
 const schemas_magic = "RSBASE05";
+const pages_magic = "RSBASE06";
 const header_size = 24;
 const table_header_size = 8;
 const part_size = 5;
@@ -55,17 +57,103 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
     const C = change_log.ChangeLog(config);
 
     return struct {
-        fn checkCatalog(db: *const Database) !void {
+        const CatalogImage = struct {
+            counts: [catalog_kinds.len]u32 = @splat(0),
+            pages: usize = 0,
+
+            fn hasObjects(self: CatalogImage) bool {
+                for (self.counts) |count| if (count != 0) return true;
+                return false;
+            }
+        };
+
+        const catalog_kinds = [_]objects.Kind{ .role, .large_object, .large_object_acl, .comment };
+
+        fn writeCatalog(db: *const Database, sink: anytype, scratch: []u8, kind: objects.Kind) !void {
+            const snap: storage.Snapshot = .{ .csn = db.csn };
+            for (&db.catalog_objects.items) |*object| {
+                if (object.kind != kind or !O.visible(object, snap)) continue;
+                var writer = try change_log.Writer.init(scratch, 0);
+                try writer.op(.object_create);
+                try O.encodeCreate(&writer, object);
+                try appendPart(sink, .object_create, scratch[0..try writer.finish()]);
+            }
+        }
+
+        fn restoreCatalog(db: *Database, file: anytype, size: u64, offset: *u64, scratch: []u8, replay: *C.Scratch, csn: u64, kind: objects.Kind, count: u32) !void {
+            for (0..count) |_| {
+                const frame = try readPart(file, offset, size, scratch, .object_create);
+                try C.applyBaseImageRecord(db, frame, replay, .{ .csn = csn, .op = .object_create, .catalog_kind = kind });
+            }
+        }
+
+        fn writePages(db: *const Database, sink: anytype) !void {
+            const pages = if (db.large_pages) |*value| value else return;
+            const snap: storage.Snapshot = .{ .csn = db.csn };
+            var cursor: large.Pages.Cursor = .{};
+            while (cursor.next(pages, snap)) |entry| {
+                const data = pages.versionBytes(entry.version);
+                var header: [10]u8 = undefined;
+                std.mem.writeInt(u32, header[0..4], entry.key.oid, .little);
+                std.mem.writeInt(u32, header[4..8], entry.key.page, .little);
+                std.mem.writeInt(u16, header[8..10], @intCast(data.len), .little);
+                try sink.appendAll(&header);
+                try sink.appendAll(data);
+            }
+        }
+
+        fn restorePages(db: *Database, file: anytype, file_len: u64, offset: *u64, scratch: []u8, csn: u64, count: u32) !void {
+            if (count == 0) return;
+            const pages = if (db.large_pages) |*value| value else return error.SnapshotUnsupportedState;
+            if (count > pages.capacity() or pages.committed_count != 0) return error.InvalidSnapshotImage;
+            const snap: storage.Snapshot = .{ .csn = csn };
+            var previous: u32 = 0;
+            var object_length: u64 = 0;
+            for (0..count) |_| {
+                var header: [10]u8 = undefined;
+                try readExact(file, offset.*, &header, file_len);
+                offset.* += header.len;
+                const key: large.Key = .{
+                    .oid = std.mem.readInt(u32, header[0..4], .little),
+                    .page = std.mem.readInt(u32, header[4..8], .little),
+                };
+                const size = std.mem.readInt(u16, header[8..10], .little);
+                if (key.oid == 0 or key.page > large.end_page or size > large.page_bytes or
+                    (key.page == large.end_page and size != 0)) return error.InvalidSnapshotImage;
+                if (key.oid != previous) {
+                    const object: O.Object = .{ .kind = .large_object, .target = key.oid };
+                    const index = db.catalog_objects.findKey(&object, snap) orelse return error.InvalidSnapshotImage;
+                    object_length = db.catalog_objects.items[index].largeObjectLength();
+                    previous = key.oid;
+                }
+                if (@as(u64, key.page) * large.page_bytes + size > object_length or pages.page(key, snap) != null)
+                    return error.InvalidSnapshotImage;
+                if (size > scratch.len) return error.SnapshotWorkspaceTooSmall;
+                try readExact(file, offset.*, scratch[0..size], file_len);
+                offset.* += size;
+                pages.replay(key, scratch[0..size], csn);
+            }
+        }
+
+        fn checkCatalog(db: *const Database) !CatalogImage {
             for (&db.txs) |*tx| if (tx.active) return error.SnapshotUnsupportedState;
             const snap: storage.Snapshot = .{ .csn = db.csn };
-            for (&db.catalog_objects.items) |*object| if (O.visible(object, snap)) return error.SnapshotUnsupportedState;
+            var image: CatalogImage = .{ .pages = if (db.large_pages) |*pages| pages.committed_count else 0 };
+            for (&db.catalog_objects.items) |*object| {
+                if (!O.visible(object, snap)) continue;
+                if (object.kind == .comment and object.grantee != objects.class_large_object)
+                    return error.SnapshotUnsupportedState;
+                const position = std.mem.indexOfScalar(objects.Kind, &catalog_kinds, object.kind) orelse return error.SnapshotUnsupportedState;
+                image.counts[position] += 1;
+            }
             for (&db.objects.routines) |*item| if (item.live and item.stamp.visible(snap)) return error.SnapshotUnsupportedState;
             for (&db.objects.triggers) |*item| if (item.live and item.stamp.visible(snap)) return error.SnapshotUnsupportedState;
             for (&db.objects.rules) |*item| if (item.live and item.stamp.visible(snap)) return error.SnapshotUnsupportedState;
+            if (image.hasObjects() and image.counts[1] == 0) return error.SnapshotUnsupportedState;
+            return image;
         }
 
         fn exportTables(db: *const Database) !struct { count: usize, first_bank: usize, with_defaults: bool } {
-            try checkCatalog(db);
             if (db.csn == 0) return error.SnapshotUnsupportedState;
             var count: usize = 0;
             var first_bank: usize = 0;
@@ -138,6 +226,8 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
         /// allocation counters. Scratch need only hold one schema or row.
         pub fn write(db: *const Database, sink: anytype, scratch: []u8) !void {
             if (scratch.len > 0xffffffff or config.tx_writes == 0) return error.SnapshotWorkspaceTooSmall;
+            const catalog_image = try checkCatalog(db);
+            const with_pages = catalog_image.hasObjects();
             const selected = try exportTables(db);
             var schema_count: u32 = 0;
             for (&db.schemas) |*schema| {
@@ -156,22 +246,29 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
                 sequence_count += 1;
             }
             if (with_defaults and !validSequenceOwnership(db)) return error.SnapshotUnsupportedState;
-            if (selected.count == 0 and sequence_count == 0 and schema_count == 0) return error.SnapshotUnsupportedState;
+            if (selected.count == 0 and sequence_count == 0 and schema_count == 0 and !with_pages) return error.SnapshotUnsupportedState;
             if (sequence_count != 0 and config.tx_writes < 2) return error.SnapshotWorkspaceTooSmall;
             var header: [header_size]u8 = undefined;
             std.mem.writeInt(u64, header[8..16], db.csn, .little);
-            if (selected.count == 1 and sequence_count == 0 and schema_count == 0 and !with_defaults) {
+            if (!with_pages and selected.count == 1 and sequence_count == 0 and schema_count == 0 and !with_defaults) {
                 @memcpy(header[0..8], single_magic);
                 const table = &db.tables[selected.first_bank];
                 writeTableHeader(header[16..24], selected.first_bank, table);
                 try sink.appendAll(&header);
                 try writeTable(table, sink, scratch);
             } else {
-                @memcpy(header[0..8], if (schema_count != 0) schemas_magic else if (with_defaults) defaults_magic else if (sequence_count == 0) multi_magic else sequence_magic);
+                @memcpy(header[0..8], if (with_pages) pages_magic else if (schema_count != 0) schemas_magic else if (with_defaults) defaults_magic else if (sequence_count == 0) multi_magic else sequence_magic);
                 std.mem.writeInt(u32, header[16..20], @intCast(selected.count), .little);
                 std.mem.writeInt(u32, header[20..24], @intCast(sequence_count), .little);
                 try sink.appendAll(&header);
-                if (schema_count != 0) {
+                if (with_pages) {
+                    var counts: [20]u8 = undefined;
+                    for (catalog_image.counts, 0..) |count, index| std.mem.writeInt(u32, counts[index * 4 ..][0..4], count, .little);
+                    std.mem.writeInt(u32, counts[16..20], @intCast(catalog_image.pages), .little);
+                    try sink.appendAll(&counts);
+                    try writeCatalog(db, sink, scratch, .role);
+                }
+                if (with_pages or schema_count != 0) {
                     var count: [4]u8 = undefined;
                     std.mem.writeInt(u32, &count, schema_count, .little);
                     try sink.appendAll(&count);
@@ -205,6 +302,10 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
                 try C.encodeSequenceValue(&state, seq.oid, seq.logged_value, seq.logged_called);
                 try appendPart(sink, .create_sequence, scratch[0..try state.finish()]);
             };
+            if (with_pages) {
+                for (catalog_kinds[1..]) |kind| try writeCatalog(db, sink, scratch, kind);
+                try writePages(db, sink);
+            }
             var counters = try change_log.Writer.init(scratch, 0);
             try C.encodeCounters(&counters, change_log.first_oid + db.oid_counter, db.next_constraint_oid, db.next_default_oid, &db.tables);
             try appendPart(sink, .catalog_counters, scratch[0..try counters.finish()]);
@@ -262,7 +363,8 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
         /// A failure discards this staged destination. The enclosing receipt
         /// provides the expected SQL CSN independently of the WAL sequence.
         pub fn restore(db: *Database, file: anytype, expected_csn: u64, scratch: []u8, replay: *C.Scratch) !void {
-            try checkCatalog(db);
+            const empty = try checkCatalog(db);
+            if (empty.hasObjects() or empty.pages != 0) return error.SnapshotUnsupportedState;
             if (db.csn != 0 or db.oid_counter != 0 or db.next_constraint_oid != change_log.first_oid or db.next_default_oid != change_log.first_oid) return error.SnapshotUnsupportedState;
             for (&db.schemas) |*schema| if (schema.live) return error.SnapshotUnsupportedState;
             for (&db.tables) |*table| if (table.live) return error.SnapshotUnsupportedState;
@@ -277,7 +379,23 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
 
             var offset: u64 = header_size;
             var sequence_count: u32 = 0;
-            const with_schemas = std.mem.eql(u8, header[0..8], schemas_magic);
+            const with_pages = std.mem.eql(u8, header[0..8], pages_magic);
+            const with_schemas = with_pages or std.mem.eql(u8, header[0..8], schemas_magic);
+            var counts: [5]u32 = @splat(0);
+            if (with_pages) {
+                var encoded: [20]u8 = undefined;
+                try readExact(file, offset, &encoded, length);
+                offset += encoded.len;
+                var objects_total: u64 = 0;
+                for (&counts, 0..) |*count, index| {
+                    count.* = std.mem.readInt(u32, encoded[index * 4 ..][0..4], .little);
+                    if (index < catalog_kinds.len) objects_total += count.*;
+                }
+                if (objects_total == 0 or objects_total > db.catalog_objects.items.len or
+                    (counts[4] != 0 and (db.large_pages == null or counts[4] > db.large_pages.?.capacity())))
+                    return error.InvalidSnapshotImage;
+                try restoreCatalog(db, file, length, &offset, scratch, replay, csn, .role, counts[0]);
+            }
             const with_defaults = with_schemas or std.mem.eql(u8, header[0..8], defaults_magic);
             const table_count = blk: {
                 if (std.mem.eql(u8, header[0..8], single_magic)) {
@@ -293,7 +411,7 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
                     try readExact(file, offset, &total, length);
                     offset += total.len;
                     const schema_count = std.mem.readInt(u32, &total, .little);
-                    if (schema_count == 0 or schema_count > db.schemas.len) return error.InvalidSnapshotImage;
+                    if ((!with_pages and schema_count == 0) or schema_count > db.schemas.len) return error.InvalidSnapshotImage;
                     for (0..schema_count) |_| {
                         const schema = try readPart(file, &offset, length, scratch, .create_schema);
                         try C.applyBaseImageRecord(db, schema, replay, .{ .csn = csn, .op = .create_schema, .with_schemas = true });
@@ -319,6 +437,12 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
                 try C.applyBaseImageRecord(db, state, replay, .{ .csn = csn, .op = .create_sequence, .with_defaults = with_defaults, .with_schemas = with_schemas });
             }
             if (with_defaults and !validSequenceOwnership(db)) return error.InvalidSnapshotImage;
+            if (with_pages) {
+                for (catalog_kinds[1..], counts[1..4]) |kind, count| {
+                    try restoreCatalog(db, file, length, &offset, scratch, replay, csn, kind, count);
+                }
+                try restorePages(db, file, length, &offset, scratch, csn, counts[4]);
+            }
             const counters = try readPart(file, &offset, length, scratch, .catalog_counters);
             if (offset != length or try file.length() != length) return error.InvalidSnapshotImage;
             const counter_op: change_log.Op = if (counters.len <= 8) .catalog_counters else switch (counters[8]) {

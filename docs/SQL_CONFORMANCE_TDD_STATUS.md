@@ -1,5 +1,27 @@
 # SQL conformance TDD checkpoint
 
+## PostgreSQL large-object transfers and compact checkpoints
+
+Transaction-owned descriptor calls share one store path for SQL and
+libpq FunctionCall messages. A read-only descriptor pins the snapshot
+taken at open. Release reparents descriptor ownership, and rollback
+closes handles opened within the affected savepoint. Commit and abort
+release the transaction's handles. SQL and wire transfers use bounded
+page and response buffers independently of inline `bytea` cells.
+
+Compact image format RSBASE06 includes supported large-object
+metadata, role ownership, SELECT/UPDATE grants, comments and page
+payloads. Restore validates page identity, length, duplicates and
+capacity before installing each image into the unpublished startup
+store. Earlier image formats remain readable. WAL suffix replay
+can add or remove pages after the checkpoint.
+
+The PG16/PG18 stock tooling gate requires plain and custom archives in
+both directions, plus role checks, transaction rollback, forced-crash
+recovery and compact checkpoint reopen. Server-side file imports,
+file exports and LO truncation are outside this slice.
+[PostgreSQL large-object client behavior](https://www.postgresql.org/docs/18/lo-interfaces.html)
+
 ## PostgreSQL large-object pages and WAL
 
 The SQL database can attach disjoint caller-owned page buffers. Ordinary

@@ -1879,6 +1879,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
             table_count: usize = 0,
             with_defaults: bool = false,
             with_schemas: bool = false,
+            catalog_kind: ?catalog_objects.Kind = null,
         };
 
         fn baseImageSchema(relkind: u8, indexes: usize, parent: u32, dependencies: usize, constraints: usize, columns: []const V.Column, with_defaults: bool) bool {
@@ -2315,6 +2316,11 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     },
                     @intFromEnum(Op.object_create) => {
                         const object = try O.decodeCreate(record, &reader.position);
+                        if (comptime base_image) {
+                            if (image.catalog_kind != object.kind or
+                                (object.kind == .comment and object.grantee != catalog_objects.class_large_object))
+                                return error.InvalidChangeRecord;
+                        }
                         if (object.kind == .large_object and object.largeObjectLength() != 0 and db.large_pages == null)
                             return error.ChangeRecordConflict;
                         try scratch.object_overlay.create(&object, &object_check);
@@ -2436,6 +2442,10 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 .create_table, .insert => if (image.bank >= config.tables) return error.InvalidChangeRecord,
                 .create_sequence => {},
                 .create_schema => if (!image.with_schemas) return error.InvalidChangeRecord,
+                .object_create => switch (image.catalog_kind orelse return error.InvalidChangeRecord) {
+                    .role, .large_object, .large_object_acl, .comment => {},
+                    else => return error.InvalidChangeRecord,
+                },
                 .catalog_counters, .catalog_counters_with_constraints, .catalog_counters_with_defaults => if (image.table_count > config.tables) return error.InvalidChangeRecord,
                 else => return error.InvalidChangeRecord,
             }
