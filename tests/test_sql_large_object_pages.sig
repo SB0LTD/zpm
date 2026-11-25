@@ -372,6 +372,73 @@ fn compactRoundTrip() !void {
     try expect(result.rows[0].cells[0].integer == 0);
 }
 
+fn truncateRecovery() !void {
+    const command = @import("sql").large_object_command;
+    const wide_end = large.max_size;
+    var wal: [4096]u8 = undefined;
+    var result: DB.Result = .{};
+    const creation = try executeWAL(&primary, "SELECT lo_from_bytea(55010,'abcdef'::bytea)", &wal);
+    try checkpointed.applyChangeRecord(creation, &replay_scratch);
+    const slot = try primary.begin();
+    const descriptor = (try primary.largeObjectStatement(slot, .{ .open = .{ .oid = 55010, .mode = command.inv_write } }, &.{}, true)).int4;
+    const frozen = (try primary.largeObjectStatement(slot, .{ .open = .{ .oid = 55010, .mode = command.inv_read } }, &.{}, true)).int4;
+    try expect(descriptor == 0);
+    _ = try primary.largeObjectStatement(slot, .{ .seek = .{ .fd = descriptor, .offset = 4, .whence = 0, .wide = true } }, &.{}, true);
+
+    try primary.savepoint(slot, "truncate");
+    try primary.statement(slot, "SELECT lo_truncate64(0,6149)", &result, .{});
+    try expect(result.rows[0].cells[0].integer == 0);
+    try expect((try primary.largeObjectStatement(slot, .{ .tell = .{ .fd = descriptor, .wide = true } }, &.{}, true)).int8 == 4);
+    try primary.statement(slot, "SELECT lo_get(55010,6145,16)", &result, .{});
+    try expect(std.mem.eql(u8, result.rows[0].cells[0].bytea.slice(), &.{0, 0, 0, 0}));
+    var old: [12]u8 = undefined;
+    const prior = (try primary.largeObjectStatement(slot, .{ .read = .{ .fd = frozen, .count = 12 } }, &old, true)).bytes;
+    try expect(std.mem.eql(u8, old[0..prior], "abcdef"));
+    _ = try primary.rollbackTo(slot, "truncate");
+    try primary.statement(slot, "SELECT lo_get(55010)", &result, .{});
+    try expect(std.mem.eql(u8, result.rows[0].cells[0].bytea.slice(), "abcdef"));
+
+    _ = try primary.largeObjectStatement(slot, .{ .truncate = .{ .fd = descriptor, .length = wide_end } }, &.{}, true);
+    try expect((try primary.largeObjectStatement(slot, .{ .seek = .{ .fd = descriptor, .offset = 0, .whence = 2, .wide = true } }, &.{}, true)).int8 == wide_end);
+    const growth = try primary.prepareCommit(slot, &wal);
+    try expect(growth.len < 256);
+    try checkpointed.applyChangeRecord(growth, &replay_scratch);
+    primary.publishCommit(slot);
+    try checkpointed.execute("SELECT COUNT(*) FROM pg_largeobject WHERE loid=55010", &result);
+    try expect(result.rows[0].cells[0].integer == 2);
+    try checkpointed.execute("SELECT data FROM pg_largeobject WHERE loid=55010 AND pageno=2147483647", &result);
+    try expect(result.row_count == 1 and result.rows[0].cells[0].bytea.len == 0);
+
+    const shrink = try primary.begin();
+    _ = try primary.largeObjectStatement(shrink, .{ .open = .{ .oid = 55010, .mode = command.inv_write } }, &.{}, true);
+    try primary.statement(shrink, "SELECT lo_truncate(0,2)", &result, .{});
+    try primary.statement(shrink, "SELECT lo_truncate(0,9)", &result, .{});
+    const shrink_growth = try primary.prepareCommit(shrink, &wal);
+    try checkpointed.applyChangeRecord(shrink_growth, &replay_scratch);
+    primary.publishCommit(shrink);
+    try queryBytes(&checkpointed, "SELECT lo_get(55010)", &.{ 'a', 'b', 0, 0, 0, 0, 0, 0, 0 });
+
+    const zero = try primary.begin();
+    _ = try primary.largeObjectStatement(zero, .{ .open = .{ .oid = 55010, .mode = command.inv_write } }, &.{}, true);
+    try primary.statement(zero, "SELECT lo_truncate(0,0)", &result, .{});
+    const clear = try primary.prepareCommit(zero, &wal);
+    try checkpointed.applyChangeRecord(clear, &replay_scratch);
+    primary.publishCommit(zero);
+    try checkpointed.execute("SELECT data FROM pg_largeobject WHERE loid=55010 AND pageno=0", &result);
+    try expect(result.row_count == 1 and result.rows[0].cells[0].bytea.len == 0);
+
+    const removal = try executeWAL(&primary, "SELECT lo_unlink(55010)", &wal);
+    try expect(removal[8] == 72 and removal[4] == 2);
+    var orphan: [128]u8 = undefined;
+    @memcpy(orphan[0..8], removal[0..8]);
+    orphan[4] -= 1;
+    @memcpy(orphan[8..][0..removal.len - 19], removal[19..]);
+    try rejectsReplay(&checkpointed, orphan[0..removal.len - 11], error.ChangeRecordConflict);
+    try checkpointed.applyChangeRecord(removal, &replay_scratch);
+    try checkpointed.execute("SELECT COUNT(*) FROM pg_largeobject WHERE loid=55010", &result);
+    try expect(result.rows[0].cells[0].integer == 0);
+}
+
 pub fn main(init: std.process.Init) !void {
     try snapshotAndSparseRead();
     try atomicCapacityFailure();
@@ -380,6 +447,7 @@ pub fn main(init: std.process.Init) !void {
     try distantPages();
     try sqlPageRecovery();
     try compactRoundTrip();
+    try truncateRecovery();
     var line: [160]u8 = undefined;
     const report = try std.fmt.bufPrint(&line, "{{\"suite\":\"sql-large-object-pages\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, report);

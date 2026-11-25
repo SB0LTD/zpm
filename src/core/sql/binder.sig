@@ -1321,6 +1321,8 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "lo_unlink", .func = .lo_unlink },
                 .{ .name = "lo_from_bytea", .func = .lo_from_bytea },
                 .{ .name = "lo_get", .func = .lo_get },
+                .{ .name = "lo_truncate", .func = .lo_truncate },
+                .{ .name = "lo_truncate64", .func = .lo_truncate64 },
                 .{ .name = "current_database", .func = .current_database },
                 .{ .name = "current_schemas", .func = .current_schemas },
                 .{ .name = "pg_encoding_to_char", .func = .pg_encoding_to_char },
@@ -2243,6 +2245,11 @@ pub fn Binder(comptime config: types.Config) type {
                 .lo_create, .lo_creat, .lo_unlink => {
                     if (context.dialect != .postgres) return error.UndefinedFunction;
                     try bindSignature(context, n, &.{if (n.func == .lo_creat) .int4 else .oid}, if (n.func == .lo_unlink) .int4 else .oid, false);
+                    n.constant = false;
+                },
+                .lo_truncate, .lo_truncate64 => {
+                    if (context.dialect != .postgres) return error.UndefinedFunction;
+                    try bindSignature(context, n, &.{ .int4, if (n.func == .lo_truncate64) .int8 else .int4 }, .int4, false);
                     n.constant = false;
                 },
                 .lo_from_bytea, .lo_get => {
@@ -8341,7 +8348,7 @@ pub fn Binder(comptime config: types.Config) type {
             switch (n.kind) {
                 .scalar_subquery, .exists_subquery, .in_subquery => return true,
                 .function => switch (n.func) {
-                    .nextval, .setval, .currval, .lastval, .identity_next, .clock_timestamp, .lo_create, .lo_creat, .lo_unlink, .lo_from_bytea, .lo_get => return true,
+                    .nextval, .setval, .currval, .lastval, .identity_next, .clock_timestamp, .lo_create, .lo_creat, .lo_unlink, .lo_from_bytea, .lo_get, .lo_truncate, .lo_truncate64 => return true,
                     else => {},
                 },
                 else => {},

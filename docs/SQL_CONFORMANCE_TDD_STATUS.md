@@ -1,5 +1,22 @@
 # SQL conformance TDD checkpoint
 
+## PostgreSQL large-object truncation
+
+`lo_truncate(int4, int4)` and `lo_truncate64(int4, int8)` use a writable
+transaction descriptor and preserve its current offset. SQL and libpq
+FunctionCall use PostgreSQL's result type and procedure OIDs. Growth
+updates the logical length and stages at most one EOF page. Shrink
+preserves the retained prefix and removes later pages. EOF on a page
+boundary has a zero-length marker in `pg_largeobject`.
+
+The tests cover sparse growth past 2 GiB and at the PostgreSQL size
+boundary, reads from a snapshot opened before truncation, savepoint
+rollback, and replay of a committed shrink followed by growth. Replay
+also rejects a drop that would orphan a zero-length EOF marker. The
+PG16 and PG18 stock archive gate includes truncate-grown objects and a
+separate libpq FunctionCall and forced-crash recovery check.
+[PostgreSQL large-object truncation](https://www.postgresql.org/docs/18/lo-interfaces.html#LO-TRUNCATE)
+
 ## PostgreSQL large-object transfers and compact checkpoints
 
 Transaction-owned descriptor calls share one store path for SQL and
@@ -21,8 +38,7 @@ can add or remove pages after the checkpoint.
 
 The PG16/PG18 stock tooling gate requires plain and custom archives in
 both directions, plus role checks, transaction rollback, forced-crash
-recovery and compact checkpoint reopen. Server-side file imports,
-file exports and LO truncation are outside this slice.
+recovery and compact checkpoint reopen. Server-side file imports and exports remain outside this slice.
 [PostgreSQL large-object client behavior](https://www.postgresql.org/docs/18/lo-interfaces.html)
 
 ## PostgreSQL large-object pages and WAL

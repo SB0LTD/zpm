@@ -107,6 +107,7 @@ pub const SequenceCall = enum { nextval, currval, setval, lastval, identity, reg
 pub const LargeObjectData = enum { create, read };
 
 pub const SequenceHook = struct {
+    large_object_truncate: ?*const fn (ptr: *anyopaque, fd: i32, length: i64) Error!i32 = null,
     large_object: ?*const fn (ptr: *anyopaque, create: bool, oid: u32) Error!u32 = null,
     large_object_data: ?*const fn (ptr: *anyopaque, operation: LargeObjectData, oid: u32, offset: i64, input: []const u8, output: []u8, requested: ?usize) Error!usize = null,
     ptr: *anyopaque,

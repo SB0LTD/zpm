@@ -52,13 +52,14 @@ pub const Request = union(enum) {
     write: struct { fd: i32, bytes: Input },
     seek: struct { fd: i32, offset: i64, whence: i32, wide: bool },
     tell: struct { fd: i32, wide: bool },
+    truncate: struct { fd: i32, length: i64 },
     from_bytes: struct { oid: u32, bytes: Input },
     get: struct { oid: u32, offset: i64 = 0, count: ?i32 = null },
     put: struct { oid: u32, offset: i64, bytes: Input },
 
     pub fn writes(self: Request) bool {
         return switch (self) {
-            .create, .unlink, .write, .from_bytes, .put => true,
+            .create, .unlink, .write, .truncate, .from_bytes, .put => true,
             else => false,
         };
     }
@@ -82,8 +83,10 @@ pub const Function = enum(u32) {
     lo_creat = 957,
     lo_tell = 958,
     lo_unlink = 964,
+    lo_truncate = 1004,
     lo_lseek64 = 3170,
     lo_tell64 = 3171,
+    lo_truncate64 = 3172,
     lo_from_bytea = 3457,
     lo_get = 3458,
     lo_get_fragment = 3459,
@@ -106,7 +109,8 @@ pub const Function = enum(u32) {
             .lo_create, .lo_unlink, .lo_get => &.{26},
             .lo_open => &.{ 26, 23 },
             .lo_close, .lo_creat, .lo_tell, .lo_tell64 => &.{23},
-            .loread => &.{ 23, 23 },
+            .loread, .lo_truncate => &.{ 23, 23 },
+            .lo_truncate64 => &.{ 23, 20 },
             .lowrite => &.{ 23, 17 },
             .lo_lseek => &.{ 23, 23, 23 },
             .lo_lseek64 => &.{ 23, 20, 23 },
@@ -138,6 +142,7 @@ pub const Function = enum(u32) {
             .lowrite => .{ .write = .{ .fd = @intCast(args[0].number), .bytes = args[1].bytes } },
             .lo_lseek, .lo_lseek64 => .{ .seek = .{ .fd = @intCast(args[0].number), .offset = args[1].number, .whence = @intCast(args[2].number), .wide = self == .lo_lseek64 } },
             .lo_tell, .lo_tell64 => .{ .tell = .{ .fd = @intCast(args[0].number), .wide = self == .lo_tell64 } },
+            .lo_truncate, .lo_truncate64 => .{ .truncate = .{ .fd = @intCast(args[0].number), .length = args[1].number } },
             .lo_from_bytea => .{ .from_bytes = .{ .oid = @intCast(args[0].number), .bytes = args[1].bytes } },
             .lo_get => .{ .get = .{ .oid = @intCast(args[0].number) } },
             .lo_get_fragment => .{ .get = .{ .oid = @intCast(args[0].number), .offset = args[1].number, .count = @intCast(args[2].number) } },

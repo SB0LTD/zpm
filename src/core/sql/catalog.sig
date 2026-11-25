@@ -229,6 +229,8 @@ pub const builtin_callbacks = [_]BuiltinCallback{
     .{ .oid = 958, .name = "lo_tell", .args = &.{23}, .result = 23, .volatility = 'v', .source = "be_lo_tell" },
     .{ .oid = 3170, .name = "lo_lseek64", .args = &.{ 23, 20, 23 }, .result = 20, .volatility = 'v', .source = "be_lo_lseek64" },
     .{ .oid = 3171, .name = "lo_tell64", .args = &.{23}, .result = 20, .volatility = 'v', .source = "be_lo_tell64" },
+    .{ .oid = 1004, .name = "lo_truncate", .args = &.{ 23, 23 }, .result = 23, .volatility = 'v', .source = "be_lo_truncate" },
+    .{ .oid = 3172, .name = "lo_truncate64", .args = &.{ 23, 20 }, .result = 23, .volatility = 'v', .source = "be_lo_truncate64" },
     .{ .oid = 3460, .name = "lo_put", .args = &.{ 26, 20, 17 }, .result = 2278, .volatility = 'v', .source = "be_lo_put" },
     .{ .oid = 957, .name = "lo_creat", .args = &.{23}, .result = 26, .volatility = 'v', .source = "be_lo_creat" },
     .{ .oid = 964, .name = "lo_unlink", .args = &.{26}, .result = 23, .volatility = 'v', .source = "be_lo_unlink" },
