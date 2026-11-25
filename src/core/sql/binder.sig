@@ -2758,44 +2758,110 @@ pub fn Binder(comptime config: types.Config) type {
             }
         }
 
-        /// overlaps(start, end|interval, start, end|interval): timestamp
-        /// when no argument is timestamptz and one is timestamp, else
-        /// timestamptz (dates prefer it). Not strict: overlaps_timestamp
-        /// has its own NULL rules. The interval forms of timestamptz are
-        /// STABLE (zone-dependent addition).
+        // The timestamp, timestamptz and time families accept durations.
+        // PostgreSQL supplies only the endpoint signature for timetz.
+        const overlap_signatures = [_][4]ast.Type{
+            .{ .timestamp, .timestamp, .timestamp, .timestamp },
+            .{ .timestamp, .interval, .timestamp, .timestamp },
+            .{ .timestamp, .timestamp, .timestamp, .interval },
+            .{ .timestamp, .interval, .timestamp, .interval },
+            .{ .timestamptz, .timestamptz, .timestamptz, .timestamptz },
+            .{ .timestamptz, .interval, .timestamptz, .timestamptz },
+            .{ .timestamptz, .timestamptz, .timestamptz, .interval },
+            .{ .timestamptz, .interval, .timestamptz, .interval },
+            .{ .time, .time, .time, .time },
+            .{ .time, .interval, .time, .time },
+            .{ .time, .time, .time, .interval },
+            .{ .time, .interval, .time, .interval },
+            .{ .timetz, .timetz, .timetz, .timetz },
+        };
+
+        fn overlapSignatureScore(input: [4]ast.Type, params: [4]ast.Type) ?u8 {
+            var score: u8 = 0;
+            for (input, params) |arg, target| {
+                if (!value.castable(arg, target, .implicit)) return null;
+                if (arg == target) {
+                    score += 5; // An exact match outweighs every preferred conversion.
+                } else if (target == .timestamptz and value.datetime(arg)) {
+                    score += 1;
+                }
+            }
+            return score;
+        }
+
+        /// Unknown arguments select a preferred type only if the remaining
+        /// signatures agree on the category at every unknown position.
+        fn preferOverlapUnknowns(input: [4]ast.Type, candidates: u16) u16 {
+            var preferred = candidates;
+            for (input, 0..) |arg, position| {
+                if (arg != .unknown) continue;
+                var datetime: u16 = 0;
+                var duration: u16 = 0;
+                var zoned: u16 = 0;
+                for (overlap_signatures, 0..) |params, index| {
+                    const bit = @as(u16, 1) << @intCast(index);
+                    if (candidates & bit == 0) continue;
+                    switch (params[position]) {
+                        .timestamptz => {
+                            datetime |= bit;
+                            zoned |= bit;
+                        },
+                        .interval => duration |= bit,
+                        else => datetime |= bit,
+                    }
+                }
+                if (datetime != 0 and duration != 0) return candidates;
+                if (zoned != 0) preferred &= zoned;
+            }
+            return if (preferred == 0) candidates else preferred;
+        }
+
+        /// PostgreSQL's final overload heuristic uses the common known type
+        /// for unknown arguments if that leaves exactly one implicit match.
+        fn inferOverlapUnknowns(input: [4]ast.Type, candidates: u16) u16 {
+            var common: ast.Type = .unknown;
+            for (input) |arg| {
+                if (arg == .unknown) continue;
+                if (common != .unknown and common != arg) return 0;
+                common = arg;
+            }
+            if (common == .unknown) return 0;
+            var inferred: u16 = 0;
+            for (overlap_signatures, 0..) |params, index| {
+                const bit = @as(u16, 1) << @intCast(index);
+                if (candidates & bit != 0 and overlapSignatureScore(@splat(common), params) != null) inferred |= bit;
+            }
+            return inferred;
+        }
+
         fn typeOverlaps(context: *const Context, n: *ast.Node, count: usize) Error!void {
             if (count != 4) return error.UndefinedFunction;
-            var zoned = false;
-            var plain = false;
-            var interval = false;
+            var input: [4]ast.Type = undefined;
             var item = n.b;
-            var index: usize = 0;
-            while (item != none) : ({
+            for (&input) |*arg| {
+                arg.* = context.node(item).ty;
                 item = context.node(item).next;
-                index += 1;
-            }) switch (context.node(item).ty) {
-                .timestamptz => zoned = true,
-                .timestamp => plain = true,
-                .date => {},
-                .interval => if (index % 2 == 1) {
-                    interval = true;
-                } else return error.UndefinedFunction,
-                // An unknown end could be a datetime or an interval.
-                .unknown => if (index % 2 == 1 and !knownNull(context, item)) return error.AmbiguousFunction,
-                else => return error.UndefinedFunction,
-            };
-            const start: ast.Type = if (zoned or !plain) .timestamptz else .timestamp;
-            var params: [4]ast.Type = .{ start, start, start, start };
-            item = n.b;
-            index = 0;
-            while (item != none) : ({
-                item = context.node(item).next;
-                index += 1;
-            }) if (context.node(item).ty == .interval) {
-                params[index] = .interval;
-            };
+            }
+            var candidates: u16 = 0;
+            var best: u8 = 0;
+            for (overlap_signatures, 0..) |params, index| {
+                const score = overlapSignatureScore(input, params) orelse continue;
+                if (score < best) continue;
+                if (score > best) {
+                    candidates = 0;
+                    best = score;
+                }
+                candidates |= @as(u16, 1) << @intCast(index);
+            }
+            if (candidates == 0) return error.UndefinedFunction;
+            if (@popCount(candidates) != 1) candidates = preferOverlapUnknowns(input, candidates);
+            if (@popCount(candidates) != 1) candidates = inferOverlapUnknowns(input, candidates);
+            if (@popCount(candidates) != 1) return error.AmbiguousFunction;
+            const params = overlap_signatures[@ctz(candidates)];
             try bindSignature(context, n, &params, .boolean, false);
-            n.func = if (start == .timestamptz and interval) .overlaps_tz else .overlaps;
+            const zoned_duration = params[0] == .timestamptz and (params[1] == .interval or params[3] == .interval);
+            const local_time_cast = params[0] == .timetz and std.mem.indexOfScalar(ast.Type, &input, .time) != null;
+            n.func = if (zoned_duration or local_time_cast) .overlaps_tz else .overlaps;
         }
 
         /// Date/time functions; timestamptz overloads (date arguments prefer

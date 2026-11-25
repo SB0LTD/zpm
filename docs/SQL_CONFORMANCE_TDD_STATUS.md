@@ -1,5 +1,24 @@
 # SQL conformance TDD checkpoint
 
+## Temporal `OVERLAPS`
+
+The original date-only inventory query already passed. New cases exposed
+missing `TIME` and `TIMETZ` operands and datetime overload resolution that
+treated untyped NULL and string endpoints differently from PostgreSQL.
+The allocator-free binder now selects the declared endpoint and duration
+signatures. It applies PostgreSQL's exact-match, preferred-type and
+unknown-type rules. Evaluation shares the existing temporal arithmetic
+and ordering, including local midnight wrap, the TIMETZ offset
+tie-breaker, and the three-valued result for missing endpoints.
+
+The native PG16 oracle confirmed boundary, duration and overload cases.
+RAMSQL's PG16 and PG18 differential suite covers column predicates,
+prepared parameters with binary output, invalid signatures, and the
+distinction between a calendar day and 24 hours across a DST boundary.
+The closure concerns the predicate and the temporal values already
+supported by the engine. The wider type and catalog inventory remains
+open.
+
 ## Stock PostgreSQL dump and restore candidate
 
 The database utility parser accepts the stock archive's database creation
