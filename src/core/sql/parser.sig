@@ -910,7 +910,13 @@ pub fn Parser(comptime config: types.Config) type {
                         } else if (try self.takeWord("NOT")) {
                             try self.expectWord("NULL");
                             try pushAction(&out, .{ .set_not_null = name });
+                        } else if (self.isSymbol(.lparen)) {
+                            try self.legacyAttributeOptions(false);
+                            try pushAction(&out, .{ .legacy_attribute_options = name });
                         } else return error.UnsupportedStatement;
+                    } else if (try self.takeRaw("reset")) {
+                        try self.legacyAttributeOptions(true);
+                        try pushAction(&out, .{ .legacy_attribute_options = name });
                     } else if (try self.takeWord("DROP")) {
                         if (try self.takeWord("DEFAULT")) {
                             try pushAction(&out, .{ .drop_default = name });
@@ -924,6 +930,36 @@ pub fn Parser(comptime config: types.Config) type {
             }
             try self.finish();
             return out;
+        }
+
+        /// Older PostgreSQL 18 dumps can include the internal row-format
+        /// version in attoptions. PostgreSQL ignores this reserved option on
+        /// restore. Other options have their own semantics and need storage.
+        fn legacyAttributeOptions(self: *Self, reset: bool) Error!void {
+            try self.expectSymbol(.lparen);
+            var unsupported = false;
+            while (true) {
+                const option = try self.identifier();
+                var buffer: [64]u8 = undefined;
+                const name = identText(self.source, option, &buffer) orelse "";
+                unsupported = unsupported or !types.same(name, "pg_attver");
+                if (try self.takeSymbol(.dot)) {
+                    _ = try self.identifier();
+                    unsupported = true;
+                }
+                if (!reset and try self.takeSymbol(.eq)) {
+                    const signed = try self.takeSymbol(.plus) or try self.takeSymbol(.minus);
+                    switch (self.current.kind) {
+                        .integer, .decimal => {},
+                        .word, .quoted_word, .string => if (signed) return error.Syntax,
+                        else => return error.Syntax,
+                    }
+                    try self.advance();
+                }
+                if (!try self.takeSymbol(.comma)) break;
+            }
+            try self.expectSymbol(.rparen);
+            if (unsupported) return error.UnsupportedStatement;
         }
 
         /// TRUNCATE [TABLE] [ONLY] name [*] [, ...] [RESTART IDENTITY |

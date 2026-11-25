@@ -816,6 +816,49 @@ fn alterErrors() !void {
     try sameState(&.{ "SELECT id, x FROM ident", probe });
 }
 
+fn legacyAttributeOptions() !void {
+    reset();
+    try run("CREATE TABLE a (id INT PRIMARY KEY, \"Payload\" INT)");
+    try run("INSERT INTO a VALUES (1, 10)");
+    const probe = "SELECT * FROM a ORDER BY id";
+    const metadata = "SELECT attoptions FROM pg_attribute WHERE attrelid='a'::regclass AND attname='Payload'";
+    const wal_before = records_applied;
+    const set = "ALTER TABLE ONLY a ALTER COLUMN \"Payload\" SET (pg_attver=42)";
+    const reset_options = "ALTER TABLE a ALTER COLUMN \"Payload\" RESET (\"pg_attver\")";
+    const result = try replicate(set);
+    try check(result.command == .alter_table);
+    try run("ALTER TABLE a ALTER id SET (PG_ATTVER, pg_attver='old'), ALTER \"Payload\" RESET (pg_attver)");
+    try run(reset_options);
+    try check(records_applied == wal_before);
+    try expect(metadata, "NULL");
+    try sameState(&.{ probe, metadata });
+
+    try rejects("ALTER TABLE a ALTER nope SET (pg_attver=1)", error.ColumnNotFound, probe, "1|10");
+    try rejects("ALTER TABLE a ALTER ctid SET (pg_attver=1)", error.UnsupportedStatement, probe, "1|10");
+    try rejects("ALTER TABLE a ALTER id SET ()", error.Syntax, probe, "1|10");
+    try rejects("ALTER TABLE a ALTER id RESET (pg_attver=1)", error.Syntax, probe, "1|10");
+    try rejects("ALTER TABLE a ALTER id SET (pg_attver=1, n_distinct=2)", error.UnsupportedStatement, probe, "1|10");
+    try rejects("ALTER TABLE a ALTER id SET (pg_attver=1+2)", error.Syntax, probe, "1|10");
+    try rejects("ALTER TABLE a ALTER id SET (\"PG_ATTVER\"=1)", error.UnsupportedStatement, probe, "1|10");
+    try rejects("ALTER TABLE a ADD COLUMN extra INT, ALTER missing SET (pg_attver=1)", error.ColumnNotFound, probe, "1|10");
+    try run("ALTER TABLE a ALTER extra SET (pg_attver=1), ADD COLUMN extra INT DEFAULT 20");
+    try expect(probe, "1|10|20");
+    try sameState(&.{probe});
+
+    const alterer = try db.begin();
+    try statement(alterer, set);
+    const concurrent = try db.begin();
+    try same(try rows(concurrent, probe), "1|10|20");
+    try statement(concurrent, "UPDATE a SET \"Payload\"=11 WHERE id=1");
+    try parks(concurrent, reset_options);
+    try check(db.waitingFor(concurrent).has(alterer));
+    db.abort(alterer);
+    _ = try resumed(concurrent, reset_options);
+    try commit(concurrent);
+    try expect(probe, "1|11|20");
+    try sameState(&.{ probe, metadata });
+}
+
 fn alterTransactions() !void {
     reset();
     try run("CREATE TABLE a (id INT PRIMARY KEY, v INT)");
@@ -1504,6 +1547,7 @@ pub fn main(init: std.process.Init) !void {
     try restorePrimaryInCreateTransaction();
     try latePrimaryRecordFence();
     try alterErrors();
+    try legacyAttributeOptions();
     try alterTransactions();
     try alterIsolation();
     try serialColumns();
