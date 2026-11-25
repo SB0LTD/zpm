@@ -8,6 +8,9 @@ taken at open. Release reparents descriptor ownership, and rollback
 closes handles opened within the affected savepoint. Commit and abort
 release the transaction's handles. SQL and wire transfers use bounded
 page and response buffers independently of inline `bytea` cells.
+The transaction handle table has 64 entries. Standalone literal calls
+and prepared scalar transfer calls use the ordinary packet and response
+budgets. Larger objects can use repeated descriptor reads and writes.
 
 Compact image format RSBASE06 includes supported large-object
 metadata, role ownership, SELECT/UPDATE grants, comments and page

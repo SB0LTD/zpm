@@ -178,6 +178,9 @@ pub fn parseSql(source: []const u8) types.Error!?SqlCall {
     var tokens: lexer.Tokenizer = .{ .source = source, .text_limit = source.len };
     if (!tokenName(try tokens.next(), source, "select")) return null;
     var word = try tokens.next();
+    if (word.kind != .word and word.kind != .quoted_word) return null;
+    const spelling = word.raw(source);
+    if (spelling.len == 0 or ((spelling[0] | 0x20) != 'l' and (spelling[0] | 0x20) != 'p')) return null;
     var token = try tokens.next();
     if (token.symbol == .dot) {
         if (!tokenName(word, source, "pg_catalog")) return null;
