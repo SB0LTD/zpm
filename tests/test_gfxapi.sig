@@ -558,3 +558,38 @@ test "gfxapi: a float texture copied whole, and a compute dispatch, on the GPU a
     try std.testing.expectEqualSlices(u8, &raw_cpu, &raw_emu);
     eng_emu.deinit();
 }
+
+test "gfxapi: a buffer the GPU wrote copied into another on the GPU (copyBytes), in order after the dispatch" {
+    emu = gpu.EmuDevice.init(emuCaps(), &emu_mem, &emu_work);
+    emu.shadow = &emu_shadow;
+    eng_emu.init(.{ .dev = emu.device(), .work = &compile_mem, .cpu_work = &cpu_work_c });
+    defer eng_emu.deinit();
+    try std.testing.expect(eng_emu.onGpu());
+    var in = eng_emu.newBuffer(512) orelse return error.OutOfMemory;
+    defer eng_emu.freeImage(&in);
+    var out = eng_emu.newBuffer(4100) orelse return error.OutOfMemory;
+    defer eng_emu.freeImage(&out);
+    var dst = eng_emu.newBuffer(4200) orelse return error.OutOfMemory;
+    defer eng_emu.freeImage(&dst);
+    var words: [128]u32 = undefined;
+    for (&words, 0..) |*w, i| w.* = @intCast(i * 3 + 1);
+    eng_emu.writeBytes(&in, 0, std.mem.sliceAsBytes(&words));
+    var cs = engine.Compute{ .build = RawCs.build, .group = gfxapi.dxbc_gen.threadGroup(&gfxapi.dxbc_compute_fixtures.cs_raw).? };
+    defer eng_emu.unloadCompute(&cs);
+    const uni = [4]u32{ 512, 4, 4100, 4 };
+    try std.testing.expect(eng_emu.dispatch(&cs, .{ 1, 1, 1 }, &.{ &in, &out }, 0b10, &uni));
+    // (recorded behind the dispatch, no wait: the copy reads what it wrote)
+    try std.testing.expect(eng_emu.copyBytes(&out, 256, &dst, 400, 2048));
+    // (not whole words, or a buffer onto itself: the caller's, through the CPU)
+    try std.testing.expect(!eng_emu.copyBytes(&out, 2, &dst, 0, 8));
+    try std.testing.expect(!eng_emu.copyBytes(&out, 0, &out, 8, 8));
+    var want: [2048]u8 = undefined;
+    eng_emu.readBytes(&out, 256, &want);
+    var got: [2048]u8 = undefined;
+    eng_emu.readBytes(&dst, 400, &got);
+    try std.testing.expectEqualSlices(u8, &want, &got);
+    try std.testing.expect(std.mem.readInt(u32, want[0..4], .little) != 0);
+    var head: [400]u8 = undefined;
+    eng_emu.readBytes(&dst, 0, &head);
+    for (head) |x| try std.testing.expectEqual(@as(u8, 0), x);
+}

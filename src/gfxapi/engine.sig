@@ -4537,6 +4537,25 @@ pub const Engine = struct {
         e.toDevice(img, off, len);
     }
 
+    /// `n` bytes of buffer `src` at `soff` to buffer `dst` at `doff`
+    /// (Direct3D's copies between buffers) on the GPU, in the open batch
+    /// after what it holds: both the GPU's, not one buffer, whole words.
+    /// False: not so, for the caller to copy through the CPU (readBytes,
+    /// writeBytes), which waited for all the GPU's work whenever it had
+    /// written the source.
+    pub fn copyBytes(e: *Engine, src: *Image, soff: usize, dst: *Image, doff: usize, n: usize) bool {
+        if (n == 0) return true;
+        if (!e.gpuUsable(src) or !e.gpuUsable(dst) or src.buf.gpu == dst.buf.gpu or e.check.mem.len != 0) return false;
+        if ((soff | doff | n) % 4 != 0 or soff + n > src.buf.cpu.len or doff + n > dst.buf.cpu.len or n / 4 > std.math.maxInt(u32)) return false;
+        const words: u32 = @intCast(n / 4);
+        const groups = (words + GROUP - 1) / GROUP;
+        const gx = @min(groups, 32768);
+        const gy = (groups + gx - 1) / gx;
+        const p = [_]u32{ @intCast(soff), @intCast(doff), words, gx };
+        e.recordProg(&e.progs[@backingInt(Prog.words)], .{ gx, gy, 1 }, &.{ src, dst }, 0b10, &p, null);
+        return true;
+    }
+
     /// Bytes from the CPU into a GL buffer's storage at `off`.
     pub fn writeBytes(e: *Engine, b: *Image, off: usize, src: []const u8) void {
         if (src.len == 0) return;
@@ -4563,6 +4582,15 @@ pub const Engine = struct {
     /// across the bus in system memory.
     pub fn intoVram(e: *Engine, img: *Image) void {
         e.toVram(img);
+    }
+
+    /// An image the CPU reads back (Direct3D's staging textures) kept in
+    /// system memory, where the GPU's copies into it land: a read then
+    /// waits for those alone. In VRAM each read copied it down behind
+    /// all the work queued since, and waited for that (Unigine
+    /// Superposition's, a read a frame, the GPU drained each time).
+    pub fn outOfVram(e: *Engine, img: *Image) void {
+        e.fromVram(img);
     }
 
     /// `img` (just made, the engine's, a buffer of its own) moved to VRAM
