@@ -2499,6 +2499,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         db.catalog_objects.applyCreate(&object, db.epoch, db.cid, csn);
                         const width = object.oidWidth();
                         if (width != 0) db.oid_counter = @max(db.oid_counter, object.oid + width - first_oid);
+                        if (object.kind == .large_object and object.grant_flags == catalog_objects.large_object_generated_oid)
+                            db.oid_counter = @max(db.oid_counter, object.target + 1 - first_oid);
                     },
                     @intFromEnum(Op.object_drop) => {
                         const key = try O.decodeDrop(record, &reader.position);

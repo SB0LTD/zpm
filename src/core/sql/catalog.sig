@@ -220,6 +220,9 @@ pub const builtin_callbacks = [_]BuiltinCallback{
     simple_template.init, simple_template.lexize,
     int4range_canonical, int8range_canonical, daterange_canonical,
     .{ .oid = 3778, .name = "pg_tablespace_location", .args = &.{26}, .result = 25, .volatility = 's' },
+    .{ .oid = 715, .name = "lo_create", .args = &.{26}, .result = 26, .volatility = 'v', .source = "be_lo_create" },
+    .{ .oid = 957, .name = "lo_creat", .args = &.{23}, .result = 26, .volatility = 'v', .source = "be_lo_creat" },
+    .{ .oid = 964, .name = "lo_unlink", .args = &.{26}, .result = 23, .volatility = 'v', .source = "be_lo_unlink" },
     .{ .oid = 6177, .name = "date_bin", .args = &.{ 1186, 1114, 1114 }, .result = 1114, .source = "timestamp_bin" },
     .{ .oid = 6178, .name = "date_bin", .args = &.{ 1186, 1184, 1184 }, .result = 1184, .source = "timestamptz_bin" },
 } ++ overlap_callbacks;

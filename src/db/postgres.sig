@@ -2326,6 +2326,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                 .create_statistics => "CREATE STATISTICS",
                 .alter_statistics => "ALTER STATISTICS",
                 .alter_schema => "ALTER SCHEMA",
+                .alter_large_object => "ALTER LARGE OBJECT",
                 .drop_statistics => "DROP STATISTICS",
                 .create_extension => "CREATE EXTENSION",
                 .create_domain => "CREATE DOMAIN",

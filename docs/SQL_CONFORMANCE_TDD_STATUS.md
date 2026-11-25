@@ -1,5 +1,29 @@
 # SQL conformance TDD checkpoint
 
+## PostgreSQL large-object SQL metadata and ACLs
+
+ZPM implements `lo_create(oid)`, `lo_creat(int4)`, `lo_unlink(oid)`,
+`ALTER LARGE OBJECT ... OWNER TO`, comments, and owner-issued SELECT
+and UPDATE grants and revocations for large-object identities. The
+PostgreSQL catalog exposes typed metadata, procedure identities,
+comments and ACLs, including the default ACL used by PG16 and PG18
+`pg_dump`. Explicit large-object OIDs can coexist with relation OIDs.
+
+Metadata, ACLs and comments use the existing transactional catalog and
+validated object WAL records. Replay checks owner and grantee
+references, the live large-object identity, and the generated OID
+high-water mark. Tests exercise duplicate OIDs, failed authorization,
+same-statement effects, savepoint rollback, competing creators, and
+malformed records. Native PostgreSQL 16.15 and 18.7 agree on the
+ownership transfer, ACL output, comments and unlink results.
+
+Page bytes still need a database-owned arena, transaction write-set
+entries, a WAL page-record validator, and checkpoint/export integration.
+Descriptor operations and the full byte-stream archive path remain
+open. Delegated grant options and PostgreSQL's warning for a grant
+that conveys no permissions also remain open.
+[PostgreSQL large-object permissions](https://www.postgresql.org/docs/18/lo-implementation.html)
+
 ## PostgreSQL large-object substrate
 
 The SQL layer now has a caller-backed 2 KiB page store that reuses the

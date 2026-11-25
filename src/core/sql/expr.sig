@@ -718,8 +718,8 @@ pub fn Eval(comptime config: types.Config) type {
 
         /// The catalog OID named by obj_description's second argument.
         fn catalogClass(name: []const u8) ?u32 {
-            const names = [_][]const u8{ "pg_class", "pg_namespace", "pg_authid", "pg_foreign_data_wrapper", "pg_foreign_server", "pg_publication", "pg_policy" };
-            const oids = [_]u32{ 1259, 2615, 1260, 2328, 1417, 6104, 3256 };
+            const names = [_][]const u8{ "pg_class", "pg_namespace", "pg_authid", "pg_foreign_data_wrapper", "pg_foreign_server", "pg_publication", "pg_policy", "pg_largeobject" };
+            const oids = [_]u32{ 1259, 2615, 1260, 2328, 1417, 6104, 3256, 2613 };
             for (names, oids) |known, oid| if (types.same(known, name)) return oid;
             return null;
         }
@@ -1464,6 +1464,14 @@ pub fn Eval(comptime config: types.Config) type {
                         return .{ .text = text };
                     },
                     .nextval, .currval, .setval, .lastval, .identity_next => return sequenceValue(ctx, n),
+                    .lo_create, .lo_creat, .lo_unlink => {
+                        const arg = try eval(ctx, n.b);
+                        if (arg == .null_value) return .null_value;
+                        const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
+                        const call = hook.large_object orelse return error.UnsupportedStatement;
+                        const oid = if (n.func == .lo_creat) 0 else @import("std").math.cast(u32, arg.integer) orelse return error.NumericValueOutOfRange;
+                        return .{ .integer = try call(hook.ptr, n.func != .lo_unlink, oid) };
+                    },
                     .current_database, .current_schema, .current_schemas, .pg_encoding_to_char, .to_regtype, .to_regclass, .to_regproc, .format_type, .pg_get_expr, .regclass_in, .regtype_in, .regclass_out, .regtype_out,
                     .to_regnamespace, .regnamespace_in, .regnamespace_out,
                     .acldefault, .pg_get_userbyid, .pg_tablespace_location, .pg_table_is_visible, .pg_get_indexdef, .pg_get_constraintdef, .pg_get_triggerdef, .pg_get_viewdef, .pg_get_statisticsobjdef_columns, .pg_relation_is_publishable, .pg_get_partkeydef => return catalogValue(ctx, n),

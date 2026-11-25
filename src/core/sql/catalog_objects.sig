@@ -74,12 +74,18 @@ pub const class_fdw: u32 = 2328;
 pub const class_server: u32 = 1417;
 pub const class_publication: u32 = 6104;
 pub const class_policy: u32 = 3256;
+pub const class_large_object: u32 = 2613;
+pub const large_object_privileges = priv_select | priv_update;
+/// The owner has implicit SELECT and UPDATE until an ACL is materialized.
+pub const large_object_explicit_acl: u32 = 1 << 31;
+/// Stored in grant_flags for an automatically generated large-object OID.
+pub const large_object_generated_oid: u32 = 1;
 
 /// The plpgsql row of pg_extension (installed in every PostgreSQL
 /// database). PostgreSQL assigns its OID at initdb; ZPM fixes it.
 pub const plpgsql_extension_oid: u32 = 13001;
 
-pub const Kind = enum(u8) { role = 1, member = 2, acl = 3, relation = 4, policy = 5, comment = 6, fdw = 7, server = 8, publication = 9, domain = 10, enum_type = 11, composite_type = 12, statistics = 13, publication_table = 14, publication_schema = 15, schema_acl = 16, schema_acl_state = 17, schema_owner = 18, role_settings = 19, _ };
+pub const Kind = enum(u8) { role = 1, member = 2, acl = 3, relation = 4, policy = 5, comment = 6, fdw = 7, server = 8, publication = 9, domain = 10, enum_type = 11, composite_type = 12, statistics = 13, publication_table = 14, publication_schema = 15, schema_acl = 16, schema_acl_state = 17, schema_owner = 18, role_settings = 19, large_object = 20, large_object_acl = 21, _ };
 
 pub fn publicationMembership(kind: Kind) bool {
     return kind == .publication_table or kind == .publication_schema;
@@ -319,6 +325,8 @@ pub const Grant = struct {
     privileges: u32 = 0,
     tables: [list_capacity]Qualified = @splat(.{}),
     table_count: usize = 0,
+    large_objects: [list_capacity]u32 = @splat(0),
+    large_object_count: usize = 0,
     granted: [list_capacity]Ident = @splat(.{}),
     granted_count: usize = 0,
     grantees: [list_capacity]Grantee = @splat(.{}),
@@ -357,8 +365,9 @@ pub const TableSecurity = struct {
     owner: Grantee = .{},
 };
 
-pub const CommentTarget = enum { table, view, materialized_view, sequence, index, foreign_table, column, schema, role, policy, fdw, server, publication, extension };
+pub const CommentTarget = enum { table, view, materialized_view, sequence, index, foreign_table, column, schema, role, policy, fdw, server, publication, extension, large_object };
 pub const Comment = struct {
+    large_object: u32 = 0,
     target: CommentTarget = .table,
     object: Qualified = .{},
     column: Ident = .{},
@@ -421,6 +430,7 @@ pub const Statement = union(enum) {
     drop_policy: Policy,
     table_security: TableSecurity,
     alter_schema_owner: struct { name: Ident, owner: Grantee },
+    alter_large_object_owner: struct { oid: u32, owner: Grantee },
     comment: Comment,
     create_fdw: Named,
     drop_fdw: Drop,
@@ -488,6 +498,16 @@ pub fn parseWithDialect(source: []const u8, comptime name_bytes: usize, comptime
         return null;
     }
     if (try p.take("alter")) {
+        if (dialect == .postgres and try p.take("large")) {
+            try p.expect("object");
+            const oid = try p.objectId();
+            try p.expect("owner");
+            try p.expect("to");
+            const owner = try p.grantee();
+            if (owner.kind == .public) return error.Syntax;
+            try p.finish();
+            return .{ .alter_large_object_owner = .{ .oid = oid, .owner = owner } };
+        }
         if (dialect == .postgres and try p.take("schema")) {
             const name = try p.ident();
             if (!try p.take("owner")) return error.UnsupportedStatement;
@@ -522,9 +542,9 @@ pub fn parseWithDialect(source: []const u8, comptime name_bytes: usize, comptime
         if (p.word("extension") or p.word("subscription")) return error.UnsupportedStatement;
         return null;
     }
-    if (try p.take("grant")) return .{ .grant = try p.grant(false) };
-    if (try p.take("revoke")) return .{ .revoke = try p.grant(true) };
-    if (try p.take("comment")) return .{ .comment = try p.comment() };
+    if (try p.take("grant")) return .{ .grant = try p.grant(false, dialect == .postgres) };
+    if (try p.take("revoke")) return .{ .revoke = try p.grant(true, dialect == .postgres) };
+    if (try p.take("comment")) return .{ .comment = try p.comment(dialect == .postgres) };
     return null;
 }
 
@@ -1056,7 +1076,15 @@ const Parser = struct {
         return null;
     }
 
-    fn grant(self: *Parser, revoke: bool) Error!Grant {
+    fn objectId(self: *Parser) Error!u32 {
+        if (self.current.kind != .integer) return error.Syntax;
+        if (self.current.integer > 0xffff_ffff) return error.NumericValueOutOfRange;
+        const oid: u32 = @intCast(self.current.integer);
+        try self.advance();
+        return oid;
+    }
+
+    fn grant(self: *Parser, revoke: bool, postgres: bool) Error!Grant {
         var out: Grant = .{};
         if (revoke) {
             if (self.word("grant") or self.word("admin")) {
@@ -1098,23 +1126,36 @@ const Parser = struct {
         }
         if (try self.take("on")) {
             out.schema = try self.take("schema");
-            // Privileges on other object kinds are outside the subset.
-            if (!out.schema and (self.word("sequence") or self.word("database") or self.word("function") or self.word("procedure") or
+            const large_object = !out.schema and postgres and try self.take("large");
+            if (large_object) try self.expect("object");
+            if (!out.schema and !large_object and (self.word("sequence") or self.word("database") or self.word("function") or self.word("procedure") or
                 self.word("routine") or self.word("language") or self.word("type") or self.word("domain") or self.word("foreign") or
                 self.word("large") or self.word("tablespace") or self.word("parameter") or self.word("all"))) return error.UnsupportedStatement;
             if (!only_privileges and !all) return error.Syntax;
-            if (out.schema) {
+            if (large_object) {
+                if (out.membership) return error.Syntax;
+                if (privileges & ~large_object_privileges != 0) return error.InvalidGrantOperation;
+                out.privileges = if (all) large_object_privileges else privileges;
+                while (true) {
+                    if (out.large_object_count == list_capacity) return error.ProgramLimitExceeded;
+                    out.large_objects[out.large_object_count] = try self.objectId();
+                    out.large_object_count += 1;
+                    if (!try self.takeSymbol(.comma)) break;
+                }
+            } else if (out.schema) {
                 if (all or privileges != priv_schema_usage) return error.UnsupportedStatement;
             } else {
                 if (privileges & ~table_privileges != 0) return error.UnsupportedStatement;
                 _ = try self.take("table");
             }
-            out.privileges = if (all) table_privileges else privileges;
-            while (true) {
-                if (out.table_count == list_capacity) return error.ProgramLimitExceeded;
-                out.tables[out.table_count] = try self.qualified();
-                out.table_count += 1;
-                if (!try self.takeSymbol(.comma)) break;
+            if (!large_object) {
+                out.privileges = if (all) table_privileges else privileges;
+                while (true) {
+                    if (out.table_count == list_capacity) return error.ProgramLimitExceeded;
+                    out.tables[out.table_count] = try self.qualified();
+                    out.table_count += 1;
+                    if (!try self.takeSymbol(.comma)) break;
+                }
             }
             out.granted_count = 0;
         } else {
@@ -1158,10 +1199,14 @@ const Parser = struct {
         return out;
     }
 
-    fn comment(self: *Parser) Error!Comment {
+    fn comment(self: *Parser, postgres: bool) Error!Comment {
         try self.expect("on");
         var out: Comment = .{};
-        if (try self.take("table")) {
+        if (postgres and try self.take("large")) {
+            try self.expect("object");
+            out.target = .large_object;
+            out.large_object = try self.objectId();
+        } else if (try self.take("table")) {
             out.target = .table;
             out.object = try self.qualified();
         } else if (try self.take("view")) {
@@ -1529,8 +1574,8 @@ pub fn Objects(comptime config: types.Config) type {
                 .role, .policy, .fdw, .server, .publication, .statistics => a.oid == b.oid,
                 .publication_table, .publication_schema => a.oid == b.oid and a.target == b.target and a.grantee == b.grantee,
                 .domain, .enum_type, .composite_type => a.oid == b.oid and a.target == b.target,
-                .member, .acl, .schema_acl => a.target == b.target and a.grantee == b.grantee,
-                .relation, .schema_acl_state, .schema_owner, .role_settings => a.target == b.target,
+                .member, .acl, .schema_acl, .large_object_acl => a.target == b.target and a.grantee == b.grantee,
+                .relation, .schema_acl_state, .schema_owner, .role_settings, .large_object => a.target == b.target,
                 .comment => a.grantee == b.grantee and a.target == b.target and a.sub == b.sub,
                 _ => false,
             };
@@ -1582,7 +1627,7 @@ pub fn Objects(comptime config: types.Config) type {
 
         /// The live transaction (other than the snapshot's) holding an
         /// uncommitted version of `o`, if any.
-        fn pendingOf(o: *const Object, snap: storage.Snapshot) ?u16 {
+        pub fn pendingOf(o: *const Object, snap: storage.Snapshot) ?u16 {
             if (!o.used) return null;
             if (o.xmin_csn == 0 and !snap.own(o.xmin)) return o.xmin.slot;
             if (o.xmax.epoch != 0 and o.xmax_csn == 0 and !snap.own(o.xmax)) return o.xmax.slot;
@@ -1605,7 +1650,10 @@ pub fn Objects(comptime config: types.Config) type {
         pub fn pendingReference(self: *const Self, oid: u32, snap: storage.Snapshot) ?u16 {
             for (&self.items) |*o| {
                 const other = pendingOf(o, snap) orelse continue;
-                if (o.oid == oid or o.target == oid or o.grantee == oid or o.owner == oid) return other;
+                const large_object = o.kind == .large_object or o.kind == .large_object_acl or
+                    (o.kind == .comment and o.grantee == class_large_object);
+                if (o.owner == oid or (!large_object and (o.oid == oid or o.target == oid or o.grantee == oid)) or
+                    (o.kind == .large_object_acl and o.grantee == oid)) return other;
                 for (o.roleList()) |role| if (role == oid) return other;
             }
             return null;
@@ -1922,7 +1970,7 @@ pub fn Objects(comptime config: types.Config) type {
 
         fn decodeKind(cursor: Cursor) Error!Kind {
             const raw = try cursor.int(u8);
-            if (raw < 1 or raw > @intFromEnum(Kind.role_settings)) return error.InvalidChangeRecord;
+            if (raw < 1 or raw > @intFromEnum(Kind.large_object_acl)) return error.InvalidChangeRecord;
             return @enumFromInt(raw);
         }
 
@@ -1946,11 +1994,11 @@ pub fn Objects(comptime config: types.Config) type {
                 .statistics => o.oid != 0 and o.target != 0 and o.grantee != 0 and o.sub >= -1 and o.sub <= 10000,
                 .publication_table, .publication_schema => o.oid != 0 and o.target != 0 and o.grantee != 0 and o.sub == 0,
                 .member => o.oid != 0 and o.target != 0 and o.grantee != 0 and o.sub == 0,
-                .acl, .schema_acl => o.oid == 0 and o.target != 0 and o.sub == 0,
-                .relation, .schema_acl_state, .schema_owner, .role_settings => o.oid == 0 and o.target != 0 and o.grantee == 0 and o.sub == 0,
+                .acl, .schema_acl, .large_object_acl => o.oid == 0 and o.target != 0 and o.sub == 0,
+                .relation, .schema_acl_state, .schema_owner, .role_settings, .large_object => o.oid == 0 and o.target != 0 and o.grantee == 0 and o.sub == 0,
                 .comment => o.oid == 0 and o.target != 0 and o.sub >= 0 and switch (o.grantee) {
                     class_relation => true,
-                    class_namespace, class_authid, class_fdw, class_server, class_publication, class_policy => o.sub == 0,
+                    class_namespace, class_authid, class_fdw, class_server, class_publication, class_policy, class_large_object => o.sub == 0,
                     else => false,
                 },
                 _ => false,
@@ -1995,6 +2043,11 @@ pub fn Objects(comptime config: types.Config) type {
                     (o.flags == 0 or (o.flags & member_configured != 0 and o.flags & ~(member_configured | member_inherit | member_set) == 0)) and
                     o.grant_flags <= member_admin and o.role_count == 0 and o.text_len == 0 and o.target != o.grantee,
                 .acl => !has_name and o.flags != 0 and o.flags & ~table_privileges == 0 and o.grant_flags & ~o.flags == 0 and o.role_count == 0 and o.text_len == 0 and o.owner != 0,
+                .large_object => !has_name and o.owner != 0 and o.role_count == 0 and o.text_len == 0 and
+                    (o.grant_flags == 0 or (o.grant_flags == large_object_generated_oid and o.target >= first_oid and o.target < 0xffff_ffff)) and
+                    (o.flags == 0 or (o.flags & large_object_explicit_acl != 0 and o.flags & ~(large_object_explicit_acl | large_object_privileges) == 0)),
+                .large_object_acl => !has_name and o.owner != 0 and o.role_count == 0 and o.text_len == 0 and o.grant_flags == 0 and
+                    o.flags != 0 and o.flags & ~large_object_privileges == 0 and o.owner != o.grantee,
                 .schema_acl => !has_name and o.owner != 0 and o.grant_flags == 0 and o.role_count == 0 and o.text_len == 0 and
                     (o.flags == priv_schema_usage or (o.flags == 0 and o.grantee == o.owner)),
                 .schema_acl_state, .schema_owner => !has_name and o.owner != 0 and o.flags == 0 and o.grant_flags == 0 and o.role_count == 0 and o.text_len == 0,
@@ -2111,6 +2164,7 @@ pub fn Objects(comptime config: types.Config) type {
             sub: i32 = 0,
             owner: u32 = 0,
             publication_all_tables: bool = false,
+            large_object_explicit_acl: bool = false,
             roles: [role_capacity]u32 = @splat(0),
             role_count: u8 = 0,
             name: V.Name = .{},
@@ -2126,6 +2180,7 @@ pub fn Objects(comptime config: types.Config) type {
                 var out: VObject = .{ .used = o.used, .live = live, .kind = o.kind, .oid = o.oid, .target = o.target, .grantee = o.grantee, .sub = o.sub, .owner = o.owner, .roles = o.roles, .role_count = o.role_count, .name = o.name };
                 out.oid_width = o.oidWidth();
                 out.publication_all_tables = o.kind == .publication and o.flags & pub_all_tables != 0;
+                out.large_object_explicit_acl = o.kind == .large_object and o.flags & large_object_explicit_acl != 0;
                 if (o.kind == .statistics) out.last_statistics_column = o.text[o.text_len - 1];
                 if (userType(o.kind)) {
                     const name = o.arrayName();
@@ -2207,6 +2262,7 @@ pub fn Objects(comptime config: types.Config) type {
                     // A decoded version is not yet an entry: mark it taken.
                     v.used = true;
                     if (width != 0) ctx.noteObjectOid(o.oid + width - 1);
+                    if (o.kind == .large_object and o.grant_flags == large_object_generated_oid) ctx.noteObjectOid(o.target);
                     return;
                 };
                 return error.ChangeRecordConflict;
@@ -2259,6 +2315,16 @@ pub fn Objects(comptime config: types.Config) type {
                             if (!self.roleExists(grantee)) return error.ChangeRecordConflict;
                         }
                     },
+                    .large_object_acl => {
+                        var object_owner: ?u32 = null;
+                        for (&self.items) |*entry| {
+                            if (entry.live and entry.kind == .large_object and entry.target == target and entry.large_object_explicit_acl) {
+                                object_owner = entry.owner;
+                                break;
+                            }
+                        }
+                        if (object_owner != v.owner or (grantee != public_role and !self.roleExists(grantee))) return error.ChangeRecordConflict;
+                    },
                     .schema_acl => {
                         const original = ctx.objectPrivateSchemaOwner(target) orelse return error.ChangeRecordConflict;
                         if (self.schemaOwner(target, original) != v.owner) return error.ChangeRecordConflict;
@@ -2295,6 +2361,12 @@ pub fn Objects(comptime config: types.Config) type {
                             class_server => self.liveOid(.server, target),
                             class_publication => self.liveOid(.publication, target),
                             class_policy => self.liveOid(.policy, target),
+                            class_large_object => blk: {
+                                for (&self.items) |*entry| {
+                                    if (entry.live and entry.kind == .large_object and entry.target == target) break :blk true;
+                                }
+                                break :blk false;
+                            },
                             else => false,
                         };
                         if (!exists) return error.ChangeRecordConflict;

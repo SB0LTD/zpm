@@ -1595,7 +1595,92 @@ fn namespaceOwnerTransfer() !void {
     try same(try query(&replica, ownership), "");
 }
 
+fn largeObjectMetadata() !void {
+    try reset();
+    try run("CREATE ROLE blobowner");
+    try run("CREATE ROLE blobreader");
+    const owner = try roleOid("blobowner");
+    const reader = try roleOid("blobreader");
+    const snapshot = "SELECT oid,pg_get_userbyid(lomowner),lomacl::text,obj_description(oid,'pg_largeobject') FROM pg_largeobject_metadata ORDER BY oid";
+    try metadata("SELECT pg_catalog.lo_create(NULL),lo_creat(NULL),lo_unlink(NULL)", &.{"lo_create","lo_creat","lo_unlink"}, &.{26,26,23});
+    try expect("SELECT pg_catalog.lo_create(NULL),lo_creat(NULL),lo_unlink(NULL)", "NULL|NULL|NULL");
+    try expect("SELECT oid,provolatile FROM pg_proc WHERE proname='lo_create'", "715|v");
+    try expect("SELECT oid,provolatile FROM pg_proc WHERE proname='lo_creat'", "957|v");
+    try expect("SELECT oid,provolatile FROM pg_proc WHERE proname='lo_unlink'", "964|v");
+    try same(try renderResult(DB, &(try replicate("SELECT pg_catalog.lo_create('55000')"))), "55000");
+    try expect(snapshot, "55000|ramsql|NULL|NULL");
+    try fails("SELECT lo_create(55000)", error.DuplicateObject);
+    try fails("SELECT lo_unlink(55001)", error.UndefinedObject);
+    try fails("SELECT lo_create(55001),lo_create(55001)", error.DuplicateObject);
+    try expect("SELECT COUNT(*) FROM pg_largeobject_metadata WHERE oid=55001", "0");
+
+    try run("GRANT SELECT ON LARGE OBJECT 55000 TO blobreader");
+    try run("GRANT UPDATE ON LARGE OBJECT 55000 TO blobowner");
+    try run("COMMENT ON LARGE OBJECT 55000 IS 'stored comment'");
+    try run("ALTER LARGE OBJECT 55000 OWNER TO blobowner");
+    try expect(snapshot, "55000|blobowner|{blobowner=rw/blobowner,blobreader=r/blobowner}|stored comment");
+    try same(try query(&replica, snapshot), "55000|blobowner|{blobowner=rw/blobowner,blobreader=r/blobowner}|stored comment");
+    try same(try query(&replica, "SELECT oid,lomacl,acldefault('L',lomowner) FROM pg_largeobject_metadata ORDER BY lomowner,lomacl::text,oid"),
+        "55000|{blobowner=rw/blobowner,blobreader=r/blobowner}|{blobowner=rw/blobowner}");
+    try fails("DROP ROLE blobowner", error.DependentObjects);
+    try fails("DROP ROLE blobreader", error.DependentObjects);
+    forceRole(reader);
+    try fails("SELECT lo_unlink(55000)", error.InsufficientPrivilege);
+    try fails("COMMENT ON LARGE OBJECT 55000 IS 'denied'", error.InsufficientPrivilege);
+    try run("GRANT UPDATE ON LARGE OBJECT 55000 TO blobreader");
+    try expect(snapshot, "55000|blobowner|{blobowner=rw/blobowner,blobreader=r/blobowner}|stored comment");
+    forceRole(owner);
+    try fails("ALTER LARGE OBJECT 55000 OWNER TO blobreader", error.InsufficientPrivilege);
+    forceRole(0);
+
+    const slot = try db.begin();
+    try db.savepoint(slot, "blob");
+    try statement(slot, "SELECT lo_create(55001)");
+    try statement(slot, "REVOKE SELECT ON LARGE OBJECT 55000 FROM blobreader");
+    try same(try rows(slot, "SELECT COUNT(*) FROM pg_largeobject_metadata"), "2");
+    _ = try db.rollbackTo(slot, "blob");
+    try same(try rows(slot, snapshot), "55000|blobowner|{blobowner=rw/blobowner,blobreader=r/blobowner}|stored comment");
+    db.abort(slot);
+
+    const read_only = try db.begin();
+    try db.beginModes(read_only, .{ .read_only = true });
+    try statementFails(read_only, "SELECT lo_create(55001)", error.ReadOnlyTransaction);
+    db.abort(read_only);
+
+    const first = try db.begin();
+    const second = try db.begin();
+    try statement(first, "SELECT lo_create(55002)");
+    try parks(second, "SELECT lo_create(55002)");
+    db.abort(first);
+    try resumed(second, "SELECT lo_create(55002)");
+    try same(try rows(second, "SELECT COUNT(*) FROM pg_largeobject_metadata WHERE oid=55002"), "1");
+    db.abort(second);
+    try expect("SELECT COUNT(*) FROM pg_largeobject_metadata WHERE oid=55002", "0");
+
+    const before_auto = replica.oid_counter;
+    try run("SELECT lo_unlink(lo_creat(-1))");
+    try check(replica.oid_counter == db.oid_counter and replica.oid_counter > before_auto);
+
+    try run("SELECT lo_create(CAST('tdd_b'::regclass AS oid))");
+    try run("COMMENT ON LARGE OBJECT 55000 IS NULL");
+    try run("DROP TABLE tdd_b");
+    try expect("SELECT COUNT(*) FROM pg_largeobject_metadata", "2");
+    try same(try query(&replica, "SELECT COUNT(*) FROM pg_largeobject_metadata"), "2");
+
+    var buffer: [128]u8 = undefined;
+    try replayFails(objectRecord(&buffer, 71, 20, 1, 55000, 0, 0, ""), error.InvalidChangeRecord);
+    try replayFails(objectRecord(&buffer, 71, 20, 0, 55000, 0, 0, ""), error.ChangeRecordConflict);
+    try same(try query(&replica, "SELECT COUNT(*) FROM pg_largeobject_metadata"), "2");
+
+    try run("REVOKE ALL PRIVILEGES ON LARGE OBJECT 55000 FROM blobreader,blobowner");
+    try expect("SELECT lomacl FROM pg_largeobject_metadata WHERE oid=55000", "{}");
+    try run("SELECT lo_unlink(55000)");
+    try run("DROP ROLE blobowner,blobreader");
+    try same(try query(&replica, "SELECT COUNT(*) FROM pg_largeobject_metadata WHERE oid=55000"), "0");
+}
+
 pub fn main() !void {
+    try largeObjectMetadata();
     try namespaceAclProjection();
     try namespaceOwnerTransfer();
     try oraclePrograms();

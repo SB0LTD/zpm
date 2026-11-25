@@ -1316,6 +1316,9 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "currval", .func = .currval },
                 .{ .name = "setval", .func = .setval },
                 .{ .name = "lastval", .func = .lastval },
+                .{ .name = "lo_create", .func = .lo_create },
+                .{ .name = "lo_creat", .func = .lo_creat },
+                .{ .name = "lo_unlink", .func = .lo_unlink },
                 .{ .name = "current_database", .func = .current_database },
                 .{ .name = "current_schemas", .func = .current_schemas },
                 .{ .name = "pg_encoding_to_char", .func = .pg_encoding_to_char },
@@ -2234,6 +2237,11 @@ pub fn Binder(comptime config: types.Config) type {
                     if (context.node(n.b).ty != .jsonb) return error.UndefinedFunction;
                     n.ty = if (n.func == .jsonb_typeof) .text else .int4;
                     n.constant = isConstant(context, n.b);
+                },
+                .lo_create, .lo_creat, .lo_unlink => {
+                    if (context.dialect != .postgres) return error.UndefinedFunction;
+                    try bindSignature(context, n, &.{if (n.func == .lo_creat) .int4 else .oid}, if (n.func == .lo_unlink) .int4 else .oid, false);
+                    n.constant = false;
                 },
                 // Sequence functions (regclass arguments as text; volatile).
                 .nextval, .currval, .setval, .lastval => {
@@ -8324,7 +8332,7 @@ pub fn Binder(comptime config: types.Config) type {
             switch (n.kind) {
                 .scalar_subquery, .exists_subquery, .in_subquery => return true,
                 .function => switch (n.func) {
-                    .nextval, .setval, .currval, .lastval, .identity_next, .clock_timestamp => return true,
+                    .nextval, .setval, .currval, .lastval, .identity_next, .clock_timestamp, .lo_create, .lo_creat, .lo_unlink => return true,
                     else => {},
                 },
                 else => {},

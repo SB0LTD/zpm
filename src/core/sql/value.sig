@@ -105,6 +105,7 @@ pub const SequenceCall = enum { nextval, currval, setval, lastval, identity, reg
 /// column in `value`; regclass resolves a relation name to its OID (-1 when
 /// missing unless `called`, which raises 42P01).
 pub const SequenceHook = struct {
+    large_object: ?*const fn (ptr: *anyopaque, create: bool, oid: u32) Error!u32 = null,
     ptr: *anyopaque,
     call: *const fn (ptr: *anyopaque, kind: SequenceCall, name: []const u8, oid: u32, value: i64, called: bool) Error!i64,
     /// regclass output: the relation named by `oid`, if any.
