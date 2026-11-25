@@ -247,6 +247,22 @@ pub fn Types(comptime Result: type) type {
 
         /// A parameter value as a typed SQL literal.
         pub fn literal(bytes: []const u8, type_oid: u32, format: u16, out: []u8) Error!usize {
+            if (type_oid == 17 and format == 1) {
+                const prefix = &.{ 'E', '\'', '\\', '\\', 'x' };
+                const suffix = "'::bytea";
+                if (out.len < prefix.len + suffix.len or bytes.len > (out.len - prefix.len - suffix.len) / 2)
+                    return error.BufferTooSmall;
+                var at: usize = 0;
+                try put(out, &at, prefix);
+                const hex = "0123456789abcdef";
+                for (bytes) |byte| {
+                    out[at] = hex[byte >> 4];
+                    out[at + 1] = hex[byte & 15];
+                    at += 2;
+                }
+                try put(out, &at, suffix);
+                return at;
+            }
             const name = castName(type_oid) orelse return error.UnsupportedBinaryType;
             var at: usize = 0;
             if (format == 0) {

@@ -2052,6 +2052,26 @@ pub fn Store(comptime Raw: type) type {
                 };
             }
 
+            /// A FunctionCall or a simple SELECT carrying large-object bytes.
+            /// It uses the same storage readiness and durable commit boundary
+            /// as SQL and owns a slot only for the duration of an implicit call.
+            pub fn largeObject(self: *Connection, request: Raw.LargeObjectRequest, output: []u8, extended: bool) !Raw.LargeObjectResponse {
+                if (self.id == 0) return error.InvalidConnection;
+                if (self.failed or self.pending.active) return error.TransactionFailed;
+                if (self.dialect != .postgres or self.read_context != null) return error.UnsupportedStatement;
+                if (extended) try self.beginExtendedGroup();
+                const implicit = !self.in_transaction;
+                if (implicit) try self.beginTransaction();
+                errdefer if (implicit) self.rollbackTransaction() catch unreachable;
+                try self.checkTransactionTimeout();
+                const ready = if (self.store.storageReady()) |_| true else |_| false;
+                const response = self.db().largeObjectStatement(self.tx.?, request, output, ready) catch |err| {
+                    return if (err == error.ReadOnlyTransaction and !ready) error.StorageUnavailable else err;
+                };
+                if (implicit) try self.commitTransaction();
+                return response;
+            }
+
             pub fn executeExtended(self: *Connection, source: []const u8, result: *Result) !void {
                 return self.executeMode(source, result, true);
             }

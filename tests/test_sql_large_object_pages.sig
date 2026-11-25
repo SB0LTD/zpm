@@ -234,6 +234,30 @@ fn rejectsReplay(db: *DB, wal: []const u8, wanted: anyerror) !void {
     try expect(db.csn == before);
 }
 
+fn descriptorContract() !void {
+    const command = @import("sql").large_object_command;
+    const slot = try primary.begin();
+    const reader = (try primary.largeObjectStatement(slot, .{ .open = .{ .oid = 55000, .mode = command.inv_read } }, &.{}, true)).int4;
+    try primary.savepoint(slot, "inner");
+    const removed = (try primary.largeObjectStatement(slot, .{ .open = .{ .oid = 55000, .mode = command.inv_read } }, &.{}, true)).int4;
+    _ = try primary.rollbackTo(slot, "inner");
+    if (primary.largeObjectStatement(slot, .{ .close = removed }, &.{}, true)) |_| return error.RolledBackDescriptorOpen else |err| try expect(err == error.InvalidParameterValue);
+    const writer = (try primary.largeObjectStatement(slot, .{ .open = .{ .oid = 55000, .mode = command.inv_write } }, &.{}, true)).int4;
+    _ = try primary.largeObjectStatement(slot, .{ .seek = .{ .fd = writer, .offset = 6, .whence = 0, .wide = true } }, &.{}, true);
+    const request = (try command.parseSql("SELECT pg_catalog.lowrite(1,'\\x00FF')")).?.request.?;
+    try expect((try primary.largeObjectStatement(slot, request, &.{}, true)).int4 == 2);
+    _ = try primary.largeObjectStatement(slot, .{ .seek = .{ .fd = writer, .offset = 0, .whence = 0, .wide = false } }, &.{}, true);
+    var bytes: [16]u8 = undefined;
+    const written = (try primary.largeObjectStatement(slot, .{ .read = .{ .fd = writer, .count = 16 } }, &bytes, true)).bytes;
+    try expect(std.mem.eql(u8, bytes[0..written], "abc\x00\x00\x00\x00\xff"));
+    const original = (try primary.largeObjectStatement(slot, .{ .read = .{ .fd = reader, .count = 16 } }, &bytes, true)).bytes;
+    try expect(std.mem.eql(u8, bytes[0..original], "abc"));
+    primary.abort(slot);
+    const next = try primary.begin();
+    if (primary.largeObjectStatement(next, .{ .close = reader }, &.{}, true)) |_| return error.CommittedDescriptorOpen else |err| try expect(err == error.InvalidParameterValue);
+    primary.abort(next);
+}
+
 fn sqlPageRecovery() !void {
     try primary_arena.bind(&primary);
     try replica_arena.bind(&replica);
@@ -241,6 +265,7 @@ fn sqlPageRecovery() !void {
     var wal: [4096]u8 = undefined;
     const creation = try executeWAL(&primary, "SELECT lo_from_bytea(55000,'abc'::bytea)", &wal);
     try queryBytes(&primary, "SELECT lo_get(55000)", "abc");
+    try descriptorContract();
     try queryBytes(&primary, "SELECT lo_get(55000,1,3)", "bc");
     try queryBytes(&primary, "SELECT lo_get(55000,100,10)", "");
     const op = creation.len - 14;

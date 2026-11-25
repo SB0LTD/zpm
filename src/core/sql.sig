@@ -133,6 +133,7 @@ pub const Config = types.Config;
 pub const HashLoad = storage.HashLoad;
 /// Caller-backed MVCC storage for PostgreSQL large-object payload pages.
 pub const large_object_pages = @import("sql/large_object_pages.sig");
+pub const large_object_command = @import("sql/large_object_command.sig");
 /// Per-statement session values (TimeZone, zone resolver, clocks).
 pub const Session = value_module.Session;
 pub const bootstrap_role_name = CO.bootstrap_name;
@@ -277,6 +278,8 @@ pub fn Database(comptime config: Config) type {
         pub const RowRef = S.RowRef;
         pub const StorageStats = S.Stats;
         pub const StorageBacking = S.Backing;
+        pub const LargeObjectRequest = large_object_command.Request;
+        pub const LargeObjectResponse = large_object_command.Response;
         pub const StorageRowSlot = S.RowSlot;
         pub const StorageVersion = S.Version;
         pub const StorageVersionRow = S.VersionRow;
@@ -2833,6 +2836,7 @@ pub fn Database(comptime config: Config) type {
         fn free(self: *Self, slot: u16) void {
             const tx = &self.txs[slot];
             tx.active = false;
+            if (tx.large_objects.used) tx.large_objects = .{};
             tx.running_snap = null;
             tx.sub_len = 0;
             tx.pin = null;
@@ -2858,6 +2862,7 @@ pub fn Database(comptime config: Config) type {
                 lock_start = tx.subs[tx.sub_len - 1].lock_start;
             }
             M.abortSlice(self, slot, start, lock_start);
+            if (tx.large_objects.used) tx.large_objects.discard(tx.userSavepoints(), null);
             self.sessionRollback(slot, tx.userSavepoints(), true);
             self.wake_epoch +%= 1;
         }
@@ -2876,6 +2881,7 @@ pub fn Database(comptime config: Config) type {
             if (tx.sub_len != 0 and tx.subs[tx.sub_len - 1].statement) {
                 const sub = tx.subs[tx.sub_len - 1];
                 M.abortSlice(self, slot, sub.write_start, sub.lock_start);
+                if (tx.large_objects.used) tx.large_objects.discard(0, tx.cid);
                 tx.sub_len -= 1;
                 // The failed statement's NOTIFY entries and set_config calls.
                 self.notify.discard(slot, tx.epoch, 0, tx.cid);
@@ -2952,6 +2958,7 @@ pub fn Database(comptime config: Config) type {
         pub fn release(self: *Self, slot: u16, name: []const u8) Error!usize {
             const index = try self.findSavepoint(slot, name);
             self.txs[slot].sub_len = index;
+            if (self.txs[slot].large_objects.used) self.txs[slot].large_objects.release(index);
             if (self.ownSession(slot)) |state| state.release(index);
             return index;
         }
@@ -2963,6 +2970,7 @@ pub fn Database(comptime config: Config) type {
             const sub = tx.subs[index];
             M.abortSlice(self, slot, sub.write_start, sub.lock_start);
             tx.sub_len = index + 1;
+            if (tx.large_objects.used) tx.large_objects.discard(index + 1, null);
             self.sessionRollback(slot, index + 1, false);
             if (self.ownSession(slot)) |state| state.rollbackTo(index);
             self.wake_epoch +%= 1;
@@ -2996,6 +3004,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn parsePostgresEnvelope(self: *Self, source: []const u8) Error!void {
+            if (try large_object_command.parseSql(source) != null) return;
             const options: parser_module.Options = .{ .dialect = .postgres };
             if (try P.parseDatabaseCommand(source, options)) |_| return;
             if (R.classify(source) != null) {
@@ -3611,6 +3620,7 @@ pub fn Database(comptime config: Config) type {
             var out = self.csn;
             for (&self.txs) |*tx| if (tx.active) {
                 if (tx.running_snap) |snap| out = @min(out, snap.csn);
+                if (tx.large_objects.min_csn) |csn| out = @min(out, csn);
                 if (tx.copy_table != null) out = @min(out, tx.copy_snap.csn);
                 if (transactionSnapshot(tx.isolation)) if (tx.snapshot_csn) |csn| {
                     out = @min(out, csn);
@@ -3998,6 +4008,143 @@ pub fn Database(comptime config: Config) type {
             return self.privilegedRole(snap) or self.catalog_objects.memberOf(self.session.role, owner, true, snap);
         }
 
+        /// Common statement boundary for PostgreSQL function calls carrying
+        /// bytes outside an inline SQL cell. The protocol retains its input
+        /// until the call returns and provides the response buffer.
+        pub fn largeObjectStatement(self: *Self, slot: u16, request: large_object_command.Request, output: []u8, writes_allowed: bool) Error!large_object_command.Response {
+            if (!self.active(slot)) return error.NoActiveTransaction;
+            if (self.dialect != .postgres) return error.UnsupportedStatement;
+            const tx = &self.txs[slot];
+            if (tx.prepared or tx.pin != null or tx.copy_table != null) return error.ObjectNotInPrerequisiteState;
+            if (request.writes() and (tx.read_only or !writes_allowed)) return error.ReadOnlyTransaction;
+            if (tx.sub_len >= M.sub_capacity) return error.SavepointCapacity;
+            tx.cid = std.math.add(u32, tx.cid, 1) catch return error.ProgramLimitExceeded;
+            var snap: Snapshot = .{ .csn = self.csn, .slot = slot, .epoch = tx.epoch, .cid = tx.cid };
+            if (tx.snapshot_csn == null) {
+                tx.snapshot_csn = self.csn;
+                tx.snapshot_cid = tx.cid;
+            }
+            if (transactionSnapshot(tx.isolation)) snap.csn = tx.snapshot_csn.?;
+            tx.subs[tx.sub_len] = .{ .statement = true, .write_start = @intCast(tx.write_len), .lock_start = @intCast(tx.lock_len) };
+            tx.sub_len += 1;
+            tx.running_snap = snap;
+            defer tx.running_snap = null;
+            errdefer {
+                self.dropStatement(slot);
+                self.wake_epoch +%= 1;
+            }
+            self.statementHooks(slot, snap);
+            try self.session.checkpoint();
+            try self.serializableSnapshot(slot);
+            const result = self.largeObjectRequest(slot, request, output, snap) catch |err| {
+                if (err == error.WouldBlock) return error.LockNotAvailable;
+                return err;
+            };
+            tx.sub_len -= 1;
+            return result;
+        }
+
+        fn largeObjectAt(self: *const Self, oid: u32, snap: Snapshot) Error!*const O.Object {
+            const key: O.Object = .{ .kind = .large_object, .target = oid };
+            return &self.catalog_objects.items[self.catalog_objects.findKey(&key, snap) orelse return error.UndefinedObject];
+        }
+
+        fn readLargeObject(self: *const Self, oid: u32, length: u64, offset: u64, requested: ?usize, output: []u8, snap: Snapshot) Error!usize {
+            const remaining = length -| offset;
+            const count = if (requested) |limit| @min(remaining, limit) else remaining;
+            if (count > output.len) return error.TextCapacity;
+            if (count == 0) return 0;
+            const pages = if (self.large_pages) |*value| value else return error.UnsupportedStatement;
+            return pages.read(oid, length, offset, output[0..@intCast(count)], snap);
+        }
+
+        fn largeObjectRequest(self: *Self, slot: u16, request: large_object_command.Request, output: []u8, original_snap: Snapshot) Error!large_object_command.Response {
+            const tx = &self.txs[slot];
+            const visible = try largeObjectView(original_snap);
+            var current = visible;
+            current.csn = self.csn;
+            switch (request) {
+                .create => |oid| return .{ .oid = try largeObjectCall(self, true, oid) },
+                .unlink => |oid| return .{ .int4 = @intCast(try largeObjectCall(self, false, oid)) },
+                .open => |args| {
+                    const write = args.mode & large_object_command.inv_write != 0;
+                    if (args.mode & (large_object_command.inv_read | large_object_command.inv_write) == 0) return error.InvalidParameterValue;
+                    if (write and tx.read_only) return error.ReadOnlyTransaction;
+                    const snap = if (write) current else visible;
+                    const object = try self.largeObjectAt(args.oid, snap);
+                    const wanted = CO.priv_select | if (write) CO.priv_update else 0;
+                    if (self.largeObjectPrivileges(object, self.session.role, snap) & wanted != wanted) return error.InsufficientPrivilege;
+                    return .{ .int4 = try tx.large_objects.open(.{
+                        .oid = args.oid, .depth = tx.userSavepoints(),
+                        .opened_cid = original_snap.cid, .snapshot = if (write) null else snap,
+                    }) };
+                },
+                .close => |fd| {
+                    try tx.large_objects.close(fd);
+                    return .{ .int4 = 0 };
+                },
+                .read => |args| {
+                    const desc = try tx.large_objects.find(args.fd);
+                    if (args.count <= 0) return .{ .bytes = 0 };
+                    const snap = desc.snapshot orelse current;
+                    const object = try self.largeObjectAt(desc.oid, snap);
+                    const count = try self.readLargeObject(desc.oid, object.largeObjectLength(), desc.offset, @intCast(args.count), output, snap);
+                    desc.offset += count;
+                    return .{ .bytes = count };
+                },
+                .write => |args| {
+                    const desc = try tx.large_objects.find(args.fd);
+                    if (desc.snapshot != null) return error.ObjectNotInPrerequisiteState;
+                    const count = try args.bytes.length();
+                    if (count > 0x7fff_ffff) return error.ProgramLimitExceeded;
+                    var mutation_snap = original_snap;
+                    mutation_snap.csn = current.csn;
+                    try self.stageLargeObjectWrite(slot, desc.oid, desc.offset, args.bytes, count, mutation_snap, false);
+                    desc.offset += count;
+                    return .{ .int4 = @intCast(count) };
+                },
+                .seek => |args| {
+                    const desc = try tx.large_objects.find(args.fd);
+                    const origin: i64 = switch (args.whence) {
+                        0 => 0,
+                        1 => @intCast(desc.offset),
+                        2 => @intCast((try self.largeObjectAt(desc.oid, desc.snapshot orelse current)).largeObjectLength()),
+                        else => return error.InvalidParameterValue,
+                    };
+                    const next = std.math.add(i64, origin, args.offset) catch return error.InvalidParameterValue;
+                    if (next < 0 or next > large_object_pages.max_size) return error.InvalidParameterValue;
+                    if (!args.wide and next > 0x7fff_ffff) return error.NumericValueOutOfRange;
+                    desc.offset = @intCast(next);
+                    return if (args.wide) .{ .int8 = next } else .{ .int4 = @intCast(next) };
+                },
+                .tell => |args| {
+                    const offset = (try tx.large_objects.find(args.fd)).offset;
+                    if (!args.wide and offset > 0x7fff_ffff) return error.NumericValueOutOfRange;
+                    return if (args.wide) .{ .int8 = @intCast(offset) } else .{ .int4 = @intCast(offset) };
+                },
+                .from_bytes => |args| {
+                    const count = try args.bytes.length();
+                    const oid = try largeObjectCall(self, true, args.oid);
+                    try self.stageLargeObjectWrite(slot, oid, 0, args.bytes, count, original_snap, true);
+                    return .{ .oid = oid };
+                },
+                .get => |args| {
+                    if (args.offset < 0 or args.offset > large_object_pages.max_size) return error.InvalidParameterValue;
+                    if (args.count) |count| if (count < 0) return error.InvalidParameterValue;
+                    const object = try self.largeObjectAt(args.oid, visible);
+                    if (self.largeObjectPrivileges(object, self.session.role, visible) & CO.priv_select == 0) return error.InsufficientPrivilege;
+                    return .{ .bytes = try self.readLargeObject(args.oid, object.largeObjectLength(), @intCast(args.offset),
+                        if (args.count) |count| @intCast(count) else null, output, visible) };
+                },
+                .put => |args| {
+                    if (args.offset < 0) return error.InvalidParameterValue;
+                    const count = try args.bytes.length();
+                    try self.stageLargeObjectWrite(slot, args.oid, @intCast(args.offset), args.bytes, count, original_snap, true);
+                    return .empty;
+                },
+            }
+        }
+
         fn largeObjectView(original_snap: Snapshot) Error!Snapshot {
             var visible = original_snap;
             visible.cid = std.math.add(u32, visible.cid, 1) catch return error.ProgramLimitExceeded;
@@ -4019,17 +4166,17 @@ pub fn Database(comptime config: Config) type {
             };
         }
 
-        fn stageLargeObjectWrite(self: *Self, slot: u16, oid: u32, offset: u64, input: []const u8, original_snap: Snapshot) Error!void {
+        fn stageLargeObjectWrite(self: *Self, slot: u16, oid: u32, offset: u64, input: large_object_command.Input, input_len: usize, original_snap: Snapshot, check_privileges: bool) Error!void {
             if (self.txs[slot].read_only) return error.ReadOnlyTransaction;
-            if (offset > large_object_pages.max_size or input.len > large_object_pages.max_size - offset) return error.InvalidParameterValue;
+            if (offset > large_object_pages.max_size or input_len > large_object_pages.max_size - offset) return error.InvalidParameterValue;
             const snap = try largeObjectView(original_snap);
             const index = (try self.lockLargeObject(slot, oid, snap)) orelse return error.UndefinedObject;
             var object = self.catalog_objects.items[index];
-            if (self.largeObjectPrivileges(&object, self.session.role, snap) & CO.priv_update == 0) return error.InsufficientPrivilege;
-            if (input.len == 0) return;
+            if (check_privileges and self.largeObjectPrivileges(&object, self.session.role, snap) & CO.priv_update == 0) return error.InsufficientPrivilege;
+            if (input_len == 0) return;
             const pages = if (self.large_pages) |*value| value else return error.UnsupportedStatement;
             const size = large_object_pages.page_bytes;
-            const end = offset + input.len;
+            const end = offset + input_len;
             const previous = object.largeObjectLength();
             const already_locked = object.xmin_csn == 0 and snap.own(object.xmin);
             const replace_metadata = end > previous or !already_locked;
@@ -4043,11 +4190,12 @@ pub fn Database(comptime config: Config) type {
 
             const mutation = self.largePageMutation(slot, original_snap, snap);
             var used: usize = 0;
-            while (used < input.len) {
+            var decoded: [size]u8 = undefined;
+            while (used < input_len) {
                 const position = offset + used;
-                const chunk = @min(size - @as(usize, @intCast(position % size)), input.len - used);
+                const chunk = @min(size - @as(usize, @intCast(position % size)), input_len - used);
                 var change: [1]large_object_pages.Pages.Change = undefined;
-                _ = try pages.stageWrite(oid, position, input[used..][0..chunk], mutation, &change);
+                _ = try pages.stageWrite(oid, position, input.chunk(used, decoded[0..chunk]), mutation, &change);
                 self.addLargePageChange(slot, change[0]);
                 used += chunk;
             }
@@ -4059,7 +4207,7 @@ pub fn Database(comptime config: Config) type {
             const original_snap = self.seq_snap;
             if (operation == .create) {
                 const object = try largeObjectCall(ptr, true, oid);
-                try self.stageLargeObjectWrite(slot, object, 0, input, original_snap);
+                try self.stageLargeObjectWrite(slot, object, 0, .{ .raw = input }, input.len, original_snap, true);
                 return object;
             }
             if (offset < 0 or offset > large_object_pages.max_size) return error.InvalidParameterValue;
@@ -4134,6 +4282,7 @@ pub fn Database(comptime config: Config) type {
                 if (O.visible(entry, snap) and isLargeObjectChild(entry, oid)) self.objectDelete(slot, child, original_snap);
             }
             self.objectDelete(slot, index, original_snap);
+            if (self.txs[slot].large_objects.used) self.txs[slot].large_objects.unlink(oid);
             return 1;
         }
 

@@ -73,6 +73,7 @@ pub fn Mvcc(comptime config: types.Config) type {
         pub const Level = enum(u8) { read_committed, repeatable_read, serializable, read_uncommitted };
 
         pub const Tx = struct {
+            large_objects: @import("large_object_command.sig").Descriptors = .{},
             active: bool = false,
             prepared: bool = false,
             epoch: u32 = 0,
