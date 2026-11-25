@@ -47,6 +47,21 @@
 //! CPU reference's within 2 of 255. Nothing here has run on the Legion's
 //! RTX yet.
 //!
+//! **Turing** (the RTX 2080 Ti: Options.sm = .sm_75). The same passes on
+//! TURING_A (0xc597, clc597.h): 625 of its 655 methods are BLACKWELL_B's
+//! at the same address with the same fields (compared method by method
+//! with Mesa's headers), and the stream differs where NVK's does for the
+//! class: no SET_TEXTURE_HEADER_VERSION (Hopper's), no
+//! SET_VARIABLE_PIXEL_RATE_SHADING_TABLE_SELECT (Ampere B's), the shader
+//! cache control off (NVK: Ada's on), a program's address in two words (the
+//! prefetch word after it is Ampere B's; 0x201c is reserved on Turing).
+//! A texture's header is Maxwell's TEXHEAD_PITCH (clb097tex.h, as NIL
+//! fills it below Hopper), the samplers' words the same. The programs are
+//! the same texts with the three forms sm_75 has not: I2F for I2FP, SEL
+//! for FSEL (each here picks between registers: bits for bits), and TEX
+//! without .DXY (sm_100's derivative mode; one level, so the same texel).
+//! Proven on the emulated engine only (emu3d as TURING_A).
+//!
 //! Allocation-free: four device buffers (the programs, the pools, the
 //! records, the pushbuffer), sized at init.
 
@@ -181,6 +196,16 @@ pub const Deep = struct {
 /// The subchannel the 3D engine is bound to (NVK's; compute is on 1).
 pub const SUBCH: u32 = 0;
 pub const BLACKWELL_B: u32 = 0xce97;
+/// Turing's 3D class (clc597.h: the RTX 2080 Ti's).
+pub const TURING_A: u32 = 0xc597;
+
+/// A shader model (sm_120: Blackwell; sm_75: Turing).
+pub const Sm = push.Sm;
+
+/// The 3D class of shader model `sm`'s chips.
+pub fn classFor(sm: Sm) u32 {
+    return if (sm == .sm_75) TURING_A else BLACKWELL_B;
+}
 
 pub const SET_API_MANDATED_EARLY_Z: u32 = 0x0210;
 pub const SET_DRAW_CONTROL_A: u32 = 0x0260;
@@ -989,6 +1014,54 @@ const FS_GLASS = VARYINGS ++
 const PROGRAMS = 2 + KINDS;
 const SOURCES = [PROGRAMS][]const u8{ VS_FLAT, VS_VARY, FS_SOLID, FS_IMAGE, FS_MASK, FS_RRECT, FS_RING, FS_IMAGE_RR, FS_MASK_GRAD, FS_GLOW, FS_SHADOW, FS_BOX, FS_GLASS };
 
+/// What sm_75 has in place of the sm_120 forms the texts use (NAK's forms
+/// for Turing): I2F (I2FP is sm_89's), SEL (every FSEL here picks between
+/// registers, so the bits are the same), TEX with the automatic derivative
+/// mode (.DXY is sm_100's; the textures have one level).
+const TURING_SWAPS = [_][2][]const u8{
+    .{ "I2FP.F32.S32 ", "I2F " },
+    .{ "FSEL ", "SEL " },
+    .{ "TEX.B.DXY ", "TEX.B " },
+};
+
+/// A program's text for sm_75.
+fn turingText(comptime src: []const u8) []const u8 {
+    comptime {
+        @setEvalBranchQuota(200_000);
+        var out: []const u8 = "";
+        var i: usize = 0;
+        while (i < src.len) {
+            // the nearest swap ahead, and what comes before it as it is
+            var at: usize = src.len;
+            var which: usize = 0;
+            for (TURING_SWAPS, 0..) |s, k| {
+                if (std.mem.indexOfPos(u8, src, i, s[0])) |j| {
+                    if (j < at) {
+                        at = j;
+                        which = k;
+                    }
+                }
+            }
+            out = out ++ src[i..at];
+            if (at == src.len) break;
+            out = out ++ TURING_SWAPS[which][1];
+            i = at + TURING_SWAPS[which][0].len;
+        }
+        return out;
+    }
+}
+
+const SOURCES75 = blk: {
+    var s: [PROGRAMS][]const u8 = undefined;
+    for (SOURCES, 0..) |src, i| s[i] = turingText(src);
+    break :blk s;
+};
+
+/// Shader model `sm`'s texts of the programs.
+fn sourcesFor(sm: Sm) *const [PROGRAMS][]const u8 {
+    return if (sm == .sm_75) &SOURCES75 else &SOURCES;
+}
+
 /// Whether a kind's programs carry varyings (all but a solid rectangle's).
 fn varies(k: Kind) bool {
     return k != .solid;
@@ -1074,6 +1147,49 @@ pub fn headerWords(t: Texture) [8]u32 {
     };
 }
 
+/// Whether Turing's texture unit reads `t` as it is meant (TEXHEAD_PITCH's
+/// fields: the rows' bytes in 16 bits from bit 5, under 2 MiB; the width
+/// and height in 16 bits each).
+pub fn textureFitsFor(sm: Sm, t: Texture) bool {
+    if (sm != .sm_75) return textureFits(t);
+    return textureFits(t) and t.pitch < (1 << 21) and t.width <= 0x1_0000 and t.height <= 0x1_0000;
+}
+
+/// A texture's header for shader model `sm`'s chips: Blackwell's
+/// (headerWords: TEXHEAD_V2_PITCH), or Turing's: Maxwell's TEXHEAD_PITCH
+/// (clb097tex.h), as NIL fills it below Hopper (nvb097_fill_image_view_desc
+/// for rows of bytes): the components and each channel's type (UNORM) and
+/// source in word 0, the address's bits 31..5 in place in word 1, its bits
+/// 47..32 and HEADER_VERSION PITCH (2 in bits 21..23) in word 2, the rows'
+/// bytes over 32 and the LOD qualities high in word 3, the width less one,
+/// TWO_D_NO_MIPMAP (7 in 23..26) and the sampler's border colour (7 in
+/// 29..31) in word 4, the height less one and normalized coordinates (the
+/// sampler forces them off) in word 5, the anisotropic spreads in word 6.
+pub fn headerWordsFor(sm: Sm, t: Texture) [8]u32 {
+    if (sm != .sm_75) return headerWords(t);
+    // (the channels' sources: R 2, G 3, B 4, A 5, ONE_FLOAT 7; x from bit
+    // 19, y 22, z 25, w 28)
+    const src: [4]u32 = switch (t.format) {
+        .bgra8 => .{ 4, 3, 2, 5 },
+        .rgba8 => .{ 2, 3, 4, 5 },
+        .r8 => .{ 2, 0, 0, 7 },
+    };
+    const components: u32 = if (t.format == .r8) 0x1d else 0x08;
+    // (R, G, B and A UNORM: 2 in each type's three bits from bit 7)
+    const unorm: u32 = 2 << 7 | 2 << 10 | 2 << 13 | 2 << 16;
+    const w_src: u32 = if (t.no_alpha and t.format != .r8) 7 else src[3];
+    return .{
+        components | unorm | src[0] << 19 | src[1] << 22 | src[2] << 25 | w_src << 28,
+        @truncate(t.va & 0xffff_ffe0),
+        @as(u32, @truncate((t.va >> 32) & 0xffff)) | 2 << 21,
+        (t.pitch >> 5) | 0x0007_0000,
+        (t.width - 1) | 0xe380_0000,
+        (t.height - 1) | 0x8000_0000,
+        0x0300_0000,
+        0,
+    };
+}
+
 /// The word a texture instruction is handed: the header's index, and the
 /// sampler's above it.
 pub fn handleOf(header: u32, sampler: u32) u32 {
@@ -1099,16 +1215,25 @@ fn bits(x: f32) u32 {
 /// The engine's state for these passes: what NVK sends when it starts a
 /// queue and before its first draw, for one color target, no depth, one
 /// sample, no vertex buffers. `zero_va` is a page of zeros, `samplers_va`
-/// and `headers_va` the pools (`headers` entries).
+/// and `headers_va` the pools (`headers` entries). Blackwell's (setupFor).
 pub fn setup(p: *Push, zero_va: u64, samplers_va: u64, headers_va: u64, headers: u32) void {
-    p.setObject(SUBCH, BLACKWELL_B);
+    setupFor(p, .sm_120, zero_va, samplers_va, headers_va, headers);
+}
+
+/// The same for shader model `sm`'s chips: on Turing, TURING_A and what NVK
+/// sends for it (no texture header version, no pixel rate shading table,
+/// the shader cache control off).
+pub fn setupFor(p: *Push, sm: Sm, zero_va: u64, samplers_va: u64, headers_va: u64, headers: u32) void {
+    const turing = sm == .sm_75;
+    p.setObject(SUBCH, classFor(sm));
     one(p, SET_RENDER_ENABLE_C, 1);
     many(p, SET_CT_SELECT, &.{0x0fac_6881}); // one target, each slot its own
     one(p, SET_BLEND_SEPARATE_FOR_ALPHA, 1);
     one(p, SET_SINGLE_CT_WRITE_CONTROL, 1);
     one(p, SET_SINGLE_ROP_CONTROL, 0);
     one(p, SET_SHADE_MODE, 0x1d01);
-    one(p, SET_SHADER_CACHE_CONTROL, 1);
+    // (NVK: on from Ada)
+    one(p, SET_SHADER_CACHE_CONTROL, @intFromBool(!turing));
     many(p, CHECK_SPH_VERSION, &.{0x0003_0003});
     many(p, CHECK_AAM_VERSION, &.{0x0002_0002});
     one(p, SET_ATTRIBUTE_DEFAULT, 0xe);
@@ -1140,7 +1265,8 @@ pub fn setup(p: *Push, zero_va: u64, samplers_va: u64, headers_va: u64, headers:
     for (0..16) |j| one(p, SET_VERTEX_STREAM_A_FORMAT + 16 * @as(u32, @intCast(j)), 0);
     for (0..16) |j| one(p, SET_VERTEX_STREAM_B_FORMAT + 16 * @as(u32, @intCast(j)), 0);
     many(p, SET_VERTEX_ATTRIBUTE_A, &(.{ATTRIBUTE_INACTIVE} ** 32));
-    one(p, SET_TEXTURE_HEADER_VERSION, 1);
+    // (TEXHEAD_V2: Hopper's on; Turing's headers are Maxwell's)
+    if (!turing) one(p, SET_TEXTURE_HEADER_VERSION, 1);
     many(p, SET_GLOBAL_BASE_VERTEX_INDEX, &.{ 0, 0 }); // and the base instance
     one(p, SET_VERTEX_ID_BASE, 0);
     // The pools, and what the engine caches of them and of the records.
@@ -1180,7 +1306,8 @@ pub fn setup(p: *Push, zero_va: u64, samplers_va: u64, headers_va: u64, headers:
     // vertex and a pixel program.
     for ([_]u32{ 2, 3, 4 }) |j| one(p, SET_PIPELINE_SHADER + 64 * j, j << 4);
     one(p, SET_MESH_CONTROL, 0);
-    one(p, SET_VARIABLE_PIXEL_RATE_SHADING_TABLE_SELECT, 2);
+    // (Ampere B's on)
+    if (!turing) one(p, SET_VARIABLE_PIXEL_RATE_SHADING_TABLE_SELECT, 2);
     one(p, SET_USER_CLIP_ENABLE, 0);
     one(p, SET_USER_CLIP_OP, 0);
     many(p, SET_SUBTILING_PERF_KNOB_A, &.{ 0x2016_4010, 0x20 });
@@ -1226,10 +1353,20 @@ pub fn setBlend(p: *Push, b: Blend) void {
 
 /// A stage's program: its type, its header's address and how much to
 /// prefetch, its registers and the group its constant buffers bind to.
-fn stage(p: *Push, j: u32, group: u32, g: Prog) void {
+fn stage(p: *Push, sm: Sm, j: u32, group: u32, g: Prog) void {
     one(p, SET_PIPELINE_SHADER + 64 * j, 1 | j << 4);
-    many(p, SET_PIPELINE_PROGRAM_ADDRESS_A + 64 * j, &.{ @truncate(g.va >> 32), @truncate(g.va), g.blocks });
+    programAddress(p, sm, j, g.va, g.blocks);
     many(p, SET_PIPELINE_REGISTER_COUNT + 64 * j, &.{ g.registers, group });
+}
+
+/// Stage j's program's header address, and on Blackwell the 256-byte
+/// blocks to prefetch (SET_PIPELINE_PROGRAM_PREFETCH, Ampere B's on: NVK;
+/// on Turing the word after the address is reserved).
+pub fn programAddress(p: *Push, sm: Sm, j: u32, va: u64, blocks: u32) void {
+    if (sm == .sm_75)
+        many(p, SET_PIPELINE_PROGRAM_ADDRESS_A + 64 * j, &.{ @truncate(va >> 32), @truncate(va) })
+    else
+        many(p, SET_PIPELINE_PROGRAM_ADDRESS_A + 64 * j, &.{ @truncate(va >> 32), @truncate(va), blocks });
 }
 
 /// The record at `va` as both stages' constant buffer 0, and its
@@ -1252,6 +1389,9 @@ pub const Options = struct {
     rects: u32 = 4096,
     /// The textures a pass may sample.
     textures: u32 = 255,
+    /// The chip's shader model: sm_75 draws with TURING_A, Turing's
+    /// headers and programs assembled for sm_75.
+    sm: Sm = .sm_120,
 };
 
 pub const Stats = struct {
@@ -1288,11 +1428,13 @@ pub const Renderer = struct {
     /// A target or a texture the engine would misread: the pass is refused.
     bad: bool,
     stats: Stats,
+    sm: Sm,
 
     /// Assemble the programs and take the buffers. `work` is the
     /// assembler's scratch.
     pub fn init(r: *Renderer, dev: Device, work: *sm120_asm.Work, opts: Options) Error!void {
         r.dev = dev;
+        r.sm = opts.sm;
         r.in_pass = false;
         r.stats = .{};
         r.max_headers = 1 + opts.textures;
@@ -1306,9 +1448,9 @@ pub const Renderer = struct {
         r.pb = try dev.alloc(opts.stream_bytes);
         errdefer dev.free(r.pb);
         @memset(r.code.cpu, 0);
-        for (SOURCES, 0..) |src, i| {
+        for (sourcesFor(r.sm), 0..) |src, i| {
             var words: [(SLOT - sph.BYTES) / 8]u64 = undefined;
-            const k = try sm120_asm.assemble(src, &words, work);
+            const k = try sm120_asm.assembleFor(r.sm, src, &words, work);
             if (k.code.len > words.len) return error.BadKernel;
             const slot = r.code.cpu[i * SLOT ..][0..SLOT];
             const head = headerOf(i);
@@ -1352,7 +1494,7 @@ pub const Renderer = struct {
         r.records_full = false;
         r.bad = !targetFits(t);
         r.stats = .{};
-        setup(&r.p, r.state.va + ZERO_AT, r.state.va + SAMPLERS_AT, r.state.va + HEADERS_AT, r.max_headers);
+        setupFor(&r.p, r.sm, r.state.va + ZERO_AT, r.state.va + SAMPLERS_AT, r.state.va + HEADERS_AT, r.max_headers);
         target(&r.p, t);
     }
 
@@ -1365,8 +1507,8 @@ pub const Renderer = struct {
     fn use(r: *Renderer, kind: Kind, b: Blend) void {
         if (r.kind == null or r.kind.? != kind) {
             // (a vertex program that stores what this pixel program reads)
-            stage(&r.p, STAGE_VERTEX, GROUP_VERTEX, r.progs[@intFromBool(varies(kind))]);
-            stage(&r.p, STAGE_PIXEL, GROUP_PIXEL, r.progs[2 + @as(usize, @intFromEnum(kind))]);
+            stage(&r.p, r.sm, STAGE_VERTEX, GROUP_VERTEX, r.progs[@intFromBool(varies(kind))]);
+            stage(&r.p, r.sm, STAGE_PIXEL, GROUP_PIXEL, r.progs[2 + @as(usize, @intFromEnum(kind))]);
             r.kind = kind;
             r.stats.programs += 1;
         }
@@ -1380,7 +1522,7 @@ pub const Renderer = struct {
     /// once a run of rectangles), and its filter's sampler.
     fn bind(r: *Renderer, t: Texture) u32 {
         if (r.tex) |cur| if (std.meta.eql(cur, t)) return r.handle;
-        if (!textureFits(t)) {
+        if (!textureFitsFor(r.sm, t)) {
             r.bad = true;
             return 0;
         }
@@ -1389,7 +1531,7 @@ pub const Renderer = struct {
             return 0;
         }
         const at = HEADERS_AT + @as(usize, r.headers) * ENTRY;
-        for (headerWords(t), 0..) |w, n| std.mem.writeInt(u32, r.state.cpu[at + n * 4 ..][0..4], w, .little);
+        for (headerWordsFor(r.sm, t), 0..) |w, n| std.mem.writeInt(u32, r.state.cpu[at + n * 4 ..][0..4], w, .little);
         r.handle = handleOf(r.headers, @intFromEnum(t.filter));
         r.headers += 1;
         r.tex = t;
@@ -1644,16 +1786,24 @@ const sched = @import("sm120_sched.sig");
 var test_work: sm120_asm.Work = .{};
 
 test "every program assembles, is scheduled without a hazard left open, and fits its slot" {
-    for (SOURCES, 0..) |src, i| {
+    for ([_]Sm{ .sm_120, .sm_75 }) |sm| for (sourcesFor(sm), 0..) |src, i| {
         var words: [(SLOT - sph.BYTES) / 8]u64 = undefined;
-        const k = try sm120_asm.assemble(src, &words, &test_work);
+        errdefer std.debug.print("program {d} for {s}\n", .{ i, @tagName(sm) });
+        const k = try sm120_asm.assembleFor(sm, src, &words, &test_work);
         try testing.expect(k.scheduled);
         try testing.expect(k.code.len <= words.len);
         try testing.expectEqual(@as(u32, 0), (try sched.check(test_work.instrs[0..k.count], test_work.slots[0..k.count], &test_work.sched)).open);
         // a vertex header in front of the vertex programs, a pixel one after
         const head = headerOf(i);
         try testing.expectEqual(if (i < 2) sph.Stage.vertex else sph.Stage.pixel, sph.stageOf(&head).?);
-    }
+    };
+    // Turing's texts: sm_120's with I2F, SEL and TEX.B in place of the
+    // forms sm_75 has not, nothing else changed
+    try testing.expect(std.mem.indexOf(u8, SOURCES75[9], "I2F R21, R21\n") != null and std.mem.indexOf(u8, SOURCES75[9], "I2FP") == null);
+    try testing.expect(std.mem.indexOf(u8, SOURCES75[10], "\nSEL R20, R31, R19, P3\n") != null and std.mem.indexOf(u8, SOURCES75[10], "FSEL") == null);
+    try testing.expect(std.mem.indexOf(u8, SOURCES75[3], "TEX.B R2, R0, R4, R6, 2D") != null and std.mem.indexOf(u8, SOURCES75[3], "DXY") == null);
+    try testing.expectEqualStrings(SOURCES[0], SOURCES75[0]);
+    try testing.expectEqual(SOURCES[10].len - 6, SOURCES75[10].len);
     // The vertex programs store what their pixel programs read: the
     // position alone, or with generic vector 0's x and y.
     try testing.expect(!sph.bit(&headerOf(0), 432));
@@ -1685,6 +1835,86 @@ test "a texture's header and the samplers: NVK's words" {
     try testing.expect(targetFits(.{ .va = 0x1000, .width = 64, .height = 32, .pitch = 256 }));
     try testing.expect(!targetFits(.{ .va = 0x1000, .width = 60, .height = 32, .pitch = 240 }));
     try testing.expect(!targetFits(.{ .va = 0x1040, .width = 64, .height = 32, .pitch = 256 }));
+}
+
+test "a texture's header on Turing: Maxwell's TEXHEAD_PITCH as NIL fills it, field by field" {
+    const t = Texture{ .va = 0x12_3456_7000, .width = 640, .height = 480, .pitch = 2560, .format = .bgra8 };
+    const h = headerWordsFor(.sm_75, t);
+    // word 0: A8B8G8R8 (8), four UNORM types (2 at 7, 10, 13, 16), x from
+    // B (4 at 19), y from G (3 at 22), z from R (2 at 25), w from A (5 at 28)
+    try testing.expectEqual(@as(u32, 8 | 2 << 7 | 2 << 10 | 2 << 13 | 2 << 16 | 4 << 19 | 3 << 22 | 2 << 25 | 5 << 28), h[0]);
+    try testing.expectEqual([8]u32{ 0x54e2_4908, 0x3456_7000, 0x0040_0012, 0x0007_0050, 0xe380_027f, 0x8000_01df, 0x0300_0000, 0 }, h);
+    var o = t;
+    o.no_alpha = true;
+    try testing.expectEqual(@as(u32, 0x74e2_4908), headerWordsFor(.sm_75, o)[0]);
+    o.format = .rgba8;
+    try testing.expectEqual(@as(u32, 0x78d2_4908), headerWordsFor(.sm_75, o)[0]);
+    o.no_alpha = false;
+    try testing.expectEqual(@as(u32, 0x58d2_4908), headerWordsFor(.sm_75, o)[0]);
+    o.format = .r8;
+    try testing.expectEqual(@as(u32, 0x7012_491d), headerWordsFor(.sm_75, o)[0]);
+    // (Blackwell's is its own: headerWordsFor(.sm_120) is headerWords)
+    try testing.expectEqual(headerWords(t), headerWordsFor(.sm_120, t));
+    // Turing's fields are narrower: rows under 2 MiB, 16-bit sizes
+    o = t;
+    o.pitch = 1 << 21;
+    o.height = 4;
+    try testing.expect(textureFits(o) and !textureFitsFor(.sm_75, o));
+    o = t;
+    o.width = 0x1_0001;
+    o.pitch = 0x4_0020;
+    try testing.expect(textureFits(o) and !textureFitsFor(.sm_75, o));
+}
+
+test "the stream on Turing: TURING_A, and NVK's differences for the class" {
+    var buf: [4096]u32 = undefined;
+    var p = Push{ .buf = &buf };
+    setupFor(&p, .sm_75, 0x1000, 0x2000, 0x3000, 16);
+    try p.check();
+    const w = p.words();
+    // the class bound to the 3D engine's subchannel
+    try testing.expectEqualSlices(u32, &.{ push.header(SUBCH, push.SET_OBJECT, 1), TURING_A }, w[0..2]);
+    // none of the methods Turing has not, the shader cache control off
+    const has = struct {
+        fn f(ws: []const u32, m: u32) ?u32 {
+            var i: usize = 0;
+            while (i < ws.len) {
+                const hd = ws[i];
+                const n = (hd >> 16) & 0x1fff;
+                const addr = (hd & 0x1fff) * 4;
+                switch (hd >> 29) {
+                    4 => {
+                        if (addr == m) return n;
+                        i += 1;
+                    },
+                    1, 3, 5 => {
+                        for (0..n) |k| if (addr + 4 * @as(u32, @intCast(k)) == m or (hd >> 29 == 3 and addr == m)) return ws[i + 1 + k];
+                        i += 1 + n;
+                    },
+                    else => i += 1,
+                }
+            }
+            return null;
+        }
+    }.f;
+    try testing.expect(has(w, SET_TEXTURE_HEADER_VERSION) == null);
+    try testing.expect(has(w, SET_VARIABLE_PIXEL_RATE_SHADING_TABLE_SELECT) == null);
+    try testing.expectEqual(@as(?u32, 0), has(w, SET_SHADER_CACHE_CONTROL));
+    // and Blackwell's has them, BLACKWELL_B bound, the cache control on
+    var q = Push{ .buf = buf[2048..] };
+    setup(&q, 0x1000, 0x2000, 0x3000, 16);
+    try testing.expectEqual(BLACKWELL_B, q.words()[1]);
+    try testing.expectEqual(@as(?u32, 1), has(q.words(), SET_TEXTURE_HEADER_VERSION));
+    try testing.expectEqual(@as(?u32, 2), has(q.words(), SET_VARIABLE_PIXEL_RATE_SHADING_TABLE_SELECT));
+    try testing.expectEqual(@as(?u32, 1), has(q.words(), SET_SHADER_CACHE_CONTROL));
+    // a program's address: two words on Turing, three (the prefetch) on
+    // Blackwell
+    p = .{ .buf = &buf };
+    programAddress(&p, .sm_75, STAGE_PIXEL, 0x12_3456_7880, 3);
+    try testing.expectEqualSlices(u32, &.{ push.header(SUBCH, SET_PIPELINE_PROGRAM_ADDRESS_A + 64 * STAGE_PIXEL, 2), 0x12, 0x3456_7880 }, p.words());
+    p = .{ .buf = &buf };
+    programAddress(&p, .sm_120, STAGE_PIXEL, 0x12_3456_7880, 3);
+    try testing.expectEqualSlices(u32, &.{ push.header(SUBCH, SET_PIPELINE_PROGRAM_ADDRESS_A + 64 * STAGE_PIXEL, 3), 0x12, 0x3456_7880, 3 }, p.words());
 }
 
 test "the stream: a target, a rectangle's nine dwords" {
@@ -1725,15 +1955,30 @@ const T = struct {
     var dev: device.EmuDevice = undefined;
     var r: Renderer = undefined;
     var pixels: Buffer = undefined;
+    /// The generation the emulated card is (both: `both`).
+    var sm: Sm = .sm_120;
 
     const W = 64;
     const H = 32;
 
+    /// A case run on the emulated RTX 5070 (BLACKWELL_B, sm_120) and on the
+    /// emulated RTX 2080 Ti (TURING_A, sm_75).
+    fn both(comptime case: fn () anyerror!void) !void {
+        defer sm = .sm_120;
+        for ([_]Sm{ .sm_120, .sm_75 }) |m| {
+            sm = m;
+            case() catch |e| {
+                std.debug.print("(on the emulated {s})\n", .{if (m == .sm_75) "RTX 2080 Ti: TURING_A, sm_75" else "RTX 5070: BLACKWELL_B, sm_120"});
+                return e;
+            };
+        }
+    }
+
     /// A fresh device with its 3D engine, the renderer on it, a target.
     fn start() !Target {
         engine = .{};
-        dev = .{ .arena = &arena, .gpu_view = &gpu_view, .work = &work, .gr3d = &engine };
-        try r.init(dev.device(), &test_work, .{ .stream_bytes = 64 * 1024, .rects = 64, .textures = 15 });
+        dev = .{ .arena = &arena, .gpu_view = &gpu_view, .work = &work, .gr3d = &engine, .sm = sm };
+        try r.init(dev.device(), &test_work, .{ .stream_bytes = 64 * 1024, .rects = 64, .textures = 15, .sm = sm });
         pixels = try dev.device().alloc(W * H * 4);
         return .{ .va = pixels.va, .width = W, .height = H, .pitch = W * 4 };
     }
@@ -1762,6 +2007,10 @@ fn expectPixel(want: u32, x: u32, y: u32) !void {
 }
 
 test "solid rectangles on the emulated RTX: where the rasterizer puts them, the scissor, the blend" {
+    try T.both(caseSolid);
+}
+
+fn caseSolid() !void {
     const t = try T.start();
     defer T.r.deinit();
     T.r.begin(t);
@@ -1802,6 +2051,10 @@ test "solid rectangles on the emulated RTX: where the rasterizer puts them, the 
 }
 
 test "an image and a mask on the emulated RTX: texel for texel, tinted, coverage times a color" {
+    try T.both(caseImageMask);
+}
+
+fn caseImageMask() !void {
     const t = try T.start();
     defer T.r.deinit();
     const d = T.dev.device();
@@ -1835,6 +2088,10 @@ test "an image and a mask on the emulated RTX: texel for texel, tinted, coverage
 }
 
 test "a target the engine would misread is refused: by the renderer, and by the emulated engine" {
+    try T.both(caseMisread);
+}
+
+fn caseMisread() !void {
     _ = try T.start();
     defer T.r.deinit();
     // rows of 240 bytes: not a multiple of 128
@@ -1893,6 +2150,10 @@ fn testPicture(x: u32, y: u32) u32 {
 }
 
 test "a box blur on the emulated RTX: gfx's mean, the edge's texels past the ends" {
+    try T.both(caseBox);
+}
+
+fn caseBox() !void {
     const t = try T.start();
     defer T.r.deinit();
     const d = T.dev.device();
@@ -1922,6 +2183,10 @@ test "a box blur on the emulated RTX: gfx's mean, the edge's texels past the end
 }
 
 test "two targets in one pass: a row blur into a scratch, a column blur of it back, one submission" {
+    try T.both(caseTwoTargets);
+}
+
+fn caseTwoTargets() !void {
     const t = try T.start();
     defer T.r.deinit();
     const d = T.dev.device();
@@ -1995,6 +2260,10 @@ fn refGlass(under: u32, blur: u32, x: u32, y: u32, s: Shape, top: f32, h: f32, l
 }
 
 test "frosted glass on the emulated RTX: the backdrop blurred, tinted, its rim and edge, as gfx's arithmetic" {
+    try T.both(caseGlass);
+}
+
+fn caseGlass() !void {
     const t = try T.start();
     defer T.r.deinit();
     const d = T.dev.device();

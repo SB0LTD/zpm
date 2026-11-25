@@ -142,6 +142,19 @@ pub fn encodeDecision(buffer: []u8, decision: *const Decision) Error![]const u8 
     return buffer[0..length];
 }
 
+/// A clone preserves the prepare sequence and GID for its decision frame.
+/// Only the source database identity becomes the new database identity.
+pub fn rebindDatabase(payload: []u8, source: u32, destination: u32) Error!void {
+    if (source == 0 or destination == 0 or source == destination) return error.InvalidParameterValue;
+    switch (try decode(payload)) {
+        .prepare => |entry| {
+            if (entry.metadata.database != source) return error.ChangeRecordConflict;
+            std.mem.writeInt(u32, payload[8..12], destination, .little);
+        },
+        .decision => {},
+    }
+}
+
 pub fn decode(bytes: []const u8) Error!Record {
     if (bytes.len < prefix_bytes) return error.InvalidChangeRecord;
     if (std.mem.readInt(u16, bytes[0..2], .little) != version) return error.UnsupportedLogVersion;

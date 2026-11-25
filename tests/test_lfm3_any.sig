@@ -264,6 +264,10 @@ fn failure(b: *const Backend, e: anyerror) anyerror {
     return e;
 }
 
+/// followTheCpu's cache keeps its KV rows in kv_memory (newCacheWith).
+var kv_in_caller_memory = false;
+var kv_memory: [4 << 20]u8 align(16) = undefined;
+
 /// A prompt, decode steps, then the CPU on the GPU's state; the worst
 /// relative logit difference.
 fn followTheCpu(which: Device, tolerance: f64, tiled_attention: bool) !f64 {
@@ -279,8 +283,14 @@ fn followTheCpu(which: Device, tolerance: f64, tiled_attention: bool) !f64 {
     };
     defer backend.deinit();
     if (which != .discrete) try std.testing.expect(backend.imported == (d.caps.import and d.caps.memory == .unified));
-    var gc = try backend.newCache(CONTEXT);
+    // (the KV rows in the caller's memory instead of a host mirror, when
+    // asked: kv_in_caller_memory)
+    var gc = if (kv_in_caller_memory) try backend.newCacheWith(CONTEXT, &kv_memory) else try backend.newCache(CONTEXT);
     defer backend.freeCache(&gc);
+    if (kv_in_caller_memory and which == .discrete) {
+        try std.testing.expect(try backend.kvBytes(CONTEXT) <= kv_memory.len);
+        try std.testing.expect(gc.kv_host == null and gc.kv_cpu.len != 0);
+    }
     var ccache = cpuCache(CONTEXT);
     // A prompt of 11 (two matrix passes, two attention launches), then
     // decode steps fed the CPU's tokens.
@@ -409,6 +419,12 @@ test "...on a GPU without fused FMA, mad rounded twice, denormals flushed, subgr
 }
 
 test "...on discrete memory: VRAM without a CPU view, staging, the copy kernel" {
+    _ = try followTheCpu(.discrete, 1e-4, true);
+}
+
+test "...on discrete memory, the KV rows in the caller's memory (no host mirror), handed over in pieces" {
+    kv_in_caller_memory = true;
+    defer kv_in_caller_memory = false;
     _ = try followTheCpu(.discrete, 1e-4, true);
 }
 

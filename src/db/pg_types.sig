@@ -91,7 +91,7 @@ pub fn Types(comptime Result: type) type {
                 .integer => |value| switch (data_type) {
                     .smallint => try putInt(i16, out, &at, @intCast(value)),
                     .integer32 => try putInt(i32, out, &at, @intCast(value)),
-                    .oid => try putInt(u32, out, &at, @intCast(value)),
+                    .oid, .xid => try putInt(u32, out, &at, @intCast(value)),
                     else => try putInt(i64, out, &at, value),
                 },
                 .boolean => |value| try put(out, &at, &.{@intFromBool(value)}),
@@ -149,7 +149,7 @@ pub fn Types(comptime Result: type) type {
                 .macaddr => |*value| try put(out, &at, value),
                 .xml => at += try sendText(cell, session, out),
                 // regtypesend is oidsend.
-                .regtype => |value| try putInt(u32, out, &at, value),
+                .regtype, .regproc => |value| try putInt(u32, out, &at, value),
                 .pg_internal_char => |value| try put(out, &at, &.{value}),
                 // tsvectorsend / tsquerysend binary forms are not provided.
                 .tsvector, .tsquery => return error.UnsupportedBinaryType,
@@ -237,6 +237,14 @@ pub fn Types(comptime Result: type) type {
             try put(out, at, "'");
         }
 
+        fn binaryInputText(cell: *const Cell, out: []u8) Error![]const u8 {
+            // Keep the original OID across binary input. A printed name
+            // could resolve to a different routine or be ambiguous.
+            var utc: Session = .{};
+            if (comptime @hasField(Session, "regproc_numeric_output")) utc.regproc_numeric_output = true;
+            return Io.format(cell, true, &utc, out) catch error.ProtocolViolation;
+        }
+
         /// A parameter value as a typed SQL literal.
         pub fn literal(bytes: []const u8, type_oid: u32, format: u16, out: []u8) Error!usize {
             const name = castName(type_oid) orelse return error.UnsupportedBinaryType;
@@ -254,8 +262,7 @@ pub fn Types(comptime Result: type) type {
             } else {
                 var text: [Io.format_bytes]u8 = undefined;
                 const cell = try decodeBinary(bytes, Io.typeFromOid(type_oid).?);
-                const utc: Session = .{};
-                const rendered = Io.format(&cell, true, &utc, &text) catch return error.ProtocolViolation;
+                const rendered = try binaryInputText(&cell, &text);
                 try quote(out, &at, rendered);
             }
             try put(out, &at, "::");
@@ -292,8 +299,7 @@ pub fn Types(comptime Result: type) type {
                 else => try decodeBinary(bytes, data_type),
             };
             var text: [Io.format_bytes]u8 = undefined;
-            const utc: Session = .{};
-            const rendered = Io.format(&cell, true, &utc, &text) catch return error.ProtocolViolation;
+            const rendered = try binaryInputText(&cell, &text);
             if (rendered.len > out.len) return error.BufferTooSmall;
             @memcpy(out[0..rendered.len], rendered);
             return out[0..rendered.len];
@@ -399,6 +405,10 @@ pub fn Types(comptime Result: type) type {
                     if (bytes.len > 1) return error.InvalidBinaryRepresentation;
                     return .{ .pg_internal_char = bytes[0] };
                 },
+                .regproc => {
+                    if (bytes.len != 4) return error.ProtocolViolation;
+                    return .{ .regproc = getInt(u32, bytes) };
+                },
                 .regtype => {
                     if (bytes.len != 4) return error.ProtocolViolation;
                     return .{ .regtype = getInt(u32, bytes) };
@@ -428,7 +438,7 @@ pub fn Types(comptime Result: type) type {
             }
             const need: usize = switch (data_type) {
                 .smallint => 2,
-                .integer32, .oid, .real, .date => 4,
+                .integer32, .oid, .xid, .real, .date => 4,
                 .integer, .double, .timestamp, .timestamptz, .time, .money, .pg_lsn, .xid8 => 8,
                 .timetz => 12,
                 .interval, .uuid => 16,
@@ -437,7 +447,7 @@ pub fn Types(comptime Result: type) type {
             if (need != 0 and bytes.len != need) return error.ProtocolViolation;
             return switch (data_type) {
                 .smallint => .{ .integer = getInt(i16, bytes) },
-                .oid => .{ .integer = getInt(u32, bytes) },
+                .oid, .xid => .{ .integer = getInt(u32, bytes) },
                 .real => .{ .float4 = @bitCast(getInt(u32, bytes)) },
                 .double => .{ .float8 = @bitCast(getInt(u64, bytes)) },
                 .date => .{ .date = getInt(i32, bytes) },

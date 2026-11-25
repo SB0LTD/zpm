@@ -84,12 +84,14 @@ pub fn Sessions(comptime config: types.Config) type {
             check_function_bodies: bool = true,
             row_security: bool = true,
             synchronize_seqscans: bool = true,
+            quote_all_identifiers: bool = false,
             restricted_relation_kinds: RelationKinds = .{},
             restriction_text: SettingText = .{},
             search_path: SettingText = SettingText.literal("\"$user\", public"),
             /// Origin bits for the named engine settings in pg_settings.
             client_settings: u8 = 0,
             session_settings: u8 = 0,
+            role_settings: u8 = 0,
             custom: [config.custom_settings]Custom = @splat(.{}),
             /// SET ROLE (catalog-security lane): the role OID, 0 for NONE
             /// (current_user is then the session user).
@@ -139,6 +141,8 @@ pub fn Sessions(comptime config: types.Config) type {
             tx_start: Values = .{},
             /// RESET / DEFAULT restore these.
             startup: Values = .{},
+            /// GUCs from the wire's startup options override role defaults.
+            client_role_booleans: u32 = 0,
             /// session_user as a role OID (catalog-security lane): the
             /// bootstrap superuser (10) unless the caller installs another.
             session_role: u32 = 10,

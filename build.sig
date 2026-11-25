@@ -137,6 +137,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addContract(ctx, test_sql, "contract-sql-split-versions", "tests/test_sql_split_versions.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-integral-versions", "tests/test_sql_integral_versions.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-compact-version-stamps", "tests/test_sql_compact_version_stamps.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    _ = try addContract(ctx, test_sql, "contract-sql-external-hash-load", "tests/test_sql_external_hash_load.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-stream-group", "tests/test_sql_stream_group.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-stream-prefix", "tests/test_sql_stream_prefix.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-joined-projection", "tests/test_sql_join_projection.sig", &.{importEntry("sql", "src/core/sql.sig")});
@@ -663,6 +664,11 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     });
     // WAV (PCM16 RIFF/WAVE) container writer — pure, std-only.
     _ = try addTest(ctx, test_all, "test-wav", "src/core/wav.sig", &.{});
+    // AAC-LC encoder, and the live path it feeds: FLV bodies, an RTMP
+    // publisher (tools/livepush.sig drives all three against a server).
+    _ = try addTest(ctx, test_all, "test-aac", "src/core/aac.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-flv", "src/live/flv.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-rtmp", "src/live/rtmp.sig", &.{importEntry("flv", "src/live/flv.sig")});
     // Phoneme → PCM16 narrator synthesizer (source-filter TTS voice).
     const tts_voice = try ctx.addModule("tts_voice", "src/core/tts_voice.sig");
     try wire(ctx, tts_voice, "math", "src/core/math.sig");
@@ -2005,6 +2011,17 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     // Net module tests — each module tested individually with its own imports resolved
     _ = try addTest(ctx, test_all, "test-net-checksum", "src/net/checksum.sig", &.{});
     _ = try addTest(ctx, test_all, "test-net-ethernet", "src/net/ethernet.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-net-i219", "src/net/i219.sig", &.{});
+
+    // Hyper-V guest support: VMBus and the synthetic devices over it (each
+    // file imports vmbus.sig beside it)
+    _ = try addTest(ctx, test_all, "test-hyperv-vmbus", "src/hyperv/vmbus.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-hyperv-keyboard", "src/hyperv/keyboard.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-hyperv-mouse", "src/hyperv/mouse.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-hyperv-storage", "src/hyperv/storage.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-hyperv-network", "src/hyperv/network.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-hyperv-gpu", "src/hyperv/gpu.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-hyperv-pci", "src/hyperv/pci.sig", &.{});
     _ = try addTest(ctx, test_all, "test-net-ipv4", "src/net/ipv4.sig", &.{
         importEntry("net_checksum", "src/net/checksum.sig"),
     });

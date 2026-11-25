@@ -50,6 +50,20 @@
 //! Bit 109 (Y) is left clear, as NAK leaves it on sm_120; `.reuse` stays as
 //! written.
 //!
+//! sm_75 (Turing) is scheduled by the same passes with NAK's model from
+//! before it had NVIDIA's tables for a chip, which is what it shipped for
+//! Turing until 2025 (sm70.rs's instr_latency, war_latency, waw_latency):
+//! a fixed-latency result in a general register can be read after 6
+//! cycles, a predicate after 13 (uniform ones 12 and 11); a register can
+//! be written 4 cycles after a fixed-latency instruction read it; the
+//! packed halves (HADD2, HMUL2, HFMA2), which Turing redirects to a
+//! variable-latency unit, take 13 and 14 cycles and a scoreboard as well.
+//! `Work.sm` picks it (`usesOfFor` gives every register one of two
+//! categories that `need` knows). It is longer than Turing's own tables
+//! (NAK's sm75_instr_latencies.rs) by a cycle or two an instruction; those
+//! tables can replace it with no change above. Nothing sm_75 has run on a
+//! card yet.
+//!
 //! Allocation-free: the caller owns the working storage (Work).
 
 const std = @import("std");
@@ -72,6 +86,14 @@ const PAD: u8 = 1;
 const WORST: u8 = 15;
 /// A scoreboard's waiter issues at least this long after its setter.
 const SB_SET: u32 = 2;
+
+/// The shader model a schedule is for.
+pub const Sm = sm120.Sm;
+
+/// sm_75's two latency categories (past every table's enum): a
+/// fixed-latency result, and a packed half's.
+pub const CAT75: u8 = 0xf0;
+pub const CAT75_HALF: u8 = 0xf1;
 
 // ── What instructions read and write ────────────────────────────────────────
 
@@ -348,7 +370,7 @@ pub fn usesOf(in: *const sm120.Instr) Error!Uses {
         regs(&u, in, 2, UDP);
     } else if (eql(op, "ISETP") or eql(op, "FSETP")) {
         regs(&u, in, 2, warp(.dualalu, .dualalu));
-    } else if (eql(op, "SEL") or eql(op, "VIMNMX") or eql(op, "FMNMX")) {
+    } else if (eql(op, "SEL") or eql(op, "VIMNMX") or eql(op, "IMNMX") or eql(op, "FMNMX")) {
         regs(&u, in, 1, warp(.dualalu, .dualalu));
     } else if (eql(op, "IMAD")) {
         if (in.has("WIDE")) {
@@ -439,6 +461,7 @@ fn adjust(u: Use) u8 {
 /// after a write NAK's padding (at least one cycle; the tensor cores'
 /// adjustment for general registers), for the others the adjustment.
 pub fn need(kind: Kind, first: Use, first_decoupled: bool, second: Use) Need {
+    if (first.cat >= CAT75) return need75(kind, first, first_decoupled);
     const e = entry(first.file, kind, second.cat, first.cat);
     if (e == lat.N) return .{ .cycles = WORST, .sb = first_decoupled };
     const sb = e & lat.SB != 0;
@@ -448,9 +471,51 @@ pub fn need(kind: Kind, first: Use, first_decoupled: bool, second: Use) Need {
     return .{ .cycles = c, .sb = sb };
 }
 
+/// sm_75: how long after an instruction issued its fixed-latency result in
+/// `u` can be read (NAK's instr_latency for sm < 80; Turing's halves 13
+/// and 14).
+fn latency75(u: Use) u8 {
+    return switch (u.file) {
+        .gpr => if (u.cat == CAT75_HALF) 13 else 6,
+        .pred => if (u.cat == CAT75_HALF) 14 else 13,
+        .ugpr => 12,
+        .upred => 11,
+    };
+}
+
+/// sm_75's hazards: a variable-latency first instruction is waited for by
+/// its scoreboard (a half's by its cycles too); a fixed-latency one by its
+/// result's cycles, or 4 when it only read the register.
+fn need75(kind: Kind, first: Use, first_decoupled: bool) Need {
+    // (a predicate is read at issue, by a variable-latency instruction
+    // too: a branch's guard, a store's; sm120_emu tracks them so)
+    if (kind == .war and first.file == .pred) return .{ .cycles = WAR75, .sb = false };
+    if (first_decoupled) return .{ .cycles = if (first.cat == CAT75_HALF and kind != .war) latency75(first) else 1, .sb = true };
+    return .{ .cycles = if (kind == .war) WAR75 else latency75(first), .sb = false };
+}
+
+/// sm_75: the cycles a fixed-latency instruction's read of a register is
+/// given before a later write of it (NAK's war_latency before its tables:
+/// "we assume the source gets read in the first 4 cycles").
+const WAR75: u8 = 4;
+
+/// `in`'s registers for shader model `sm`: sm_120's categories, or sm_75's
+/// two (the packed halves variable-latency there).
+pub fn usesOfFor(sm: Sm, in: *const sm120.Instr) Error!Uses {
+    var u = try usesOf(in);
+    if (sm != .sm_75) return u;
+    const half = eql(in.op, "HADD2") or eql(in.op, "HMUL2") or eql(in.op, "HFMA2");
+    if (half) u.decoupled = true;
+    const cat: u8 = if (half) CAT75_HALF else CAT75;
+    for (u.dst[0..u.n_dst]) |*d| d.cat = cat;
+    for (u.src[0..u.n_src]) |*s| s.cat = cat;
+    return u;
+}
+
 /// A fixed-latency result's longest wait to any reader (NAK's
 /// worst_latency): what a branch drains.
 fn worst(d: Use) u8 {
+    if (d.cat >= CAT75) return latency75(d);
     var m: u8 = 0;
     const n: usize = switch (d.file) {
         .gpr => lat.reg_raw.len,
@@ -526,12 +591,27 @@ fn hazards(uses: []const Uses, start: usize, j: usize, ctx: anytype, comptime f:
 }
 
 /// The cycle the instruction after a branch at `j` may start: every
-/// fixed-latency result of its block ready to any reader.
+/// fixed-latency result of its block ready to any reader. On sm_75 every
+/// fixed-latency read of the block, the branch's own predicate too, has
+/// had its WAR75 cycles as well: the model there gives a read that long
+/// whatever writes next, and what follows a branch is not known here
+/// (sm_120's tables have the pairs, and its branches' reads need none).
 fn drained(uses: []const Uses, cycle: []const u32, start: usize, j: usize) u32 {
     var c: u32 = cycle[j] + 1;
     for (start..j) |i| {
         if (uses[i].decoupled) continue;
         for (uses[i].dsts()) |d| c = @max(c, cycle[i] + worst(d));
+    }
+    for (start..j + 1) |i| {
+        for (uses[i].srcs()) |s| {
+            if (s.cat < CAT75) continue;
+            // (a variable-latency instruction's registers are waited for
+            // by its scoreboard, which the branch waits on; its
+            // predicates are read at issue)
+            if (uses[i].decoupled and s.file != .pred) continue;
+            c = @max(c, cycle[i] + WAR75);
+            break;
+        }
     }
     return c;
 }
@@ -542,6 +622,8 @@ fn drained(uses: []const Uses, cycle: []const u32, start: usize, j: usize) u32 {
 /// a larger one for larger programs: kir_sm120's LARGE).
 pub fn WorkOf(comptime n: usize) type {
     return struct {
+        /// The shader model scheduled for.
+        sm: Sm = .sm_120,
         uses: [n]Uses = undefined,
         cycle: [n]u32 = undefined,
         need_rd: [n]bool = undefined,
@@ -556,8 +638,9 @@ pub fn WorkOf(comptime n: usize) type {
 }
 pub const Work = WorkOf(MAX_INSTRS);
 
-/// A WorkOf's arrays, whatever its size.
+/// A WorkOf's shader model and arrays, whatever its size.
 const View = struct {
+    sm: Sm,
     uses: []Uses,
     cycle: []u32,
     need_rd: []bool,
@@ -567,7 +650,7 @@ const View = struct {
     rd_gen: []u32,
     wr_gen: []u32,
     fn of(w: anytype) View {
-        return .{ .uses = &w.uses, .cycle = &w.cycle, .need_rd = &w.need_rd, .need_wr = &w.need_wr, .rd_bar = &w.rd_bar, .wr_bar = &w.wr_bar, .rd_gen = &w.rd_gen, .wr_gen = &w.wr_gen };
+        return .{ .sm = w.sm, .uses = &w.uses, .cycle = &w.cycle, .need_rd = &w.need_rd, .need_wr = &w.need_wr, .rd_bar = &w.rd_bar, .wr_bar = &w.wr_bar, .rd_gen = &w.rd_gen, .wr_gen = &w.wr_gen };
     }
 };
 
@@ -661,7 +744,7 @@ pub fn schedule(ins: []const sm120.Instr, out: []Slot, work: anytype) Error!void
     if (ins.len > w.uses.len or out.len < ins.len) return error.TooManyInstructions;
     const n = ins.len;
     for (ins, 0..) |*in, i| {
-        w.uses[i] = try usesOf(in);
+        w.uses[i] = try usesOfFor(w.sm, in);
         w.need_rd[i] = false;
         w.need_wr[i] = false;
         w.rd_bar[i] = sm120.Control.NONE;
@@ -787,7 +870,7 @@ pub fn check(ins: []const sm120.Instr, slots: []const Slot, work: anytype) Error
     const n = ins.len;
     var c: u32 = 0;
     for (ins, 0..) |*in, i| {
-        w.uses[i] = try usesOf(in);
+        w.uses[i] = try usesOfFor(w.sm, in);
         w.cycle[i] = c;
         c += slots[i].control.stall;
         for (slots[i].nops[0..slots[i].n_nops]) |s| c += s;

@@ -69,8 +69,8 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     power, ln, log, log10, exp, mod, div, pi, degrees, radians, cbrt, sin, cos, tan, cot, asin, acos, atan, atan2, gcd, lcm, scale, min_scale, trim_scale,
     // Date/time functions (B11, functions_temporal.sig); *_tz are the STABLE
     // timestamptz (session time zone) overloads chosen by the binder.
-    extract, extract_tz, date_part, date_part_tz, date_trunc, date_trunc_tz, age, age_tz, justify_days, justify_hours, justify_interval, make_date, make_timestamp, isfinite, tds_dateadd, tds_isnull,
-    // (a, b) OVERLAPS (c, d); overlaps_tz is the STABLE timestamptz + interval form.
+    extract, extract_tz, date_part, date_part_tz, date_trunc, date_trunc_tz, date_bin, age, age_tz, justify_days, justify_hours, justify_interval, make_date, make_timestamp, isfinite, tds_dateadd, tds_isnull,
+    // (a, b) OVERLAPS (c, d); overlaps_tz includes session-dependent zone arithmetic or coercion.
     overlaps, overlaps_tz,
     // Internal: the (Y, X) input of a two-argument aggregate, NULL when either is.
     aggregate_pair,
@@ -129,13 +129,14 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     obj_description, col_description, shobj_description, current_user, session_user,
     // Discovery (B11 text lane): pg_typeof (the argument's type OID in
     // `integer`, set by the binder) and pg_get_serial_sequence.
-    pg_typeof, pg_get_serial_sequence, pg_table_is_visible, pg_get_indexdef, pg_get_constraintdef, pg_get_triggerdef, pg_partition_ancestors,
+    pg_typeof, pg_get_serial_sequence, pg_table_is_visible, pg_get_indexdef, pg_get_constraintdef, pg_get_triggerdef, pg_get_viewdef, pg_partition_ancestors,
     to_regnamespace, regnamespace_in, regnamespace_out, pg_get_statisticsobjdef_columns, pg_relation_is_publishable, pg_get_partkeydef,
     // Regular expressions (B11 text lane, regex.sig).
     regexp_like, similar_to_escape,
     // Full text search (B11 text lane, text_search.sig): the first argument
     // is the regconfig name.
-    to_tsvector, to_tsquery, plainto_tsquery, phraseto_tsquery, mysql_ifnull, mysql_date_add, mysql_last_insert_id, sind, cosd };
+    to_tsvector, to_tsquery, plainto_tsquery, phraseto_tsquery, mysql_ifnull, mysql_date_add, mysql_last_insert_id, sind, cosd, acldefault, pg_encoding_to_char, current_schemas, array_remove, to_regproc,
+    quote_ident, quote_literal, pg_get_userbyid, pg_tablespace_location };
 
 /// JSON_TABLE column flags (Node.integer of a json_table_column).
 pub const JsonTableColumn = struct {
@@ -204,13 +205,14 @@ pub fn immutableFunction(func: Func) bool {
 /// STABLE: they use type output functions.
 pub fn immutableBuiltin(func: Func) bool {
     return switch (func) {
+        .quote_ident, .quote_literal => true,
         .lower, .upper, .initcap, .char_length, .octet_length, .bit_length, .substring, .btrim, .ltrim, .rtrim, .strpos, .replace,
         .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .overlay, .to_hex => true,
         .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .sind, .cosd, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => true,
-        .extract, .date_part, .date_trunc, .age, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => true,
+        .extract, .date_part, .date_trunc, .date_bin, .age, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => true,
         .overlaps, .aggregate_pair, .normalize, .is_normalized, .mysql_date_add => true,
         .array_constructor, .array_subscript, .array_any, .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper,
-        .array_append, .array_prepend, .array_cat => true,
+        .array_append, .array_prepend, .array_cat, .array_remove => true,
         .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => true,
         .inet_host, .masklen, .inet_family, .inet_network, .broadcast, .netmask => true,
         .point_constructor, .box_constructor, .area, .center, .width, .height => true,
@@ -225,16 +227,17 @@ pub fn immutableBuiltin(func: Func) bool {
 
 pub fn strictFunction(func: Func) bool {
     return switch (func) {
+        .quote_ident, .quote_literal => true,
         .to_char, .round, .abs, .ceil, .floor, .trunc, .sign, .sqrt, .jsonb_typeof, .jsonb_array_length,
         .nextval, .currval, .setval, .lastval, .identity_next,
         .now, .transaction_timestamp, .statement_timestamp, .clock_timestamp,
-        .current_timestamp, .current_date, .current_database, .current_schema,
-        .to_regtype, .to_regclass, .pg_get_expr,
+        .current_timestamp, .current_date, .current_database, .current_schema, .current_schemas, .pg_encoding_to_char,
+        .to_regtype, .to_regclass, .to_regproc, .pg_get_expr, .acldefault, .pg_get_userbyid, .pg_tablespace_location,
         .regclass_in, .regtype_in, .regclass_out, .regtype_out, .to_regnamespace, .regnamespace_in, .regnamespace_out => true,
         .lower, .upper, .initcap, .char_length, .octet_length, .bit_length, .substring, .btrim, .ltrim, .rtrim, .strpos, .replace,
         .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .overlay, .to_hex => true,
         .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .sind, .cosd, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => true,
-        .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => true,
+        .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .date_bin, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => true,
         .to_date, .to_number, .to_timestamp, .aggregate_pair, .normalize, .is_normalized => true,
         .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper => true,
         .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => true,
@@ -243,7 +246,7 @@ pub fn strictFunction(func: Func) bool {
         .xml_is_well_formed, .xml_is_well_formed_document, .xml_is_well_formed_content => true,
         // jsonb_set_lax reads NULL arguments itself.
         .jsonb_set_lax => false,
-        .pg_get_serial_sequence, .pg_table_is_visible, .pg_get_indexdef, .pg_get_constraintdef, .pg_get_triggerdef, .pg_partition_ancestors, .pg_get_statisticsobjdef_columns, .pg_relation_is_publishable, .pg_get_partkeydef => true,
+        .pg_get_serial_sequence, .pg_table_is_visible, .pg_get_indexdef, .pg_get_constraintdef, .pg_get_triggerdef, .pg_get_viewdef, .pg_partition_ancestors, .pg_get_statisticsobjdef_columns, .pg_relation_is_publishable, .pg_get_partkeydef => true,
         .regexp_like, .similar_to_escape => true,
         .to_tsvector, .to_tsquery, .plainto_tsquery, .phraseto_tsquery => true,
         else => jsonFunction(func),
@@ -541,7 +544,10 @@ pub fn Ast(comptime config: types.Config) type {
             if_exists: bool = false,
             name: TableRef = .{},
             options: sequence.Options = .{},
+            owned_by: ?SequenceOwner = null,
         };
+
+        pub const SequenceOwner = struct { table: TableRef = .{}, column: ?Ident = null };
 
         pub const ConstraintKind = enum { check, unique, primary, foreign, exclusion };
 
@@ -693,7 +699,7 @@ pub fn Ast(comptime config: types.Config) type {
 
         pub const CreateSequence = struct {
             if_not_exists: bool = false,
-            name: Ident = .{},
+            name: TableRef = .{},
             options: sequence.Options = .{},
         };
 
@@ -709,6 +715,7 @@ pub fn Ast(comptime config: types.Config) type {
             expr: u16 = none,
             star: bool = false,
             alias: ?Ident = null,
+            expression_end: usize = 0,
         };
 
         /// RETURNING or T-SQL OUTPUT target list (count 0: none).
@@ -797,6 +804,7 @@ pub fn Ast(comptime config: types.Config) type {
             only: bool = false,
             /// A derived table expanded from a stored view definition.
             view: bool = false,
+            view_table: u16 = none,
             // Query composition (B11). NATURAL join: USING over every common
             // column name of the two operands.
             natural: bool = false,
@@ -861,7 +869,7 @@ pub fn Ast(comptime config: types.Config) type {
         /// blocks `left` and `right` (set_op != none). ORDER BY, LIMIT and
         /// OFFSET apply to the block's result.
         pub const Select = struct {
-            targets: [config.columns]Target = undefined,
+            targets: [types.projectionColumns(config)]Target = undefined,
             count: usize = 0,
             /// The single FROM table of a simple statement.
             from: ?TableRef = null,
@@ -971,8 +979,15 @@ pub fn Ast(comptime config: types.Config) type {
             rename_column: struct { from: Ident, to: Ident },
             set_default: struct { column: Ident, expression: Span },
             drop_default: Ident,
+            add_identity: struct {
+                column: Ident,
+                always: bool,
+                name: ?TableRef = null,
+                options: sequence.Options = .{},
+            },
             set_not_null: Ident,
             drop_not_null: Ident,
+            legacy_attribute_options: Ident,
             add_constraint: ConstraintDef,
             drop_constraint: struct { name: Ident, if_exists: bool = false },
             rename_table: Ident,

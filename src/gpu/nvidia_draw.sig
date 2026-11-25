@@ -7,6 +7,13 @@
 //! each call here hands its arguments over field for field. The device's
 //! memory is the nvidia Device's.
 //!
+//! On Turing (the RTX 2080 Ti: TestOptions.sm / selfTestFor .sm_75) the
+//! same test runs with TURING_A and the sm_75 programs; its depth steps
+//! read Turing's one depth-stencil surface (S8Z24) as Turing2D's words, a
+//! guess (NIL gives Turing's depth formats FermiZS GOBs, not public): 4g's
+//! probe and its logged GOBs say whether it holds. 4e (a separate stencil
+//! plane) is not on Turing.
+//!
 //! Allocation-free: `Over` holds the RTX's renderer and is at a fixed
 //! address once init has run (the Renderer points at it).
 
@@ -199,7 +206,12 @@ fn errOf(e: anyerror) draw.Error {
 /// (in `o`, the caller's storage), draw.selfTest's cases, then its
 /// buffers given back.
 pub fn selfTest(dev: Device, o: *Over, work: *nvidia.sm120_asm.Work, log: draw.Log, now_us: ?*const fn () u64) draw.SelfTest {
-    o.init(dev, work, .{ .stream_bytes = 64 * 1024, .rects = 256, .textures = 31 }) catch |e| {
+    return selfTestFor(.sm_120, dev, o, work, log, now_us);
+}
+
+/// The same on a chip of shader model `sm` (sm_75: TURING_A).
+pub fn selfTestFor(sm: nv.Sm, dev: Device, o: *Over, work: *nvidia.sm120_asm.Work, log: draw.Log, now_us: ?*const fn () u64) draw.SelfTest {
+    o.init(dev, work, .{ .stream_bytes = 64 * 1024, .rects = 256, .textures = 31, .sm = sm }) catch |e| {
         var buf: [120]u8 = undefined;
         log(std.fmt.bufPrint(&buf, "draw self-test: the renderer did not start ({s})", .{@errorName(e)}) catch "draw self-test: the renderer did not start");
         return .{ .failed = 1 };
@@ -221,7 +233,8 @@ pub fn selfTest(dev: Device, o: *Over, work: *nvidia.sm120_asm.Work, log: draw.L
 pub const Hardware = struct {
     /// The renderer started (its programs assembled, its buffers taken).
     started: bool = false,
-    /// SET_OBJECT BLACKWELL_B alone ran to its fence.
+    /// SET_OBJECT of the 3D class (BLACKWELL_B, or TURING_A) alone ran to
+    /// its fence.
     object: bool = false,
     /// The whole state and the target, no draw, ran to its fence.
     state: bool = false,
@@ -279,6 +292,8 @@ pub const TestOptions = struct {
     /// groups after the lost one still run, each naming itself; without
     /// it (or when it gives null) the test ends there.
     reopen: ?*const fn () ?gpu.Device = null,
+    /// The chip's shader model: sm_75 is TURING_A, the sm_75 programs.
+    sm: nv.Sm = .sm_120,
 };
 
 pub const Clock = *const fn () u64;
@@ -342,7 +357,7 @@ pub fn hardwareTest(dev: Device, gd: ?gpu.Device, o: *Over, kst: *kir_sm120.Stat
 pub fn hardwareTestWith(dev: Device, gd: ?gpu.Device, o: *Over, kst: *kir_sm120.State, model: *draw.Reference, log: draw.Log, now_us: Clock, opts: TestOptions) Hardware {
     var res: Hardware = .{};
     const work = &kst.asm_work;
-    o.init(dev, work, .{ .stream_bytes = 64 * 1024, .rects = 256, .textures = 31 }) catch |e| {
+    o.init(dev, work, .{ .stream_bytes = 64 * 1024, .rects = 256, .textures = 31, .sm = opts.sm }) catch |e| {
         hsay(log, "the renderer did not start ({s}): nothing sent", .{@errorName(e)});
         return res;
     };
@@ -354,15 +369,17 @@ pub fn hardwareTestWith(dev: Device, gd: ?gpu.Device, o: *Over, kst: *kir_sm120.
     // 1. The 3D engine's object bound to its subchannel, nothing else.
     {
         var p = nvidia.push.Push{ .buf = o.r.pb.words() };
-        p.setObject(nv.SUBCH, nv.BLACKWELL_B);
+        const class = nv.classFor(opts.sm);
+        const cname = if (opts.sm == .sm_75) "TURING_A" else "BLACKWELL_B";
+        p.setObject(nv.SUBCH, class);
         const t0 = now_us();
         dev.run(o.r.pb, @intCast(p.len), STEP_US) catch |e| {
-            hsay(log, "step 1, SET_OBJECT BLACKWELL_B (0x{x}) on subchannel {d}: FAILED ({s} after {d} us): the channel did not take the 3D engine's object", .{ nv.BLACKWELL_B, nv.SUBCH, @errorName(e), now_us() - t0 });
+            hsay(log, "step 1, SET_OBJECT {s} (0x{x}) on subchannel {d}: FAILED ({s} after {d} us): the channel did not take the 3D engine's object", .{ cname, class, nv.SUBCH, @errorName(e), now_us() - t0 });
             res.lost = true;
             return res;
         };
         res.object = true;
-        hsay(log, "step 1, SET_OBJECT BLACKWELL_B (0x{x}) on subchannel {d}: done in {d} us", .{ nv.BLACKWELL_B, nv.SUBCH, now_us() - t0 });
+        hsay(log, "step 1, SET_OBJECT {s} (0x{x}) on subchannel {d}: done in {d} us", .{ cname, class, nv.SUBCH, now_us() - t0 });
     }
 
     const bytes = draw.CASE_W * draw.CASE_H * 4;
@@ -711,13 +728,19 @@ fn inGroup(g: EdgeGroup, sc: EdgeScene) bool {
 }
 
 /// The draws step 4 makes (each group's scenes, rows up and flipped).
-pub const EDGE_RUNS = blk: {
+pub const EDGE_RUNS = edgeRunsFor(false);
+
+/// The same on Turing: no 4e (Turing has no stencil plane of its own).
+pub const EDGE_RUNS_TURING = edgeRunsFor(true);
+
+fn edgeRunsFor(comptime turing: bool) u32 {
     var n: u32 = 0;
     for (edge_groups) |g| {
+        if (turing and g.g == .depth_less_separate) continue;
         for (edge_scenes) |sc| n += 2 * @as(u32, @intFromBool(inGroup(g.g, sc)));
     }
-    break :blk n;
-};
+    return n;
+}
 
 /// Byte offset of pixel (x, y) of a 64 x 32 RGBA8 target: rows, or block
 /// linear as the depth target (E_GOBS).
@@ -756,6 +779,10 @@ fn edges(d0: gpu.Device, st: *kir_sm120.State, log: draw.Log, now_us: Clock, res
     };
     var d = d0;
     for (edge_groups) |grp| {
+        if (d.caps.target == .sm_75 and grp.g == .depth_less_separate) {
+            hsay(log, "step {s}, edges: not on Turing (its stencil is in the depth's words: clc597.h has no SET_ST_*, no STENCIL_IS_SEPARATE)", .{grp.label});
+            continue;
+        }
         const outcome = if (grp.g == .z24_probe) z24Probe(d, st, &vbin, grp, log, now_us, res) else edgeGroup(d, &vbin, &pbin, grp, log, now_us, res);
         switch (outcome) {
             .done => {},
@@ -811,12 +838,15 @@ fn edgeGroup(d: gpu.Device, vbin: *const gpu.Binary, pbin: *const gpu.Binary, gr
     const block = grp.g != .triangles and grp.g != .culling;
     const less = grp.g != .depth_equal;
     const z24 = grp.g == .z24_less;
+    // (Turing: a 24-bit depth a whole word where Turing2D puts it, the guess
+    // 4g probes; Blackwell: its Z24 GOBs' three bytes)
+    const words = d.caps.target == .sm_75;
     const splane = d.alloc(E_S_BYTES, .host) catch return noMemory(log, res);
     defer d.free(splane);
     @memset(splane.cpu[0..E_S_BYTES], 0);
     d.toDevice(splane, 0, E_S_BYTES);
     const add = gpu.GraphicsBlend{ .src_rgb = .one, .dst_rgb = .one, .src_a = .one, .dst_a = .one };
-    hsay(log, "step {s}, edges: {s}", .{ grp.label, grp.what });
+    hsay(log, "step {s}, edges: {s}{s}", .{ grp.label, grp.what, if (words and block) " (on Turing: the depth read as Turing2D's words, a guess: FermiZS)" else "" });
     for ([_]bool{ false, true }) |flipped| {
         for (edge_scenes) |sc| {
             if (!inGroup(grp.g, sc)) continue;
@@ -831,7 +861,9 @@ fn edgeGroup(d: gpu.Device, vbin: *const gpu.Binary, pbin: *const gpu.Binary, gr
             d.toDevice(target, 0, E_DEPTH_BYTES);
             if (block) {
                 for (0..EH) |y| for (0..EW) |x| {
-                    if (z24) {
+                    if (z24 and words) {
+                        std.mem.writeInt(u32, depth.cpu[pixelAt(true, x, y)..][0..4], 0x00ff_ffff, .little);
+                    } else if (z24) {
                         for (model3d.z24Bytes(E_PITCH, E_GOBS, @intCast(x), @intCast(y))) |b| depth.cpu[b] = 0xff;
                     } else std.mem.writeInt(u32, depth.cpu[pixelAt(true, x, y)..][0..4], ONE_BITS, .little);
                 };
@@ -921,7 +953,8 @@ fn edgeGroup(d: gpu.Device, vbin: *const gpu.Binary, pbin: *const gpu.Binary, gr
                 const at = pixelAt(block, x, y);
                 const h = hitsOf(target.cpu[at]);
                 const zb = model3d.z24Bytes(E_PITCH, E_GOBS, @intCast(x), @intCast(y));
-                const z = if (!block) 0 else if (z24) @as(u32, depth.cpu[zb[0]]) | @as(u32, depth.cpu[zb[1]]) << 8 | @as(u32, depth.cpu[zb[2]]) << 16 else std.mem.readInt(u32, depth.cpu[pixelAt(true, x, y)..][0..4], .little);
+                const zword = std.mem.readInt(u32, depth.cpu[pixelAt(true, x, y)..][0..4], .little);
+                const z = if (!block) 0 else if (z24 and words) zword & 0xff_ffff else if (z24) @as(u32, depth.cpu[zb[0]]) | @as(u32, depth.cpu[zb[1]]) << 8 | @as(u32, depth.cpu[zb[2]]) << 16 else zword;
                 const mz = if (z24) E.m.z[i] else E.m.zf[i];
                 const mh = E.m.hits[i];
                 if (grp.g != .depth_equal) {
@@ -1041,7 +1074,11 @@ fn z24Probe(d: gpu.Device, st: *kir_sm120.State, vbin: *const gpu.Binary, grp: E
     defer d.free(target);
     const depth = d.alloc(E_DEPTH_BYTES, .host) catch return noMemory(log, res);
     defer d.free(depth);
-    hsay(log, "step {s}: {s}", .{ grp.label, grp.what });
+    const words = d.caps.target == .sm_75;
+    if (words)
+        hsay(log, "step {s}: a probe of Turing's depth GOBs (FermiZS: not public): each pixel's id as its gl_FragDepth, ALWAYS, into an X8Z24 plane zeroed; checked against Turing2D's 32-bit words, its first two GOBs logged", .{grp.label})
+    else
+        hsay(log, "step {s}: {s}", .{ grp.label, grp.what });
     const whole = [6][4]f32{ .{ -1, -1, 0, 1 }, .{ 1, -1, 0, 1 }, .{ 1, 1, 0, 1 }, .{ -1, -1, 0, 1 }, .{ 1, 1, 0, 1 }, .{ -1, 1, 0, 1 } };
     @memcpy(vb.cpu[0 .. 6 * 16], std.mem.sliceAsBytes(&whole));
     d.toDevice(vb, 0, 6 * 16);
@@ -1081,7 +1118,8 @@ fn z24Probe(d: gpu.Device, st: *kir_sm120.State, vbin: *const gpu.Binary, grp: E
     var upper: u32 = 0;
     for (0..EH) |y| for (0..EW) |x| {
         drawn += @intFromBool(hitsOf(target.cpu[pixelAt(true, x, y)]) != 0);
-        const zb = model3d.z24Bytes(E_PITCH, E_GOBS, @intCast(x), @intCast(y));
+        const wat = pixelAt(true, x, y);
+        const zb = if (words) [3]usize{ wat, wat + 1, wat + 2 } else model3d.z24Bytes(E_PITCH, E_GOBS, @intCast(x), @intCast(y));
         const got = [3]u8{ depth.cpu[zb[0]], depth.cpu[zb[1]], depth.cpu[zb[2]] };
         const is_split = zb[1] + 1 == zb[2] and zb[0] + 1 != zb[1];
         const ok = probeIs(got, @intCast(x), @intCast(y));
@@ -1091,7 +1129,10 @@ fn z24Probe(d: gpu.Device, st: *kir_sm120.State, vbin: *const gpu.Binary, grp: E
         split += @intFromBool(is_split);
         split_placed += @intFromBool(is_split and ok);
     };
-    hsay(log, "step {s}: the 3D engine drew {d} of {d} pixels; {d} pixels' three bytes are where Blackwell's Z24 GOBs (emu3d.z24Bytes) put them, {d} their upper two; of the {d} split ones {d} with their low byte where guessed; in {d} us; the first two GOBs' words:", .{ grp.label, drawn, EW * EH, placed, upper, split, split_placed, now_us() - t0 });
+    if (words)
+        hsay(log, "step {s}: the 3D engine drew {d} of {d} pixels; {d} pixels' depths are where Turing2D's 32-bit words put them ({s}), {d} their upper two bytes; in {d} us; the first two GOBs' words:", .{ grp.label, drawn, EW * EH, placed, if (placed == EW * EH) "Turing's depth GOBs ARE Turing2D's" else "Turing's depth GOBs are NOT Turing2D's: the words below say how", upper, now_us() - t0 })
+    else
+        hsay(log, "step {s}: the 3D engine drew {d} of {d} pixels; {d} pixels' three bytes are where Blackwell's Z24 GOBs (emu3d.z24Bytes) put them, {d} their upper two; of the {d} split ones {d} with their low byte where guessed; in {d} us; the first two GOBs' words:", .{ grp.label, drawn, EW * EH, placed, upper, split, split_placed, now_us() - t0 });
     var off: usize = 0;
     while (off < 1024) : (off += 32) {
         var ws: [8]u32 = undefined;
@@ -1425,6 +1466,8 @@ fn featuresFrom(d: gpu.Device, from: usize, st: *kir_sm120.State, log: draw.Log,
     defer d.free(ibuf);
     @memcpy(ibuf.cpu[0 .. restart_indices.len * 2], std.mem.sliceAsBytes(&restart_indices));
     d.toDevice(ibuf, 0, 64);
+    // (Turing: the stencil in the depth's words, S8Z24's top byte)
+    const on_turing = d.caps.target == .sm_75;
     for (feature_scenes, 0..) |sc, si| {
         if (si < from) continue;
         const block = featureDepth(sc.kind);
@@ -1473,7 +1516,7 @@ fn featuresFrom(d: gpu.Device, from: usize, st: *kir_sm120.State, log: draw.Log,
             .offset = .{ EW / 2, EH / 2, 0.5 },
             .scissor = .{ 0, 0, EW, EH },
             .count = nverts,
-            .depth = if (block) .{ .va = depth.gpu, .stencil_va = if (stencil) splane.gpu else null, .float = featureFloat(sc.kind), .width = EW, .height = EH, .gobs_log2 = E_GOBS, .tested = false, .write = false, .func = 7 } else null,
+            .depth = if (block) .{ .va = depth.gpu, .stencil_va = if (stencil and !on_turing) splane.gpu else null, .float = featureFloat(sc.kind), .width = EW, .height = EH, .gobs_log2 = E_GOBS, .tested = false, .write = false, .func = 7 } else null,
         };
         featureGraphics(sc.kind, &g);
         if (sc.kind == .mrt) g.more[1] = .{ .va = target2.gpu, .stride = EW * 4, .format = .bgra8 };
@@ -1490,7 +1533,7 @@ fn featuresFrom(d: gpu.Device, from: usize, st: *kir_sm120.State, log: draw.Log,
             continue;
         };
         d.wait(fence, STEP_US) catch |e| {
-            hsay(log, "step 5, '{s}': FAILED: the draw did not finish ({s} after {d} us): the channel is lost ({s})", .{ sc.name, @errorName(e), now_us() - t0, if (block) "a block-linear colour target, an S8Z24 depth target" else "a pitch target, no depth" });
+            hsay(log, "step 5, '{s}': FAILED: the draw did not finish ({s} after {d} us): the channel is lost ({s})", .{ sc.name, @errorName(e), now_us() - t0, if (block and on_turing) "a block-linear colour target, an S8Z24 depth target, its stencil in the depth's words" else if (block) "a block-linear colour target, an S8Z24 depth target" else "a pitch target, no depth" });
             return si;
         };
         d.fromDevice(target, 0, E_DEPTH_BYTES);
@@ -1511,7 +1554,7 @@ fn featuresFrom(d: gpu.Device, from: usize, st: *kir_sm120.State, log: draw.Log,
             // scene's, never written: the CPU's own words) its low 24 bits)
             const zword = std.mem.readInt(u32, depth.cpu[at..][0..4], .little);
             const zw = if (!block) F.m.z[i] else if (featureFloat(sc.kind)) zword else zword & 0xff_ffff;
-            const sv: u32 = if (stencil) splane.cpu[model3d.blAddress8(E_S_PITCH, E_GOBS, @intCast(x), @intCast(y))] else F.m.s[i];
+            const sv: u32 = if (stencil and on_turing) zword >> 24 else if (stencil) splane.cpu[model3d.blAddress8(E_S_PITCH, E_GOBS, @intCast(x), @intCast(y))] else F.m.s[i];
             const mc = F.m.color[i];
             drawn += @intFromBool(!std.mem.allEqual(u8, &got, 0));
             want += @intFromBool(!std.mem.allEqual(u8, &mc, 0));
@@ -1564,8 +1607,13 @@ const T = struct {
     var model: draw.Reference = .{ .mem = &mem };
 
     fn fresh() Device {
+        return freshFor(.sm_120);
+    }
+
+    /// A fresh emulated card of generation `sm` with its 3D engine.
+    fn freshFor(sm: nv.Sm) Device {
         engine = .{};
-        dev = .{ .arena = &arena, .gpu_view = &gpu_view, .work = &work, .gr3d = &engine };
+        dev = .{ .arena = &arena, .gpu_view = &gpu_view, .work = &work, .gr3d = &engine, .sm = sm };
         return dev.device();
     }
 
@@ -1659,4 +1707,20 @@ test "nvidia_draw: compare counts the pixels further apart than the tolerance" {
     try testing.expectEqual(@as(?usize, 1), d.first);
     try testing.expectEqual(@as(u8, 9), d.largest);
     try testing.expectEqual(@as(?usize, null), compare(&a, &a, 0).first);
+}
+
+test "nvidia_draw on Turing: the self-test and the hardware test's steps 1 to 3 on the emulated RTX 2080 Ti (TURING_A, sm_75 programs)" {
+    const st = selfTestFor(.sm_75, T.freshFor(.sm_75), &T.over, &T.asm_work, &T.quiet, null);
+    try testing.expectEqual(@as(u32, draw.cases.len), st.passed);
+    try testing.expectEqual(@as(u32, 0), st.failed);
+    const res = hardwareTestWith(T.freshFor(.sm_75), null, &T.over, &T.st, &T.model, &T.loud, &T.clock, .{ .sm = .sm_75 });
+    try testing.expect(res.started and res.object and res.state);
+    try testing.expectEqual(@as(u32, draw.cases.len), res.passed);
+    try testing.expectEqual(@as(u32, 0), res.failed);
+    try testing.expect(!res.lost and res.mpx_per_s > 0);
+    // (Blackwell's class on the Turing card is refused at step 1)
+    const wrong = hardwareTest(T.freshFor(.sm_75), null, &T.over, &T.st, &T.model, &T.silent, &T.clock);
+    try testing.expect(wrong.started and !wrong.object and wrong.lost);
+    // (4e's five scenes, each rows up and flipped, are not on Turing)
+    try testing.expectEqual(EDGE_RUNS - 10, EDGE_RUNS_TURING);
 }

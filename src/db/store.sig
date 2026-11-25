@@ -697,6 +697,8 @@ pub fn Store(comptime Raw: type) type {
 
         pub const Connection = struct {
             pub const detached_primary_key = if (@hasDecl(Raw, "ReadContext")) @hasDecl(Raw.ReadContext, "primaryKeyMatches") else false;
+            pub const detached_cached_primary_key = if (@hasDecl(Raw, "ReadContext")) @hasDecl(Raw.ReadContext, "runCachedPrimaryKey") else false;
+            pub const DetachedKeyView = if (@hasDecl(Raw, "ReadContext") and @hasDecl(Raw.ReadContext, "cachedPrimaryKeyView")) Raw.ReadContext.PrimaryKeyView else void;
 
             pub const Result = Raw.Result;
             pub const simple_query_batches = @hasDecl(Raw, "preflightPostgresBatch");
@@ -775,6 +777,14 @@ pub fn Store(comptime Raw: type) type {
                     self.engine_session.values.role != 0)
                     return error.AuthenticationFailed;
                 self.engine_session.session_role = self.store.database.authenticatedRole(username) orelse return error.AuthenticationFailed;
+            }
+
+            /// Startup parameters have been parsed and the wire identity is
+            /// final. Install the role's defaults before the first query.
+            pub fn finalizePostgresLogin(self: *Connection) void {
+                if (comptime has_engine_session and @hasDecl(Raw, "applyRoleDefaults")) {
+                    self.store.database.applyRoleDefaults(&self.engine_session);
+                }
             }
 
             /// Backend pid reported with this session's NOTIFY (codec-set).
@@ -916,6 +926,9 @@ pub fn Store(comptime Raw: type) type {
                 }
                 if (comptime has_engine_session and @hasField(Raw.SessionValues, "synchronize_seqscans")) {
                     session.synchronize_seqscans = self.dialect == .postgres and self.engine_session.values.synchronize_seqscans;
+                }
+                if (comptime has_engine_session and @hasField(Raw.SessionValues, "quote_all_identifiers")) {
+                    session.quote_all_identifiers = self.engine_session.values.quote_all_identifiers;
                 }
                 if (comptime has_engine_session and @hasField(Raw.SessionValues, "restricted_relation_kinds")) {
                     session.restricted_relation_kinds = self.engine_session.values.restricted_relation_kinds;
@@ -2006,6 +2019,37 @@ pub fn Store(comptime Raw: type) type {
 
             pub fn execute(self: *Connection, source: []const u8, result: *Result) !void {
                 return self.executeMode(source, result, false);
+            }
+
+            /// The reactor owns the database read gate and a private context.
+            /// A cache miss leaves the request to the ordinary portal path.
+            pub fn executeCachedDetachedPrimaryKey(self: *Connection, source: []const u8, oid: u32, key: ?i64, result: *Result) !bool {
+                if (comptime !detached_cached_primary_key) return false;
+                const context = self.read_context orelse return false;
+                const data_type = self.detachedKeyType(oid) orelse return false;
+                const raw = &self.store.database;
+                const argument: Raw.Cell = if (key) |value| .{ .integer = value } else .null_value;
+                return context.runCachedPrimaryKey(raw, source, .{ .csn = raw.csn }, data_type, &argument, result);
+            }
+
+            pub fn viewCachedDetachedPrimaryKey(self: *Connection, source: []const u8, oid: u32, key: ?i64, output: []u8) !?DetachedKeyView {
+                if (comptime DetachedKeyView == void) return null;
+                const context = self.read_context orelse return null;
+                const data_type = self.detachedKeyType(oid) orelse return null;
+                const raw = &self.store.database;
+                const argument: Raw.Cell = if (key) |value| .{ .integer = value } else .null_value;
+                return context.cachedPrimaryKeyView(raw, source, .{ .csn = raw.csn }, data_type, &argument, output);
+            }
+
+            fn detachedKeyType(self: *const Connection, oid: u32) ?@TypeOf(@as(Result, undefined).column_types[0]) {
+                if (self.id == 0 or !self.running_statement or self.failed or self.in_transaction or self.tx != null or
+                    !self.autocommit or self.pending.active or self.dialect != .postgres or !self.detachedIdentity()) return null;
+                return switch (oid) {
+                    20 => .integer,
+                    21 => .smallint,
+                    23 => .integer32,
+                    else => null,
+                };
             }
 
             pub fn executeExtended(self: *Connection, source: []const u8, result: *Result) !void {

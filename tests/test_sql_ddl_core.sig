@@ -693,8 +693,36 @@ fn alterPrimaryKey() !void {
     try run("CREATE TABLE pairs (a INT, b INT)");
     try run("INSERT INTO pairs VALUES (1,1),(1,2),(2,1)");
     const pair_query = "SELECT a,b FROM pairs ORDER BY a,b";
-    try rejects("ALTER TABLE pairs ADD PRIMARY KEY (a,b)", error.UnsupportedStatement, pair_query, "1|1;1|2;2|1");
+    try run("ALTER TABLE pairs ADD PRIMARY KEY (a,b)");
+    try expect(pair_query, "1|1;1|2;2|1");
+    try rejects("INSERT INTO pairs VALUES (1,2)", error.PrimaryKeyViolation, pair_query, "1|1;1|2;2|1");
+    try rejects("INSERT INTO pairs VALUES (2,NULL)", error.NotNullViolation, pair_query, "1|1;1|2;2|1");
     try sameState(&.{pair_query});
+}
+
+fn restorePrimaryInCreateTransaction() !void {
+    reset();
+    const restore = try db.begin();
+    try statement(restore, "CREATE TABLE restore_parent(id INT, label TEXT DEFAULT 'north')");
+    try statement(restore, "CREATE TABLE restore_child(id INT, parent_id INT)");
+    try statement(restore, "INSERT INTO restore_parent(id) VALUES (1),(2)");
+    try statement(restore, "INSERT INTO restore_child VALUES (11,2),(12,1)");
+    try statement(restore, "ALTER TABLE ONLY restore_parent ADD CONSTRAINT restore_parent_pkey PRIMARY KEY (id)");
+    try statement(restore, "ALTER TABLE ONLY restore_child ADD CONSTRAINT restore_child_pkey PRIMARY KEY (id)");
+    try statement(restore, "ALTER TABLE ONLY restore_child ADD CONSTRAINT restore_parent_fk FOREIGN KEY (parent_id) REFERENCES restore_parent(id)");
+    try commit(restore);
+    const query_text = "SELECT c.id,p.label FROM restore_child c JOIN restore_parent p ON p.id=c.parent_id ORDER BY c.id";
+    try expect(query_text, "11|north;12|north");
+    try sameState(&.{query_text});
+    try rejects("INSERT INTO restore_parent(id) VALUES (1)", error.PrimaryKeyViolation, query_text, "11|north;12|north");
+    try rejects("INSERT INTO restore_child VALUES (13,99)", error.ForeignKeyViolation, query_text, "11|north;12|north");
+
+    const invalid = try db.begin();
+    try statement(invalid, "CREATE TABLE invalid_restore(id INT)");
+    try statement(invalid, "INSERT INTO invalid_restore VALUES (1),(1)");
+    try statementFails(invalid, "ALTER TABLE invalid_restore ADD PRIMARY KEY(id)", error.PrimaryKeyViolation);
+    db.abort(invalid);
+    try expect("SELECT count(*) FROM pg_class WHERE relname='invalid_restore'", "0");
 }
 
 fn latePrimaryRecordFence() !void {
@@ -786,6 +814,49 @@ fn alterErrors() !void {
     try run("INSERT INTO ident (x) VALUES (5)");
     try expect("SELECT id, x FROM ident", "1|5");
     try sameState(&.{ "SELECT id, x FROM ident", probe });
+}
+
+fn legacyAttributeOptions() !void {
+    reset();
+    try run("CREATE TABLE a (id INT PRIMARY KEY, \"Payload\" INT)");
+    try run("INSERT INTO a VALUES (1, 10)");
+    const probe = "SELECT * FROM a ORDER BY id";
+    const metadata = "SELECT attoptions FROM pg_attribute WHERE attrelid='a'::regclass AND attname='Payload'";
+    const wal_before = records_applied;
+    const set = "ALTER TABLE ONLY a ALTER COLUMN \"Payload\" SET (pg_attver=42)";
+    const reset_options = "ALTER TABLE a ALTER COLUMN \"Payload\" RESET (\"pg_attver\")";
+    const result = try replicate(set);
+    try check(result.command == .alter_table);
+    try run("ALTER TABLE a ALTER id SET (PG_ATTVER, pg_attver='old'), ALTER \"Payload\" RESET (pg_attver)");
+    try run(reset_options);
+    try check(records_applied == wal_before);
+    try expect(metadata, "NULL");
+    try sameState(&.{ probe, metadata });
+
+    try rejects("ALTER TABLE a ALTER nope SET (pg_attver=1)", error.ColumnNotFound, probe, "1|10");
+    try rejects("ALTER TABLE a ALTER ctid SET (pg_attver=1)", error.UnsupportedStatement, probe, "1|10");
+    try rejects("ALTER TABLE a ALTER id SET ()", error.Syntax, probe, "1|10");
+    try rejects("ALTER TABLE a ALTER id RESET (pg_attver=1)", error.Syntax, probe, "1|10");
+    try rejects("ALTER TABLE a ALTER id SET (pg_attver=1, n_distinct=2)", error.UnsupportedStatement, probe, "1|10");
+    try rejects("ALTER TABLE a ALTER id SET (pg_attver=1+2)", error.Syntax, probe, "1|10");
+    try rejects("ALTER TABLE a ALTER id SET (\"PG_ATTVER\"=1)", error.UnsupportedStatement, probe, "1|10");
+    try rejects("ALTER TABLE a ADD COLUMN extra INT, ALTER missing SET (pg_attver=1)", error.ColumnNotFound, probe, "1|10");
+    try run("ALTER TABLE a ALTER extra SET (pg_attver=1), ADD COLUMN extra INT DEFAULT 20");
+    try expect(probe, "1|10|20");
+    try sameState(&.{probe});
+
+    const alterer = try db.begin();
+    try statement(alterer, set);
+    const concurrent = try db.begin();
+    try same(try rows(concurrent, probe), "1|10|20");
+    try statement(concurrent, "UPDATE a SET \"Payload\"=11 WHERE id=1");
+    try parks(concurrent, reset_options);
+    try check(db.waitingFor(concurrent).has(alterer));
+    db.abort(alterer);
+    _ = try resumed(concurrent, reset_options);
+    try commit(concurrent);
+    try expect(probe, "1|11|20");
+    try sameState(&.{ probe, metadata });
 }
 
 fn alterTransactions() !void {
@@ -918,6 +989,33 @@ fn serialColumns() !void {
     try sameState(&sequence_probes);
 }
 
+fn sequenceOwnership() !void {
+    reset();
+    try run("CREATE SCHEMA src");
+    try run("CREATE SCHEMA dst");
+    try run("CREATE TABLE src.items (id SERIAL, n INT)");
+    try run("CREATE TABLE dst.items (id SERIAL, n INT)");
+    try run("INSERT INTO src.items(n) VALUES (10)");
+    try run("INSERT INTO dst.items(n) VALUES (20)");
+    try run("CREATE SEQUENCE src.ticket START WITH 21");
+    const registered = "SELECT pg_get_serial_sequence('src.items','n')";
+    const abandoned = try db.begin();
+    try statement(abandoned, "ALTER SEQUENCE src.ticket OWNED BY src.items.n");
+    db.abort(abandoned);
+    try expect(registered, "NULL");
+    try rejects("ALTER SEQUENCE src.ticket OWNED BY dst.items.n", error.InvalidParameterValue, registered, "NULL");
+    try run("ALTER SEQUENCE src.ticket OWNED BY src.items.n CACHE 2");
+    try expect(registered, "src.ticket");
+    try expect("SELECT pg_get_serial_sequence('src.items','id'),pg_get_serial_sequence('dst.items','id')", "src.items_id_seq|dst.items_id_seq");
+    try sameState(&.{ registered, "SELECT id,n FROM src.items", "SELECT id,n FROM dst.items" });
+    try run("ALTER SEQUENCE src.ticket OWNED BY NONE");
+    try expect(registered, "NULL");
+    try run("DROP TABLE src.items");
+    const count = "SELECT count(*) FROM pg_class WHERE relkind='S'";
+    try expect(count, "2");
+    try sameState(&.{ count, "SELECT last_value FROM src.ticket" });
+}
+
 var session_a: DB.SequenceSession = .{};
 var session_b: DB.SequenceSession = .{};
 
@@ -990,7 +1088,8 @@ fn alterSequences() !void {
     try rejects("ALTER SEQUENCE tdd_seq RESTART WITH 41", error.InvalidParameterValue, "SELECT seqmax FROM pg_sequence WHERE seqrelid = 'tdd_seq'::regclass", "40");
     try rejects("ALTER SEQUENCE missing RESTART", error.TableNotFound, "SELECT COUNT(*) FROM pg_sequence", "2");
     try rejects("ALTER SEQUENCE tdd_serial RESTART", error.WrongObjectType, "SELECT COUNT(*) FROM pg_sequence", "2");
-    try rejects("ALTER SEQUENCE tdd_seq OWNED BY NONE", error.UnsupportedStatement, "SELECT COUNT(*) FROM pg_sequence", "2");
+    try run("ALTER SEQUENCE tdd_seq OWNED BY NONE");
+    try expect("SELECT COUNT(*) FROM pg_sequence", "2");
     try rejects("ALTER SEQUENCE tdd_seq INCREMENT BY 0", error.InvalidParameterValue, "SELECT seqincrement FROM pg_sequence WHERE seqrelid = 'tdd_seq'::regclass", "5");
     try sameState(&sequence_probes);
     try check(try int(&replica, "SELECT nextval('tdd_seq')") == 30);
@@ -1445,11 +1544,14 @@ pub fn main(init: std.process.Init) !void {
     try alterValues();
     try alterConstraints();
     try alterPrimaryKey();
+    try restorePrimaryInCreateTransaction();
     try latePrimaryRecordFence();
     try alterErrors();
+    try legacyAttributeOptions();
     try alterTransactions();
     try alterIsolation();
     try serialColumns();
+    try sequenceOwnership();
     try sequenceCache();
     try alterSequences();
     try updateFrom();

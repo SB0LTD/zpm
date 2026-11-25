@@ -51,7 +51,16 @@ pub const MAX_CONNECTIONS: usize = 128;
 pub const RECV_BUF_SIZE: usize = 512 * 1024;
 pub const SMALL_RECV_SIZE: usize = 64 * 1024;
 pub const BIG_WINDOWS: usize = 32;
+/// A send buffer, likewise: a slot's own is SEND_BUF_SIZE, and a sender
+/// that fills it (an upload, a live stream) borrows one of BIG_SENDS big
+/// ones until the slot is freed. A sender can have no more than its buffer
+/// in flight, so at 32 KiB a stream to Twitch's ingest, 60 ms away, ran at
+/// 32 KiB a round trip, 4.4 Mb/s, under the 4.8 Mb/s it sends: every
+/// picture waited for room, a quarter of them skipped (galaxy-turing,
+/// 2026-11-25). 512 KiB at 60 ms is 70 Mb/s. 8 x 512 KiB = 4 MiB.
 pub const SEND_BUF_SIZE: usize = 32 * 1024;
+pub const BIG_SEND_SIZE: usize = 512 * 1024;
+pub const BIG_SENDS: usize = 8;
 pub const DEFAULT_MSS: u16 = 1460; // Ethernet MTU - IP(20) - TCP(20)
 pub const MAX_WINDOW: u32 = 1073741824; // 1GB with scaling
 /// Our window scale shift (the window field counts in 16-byte units).
@@ -288,19 +297,25 @@ pub const Connection = struct {
     total_recv: u64,
     retransmits: u32,
 
+    /// The send ring while the slot has no big send buffer.
     send_buf: [SEND_BUF_SIZE]u8,
     /// The receive ring while the slot has no big window.
     recv_small: [SMALL_RECV_SIZE]u8,
     /// The big window this slot borrowed (an index into big_windows), or
     /// NO_BIG_WINDOW.
     big: u8,
+    /// The big send buffer this slot borrowed (an index into big_sends), or
+    /// NO_BIG_SEND.
+    big_send: u8,
 
     /// Reset everything but the buffers (their contents are dead once the
     /// counters are zero; clearing 96 KB per connection would be waste),
-    /// and give back a borrowed big window.
+    /// and give back a borrowed big window and big send buffer.
     pub fn reset(self: *Connection) void {
         if (self.big < BIG_WINDOWS) big_window_used[self.big] = false;
         self.big = NO_BIG_WINDOW;
+        if (self.big_send < BIG_SENDS) big_send_used[self.big_send] = false;
+        self.big_send = NO_BIG_SEND;
         self.state = .closed;
         self.active = false;
         self.user_closed = false;
@@ -382,8 +397,23 @@ pub const Connection = struct {
         return self.rcv_count;
     }
 
+    /// Room in the send ring (a write that does not fit the slot's own
+    /// borrows a big one: send).
     pub fn writable(self: *const Connection) usize {
-        return SEND_BUF_SIZE - self.snd_count;
+        return self.sendCap() - self.snd_count;
+    }
+
+    /// The send ring: the borrowed big buffer, or the slot's own.
+    fn sendRing(self: *Connection) []u8 {
+        return if (self.big_send < BIG_SENDS) &big_sends[self.big_send] else &self.send_buf;
+    }
+
+    fn sendView(self: *const Connection) []const u8 {
+        return if (self.big_send < BIG_SENDS) &big_sends[self.big_send] else &self.send_buf;
+    }
+
+    fn sendCap(self: *const Connection) usize {
+        return if (self.big_send < BIG_SENDS) BIG_SEND_SIZE else SEND_BUF_SIZE;
     }
 
     /// RTO with exponential backoff for consecutive timeouts. The backoff is
@@ -447,6 +477,9 @@ var pool_ready = false;
 const NO_BIG_WINDOW: u8 = 0xFF;
 var big_windows: [BIG_WINDOWS][RECV_BUF_SIZE]u8 = undefined;
 var big_window_used: [BIG_WINDOWS]bool = @splat(false);
+const NO_BIG_SEND: u8 = 0xFF;
+var big_sends: [BIG_SENDS][BIG_SEND_SIZE]u8 = undefined;
+var big_send_used: [BIG_SENDS]bool = @splat(false);
 var clock_us: u64 = 0;
 var isn_key: u64 = 0x9E37_79B9_7F4A_7C15;
 var next_local_port: u16 = 49152;
@@ -455,6 +488,7 @@ fn pool() *[MAX_CONNECTIONS]Connection {
     if (!pool_ready) {
         for (&connections) |*c| {
             c.big = NO_BIG_WINDOW;
+            c.big_send = NO_BIG_SEND;
             c.reset();
         }
         pool_ready = true;
@@ -629,11 +663,29 @@ pub fn send(handle: u8, data: []const u8) usize {
     const c = conn(handle) orelse return 0;
     if (c.state != .established and c.state != .close_wait) return 0;
     if (c.fin_queued) return 0;
-    const n = @min(data.len, SEND_BUF_SIZE - c.snd_count);
+    // (more than its own buffer holds: a big one, if one is free)
+    if (c.snd_count + data.len > SEND_BUF_SIZE) growSend(c);
+    const cap = c.sendCap();
+    const n = @min(data.len, cap - c.snd_count);
     if (n == 0) return 0;
-    ringWrite(&c.send_buf, (c.snd_head + c.snd_count) % SEND_BUF_SIZE, data[0..n]);
+    ringWrite(c.sendRing(), (c.snd_head + c.snd_count) % cap, data[0..n]);
     c.snd_count += n;
     return n;
+}
+
+/// Borrow a free big send buffer for `c`, if it has none and one is free:
+/// the bytes queued (in flight or not) move over from the head, so every
+/// sequence number keeps its offset from SND.UNA.
+fn growSend(c: *Connection) void {
+    if (c.big_send < BIG_SENDS) return;
+    for (&big_send_used, 0..) |*used, i| {
+        if (used.*) continue;
+        used.* = true;
+        ringRead(&c.send_buf, c.snd_head, big_sends[i][0..c.snd_count]);
+        c.snd_head = 0;
+        c.big_send = @intCast(i);
+        return;
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1105,7 +1157,7 @@ fn processAck(c: *Connection, seg: *const Segment, payload_len: usize) void {
         c.snd_una = seg.ack;
         if (seqLt(c.snd_nxt, c.snd_una)) c.snd_nxt = c.snd_una;
         const data_acked: u32 = @min(acked, @as(u32, @intCast(c.snd_count)));
-        c.snd_head = (c.snd_head + data_acked) % SEND_BUF_SIZE;
+        c.snd_head = (c.snd_head + data_acked) % c.sendCap();
         c.snd_count -= data_acked;
         acked = data_acked;
         // Our FIN occupies fin_seq; it is acknowledged once SND.UNA passes it
@@ -1346,10 +1398,12 @@ fn buildControl(c: *Connection, flags: u8, seq: u32, buf: []u8) ?usize {
 /// out of the send ring (which may wrap: up to two slices).
 fn buildData(c: *Connection, seq: u32, len: u32, push: bool, buf: []u8) ?usize {
     const off: usize = seq -% c.snd_una;
-    const start = (c.snd_head + off) % SEND_BUF_SIZE;
-    const first = @min(@as(usize, len), SEND_BUF_SIZE - start);
-    const a = c.send_buf[start..][0..first];
-    const b = c.send_buf[0 .. @as(usize, len) - first];
+    const cap = c.sendCap();
+    const ring = c.sendView();
+    const start = (c.snd_head + off) % cap;
+    const first = @min(@as(usize, len), cap - start);
+    const a = ring[start..][0..first];
+    const b = ring[0 .. @as(usize, len) - first];
     ackSent(c);
     const flags: u8 = FLAG_ACK | (if (push) FLAG_PSH else 0);
     return buildRawSegment(c.local_ip, c.remote_ip, c.local_port, c.remote_port, seq, c.rcv_nxt, flags, windowField(c, false), &.{}, a, b, buf);
@@ -1680,6 +1734,7 @@ fn wireSend(pkt: []const u8) void {
 fn resetPool() void {
     for (pool()) |*c| c.reset();
     big_window_used = @splat(false);
+    big_send_used = @splat(false);
     clock_us = 1_000_000;
     wire = Wire{};
     t_have_server = false;
@@ -1904,6 +1959,107 @@ test "tcp: big windows are borrowed by the slots that fill, and given back" {
     growWindow(&pool()[other]);
     try testing.expectEqual(RECV_BUF_SIZE, pool()[other].recvCap());
     abort(other);
+    resetPool();
+}
+
+/// Deliver and read until the server has `want` bytes of `salt`'s pattern
+/// (every byte checked) and the client has nothing left unacknowledged.
+fn drainTo(want: usize, got: *usize, salt: u8, pkt: []u8) !void {
+    var rb: [4096]u8 = undefined;
+    var step: usize = 0;
+    while (step < 20_000) : (step += 1) {
+        tick(clock_us + 1000, pkt, wireSend);
+        wire.deliver(clock_us);
+        while (true) {
+            const n = recv(t_server, &rb);
+            if (n == 0) break;
+            for (rb[0..n], 0..) |b, k| if (b != pattern(got.* + k, salt)) return error.Corrupt;
+            got.* += n;
+        }
+        if (got.* == want and pool()[t_client].snd_count == 0) return;
+    }
+    return error.Stalled;
+}
+
+test "tcp: a sender that fills its own buffer borrows a big one, its queued bytes in order, and gives it back" {
+    resetPool();
+    var pkt: [1600]u8 = undefined;
+    try openPair(&pkt);
+    var chunk: [4096]u8 = undefined;
+    var sent: usize = 0;
+    var got: usize = 0;
+    // 20 KiB through: the slot's own ring's head moves on
+    while (sent < 20 * 1024) {
+        const want = @min(chunk.len, 20 * 1024 - sent);
+        for (chunk[0..want], 0..) |*b, k| b.* = pattern(sent + k, 0x3C);
+        sent += send(t_client, chunk[0..want]);
+    }
+    try drainTo(sent, &got, 0x3C, &pkt);
+    try testing.expectEqual(SEND_BUF_SIZE, pool()[t_client].sendCap());
+    // 32 KiB queued fills the own ring, wrapped (its head is at 20 KiB);
+    // the next 2 KiB do not fit: a big one, the 32 KiB moved over in order
+    while (sent < 54 * 1024) {
+        const want = @min(chunk.len, 54 * 1024 - sent);
+        for (chunk[0..want], 0..) |*b, k| b.* = pattern(sent + k, 0x3C);
+        const n = send(t_client, chunk[0..want]);
+        try testing.expectEqual(want, n);
+        sent += n;
+    }
+    try testing.expectEqual(BIG_SEND_SIZE, pool()[t_client].sendCap());
+    try testing.expectEqual(@as(usize, 34 * 1024), pool()[t_client].snd_count);
+    try drainTo(sent, &got, 0x3C, &pkt);
+    // Every big one taken: another slot keeps its own; a freed slot's is
+    // taken again.
+    const big = pool()[t_client].big_send;
+    for (&big_send_used) |*u| u.* = true;
+    const other = connect(CLIENT_IP, SERVER_IP, 443) orelse return error.Pool;
+    growSend(&pool()[other]);
+    try testing.expectEqual(SEND_BUF_SIZE, pool()[other].sendCap());
+    abort(t_client);
+    try testing.expect(!big_send_used[big]);
+    growSend(&pool()[other]);
+    try testing.expectEqual(BIG_SEND_SIZE, pool()[other].sendCap());
+    abort(other);
+    resetPool();
+}
+
+test "tcp: a stream to a server 60 ms away is not held to 32 KiB a round trip" {
+    resetPool();
+    wire.delay_us = 30_000;
+    var pkt: [1600]u8 = undefined;
+    try openPair(&pkt);
+    var chunk: [4096]u8 = undefined;
+    var rb: [4096]u8 = undefined;
+    var sent: usize = 0;
+    var got: usize = 0;
+    var got_at_1s: usize = 0;
+    var ms: usize = 0;
+    while (ms < 4000) : (ms += 1) {
+        // a producer that never waits: as much as the socket takes
+        while (true) {
+            for (&chunk, 0..) |*b, k| b.* = pattern(sent + k, 0x77);
+            const n = send(t_client, &chunk);
+            sent += n;
+            if (n < chunk.len) break;
+        }
+        const now = clock_us + 1000;
+        tick(now, &pkt, wireSend);
+        wire.deliver(now);
+        while (true) {
+            const n = recv(t_server, &rb);
+            if (n == 0) break;
+            for (rb[0..n], 0..) |b, k| if (b != pattern(got + k, 0x77)) return error.Corrupt;
+            got += n;
+        }
+        if (ms == 1000) got_at_1s = got;
+    }
+    // (the receiver here is this stack's own, whose small window of 64 KiB
+    // caps it at about 1 MB/s; Twitch's is far bigger. 32 KiB of send
+    // buffer held it to about half that: 4.4 Mb/s.)
+    const per_s = (got - got_at_1s) / 3;
+    @import("std").debug.print("tcp: 60 ms away: {d} KB/s\n", .{per_s / 1000});
+    try testing.expect(per_s >= 800_000);
+    try testing.expectEqual(BIG_SEND_SIZE, pool()[t_client].sendCap());
     resetPool();
 }
 

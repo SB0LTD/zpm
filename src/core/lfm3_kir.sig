@@ -2761,10 +2761,14 @@ const Rtx = struct {
     var emu_work: nvidia.sm120_emu.Work = undefined;
     var dev: gpu.nvidia_device.Emu = undefined;
     var code: [512 << 10]u8 align(16) = undefined;
+    /// The generation the emulated card is (sm_75: a Turing one, the RTX
+    /// 2080 Ti; its tests set it back).
+    var sm: nvidia.chips.Sm = .sm_120;
 
     /// A fresh emulated RTX (its buffers are bump-allocated: one a run)
     fn device() gpu.Device {
         dev.init(&arena, &view, &emu_work);
+        dev.setSm(sm);
         return dev.device();
     }
 };
@@ -2866,7 +2870,7 @@ fn testMatrix(caps: Caps, lay: Layout, format: Format, tokens: u32, rows: u32, b
 /// The matrix kernel as the Legion's RTX runs it: kir_sm120's code in
 /// sm120_emu, its hazard checks on.
 fn testMatrixRtx(lay: Layout, format: Format, tokens: u32, rows: u32, blocks: u32) !void {
-    return testMatrixOn(.rtx, gpu.nvidia_device.emuCaps(), lay, format, tokens, rows, blocks);
+    return testMatrixOn(.rtx, gpu.nvidia_device.emuCapsFor(Rtx.sm), lay, format, tokens, rows, blocks);
 }
 
 /// The matrix kernel as the Surface's Adreno runs it: kir_ir3's code in
@@ -2991,6 +2995,19 @@ test "Q6_K x Q8_K: the CPU's bits, odd blocks two bytes off, odd block counts" {
 
 test "Q4_K and Q6_K on the emulated RTX (kir_sm120 in sm120_emu): the CPU's bits in every kind of layout" {
     // (the default, unroll with the last iteration moved back, slots, both)
+    for ([_]Format{ .q4_k, .q6_k }) |f| {
+        try testMatrixRtx(.{ .lanes = 4 }, f, 1, 21, 3);
+        try testMatrixRtx(.{ .lanes = 4, .unroll = 4 }, f, 1, 13, 30);
+        try testMatrixRtx(.{ .lanes = 1, .slots = 4 }, f, 1, 9, 30);
+        try testMatrixRtx(.{ .lanes = 2, .slots = 8, .unroll = 2 }, f, 1, 7, 30);
+        try testMatrixRtx(.{ .lanes = 4, .slots = 2, .unroll = 2 }, f, 2, 37, 8);
+    }
+}
+
+test "Q4_K and Q6_K on the emulated RTX 2080 Ti (kir_sm120 for sm_75; sm120_emu as a Turing card): the CPU's bits in every kind of layout" {
+    Rtx.sm = .sm_75;
+    defer Rtx.sm = .sm_120;
+    try std.testing.expectEqual(gpu.Target.sm_75, gpu.nvidia_device.emuCapsFor(Rtx.sm).target);
     for ([_]Format{ .q4_k, .q6_k }) |f| {
         try testMatrixRtx(.{ .lanes = 4 }, f, 1, 21, 3);
         try testMatrixRtx(.{ .lanes = 4, .unroll = 4 }, f, 1, 13, 30);

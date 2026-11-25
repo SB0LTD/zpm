@@ -57,6 +57,7 @@
 const types = @import("types.sig");
 const storage = @import("storage.sig");
 const lexer = @import("lexer.sig");
+const role_defaults = @import("role_defaults.sig");
 const Error = types.Error;
 
 pub const bootstrap_role: u32 = 10;
@@ -78,7 +79,7 @@ pub const class_policy: u32 = 3256;
 /// database). PostgreSQL assigns its OID at initdb; ZPM fixes it.
 pub const plpgsql_extension_oid: u32 = 13001;
 
-pub const Kind = enum(u8) { role = 1, member = 2, acl = 3, relation = 4, policy = 5, comment = 6, fdw = 7, server = 8, publication = 9, domain = 10, enum_type = 11, composite_type = 12, statistics = 13, publication_table = 14, publication_schema = 15, schema_acl = 16, schema_acl_state = 17, _ };
+pub const Kind = enum(u8) { role = 1, member = 2, acl = 3, relation = 4, policy = 5, comment = 6, fdw = 7, server = 8, publication = 9, domain = 10, enum_type = 11, composite_type = 12, statistics = 13, publication_table = 14, publication_schema = 15, schema_acl = 16, schema_acl_state = 17, schema_owner = 18, role_settings = 19, _ };
 
 pub fn publicationMembership(kind: Kind) bool {
     return kind == .publication_table or kind == .publication_schema;
@@ -217,6 +218,17 @@ pub const role_replication: u32 = 32;
 pub const role_bypassrls: u32 = 64;
 pub const role_attributes: u32 = 127;
 
+// Memberships written before per-edge options used flags = 0.
+pub const member_configured: u32 = 1;
+pub const member_inherit: u32 = 2;
+pub const member_set: u32 = 4;
+pub const member_admin: u32 = 1;
+pub const MembershipPath = enum { any, inherit, set };
+
+pub fn membershipFlags(inherit: bool, set: bool) u32 {
+    return member_configured | (if (inherit) member_inherit else 0) | (if (set) member_set else 0);
+}
+
 /// Table privileges as PostgreSQL's AclMode bits (aclitem letters arwdDxtm).
 pub const priv_insert: u32 = 1 << 0;
 pub const priv_select: u32 = 1 << 1;
@@ -272,6 +284,16 @@ pub const Ident = struct { span: Span = .{}, quoted: bool = false, len: usize = 
 pub const Qualified = struct { has_schema: bool = false, schema: Ident = .{}, name: Ident = .{} };
 
 pub const RoleKind = enum { role, user, group };
+pub const RoleBoolean = role_defaults.Boolean;
+pub const role_boolean_mask = role_defaults.mask;
+
+pub const RoleDefaults = union(enum) {
+    reset_all,
+    reset: RoleBoolean,
+    from_current: RoleBoolean,
+    set: struct { setting: RoleBoolean, spelling: Span = .{}, quoted: ?lexer.Quoted = null },
+};
+
 pub const RoleSpec = struct {
     kind: RoleKind = .role,
     name: Ident = .{},
@@ -284,6 +306,7 @@ pub const RoleSpec = struct {
     /// CREATE ROLE ... IN ROLE a, b: the new role becomes a member of each.
     in_roles: [list_capacity]Ident = @splat(.{}),
     in_count: usize = 0,
+    defaults: ?RoleDefaults = null,
 };
 
 pub const GranteeKind = enum(u8) { name, public, current_user, session_user, current_role };
@@ -302,6 +325,10 @@ pub const Grant = struct {
     grantee_count: usize = 0,
     /// WITH GRANT / ADMIN OPTION; for REVOKE, GRANT / ADMIN OPTION FOR.
     option: bool = false,
+    admin: ?bool = null,
+    inherit: ?bool = null,
+    set: ?bool = null,
+    grantor: ?Grantee = null,
     cascade: bool = false,
 };
 
@@ -393,6 +420,7 @@ pub const Statement = union(enum) {
     alter_policy: Policy,
     drop_policy: Policy,
     table_security: TableSecurity,
+    alter_schema_owner: struct { name: Ident, owner: Grantee },
     comment: Comment,
     create_fdw: Named,
     drop_fdw: Drop,
@@ -460,6 +488,14 @@ pub fn parseWithDialect(source: []const u8, comptime name_bytes: usize, comptime
         return null;
     }
     if (try p.take("alter")) {
+        if (dialect == .postgres and try p.take("schema")) {
+            const name = try p.ident();
+            if (!try p.take("owner")) return error.UnsupportedStatement;
+            try p.expect("to");
+            const owner = try p.grantee();
+            if (owner.kind == .public or !p.atEnd()) return error.Syntax;
+            return .{ .alter_schema_owner = .{ .name = name, .owner = owner } };
+        }
         if (dialect == .postgres and try p.take("statistics")) return .{ .alter_statistics = try p.alterStatistics() };
         if (p.word("domain") or p.word("type")) return error.UnsupportedStatement;
         if (try p.take("role") or try p.take("user") or try p.take("group")) return .{ .alter_role = try p.roleSpec(.role, false) };
@@ -796,7 +832,15 @@ const Parser = struct {
                 try self.finish();
                 return out;
             }
-            if (self.word("set") or self.word("reset") or self.word("in")) return error.UnsupportedStatement;
+            if (try self.take("set")) {
+                out.defaults = try self.roleDefaults(false);
+                return out;
+            }
+            if (try self.take("reset")) {
+                out.defaults = try self.roleDefaults(true);
+                return out;
+            }
+            if (self.word("in")) return error.UnsupportedStatement;
         }
         _ = try self.take("with");
         var seen: u32 = 0;
@@ -858,6 +902,41 @@ const Parser = struct {
         }
         try self.finish();
         return out;
+    }
+
+    fn roleDefaults(self: *Parser, reset: bool) Error!RoleDefaults {
+        if (reset and try self.take("all")) {
+            try self.finish();
+            return .reset_all;
+        }
+        const token = self.current;
+        if (token.kind != .word and token.kind != .quoted_word) return error.Syntax;
+        const name = token.raw(self.source);
+        const setting = inline for (@typeInfo(RoleBoolean).@"enum".field_names) |field| {
+            const matches = if (token.kind == .quoted_word) types.same(name, field) else types.keyword(name, field);
+            if (matches) break @field(RoleBoolean, field);
+        } else return error.UnsupportedStatement;
+        try self.advance();
+        if (reset) {
+            try self.finish();
+            return .{ .reset = setting };
+        }
+        if (try self.take("from")) {
+            try self.expect("current");
+            try self.finish();
+            return .{ .from_current = setting };
+        }
+        if (!try self.take("to") and !try self.takeSymbol(.eq)) return error.Syntax;
+        if (try self.take("default")) {
+            try self.finish();
+            return .{ .reset = setting };
+        }
+        const value = self.current;
+        if (value.kind != .word and value.kind != .string and value.kind != .integer) return error.Syntax;
+        const spelling: Span = .{ .start = value.start, .len = value.end - value.start };
+        try self.advance();
+        try self.finish();
+        return .{ .set = .{ .setting = setting, .spelling = spelling, .quoted = if (value.kind == .string) value.quoted() else null } };
     }
 
     const PolicyForm = enum { create, alter, drop };
@@ -1052,15 +1131,28 @@ const Parser = struct {
         }
         if (!revoke and try self.take("with")) {
             if (out.membership) {
-                if (!try self.take("admin")) return error.UnsupportedStatement;
-                if (!try self.take("option") and !try self.take("true")) return error.UnsupportedStatement;
+                while (true) {
+                    const option = if (try self.take("admin")) &out.admin
+                        else if (try self.take("inherit")) &out.inherit
+                        else if (try self.take("set")) &out.set
+                        else return error.Syntax;
+                    if (option.* != null) return error.Syntax;
+                    option.* = if (try self.take("false")) false
+                        else if (try self.take("true") or try self.take("option")) true
+                        else return error.Syntax;
+                    if (!try self.takeSymbol(.comma)) break;
+                }
             } else {
                 try self.expect("grant");
                 try self.expect("option");
+                out.option = true;
             }
-            out.option = true;
         }
-        if (self.word("granted")) return error.UnsupportedStatement;
+        if (try self.take("granted")) {
+            if (!out.membership or revoke) return error.UnsupportedStatement;
+            try self.expect("by");
+            out.grantor = try self.grantee();
+        }
         if (revoke) out.cascade = try self.dropBehavior();
         try self.finish();
         return out;
@@ -1438,7 +1530,7 @@ pub fn Objects(comptime config: types.Config) type {
                 .publication_table, .publication_schema => a.oid == b.oid and a.target == b.target and a.grantee == b.grantee,
                 .domain, .enum_type, .composite_type => a.oid == b.oid and a.target == b.target,
                 .member, .acl, .schema_acl => a.target == b.target and a.grantee == b.grantee,
-                .relation, .schema_acl_state => a.target == b.target,
+                .relation, .schema_acl_state, .schema_owner, .role_settings => a.target == b.target,
                 .comment => a.grantee == b.grantee and a.target == b.target and a.sub == b.sub,
                 _ => false,
             };
@@ -1610,10 +1702,18 @@ pub fn Objects(comptime config: types.Config) type {
             return flags & role_superuser != 0;
         }
 
-        /// `member` is `group` or (transitively) a member of it. With
-        /// `inherit`, only through roles that inherit privileges
-        /// (has_privs_of_role); without, any membership (SET ROLE).
-        pub fn memberOf(self: *const Self, member: u32, group: u32, inherit: bool, snap: storage.Snapshot) bool {
+        pub fn membershipInherits(self: *const Self, entry: *const Object, snap: storage.Snapshot) bool {
+            if (entry.flags != 0) return entry.flags & member_inherit != 0;
+            return (self.roleFlags(entry.grantee, snap) orelse 0) & role_inherit != 0;
+        }
+
+        pub fn membershipCanSet(entry: *const Object) bool {
+            return entry.flags == 0 or entry.flags & member_set != 0;
+        }
+
+        /// Walk either all edges (cycle detection) or only edges that allow
+        /// the requested use of a membership.
+        pub fn membershipPath(self: *const Self, member: u32, group: u32, path: MembershipPath, snap: storage.Snapshot) bool {
             if (member == group) return true;
             // Breadth-first over at most `capacity` roles.
             var queue: [capacity + 1]u32 = undefined;
@@ -1622,12 +1722,10 @@ pub fn Objects(comptime config: types.Config) type {
             var next: usize = 0;
             while (next < count) : (next += 1) {
                 const current = queue[next];
-                if (inherit) {
-                    const flags = self.roleFlags(current, snap) orelse continue;
-                    if (flags & role_inherit == 0) continue;
-                }
                 for (&self.items) |*o| {
                     if (o.kind != .member or o.grantee != current or !visible(o, snap)) continue;
+                    if (path == .inherit and !self.membershipInherits(o, snap)) continue;
+                    if (path == .set and !membershipCanSet(o)) continue;
                     if (o.target == group) return true;
                     var known = false;
                     for (queue[0..count]) |seen| known = known or seen == o.target;
@@ -1638,6 +1736,10 @@ pub fn Objects(comptime config: types.Config) type {
                 }
             }
             return false;
+        }
+
+        pub fn memberOf(self: *const Self, member: u32, group: u32, inherit: bool, snap: storage.Snapshot) bool {
+            return self.membershipPath(member, group, if (inherit) .inherit else .any, snap);
         }
 
         /// The relation object of a table (owner, RLS flags), if any.
@@ -1820,7 +1922,7 @@ pub fn Objects(comptime config: types.Config) type {
 
         fn decodeKind(cursor: Cursor) Error!Kind {
             const raw = try cursor.int(u8);
-            if (raw < 1 or raw > @intFromEnum(Kind.schema_acl_state)) return error.InvalidChangeRecord;
+            if (raw < 1 or raw > @intFromEnum(Kind.role_settings)) return error.InvalidChangeRecord;
             return @enumFromInt(raw);
         }
 
@@ -1845,7 +1947,7 @@ pub fn Objects(comptime config: types.Config) type {
                 .publication_table, .publication_schema => o.oid != 0 and o.target != 0 and o.grantee != 0 and o.sub == 0,
                 .member => o.oid != 0 and o.target != 0 and o.grantee != 0 and o.sub == 0,
                 .acl, .schema_acl => o.oid == 0 and o.target != 0 and o.sub == 0,
-                .relation, .schema_acl_state => o.oid == 0 and o.target != 0 and o.grantee == 0 and o.sub == 0,
+                .relation, .schema_acl_state, .schema_owner, .role_settings => o.oid == 0 and o.target != 0 and o.grantee == 0 and o.sub == 0,
                 .comment => o.oid == 0 and o.target != 0 and o.sub >= 0 and switch (o.grantee) {
                     class_relation => true,
                     class_namespace, class_authid, class_fdw, class_server, class_publication, class_policy => o.sub == 0,
@@ -1889,11 +1991,15 @@ pub fn Objects(comptime config: types.Config) type {
             const check_ok = if (o.flags & policy_check != 0) o.split != o.text_len else o.split == o.text_len;
             const valid = switch (o.kind) {
                 .role => has_name and o.owner == 0 and o.flags & ~role_attributes == 0 and o.role_count == 0 and o.text_len == 0,
-                .member => !has_name and o.owner != 0 and o.flags == 0 and o.grant_flags <= 1 and o.role_count == 0 and o.text_len == 0 and o.target != o.grantee,
+                .member => !has_name and o.owner != 0 and
+                    (o.flags == 0 or (o.flags & member_configured != 0 and o.flags & ~(member_configured | member_inherit | member_set) == 0)) and
+                    o.grant_flags <= member_admin and o.role_count == 0 and o.text_len == 0 and o.target != o.grantee,
                 .acl => !has_name and o.flags != 0 and o.flags & ~table_privileges == 0 and o.grant_flags & ~o.flags == 0 and o.role_count == 0 and o.text_len == 0 and o.owner != 0,
                 .schema_acl => !has_name and o.owner != 0 and o.grant_flags == 0 and o.role_count == 0 and o.text_len == 0 and
                     (o.flags == priv_schema_usage or (o.flags == 0 and o.grantee == o.owner)),
-                .schema_acl_state => !has_name and o.owner != 0 and o.flags == 0 and o.grant_flags == 0 and o.role_count == 0 and o.text_len == 0,
+                .schema_acl_state, .schema_owner => !has_name and o.owner != 0 and o.flags == 0 and o.grant_flags == 0 and o.role_count == 0 and o.text_len == 0,
+                .role_settings => !has_name and o.owner == 0 and o.flags != 0 and o.flags & ~role_boolean_mask == 0 and
+                    o.grant_flags & ~o.flags == 0 and o.role_count == 0 and o.text_len == 0,
                 .relation => !has_name and o.flags & ~(rls_enabled | rls_forced) == 0 and o.grant_flags == 0 and o.role_count == 0 and o.text_len == 0 and o.owner != 0,
                 .policy => has_name and o.flags & ~@as(u32, 0x7ff) == 0 and (o.flags & 0xff) <= 4 and o.grant_flags == 0 and o.role_count != 0 and o.owner == 0 and using_ok and check_ok,
                 .comment => !has_name and o.owner == 0 and o.flags == 0 and o.grant_flags == 0 and o.role_count == 0 and o.text_len != 0 and o.split == 0,
@@ -2118,6 +2224,13 @@ pub fn Objects(comptime config: types.Config) type {
                 return error.ChangeRecordConflict;
             }
 
+            pub fn schemaOwner(self: *const Overlay, target: u32, original: u32) u32 {
+                for (&self.items) |*v| {
+                    if (v.live and v.kind == .schema_owner and v.target == target) return v.owner;
+                }
+                return original;
+            }
+
             fn references(self: *const Overlay, v: *const VObject, ctx: anytype) Error!void {
                 const target = v.target;
                 const grantee = v.grantee;
@@ -2147,12 +2260,16 @@ pub fn Objects(comptime config: types.Config) type {
                         }
                     },
                     .schema_acl => {
-                        if (ctx.objectPrivateSchemaOwner(target) != v.owner) return error.ChangeRecordConflict;
+                        const original = ctx.objectPrivateSchemaOwner(target) orelse return error.ChangeRecordConflict;
+                        if (self.schemaOwner(target, original) != v.owner) return error.ChangeRecordConflict;
                         if (grantee != public_role and !self.roleExists(grantee)) return error.ChangeRecordConflict;
                     },
                     .schema_acl_state => {
-                        if (ctx.objectPrivateSchemaOwner(target) != v.owner) return error.ChangeRecordConflict;
+                        const original = ctx.objectPrivateSchemaOwner(target) orelse return error.ChangeRecordConflict;
+                        if (self.schemaOwner(target, original) != v.owner) return error.ChangeRecordConflict;
                     },
+                    .schema_owner => if (ctx.objectPrivateSchemaOwner(target) == null) return error.ChangeRecordConflict,
+                    .role_settings => if (!self.roleExists(target)) return error.ChangeRecordConflict,
                     .relation => {
                         if (!ctx.objectTableLive(target)) return error.ChangeRecordConflict;
                     },

@@ -13,6 +13,14 @@
 //! `Push` writes into the caller's dwords and remembers an overflow rather
 //! than writing past them: `check` says whether the batch is whole.
 //!
+//! A Turing GPU's compute class is TURING_COMPUTE_A (clc5c0.h): the same
+//! methods at the same addresses for what a batch sends, but for two. A
+//! QMD is scheduled with SEND_SIGNALING_PCAS_B (its INVALIDATE and
+//! SCHEDULE bits: NVK does so for every class up to Turing's) where
+//! Blackwell has SEND_SIGNALING_PCAS2_B, and the engine's report is
+//! SET_REPORT_SEMAPHORE_A..D. `Push.sm` picks (`batchPushFor`). Not run on
+//! a card yet.
+//!
 //! Allocation-free: the caller owns the dwords.
 
 const std = @import("std");
@@ -27,6 +35,25 @@ pub const Error = error{
 
 pub const BLACKWELL_CHANNEL_GPFIFO_B: u32 = 0xca6f;
 pub const BLACKWELL_COMPUTE_B: u32 = 0xcec0;
+pub const TURING_COMPUTE_A: u32 = 0xc5c0;
+
+/// The shader model a pushbuffer's compute methods are for.
+pub const Sm = @import("chips.sig").Sm;
+
+/// The compute class of shader model `sm`'s GPUs.
+pub fn computeClass(sm: Sm) u32 {
+    return if (sm == .sm_75) TURING_COMPUTE_A else BLACKWELL_COMPUTE_B;
+}
+
+/// TURING_COMPUTE_A's own (clc5c0.h): the schedule (INVALIDATE bit 0,
+/// SCHEDULE bit 1) and the report (the address's upper 8 bits, its lower
+/// word, the payload, then the operation: RELEASE 0 in 1:0, the structure
+/// in bit 28: four words 0, one word 1).
+pub const SEND_SIGNALING_PCAS_B: u32 = 0x02bc;
+pub const PCAS_B_INVALIDATE_SCHEDULE: u32 = 0x3;
+pub const SET_REPORT_SEMAPHORE_A: u32 = 0x1b00;
+pub const SET_REPORT_SEMAPHORE_D: u32 = 0x1b0c;
+pub const REPORT_D_ONE_WORD: u32 = 1 << 28;
 
 /// The subchannel compute is bound to (tinygrad's; the host's methods,
 /// below 0x100, work on any).
@@ -183,6 +210,8 @@ pub const Push = struct {
     buf: []u32,
     len: usize = 0,
     overflow: bool = false,
+    /// The shader model whose compute class the batch is for.
+    sm: Sm = .sm_120,
 
     pub fn words(p: *const Push) []const u32 {
         return p.buf[0..p.len];
@@ -228,7 +257,7 @@ pub const Push = struct {
 
     /// Compute bound to its subchannel, and its windows.
     pub fn computeSetup(p: *Push, w: Windows) void {
-        p.setObject(SUBCH_COMPUTE, BLACKWELL_COMPUTE_B);
+        p.setObject(SUBCH_COMPUTE, computeClass(p.sm));
         p.address(SUBCH_COMPUTE, SET_SHADER_LOCAL_MEMORY_WINDOW_A, w.local);
         p.address(SUBCH_COMPUTE, SET_SHADER_SHARED_MEMORY_WINDOW_A, w.shared);
     }
@@ -254,6 +283,7 @@ pub const Push = struct {
     /// The QMD at `qmd_va` (256-aligned) prefetched and scheduled.
     pub fn launch(p: *Push, qmd_va: u64) void {
         p.method(SUBCH_COMPUTE, SEND_PCAS_A, &.{@truncate(qmd_va >> 8)});
+        if (p.sm == .sm_75) return p.method(SUBCH_COMPUTE, SEND_SIGNALING_PCAS_B, &.{PCAS_B_INVALIDATE_SCHEDULE});
         p.method(SUBCH_COMPUTE, SEND_SIGNALING_PCAS2_B, &.{PCAS_PREFETCH_SCHEDULE});
     }
 
@@ -268,6 +298,7 @@ pub const Push = struct {
     /// timestamp (ns) at va + 8, once the launches before it are done (16
     /// bytes, 16-aligned).
     pub fn reportTimestamp(p: *Push, va: u64, payload: u32) void {
+        if (p.sm == .sm_75) return p.method(SUBCH_COMPUTE, SET_REPORT_SEMAPHORE_A, &.{ @truncate((va >> 32) & 0xff), @truncate(va), payload, REPORT_RELEASE });
         p.method(SUBCH_COMPUTE, REPORT_SEMAPHORE_PAYLOAD_LOWER, &.{ payload, 0, @truncate(va), @truncate(va >> 32), REPORT_RELEASE | REPORT_FOUR_WORDS });
     }
 };
@@ -278,7 +309,12 @@ pub const Push = struct {
 /// scheduled, then a host semaphore release of `payload` at `sem_va` once
 /// all of that is done. Its length (Galaxy's runBatch's words).
 pub fn batchPush(out: []u32, qmds: []const u64, local: ?Local, sem_va: u64, payload: u32) Error!usize {
-    var p = Push{ .buf = out };
+    return batchPushFor(.sm_120, out, qmds, local, sem_va, payload);
+}
+
+/// The same for shader model `sm`'s compute class.
+pub fn batchPushFor(sm: Sm, out: []u32, qmds: []const u64, local: ?Local, sem_va: u64, payload: u32) Error!usize {
+    var p = Push{ .buf = out, .sm = sm };
     p.computeSetup(.{});
     if (local) |l| p.localMemory(l);
     p.invalidateShaderCaches();
@@ -349,4 +385,34 @@ test "a timestamp report" {
     try p.check();
     try testing.expectEqual(@as(u32, 0x2005_2056), pb[0]); // 0x158, 5 words
     try testing.expectEqualSlices(u32, &.{ 5, 0, 0x0002_0100, 0x20, 0 }, pb[1..6]);
+}
+
+test "a Turing batch: TURING_COMPUTE_A bound, each QMD scheduled with SEND_SIGNALING_PCAS_B" {
+    var pb: [64]u32 = undefined;
+    const n = try batchPushFor(.sm_75, &pb, &.{0x20_0003_0000}, null, 0x20_0002_0000, 5);
+    try testing.expectEqual(header(SUBCH_COMPUTE, SET_OBJECT, 1), pb[0]);
+    try testing.expectEqual(TURING_COMPUTE_A, pb[1]);
+    // (the windows and the invalidate as on Blackwell: the same methods)
+    try testing.expectEqual(header(SUBCH_COMPUTE, SET_SHADER_LOCAL_MEMORY_WINDOW_A, 2), pb[2]);
+    try testing.expectEqual(header(SUBCH_COMPUTE, INVALIDATE_SHADER_CACHES, 1), pb[8]);
+    try testing.expectEqual(header(SUBCH_COMPUTE, SEND_PCAS_A, 1), pb[10]);
+    try testing.expectEqual(@as(u32, 0x2000_0300), pb[11]);
+    try testing.expectEqual(header(SUBCH_COMPUTE, SEND_SIGNALING_PCAS_B, 1), pb[12]);
+    try testing.expectEqual(@as(u32, 3), pb[13]);
+    try testing.expectEqual(header(0, SEM_ADDR_LO, 5), pb[14]);
+    try testing.expectEqual(@as(usize, 20), n);
+    // the same batch for Blackwell differs in the class and the schedule alone
+    var pb2: [64]u32 = undefined;
+    const n2 = try batchPush(&pb2, &.{0x20_0003_0000}, null, 0x20_0002_0000, 5);
+    try testing.expectEqual(n, n2);
+    for (pb[0..n], pb2[0..n], 0..) |a, b, i| {
+        if (i == 1 or i == 12 or i == 13) try testing.expect(a != b) else try testing.expectEqual(b, a);
+    }
+    // the report: four words, the address's upper byte first
+    var p = Push{ .buf = &pb, .sm = .sm_75 };
+    p.reportTimestamp(0x20_0002_0010, 1);
+    try testing.expectEqual(header(SUBCH_COMPUTE, SET_REPORT_SEMAPHORE_A, 4), pb[0]);
+    try testing.expectEqual([4]u32{ 0x20, 0x0002_0010, 1, 0 }, pb[1..5].*);
+    try testing.expectEqual(TURING_COMPUTE_A, computeClass(.sm_75));
+    try testing.expectEqual(BLACKWELL_COMPUTE_B, computeClass(.sm_120));
 }

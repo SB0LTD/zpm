@@ -842,6 +842,7 @@ fn roles() !void {
     try rejects("ALTER ROLE r_plain RENAME TO r_admin", error.DuplicateObject, count, "4");
     try rejects("ALTER ROLE r_plain RENAME TO pg_x", error.ReservedName, count, "4");
     try rejects("ALTER ROLE ramsql NOLOGIN", error.UnsupportedStatement, count, "4");
+    try run("ALTER ROLE ramsql WITH SUPERUSER INHERIT CREATEROLE CREATEDB LOGIN REPLICATION BYPASSRLS");
     try sameState();
     // Membership: GRANT role TO role, IN ROLE, ADMIN OPTION, cycles (0LP01).
     try run("CREATE ROLE r_group");
@@ -883,6 +884,20 @@ fn roles() !void {
     try commit(local_tx);
     try expect("SELECT current_user", "ramsql");
     try fails("SET ROLE nosuch", error.InvalidSettingValue);
+    const options = "SELECT admin_option, inherit_option, set_option FROM pg_auth_members";
+    try run("GRANT r_group TO r_plain WITH ADMIN TRUE, INHERIT FALSE, SET FALSE GRANTED BY ramsql");
+    try expect(options, "t|f|f");
+    try rejects("GRANT r_plain TO r_group", error.InvalidGrantOperation, options, "t|f|f");
+    try rejects("GRANT r_group TO r_plain WITH SET FALSE, SET TRUE", error.Syntax, options, "t|f|f");
+    try rejects("GRANT r_group TO r_plain WITH ADMIN FALSE GRANTED BY r_member", error.UnsupportedStatement, options, "t|f|f");
+    try sameState();
+    db.default_session_state.session_role = try roleOid("r_plain");
+    try fails("SET ROLE r_group", error.InsufficientPrivilege);
+    db.default_session_state.session_role = 10;
+    try run("GRANT r_group TO r_plain WITH SET TRUE");
+    try expect(options, "t|f|t");
+    try run("GRANT r_group TO r_plain WITH ADMIN FALSE, INHERIT TRUE");
+    try expect(options, "f|t|t");
     // The session user must be a member of the role it becomes.
     db.default_session_state.session_role = try roleOid("r_plain");
     try as("r_group");
@@ -1522,7 +1537,67 @@ fn rowSecuritySetting() !void {
     try sameState();
 }
 
+fn namespaceAclProjection() !void {
+    try reset();
+    try run("CREATE ROLE inspectors");
+    try run("CREATE SCHEMA export_scope");
+    try expect("SELECT pg_typeof(nspacl)::text FROM pg_namespace WHERE nspname='export_scope'", "aclitem[]");
+    try expect("SELECT nspacl IS NULL FROM pg_namespace WHERE nspname='export_scope'", "t");
+    try expect("SELECT acldefault('n',nspowner)::text FROM pg_namespace WHERE nspname='export_scope'", "{ramsql=UC/ramsql}");
+    try run("GRANT USAGE ON SCHEMA export_scope TO inspectors");
+    try expect("SELECT nspacl::text FROM pg_namespace WHERE nspname='export_scope'", "{ramsql=UC/ramsql,inspectors=U/ramsql}");
+    try run("REVOKE USAGE ON SCHEMA export_scope FROM ramsql");
+    try expect("SELECT nspacl::text FROM pg_namespace WHERE nspname='export_scope'", "{ramsql=C/ramsql,inspectors=U/ramsql}");
+    try run("REVOKE USAGE ON SCHEMA export_scope FROM inspectors");
+    try expect("SELECT nspacl::text FROM pg_namespace WHERE nspname='export_scope'", "{ramsql=C/ramsql}");
+    try same(try query(&replica, "SELECT nspacl::text FROM pg_namespace WHERE nspname='export_scope'"), "{ramsql=C/ramsql}");
+}
+
+fn namespaceOwnerTransfer() !void {
+    try reset();
+    try run("CREATE ROLE first_owner");
+    try run("CREATE ROLE final_owner");
+    try run("CREATE ROLE archive_reader");
+    try run("CREATE SCHEMA owned_archive");
+    const ownership = "SELECT rolname,nspacl::text FROM pg_namespace JOIN pg_roles ON nspowner=pg_roles.oid WHERE nspname='owned_archive'";
+    try run("ALTER SCHEMA owned_archive OWNER TO ramsql");
+    const created = db.catalog.findSchema("owned_archive", .{ .csn = db.csn }) orelse return error.NamespaceMissing;
+    try check(db.catalog_objects.findKey(&.{ .kind = .schema_owner, .target = created.oid }, .{ .csn = db.csn }) == null);
+    try expect(ownership, "ramsql|NULL");
+    try rejects("ALTER SCHEMA owned_archive OWNER TO no_such_role", error.UndefinedObject, ownership, "ramsql|NULL");
+
+    const pending = try db.begin();
+    try statement(pending, "ALTER SCHEMA owned_archive OWNER TO first_owner");
+    try same(try rows(pending, ownership), "first_owner|NULL");
+    try expect(ownership, "ramsql|NULL");
+    db.abort(pending);
+    try expect(ownership, "ramsql|NULL");
+
+    try run("ALTER SCHEMA owned_archive OWNER TO first_owner");
+    try run("GRANT USAGE ON SCHEMA owned_archive TO archive_reader");
+    try run("REVOKE USAGE ON SCHEMA owned_archive FROM first_owner");
+    try rejects("DROP ROLE first_owner", error.DependentObjects, ownership, "first_owner|{first_owner=C/first_owner,archive_reader=U/first_owner}");
+    try run("ALTER SCHEMA owned_archive OWNER TO final_owner");
+    try expect(ownership, "final_owner|{final_owner=C/final_owner,archive_reader=U/final_owner}");
+    try same(try query(&replica, ownership), "final_owner|{final_owner=C/final_owner,archive_reader=U/final_owner}");
+    try run("DROP ROLE first_owner");
+    try run("GRANT USAGE ON SCHEMA owned_archive TO final_owner");
+    try expect(ownership, "final_owner|{final_owner=UC/final_owner,archive_reader=U/final_owner}");
+    try as("final_owner");
+    try run("CREATE TABLE owned_archive.owner_table (id int)");
+    try run("DROP TABLE owned_archive.owner_table");
+    try as("ramsql");
+    var invalid: [256]u8 = undefined;
+    const owner_tail = [_]u8{ 10, 0, 0, 0 } ++ [_]u8{0} ** 14;
+    try replayFails(objectRecord(&invalid, 70, 18, 0, 99999, 0, 0, &owner_tail), error.ChangeRecordConflict);
+    try run("DROP SCHEMA owned_archive");
+    try run("DROP ROLE final_owner");
+    try same(try query(&replica, ownership), "");
+}
+
 pub fn main() !void {
+    try namespaceAclProjection();
+    try namespaceOwnerTransfer();
     try oraclePrograms();
     try namespacesAndExtensions();
     try namespaceOwners();

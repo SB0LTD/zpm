@@ -1,7 +1,7 @@
 //! Versioned table storage: S01 subset (Layer 0, design §4.3).
 //!
 //! Each table holds a row directory {rowid, generation, newest version}, a
-//! rowid -> slot open-addressing index (load <= 50%), a version arena of
+//! rowid -> slot open-addressing index (default load <= 50%), a version arena of
 //! Config.versions_per_table slots (default 2 x rows_per_table) and a
 //! multi-entry primary-key index from key to version, filtered by
 //! visibility. The default arrays are inline caller-owned storage. With
@@ -28,6 +28,27 @@ const types = @import("types.sig");
 const character = @import("character.sig");
 const mem = @import("std").mem;
 const Error = types.Error;
+
+/// Maximum load for caller-owned row and version index slices.
+pub const HashLoad = enum {
+    half,
+    three_quarters,
+
+    fn allows(self: HashLoad, slots: usize, entries: usize) bool {
+        const limit = slots / 2 + if (self == .three_quarters) slots / 4 else 0;
+        return entries <= limit;
+    }
+
+    pub fn slotsFor(self: HashLoad, entries: usize) Error!usize {
+        var slots: usize = 2;
+        while (!self.allows(slots, entries)) {
+            const next = @mulWithOverflow(slots, 2);
+            if (next[1] != 0) return error.InvalidParameterValue;
+            slots = next[0];
+        }
+        return slots;
+    }
+};
 
 fn pow2(minimum: usize) usize {
     var capacity: usize = 2;
@@ -314,6 +335,7 @@ pub fn Storage(comptime config: types.Config) type {
             integral_row_words: if (integral_enabled) usize else void = if (integral_enabled) 0 else {},
             row_index: []u32,
             key_index: []u32,
+            hash_load: HashLoad = .half,
             scan_values: []i64 = &.{},
             scan_nonnull: []u64 = &.{},
             scan_live: []u8 = &.{},
@@ -347,8 +369,8 @@ pub fn Storage(comptime config: types.Config) type {
                 }
                 return self.rows.len != 0 and self.rows.len <= 0x7fffffff and
                     self.versions.len > self.rows.len and self.versions.len <= 0x7fffffff and
-                    self.row_index.len >= self.rows.len * 2 and powerOfTwo(self.row_index.len) and
-                    self.key_index.len >= self.versions.len * 2 and powerOfTwo(self.key_index.len) and
+                    self.hash_load.allows(self.row_index.len, self.rows.len) and powerOfTwo(self.row_index.len) and
+                    self.hash_load.allows(self.key_index.len, self.versions.len) and powerOfTwo(self.key_index.len) and
                     self.index_slots.len % self.key_index.len == 0 and self.index_slots.len / self.key_index.len <= index_capacity and
                     self.scan_index_limit <= index_capacity;
             }
@@ -1572,6 +1594,40 @@ pub fn Storage(comptime config: types.Config) type {
         pub inline fn versionCellEquals(table: *const Table, version: usize, column: usize, value: *const V.Cell) bool {
             var scratch: V.Cell = undefined;
             return V.compare(borrowVersionCell(table, version, column, &scratch), value) == 0;
+        }
+
+        /// An exclusive DDL or replay caller may borrow an empty scalar
+        /// index bank to validate an entire primary key without query scratch.
+        pub fn validatePrimaryColumns(table: *Table, columns: []const u8, definitions: []const V.Column, snap: Snapshot, control: ?*types.ExecutionControl) types.Error!void {
+            const bank = table.key_index[0..];
+            if (columns.len == 0 or bank.len == 0 or bank.len & (bank.len - 1) != 0) return error.IndexCapacity;
+            for (bank) |entry| if (entry != 0) return error.IndexCapacity;
+            defer @memset(bank, 0);
+            var entries: usize = 0;
+            for (0..table.row_high) |row| {
+                const version = visibleAt(table, row, snap) orelse continue;
+                if (control) |execution| try execution.checkpoint();
+                if (entries >= bank.len / 2) return error.IndexCapacity;
+                var hash: u64 = 0x51ed2701a5b3c4d9;
+                for (columns) |column| {
+                    var scratch: V.Cell = undefined;
+                    const cell = borrowVersionCell(table, version, column, &scratch);
+                    if (cell.* == .null_value) return error.NotNullViolation;
+                    try V.validate(&definitions[column], cell);
+                    hash = mix(hash ^ V.hash(cell));
+                }
+                var position: usize = @intCast(hash & (bank.len - 1));
+                while (bank[position] != 0) : (position = (position + 1) & (bank.len - 1)) {
+                    if (control) |execution| try execution.checkpoint();
+                    for (columns) |column| {
+                        var scratch: V.Cell = undefined;
+                        const candidate = borrowVersionCell(table, version, column, &scratch);
+                        if (!versionCellEquals(table, bank[position] - 1, column, candidate)) break;
+                    } else return error.PrimaryKeyViolation;
+                }
+                bank[position] = version + 1;
+                entries += 1;
+            }
         }
 
         fn keyPosition(table: *const Table, version: u32) ?usize {

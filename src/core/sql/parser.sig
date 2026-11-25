@@ -46,6 +46,7 @@ pub fn Parser(comptime config: types.Config) type {
         const Self = @This();
         tokens: lexer.Tokenizer,
         current: Token = .{},
+        previous_end: usize = 0,
         /// One-token lookahead cache: the token after current and the
         /// tokenizer state after it.
         peeked: Token = .{},
@@ -76,8 +77,9 @@ pub fn Parser(comptime config: types.Config) type {
 
         const DatabaseName = types.Values(config).Name;
         pub const DatabaseCommand = union(enum) {
-            create: DatabaseName,
+            create: struct { name: DatabaseName, template: ?DatabaseName },
             drop: struct { name: DatabaseName, if_exists: bool },
+            alter_owner: struct { name: DatabaseName, owner: DatabaseName },
         };
 
         /// A cluster owner can recognize these utility statements without
@@ -87,26 +89,110 @@ pub fn Parser(comptime config: types.Config) type {
             var tokens: lexer.Tokenizer = .{ .source = source, .text_limit = config.text_bytes };
             const first = try tokens.next();
             const is_create = wordIs(source, first, "create");
-            if (!is_create and !wordIs(source, first, "drop")) return null;
+            const is_drop = wordIs(source, first, "drop");
+            const is_alter = wordIs(source, first, "alter");
+            if (!is_create and !is_drop and !is_alter) return null;
             if (!wordIs(source, try tokens.next(), "database")) return null;
 
             var token = try tokens.next();
-            const if_exists = !is_create and wordIs(source, token, "if");
+            const if_exists = is_drop and wordIs(source, token, "if");
             if (if_exists) {
                 if (!wordIs(source, try tokens.next(), "exists")) return error.Syntax;
                 token = try tokens.next();
             }
-            const ident = try identToken(token, .standard);
-            var name: DatabaseName = .{ .len = ident.len };
-            identBytes(source, ident, &name.bytes);
+            const name = try databaseName(source, token);
             var end = try tokens.next();
+            var command: DatabaseCommand = .{ .drop = .{ .name = name, .if_exists = if_exists } };
+            if (is_create) {
+                const declaration = try databaseOptions(&tokens, source, end);
+                end = declaration.end;
+                command = .{ .create = .{ .name = name, .template = declaration.template } };
+            } else if (is_alter) {
+                if (!wordIs(source, end, "owner")) return error.UnsupportedStatement;
+                if (!wordIs(source, try tokens.next(), "to")) return error.Syntax;
+                command = .{ .alter_owner = .{ .name = name, .owner = try databaseName(source, try tokens.next()) } };
+                end = try tokens.next();
+            }
             if (end.kind == .symbol and end.symbol == .semicolon) {
                 end = try tokens.next();
                 if (end.kind != .end) return error.Syntax;
             }
             if (end.kind == .word) return error.UnsupportedStatement;
             if (end.kind != .end) return error.Syntax;
-            return if (is_create) .{ .create = name } else .{ .drop = .{ .name = name, .if_exists = if_exists } };
+            return command;
+        }
+
+        fn databaseName(source: []const u8, token: Token) Error!DatabaseName {
+            const ident = try identToken(token, .standard);
+            var name: DatabaseName = .{ .len = ident.len };
+            identBytes(source, ident, &name.bytes);
+            return name;
+        }
+
+        const DatabaseOption = enum(u3) { template, encoding, locale, locale_provider, lc_collate, lc_ctype, tablespace };
+
+        /// The cluster resolves the source. Each database uses UTF-8, the C
+        /// locale and the default tablespace.
+        fn databaseOptions(tokens: *lexer.Tokenizer, source: []const u8, first: Token) Error!struct { end: Token, template: ?DatabaseName } {
+            var key = if (wordIs(source, first, "with")) try tokens.next() else first;
+            var seen: u8 = 0;
+            var template: ?DatabaseName = null;
+            while (key.kind == .word) : (key = try tokens.next()) {
+                const option = databaseOption(source, key) orelse return error.UnsupportedStatement;
+                const bit = @as(u8, 1) << @intFromEnum(option);
+                if (seen & bit != 0) return error.Syntax;
+                seen |= bit;
+                var value = try tokens.next();
+                if (value.kind == .symbol and value.symbol == .eq) value = try tokens.next();
+                if (option == .template) {
+                    template = try databaseTemplateName(source, value);
+                    continue;
+                }
+                if (value.kind == .integer and option == .encoding) {
+                    if (value.integer != 6) return error.UnsupportedStatement;
+                    continue;
+                }
+                var buffer: [32]u8 = undefined;
+                const setting = switch (value.kind) {
+                    .word, .quoted_word => blk: {
+                        const ident = try identToken(value, .standard);
+                        if (ident.len > buffer.len) return error.UnsupportedStatement;
+                        identBytes(source, ident, &buffer);
+                        break :blk buffer[0..ident.len];
+                    },
+                    .string => blk: {
+                        if (value.len > buffer.len) return error.UnsupportedStatement;
+                        lexer.decodeQuoted(source, value.quoted(), buffer[0..value.len]);
+                        break :blk buffer[0..value.len];
+                    },
+                    else => return error.Syntax,
+                };
+                const supported = switch (option) {
+                    .template => unreachable,
+                    .encoding => types.keyword(setting, "utf8") or types.keyword(setting, "utf-8"),
+                    .locale, .lc_collate, .lc_ctype => types.same(setting, "C"),
+                    .locale_provider => types.same(setting, "libc"),
+                    .tablespace => types.same(setting, "pg_default"),
+                };
+                if (!supported) return error.UnsupportedStatement;
+            }
+            return .{ .end = key, .template = template };
+        }
+
+        fn databaseTemplateName(source: []const u8, value: Token) Error!DatabaseName {
+            if (value.kind != .string) return databaseName(source, value);
+            var name: DatabaseName = .{ .len = value.len };
+            if (name.len == 0) return error.Syntax;
+            if (name.len > name.bytes.len) return error.NameCapacity;
+            lexer.decodeQuoted(source, value.quoted(), name.bytes[0..name.len]);
+            return name;
+        }
+
+        fn databaseOption(source: []const u8, token: Token) ?DatabaseOption {
+            inline for (@typeInfo(DatabaseOption).@"enum".field_names) |name| {
+                if (wordIs(source, token, name)) return @field(DatabaseOption, name);
+            }
+            return null;
         }
 
         pub const Explain = struct { analyze: bool = false };
@@ -180,6 +266,7 @@ pub fn Parser(comptime config: types.Config) type {
         }
 
         fn advance(self: *Self) Error!void {
+            self.previous_end = self.current.end + self.current.suffix;
             if (self.current.dialectQuotedIdentifier(self.source))
                 self.last_native_syntax = self.current.start - 1;
             if (self.has_peek) {
@@ -351,7 +438,7 @@ pub fn Parser(comptime config: types.Config) type {
             try self.advance();
             if (self.current.kind == .end) return null;
             const name = try self.identifier();
-            if (!typeWord(self.current) and !self.internalCharName() and !(try self.internalCharQualifier())) {
+            if (!typeWord(self.current) and !(try self.catalogTypeAhead())) {
                 if (self.current.kind == .word or self.current.kind == .quoted_word) return error.UnsupportedStatement;
                 return error.Syntax;
             }
@@ -471,8 +558,7 @@ pub fn Parser(comptime config: types.Config) type {
                 if (try self.takeWord("SEQUENCE")) {
                     var out: Ast.AlterSequence = .{ .if_exists = try self.ifExists() };
                     out.name = try self.qualifiedName();
-                    try self.sequenceOptions(&out.options);
-                    // OWNED BY, RENAME TO, SET SCHEMA ... are outside the subset.
+                    try self.sequenceOptions(&out.options, &out.owned_by);
                     if (self.current.kind != .end and !self.isSymbol(.semicolon)) return error.UnsupportedStatement;
                     try self.finish();
                     return .{ .alter_sequence = out };
@@ -547,7 +633,7 @@ pub fn Parser(comptime config: types.Config) type {
             out.table = try self.qualifiedName();
             if (try self.takeWord("USING")) {
                 // Hash entries serve btree and hash requests; others are 0A000.
-                if (!try self.takeRaw("btree") and !try self.takeRaw("hash")) return error.UnsupportedStatement;
+                try self.accessMethod(false);
             }
             try self.expectSymbol(.lparen);
             while (true) {
@@ -796,7 +882,27 @@ pub fn Parser(comptime config: types.Config) type {
                 } else if (try self.takeRaw("alter")) {
                     _ = try self.takeRaw("column");
                     const name = try self.identifier();
-                    if (try self.takeWord("SET")) {
+                    if (self.mode == .standard and try self.takeRaw("add")) {
+                        try self.expectWord("GENERATED");
+                        const always = try self.takeWord("ALWAYS");
+                        if (!always) {
+                            try self.expectWord("BY");
+                            try self.expectWord("DEFAULT");
+                        }
+                        try self.expectWord("AS");
+                        try self.expectWord("IDENTITY");
+                        var action: Ast.AlterAction = .{ .add_identity = .{ .column = name, .always = always } };
+                        if (try self.takeSymbol(.lparen)) {
+                            const identity = &action.add_identity;
+                            if (try self.takeWord("SEQUENCE")) {
+                                try self.expectWord("NAME");
+                                identity.name = try self.qualifiedName();
+                            }
+                            try self.sequenceOptions(&identity.options, null);
+                            try self.expectSymbol(.rparen);
+                        }
+                        try pushAction(&out, action);
+                    } else if (try self.takeWord("SET")) {
                         if (try self.takeWord("DEFAULT")) {
                             const start = self.tokenStart();
                             _ = try self.expression();
@@ -804,7 +910,13 @@ pub fn Parser(comptime config: types.Config) type {
                         } else if (try self.takeWord("NOT")) {
                             try self.expectWord("NULL");
                             try pushAction(&out, .{ .set_not_null = name });
+                        } else if (self.isSymbol(.lparen)) {
+                            try self.legacyAttributeOptions(false);
+                            try pushAction(&out, .{ .legacy_attribute_options = name });
                         } else return error.UnsupportedStatement;
+                    } else if (try self.takeRaw("reset")) {
+                        try self.legacyAttributeOptions(true);
+                        try pushAction(&out, .{ .legacy_attribute_options = name });
                     } else if (try self.takeWord("DROP")) {
                         if (try self.takeWord("DEFAULT")) {
                             try pushAction(&out, .{ .drop_default = name });
@@ -818,6 +930,36 @@ pub fn Parser(comptime config: types.Config) type {
             }
             try self.finish();
             return out;
+        }
+
+        /// Older PostgreSQL 18 dumps can include the internal row-format
+        /// version in attoptions. PostgreSQL ignores this reserved option on
+        /// restore. Other options have their own semantics and need storage.
+        fn legacyAttributeOptions(self: *Self, reset: bool) Error!void {
+            try self.expectSymbol(.lparen);
+            var unsupported = false;
+            while (true) {
+                const option = try self.identifier();
+                var buffer: [64]u8 = undefined;
+                const name = identText(self.source, option, &buffer) orelse "";
+                unsupported = unsupported or !types.same(name, "pg_attver");
+                if (try self.takeSymbol(.dot)) {
+                    _ = try self.identifier();
+                    unsupported = true;
+                }
+                if (!reset and try self.takeSymbol(.eq)) {
+                    const signed = try self.takeSymbol(.plus) or try self.takeSymbol(.minus);
+                    switch (self.current.kind) {
+                        .integer, .decimal => {},
+                        .word, .quoted_word, .string => if (signed) return error.Syntax,
+                        else => return error.Syntax,
+                    }
+                    try self.advance();
+                }
+                if (!try self.takeSymbol(.comma)) break;
+            }
+            try self.expectSymbol(.rparen);
+            if (unsupported) return error.UnsupportedStatement;
         }
 
         /// TRUNCATE [TABLE] [ONLY] name [*] [, ...] [RESTART IDENTITY |
@@ -1582,7 +1724,7 @@ pub fn Parser(comptime config: types.Config) type {
 
         fn typeWord(token: Token) bool {
             return switch (token.keyword) {
-                .integer, .int, .int4, .bigint, .int8, .smallint, .int2, .boolean, .@"bool", .text, .numeric, .decimal, .real, .float4, .float8, .float, .double, .name, .oid, .date, .timestamp, .timestamptz, .interval, .json, .jsonb, .regclass, .regtype, .regnamespace => true,
+                .integer, .int, .int4, .bigint, .int8, .smallint, .int2, .boolean, .@"bool", .text, .numeric, .decimal, .real, .float4, .float8, .float, .double, .name, .oid, .date, .timestamp, .timestamptz, .interval, .json, .jsonb, .regclass, .regtype, .regnamespace, .regproc => true,
                 .varchar, .character, .char, .bpchar, .uuid, .bytea, .time, .timetz, .bit, .varbit, .money => true,
                 .pg_lsn, .xid8, .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange, .inet, .cidr, .macaddr, .point, .box, .xml, .jsonpath, .tsvector, .tsquery => true,
                 else => false,
@@ -1657,16 +1799,52 @@ pub fn Parser(comptime config: types.Config) type {
             return (try lookahead.next()).kind == .string;
         }
 
+        fn catalogRegTypmod(name: []const u8) ?i32 {
+            if (types.same(name, "regclass")) return ast.regclass_typmod;
+            if (types.same(name, "regnamespace")) return ast.regnamespace_typmod;
+            if (types.same(name, "regtype")) return ast.regtype_typmod;
+            return null;
+        }
+
+        fn catalogQualifierAhead(self: *Self) Error!bool {
+            if (!(self.rawWord("pg_catalog") or
+                (self.current.kind == .quoted_word and types.same(self.current.raw(self.source), "pg_catalog")))) return false;
+            const next = try self.peek();
+            return next.kind == .symbol and next.symbol == .dot;
+        }
+
+        fn catalogTypeAhead(self: *Self) Error!bool {
+            if (self.mode != .standard or self.tokens.dialect != .postgres) return false;
+            if (try self.catalogQualifierAhead()) return true;
+            if (self.current.kind != .quoted_word) return false;
+            const name = self.current.raw(self.source);
+            return catalogRegTypmod(name) != null or types.typeByCatalogName(name) != null;
+        }
+
+        fn catalogScalarType(self: *Self, name: []const u8) Error!TypeSpec {
+            if (catalogRegTypmod(name)) |typmod| return .{ .ty = .oid, .typmod = typmod };
+            const data_type = types.typeByCatalogName(name) orelse return error.UndefinedObject;
+            const base_type = types.typeOfData(types.elementData(data_type) orelse data_type);
+            const typmod: i32 = switch (base_type) {
+                .numeric => try self.numericModifier(),
+                .varchar, .bpchar => try self.characterLength(false),
+                .bit, .varbit => try self.bitLength(false),
+                .time, .timetz, .timestamp, .timestamptz => try self.precision(),
+                else => -1,
+            };
+            return .{ .ty = types.typeOfData(data_type), .typmod = typmod };
+        }
+
         fn typeName(self: *Self) Error!TypeSpec {
-            if (try self.internalCharQualifier()) {
-                try self.advance();
-                try self.expectSymbol(.dot);
-                try self.advance();
-                return self.typeArraySuffix(.{ .ty = .pg_internal_char });
-            }
-            if (self.internalCharName()) {
-                try self.advance();
-                return self.typeArraySuffix(.{ .ty = .pg_internal_char });
+            if (try self.catalogTypeAhead()) {
+                if (try self.catalogQualifierAhead()) {
+                    try self.advance();
+                    try self.expectSymbol(.dot);
+                }
+                const ident = try self.label();
+                var buffer: [64]u8 = undefined;
+                const name = identText(self.source, ident, &buffer) orelse return error.UndefinedObject;
+                return self.typeArraySuffix(try self.catalogScalarType(name));
             }
             return self.typeArraySuffix(try self.scalarTypeName());
         }
@@ -1691,9 +1869,17 @@ pub fn Parser(comptime config: types.Config) type {
             }
             if (array) {
                 if (ast.regKind(spec.typmod) != .none) return error.UnsupportedStatement;
-                spec.ty = types.arrayType(spec.ty) orelse return error.Syntax;
+                if (!types.isArray(spec.ty)) spec.ty = types.arrayType(spec.ty) orelse return error.Syntax;
             }
             return spec;
+        }
+
+        fn numericModifier(self: *Self) Error!i32 {
+            if (!try self.takeSymbol(.lparen)) return -1;
+            const precision_digits = try self.typmodNumber();
+            const scale = if (try self.takeSymbol(.comma)) try self.typmodNumber() else 0;
+            try self.expectSymbol(.rparen);
+            return numeric.Ops(config.numeric_digits).encodeTypmod(precision_digits, scale);
         }
 
         fn scalarTypeName(self: *Self) Error!TypeSpec {
@@ -1721,14 +1907,7 @@ pub fn Parser(comptime config: types.Config) type {
                     if (bits < 1 or bits > 53) return error.InvalidParameterValue;
                     break :blk .{ .ty = if (bits <= 24) .float4 else .float8 };
                 },
-                .numeric, .decimal => blk: {
-                    if (!try self.takeSymbol(.lparen)) break :blk .{ .ty = .numeric };
-                    const p = try self.typmodNumber();
-                    var s: i32 = 0;
-                    if (try self.takeSymbol(.comma)) s = try self.typmodNumber();
-                    try self.expectSymbol(.rparen);
-                    break :blk .{ .ty = .numeric, .typmod = try numeric.Ops(config.numeric_digits).encodeTypmod(p, s) };
-                },
+                .numeric, .decimal => .{ .ty = .numeric, .typmod = try self.numericModifier() },
                 .date => .{ .ty = .date },
                 .timestamp => blk: {
                     const p = try self.precision();
@@ -1747,6 +1926,7 @@ pub fn Parser(comptime config: types.Config) type {
                 .interval => .{ .ty = .interval },
                 .json => .{ .ty = .json },
                 .jsonb => .{ .ty = .jsonb },
+                .regproc => .{ .ty = .regproc },
                 .regclass => .{ .ty = .oid, .typmod = ast.regclass_typmod },
                 .regnamespace => .{ .ty = .oid, .typmod = ast.regnamespace_typmod },
                 .regtype => .{ .ty = .oid, .typmod = ast.regtype_typmod },
@@ -1816,7 +1996,7 @@ pub fn Parser(comptime config: types.Config) type {
         }
 
         /// Sequence options (CREATE SEQUENCE and identity specifications).
-        fn sequenceOptions(self: *Self, out: *sequence.Options) Error!void {
+        fn sequenceOptions(self: *Self, out: *sequence.Options, ownership: ?*?Ast.SequenceOwner) Error!void {
             var seen:u16=0;
             while (true) {
                 var option:u16=0;
@@ -1875,10 +2055,25 @@ pub fn Parser(comptime config: types.Config) type {
                         // creation skips option validation before resolve().
                         else => 0xffffffff,
                     };
+                } else if (ownership != null and try self.takeRaw("owned")) {
+                    option = 256;
+                    try self.expectWord("BY");
+                    ownership.?.* = try self.sequenceOwner();
                 } else return;
                 if(seen&option!=0) out.duplicate_options=true;
                 seen|=option;
             }
+        }
+
+        fn sequenceOwner(self: *Self) Error!Ast.SequenceOwner {
+            if (try self.takeRaw("none")) return .{};
+            const first = try self.identifier();
+            try self.expectSymbol(.dot);
+            const second = try self.identifier();
+            return if (try self.takeSymbol(.dot))
+                .{ .table = .{ .schema = first, .name = second }, .column = try self.identifier() }
+            else
+                .{ .table = .{ .name = first }, .column = second };
         }
 
         fn ifNotExists(self: *Self) Error!bool {
@@ -1889,8 +2084,8 @@ pub fn Parser(comptime config: types.Config) type {
 
         fn createSequence(self: *Self) Error!Ast.CreateSequence {
             const conditional = try self.ifNotExists();
-            var out: Ast.CreateSequence = .{ .name = try self.identifier(), .if_not_exists = conditional };
-            try self.sequenceOptions(&out.options);
+            var out: Ast.CreateSequence = .{ .name = try self.qualifiedName(), .if_not_exists = conditional };
+            try self.sequenceOptions(&out.options, null);
             try self.finish();
             return out;
         }
@@ -2003,7 +2198,7 @@ pub fn Parser(comptime config: types.Config) type {
             if (try self.takeWord("EXCLUDE")) {
                 var out: Ast.ConstraintDef = .{ .name = name, .kind = .exclusion };
                 if (try self.takeWord("USING")) {
-                    if (!try self.takeRaw("gist") and !try self.takeRaw("btree") and !try self.takeRaw("hash")) return error.UnsupportedStatement;
+                    try self.accessMethod(true);
                 }
                 try self.expectSymbol(.lparen);
                 while (true) {
@@ -2104,7 +2299,7 @@ pub fn Parser(comptime config: types.Config) type {
                     break;
                 }
             } else {
-                if (self.mode == .standard and !typeWord(self.current) and !self.internalCharName() and !(try self.internalCharQualifier()) and
+                if (self.mode == .standard and !typeWord(self.current) and !(try self.catalogTypeAhead()) and
                     (self.current.kind == .quoted_word or (self.current.kind == .word and !lexer.reserved(self.current.keyword)))) {
                     return error.UnsupportedStatement;
                 }
@@ -2142,7 +2337,7 @@ pub fn Parser(comptime config: types.Config) type {
                     if (try self.takeWord("IDENTITY")) {
                         column.default_kind = if (always) .identity_always else .identity_by_default;
                         if (try self.takeSymbol(.lparen)) {
-                            try self.sequenceOptions(&column.sequence);
+                            try self.sequenceOptions(&column.sequence, null);
                             try self.expectSymbol(.rparen);
                         }
                     } else {
@@ -3056,7 +3251,8 @@ pub fn Parser(comptime config: types.Config) type {
             }
             var star = false;
             while (true) {
-                if (out.count == config.columns) return error.ColumnCapacity;
+                if (out.count == out.targets.len) return error.ColumnCapacity;
+                if (out.count == config.columns) self.pool.complex = true;
                 var target: Ast.Target = .{};
                 if (try self.takeSymbol(.star)) {
                     target.star = true;
@@ -3069,7 +3265,16 @@ pub fn Parser(comptime config: types.Config) type {
                         target.star = true;
                         star = true;
                         self.pool.complex = true;
-                    } else target.alias = try self.bareAlias();
+                    } else {
+                        if (self.mode == .standard and self.tokens.dialect == .postgres and !self.pool.complex and n.kind == .function) {
+                            var buf: [64]u8 = undefined;
+                            if (identText(self.source, n.name, &buf)) |name| {
+                                if (types.same(name, "unnest")) self.pool.complex = true;
+                            }
+                        }
+                        target.expression_end = self.previous_end;
+                        target.alias = try self.bareAlias();
+                    }
                 }
                 out.targets[out.count] = target;
                 out.count += 1;
@@ -3570,41 +3775,8 @@ pub fn Parser(comptime config: types.Config) type {
             var left = try self.pattern();
             while (self.comparisonOp()) |op| {
                 try self.advance();
-                if (self.mode == .standard and (self.isWord("ANY") or self.isWord("SOME") or self.isWord("ALL"))) {
-                    const all = self.isWord("ALL");
-                    try self.advance();
-                    try self.expectSymbol(.lparen);
-                    if (!self.isWord("SELECT") and !self.isWord("WITH") and !self.isSymbol(.lparen)) {
-                        // `x op ANY/ALL (array)`: an array_any call over
-                        // (x, array), with in_subquery's op/negated encoding.
-                        const array = try self.expression();
-                        try self.expectSymbol(.rparen);
-                        const any = try self.pool.add(.{ .kind = .function, .func = .array_any, .op = if (all) oppositeComparison(op) else op, .negated = all, .b = left });
-                        self.pool.nodes[left].next = array;
-                        try self.pool.raise(any, left);
-                        try self.pool.raise(any, array);
-                        left = try self.castTail(any);
-                        left = try self.collateTail(left);
-                        left = try self.atZoneTail(left);
-                        left = try self.multiplicativeTail(left);
-                        left = try self.additiveTail(left);
-                        left = try self.otherTail(left);
-                        left = try self.patternTail(left);
-                        continue;
-                    }
-                    const inner = try self.query();
-                    try self.expectSymbol(.rparen);
-                    self.pool.complex = true;
-                    // SQL three-valued De Morgan duality preserves NULL and
-                    // empty-set semantics without a new AST storage field.
-                    left = try self.pool.add(.{ .kind = .in_subquery, .op = if (all) oppositeComparison(op) else op, .negated = all, .a = left, .integer = inner });
-                    // A completed sublink can itself be a higher-precedence
-                    // operand: x=ANY(...)::text || 'suffix', or ... = TRUE.
-                    left = try self.castTail(left);
-                    left = try self.collateTail(left);
-                    left = try self.atZoneTail(left);
-                    left = try self.multiplicativeTail(left);
-                    left = try self.additiveTail(left);
+                if (self.hasQuantifier()) {
+                    left = try self.quantified(left, op);
                     left = try self.otherTail(left);
                     left = try self.patternTail(left);
                     continue;
@@ -3615,6 +3787,37 @@ pub fn Parser(comptime config: types.Config) type {
                 return self.pool.add(.{ .kind = .binary, .op = op, .a = left, .b = right });
             }
             return left;
+        }
+
+        fn hasQuantifier(self: *const Self) bool {
+            return self.mode == .standard and (self.isWord("ANY") or self.isWord("SOME") or self.isWord("ALL"));
+        }
+
+        fn quantified(self: *Self, left: u16, op: ast.Op) Error!u16 {
+            const all = self.isWord("ALL");
+            try self.advance();
+            try self.expectSymbol(.lparen);
+            const comparison_op = if (all) oppositeComparison(op) else op;
+            var value: u16 = undefined;
+            if (self.isWord("SELECT") or self.isWord("WITH") or self.isSymbol(.lparen)) {
+                const inner = try self.query();
+                try self.expectSymbol(.rparen);
+                self.pool.complex = true;
+                value = try self.pool.add(.{ .kind = .in_subquery, .op = comparison_op, .negated = all, .a = left, .integer = inner });
+            } else {
+                const array = try self.expression();
+                try self.expectSymbol(.rparen);
+                value = try self.pool.add(.{ .kind = .function, .func = .array_any, .op = comparison_op, .negated = all, .b = left });
+                self.pool.nodes[left].next = array;
+                try self.pool.raise(value, left);
+                try self.pool.raise(value, array);
+            }
+            // A completed sublink may be an operand of a tighter operator.
+            value = try self.castTail(value);
+            value = try self.collateTail(value);
+            value = try self.atZoneTail(value);
+            value = try self.multiplicativeTail(value);
+            return self.additiveTail(value);
         }
 
         fn oppositeComparison(op: ast.Op) ast.Op {
@@ -3752,8 +3955,15 @@ pub fn Parser(comptime config: types.Config) type {
                         else => self.comparisonOp() orelse return error.UndefinedFunction,
                     } else break,
                 };
+                const comparison_op = if (qualified) self.comparisonOp() else null;
                 try self.advance();
                 if (qualified) try self.expectSymbol(.rparen);
+                if (comparison_op) |comparison_operator| {
+                    if (self.hasQuantifier()) {
+                        left = try self.quantified(left, comparison_operator);
+                        continue;
+                    }
+                }
                 const right = try self.additive();
                 left = try self.pool.add(.{ .kind = .binary, .op = op, .a = left, .b = right,
                     .insensitive = symbol == .regex_icase or symbol == .not_regex_icase, .negated = symbol == .not_regex or symbol == .not_regex_icase });
@@ -3847,6 +4057,14 @@ pub fn Parser(comptime config: types.Config) type {
             return out[0..ident.len];
         }
 
+        fn accessMethod(self: *Self, allow_gist: bool) Error!void {
+            const ident = try self.identifier();
+            var buffer: [64]u8 = undefined;
+            const method = identText(self.source, ident, &buffer) orelse return error.UnsupportedStatement;
+            if (types.same(method, "btree") or types.same(method, "hash") or (allow_gist and types.same(method, "gist"))) return;
+            return error.UnsupportedStatement;
+        }
+
         fn requireCatalogQualifier(self: *const Self, name: ast.Ident) Error!void {
             var schema: [64]u8 = undefined;
             const spelling = identText(self.source, name, &schema) orelse return error.UndefinedSchema;
@@ -3919,29 +4137,15 @@ pub fn Parser(comptime config: types.Config) type {
         }
 
         fn castTarget(self: *Self, inner: u16) Error!u16 {
-            if (typeWord(self.current) or self.internalCharName()) {
+            if (typeWord(self.current) or try self.catalogTypeAhead()) {
                 const next = try self.peek();
-                if (next.kind != .symbol or next.symbol != .dot) {
+                if (next.kind != .symbol or next.symbol != .dot or
+                    (self.tokens.dialect == .postgres and try self.catalogQualifierAhead())) {
                     const target = try self.typeName();
                     return self.pool.add(.{ .kind = .cast, .cast_type = target.ty, .typmod = target.typmod, .a = inner });
                 }
             }
             const named = try self.qualifiedName();
-            if (self.tokens.dialect == .postgres) if (named.schema) |qualifier| {
-                var schema_buffer: [64]u8 = undefined;
-                var name_buffer: [64]u8 = undefined;
-                const schema = identText(self.source, qualifier, &schema_buffer) orelse "";
-                const name = identText(self.source, named.name, &name_buffer) orelse "";
-                if (types.same(schema, "pg_catalog")) {
-                    const scalar: TypeSpec =
-                        if (types.same(name, "regclass")) .{ .ty = .oid, .typmod = ast.regclass_typmod }
-                        else if (types.same(name, "regnamespace")) .{ .ty = .oid, .typmod = ast.regnamespace_typmod }
-                        else if (types.same(name, "regtype")) .{ .ty = .oid, .typmod = ast.regtype_typmod }
-                        else .{ .ty = types.typeOfData(types.typeByCatalogName(name) orelse return error.UndefinedObject) };
-                    const target = try self.typeArraySuffix(scalar);
-                    return self.pool.add(.{ .kind = .cast, .cast_type = target.ty, .typmod = target.typmod, .a = inner });
-                }
-            };
             if (self.isSymbol(.lbracket) or self.isSymbol(.lparen) or self.rawWord("array")) return error.UnsupportedStatement;
             return self.pool.add(.{ .kind = .cast, .cast_type = .unknown, .a = inner, .name = named.name, .qualifier = named.schema orelse .{} });
         }

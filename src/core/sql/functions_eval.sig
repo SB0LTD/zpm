@@ -13,6 +13,7 @@ const numeric = @import("numeric.sig");
 const numeric_math = @import("numeric_math.sig");
 const float_text = @import("float_text.sig");
 const temporal = @import("temporal.sig");
+const time_of_day = @import("time_of_day.sig");
 const times = @import("functions_temporal.sig");
 const formats = @import("functions_format.sig");
 const unicode = @import("functions_unicode.sig");
@@ -76,6 +77,7 @@ pub fn Builtins(comptime config: types.Config, comptime E: type) type {
             var out: strings.Out = .{ .bytes = &result.bytes };
             const count = argumentCount(ctx, n);
             switch (n.func) {
+                .quote_ident, .quote_literal => try strings.quoteSql(textOf(&cells[0]), n.func == .quote_ident, ctx.session.quote_all_identifiers, &out, control),
                 .lower => try strings.mapCase(textOf(&cells[0]), .lower, &out, control),
                 .upper => try strings.mapCase(textOf(&cells[0]), .upper, &out, control),
                 .initcap => try strings.mapCase(textOf(&cells[0]), .initcap, &out, control),
@@ -107,7 +109,7 @@ pub fn Builtins(comptime config: types.Config, comptime E: type) type {
                 .to_hex => try strings.toHex(cells[0].integer, if (node(ctx, n.b).ty == .int8) 64 else 32, &out),
                 .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .sind, .cosd, .tan, .cot, .asin, .acos, .atan, .atan2,
                 .gcd, .lcm, .scale, .min_scale, .trim_scale => return mathematical(n, &cells, count, control),
-                .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .age, .age_tz, .justify_days, .justify_hours,
+                .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .date_bin, .age, .age_tz, .justify_days, .justify_hours,
                 .justify_interval, .make_date, .make_timestamp, .isfinite => return temporalValue(ctx, n, &cells, count),
                 .to_date, .to_number, .to_timestamp => return formatValue(ctx, n, &cells, count),
                 .normalize, .is_normalized => {
@@ -388,6 +390,11 @@ pub fn Builtins(comptime config: types.Config, comptime E: type) type {
                         else => unreachable,
                     }
                 },
+                .date_bin => return switch (cells[1]) {
+                    .timestamp => |stamp| .{ .timestamp = try times.dateBin(cells[0].interval, stamp, cells[2].timestamp) },
+                    .timestamptz => |stamp| .{ .timestamptz = try times.dateBin(cells[0].interval, stamp, cells[2].timestamptz) },
+                    else => unreachable,
+                },
                 .age, .age_tz => {
                     const zoned = n.func == .age_tz and (cells[0] == .timestamptz);
                     var first: i64 = undefined;
@@ -422,23 +429,44 @@ pub fn Builtins(comptime config: types.Config, comptime E: type) type {
             }
         }
 
-        /// An OVERLAPS endpoint: the start, or start + interval (SQL form).
-        fn endpoint(ctx: *const E.Context, start: *const V.Cell, end: *const V.Cell) Error!?i64 {
-            if (end.* == .null_value) return null;
-            if (end.* != .interval) return if (end.* == .timestamp) end.timestamp else end.timestamptz;
-            if (start.* == .null_value) return null;
-            return if (start.* == .timestamp) try temporal.timestampPlus(start.timestamp, end.interval) else try temporal.timestamptzPlus(start.timestamptz, end.interval, &ctx.session.zone);
-        }
-
-        fn instant(cell: *const V.Cell) ?i64 {
-            return switch (cell.*) {
-                .timestamp => |us| us,
-                .timestamptz => |us| us,
-                else => null,
+        /// A duration supplies the second endpoint through the existing
+        /// datetime addition rules, including the TIME wrap at midnight.
+        fn finishPeriod(ctx: *const E.Context, start: *const V.Cell, end: *V.Cell) Error!void {
+            if (end.* != .interval) return;
+            const duration = end.interval;
+            end.* = switch (start.*) {
+                .null_value => .null_value,
+                .timestamp => |us| .{ .timestamp = try temporal.timestampPlus(us, duration) },
+                .timestamptz => |us| .{ .timestamptz = try temporal.timestamptzPlus(us, duration, &ctx.session.zone) },
+                .time => |us| .{ .time = time_of_day.plus(us, duration, false) },
+                else => unreachable,
             };
         }
 
-        /// overlaps_timestamp, including its NULL rules.
+        const Period = struct {
+            start: *const V.Cell,
+            end: ?*const V.Cell,
+
+            fn ordered(start: *const V.Cell, end: *const V.Cell) ?Period {
+                if (start.* == .null_value) {
+                    if (end.* == .null_value) return null;
+                    return .{ .start = end, .end = null };
+                }
+                if (end.* == .null_value) return .{ .start = start, .end = null };
+                return if (V.compare(start, end) > 0)
+                    .{ .start = end, .end = start }
+                else
+                    .{ .start = start, .end = end };
+            }
+
+            fn overlapsLater(earlier: Period, later: Period) V.Cell {
+                const end = earlier.end orelse return .null_value;
+                if (V.compare(later.start, end) < 0) return .{ .boolean = true };
+                return if (later.end == null) .null_value else .{ .boolean = false };
+            }
+        };
+
+        /// Half-open periods and single instants with PostgreSQL's NULL rules.
         fn overlaps(ctx: *const E.Context, n: *const ast.Node) Error!V.Cell {
             var cells: [4]V.Cell = undefined;
             var item = n.b;
@@ -446,44 +474,15 @@ pub fn Builtins(comptime config: types.Config, comptime E: type) type {
                 cell.* = try E.eval(ctx, item);
                 item = node(ctx, item).next;
             }
-            var s1 = instant(&cells[0]);
-            var e1 = try endpoint(ctx, &cells[0], &cells[1]);
-            var s2 = instant(&cells[2]);
-            var e2 = try endpoint(ctx, &cells[2], &cells[3]);
-            if (s1 == null) {
-                if (e1 == null) return .null_value;
-                s1 = e1;
-                e1 = null;
-            } else if (e1 != null and s1.? > e1.?) {
-                const swap = s1;
-                s1 = e1;
-                e1 = swap;
-            }
-            if (s2 == null) {
-                if (e2 == null) return .null_value;
-                s2 = e2;
-                e2 = null;
-            } else if (e2 != null and s2.? > e2.?) {
-                const swap = s2;
-                s2 = e2;
-                e2 = swap;
-            }
-            const a = s1.?;
-            const b = s2.?;
-            if (a > b) {
-                const end2 = e2 orelse return .null_value;
-                if (a < end2) return .{ .boolean = true };
-                if (e1 == null) return .null_value;
-                return .{ .boolean = false };
-            }
-            if (a < b) {
-                const end1 = e1 orelse return .null_value;
-                if (b < end1) return .{ .boolean = true };
-                if (e2 == null) return .null_value;
-                return .{ .boolean = false };
-            }
-            if (e1 == null or e2 == null) return .null_value;
-            return .{ .boolean = true };
+            try finishPeriod(ctx, &cells[0], &cells[1]);
+            try finishPeriod(ctx, &cells[2], &cells[3]);
+            const left = Period.ordered(&cells[0], &cells[1]) orelse return .null_value;
+            const right = Period.ordered(&cells[2], &cells[3]) orelse return .null_value;
+            return switch (V.compare(left.start, right.start)) {
+                -1 => left.overlapsLater(right),
+                1 => right.overlapsLater(left),
+                else => if (left.end == null or right.end == null) .null_value else .{ .boolean = true },
+            };
         }
 
         /// to_date / to_timestamp / to_number.

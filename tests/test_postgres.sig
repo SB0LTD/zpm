@@ -688,6 +688,14 @@ fn inference() !void {
     try sync(&s, &db);
     try tags(try query(&s, &db, "SELECT body FROM t ORDER BY id"), "TDDCZ");
     try check(equal(s.result.rows[0].cells[0].text.slice(), "456") and equal(s.result.rows[1].cells[0].text.slice(), "999"));
+    _ = try query(&s, &db, "CREATE SCHEMA \"Archive Names\"");
+    _ = try query(&s, &db, "CREATE TABLE \"Archive Names\".\"Records\" (id INTEGER PRIMARY KEY, \"short\"\"note\" TEXT)");
+    try tags(try parse(&s, &db, "scoped", "INSERT INTO \"Archive Names\".\"Records\" VALUES ($1,$2)", &.{}), "1");
+    try tags(try bind(&s, &db, "", "scoped", &.{ "1", "archived" }, 0, 0), "2");
+    try tags(try execute(&s, &db, "", 0), "C");
+    try sync(&s, &db);
+    try tags(try query(&s, &db, "SELECT \"short\"\"note\" FROM \"Archive Names\".\"Records\""), "TDCZ");
+    try check(equal(s.result.rows[0].cells[0].text.slice(), "archived"));
 }
 /// The unnamed portal's SQL after Bind: the statement with parameters spliced.
 fn portalText(s: *Session) ![]const u8 {
@@ -1526,12 +1534,49 @@ fn detachedPrimaryKeys() !void {
     db.running_statement = false;
     try check(s.result.row_count == 1 and s.result.rows[0].cells[0].integer == 7);
 
+    try tags(store_output[0..(try storeSend(&s, &db, &sync_packet)).written], "Z");
+    var fused_bind = Packet.init('B');
+    fused_bind.string("");
+    fused_bind.string("");
+    fused_bind.number16(1);
+    fused_bind.number16(1);
+    fused_bind.number16(1);
+    fused_bind.number32(8);
+    fused_bind.append("\xff\xff\xff\xff\xff\xff\xff\xf7");
+    fused_bind.number16(1);
+    fused_bind.number16(1);
+    var fused_execute = Packet.init('E');
+    fused_execute.string("");
+    fused_execute.number32(0);
+    var exchange_bytes: [128]u8 = undefined;
+    var request_len: usize = 0;
+    for ([_][]const u8{ fused_bind.slice(), fused_execute.slice(), sync_packet.slice() }) |item| {
+        @memcpy(exchange_bytes[request_len..][0..item.len], item);
+        request_len += item.len;
+    }
+    const request = exchange_bytes[0..request_len];
+    try check(s.detachedKeyExchange(request[0 .. request.len - 1]) == null);
+    const exchange = s.detachedKeyExchange(request) orelse return error.MissingPrimaryKeyExchange;
+    s.result.row_count = 0;
+    db.read_context = &context;
+    db.running_statement = true;
+    const fused = (try s.handleDetachedKeyExchange(&db, exchange, &store_output)) orelse return error.MissedRetainedKeyExchange;
+    db.read_context = null;
+    db.running_statement = false;
+    try check(fused.consumed == request.len and context.primary_key_cache_hits == 2 and s.result.row_count == 0);
+    try tags(store_output[0..fused.written], "2DCZ");
+    var fused_frames: Frames = .{ .bytes = store_output[0..fused.written] };
+    _ = try fused_frames.next();
+    const fused_row = (try fused_frames.next()).?;
+    try check(equal(fused_row.body[6..14], "\xff\xff\xff\xff\xff\xff\xff\xf7"));
+
     _ = try storeQuery(&s, &db, "UPDATE pk SET id=8 WHERE id=7");
     const after: Raw.Snapshot = .{.csn=store.database.csn};
     const old_key: Raw.Cell = .{.integer=7};
+    try check(!try context.runCachedPrimaryKey(&store.database, template, after, .integer, &old_key, &s.result));
     try check(!try context.runPrimaryKey(&store.database, after, &old_key, &s.result));
     try check(try context.preparePrimaryKey(&store.database, template, after, .integer));
-    try check(context.primary_key_cache_hits == 1);
+    try check(context.primary_key_cache_hits == 2);
     try check(try context.runPrimaryKey(&store.database, after, &old_key, &s.result));
     try check(s.result.row_count == 0);
 }

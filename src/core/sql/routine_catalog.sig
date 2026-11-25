@@ -21,7 +21,8 @@
 //!       language u8 (0 sql, 1 plpgsql), volatility u8 ('i', 's', 'v'),
 //!       strict u8, arg_count u8, per argument: name, type OID u32, typmod
 //!       i32; return type OID u32 (2278 void, 2279 trigger), return typmod
-//!       i32, body text.
+//!       i32, body text, optional owner OID u32, and optional EXECUTE ACL
+//!       (owner/PUBLIC flags u8, count u8, grantee OIDs u32).
 //!   62: oid u32, name, table OID u32, function OID u32, tgtype u8
 //!       (PostgreSQL's bits: 1 ROW, 2 BEFORE, 4 INSERT, 8 DELETE, 16 UPDATE,
 //!       32 TRUNCATE, 64 INSTEAD), column_count u8 + column indexes u8
@@ -133,7 +134,7 @@ pub fn Catalog(comptime config: types.Config) type {
         pub const Name = V.Name;
         pub const arg_bytes: usize = @max(config.routine_bytes / 4, 16);
         /// Largest object payload (a routine with every argument named).
-        pub const payload_bytes: usize = config.routine_bytes + arg_bytes + config.routine_args * (config.name_bytes + 10) + config.columns + 2 * config.name_bytes + 64;
+        pub const payload_bytes: usize = config.routine_bytes + arg_bytes + config.routine_args * (config.name_bytes + 10) + config.columns + 2 * config.name_bytes + 64 + 4 * @as(usize, config.routine_acl_entries);
 
         /// Inline object text (bodies, WHEN conditions, rule qualifications).
         pub const Text = struct {
@@ -151,11 +152,50 @@ pub fn Catalog(comptime config: types.Config) type {
             }
         };
 
+        pub const ExecuteAcl = struct {
+            explicit: bool = false,
+            owner: bool = true,
+            public: bool = true,
+            count: u8 = 0,
+            grantees: [config.routine_acl_entries]u32 = @splat(0),
+
+            pub fn roles(self: *const ExecuteAcl) []const u32 {
+                return self.grantees[0..self.count];
+            }
+
+            pub fn set(self: *ExecuteAcl, role: u32, owner: u32, allow: bool) Error!void {
+                self.explicit = true;
+                if (role == owner) {
+                    self.owner = allow;
+                    return;
+                }
+                if (role == 0) {
+                    self.public = allow;
+                    return;
+                }
+                for (self.roles(), 0..) |grantee, index| {
+                    if (grantee != role) continue;
+                    if (!allow) {
+                        const count = self.count - 1;
+                        for (index..count) |i| self.grantees[i] = self.grantees[i + 1];
+                        self.count = count;
+                    }
+                    return;
+                }
+                if (!allow) return;
+                if (self.count == self.grantees.len) return error.ProgramLimitExceeded;
+                self.grantees[self.count] = role;
+                self.count += 1;
+            }
+        };
+
         pub const Routine = struct {
             live: bool = false,
             stamp: Stamp = .{},
             oid: u32 = 0,
             namespace: u32 = 2200,
+            owner: u32 = @import("catalog_objects.sig").bootstrap_role,
+            acl: ExecuteAcl = .{},
             name: Name = .{},
             /// 'f' function, 'p' procedure (pg_proc.prokind).
             kind: u8 = 'f',
@@ -438,6 +478,14 @@ pub fn Catalog(comptime config: types.Config) type {
             try out.int(u32, item.return_oid);
             try out.int(i32, item.return_typmod);
             try out.text(item.body.slice());
+            // Older routine records end after the body and imply the bootstrap owner.
+            if (item.owner != @import("catalog_objects.sig").bootstrap_role or item.acl.explicit) try out.int(u32, item.owner);
+            if (item.acl.explicit) {
+                const flags = @as(u8, @intFromBool(item.acl.owner)) | (@as(u8, @intFromBool(item.acl.public)) << 1);
+                try out.int(u8, flags);
+                try out.int(u8, item.acl.count);
+                for (item.acl.roles()) |role| try out.int(u32, role);
+            }
         }
 
         pub fn encodeTrigger(out: *Payload, item: *const Trigger) Error!void {
@@ -512,6 +560,22 @@ pub fn Catalog(comptime config: types.Config) type {
             if (out.return_oid != void_oid and out.return_oid != trigger_oid and !knownType(out.return_oid)) return error.InvalidChangeRecord;
             if (out.kind == 'p' and out.return_oid != void_oid) return error.InvalidChangeRecord;
             out.body.len = try readText(&reader, &out.body.bytes);
+            if (!reader.finished()) {
+                out.owner = try reader.int(u32);
+                if (out.owner == 0) return error.InvalidChangeRecord;
+            }
+            if (!reader.finished()) {
+                const flags = try reader.int(u8);
+                const count_acl = try reader.int(u8);
+                if (flags > 3 or count_acl > config.routine_acl_entries) return error.InvalidChangeRecord;
+                out.acl = .{ .explicit = true, .owner = flags & 1 != 0, .public = flags & 2 != 0 };
+                for (0..count_acl) |_| {
+                    const role = try reader.int(u32);
+                    if (role == 0 or role == out.owner) return error.InvalidChangeRecord;
+                    for (out.acl.roles()) |existing| if (role == existing) return error.InvalidChangeRecord;
+                    try out.acl.set(role, out.owner, true);
+                }
+            }
             if (!reader.finished()) return error.InvalidChangeRecord;
         }
 
@@ -572,6 +636,8 @@ pub fn Catalog(comptime config: types.Config) type {
             class: Class = .routine,
             oid: u32 = 0,
             namespace: u32 = 0,
+            owner: u32 = 0,
+            acl: ExecuteAcl = .{},
             /// Trigger / rule table OID.
             table_oid: u32 = 0,
             /// Trigger function OID.
@@ -604,7 +670,7 @@ pub fn Catalog(comptime config: types.Config) type {
             var at: usize = 0;
             for (&set.routines) |*item| {
                 if (!item.live or !item.stamp.committedLive()) continue;
-                overlay.objects[at] = .{ .live = true, .class = .routine, .oid = item.oid, .namespace = item.namespace, .kind = item.kind, .return_oid = item.return_oid, .name = item.name, .arg_count = item.arg_count, .arg_oids = item.arg_oids };
+                overlay.objects[at] = .{ .live = true, .class = .routine, .oid = item.oid, .namespace = item.namespace, .owner = item.owner, .acl = item.acl, .kind = item.kind, .return_oid = item.return_oid, .name = item.name, .arg_count = item.arg_count, .arg_oids = item.arg_oids };
                 overlay.counts[0] += 1;
                 at += 1;
             }
@@ -658,7 +724,7 @@ pub fn Catalog(comptime config: types.Config) type {
                         if (object.live and object.class == .routine and object.namespace == item.namespace and types.same(object.name.slice(), item.name.slice()) and
                             sameArgs(object.arg_oids[0..object.arg_count], item.args())) return error.ChangeRecordConflict;
                     }
-                    try overlayAdd(overlay, .{ .live = true, .class = .routine, .oid = item.oid, .namespace = item.namespace, .kind = item.kind, .return_oid = item.return_oid, .name = item.name, .arg_count = item.arg_count, .arg_oids = item.arg_oids });
+                    try overlayAdd(overlay, .{ .live = true, .class = .routine, .oid = item.oid, .namespace = item.namespace, .owner = item.owner, .acl = item.acl, .kind = item.kind, .return_oid = item.return_oid, .name = item.name, .arg_count = item.arg_count, .arg_oids = item.arg_oids });
                     return item.oid;
                 },
                 @intFromEnum(Op.create_trigger) => {
@@ -692,15 +758,30 @@ pub fn Catalog(comptime config: types.Config) type {
                         else => .rule,
                     };
                     const object = overlayFind(overlay, class, try decodeOid(payload)) orelse return error.ChangeRecordConflict;
-                    if (class == .routine) {
-                        // A trigger still using the function must be dropped first.
-                        for (&overlay.objects) |*other| if (other.live and other.class == .trigger and other.function_oid == object.oid) return error.ChangeRecordConflict;
-                    }
                     object.live = false;
                     overlay.counts[@intFromEnum(class)] -= 1;
                     return null;
                 },
                 else => return error.UnsupportedLogVersion,
+            }
+        }
+
+        /// ACL changes and routine replacement retain the OID with a
+        /// drop/create pair. Check dependencies on the final record state.
+        pub fn finishOverlay(overlay: *Overlay, roles: anytype) Error!void {
+            for (&overlay.objects) |*object| {
+                if (!object.live) continue;
+                switch (object.class) {
+                    .routine => {
+                        if (!roles.roleExists(object.owner)) return error.ChangeRecordConflict;
+                        for (object.acl.roles()) |role| if (!roles.roleExists(role)) return error.ChangeRecordConflict;
+                    },
+                    .trigger => {
+                        const function = overlayFind(overlay, .routine, object.function_oid) orelse return error.ChangeRecordConflict;
+                        if (function.return_oid != trigger_oid or function.arg_count != 0 or function.kind != 'f') return error.ChangeRecordConflict;
+                    },
+                    .rule => {},
+                }
             }
         }
 

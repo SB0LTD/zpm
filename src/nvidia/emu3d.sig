@@ -49,6 +49,20 @@
 //! insists on, or wants more. Nothing here has been compared with the
 //! hardware yet.
 //!
+//! **Turing** (TURING_A, when the emulator's Work says sm_75: the device
+//! it is on is a Turing one). The same engine, with what clc597.h and NVK
+//! say differs: a method only BLACKWELL_B has (the separate stencil plane,
+//! the texture header version, the pixel rate shading table, a program's
+//! prefetch word, ...) is a refused stream; a texture's header is Maxwell's
+//! TEXHEAD_PITCH; the depth target is one surface, the stencil in its
+//! words (S8Z24: depth in bits 0..23, stencil in 24..31), no
+//! STENCIL_IS_SEPARATE. Mesa's NIL gives every depth and stencil format
+//! Turing's FermiZS GOBs, whose layout is not public; modelled here as
+//! Turing2D's 32-bit words, which the 2080 Ti confirmed for ZF32 (its draw
+//! test through Windows' driver: step 4c within 3 ulps, 4d exact), so
+//! gfxapi's float depth images go to Turing's 3D engine as to Blackwell's.
+//! The 24-bit ones are not that layout on the card (4f lost the channel).
+//!
 //! Allocation-free: an Engine is the caller's (about 1 MB, static).
 
 const std = @import("std");
@@ -103,8 +117,26 @@ const Clip = struct { x0: i64, y0: i64, x1: i64, y1: i64 };
 
 /// The depth target as gl3d sends it: block linear, 32-bit words, depth
 /// in bits 0..23 (X8Z24, or S8Z24 with STENCIL_IS_SEPARATE), and its
-/// stencil plane (S8, Blackwell's 8-bit GOBs) when there is one.
-const ZT = struct { bytes: []u8, pitch: u32, width: u32, height: u32, gobs: u3, stencil: ?[]u8 = null, s_pitch: u32 = 0, float: bool = false };
+/// stencil plane (S8, Blackwell's 8-bit GOBs) when there is one. On Turing
+/// (`words`) a 24-bit depth is a whole word where Turing2D puts it (the
+/// guess: see the header), and with `combined` its stencil is the word's
+/// top byte.
+const ZT = struct { bytes: []u8, pitch: u32, width: u32, height: u32, gobs: u3, stencil: ?[]u8 = null, s_pitch: u32 = 0, float: bool = false, words: bool = false, combined: bool = false };
+
+/// The methods BLACKWELL_B has and TURING_A has not (clce97.h against
+/// clc597.h): sending one to Turing's engine is refused here.
+fn blackwellOnly(m: u32) bool {
+    return switch (m) {
+        // REPORT_SEMAPHORE_* (Hopper's), SET_MME_SWITCH_STATE, the pixel
+        // rate shading table, SET_ROOT_TABLE_PREFETCH, the Z ROP slice
+        // map, the texture header version, THROTTLE_SM, the method
+        // barrier, the separate stencil plane (SET_ST_*), the caches'
+        // invalidates by tag
+        0x0158, 0x015c, 0x0160, 0x0164, 0x0168, 0x01ec, 0x02cc, 0x02d0, 0x0500, 0x07ac, 0x07fc, 0x0dec, 0x0f00, 0x0f04, 0x0f08, 0x0f0c, 0x120c, 0x1210, 0x1458, 0x145c, 0x1460, 0x1930, 0x1934, 0x1938 => true,
+        // SET_PIPELINE_PROGRAM_PREFETCH(j) (Ampere B's: reserved on Turing)
+        else => m >= 0x201c and m < 0x201c + 64 * 6 and (m - 0x201c) % 64 == 0,
+    };
+}
 const STENCIL_TWO_SIDE = gl3d.SET_TWO_SIDED_STENCIL_TEST;
 
 /// A texture as its header and its sampler describe it.
@@ -112,6 +144,8 @@ const Tex = struct {
     bytes: []const u8,
     /// Rows `pitch` bytes apart, or (block) block linear, `pitch` bytes
     /// across (the width's texels in whole GOBs), blocks 2^block GOBs high.
+    /// Where its texels are (the header's address).
+    va: u64 = 0,
     pitch: u32,
     block: ?u3 = null,
     width: u32,
@@ -197,9 +231,15 @@ pub const Engine = struct {
         return @as(f32, @bitCast(g.methods[m / 4]));
     }
 
+    /// TURING_A (the device a Turing one), not BLACKWELL_B: during a draw.
+    fn turing(g: *const Engine) bool {
+        return g.host.work.sm == .sm_75;
+    }
+
     /// One method's data, as the engine takes it.
     pub fn method(g: *Engine, host: Host, m: u32, v: u32) anyerror!void {
         if (m / 4 >= METHODS) return g.refuse("a method past the class's");
+        if (host.work.sm == .sm_75 and blackwellOnly(m)) return g.refuse("a method TURING_A has not (BLACKWELL_B's alone: clc597.h has nothing there, or a reserved word)");
         // (the ways of drawing nothing here models: BEGIN and END, the
         // older array draw, a clear, a macro)
         if (m == 0x1618 or m == 0x1614 or m == 0x0d78 or m == 0x19d0 or m == 0x1214 or m == 0x1218 or m >= 0x3800)
@@ -243,7 +283,10 @@ pub const Engine = struct {
         try g.need(cts & 0xf >= 1 and cts & 0xf <= 8 and cts & ~@as(u32, 0xf) == gl3d.ctSelect(0) and g.reg(gr.SET_CT_MRT_ENABLE) == 1, "not 1 to 8 color targets, slot t target t (SET_CT_SELECT, SET_CT_MRT_ENABLE)");
         try g.need(g.reg(gr.SET_ZT_SELECT) <= 1 and g.reg(gr.SET_DEPTH_BOUNDS_TEST) == 0, "more than one depth target, or a depth bounds test: not modelled");
         try g.need(g.reg(gr.SET_ZT_SELECT) == 1 or (g.reg(gr.SET_DEPTH_TEST) == 0 and g.reg(gr.SET_STENCIL_TEST) == 0), "a depth or stencil test with no depth target (SET_ZT_SELECT)");
-        try g.need(g.reg(gr.SET_STENCIL_TEST) == 0 or g.reg(gl3d.SET_ZT_A + 8) & gl3d.ZT_STENCIL_IS_SEPARATE != 0, "a stencil test with no stencil plane (X8Z24 has none)");
+        if (g.turing())
+            try g.need(g.reg(gr.SET_STENCIL_TEST) == 0 or g.reg(gl3d.SET_ZT_A + 8) == gl3d.ZT_S8Z24, "a stencil test on Turing with no stencil in the depth's words (S8Z24)")
+        else
+            try g.need(g.reg(gr.SET_STENCIL_TEST) == 0 or g.reg(gl3d.SET_ZT_A + 8) & gl3d.ZT_STENCIL_IS_SEPARATE != 0, "a stencil test with no stencil plane (X8Z24 has none)");
         try g.need(g.reg(STENCIL_TWO_SIDE) <= 1, "SET_TWO_SIDED_STENCIL_TEST neither on nor off");
         try g.need(g.reg(gr.SET_RASTER_ENABLE) == 1, "the rasterizer is off (SET_RASTER_ENABLE)");
         try g.need(g.reg(gr.SET_ANTI_ALIAS) == 0 and g.reg(gr.SET_ANTI_ALIAS_SAMPLE_POSITIONS) == 0x8888_8888, "more than one sample, or a sample not at the pixel's centre");
@@ -368,9 +411,13 @@ pub const Engine = struct {
         const va = @as(u64, g.reg(a) & 0xff) << 32 | g.reg(a + 4);
         const fmt = g.reg(a + 8);
         const sep = gl3d.ZT_STENCIL_IS_SEPARATE;
-        const separate = fmt == gl3d.ZT_S8Z24 | sep or fmt == gl3d.ZT_ZF32_X24S8 | sep;
+        const on_turing = g.turing();
+        // (Turing: one surface, X8Z24, ZF32, or S8Z24 with the stencil in
+        // the word's top byte; no STENCIL_IS_SEPARATE, clcd97.h's)
+        if (on_turing) try g.need(fmt == gl3d.ZT_X8Z24 or fmt == gl3d.ZT_ZF32 or fmt == gl3d.ZT_S8Z24, "a depth format on Turing other than X8Z24, ZF32 or S8Z24 (STENCIL_IS_SEPARATE is Blackwell's; the others are not modelled)");
+        const separate = !on_turing and (fmt == gl3d.ZT_S8Z24 | sep or fmt == gl3d.ZT_ZF32_X24S8 | sep);
         const is_float = fmt == gl3d.ZT_ZF32 or fmt == gl3d.ZT_ZF32_X24S8 | sep;
-        try g.need(fmt == gl3d.ZT_X8Z24 or fmt == gl3d.ZT_ZF32 or separate, "a depth target whose stencil shares its words (Z24S8, or S8Z24 / ZF32_X24S8 without STENCIL_IS_SEPARATE): Blackwell refuses the draw (class error 0x13 at the draw, Xid 69: pc-full2); X8Z24 or ZF32, or S8Z24 / ZF32_X24S8 with its stencil a plane of its own");
+        if (!on_turing) try g.need(fmt == gl3d.ZT_X8Z24 or fmt == gl3d.ZT_ZF32 or separate, "a depth target whose stencil shares its words (Z24S8, or S8Z24 / ZF32_X24S8 without STENCIL_IS_SEPARATE): Blackwell refuses the draw (class error 0x13 at the draw, Xid 69: pc-full2); X8Z24 or ZF32, or S8Z24 / ZF32_X24S8 with its stencil a plane of its own");
         const bs = g.reg(a + 12);
         try g.need(bs & 0xf == 0 and (bs >> 8) & 0xf == 0 and (bs >> 4) & 0xf <= 5, "a depth target's blocks not one GOB wide and deep");
         const gobs: u3 = @intCast((bs >> 4) & 0xf);
@@ -384,7 +431,7 @@ pub const Engine = struct {
         const blocks_down = (h + rows_per_block - 1) / rows_per_block;
         const bytes = @as(usize, pitch / 64) * blocks_down * (@as(usize, 512) << gobs);
         const mem = g.host.mem.find(va, bytes) orelse return g.refuse("the depth target's memory is not mapped");
-        var z = ZT{ .bytes = mem, .pitch = pitch, .width = w, .height = h, .gobs = gobs, .float = is_float };
+        var z = ZT{ .bytes = mem, .pitch = pitch, .width = w, .height = h, .gobs = gobs, .float = is_float, .words = on_turing, .combined = on_turing and fmt == gl3d.ZT_S8Z24 };
         if (separate) {
             const st = gl3d.SET_ST_A;
             const sva = @as(u64, g.reg(st) & 0xff) << 32 | g.reg(st + 4);
@@ -448,9 +495,12 @@ pub const Engine = struct {
             code[2 * n + 1] = std.mem.readInt(u64, ib[8..16], .little);
         }
         try g.need(n != 0 and n < CODE, "a program with no code after its header, or more instructions than the emulator holds");
-        // (what the engine prefetches must reach the code's end)
-        const blocks = g.reg(gr.SET_PIPELINE_PROGRAM_ADDRESS_A + 64 * j + 8) & 0x7f;
-        try g.need(blocks != 0, "a program with nothing to prefetch (SET_PIPELINE_PROGRAM_PREFETCH)");
+        // (what the engine prefetches must reach the code's end; Turing has
+        // no prefetch word: Ampere B's)
+        if (!g.turing()) {
+            const blocks = g.reg(gr.SET_PIPELINE_PROGRAM_ADDRESS_A + 64 * j + 8) & 0x7f;
+            try g.need(blocks != 0, "a program with nothing to prefetch (SET_PIPELINE_PROGRAM_PREFETCH)");
+        }
         n_out.* = n;
         const group = g.reg(gr.SET_PIPELINE_REGISTER_COUNT + 64 * j + 4) & 7;
         try g.need(group < GROUPS, "a stage's binding group past 4");
@@ -950,14 +1000,16 @@ pub const Engine = struct {
         if (x >= z.width or y >= z.height) return false;
         // (a float depth's word where Turing2D puts it; a 24-bit one's
         // three bytes where Blackwell's Z24 GOBs do: z24Bytes)
+        // (on Turing a whole word where Turing2D puts it, the stencil its top
+        // byte with S8Z24: the guess the header names)
         const at = blAddress(z.pitch, z.gobs, x * 4, y);
         const zb = z24Bytes(z.pitch, z.gobs, x, y);
-        const w = if (z.float) std.mem.readInt(u32, z.bytes[at..][0..4], .little) else @as(u32, z.bytes[zb[0]]) | @as(u32, z.bytes[zb[1]]) << 8 | @as(u32, z.bytes[zb[2]]) << 16;
+        const w = if (z.float or z.words) std.mem.readInt(u32, z.bytes[at..][0..4], .little) else @as(u32, z.bytes[zb[0]]) | @as(u32, z.bytes[zb[1]]) << 8 | @as(u32, z.bytes[zb[2]]) << 16;
         const zq = if (z.float) depthBits(zw) else depthWord(zw);
         const old_z = if (z.float) w else w & 0xff_ffff;
         const s_at = if (z.stencil != null) blAddress8(z.s_pitch, z.gobs, x, y) else 0;
-        var stencil: u32 = if (z.stencil) |sb| sb[s_at] else 0;
-        const st_on = g.reg(gr.SET_STENCIL_TEST) & 1 != 0 and z.stencil != null;
+        var stencil: u32 = if (z.stencil) |sb| sb[s_at] else if (z.combined) w >> 24 else 0;
+        const st_on = g.reg(gr.SET_STENCIL_TEST) & 1 != 0 and (z.stencil != null or z.combined);
         const back = !front and g.reg(STENCIL_TWO_SIDE) & 1 != 0;
         // (each face's: the ops and the func, the reference, the value
         // mask, the write mask)
@@ -981,6 +1033,10 @@ pub const Engine = struct {
         }
         if (z.float) {
             std.mem.writeInt(u32, z.bytes[at..][0..4], new_z, .little);
+        } else if (z.words) {
+            // (X8Z24 keeps its top byte; S8Z24's is the stencil)
+            const top = if (z.combined) (stencil & 0xff) << 24 else w & 0xff00_0000;
+            std.mem.writeInt(u32, z.bytes[at..][0..4], (new_z & 0xff_ffff) | top, .little);
         } else for (zb, 0..) |zbyte, k| {
             z.bytes[zbyte] = @truncate(new_z >> @intCast(8 * k));
         }
@@ -988,19 +1044,23 @@ pub const Engine = struct {
         return s_pass and d_pass;
     }
 
-    /// The texture and the sampler a handle names, from the pools.
     /// The texture a handle names: its header, and with `sampled` its
     /// sampler (a fetch, TLD, has none).
     fn texture(g: *Engine, handle: u32, sampled: bool) error{BadStream}!Tex {
-        try g.need(g.reg(gr.SET_TEXTURE_HEADER_VERSION) == 1 and g.reg(gr.SET_SAMPLER_BINDING) == 0, "the texture header version is not 1, or samplers are bound through headers");
+        const on_turing = g.turing();
+        // (Turing's headers are Maxwell's: the version method is Hopper's)
+        try g.need(on_turing or g.reg(gr.SET_TEXTURE_HEADER_VERSION) == 1, "the texture header version is not 1");
+        try g.need(g.reg(gr.SET_SAMPLER_BINDING) == 0, "samplers are bound through headers");
         const hi = handle & 0xf_ffff;
         const si = handle >> 20;
         const hp = gr.SET_TEX_HEADER_POOL_A;
         const sp = gr.SET_TEX_SAMPLER_POOL_A;
         try g.need(hi != 0 and hi <= g.reg(hp + 8), "a texture handle names the null header or one past the pool's last");
         if (sampled) try g.need(si <= g.reg(sp + 8), "a texture handle names a sampler past the pool's last");
-        const hva = (@as(u64, g.reg(hp) & 0x1ff_ffff) << 32 | g.reg(hp + 4)) + @as(u64, hi) * 32;
-        const sva = (@as(u64, g.reg(sp) & 0x1ff_ffff) << 32 | g.reg(sp + 4)) + @as(u64, si) * 32;
+        // (the pools' upper address: 8 bits on Turing, 25 on Blackwell)
+        const upper: u32 = if (on_turing) 0xff else 0x1ff_ffff;
+        const hva = (@as(u64, g.reg(hp) & upper) << 32 | g.reg(hp + 4)) + @as(u64, hi) * 32;
+        const sva = (@as(u64, g.reg(sp) & upper) << 32 | g.reg(sp + 4)) + @as(u64, si) * 32;
         const hb = g.host.mem.find(hva, 32) orelse return g.refuse("the texture header pool is not in mapped memory");
         var h: [8]u32 = undefined;
         // (a fetch's: point, clamped to the edge, the header's coordinates)
@@ -1010,54 +1070,69 @@ pub const Engine = struct {
             const sb = g.host.mem.find(sva, 32) orelse return g.refuse("the sampler pool is not in mapped memory");
             for (&s, 0..) |*w, k| w.* = std.mem.readInt(u32, sb[k * 4 ..][0..4], .little);
         }
-        // The header: a level of two dimensions, rows of bytes (PITCH_V2,
-        // TWO_D_NO_MIPMAP) or block linear (BLOCKLINEAR_V2, TWO_D, one
-        // GOB wide and deep, one level).
-        const version = h[3] >> 28;
-        const kind = (h[4] >> 22) & 0xf;
-        try g.need((version == 2 and kind == 7) or (version == 3 and kind == 1), "a texture header that is not one level of two dimensions, rows of bytes (PITCH_V2) or block linear (BLOCKLINEAR_V2)");
-        try g.need(h[4] & (1 << 21) == 0, "an sRGB texture: not modelled");
-        const comps: u7 = @truncate(h[3] >> 16);
-        const data: u4 = @truncate(h[3] >> 12);
-        const size = texelBytes(comps, data) orelse return g.refuse("a texture's components or data type are not modelled (unsigned normalized or float: A8B8G8R8, R8, G8R8, R16, R16_G16, R16_G16_B16_A16, R32, R32_G32, R32_G32_B32_A32, ZF32)");
-        var t = Tex{
-            .bytes = &.{},
-            .pitch = (h[2] & 0x1_ffff) << 5,
-            .width = (h[4] & 0x1_ffff) + 1,
-            .height = (h[5] & 0x1_ffff) + 1,
-            .comps = comps,
-            .data = data,
-            .size = size,
-            .source = .{ @truncate(h[3]), @truncate(h[3] >> 3), @truncate(h[3] >> 6), @truncate(h[3] >> 9) },
-            .linear = false,
-            .normalized = (h[4] >> 17) & 1 != 0 and s[1] & (1 << 25) == 0,
-        };
-        for (t.source) |src| try g.need(src == 0 or src == 7 or (src >= 2 and src <= 5), "a texture channel's source the renderer does not use");
-        var va: u64 = undefined;
-        var bytes: usize = undefined;
-        if (version == 3) {
-            try g.need((h[2] >> 0) & 7 == 0 and (h[2] >> 6) & 7 == 0 and (h[2] >> 10) & 7 == 0 and (h[2] >> 13) & 1 == 0, "a block-linear texture more than a GOB wide or deep");
-            try g.need((h[6] >> 0) & 1 == 0 and (h[3] >> 28) != 0 and (h[2] >> 28) == 0 and (h[3] >> 27) & 1 == 0, "a block-linear texture header of more levels or another depth");
-            const n: u3 = @truncate(h[2] >> 3);
-            try g.need(n <= 5, "a block-linear texture's blocks over 32 GOBs high");
-            t.block = n;
-            t.pitch = (t.width * t.size + 63) / 64 * 64;
-            va = @as(u64, h[1] & 0x1ff_ffff) << 32 | (h[0] & 0xffff_fe00);
-            const rows_of_blocks = (t.height + (@as(u32, 8) << n) - 1) >> (@as(u5, n) + 3);
-            bytes = @as(usize, rows_of_blocks) * (t.pitch / 64) << (@as(u6, n) + 9);
-        } else {
+        var t: Tex = undefined;
+        if (on_turing) {
+            // (Turing's header: Maxwell's TEXHEAD_PITCH, rows of bytes, its
+            // sampler clamped to the edge with unnormalized coordinates)
+            t = try g.texheadPitch(&h);
+            for (t.source) |src| try g.need(src == 0 or src == 7 or (src >= 2 and src <= 5), "a texture channel's source the renderer does not use");
             try g.need(t.pitch >= t.width * t.size, "a texture's rows are shorter than its width");
-            va = @as(u64, h[1] & 0x1ff_ffff) << 32 | (h[0] & 0xffff_ffe0);
-            bytes = @as(usize, t.pitch) * (t.height - 1) + @as(usize, t.width) * t.size;
+            t.bytes = g.host.mem.find(t.va, @as(usize, t.pitch) * (t.height - 1) + @as(usize, t.width) * t.size) orelse return g.refuse("a texture's memory is not mapped");
+            if (sampled) {
+                try g.need(s[0] & 7 == 2 and (s[0] >> 3) & 7 == 2, "a sampler that does not clamp to the edge: not modelled");
+                try g.need(s[1] & (1 << 25) != 0, "a sampler with normalized coordinates: not modelled");
+            }
+        } else {
+            // The header: a level of two dimensions, rows of bytes (PITCH_V2,
+            // TWO_D_NO_MIPMAP) or block linear (BLOCKLINEAR_V2, TWO_D, one
+            // GOB wide and deep, one level).
+            const version = h[3] >> 28;
+            const kind = (h[4] >> 22) & 0xf;
+            try g.need((version == 2 and kind == 7) or (version == 3 and kind == 1), "a texture header that is not one level of two dimensions, rows of bytes (PITCH_V2) or block linear (BLOCKLINEAR_V2)");
+            try g.need(h[4] & (1 << 21) == 0, "an sRGB texture: not modelled");
+            const comps: u7 = @truncate(h[3] >> 16);
+            const data: u4 = @truncate(h[3] >> 12);
+            const size = texelBytes(comps, data) orelse return g.refuse("a texture's components or data type are not modelled (unsigned normalized or float: A8B8G8R8, R8, G8R8, R16, R16_G16, R16_G16_B16_A16, R32, R32_G32, R32_G32_B32_A32, ZF32)");
+            t = Tex{
+                .bytes = &.{},
+                .pitch = (h[2] & 0x1_ffff) << 5,
+                .width = (h[4] & 0x1_ffff) + 1,
+                .height = (h[5] & 0x1_ffff) + 1,
+                .comps = comps,
+                .data = data,
+                .size = size,
+                .source = .{ @truncate(h[3]), @truncate(h[3] >> 3), @truncate(h[3] >> 6), @truncate(h[3] >> 9) },
+                .linear = false,
+                .normalized = (h[4] >> 17) & 1 != 0 and s[1] & (1 << 25) == 0,
+            };
+            for (t.source) |src| try g.need(src == 0 or src == 7 or (src >= 2 and src <= 5), "a texture channel's source the renderer does not use");
+            var va: u64 = undefined;
+            var bytes: usize = undefined;
+            if (version == 3) {
+                try g.need((h[2] >> 0) & 7 == 0 and (h[2] >> 6) & 7 == 0 and (h[2] >> 10) & 7 == 0 and (h[2] >> 13) & 1 == 0, "a block-linear texture more than a GOB wide or deep");
+                try g.need((h[6] >> 0) & 1 == 0 and (h[3] >> 28) != 0 and (h[2] >> 28) == 0 and (h[3] >> 27) & 1 == 0, "a block-linear texture header of more levels or another depth");
+                const n: u3 = @truncate(h[2] >> 3);
+                try g.need(n <= 5, "a block-linear texture's blocks over 32 GOBs high");
+                t.block = n;
+                t.pitch = (t.width * t.size + 63) / 64 * 64;
+                va = @as(u64, h[1] & 0x1ff_ffff) << 32 | (h[0] & 0xffff_fe00);
+                const rows_of_blocks = (t.height + (@as(u32, 8) << n) - 1) >> (@as(u5, n) + 3);
+                bytes = @as(usize, rows_of_blocks) * (t.pitch / 64) << (@as(u6, n) + 9);
+            } else {
+                try g.need(t.pitch >= t.width * t.size, "a texture's rows are shorter than its width");
+                va = @as(u64, h[1] & 0x1ff_ffff) << 32 | (h[0] & 0xffff_ffe0);
+                bytes = @as(usize, t.pitch) * (t.height - 1) + @as(usize, t.width) * t.size;
+            }
+            t.va = va;
+            t.bytes = g.host.mem.find(va, bytes) orelse return g.refuse("a texture's memory is not mapped");
+            // The sampler: each axis's wrap, one filter (point or linear), a
+            // depth comparison, the border colour.
+            const wu: u3 = @truncate(s[0]);
+            const wv: u3 = @truncate(s[0] >> 3);
+            try g.need(wu <= 3 and wv <= 3, "a sampler's wrap mode is not wrap, mirror, clamp to the edge or the border");
+            try g.need(t.normalized or (wu == 2 and wv == 2), "unnormalized coordinates not clamped to the edge: not modelled");
+            t.wrap = .{ wu, wv };
         }
-        t.bytes = g.host.mem.find(va, bytes) orelse return g.refuse("a texture's memory is not mapped");
-        // The sampler: each axis's wrap, one filter (point or linear), a
-        // depth comparison, the border colour.
-        const wu: u3 = @truncate(s[0]);
-        const wv: u3 = @truncate(s[0] >> 3);
-        try g.need(wu <= 3 and wv <= 3, "a sampler's wrap mode is not wrap, mirror, clamp to the edge or the border");
-        try g.need(t.normalized or (wu == 2 and wv == 2), "unnormalized coordinates not clamped to the edge: not modelled");
-        t.wrap = .{ wu, wv };
         const mag = s[1] & 7;
         const min = (s[1] >> 4) & 3;
         try g.need(mag == min and (mag == 1 or mag == 2), "a sampler whose two filters differ, or are neither point nor linear");
@@ -1065,6 +1140,29 @@ pub const Engine = struct {
         if (s[0] & (1 << 9) != 0) t.compare = @truncate(s[0] >> 10);
         for (&t.border, 0..) |*b, k| b.* = @bitCast(s[4 + k]);
         return t;
+    }
+
+    /// Turing's header (Maxwell's TEXHEAD_PITCH, clb097tex.h;
+    /// draw.headerWordsFor): HEADER_VERSION PITCH, TWO_D_NO_MIPMAP, every
+    /// channel UNORM, not sRGB, one level.
+    fn texheadPitch(g: *Engine, h: *const [8]u32) error{BadStream}!Tex {
+        try g.need((h[2] >> 21) & 7 == 2 and (h[4] >> 23) & 0xf == 7 and (h[3] >> 28) == 0, "a Turing texture header that is not rows of bytes (HEADER_VERSION PITCH), TWO_D_NO_MIPMAP, one level");
+        try g.need((h[0] >> 7) & 0xfff == 0x492 and h[4] & (1 << 22) == 0, "a texture that is not unsigned normalized in every channel, or is sRGB: not modelled");
+        const components = h[0] & 0x7f;
+        try g.need(components == 0x08 or components == 0x1d, "a texture's components are not A8B8G8R8 or R8");
+        return .{
+            .bytes = &.{},
+            .va = @as(u64, h[2] & 0xffff) << 32 | (h[1] & 0xffff_ffe0),
+            .pitch = (h[3] & 0xffff) << 5,
+            .width = (h[4] & 0xffff) + 1,
+            .height = (h[5] & 0xffff) + 1,
+            .comps = @truncate(components),
+            .data = 0, // (unsigned normalized: the rule above)
+            .size = if (components == 0x08) 4 else 1,
+            .source = .{ @truncate(h[0] >> 19), @truncate(h[0] >> 22), @truncate(h[0] >> 25), @truncate(h[0] >> 28) },
+            .linear = false,
+            .normalized = false,
+        };
     }
 
     /// TEX: the Stage's callback.

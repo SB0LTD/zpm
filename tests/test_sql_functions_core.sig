@@ -657,6 +657,33 @@ fn temporals() void {
     report("temporal",before);
 }
 
+fn dateBins() void {
+    const before = begin("date-bin");
+    value("SELECT date_bin('15 minutes', TIMESTAMP '2020-02-11 15:44:17', TIMESTAMP '2001-01-01 00:02:30')", 1114, "2020-02-11 15:32:30");
+    value("SELECT date_bin('15 minutes', TIMESTAMP '1999-12-31 23:45', TIMESTAMP '2000-01-01')", 1114, "1999-12-31 23:45:00");
+    value("SELECT date_bin('15 minutes', TIMESTAMP '1999-12-31 23:44:59.999999', TIMESTAMP '2000-01-01')", 1114, "1999-12-31 23:30:00");
+    value("SELECT date_bin('3 microseconds', TIMESTAMP '1999-12-31 23:59:59.999998', TIMESTAMP '2000-01-01')", 1114, "1999-12-31 23:59:59.999997");
+    value("SELECT date_bin('1 day', DATE '2000-01-02', DATE '2000-01-01')", 1184, "2000-01-02 00:00:00+00");
+    value("SELECT date_bin('1 day', DATE '2000-01-02', TIMESTAMP '2000-01-01')", 1114, "2000-01-02 00:00:00");
+    value("SELECT pg_catalog.date_bin('1 day', '2000-01-02', '2000-01-01')", 1184, "2000-01-02 00:00:00+00");
+    value("SELECT date_bin('1 day', TIMESTAMPTZ '2000-01-02', TIMESTAMP '2000-01-01')", 1184, "2000-01-02 00:00:00+00");
+    value("SELECT date_bin('1 month', TIMESTAMP 'infinity', TIMESTAMP 'infinity')", 1114, "infinity");
+    value("SELECT date_bin(NULL::interval, TIMESTAMP 'infinity', TIMESTAMP 'infinity')", 1114, null);
+    rejects("SELECT date_bin('1 day', TIME '12:00', TIME '11:00')", error.UndefinedFunction);
+    rejects("SELECT date_bin('1 month', TIMESTAMP '2025-01-01', TIMESTAMP '2020-01-01')", error.UnsupportedStatement);
+    rejects("SELECT date_bin('0 seconds', TIMESTAMP '2025-01-01', TIMESTAMP '2020-01-01')", error.DatetimeFieldOverflow);
+    rejects("SELECT date_bin('-1 days', TIMESTAMP '2025-01-01', TIMESTAMP '2020-01-01')", error.DatetimeFieldOverflow);
+    rejects("SELECT date_bin('1000000000 days', TIMESTAMP '2025-01-01', TIMESTAMP '2020-01-01')", error.DatetimeFieldOverflow);
+    rejects("SELECT date_bin('1 week', TIMESTAMP '294276-12-30', TIMESTAMP '4713-01-02 BC')", error.DatetimeFieldOverflow);
+    rejects("SELECT date_bin('1 day', TIMESTAMP '2025-01-01', TIMESTAMP '-infinity')", error.DatetimeFieldOverflow);
+    _ = run("CREATE TABLE bin_events (happened timestamp, bucket timestamp GENERATED ALWAYS AS " ++
+        "(date_bin('15 minutes', happened, TIMESTAMP '2000-01-01')) STORED)");
+    value("SELECT pg_get_expr(adbin,adrelid) FROM pg_attrdef WHERE adrelid='bin_events'::regclass", 25,
+        "date_bin('15 minutes', happened, '2000-01-01'::timestamp without time zone)");
+    _ = run("DROP TABLE bin_events");
+    report("date-bin", before);
+}
+
 // ---- PG.PRED.OVERLAPS --------------------------------------------------------
 
 fn overlapsPredicate() void {
@@ -683,6 +710,28 @@ fn overlapsPredicate() void {
     value("SELECT (DATE '2001-01-05', NULL) OVERLAPS (DATE '2001-01-06', DATE '2001-01-07')",16,null);
     value("SELECT (DATE '2001-01-05', DATE '2001-01-06') OVERLAPS (DATE '2001-01-05', NULL::date)",16,null);
     value("SELECT (DATE '2001-01-05', NULL::interval) OVERLAPS (DATE '2001-01-01', DATE '2001-01-02')",16,null);
+    value("SELECT (TIME '09:00', TIME '10:00') OVERLAPS (TIME '09:30', TIME '11:00')",16,"t");
+    value("SELECT (TIME '09:00', INTERVAL '90 minutes') OVERLAPS (TIME '10:30', TIME '11:00')",16,"f");
+    value("SELECT (TIME '09:00', INTERVAL '-1 hour') OVERLAPS (TIME '08:30', TIME '09:00')",16,"t");
+    value("SELECT (TIME '23:30', INTERVAL '1 hour') OVERLAPS (TIME '12:00', TIME '13:00')",16,"t");
+    value("SELECT (TIME '11:00', NULL::time) OVERLAPS (TIME '09:30', TIME '11:30')",16,"t");
+    value("SELECT (TIME '11:00', TIME '11:30') OVERLAPS (TIME '11:30', NULL::time)",16,null);
+    value("SELECT (TIMETZ '10:00+02', TIMETZ '10:00+02') OVERLAPS (TIMETZ '09:00+01', TIMETZ '09:00+01')",16,"f");
+    value("SELECT (TIMETZ '09:00+02', TIMETZ '11:00+02') OVERLAPS (TIMETZ '10:00+03', TIMETZ '12:00+03')",16,"t");
+    value("SELECT (TIME '09:00', TIME '10:00') OVERLAPS (TIMETZ '09:00+00', TIMETZ '10:00+00')",16,"t");
+    value("SELECT (TIMESTAMP '2020-01-01', '2020-01-03') OVERLAPS (TIMESTAMP '2020-01-02', TIMESTAMP '2020-01-04')",16,"t");
+    shaped("SELECT pg_catalog.overlaps(TIME '09:00', TIME '10:00', TIME '09:30', TIME '11:00')",
+        &.{.{.name="overlaps",.oid=16}},&.{"t"});
+    value("SELECT overlaps(TIME '09:00', INTERVAL '1 hour', TIME '10:00', TIME '11:00')",16,"f");
+    value("SELECT \"overlaps\"(TIMETZ '10:00+02', NULL::timetz, TIMETZ '08:30+01', TIMETZ '10:00+01')",16,"t");
+    rowsOf("SELECT oid FROM pg_proc WHERE proname='overlaps' ORDER BY oid",26,
+        &.{"1271","1304","1305","1306","1307","1308","1309","1310","1311","2041","2042","2043","2044"});
+    value("SELECT count(*) FROM pg_proc WHERE proname='overlaps' AND pronargs=4 AND prorettype=16 AND NOT proisstrict",20,"13");
+    shaped("SELECT prolang,provolatile,prosrc FROM pg_proc WHERE oid=1305",
+        &.{.{.name="prolang",.oid=26},.{.name="provolatile",.oid=18},.{.name="prosrc",.oid=25}},
+        &.{"14","s",""});
+    value("SELECT prosrc FROM pg_proc WHERE oid=1308",25,"overlaps_time");
+    value("SELECT to_regproc('overlaps')",24,null);
     setup(&.{"CREATE TABLE ov_t(id INT PRIMARY KEY,s DATE,e DATE)","INSERT INTO ov_t VALUES(1,'2025-01-01','2025-01-10'),(2,'2025-02-01','2025-02-10'),(3,NULL,NULL)"});
     rowsOf("SELECT id FROM ov_t WHERE (s,e) OVERLAPS (DATE '2025-01-05',DATE '2025-01-06') ORDER BY id",23,&.{"1"});
     rowsOf("SELECT (s,e) OVERLAPS (DATE '2025-02-05',INTERVAL '1 day') FROM ov_t ORDER BY id",16,&.{"f","t",null});
@@ -694,6 +743,12 @@ fn overlapsPredicate() void {
     rejects("SELECT (1, 2) OVERLAPS (3, 4)",error.UndefinedFunction);
     rejects("SELECT (INTERVAL '1 day', DATE '2001-01-02') OVERLAPS (DATE '2001-01-02', DATE '2001-01-03')",error.UndefinedFunction);
     rejects("SELECT ('2001-01-01', '2001-02-01') OVERLAPS ('2001-01-15', '2001-03-01')",error.AmbiguousFunction);
+    rejects("SELECT (NULL,NULL) OVERLAPS (NULL,NULL)",error.AmbiguousFunction);
+    rejects("SELECT (TIME '09:00', '11:00') OVERLAPS (TIME '09:30', TIME '10:30')",error.AmbiguousFunction);
+    rejects("SELECT (TIME '11:00', NULL) OVERLAPS (TIME '09:30', TIME '11:30')",error.AmbiguousFunction);
+    rejects("SELECT (DATE '2020-01-01', '2020-01-03') OVERLAPS (DATE '2020-01-02', TIMESTAMP '2020-01-04')",error.AmbiguousFunction);
+    rejects("SELECT (TIMETZ '10:00+02', INTERVAL '1 hour') OVERLAPS (TIMETZ '09:00+01', TIMETZ '11:00+01')",error.UndefinedFunction);
+    rejects("SELECT pg_catalog.overlaps(TIME '09:00', TIME '10:00', TIME '09:30')",error.UndefinedFunction);
     report("overlaps",before);
 }
 
@@ -901,6 +956,7 @@ pub fn main(init:std.process.Init) !void {
     numerics();
     bitwise();
     temporals();
+    dateBins();
     overlapsPredicate();
     formatting();
     statistical();

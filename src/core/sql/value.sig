@@ -1,4 +1,4 @@
-//! Value conversions (Layer 0, design §4.2): text input and output for every
+//! Value conversions (Layer 0, design Â§4.2): text input and output for every
 //! type, casts (explicit, assignment and implicit contexts follow
 //! PostgreSQL's pg_cast for the supported types), typmod coercion and the
 //! operators over the Q02/Q03/Q04 types. Cells are the tagged union in
@@ -58,6 +58,8 @@ pub const Session = struct {
     /// Sequence functions, identity defaults and regclass lookups (set by
     /// the Database for each statement); null rejects them (0A000).
     sequences: ?*const SequenceHook = null,
+    /// Internal rendering for the PostgreSQL binary-input bridge.
+    regproc_numeric_output: bool = false,
     /// current_database(): the session's startup database.
     database: []const u8 = "postgres",
     /// The implicit catalog remains visible when a PostgreSQL session
@@ -65,6 +67,7 @@ pub const Session = struct {
     public_schema_on_path: bool = true,
     row_security: bool = true,
     synchronize_seqscans: bool = true,
+    quote_all_identifiers: bool = false,
     extra_float_digits: i8 = 1,
     mysql_keep_zero: bool = false,
     mysql_last_insert_id: u64 = 0,
@@ -110,6 +113,7 @@ pub const SequenceHook = struct {
     /// Catalog-object text (B11 wave 3): a comment (obj_description,
     /// col_description, shobj_description) or a role name, written to `out`.
     catalog_text: ?*const fn (ptr: *anyopaque, kind: CatalogText, object: u32, classoid: u32, sub: i32, out: []u8) Error!?usize = null,
+    schema_path: ?*const fn (ptr: *anyopaque, implicit: bool, names: *[2][]const u8) usize = null,
     /// pg_get_serial_sequence(table, column): the qualified name of the
     /// sequence a column owns (SERIAL or identity) into `out`, null when it
     /// owns none (42P01 / 42703 for a missing table / column).
@@ -119,6 +123,7 @@ pub const SequenceHook = struct {
     /// Index definition or one index attribute in the owning snapshot.
     index_definition: ?*const fn (ptr: *anyopaque, oid: u32, column: i32, pretty: bool, out: []u8) Error!?usize = null,
     constraint_definition: ?*const fn (ptr: *anyopaque, oid: u32, pretty: bool, out: []u8) Error!?usize = null,
+    view_definition: ?*const fn (ptr: *anyopaque, oid: u32, pretty: bool, out: []u8) Error!?usize = null,
     statistics_columns: ?*const fn (ptr: *anyopaque, oid: u32, out: []u8) Error!?usize = null,
     relation_publishable: ?*const fn (ptr: *anyopaque, oid: u32) ?bool = null,
     partition_key_definition: ?*const fn (ptr: *anyopaque, oid: u32, out: []u8) Error!?usize = null,
@@ -126,9 +131,26 @@ pub const SequenceHook = struct {
     partition_ancestors: ?*const fn (ptr: *anyopaque, oid: u32, out: []u32) Error!usize = null,
     namespace_lookup: ?*const fn (ptr: *anyopaque, name: []const u8, strict: bool) Error!?u32 = null,
     namespace_name: ?*const fn (ptr: *anyopaque, oid: u32, out: []u8) Error!?usize = null,
+    routine_lookup: ?*const fn (ptr: *anyopaque, name: []const u8, strict: bool) Error!?u32 = null,
+    routine_name: ?*const fn (ptr: *anyopaque, oid: u32, out: []u8) Error!?usize = null,
 };
 
 pub const SessionCall = enum { current_setting, set_config, advisory_lock, advisory_try_lock, advisory_unlock, advisory_unlock_all, notify, backend_pid, recovery_status };
+
+pub fn routineOid(session: *const Session, input: []const u8, strict: bool) Error!?u32 {
+    if (types.same(input, "-")) return 0;
+    if (input.len != 0) {
+        const digits_only = for (input) |byte| {
+            if (!types.digit(byte)) break false;
+        } else true;
+        if (digits_only) return @as(?u32, @import("std").fmt.parseInt(u32, input, 10) catch return error.NumericValueOutOfRange);
+    }
+    if (session.sequences) |hook| {
+        if (hook.routine_lookup) |lookup| return lookup(hook.ptr, input, strict);
+    }
+    if (strict) return error.UndefinedFunction;
+    return null;
+}
 
 /// Advisory call flags: 1 shared, 2 transaction-level, 4 two int4 keys;
 /// current_setting / set_config: 1 missing_ok / is_local.
@@ -240,12 +262,13 @@ fn extendedCast(from: Type, to: Type, context: Context) ?bool {
         if (stringType(from)) return context == .explicit;
         return false;
     }
-    if (from == .regtype or to == .regtype) {
-        // pg_cast: oid/int4 <-> regtype binary and int2/int8 -> regtype
-        // implicit; regtype -> int4/int8 by assignment; strings by I/O
+    if (from == .regtype or to == .regtype or from == .regproc or to == .regproc) {
+        // OID aliases share binary casts with oid, integer casts and string I/O.
+        const target_alias = to == .regtype or to == .regproc;
+        const source_alias = from == .regtype or from == .regproc;
+        if (from == .oid or to == .oid or (target_alias and integral(from))) return true;
+        if (source_alias and (to == .int4 or to == .int8)) return context != .implicit;
         // conversion.
-        if (from == .oid or to == .oid or (to == .regtype and integral(from))) return true;
-        if (from == .regtype and (to == .int4 or to == .int8)) return context != .implicit;
         if (stringType(to)) return context != .implicit;
         if (stringType(from)) return context == .explicit;
         return false;
@@ -544,6 +567,15 @@ pub fn Io(comptime config: types.Config) type {
                 .xml => |*value| xml.output(value.slice(), buffer),
                 // regtypeout: the type's SQL name, or the number.
                 .regtype => |oid| if (types.regtypeName(oid)) |name| copy(buffer, name) else integerText(oid, buffer),
+                .regproc => |oid| blk: {
+                    if (session.regproc_numeric_output) break :blk integerText(oid, buffer);
+                    if (oid == 0) break :blk copy(buffer, "-");
+                    if (session.sequences) |hook| if (hook.routine_name) |name| {
+                        if (try name(hook.ptr, oid, buffer)) |used| break :blk buffer[0..used];
+                    };
+                    if (@import("catalog.sig").builtinRoutineName(oid)) |name| break :blk copy(buffer, name);
+                    break :blk integerText(oid, buffer);
+                },
                 // Stored as their canonical output text.
                 .tsvector, .tsquery => |*value| copy(buffer, value.slice()),
                 .pg_internal_char => |value| if (value == 0)
@@ -582,6 +614,13 @@ pub fn Io(comptime config: types.Config) type {
             var text: V.Text = .{};
             try appendCell(&text, cell, verbose, session);
             return .{ .text = text };
+        }
+
+        fn clipName(bytes: []const u8) []const u8 {
+            if (bytes.len < types.pg_name_bytes) return bytes;
+            var end: usize = types.pg_name_bytes - 1;
+            while (end != 0 and bytes[end] & 0xc0 == 0x80) end -= 1;
+            return bytes[0..end];
         }
 
         fn textCell(bytes: []const u8) Error!V.Cell {
@@ -638,7 +677,7 @@ pub fn Io(comptime config: types.Config) type {
                     if (ty == .int2 and (value < -32768 or value > 32767)) return error.NumericValueOutOfRange;
                     break :blk value;
                 } },
-                .oid => .{ .integer = blk: {
+                .oid, .xid => .{ .integer = blk: {
                     const value = expr.parseInteger(input, .int8) catch |err| return if (err == error.IntegerOverflow) error.NumericValueOutOfRange else err;
                     // oidin accepts -2^31..2^32-1, negatives wrap.
                     if (value < -2147483648 or value > 4294967295) return error.NumericValueOutOfRange;
@@ -649,7 +688,7 @@ pub fn Io(comptime config: types.Config) type {
                     if (ty == .json) try J.validateJsonControlled(input, session.control);
                     break :blk try textCell(input);
                 },
-                .name => try textCell(input[0..@min(input.len, 63)]),
+                .name => try textCell(clipName(input)),
                 .numeric => .{ .numeric = try N.parse(input) },
                 .mysql_bigint_unsigned => try checkedUnsigned(try N.parse(input)),
                 .float4 => .{ .float4 = try float_text.parse(f32, input) },
@@ -692,6 +731,8 @@ pub fn Io(comptime config: types.Config) type {
                     break :blk try textCell(try jsonpath.Engine(config).canonical(input, &buffer, session.control));
                 },
                 .regtype => .{ .regtype = try types.regtypeInput(input) },
+                .regproc => .{ .regproc = (try routineOid(session, input, true)) orelse return error.UndefinedFunction },
+                .aclitem => return error.UnsupportedStatement,
                 .pg_internal_char => .{ .pg_internal_char = parseInternalChar(input) },
                 .tsvector, .tsquery => blk: {
                     var out: TS.Out = .{};
@@ -881,22 +922,26 @@ pub fn Io(comptime config: types.Config) type {
                 if (!characterType(to)) return error.CannotCoerce;
                 return cast(try textCell(cell.xml.slice()), .text, to, typmod, session);
             }
-            if (cell == .regtype and to != .regtype) {
-                // regtype -> oid/int4/int8 reads the OID; strings by output.
-                if (to == .oid or to == .int8) return .{ .integer = cell.regtype };
-                if (to == .int4) return .{ .integer = @as(i32, @bitCast(cell.regtype)) };
+            if ((cell == .regtype and to != .regtype) or (cell == .regproc and to != .regproc)) {
+                const oid = if (cell == .regtype) cell.regtype else cell.regproc;
+                if (to == .oid or to == .int8) return .{ .integer = oid };
+                if (to == .int4) return .{ .integer = @as(i32, @bitCast(oid)) };
                 if (!characterType(to)) return error.CannotCoerce;
                 var buffer: [format_bytes]u8 = undefined;
                 return cast(try textCell(try format(&cell, true, session, &buffer)), .text, to, typmod, session);
             }
-            if (to == .regtype and cell == .integer) {
-                // int8 -> regtype checks the OID range (oidin); int4 wraps.
+            if ((to == .regtype or to == .regproc) and cell == .integer) {
+                // int8 -> OID aliases checks the range; int4 wraps.
                 const value = cell.integer;
-                if (from == .int4 or from == .int2) return .{ .regtype = @bitCast(@as(i32, @intCast(value))) };
-                if (value < 0 or value > 4294967295) return error.NumericValueOutOfRange;
-                return .{ .regtype = @intCast(value) };
+                const oid: u32 = if (from == .int4 or from == .int2)
+                    @bitCast(@as(i32, @intCast(value)))
+                else if (value >= 0 and value <= 4294967295)
+                    @intCast(value)
+                else
+                    return error.NumericValueOutOfRange;
+                return if (to == .regtype) .{ .regtype = oid } else .{ .regproc = oid };
             }
-            if (to == .regtype and cell == .text) return parse(.regtype, -1, cell.text.slice(), session);
+            if ((to == .regtype or to == .regproc) and cell == .text) return parse(to, -1, cell.text.slice(), session);
             if (cell == .array and types.isArray(to)) {
                 if (from == to) return applyTypmodExplicit(cell, to, typmod);
                 return ArrayText.cast(cell.array.slice(), types.elementType(from) orelse return error.CannotCoerce, types.elementType(to).?, typmod, session);
@@ -909,6 +954,7 @@ pub fn Io(comptime config: types.Config) type {
                 return cast(text, .text, to, typmod, session);
             }
             const out: V.Cell = switch (to) {
+                .aclitem => return error.UnsupportedStatement,
                 .pg_internal_char => switch (cell) {
                     .integer => |value| blk: {
                         if (value < -128 or value > 127) return error.NumericValueOutOfRange;
@@ -941,7 +987,7 @@ pub fn Io(comptime config: types.Config) type {
                     .bits => |*value| V.Cell{ .integer = try value.toInteger(if (to == .int4) 32 else 64) },
                     else => return error.CannotCoerce,
                 },
-                .oid => switch (cell) {
+                .oid, .xid => switch (cell) {
                     .integer => |value| V.Cell{ .integer = if (from == .int4 and value < 0) value + 4294967296 else try checkedInteger(value, .oid) },
                     .text => |*value| try parse(.oid, -1, value.slice(), session),
                     else => return error.CannotCoerce,
@@ -995,11 +1041,11 @@ pub fn Io(comptime config: types.Config) type {
                 .text, .name => blk: {
                     if (cell == .text) {
                         const bytes = cell.text.slice();
-                        break :blk try textCell(if (to == .name) bytes[0..@min(bytes.len, 63)] else bytes);
+                        break :blk try textCell(if (to == .name) clipName(bytes) else bytes);
                     }
                     var buffer: [format_bytes]u8 = undefined;
                     const bytes = try format(&cell, true, session, &buffer);
-                    break :blk try textCell(if (to == .name) bytes[0..@min(bytes.len, 63)] else bytes);
+                    break :blk try textCell(if (to == .name) clipName(bytes) else bytes);
                 },
                 .json => switch (cell) {
                     .text => |*value| blk: {
@@ -1137,6 +1183,10 @@ pub fn Io(comptime config: types.Config) type {
                 // Integers and text are converted above.
                 .regtype => switch (cell) {
                     .regtype => cell,
+                    else => return error.CannotCoerce,
+                },
+                .regproc => switch (cell) {
+                    .regproc => cell,
                     else => return error.CannotCoerce,
                 },
                 .point, .box => switch (cell) {

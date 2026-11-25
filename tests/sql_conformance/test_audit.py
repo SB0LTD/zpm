@@ -38,6 +38,22 @@ def message(kind, body):
 
 
 class AuditTests(unittest.TestCase):
+    def test_user_type_metadata_compares_identity_and_wire_shape(self):
+        oracle = result([["a"]])
+        oracle["columns"] = [["v", 17000, 4, -1, 0]]
+        oracle["user_types"] = {"17000": ["public", "flavor", "e"]}
+        candidate = copy.deepcopy(oracle)
+        candidate["columns"][0][1] = 16388
+        candidate["user_types"] = {"16388": ["public", "flavor", "e"]}
+        self.assertTrue(equivalent([oracle], [candidate], True))
+        candidate["user_types"]["16388"] = ["other", "flavor", "e"]
+        self.assertFalse(equivalent([oracle], [candidate], True))
+        candidate["user_types"] = {}
+        self.assertFalse(equivalent([oracle], [candidate], True))
+        candidate["user_types"] = {"16388": ["public", "flavor", "e"]}
+        candidate["columns"][0][2] = -1
+        self.assertFalse(equivalent([oracle], [candidate], True))
+
     def test_generated_oracle_identity(self):
         root = Path(__file__).parent
         report = json.loads((root / 'generated_oracle.json').read_text(encoding='utf8'))

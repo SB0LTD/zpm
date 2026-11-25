@@ -754,6 +754,9 @@ fn views() !void {
     try run("ALTER TABLE a RENAME COLUMN v TO val");
     try run("CREATE VIEW v AS SELECT id, val FROM a WHERE id <= 2");
     try expect(view_probes[0], "1|10;2|20");
+    try run("CREATE VIEW compacted AS SELECT id, /* View text is intentionally padded to test lexical compaction. Quoted spaces and comment markers in SQL literals must remain unchanged. */ 'a  --  b' AS label FROM a WHERE id=1");
+    try expect("SELECT id,label FROM compacted", "1|a  --  b");
+    try sameState(&.{"SELECT id,label FROM compacted"});
     // A concurrent DROP TABLE waits for the transaction that created a view
     // over it (AccessShare) and then fails on the committed dependent.
     const creator = try db.begin();
@@ -790,6 +793,22 @@ const matview_probes = [_][]const u8{
     "SELECT relname, relkind FROM pg_class WHERE relnamespace = 2200 ORDER BY oid",
 };
 
+fn viewColumnNames() !void {
+    reset();
+    try run("CREATE TABLE t (id INT, n INT)");
+    try run("INSERT INTO t VALUES (1,20)");
+    try run("CREATE VIEW v (\"Item\", \"a\"\"b\", total) AS SELECT id, n AS \"old\"\"name\", n+1 FROM t");
+    const definition = "SELECT pg_get_viewdef('v'::regclass)";
+    const aliases = "SELECT \"Item\", \"a\"\"b\", total FROM v";
+    try expect(aliases, "1|20|21");
+    try expect(definition, "SELECT id AS \"Item\", n AS \"a\"\"b\", n+1 AS total FROM public.t\n;");
+    try run("INSERT INTO t VALUES (2,30)");
+    try run("CREATE VIEW ranked (value) AS SELECT n+1 AS original FROM t ORDER BY original DESC LIMIT 1");
+    const ordered = "SELECT value FROM ranked";
+    try expect(ordered, "31");
+    try sameState(&.{ aliases, definition, ordered });
+}
+
 fn materializedViews() !void {
     reset();
     try run("CREATE TABLE a (id INT PRIMARY KEY, g INT, v INT)");
@@ -817,10 +836,23 @@ fn materializedViews() !void {
     // WITH NO DATA: unpopulated until REFRESH (55000); REFRESH WITH NO DATA
     // empties it again. Both change the durable definition.
     try run("CREATE MATERIALIZED VIEW later AS SELECT id FROM a WITH NO DATA");
-    try rejects("SELECT * FROM later", error.ObjectNotInPrerequisiteState, matview_probes[1], "later|f|SELECT id FROM a;mv|t|SELECT g, SUM(v) AS total, COUNT(*) AS n FROM a WHERE g < 9 GROUP BY g");
+    try run("CREATE VIEW later_report AS SELECT id FROM later");
+    try run("CREATE MATERIALIZED VIEW later_copy AS SELECT id FROM later WITH NO DATA");
+    try run("CREATE TABLE empty_later AS SELECT id FROM later WITH NO DATA");
+    try expect("SELECT count(*) FROM empty_later", "0");
+    try run("DROP TABLE empty_later");
+    try rejects("SELECT * FROM later_report", error.ObjectNotInPrerequisiteState, "SELECT COUNT(*) FROM a", "5");
+    try rejects("REFRESH MATERIALIZED VIEW later_copy", error.ObjectNotInPrerequisiteState, "SELECT COUNT(*) FROM a", "5");
+    try rejects("SELECT * FROM later", error.ObjectNotInPrerequisiteState, matview_probes[1], "later|f|SELECT id FROM a;later_copy|f|SELECT id FROM later;mv|t|SELECT g, SUM(v) AS total, COUNT(*) AS n FROM a WHERE g < 9 GROUP BY g");
     try run("REFRESH MATERIALIZED VIEW later");
     try expect("SELECT COUNT(*) FROM later", "5");
+    try expect("SELECT COUNT(*) FROM later_report", "5");
+    try run("REFRESH MATERIALIZED VIEW later_copy");
+    try expect("SELECT COUNT(*) FROM later_copy", "5");
     try run("REFRESH MATERIALIZED VIEW later WITH NO DATA");
+    try run("REFRESH MATERIALIZED VIEW later_copy WITH NO DATA");
+    try run("DROP MATERIALIZED VIEW later_copy");
+    try run("DROP VIEW later_report");
     try rejects("SELECT * FROM later", error.ObjectNotInPrerequisiteState, "SELECT COUNT(*) FROM a", "5");
     try sameState(&[_][]const u8{ matview_probes[0], matview_probes[1], matview_probes[2] });
     // Writes are 42809; REFRESH of a table 42809; dependents 2BP01.
@@ -997,7 +1029,7 @@ fn advancedIndexes() !void {
         "a_adv|CREATE INDEX a_adv ON public.a USING btree (g, (v + 1)) INCLUDE (id) WHERE (v IS NOT NULL);" ++
         "a_expr_expr1_idx|CREATE INDEX a_expr_expr1_idx ON public.a USING btree ((g * 2), (v - 1));" ++
         "a_multi|CREATE INDEX a_multi ON public.a USING btree (g DESC, v NULLS FIRST, id)");
-    try expect("SELECT c.relname, c.relnatts, i.indkey FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname <> 'a_pkey' ORDER BY c.relname", "a_adv|3|2 0;a_expr_expr1_idx|2|0 0;a_multi|3|2 3 1");
+    try expect("SELECT c.relname, c.relnatts, i.indnkeyatts, i.indkey FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname <> 'a_pkey' ORDER BY c.relname", "a_adv|3|2|2 0 1;a_expr_expr1_idx|2|2|0 0;a_multi|3|3|2 3 1");
     // Entries cover every version; probes over the plain key column g
     // equal scans through updates, deletes and an abort.
     try indexAgrees(&db, "a", "a_adv");
@@ -1570,6 +1602,7 @@ pub fn main() !void {
     try deferredConstraints();
     try views();
     try viewCapacity();
+    try viewColumnNames();
     try materializedViews();
     try createVariants();
     try mergeStatement();

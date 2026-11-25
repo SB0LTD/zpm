@@ -1,15 +1,19 @@
-//! Bounded logical image of committed public base tables and standalone sequences.
+//! Bounded logical image of committed base tables, schemas and sequences.
 //! The caller freezes the source and owns an unpublished, fresh destination.
 //! The caller verifies the enclosing snapshot seal before publication.
 const std = @import("std");
 const types = @import("types.sig");
 const storage = @import("storage.sig");
+const catalog = @import("catalog.sig");
 const objects = @import("catalog_objects.sig");
 const change_log = @import("change_log.sig");
 
 const single_magic = "RSBASE01";
 const multi_magic = "RSBASE02";
 const sequence_magic = "RSBASE03";
+const defaults_magic = "RSBASE04";
+// Version 5 inserts a schema count and checked definitions before tables.
+const schemas_magic = "RSBASE05";
 const header_size = 24;
 const table_header_size = 8;
 const part_size = 5;
@@ -53,7 +57,6 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
     return struct {
         fn checkCatalog(db: *const Database) !void {
             for (&db.txs) |*tx| if (tx.active) return error.SnapshotUnsupportedState;
-            for (&db.schemas) |*schema| if (schema.live) return error.SnapshotUnsupportedState;
             const snap: storage.Snapshot = .{ .csn = db.csn };
             for (&db.catalog_objects.items) |*object| if (O.visible(object, snap)) return error.SnapshotUnsupportedState;
             for (&db.objects.routines) |*item| if (item.live and item.stamp.visible(snap)) return error.SnapshotUnsupportedState;
@@ -61,14 +64,18 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
             for (&db.objects.rules) |*item| if (item.live and item.stamp.visible(snap)) return error.SnapshotUnsupportedState;
         }
 
-        fn exportTables(db: *const Database) !struct { count: usize, first_bank: usize } {
+        fn exportTables(db: *const Database) !struct { count: usize, first_bank: usize, with_defaults: bool } {
             try checkCatalog(db);
             if (db.csn == 0) return error.SnapshotUnsupportedState;
             var count: usize = 0;
             var first_bank: usize = 0;
+            var with_defaults = false;
             for (&db.tables, 0..) |*table, bank| {
                 if (!S.committedTable(table)) continue;
-                if (!C.supportsBaseImage(table)) return error.SnapshotUnsupportedState;
+                if (!C.supportsBaseImage(table) or !liveNamespace(db, table.namespace)) return error.SnapshotUnsupportedState;
+                for (table.columns[0..table.column_count]) |*column| {
+                    with_defaults = with_defaults or column.default_kind != .none;
+                }
                 // Earlier committed banks are installed first. An earlier
                 // vacant compatible bank would change first-fit placement
                 // on restore and could change where WAL suffix DDL lands.
@@ -79,7 +86,52 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
                 if (count == 0) first_bank = bank;
                 count += 1;
             }
-            return .{ .count = count, .first_bank = first_bank };
+            return .{ .count = count, .first_bank = first_bank, .with_defaults = with_defaults };
+        }
+
+        fn liveNamespace(db: *const Database, oid: u32) bool {
+            if (oid == catalog.public_namespace) return true;
+            for (&db.schemas) |*schema| {
+                if (schema.live and schema.dead_csn == 0 and schema.oid == oid) return true;
+            }
+            return false;
+        }
+
+        fn ownerBank(db: *const Database, oid: u32) ?usize {
+            for (&db.tables, 0..) |*table, bank| {
+                if (S.committedTable(table) and table.oid == oid) return bank;
+            }
+            return null;
+        }
+
+        /// The identity generator is part of the column definition. An
+        /// ordinary owned sequence may coexist with other automatic links.
+        fn validSequenceOwnership(db: *const Database) bool {
+            const Bits = std.StaticBitSet(config.columns);
+            var linked: [config.tables]Bits = @splat(.empty);
+            for (&db.seqs) |*seq| {
+                if (!seq.live or seq.dead_csn != 0) continue;
+                if (seq.owner == 0) {
+                    if (seq.owner_column != 0) return false;
+                    continue;
+                }
+                const bank = ownerBank(db, seq.owner) orelse return false;
+                const owner = &db.tables[bank];
+                if (seq.namespace != owner.namespace or seq.owner_column >= owner.column_count) return false;
+                const column = &owner.columns[seq.owner_column];
+                if (column.default_kind == .identity_always or column.default_kind == .identity_by_default) {
+                    if (linked[bank].isSet(seq.owner_column)) return false;
+                    linked[bank].set(seq.owner_column);
+                }
+            }
+            for (&db.tables, &linked) |*table, *set| {
+                if (!S.committedTable(table)) continue;
+                for (table.columns[0..table.column_count], 0..) |*column, index| {
+                    if ((column.default_kind == .identity_always or column.default_kind == .identity_by_default) and
+                        !set.isSet(index)) return false;
+                }
+            }
+            return true;
         }
 
         /// Write schema definitions, batches of committed rows and exact
@@ -87,27 +139,49 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
         pub fn write(db: *const Database, sink: anytype, scratch: []u8) !void {
             if (scratch.len > 0xffffffff or config.tx_writes == 0) return error.SnapshotWorkspaceTooSmall;
             const selected = try exportTables(db);
+            var schema_count: u32 = 0;
+            for (&db.schemas) |*schema| {
+                if (!schema.live or schema.dead_csn != 0) continue;
+                if (schema.pending_create or schema.pending_drop or schema.owner != objects.bootstrap_role)
+                    return error.SnapshotUnsupportedState;
+                schema_count += 1;
+            }
             var sequence_count: usize = 0;
+            var with_defaults = selected.with_defaults;
             for (&db.seqs) |*seq| {
                 if (!seq.live or seq.dead_csn != 0) continue;
-                if (seq.pending_create or seq.pending_drop or seq.owner != 0) return error.SnapshotUnsupportedState;
+                if (seq.pending_create or seq.pending_drop or !liveNamespace(db, seq.namespace))
+                    return error.SnapshotUnsupportedState;
+                with_defaults = with_defaults or seq.owner != 0;
                 sequence_count += 1;
             }
-            if (selected.count == 0 and sequence_count == 0) return error.SnapshotUnsupportedState;
+            if (with_defaults and !validSequenceOwnership(db)) return error.SnapshotUnsupportedState;
+            if (selected.count == 0 and sequence_count == 0 and schema_count == 0) return error.SnapshotUnsupportedState;
             if (sequence_count != 0 and config.tx_writes < 2) return error.SnapshotWorkspaceTooSmall;
             var header: [header_size]u8 = undefined;
             std.mem.writeInt(u64, header[8..16], db.csn, .little);
-            if (selected.count == 1 and sequence_count == 0) {
+            if (selected.count == 1 and sequence_count == 0 and schema_count == 0 and !with_defaults) {
                 @memcpy(header[0..8], single_magic);
                 const table = &db.tables[selected.first_bank];
                 writeTableHeader(header[16..24], selected.first_bank, table);
                 try sink.appendAll(&header);
                 try writeTable(table, sink, scratch);
             } else {
-                @memcpy(header[0..8], if (sequence_count == 0) multi_magic else sequence_magic);
+                @memcpy(header[0..8], if (schema_count != 0) schemas_magic else if (with_defaults) defaults_magic else if (sequence_count == 0) multi_magic else sequence_magic);
                 std.mem.writeInt(u32, header[16..20], @intCast(selected.count), .little);
                 std.mem.writeInt(u32, header[20..24], @intCast(sequence_count), .little);
                 try sink.appendAll(&header);
+                if (schema_count != 0) {
+                    var count: [4]u8 = undefined;
+                    std.mem.writeInt(u32, &count, schema_count, .little);
+                    try sink.appendAll(&count);
+                    for (&db.schemas) |*schema| {
+                        if (!schema.live or schema.dead_csn != 0) continue;
+                        var definition = try change_log.Writer.init(scratch, 0);
+                        try C.encodeCreateSchema(&definition, schema);
+                        try appendPart(sink, .create_schema, scratch[0..try definition.finish()]);
+                    }
+                }
                 for (&db.tables, 0..) |*table, bank| {
                     if (!S.committedTable(table)) continue;
                     var table_header: [table_header_size]u8 = undefined;
@@ -119,14 +193,20 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
             if (sequence_count != 0) for (&db.seqs) |*seq| {
                 if (!seq.live or seq.dead_csn != 0) continue;
                 var state = try change_log.Writer.init(scratch, 0);
-                try C.encodeCreateSequence(&state, seq);
+                var automatic = false;
+                if (seq.namespace != catalog.public_namespace and seq.owner != 0) {
+                    const owner = &db.tables[ownerBank(db, seq.owner).?];
+                    const kind = owner.columns[seq.owner_column].default_kind;
+                    automatic = kind != .identity_always and kind != .identity_by_default;
+                }
+                try C.encodeCreateSequence(&state, seq, automatic);
                 // Preserve the WAL's reservation boundary, including numbers
                 // reserved in live session caches that restart discards.
                 try C.encodeSequenceValue(&state, seq.oid, seq.logged_value, seq.logged_called);
                 try appendPart(sink, .create_sequence, scratch[0..try state.finish()]);
             };
             var counters = try change_log.Writer.init(scratch, 0);
-            try C.encodeCounters(&counters, change_log.first_oid + db.oid_counter, db.next_constraint_oid, &db.tables);
+            try C.encodeCounters(&counters, change_log.first_oid + db.oid_counter, db.next_constraint_oid, db.next_default_oid, &db.tables);
             try appendPart(sink, .catalog_counters, scratch[0..try counters.finish()]);
         }
 
@@ -161,13 +241,13 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
             }
         }
 
-        fn restoreTable(db: *Database, file: anytype, length: u64, offset: *u64, header: *const [table_header_size]u8, csn: u64, previous_bank: ?usize, scratch: []u8, replay: *C.Scratch) !usize {
+        fn restoreTable(db: *Database, file: anytype, length: u64, offset: *u64, header: *const [table_header_size]u8, csn: u64, previous_bank: ?usize, scratch: []u8, replay: *C.Scratch, with_defaults: bool, with_schemas: bool) !usize {
             const bank = std.mem.readInt(u32, header[0..4], .little);
             const rows = std.mem.readInt(u32, header[4..8], .little);
             if (bank >= db.tables.len or (previous_bank != null and bank <= previous_bank.?) or
                 rows > db.tables[bank].rows.len or rows > db.tables[bank].versions.len) return error.InvalidSnapshotImage;
             const definition = try readPart(file, offset, length, scratch, .create_table);
-            try C.applyBaseImageRecord(db, definition, replay, .{ .csn = csn, .op = .create_table, .bank = bank });
+            try C.applyBaseImageRecord(db, definition, replay, .{ .csn = csn, .op = .create_table, .bank = bank, .with_defaults = with_defaults, .with_schemas = with_schemas });
             var remaining = rows;
             while (remaining != 0) {
                 const record = try readPart(file, offset, length, scratch, .insert);
@@ -183,7 +263,8 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
         /// provides the expected SQL CSN independently of the WAL sequence.
         pub fn restore(db: *Database, file: anytype, expected_csn: u64, scratch: []u8, replay: *C.Scratch) !void {
             try checkCatalog(db);
-            if (db.csn != 0 or db.oid_counter != 0 or db.next_constraint_oid != change_log.first_oid) return error.SnapshotUnsupportedState;
+            if (db.csn != 0 or db.oid_counter != 0 or db.next_constraint_oid != change_log.first_oid or db.next_default_oid != change_log.first_oid) return error.SnapshotUnsupportedState;
+            for (&db.schemas) |*schema| if (schema.live) return error.SnapshotUnsupportedState;
             for (&db.tables) |*table| if (table.live) return error.SnapshotUnsupportedState;
             for (&db.seqs) |*seq| if (seq.live) return error.SnapshotUnsupportedState;
             if (comptime config.external_storage) if (db.workspace.query.refs.len == 0) return error.InvalidParameterValue;
@@ -196,15 +277,30 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
 
             var offset: u64 = header_size;
             var sequence_count: u32 = 0;
+            const with_schemas = std.mem.eql(u8, header[0..8], schemas_magic);
+            const with_defaults = with_schemas or std.mem.eql(u8, header[0..8], defaults_magic);
             const table_count = blk: {
                 if (std.mem.eql(u8, header[0..8], single_magic)) {
-                    _ = try restoreTable(db, file, length, &offset, header[16..24], csn, null, scratch, replay);
+                    _ = try restoreTable(db, file, length, &offset, header[16..24], csn, null, scratch, replay, false, false);
                     break :blk 1;
                 }
                 const count = std.mem.readInt(u32, header[16..20], .little);
                 sequence_count = std.mem.readInt(u32, header[20..24], .little);
                 if (count > db.tables.len) return error.InvalidSnapshotImage;
-                if (std.mem.eql(u8, header[0..8], sequence_magic)) {
+                if (with_schemas) {
+                    if (sequence_count > db.seqs.len) return error.InvalidSnapshotImage;
+                    var total: [4]u8 = undefined;
+                    try readExact(file, offset, &total, length);
+                    offset += total.len;
+                    const schema_count = std.mem.readInt(u32, &total, .little);
+                    if (schema_count == 0 or schema_count > db.schemas.len) return error.InvalidSnapshotImage;
+                    for (0..schema_count) |_| {
+                        const schema = try readPart(file, &offset, length, scratch, .create_schema);
+                        try C.applyBaseImageRecord(db, schema, replay, .{ .csn = csn, .op = .create_schema, .with_schemas = true });
+                    }
+                } else if (with_defaults) {
+                    if (count == 0 or sequence_count > db.seqs.len) return error.InvalidSnapshotImage;
+                } else if (std.mem.eql(u8, header[0..8], sequence_magic)) {
                     if (sequence_count == 0 or sequence_count > db.seqs.len) return error.InvalidSnapshotImage;
                 } else if (!std.mem.eql(u8, header[0..8], multi_magic) or count < 2 or sequence_count != 0) {
                     return error.InvalidSnapshotImage;
@@ -214,17 +310,22 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
                     var table_header: [table_header_size]u8 = undefined;
                     try readExact(file, offset, &table_header, length);
                     offset += table_header.len;
-                    previous_bank = try restoreTable(db, file, length, &offset, &table_header, csn, previous_bank, scratch, replay);
+                    previous_bank = try restoreTable(db, file, length, &offset, &table_header, csn, previous_bank, scratch, replay, with_defaults, with_schemas);
                 }
                 break :blk count;
             };
             for (0..sequence_count) |_| {
                 const state = try readPart(file, &offset, length, scratch, .create_sequence);
-                try C.applyBaseImageRecord(db, state, replay, .{ .csn = csn, .op = .create_sequence });
+                try C.applyBaseImageRecord(db, state, replay, .{ .csn = csn, .op = .create_sequence, .with_defaults = with_defaults, .with_schemas = with_schemas });
             }
+            if (with_defaults and !validSequenceOwnership(db)) return error.InvalidSnapshotImage;
             const counters = try readPart(file, &offset, length, scratch, .catalog_counters);
             if (offset != length or try file.length() != length) return error.InvalidSnapshotImage;
-            const counter_op: change_log.Op = if (counters.len > 8 and counters[8] == @intFromEnum(change_log.Op.catalog_counters_with_constraints)) .catalog_counters_with_constraints else .catalog_counters;
+            const counter_op: change_log.Op = if (counters.len <= 8) .catalog_counters else switch (counters[8]) {
+                @intFromEnum(change_log.Op.catalog_counters_with_constraints) => .catalog_counters_with_constraints,
+                @intFromEnum(change_log.Op.catalog_counters_with_defaults) => .catalog_counters_with_defaults,
+                else => .catalog_counters,
+            };
             return C.applyBaseImageRecord(db, counters, replay, .{ .csn = csn, .op = counter_op, .table_count = table_count });
         }
     };

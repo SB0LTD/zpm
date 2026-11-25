@@ -193,6 +193,7 @@ pub const Keyword = enum {
     user,
     value,
     regclass,
+    regproc,
     regnamespace,
     regtype,
     greatest,
@@ -705,6 +706,40 @@ pub const Tokenizer = struct {
         return .{ .kind = .symbol, .symbol = symbol, .start = start, .end = self.position, .len = width };
     }
 };
+
+/// Compact a parsed definition into caller-owned storage. Token spelling,
+/// quoting, and adjacency stay intact. A newline between separate string
+/// tokens remains a newline for PostgreSQL's literal concatenation rule.
+pub fn compactDefinition(source: []const u8, out: []u8) Error!usize {
+    var lexer: Tokenizer = .{ .source = source, .text_limit = out.len };
+    var previous: Token = .{};
+    var previous_end: usize = 0;
+    var length: usize = 0;
+    while (true) {
+        const token = try lexer.next();
+        if (token.kind == .end) return length;
+        const start = token.start - token.prefix;
+        const end = token.end + token.suffix;
+        if (length != 0 and previous_end < start) {
+            if (length == out.len) return error.TextCapacity;
+            var delimiter: u8 = ' ';
+            if (previous.kind == .string and token.kind == .string) {
+                for (source[previous_end..start]) |byte| if (lineBreak(byte)) {
+                    delimiter = '\n';
+                    break;
+                };
+            }
+            out[length] = delimiter;
+            length += 1;
+        }
+        const raw = source[start..end];
+        if (raw.len > out.len - length) return error.TextCapacity;
+        @memcpy(out[length..][0..raw.len], raw);
+        length += raw.len;
+        previous = token;
+        previous_end = end;
+    }
+}
 
 fn escapedQuoteEnd(source: []const u8, start: usize) Error!usize {
     var at = start;

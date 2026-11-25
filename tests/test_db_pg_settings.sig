@@ -51,7 +51,95 @@ pub fn main() !void {
     try one.execute("RESET restrict_nonsystem_relation_kind", &result);
     try state(&one, &result, "view", "client", "view");
     try state(&two, &result, "", "default", "");
+    try one.execute("SELECT setting, vartype, source FROM pg_settings WHERE name = 'quote_all_identifiers'", &result);
+    try wantText(&result, 0, "off");
+    try wantText(&result, 1, "bool");
+    try wantText(&result, 2, "default");
+    try one.execute("CREATE TABLE archive_base(id \"pg_catalog\".\"int4\" PRIMARY KEY, label \"text\")", &result);
+    try one.execute("CREATE INDEX label_idx ON archive_base USING \"btree\" (label)", &result);
+    try one.execute("BEGIN", &result);
+    try one.execute("SAVEPOINT unquoted", &result);
+    try one.execute("SET LOCAL quote_all_identifiers = true", &result);
+    try one.execute("SELECT quote_ident('plain'), quote_literal('plain')", &result);
+    try wantText(&result, 0, "\"plain\"");
+    try wantText(&result, 1, "'plain'");
+    try one.execute("SELECT pg_get_indexdef('label_idx'::regclass, 1, true), 'public'::regnamespace::text, 'archive_base'::regclass::text", &result);
+    try wantText(&result, 0, "\"label\"");
+    try wantText(&result, 1, "\"public\"");
+    try wantText(&result, 2, "\"archive_base\"");
+    try one.execute("SELECT CAST('abcd' AS \"pg_catalog\".\"varchar\"(3))::\"text\"", &result);
+    try wantText(&result, 0, "abc");
+    try one.execute("SELECT format_type(25, -1), format_type(23, -1), format_type(1009, NULL)", &result);
+    try wantText(&result, 0, "\"text\"");
+    try wantText(&result, 1, "integer");
+    try wantText(&result, 2, "\"text\"[]");
+    try two.execute("SELECT quote_ident('plain')", &result);
+    try wantText(&result, 0, "plain");
+    try one.execute("ROLLBACK TO unquoted", &result);
+    try one.execute("SELECT quote_ident('plain')", &result);
+    try wantText(&result, 0, "plain");
+    try one.execute("ROLLBACK", &result);
+    try two.execute("SELECT set_config('quote_all_identifiers', 'on', false)", &result);
+    try wantText(&result, 0, "on");
+    try two.execute("SELECT quote_ident('plain')", &result);
+    try wantText(&result, 0, "\"plain\"");
+    try two.execute("RESET ALL", &result);
+    try two.execute("SHOW quote_all_identifiers", &result);
+    try wantText(&result, 0, "off");
+    try one.execute("CREATE ROLE settings_login LOGIN", &result);
+    try one.execute("ALTER ROLE settings_login SET quote_all_identifiers TO 'on'", &result);
+    try one.execute("ALTER ROLE settings_login SET check_function_bodies = false", &result);
+    try one.execute("SET row_security = off", &result);
+    try one.execute("ALTER ROLE settings_login SET row_security FROM CURRENT", &result);
+    try one.execute("BEGIN", &result);
+    try one.execute("ALTER ROLE settings_login RESET ALL", &result);
+    try one.execute("ROLLBACK", &result);
+
+    var role_login: Store.Connection = .{ .store = &store, .id = 3 };
+    try role_login.bindAuthenticatedRole("settings_login");
+    role_login.finalizePostgresLogin();
+    try role_login.execute("SELECT quote_ident('plain'), current_setting('row_security')", &result);
+    try wantText(&result, 0, "\"plain\"");
+    try wantText(&result, 1, "off");
+    try role_login.execute("SELECT setting, source, reset_val FROM pg_settings WHERE name = 'quote_all_identifiers'", &result);
+    try wantText(&result, 0, "on");
+    try wantText(&result, 1, "user");
+    try wantText(&result, 2, "on");
+    try role_login.execute("SET quote_all_identifiers TO off", &result);
+    try role_login.execute("RESET quote_all_identifiers", &result);
+    try role_login.execute("SHOW quote_all_identifiers", &result);
+    try wantText(&result, 0, "on");
+
+    var overridden: Store.Connection = .{ .store = &store, .id = 4 };
+    try overridden.startupParameter("options", "-c quote_all_identifiers=off -c row_security=on");
+    try overridden.bindAuthenticatedRole("settings_login");
+    overridden.finalizePostgresLogin();
+    try overridden.execute("SELECT quote_ident('plain'), current_setting('row_security')", &result);
+    try wantText(&result, 0, "plain");
+    try wantText(&result, 1, "on");
+    try overridden.execute("SHOW check_function_bodies", &result);
+    try wantText(&result, 0, "off");
+
+    try one.execute("BEGIN ISOLATION LEVEL REPEATABLE READ", &result);
+    try one.execute("SELECT setrole FROM pg_db_role_setting", &result);
+    try two.execute("ALTER ROLE settings_login SET row_security = on", &result);
+    if (one.execute("ALTER ROLE settings_login RESET row_security", &result)) |_| {
+        return error.LostRoleDefaultsUpdate;
+    } else |err| {
+        if (err != error.SerializationFailure) return err;
+    }
+    try one.execute("ROLLBACK", &result);
+
+    // All supported defaults must fit even with this 128-byte SQL cell.
+    try one.execute("ALTER ROLE settings_login SET synchronize_seqscans TO off", &result);
+    try one.execute("ALTER ROLE settings_login SET default_transaction_read_only TO off", &result);
+    try one.execute("ALTER ROLE settings_login SET default_transaction_deferrable TO on", &result);
+    try one.execute("SELECT unnest(setconfig) FROM pg_db_role_setting", &result);
+    if (result.row_count != 6) return error.MissingRoleDefaults;
+    try one.execute("DROP ROLE settings_login", &result);
+    try one.execute("SELECT setrole FROM pg_db_role_setting", &result);
+    if (result.row_count != 0) return error.OrphanRoleDefaults;
     try one.execute("SELECT name FROM pg_settings WHERE name = 'unsupported_setting'", &result);
     if (result.row_count != 0) return error.SyntheticSetting;
-    std.debug.print("pg_settings: columns, sources, setter and session isolation passed\n", .{});
+    std.debug.print("pg_settings: columns, sources, role defaults, startup precedence and session isolation passed\n", .{});
 }

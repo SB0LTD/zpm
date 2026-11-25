@@ -27,7 +27,9 @@ pub fn main(init:std.process.Init) !void {
     if(!threads.available) {try std.Io.File.stdout().writeStreamingAll(init.io,"SKIP native reader/writer contention: unsupported worker backend\n");return;}
     if(!gate.tryLockRead()) return error.SharedTryLockFailed;
     if(gate.tryLockWrite()) return error.WriterBypassedReaders;
+    const quiet_epoch=gate.signal.epoch.load(.acquire);
     gate.unlockRead();
+    if(gate.signal.epoch.load(.acquire)!=quiet_epoch) return error.UncontendedReaderWokeWriters;
     if(!gate.tryLockWrite()) return error.ExclusiveTryLockFailed;
     if(gate.tryLockRead()) return error.ReaderBypassedWriter;
     gate.unlockWrite();

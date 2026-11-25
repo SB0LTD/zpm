@@ -78,6 +78,11 @@ pub fn appendKind(file: anytype, sequence: u64, payload: []const u8, kind: u16) 
     if (kind == 0) return error.UnsupportedLogVersion;
     if (sequence == 0) return error.InvalidSequence;
     if (payload.len == 0 or payload.len > 0xffffffff) return error.InvalidPayloadLength;
+    try appendFrame(file, sequence, payload, kind);
+    try file.sync();
+}
+
+fn appendFrame(file: anytype, sequence: u64, payload: []const u8, kind: u16) !void {
     var header: [header_size]u8 = undefined;
     var trailer: [trailer_size]u8 = undefined;
     encodeHeader(&header, sequence, @intCast(payload.len), kind);
@@ -96,7 +101,6 @@ pub fn appendKind(file: anytype, sequence: u64, payload: []const u8, kind: u16) 
         try file.appendAll(payload);
         try file.appendAll(&trailer);
     }
-    try file.sync();
 }
 
 fn overlaps(first: usize, first_len: usize, second: usize, second_len: usize) bool {
@@ -174,7 +178,7 @@ fn readHeader(file: anytype, offset: u64, accepted_mask: u32) !Frame {
     return .{ .offset = offset, .sequence = get(u64, header[16..24]), .kind = kind, .payload_len = payload_len };
 }
 
-fn readPayload(file: anytype, frame: Frame, scratch: []u8) ![]const u8 {
+fn readPayload(file: anytype, frame: Frame, scratch: []u8) ![]u8 {
     const payload = scratch[0..frame.payload_len];
     const start = frame.offset + header_size;
     try readExact(file, start, payload);
@@ -197,7 +201,39 @@ pub fn readFrame(file: anytype, scratch: []u8, expected: Frame) ![]const u8 {
     if (frame.payload_len != expected.payload_len) return error.InvalidPayloadLength;
     if (frame.payload_len > scratch.len) return error.LogPayloadCapacity;
     if (frame.byteCount() > length - frame.offset) return error.UnexpectedEndOfLog;
-    return readPayload(file, frame, scratch);
+    return try readPayload(file, frame, scratch);
+}
+
+/// Stage a separate WAL from a frozen, live source. Validate each original
+/// frame before rewriting its payload. Preserve kinds, lengths and sequence
+/// numbers, then flush the destination once. Never repair the source. The
+/// destination must be a new unpublished file and is poisoned on failure.
+pub fn cloneFrames(
+    source: anytype,
+    destination: anytype,
+    scratch: []u8,
+    expected_sequence: u64,
+    accepted_mask: u32,
+    context: anytype,
+    comptime rewrite: anytype,
+) !void {
+    if (expected_sequence == 0 or accepted_mask & ~@as(u32, 1) == 0) return error.InvalidSequence;
+    if (try source.length() < overhead) return error.UnexpectedEndOfLog;
+    if (try destination.length() != 0) return error.DestinationNotEmpty;
+    const Copy = struct {
+        file: @TypeOf(destination),
+        owner: @TypeOf(context),
+
+        fn write(self: *@This(), frame: Frame, payload: []u8) !void {
+            try rewrite(self.owner, frame, payload);
+            try appendFrame(self.file, frame.sequence, payload, frame.kind);
+        }
+    };
+    var copy: Copy = .{ .file = destination, .owner = context };
+    errdefer destination.poison();
+    const checked = try recoverImpl(source, scratch, &copy, Copy.write, null, accepted_mask, .strict_frame, .{});
+    if (checked.sequence != expected_sequence) return error.InvalidSequence;
+    try destination.sync();
 }
 
 /// scratch bounds transaction bytes and is reused between records. The replay
@@ -259,7 +295,7 @@ pub fn recoverAfterFrame(
     return recoverImpl(file, scratch, context, replay, finish, accepted_mask, .frame, start);
 }
 
-const ReplayMode = enum { sequence, kind, frame };
+const ReplayMode = enum { sequence, kind, frame, strict_frame };
 
 fn recoverImpl(
     file: anytype,
@@ -285,13 +321,14 @@ fn recoverImpl(
         switch (mode) {
             .sequence => try replay(context, frame.sequence, payload),
             .kind => try replay(context, frame.kind, frame.sequence, payload),
-            .frame => try replay(context, frame, payload),
+            .frame, .strict_frame => try replay(context, frame, payload),
         }
         result.sequence = frame.sequence;
         result.valid_bytes += frame.byteCount();
     }
     if (comptime @TypeOf(finish) != @TypeOf(null)) try finish(context);
     if (result.valid_bytes != length) {
+        if (comptime mode == .strict_frame) return error.UnexpectedEndOfLog;
         try file.truncate(result.valid_bytes);
         try file.sync();
         result.truncated_tail = true;

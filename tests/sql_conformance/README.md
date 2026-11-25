@@ -45,7 +45,7 @@ component is missing. The annotations below separate those cases.
 | PG.PRED.DISTINCT | NULL-safe equality | pass; closure incomplete |
 | PG.PRED.QUANTIFIED | ANY/SOME/ALL, scalar subqueries with six ordinary comparison operators | pass; array/row/custom-operator forms and closure remain incomplete |
 | PG.PRED.SYMMETRIC | Symmetric BETWEEN | pass; scalar/flat-row range contracts, broader closure incomplete |
-| PG.PRED.OVERLAPS | Temporal overlaps | Syntax |
+| PG.PRED.OVERLAPS | Temporal overlaps | Original DATE smoke case passes. The follow-up covers DATE/TIMESTAMP/TIMESTAMPTZ/TIME/TIMETZ endpoints, supported durations, NULL logic and overload diagnostics. |
 | PG.PRED.REGEX | Regular expressions | pass (B11 candidate); ARE operators, SIMILAR TO, regexp_like; back references, BREs and positional regexp_* functions open |
 | PG.PRED.ESCAPE | LIKE escape clause | pass; UTF-8 LIKE/ASCII ILIKE contracts, collations and planner closure incomplete |
 | PG.QUERY.WINDOW | Ranking/offset windows | qualified smoke pass; LAG/LEAD finite coverage, demand/other window closure incomplete |
@@ -211,7 +211,15 @@ matching database, user, extension and catalog setup. Each transaction fixture
 gets its own connection. Disconnect rolls back. The harness compares typed
 metadata, command tags, transaction state, bags including multiplicity, NULLs
 and SQL errors. Set `ordered: true` where the statement promises row order.
-OID-valued discovery cases need stable-object normalization before qualification.
+Result columns keep exact built-in type OIDs, lengths, modifiers and formats.
+For allocated type OIDs, the audit resolves namespace, type name and kind
+inside the fixture transaction and compares those identities. It retains the
+raw IDs in the report. Object OIDs inside row values still need fixture-specific
+normalization before qualification.
+Select one PostgreSQL cluster or session fixture with
+`--outside-transaction --case ID` to run it outside the harness transaction.
+Use fresh instances because the fixture can commit changes. Enable cluster
+routing for `PG.DDL.DATABASE` and prepared transactions for `PG.TX.TWO_PHASE`.
 Positive-oracle errors are reported as `oracle_invalid`. The audit always exits
 nonzero while only smoke coverage exists, including when every selected smoke
 passes.
@@ -228,6 +236,14 @@ native PostgreSQL 18.3 returned **93 passes, 10 mismatches and 15 unexecuted
 scopes**. `EXPLAIN` and `COPY ... FORCE_QUOTE` each returned `0A000` in the
 candidate. The run preserves the same 118-case inventory and records both
 servers' responses. [Audited prerelease](https://github.com/SB0LTD/ramsql/releases/tag/ci-v0.3.0-beta.2-run.44099014318.1)
+
+On 22 November 2026, RAMSQL `be1cfe4` matched all 106 PostgreSQL programs
+against native PostgreSQL 18.3 with XML support. The comparison ran 103
+transaction and COPY programs and three isolated programs for database
+lifecycle, prepared transactions and maintenance. The six MySQL
+programs matched native MySQL 8.0.36 through PyMySQL. The six
+T-SQL programs matched expected rows over python-tds. Native
+SQL Server comparison remains open.
 
 `postgres18_oracle.json` records the native PostgreSQL 18.3 fixture run, including
 exact server version and manifest SHA-256 (UTF-8 with LF newlines): 102 valid programs and 16 unexecuted

@@ -27,6 +27,17 @@ pub const emu3d = @import("emu3d.sig");
 /// renderer over any Device).
 pub const draw = @import("draw.sig");
 pub const gl3d = @import("gl3d.sig");
+/// The GPUs Galaxy's driver knows and what differs between them (how
+/// GSP-RM boots, the page tables, the classes, the shader model).
+pub const chips = @import("chips.sig");
+/// A Turing GPU's GSP boot through SEC2: the card's VBIOS (FWSEC), the
+/// falcons' firmware and register sequences, VRAM's layout and the steps.
+pub const vbios = @import("vbios.sig");
+pub const falcon = @import("falcon.sig");
+pub const turing = @import("turing.sig");
+/// sm_75 (Turing) kernels end to end: the words, the schedule, a launch on
+/// the emulated Turing GPU (the tests of sm120*.sig's sm_75 side).
+pub const sm75 = @import("sm75.sig");
 
 test {
     _ = sm120;
@@ -40,4 +51,9 @@ test {
     _ = emu3d;
     _ = draw;
     _ = gl3d;
+    _ = chips;
+    _ = vbios;
+    _ = falcon;
+    _ = turing;
+    _ = sm75;
 }

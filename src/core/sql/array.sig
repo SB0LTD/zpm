@@ -6,7 +6,8 @@
 //!   element is NULL), [3] 0, then ndim x {dim u32, lbound i32} (native
 //!   byte order), then every element in row-major order: 0 for NULL, or 1
 //!   and the element payload (fixed width for scalar types, a length prefix
-//!   for text-like values and bit strings).
+//!   for text-like values and bit strings). In text arrays, markers above
+//!   1 represent canonical catalog setting values.
 //! A zero-dimensional array is the empty array '{}'. Nested arrays are
 //! multi-dimensional arrays of the same element type; there are no arrays
 //! of arrays. The element payload is an in-memory encoding: durable change
@@ -18,6 +19,7 @@
 //! is ordering equality, and hashing is consistent with it.
 const types = @import("types.sig");
 const numeric = @import("numeric.sig");
+const role_defaults = @import("role_defaults.sig");
 const Error = types.Error;
 const DataType = types.DataType;
 
@@ -182,6 +184,9 @@ pub fn Arrays(comptime V: type) type {
                     return put(self.out, &.{0});
                 }
                 if (@as(V.CellTag, cell.*) != V.cellTag(self.element)) return error.TypeMismatch;
+                if (self.element == .text) {
+                    if (role_defaults.symbol(cell.text.slice())) |code| return put(self.out, &.{code});
+                }
                 try put(self.out, &.{1});
                 try encode(self.out, self.element, cell);
             }
@@ -223,7 +228,7 @@ pub fn Arrays(comptime V: type) type {
                         if (value < -2147483648 or value > 2147483647) return error.IntegerOverflow;
                         try putInt(out, i32, @intCast(value));
                     },
-                    .oid => {
+                    .oid, .xid => {
                         if (value < 0 or value > 4294967295) return error.NumericValueOutOfRange;
                         try putInt(out, u32, @intCast(value));
                     },
@@ -262,7 +267,7 @@ pub fn Arrays(comptime V: type) type {
                     try put(out, &value.address);
                 },
                 .macaddr => |*value| try put(out, value),
-                .regtype => |value| try putInt(out, u32, value),
+                .regtype, .regproc => |value| try putInt(out, u32, value),
                 .pg_internal_char => |value| try putInt(out, u8, value),
                 .point => |value| {
                     try putInt(out, u64, @bitCast(value.x));
@@ -287,7 +292,7 @@ pub fn Arrays(comptime V: type) type {
                 .integer => .{ .integer = switch (element) {
                     .smallint => getInt(i16, bytes, at),
                     .integer32 => getInt(i32, bytes, at),
-                    .oid => getInt(u32, bytes, at),
+                    .oid, .xid => getInt(u32, bytes, at),
                     else => getInt(i64, bytes, at),
                 } },
                 .boolean => blk: {
@@ -301,6 +306,7 @@ pub fn Arrays(comptime V: type) type {
                 .range => .{ .range = takeText(bytes, at) },
                 .xml => .{ .xml = takeText(bytes, at) },
                 .regtype => .{ .regtype = getInt(u32, bytes, at) },
+                .regproc => .{ .regproc = getInt(u32, bytes, at) },
                 .pg_internal_char => .{ .pg_internal_char = getInt(u8, bytes, at) },
                 .tsvector => .{ .tsvector = takeText(bytes, at) },
                 .tsquery => .{ .tsquery = takeText(bytes, at) },
@@ -374,10 +380,12 @@ pub fn Arrays(comptime V: type) type {
                 const flag = bytes[at];
                 at += 1;
                 var item: ?[]const u8 = null;
-                if (flag != 0) {
+                if (flag == 1) {
                     const len = getInt(u16, bytes, &at);
                     item = bytes[at..][0..len];
                     at += len;
+                } else if (flag != 0) {
+                    item = role_defaults.string(flag);
                 }
                 if (index < out.len) out[index] = item;
             }
@@ -403,7 +411,15 @@ pub fn Arrays(comptime V: type) type {
                 self.index += 1;
                 const flag = self.bytes[self.at];
                 self.at += 1;
-                out.* = if (flag == 0) .null_value else decode(self.bytes, &self.at, self.element);
+                switch (flag) {
+                    0 => out.* = .null_value,
+                    1 => out.* = decode(self.bytes, &self.at, self.element),
+                    else => {
+                        const value = role_defaults.string(flag);
+                        out.* = .{ .text = .{ .len = value.len } };
+                        @memcpy(out.text.bytes[0..value.len], value);
+                    },
+                }
                 return true;
             }
 

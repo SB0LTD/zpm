@@ -14,7 +14,9 @@ fn admit(principal: u32) Registry.Admission {
 
 fn clusterGrammar() !void {
     const Raw = sql.Database(.{ .tables = 1, .columns = 2, .rows_per_table = 2 });
-    try std.testing.expectEqualStrings("mydb", (try Raw.parseDatabaseCommand("/* owned */ CREATE DATABASE MyDB;", .{})).?.create.slice());
+    const ordinary = (try Raw.parseDatabaseCommand("/* owned */ CREATE DATABASE MyDB;", .{})).?.create;
+    try std.testing.expectEqualStrings("mydb", ordinary.name.slice());
+    try std.testing.expect(ordinary.template == null);
     const drop = (try Raw.parseDatabaseCommand("DROP DATABASE IF EXISTS \"Two\"\"Words\"", .{})).?.drop;
     try std.testing.expect(drop.if_exists);
     try std.testing.expectEqualStrings("Two\"Words", drop.name.slice());
@@ -24,6 +26,17 @@ fn clusterGrammar() !void {
     try std.testing.expectError(error.Syntax, Raw.parseDatabaseCommand("CREATE DATABASE alpha; SELECT 1", .{}));
     try std.testing.expectError(error.Syntax, Raw.parseDatabaseCommand("DROP DATABASE IF alpha", .{}));
     try std.testing.expectError(error.UnsupportedStatement, Raw.parseDatabaseCommand("CREATE DATABASE alpha OWNER bob", .{}));
+    const pristine = (try Raw.parseDatabaseCommand("CREATE DATABASE \"Archive Child\" WITH TEMPLATE = template0 ENCODING = 'UTF8' LOCALE_PROVIDER = libc LOCALE = 'C'", .{})).?.create;
+    try std.testing.expectEqualStrings("Archive Child", pristine.name.slice());
+    try std.testing.expectEqualStrings("template0", pristine.template.?.slice());
+    const template = (try Raw.parseDatabaseCommand("CREATE DATABASE alpha TEMPLATE 'Sales Model'", .{})).?.create.template.?;
+    try std.testing.expectEqualStrings("Sales Model", template.slice());
+    const owner = (try Raw.parseDatabaseCommand("ALTER DATABASE \"Archive Child\" OWNER TO \"ramsql\"", .{})).?.alter_owner;
+    try std.testing.expectEqualStrings("Archive Child", owner.name.slice());
+    try std.testing.expectEqualStrings("ramsql", owner.owner.slice());
+    try std.testing.expectError(error.Syntax, Raw.parseDatabaseCommand("CREATE DATABASE alpha TEMPLATE template1 TEMPLATE template0", .{}));
+    try std.testing.expectError(error.UnsupportedStatement, Raw.parseDatabaseCommand("CREATE DATABASE alpha ENCODING 'LATIN1'", .{}));
+    try std.testing.expectError(error.Syntax, Raw.parseDatabaseCommand("CREATE DATABASE alpha ENCODING 'UTF8' ENCODING 6", .{}));
 }
 
 pub fn main() !void {
@@ -49,6 +62,7 @@ pub fn main() !void {
     try std.testing.expectEqual(@as(u32, 5), cluster.lookup("alpha").?.oid);
     try std.testing.expectError(error.AdmissionDenied, cluster.attach("alpha", admit(11)));
     const first = try cluster.attach("alpha", admit(10));
+    try std.testing.expectEqual(@as(usize, 1), cluster.lookup("alpha").?.clients);
     const second = try cluster.attach("beta", admit(11));
     try std.testing.expectEqual(@as(u32, 10), first.store.value);
     try std.testing.expectEqual(@as(u32, 20), second.store.value);
