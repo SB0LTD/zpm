@@ -1,5 +1,35 @@
 # SQL conformance TDD checkpoint
 
+## PostgreSQL large-object privileges and ownership
+
+Large-object ACLs retain the grantor, grantee, SELECT/UPDATE mask, and
+grant options. An owner or a role with the applicable grant option can
+grant privileges. `REVOKE GRANT OPTION FOR` preserves ordinary access.
+`RESTRICT` rejects a revoke that would invalidate another grant, and
+`CASCADE` removes only the rights that have lost every grant-option
+path. PUBLIC can receive ordinary rights. Owners keep implicit grant
+authority and can revoke their own ordinary rights.
+
+`ALTER LARGE OBJECT … OWNER TO` checks current ownership and SET ROLE
+authority, then rewrites both ends of affected grants and combines
+duplicate entries. Direct and descriptor reads require SELECT. A write
+open and `lo_put` require SELECT and UPDATE, and write descriptors retain
+their open-time access. Unlink and comments require ownership.
+
+The catalog renders typed ACL entries in an order stock `pg_dump` can
+restore, including delegated grantors via `SET SESSION AUTHORIZATION`.
+The WAL and compact checkpoint validators check role references and
+grant-option ancestry. Existing owner-issued records still replay.
+PG16 and PG18 qualification includes delegated ACLs in stock plain and
+custom archives in both directions, savepoint rollback, forced-crash
+recovery, and revocation across checkpoint WAL replay.
+
+Server-side file import/export and large-object default-privilege DDL
+remain open. The current catalog capacity covers roles, large-object
+metadata and ACL versions together.
+[PostgreSQL large-object permissions](https://www.postgresql.org/docs/18/lo-implementation.html)
+[PostgreSQL ownership transfers](https://www.postgresql.org/docs/18/sql-alterlargeobject.html)
+
 ## PostgreSQL large-object truncation
 
 `lo_truncate(int4, int4)` and `lo_truncate64(int4, int8)` use a writable
@@ -56,9 +86,8 @@ whole frame, including object existence, logical EOF, peak capacity,
 and references that would outlive metadata. The page bytes and their
 catalog length publish at the same commit boundary.
 
-Prepared binary streaming, descriptor operations, sparse writes from
-SQL, and compact page checkpoints remain open. The stock large-object
-archive gate still exercises those paths.
+The transfer and truncation checkpoints cover the subsequent binary
+streaming, descriptor, sparse write and compact checkpoint work.
 
 ## PostgreSQL large-object SQL metadata and ACLs
 
@@ -78,11 +107,8 @@ malformed records. Native PostgreSQL 16.15 and 18.7 agree on the
 ownership transfer, ACL output, comments and unlink results. Duplicate
 explicit OIDs return 23505, matching the native metadata primary key.
 
-Page bytes still need a database-owned arena, transaction write-set
-entries, a WAL page-record validator, and checkpoint/export integration.
-Descriptor operations and the full byte-stream archive path remain
-open. Delegated grant options and PostgreSQL's warning for a grant
-that conveys no permissions also remain open.
+The later checkpoints cover page storage, descriptor transfers, delegated
+grant options and warnings for commands that convey no privileges.
 [PostgreSQL large-object permissions](https://www.postgresql.org/docs/18/lo-implementation.html)
 
 ## PostgreSQL large-object substrate
@@ -100,9 +126,8 @@ on a standalone FunctionCall ends with ReadyForQuery. Native PostgreSQL
 16.15 and 18.7 verified an actual 16 KiB large-object call, the sparse page
 layout and an offset at the native size boundary.
 
-Large-object SQL routines, catalog owners and grants, transaction-scoped
-descriptors, host capacity admission, WAL replay, and checkpoint/export
-integration remain open. The stock archive gate stays partial.
+The later checkpoints cover how SQL, the catalog, host page admission,
+WAL replay and stock archive qualification build on this substrate.
 [PostgreSQL large-object API](https://www.postgresql.org/docs/18/lo-interfaces.html)
 
 ## PostgreSQL time bucketing candidate

@@ -1968,6 +1968,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
             var row: V.Row = .{};
             var check_schema_owners = false;
             var check_routine_references = false;
+            var check_large_object_grants = false;
             var image_sequence: SequenceDefinition = undefined;
             for (0..count) |part| {
                 const tag = try reader.int(u8);
@@ -2325,6 +2326,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         if (object.kind == .large_object and object.largeObjectLength() != 0 and db.large_pages == null)
                             return error.ChangeRecordConflict;
                         try scratch.object_overlay.create(&object, &object_check);
+                        check_large_object_grants = check_large_object_grants or object.kind == .large_object_acl;
                     },
                     @intFromEnum(Op.object_drop) => {
                         const key = try O.decodeDrop(record, &reader.position);
@@ -2337,6 +2339,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         }
                         try scratch.object_overlay.drop(&key);
                         check_schema_owners = check_schema_owners or key.kind == .role;
+                        check_large_object_grants = check_large_object_grants or key.kind == .large_object_acl;
                     },
                     @intFromEnum(Op.large_object_page) => {
                         const page = try decodeLargeObjectPage(&reader);
@@ -2358,6 +2361,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
             }
             // Objects never outlive the tables, roles and objects they name.
             try scratch.object_overlay.finish(&object_check);
+            if (!base_image and check_large_object_grants) try scratch.object_overlay.verifyLargeObjectGrants();
             try scratch.large_pages.finish(db, &scratch.object_overlay);
             if (check_routine_references or check_schema_owners) try RC.finishOverlay(&scratch.objects, &scratch.object_overlay);
             if (check_schema_owners) for (&scratch.schemas) |*schema| {
@@ -2648,7 +2652,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         db.catalog_objects.applyCreate(&object, db.epoch, db.cid, csn);
                         const width = object.oidWidth();
                         if (width != 0) db.oid_counter = @max(db.oid_counter, object.oid + width - first_oid);
-                        if (object.kind == .large_object and object.grant_flags == catalog_objects.large_object_generated_oid)
+                        if (object.kind == .large_object and object.grant_flags & catalog_objects.large_object_generated_oid != 0)
                             db.oid_counter = @max(db.oid_counter, object.target + 1 - first_oid);
                     },
                     @intFromEnum(Op.object_drop) => {

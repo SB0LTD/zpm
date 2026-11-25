@@ -1682,7 +1682,49 @@ fn largeObjectMetadata() !void {
     try same(try query(&replica, "SELECT COUNT(*) FROM pg_largeobject_metadata WHERE oid=55000"), "0");
 }
 
+fn largeObjectDelegation() !void {
+    try reset();
+    try run("CREATE ROLE lo_alice");
+    try run("CREATE ROLE lo_bob");
+    try run("CREATE ROLE lo_carol");
+    try run("SELECT lo_create(56000)");
+    const acl = "SELECT lomacl::text FROM pg_largeobject_metadata WHERE oid=56000";
+    try rejects("GRANT SELECT ON LARGE OBJECT 56000,56001 TO lo_alice WITH GRANT OPTION", error.UndefinedObject, acl, "NULL");
+    try run("GRANT SELECT ON LARGE OBJECT 56000 TO lo_alice WITH GRANT OPTION");
+    try run("SET SESSION AUTHORIZATION lo_alice");
+    try run("RESET ALL");
+    try expect("SELECT current_user,session_user", "lo_alice|lo_alice");
+    try run("GRANT SELECT ON LARGE OBJECT 56000 TO lo_bob WITH GRANT OPTION");
+    try run("RESET SESSION AUTHORIZATION");
+    try run("SET ROLE lo_bob");
+    try run("GRANT SELECT ON LARGE OBJECT 56000 TO lo_carol");
+    try run("RESET SESSION AUTHORIZATION");
+    const chain = "{ramsql=rw/ramsql,lo_alice=r*/ramsql,lo_bob=r*/lo_alice,lo_carol=r/lo_bob}";
+    try expect(acl, chain);
+    try same(try query(&replica, acl), chain);
+
+    // A syntactically correct drop of the root cannot leave an orphaned
+    // delegated grant in a replayed record.
+    var encoded: [128]u8 = undefined;
+    try replayFails(objectRecord(&encoded, 71, 21, 0, 56000, try roleOid("lo_alice"), 0, ""), error.ChangeRecordConflict);
+    try same(try query(&replica, acl), chain);
+    try rejects("REVOKE GRANT OPTION FOR SELECT ON LARGE OBJECT 56000 FROM lo_alice RESTRICT", error.DependentObjects, acl, chain);
+    try run("REVOKE GRANT OPTION FOR SELECT ON LARGE OBJECT 56000 FROM lo_alice CASCADE");
+    try expect(acl, "{ramsql=rw/ramsql,lo_alice=r/ramsql}");
+    try same(try query(&replica, acl), "{ramsql=rw/ramsql,lo_alice=r/ramsql}");
+
+    const alice = try roleOid("lo_alice");
+    db.default_session_state.session_role = alice;
+    try fails("SET SESSION AUTHORIZATION ramsql", error.InsufficientPrivilege);
+    try run("SET SESSION AUTHORIZATION lo_alice");
+    try expect("SELECT current_user,session_user", "lo_alice|lo_alice");
+    db.default_session_state.session_role = 10;
+    try run("RESET SESSION AUTHORIZATION");
+    try expect("SELECT current_user,session_user", "ramsql|ramsql");
+}
+
 pub fn main() !void {
+    try largeObjectDelegation();
     try largeObjectMetadata();
     try namespaceAclProjection();
     try namespaceOwnerTransfer();

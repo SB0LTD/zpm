@@ -1932,6 +1932,7 @@ pub fn Database(comptime config: Config) type {
             context: ?*anyopaque = null,
             show: *const fn (?*anyopaque, []const u8, []u8) ?usize,
             set: *const fn (?*anyopaque, []const u8, []const u8, bool, bool) Error!bool,
+            warn: ?*const fn (?*anyopaque, []const u8, []const u8) void = null,
         };
 
         const storage_fields = .{ "rows", "versions", "row_index", "key_index", "scan_values", "scan_nonnull", "scan_live", "scan_presence", "index_slots" } ++
@@ -2641,7 +2642,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn effectiveRole(state: *const Sess.State) u32 {
-            return if (state.values.role == 0) state.session_role else state.values.role;
+            return if (state.values.role == 0) state.sessionUser() else state.values.role;
         }
 
         pub fn canResolvePrepared(self: *Self, owner: u32) bool {
@@ -4173,7 +4174,8 @@ pub fn Database(comptime config: Config) type {
             const snap = try largeObjectView(original_snap);
             const index = (try self.lockLargeObject(slot, oid, snap)) orelse return error.UndefinedObject;
             var object = self.catalog_objects.items[index];
-            if (check_privileges and self.largeObjectPrivileges(&object, self.session.role, snap) & CO.priv_update == 0) return error.InsufficientPrivilege;
+            if (check_privileges and self.largeObjectPrivileges(&object, self.session.role, snap) != CO.large_object_privileges)
+                return error.InsufficientPrivilege;
             if (input_len == 0) return;
             const pages = if (self.large_pages) |*value| value else return error.UnsupportedStatement;
             const size = large_object_pages.page_bytes;
@@ -4349,9 +4351,107 @@ pub fn Database(comptime config: Config) type {
             return privileges;
         }
 
+        const LoAcl = @import("sql/large_object_acl.sig");
+
+        fn largeObjectGrantGraph(self: *const Self, object: *const O.Object, snap: Snapshot, edges: []LoAcl.Edge) LoAcl.Graph {
+            var graph: LoAcl.Graph = .{ .edges = edges, .owner = object.owner, .privileges = CO.large_object_privileges };
+            for (&self.catalog_objects.items, 0..) |*entry, index| {
+                if (entry.kind != .large_object_acl or entry.target != object.target or !O.visible(entry, snap)) continue;
+                graph.add(.{
+                    .grantor = entry.owner, .grantee = entry.grantee, .flags = entry.flags,
+                    .options = entry.grant_flags, .original = index,
+                });
+            }
+            return graph;
+        }
+
+        /// PostgreSQL selects one grantor for all privileges in a command.
+        /// Prefer the owner, then the closest eligible role with the most options.
+        fn largeObjectGrantor(self: *const Self, graph: LoAcl.Graph, wanted: u32, snap: Snapshot) struct { role: u32, options: u32 } {
+            if (self.ownsLargeObject(graph.owner, snap)) return .{ .role = graph.owner, .options = wanted };
+            var roles: [O.capacity + 1]u32 = undefined;
+            roles[0] = self.session.role;
+            var length: usize = 1;
+            var next: usize = 0;
+            var best_role = roles[0];
+            var best_options: u32 = 0;
+            while (next < length) : (next += 1) {
+                const role = roles[next];
+                var options: u32 = 0;
+                for (graph.edges[0..graph.len]) |edge| {
+                    if (edge.grantee == role) options |= edge.options & wanted;
+                }
+                if (options == wanted) return .{ .role = role, .options = options };
+                if (@popCount(options) > @popCount(best_options)) {
+                    best_options = options;
+                    best_role = role;
+                }
+                for (&self.catalog_objects.items) |*entry| {
+                    if (entry.kind != .member or entry.grantee != role or !O.visible(entry, snap) or
+                        !self.catalog_objects.membershipInherits(entry, snap)) continue;
+                    if (std.mem.indexOfScalar(u32, roles[0..length], entry.target) == null) {
+                        roles[length] = entry.target;
+                        length += 1;
+                    }
+                }
+            }
+            return .{ .role = best_role, .options = best_options };
+        }
+
+        fn largeObjectGrantorKey(object_owner: u32, grantor: u32) i32 {
+            return if (object_owner == grantor) 0 else @bitCast(grantor);
+        }
+
+        fn largeObjectGrantChanged(self: *const Self, graph: LoAcl.Graph, edge: LoAcl.Edge) bool {
+            const original = &self.catalog_objects.items[edge.original orelse return edge.flags != 0];
+            return original.flags != edge.flags or original.grant_flags != edge.options or
+                original.grantee != edge.grantee or original.owner != edge.grantor or
+                original.sub != largeObjectGrantorKey(graph.owner, edge.grantor);
+        }
+
+        fn storeLargeObjectGrants(self: *Self, slot: u16, index: usize, object: *O.Object, graph: LoAcl.Graph, snap: Snapshot) Error!void {
+            const original = &self.catalog_objects.items[index];
+            const metadata_changed = object.owner != original.owner or object.flags != original.flags or object.grant_flags != original.grant_flags;
+            var writes: usize = if (metadata_changed) 2 else 0;
+            for (graph.edges[0..graph.len]) |edge| {
+                if (self.largeObjectGrantChanged(graph, edge)) writes += @as(usize, @intFromBool(edge.original != null)) + @intFromBool(edge.flags != 0);
+            }
+            try self.reserveWrites(slot, writes);
+            // Remove all replaced keys before inserting new ones. Ownership
+            // transfer can merge two grants or move a grant to a former key.
+            for (graph.edges[0..graph.len]) |edge| {
+                if (self.largeObjectGrantChanged(graph, edge)) {
+                    if (edge.original) |old| self.objectDelete(slot, old, snap);
+                }
+            }
+            if (metadata_changed) {
+                self.objectDelete(slot, index, snap);
+                _ = try self.objectInsert(slot, object, false, snap);
+            }
+            for (graph.edges[0..graph.len]) |edge| {
+                if (edge.flags == 0 or !self.largeObjectGrantChanged(graph, edge)) continue;
+                var row: O.Object = .{
+                    .kind = .large_object_acl, .target = object.target, .grantee = edge.grantee, .owner = edge.grantor,
+                    .sub = largeObjectGrantorKey(graph.owner, edge.grantor), .flags = edge.flags, .grant_flags = edge.options,
+                };
+                _ = try self.objectInsert(slot, &row, false, snap);
+            }
+        }
+
+        fn largeObjectGrantWarning(self: *Self, revoke: bool, partial: bool) void {
+            const provider = self.settings_provider orelse return;
+            const warn = provider.warn orelse return;
+            warn(provider.context, if (revoke) "01006" else "01007",
+                if (revoke)
+                    (if (partial) "not all privileges could be revoked" else "no privileges could be revoked")
+                else
+                    (if (partial) "not all privileges were granted" else "no privileges were granted"));
+        }
+
         fn grantLargeObjects(self: *Self, slot: u16, source: []const u8, grant: *const CO.Grant, revoke: bool, snap: Snapshot) Error!void {
-            // Delegated grant options need a separate grantor dependency graph.
-            if (grant.option) return error.UnsupportedStatement;
+            if (grant.grantor) |specified| {
+                if (try self.objectRole(source, specified, snap) != self.session.role) return error.UnsupportedStatement;
+            }
             var grantees: [CO.list_capacity]u32 = undefined;
             var count: usize = 0;
             var latest = snap;
@@ -4359,6 +4459,7 @@ pub fn Database(comptime config: Config) type {
             for (grant.grantees[0..grant.grantee_count]) |grantee| {
                 const role = try self.objectRole(source, grantee, snap);
                 if (std.mem.indexOfScalar(u32, grantees[0..count], role) != null) continue;
+                if (role == CO.public_role and !revoke and grant.option) return error.InvalidGrantOperation;
                 if (role != CO.public_role) {
                     const key: O.Object = .{ .kind = .role, .oid = role };
                     if (self.catalog_objects.pendingConflict(&key, snap)) |other| return self.objectPark(slot, other);
@@ -4371,30 +4472,56 @@ pub fn Database(comptime config: Config) type {
                 if (std.mem.indexOfScalar(u32, grant.large_objects[0..position], oid) != null) continue;
                 const index = (try self.lockLargeObject(slot, oid, snap)) orelse return error.UndefinedObject;
                 var object = self.catalog_objects.items[index];
-                if (!self.ownsLargeObject(object.owner, snap)) {
+                var edges: [O.capacity + CO.list_capacity]LoAcl.Edge = undefined;
+                var support: [edges.len]LoAcl.Graph.State = undefined;
+                var graph = self.largeObjectGrantGraph(&object, snap, &edges);
+                const issuer = self.largeObjectGrantor(graph, grant.privileges, snap);
+                if (issuer.options == 0) {
                     if (self.largeObjectPrivileges(&object, self.session.role, snap) == 0) return error.InsufficientPrivilege;
+                    self.largeObjectGrantWarning(revoke, false);
                     continue;
                 }
-                try self.reserveWrites(slot, 2 + 2 * count);
+                if (issuer.options != grant.privileges and !grant.all_privileges) self.largeObjectGrantWarning(revoke, true);
                 var owner_flags = largeObjectOwnerPrivileges(&object);
-                if (std.mem.indexOfScalar(u32, grantees[0..count], object.owner) != null)
-                    owner_flags = if (revoke) owner_flags & ~grant.privileges else owner_flags | grant.privileges;
-                const flags = CO.large_object_explicit_acl | owner_flags;
-                if (object.flags != flags) {
-                    self.objectDelete(slot, index, snap);
-                    object.flags = flags;
-                    _ = try self.objectInsert(slot, &object, false, snap);
-                }
                 for (grantees[0..count]) |role| {
-                    if (role == object.owner) continue;
-                    var entry: O.Object = .{ .kind = .large_object_acl, .target = oid, .grantee = role, .owner = object.owner };
-                    const old = self.catalog_objects.findKey(&entry, snap);
-                    const old_flags = if (old) |item| self.catalog_objects.items[item].flags else 0;
-                    entry.flags = if (revoke) old_flags & ~grant.privileges else old_flags | grant.privileges;
-                    if (entry.flags == old_flags) continue;
-                    if (old) |item| self.objectDelete(slot, item, snap);
-                    if (entry.flags != 0) _ = try self.objectInsert(slot, &entry, false, snap);
+                    if (role == object.owner and issuer.role == role) {
+                        if (!revoke) owner_flags |= issuer.options else if (!grant.option) owner_flags &= ~issuer.options;
+                        if (revoke) object.grant_flags &= ~issuer.options else if (grant.option) object.grant_flags |= issuer.options;
+                        continue;
+                    }
+                    const existing = graph.find(issuer.role, role);
+                    if (!revoke and grant.option and issuer.role != object.owner and role != object.owner) {
+                        const new_options = issuer.options & ~(if (existing) |old| graph.edges[old].options else @as(u32, 0));
+                        if (new_options != 0) {
+                            graph.support(&support, role);
+                            if (graph.supportedOptions(issuer.role, &support) & new_options != new_options) return error.InvalidGrantOperation;
+                        }
+                    }
+                    const item = existing orelse blk: {
+                        if (revoke) continue;
+                        graph.add(.{ .grantor = issuer.role, .grantee = role, .flags = 0, .options = 0 });
+                        break :blk graph.len - 1;
+                    };
+                    const edge = &graph.edges[item];
+                    if (revoke) {
+                        edge.options &= ~issuer.options;
+                        if (!grant.option) edge.flags &= ~issuer.options;
+                    } else {
+                        edge.flags |= issuer.options;
+                        if (grant.option) edge.options |= issuer.options;
+                    }
                 }
+                if (revoke) {
+                    graph.support(&support, null);
+                    for (graph.edges[0..graph.len], support[0..graph.len]) |*edge, state| {
+                        if (edge.flags & ~state.available == 0) continue;
+                        if (!grant.cascade) return error.DependentObjects;
+                        edge.flags &= state.available;
+                        edge.options &= state.available;
+                    }
+                }
+                object.flags = CO.large_object_explicit_acl | owner_flags;
+                try self.storeLargeObjectGrants(slot, index, &object, graph, snap);
             }
         }
 
@@ -4412,27 +4539,13 @@ pub fn Database(comptime config: Config) type {
             latest.csn = self.csn;
             if (self.catalog_objects.roleFlags(owner, latest) == null) return error.SerializationFailure;
 
-            var writes: usize = 2;
-            for (&self.catalog_objects.items) |*entry| {
-                if (entry.kind != .large_object_acl or entry.target != oid or !O.visible(entry, snap)) continue;
-                if (entry.grantee == owner) {
-                    object.flags |= entry.flags;
-                    writes += 1;
-                } else writes += 2;
-            }
-            try self.reserveWrites(slot, writes);
-            self.objectDelete(slot, index, snap);
+            var edges: [O.capacity]LoAcl.Edge = undefined;
+            var graph = self.largeObjectGrantGraph(&object, snap, &edges);
+            const merged_acl = graph.changeOwner(owner);
+            object.flags |= merged_acl.flags;
+            object.grant_flags |= merged_acl.options;
             object.owner = owner;
-            _ = try self.objectInsert(slot, &object, false, snap);
-
-            for (&self.catalog_objects.items, 0..) |*entry, old| {
-                if (entry.kind != .large_object_acl or entry.target != oid or entry.owner != old_owner or !O.visible(entry, snap)) continue;
-                var replacement = entry.*;
-                self.objectDelete(slot, old, snap);
-                if (replacement.grantee == owner) continue;
-                replacement.owner = owner;
-                _ = try self.objectInsert(slot, &replacement, false, snap);
-            }
+            try self.storeLargeObjectGrants(slot, index, &object, graph, snap);
         }
 
         fn catalogObject(self: *Self, slot: u16, source: []const u8, object_statement: *const CO.Statement, snap: Snapshot) Error!void {
@@ -5908,30 +6021,43 @@ pub fn Database(comptime config: Config) type {
             if (object.flags & CO.large_object_explicit_acl == 0) return .null_value;
             const owner = self.catalog_objects.roleName(object.owner, snapshot) orelse return error.UndefinedObject;
             const owner_flags = largeObjectOwnerPrivileges(object);
-            var count: u32 = @intFromBool(owner_flags != 0);
-            for (&self.catalog_objects.items) |*entry| {
-                if (entry.kind == .large_object_acl and entry.target == object.target and O.visible(entry, snapshot)) count += 1;
+            var edges: [O.capacity]LoAcl.Edge = undefined;
+            const graph = self.largeObjectGrantGraph(object, snapshot, &edges);
+            var emitted: [O.capacity]LoAcl.Graph.State = undefined;
+            graph.start(&emitted);
+            var steps: [2 * O.capacity]LoAcl.Graph.Step = undefined;
+            var count: usize = 0;
+            while (graph.next(&emitted)) |step| {
+                steps[count] = step;
+                count += 1;
             }
             const Acl = @import("sql/catalog_acl.sig").Acl(V);
             var output: Text = .{};
-            var writer = try Acl.begin(&output, count);
-            if (owner_flags != 0) try Acl.append(&writer, owner, largeObjectPermissionLetters(owner_flags), owner);
-            for (&self.catalog_objects.items) |*entry| {
-                if (entry.kind != .large_object_acl or entry.target != object.target or !O.visible(entry, snapshot)) continue;
+            var writer = try Acl.begin(&output, @intCast(count + @intFromBool(owner_flags != 0)));
+            var letters: [4]u8 = undefined;
+            if (owner_flags != 0) try Acl.append(&writer, owner, largeObjectPermissionLetters(owner_flags, object.grant_flags, &letters), owner);
+            for (steps[0..count]) |step| {
+                const entry = &edges[step.index];
                 const grantee = if (entry.grantee == CO.public_role) "" else
                     self.catalog_objects.roleName(entry.grantee, snapshot) orelse return error.UndefinedObject;
-                try Acl.append(&writer, grantee, largeObjectPermissionLetters(entry.flags), owner);
+                const grantor = self.catalog_objects.roleName(entry.grantor, snapshot) orelse return error.UndefinedObject;
+                try Acl.append(&writer, grantee, largeObjectPermissionLetters(step.flags, entry.options, &letters), grantor);
             }
             return .{ .array = output };
         }
 
-        fn largeObjectPermissionLetters(flags: u32) []const u8 {
-            return switch (flags & CO.large_object_privileges) {
-                CO.priv_select => "r",
-                CO.priv_update => "w",
-                CO.large_object_privileges => "rw",
-                else => "",
-            };
+        fn largeObjectPermissionLetters(flags: u32, options: u32, letters: *[4]u8) []const u8 {
+            var used: usize = 0;
+            for ([_]u32{ CO.priv_select, CO.priv_update }, "rw") |flag, letter| {
+                if (flags & flag == 0) continue;
+                letters[used] = letter;
+                used += 1;
+                if (options & flag != 0) {
+                    letters[used] = '*';
+                    used += 1;
+                }
+            }
+            return letters[0..used];
         }
 
         fn namespaceAcl(self: *const Self, oid: u32, owner: u32, snapshot: Snapshot) Error!Cell {
@@ -10585,7 +10711,7 @@ pub fn Database(comptime config: Config) type {
             tx.deferrable = deferrable;
         }
 
-        const SettingKind = enum { search_path, check_function_bodies, row_security, synchronize_seqscans, restrict_nonsystem_relation_kind, default_transaction_isolation, default_transaction_read_only, default_transaction_deferrable, transaction_isolation, transaction_read_only, transaction_deferrable, custom, role, quote_all_identifiers };
+        const SettingKind = enum { search_path, check_function_bodies, row_security, synchronize_seqscans, restrict_nonsystem_relation_kind, default_transaction_isolation, default_transaction_read_only, default_transaction_deferrable, transaction_isolation, transaction_read_only, transaction_deferrable, custom, role, session_authorization, quote_all_identifiers };
 
         const SettingDescriptor = struct {
             kind: SettingKind,
@@ -10845,7 +10971,7 @@ pub fn Database(comptime config: Config) type {
                 },
                 .transaction_isolation, .transaction_read_only, .transaction_deferrable => return error.UnsupportedStatement,
                 // SET ROLE resolves against the catalog (setSetting).
-                .role => return error.UnsupportedStatement,
+                .role, .session_authorization => return error.UnsupportedStatement,
             }
         }
 
@@ -10874,6 +11000,10 @@ pub fn Database(comptime config: Config) type {
                 },
                 .transaction_isolation, .transaction_read_only, .transaction_deferrable => {},
                 .role => into.role = source.role,
+                .session_authorization => {
+                    into.authorization = source.authorization;
+                    into.role = source.role;
+                },
             }
             const bit = settingOriginBit(which);
             into.client_settings = (into.client_settings & ~bit) | (source.client_settings & bit);
@@ -10893,6 +11023,7 @@ pub fn Database(comptime config: Config) type {
             };
             const state = self.sessionState();
             switch (which) {
+                .session_authorization => if (self.dialect != .postgres) return error.UnsupportedStatement,
                 .transaction_isolation, .transaction_read_only, .transaction_deferrable => {
                     const owner = slot orelse return;
                     var modes: ast.Characteristics = .{};
@@ -10917,7 +11048,10 @@ pub fn Database(comptime config: Config) type {
             if (kind == .default) {
                 try copySetting(&next, &state.startup, which, name);
             } else if (which == .role) {
-                next.role = try self.roleSetting(slot, kind, value);
+                next.role = try self.roleSetting(slot, kind, value, false);
+            } else if (which == .session_authorization) {
+                next.authorization = try self.roleSetting(slot, kind, value, true);
+                next.role = 0;
             } else {
                 try assignSetting(&next, which, name, kind, value);
                 const bit = settingOriginBit(which);
@@ -10953,7 +11087,7 @@ pub fn Database(comptime config: Config) type {
         /// session user is a member of (any membership; superusers may
         /// become any role). An unknown role is 22023, a role the session
         /// user may not become 42501.
-        fn roleSetting(self: *Self, slot: ?u16, kind: SettingValueKind, value: []const u8) Error!u32 {
+        fn roleSetting(self: *Self, slot: ?u16, kind: SettingValueKind, value: []const u8, authorization: bool) Error!u32 {
             var folded: [64]u8 = undefined;
             if (value.len > folded.len) return error.InvalidSettingValue;
             var length: usize = 0;
@@ -10969,12 +11103,18 @@ pub fn Database(comptime config: Config) type {
             } else {
                 for (value, 0..) |byte, index| folded[index] = if (kind == .word) types.lower(byte) else byte;
                 length = value.len;
-                if (kind == .word and types.same(folded[0..length], "none")) return 0;
+                if (!authorization and kind == .word and types.same(folded[0..length], "none")) return 0;
             }
             const name = folded[0..length];
             const snap = self.settingSnapshot(slot);
-            const oid = self.catalog_objects.roleByName(name, snap) orelse return error.InvalidSettingValue;
-            const session_role = self.sessionState().session_role;
+            const oid = self.catalog_objects.roleByName(name, snap) orelse return if (authorization) error.UndefinedObject else error.InvalidSettingValue;
+            const state = self.sessionState();
+            if (authorization) {
+                if (oid == state.session_role) return 0;
+                if (!self.catalog_objects.superuser(state.session_role, snap)) return error.InsufficientPrivilege;
+                return oid;
+            }
+            const session_role = state.sessionUser();
             if (!self.catalog_objects.superuser(session_role, snap) and !self.catalog_objects.membershipPath(session_role, oid, .set, snap)) return error.InsufficientPrivilege;
             return oid;
         }
@@ -10983,8 +11123,8 @@ pub fn Database(comptime config: Config) type {
         /// session state (SET ROLE).
         fn installRole(self: *Self) void {
             const state = self.session_state orelse &self.default_session_state;
-            self.session.session_role = state.session_role;
-            self.session.role = if (state.values.role != 0) state.values.role else state.session_role;
+            self.session.session_role = state.sessionUser();
+            self.session.role = effectiveRole(state);
             self.session.public_schema_on_path = state.values.publicSchemaOnPath();
             self.session.row_security = state.values.row_security;
             self.session.synchronize_seqscans = self.dialect == .postgres and state.values.synchronize_seqscans;
@@ -10996,8 +11136,16 @@ pub fn Database(comptime config: Config) type {
         fn resetSettings(self: *Self, slot: ?u16) Error!void {
             const state = self.sessionState();
             if (slot != null) try state.preserve();
+            const active_role = state.values.role;
+            const active_authorization = state.values.authorization;
+            const base_role = state.base.role;
+            const base_authorization = state.base.authorization;
             state.values = state.startup;
             state.base = state.startup;
+            state.values.role = active_role;
+            state.values.authorization = active_authorization;
+            state.base.role = base_role;
+            state.base.authorization = base_authorization;
         }
 
         /// The current text of setting `name` (engine, else the provider).
@@ -11021,6 +11169,7 @@ pub fn Database(comptime config: Config) type {
                     break :blk state.values.custom[index].value.slice();
                 },
                 .role => if (state.values.role == 0) "none" else self.catalog_objects.roleName(state.values.role, self.settingSnapshot(slot)) orelse "none",
+                .session_authorization => self.catalog_objects.roleName(state.sessionUser(), self.settingSnapshot(slot)) orelse return error.UndefinedObject,
                 else => unreachable,
             };
             if (text.len > out.len) return error.TextCapacity;
@@ -13013,6 +13162,7 @@ pub fn Database(comptime config: Config) type {
                 .none => return decodeIdent(source, name.ident, out),
                 .time_zone => "timezone",
                 .xml_option => "xmloption",
+                .session_authorization => "session_authorization",
                 .transaction_isolation => "transaction_isolation",
             };
             out.len = special.len;
