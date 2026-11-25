@@ -20,6 +20,19 @@ descriptors, host capacity admission, WAL replay, and checkpoint/export
 integration remain open. The stock archive gate stays partial.
 [PostgreSQL large-object API](https://www.postgresql.org/docs/18/lo-interfaces.html)
 
+## PostgreSQL time bucketing candidate
+
+`date_bin` supports both stock timestamp signatures and their `pg_proc`
+identities. It bins finite strides on the microsecond timeline, including
+negative offsets from the origin and exact boundaries. The contracts
+cover overload selection, NULL, timestamp infinity, invalid strides and
+range overflow. PostgreSQL 18 infinite interval values remain open as
+a separate temporal type gap.
+
+Stock restore exposed an incorrect TEXT cast on an untyped function
+argument in a stored bucket expression. The expression writer preserves
+unknown call arguments so native restore resolves the same overload.
+
 ## Temporal `OVERLAPS`
 
 The original date-only inventory query already passed. New cases exposed
@@ -38,6 +51,14 @@ distinction between a calendar day and 24 hours across a DST boundary.
 The closure concerns the predicate and the temporal values already
 supported by the engine. The wider type and catalog inventory remains
 open.
+
+The follow-up makes the same signatures callable through
+`pg_catalog.overlaps` and exposes their 13 native `pg_proc` identities.
+The binder and catalog share the signature list. The local PG16 wire
+run passed all 19 boundary cases and the full 2,401-case combination
+matrix. It also passed the 47 stock-tooling checks, including a stored
+TIME predicate verified after restoring an archive and reopening its
+WAL. The versioned CI suite uses the same checks on PG16 and PG18.
 
 ## Stock PostgreSQL dump and restore candidate
 
@@ -310,6 +331,15 @@ targets use the advertised PostgreSQL 16 default, and compression
 and option fields have no overrides. RamSQL materializes added column
 values, so `atthasmissing` is false and `attmissingval` is a typed
 `anyarray` NULL. That pseudo-type is available for catalog output.
+
+PostgreSQL 18.0's dump client can export the internal `pg_attver` column
+option. The restore path accepts unqualified SET and RESET for that
+reserved option, matching the later PostgreSQL 18 handler. It checks the
+relation, owner, column and transaction mode and takes a SHARE UPDATE
+EXCLUSIVE lock for an options-only command. The command leaves attributes,
+rows and WAL unchanged. The DDL contract covers replay, compound ALTER,
+bad syntax and two transactions contending for the lock.
+User-configurable attribute options such as `n_distinct` remain open.
 
 RAMSQL `9e4bfa6` with ZPM `7a160f13` passed the column discovery
 projection against PostgreSQL 16 and 18, including inherited and
