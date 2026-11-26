@@ -1,5 +1,29 @@
 # SQL conformance TDD checkpoint
 
+## PostgreSQL large-object default privileges
+
+`ALTER DEFAULT PRIVILEGES ... ON LARGE OBJECTS` supports SELECT and
+UPDATE, ALL, grants to roles and PUBLIC, and grant-option revocation.
+The command uses the current role by default. A role can also change
+defaults for roles whose privileges it inherits. Large objects use
+database-wide defaults, so the command rejects IN SCHEMA.
+
+Creation copies the effective creator's template into the object's ACL.
+Later default grants or revocations affect subsequent creations. A
+template that returns to the built-in owner ACL disappears from
+`pg_default_acl`. The catalog exposes the template as a typed ACL with
+object kind `L`. WAL preserves the template OID and role dependencies.
+Compact checkpoint format RSBASE07 carries templates and their grants,
+and the reader still accepts earlier images.
+
+Qualification checks actual access before and after GRANT, REVOKE GRANT
+OPTION and REVOKE, including rollback, forced-crash WAL recovery, and
+checkpoint replay. Stock PG18 archives preserve both default templates
+and materialized object ACLs. Stock PG16 archives exercise only the
+materialized ACLs because PG16 does not accept the default DDL.
+[PostgreSQL 18 default privileges](https://www.postgresql.org/docs/18/sql-alterdefaultprivileges.html)
+[PostgreSQL 16 default privileges](https://www.postgresql.org/docs/16/sql-alterdefaultprivileges.html)
+
 ## PostgreSQL large-object ACL values
 
 `pg_largeobject_metadata.lomacl` and `acldefault('L', owner)` keep their
@@ -43,8 +67,8 @@ PG16 and PG18 qualification includes delegated ACLs in stock plain and
 custom archives in both directions, savepoint rollback, forced-crash
 recovery, and revocation across checkpoint WAL replay.
 
-Server-side file import/export and large-object default-privilege DDL
-remain open. Roles, large-object metadata and ACL versions use the
+Server-side file import/export remains open. Roles, large-object
+metadata and ACL versions use the
 shared catalog budget. The large-object ACL value checkpoint covers
 display and archive output for large ACLs.
 [PostgreSQL large-object permissions](https://www.postgresql.org/docs/18/lo-implementation.html)

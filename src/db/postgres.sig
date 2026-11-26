@@ -2447,6 +2447,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             return switch (self.result.command) {
                 .create_role => "CREATE ROLE",
                 .alter_role => "ALTER ROLE",
+                .alter_default_privileges => "ALTER DEFAULT PRIVILEGES",
                 .drop_role => "DROP ROLE",
                 .grant => "GRANT",
                 .revoke => "REVOKE",

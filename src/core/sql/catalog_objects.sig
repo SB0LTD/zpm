@@ -85,7 +85,7 @@ pub const large_object_generated_oid: u32 = 1;
 /// database). PostgreSQL assigns its OID at initdb; ZPM fixes it.
 pub const plpgsql_extension_oid: u32 = 13001;
 
-pub const Kind = enum(u8) { role = 1, member = 2, acl = 3, relation = 4, policy = 5, comment = 6, fdw = 7, server = 8, publication = 9, domain = 10, enum_type = 11, composite_type = 12, statistics = 13, publication_table = 14, publication_schema = 15, schema_acl = 16, schema_acl_state = 17, schema_owner = 18, role_settings = 19, large_object = 20, large_object_acl = 21, _ };
+pub const Kind = enum(u8) { role = 1, member = 2, acl = 3, relation = 4, policy = 5, comment = 6, fdw = 7, server = 8, publication = 9, domain = 10, enum_type = 11, composite_type = 12, statistics = 13, publication_table = 14, publication_schema = 15, schema_acl = 16, schema_acl_state = 17, schema_owner = 18, role_settings = 19, large_object = 20, large_object_acl = 21, large_object_default_acl = 22, _ };
 
 pub fn publicationMembership(kind: Kind) bool {
     return kind == .publication_table or kind == .publication_schema;
@@ -416,6 +416,12 @@ pub const Statistics = struct {
 };
 pub const AlterStatistics = struct { name: Qualified, if_exists: bool, target: i32 };
 pub const CreateDomain = struct { name: Qualified, spec: Domain };
+pub const LargeObjectDefaults = struct {
+    owners: [list_capacity]Grantee = @splat(.{}),
+    count: usize = 0,
+    revoke: bool = false,
+    grant: Grant = .{},
+};
 pub const CreateEnum = struct { name: Qualified, labels: Span };
 pub const CreateComposite = struct { name: Qualified, fields: Span };
 pub const DropTypes = struct { names: [list_capacity]Qualified = @splat(.{}), count: usize = 0, if_exists: bool = false };
@@ -432,6 +438,7 @@ pub const Statement = union(enum) {
     table_security: TableSecurity,
     alter_schema_owner: struct { name: Ident, owner: Grantee },
     alter_large_object_owner: struct { oid: u32, owner: Grantee },
+    alter_large_object_defaults: LargeObjectDefaults,
     comment: Comment,
     create_fdw: Named,
     drop_fdw: Drop,
@@ -499,6 +506,10 @@ pub fn parseWithDialect(source: []const u8, comptime name_bytes: usize, comptime
         return null;
     }
     if (try p.take("alter")) {
+        if (dialect == .postgres and try p.take("default")) {
+            try p.expect("privileges");
+            return .{ .alter_large_object_defaults = try p.largeObjectDefaults() };
+        }
         if (dialect == .postgres and try p.take("large")) {
             try p.expect("object");
             const oid = try p.objectId();
@@ -543,8 +554,8 @@ pub fn parseWithDialect(source: []const u8, comptime name_bytes: usize, comptime
         if (p.word("extension") or p.word("subscription")) return error.UnsupportedStatement;
         return null;
     }
-    if (try p.take("grant")) return .{ .grant = try p.grant(false, dialect == .postgres) };
-    if (try p.take("revoke")) return .{ .revoke = try p.grant(true, dialect == .postgres) };
+    if (try p.take("grant")) return .{ .grant = try p.grant(false, dialect == .postgres, false) };
+    if (try p.take("revoke")) return .{ .revoke = try p.grant(true, dialect == .postgres, false) };
     if (try p.take("comment")) return .{ .comment = try p.comment(dialect == .postgres) };
     return null;
 }
@@ -1085,7 +1096,39 @@ const Parser = struct {
         return oid;
     }
 
-    fn grant(self: *Parser, revoke: bool, postgres: bool) Error!Grant {
+    fn largeObjectDefaults(self: *Parser) Error!LargeObjectDefaults {
+        var out: LargeObjectDefaults = .{};
+        var has_schema = false;
+        while (true) {
+            if (try self.take("for")) {
+                if (out.count != 0) return error.Syntax;
+                if (!try self.take("role")) try self.expect("user");
+                while (true) {
+                    if (out.count == list_capacity) return error.ProgramLimitExceeded;
+                    const owner = try self.grantee();
+                    if (owner.kind == .public) return error.InvalidGrantOperation;
+                    out.owners[out.count] = owner;
+                    out.count += 1;
+                    if (!try self.takeSymbol(.comma)) break;
+                }
+            } else if (try self.take("in")) {
+                if (has_schema) return error.Syntax;
+                try self.expect("schema");
+                has_schema = true;
+                while (true) {
+                    _ = try self.ident();
+                    if (!try self.takeSymbol(.comma)) break;
+                }
+            } else break;
+        }
+        out.revoke = try self.take("revoke");
+        if (!out.revoke) try self.expect("grant");
+        out.grant = try self.grant(out.revoke, true, true);
+        if (has_schema) return error.InvalidGrantOperation;
+        return out;
+    }
+
+    fn grant(self: *Parser, revoke: bool, postgres: bool, comptime defaults: bool) Error!Grant {
         var out: Grant = .{};
         if (revoke) {
             if (self.word("grant") or self.word("admin")) {
@@ -1128,7 +1171,8 @@ const Parser = struct {
         if (try self.take("on")) {
             out.schema = try self.take("schema");
             const large_object = !out.schema and postgres and try self.take("large");
-            if (large_object) try self.expect("object");
+            if (defaults and !large_object) return error.UnsupportedStatement;
+            if (large_object) try self.expect(if (defaults) "objects" else "object");
             if (!out.schema and !large_object and (self.word("sequence") or self.word("database") or self.word("function") or self.word("procedure") or
                 self.word("routine") or self.word("language") or self.word("type") or self.word("domain") or self.word("foreign") or
                 self.word("large") or self.word("tablespace") or self.word("parameter") or self.word("all"))) return error.UnsupportedStatement;
@@ -1138,7 +1182,7 @@ const Parser = struct {
                 if (privileges & ~large_object_privileges != 0) return error.InvalidGrantOperation;
                 out.privileges = if (all) large_object_privileges else privileges;
                 out.all_privileges = all;
-                while (true) {
+                while (!defaults) {
                     if (out.large_object_count == list_capacity) return error.ProgramLimitExceeded;
                     out.large_objects[out.large_object_count] = try self.objectId();
                     out.large_object_count += 1;
@@ -1161,6 +1205,7 @@ const Parser = struct {
             }
             out.granted_count = 0;
         } else {
+            if (defaults) return error.Syntax;
             if (!names_ok or out.granted_count == 0) return error.Syntax;
             if (revoke and out.option and !out.membership) return error.Syntax;
             out.membership = true;
@@ -1192,6 +1237,7 @@ const Parser = struct {
             }
         }
         if (try self.take("granted")) {
+            if (defaults) return error.Syntax;
             if (out.large_object_count == 0 and (!out.membership or revoke)) return error.UnsupportedStatement;
             try self.expect("by");
             out.grantor = try self.grantee();
@@ -1515,6 +1561,7 @@ pub fn Objects(comptime config: types.Config) type {
             pub fn oidWidth(self: *const Object) u32 {
                 if (self.kind == .composite_type) return 3;
                 if (userType(self.kind)) return 2 + @as(u32, self.enum_label_count);
+                if (self.kind == .large_object_default_acl) return @intFromBool(self.oid != 0);
                 return @intFromBool(ownsOid(self.kind));
             }
 
@@ -1589,7 +1636,7 @@ pub fn Objects(comptime config: types.Config) type {
                 .role, .policy, .fdw, .server, .publication, .statistics => a.oid == b.oid,
                 .publication_table, .publication_schema => a.oid == b.oid and a.target == b.target and a.grantee == b.grantee,
                 .domain, .enum_type, .composite_type => a.oid == b.oid and a.target == b.target,
-                .member, .acl, .schema_acl => a.target == b.target and a.grantee == b.grantee,
+                .member, .acl, .schema_acl, .large_object_default_acl => a.target == b.target and a.grantee == b.grantee,
                 .large_object_acl => a.target == b.target and a.grantee == b.grantee and a.sub == b.sub,
                 .relation, .schema_acl_state, .schema_owner, .role_settings, .large_object => a.target == b.target,
                 .comment => a.grantee == b.grantee and a.target == b.target and a.sub == b.sub,
@@ -1986,7 +2033,7 @@ pub fn Objects(comptime config: types.Config) type {
 
         fn decodeKind(cursor: Cursor) Error!Kind {
             const raw = try cursor.int(u8);
-            if (raw < 1 or raw > @intFromEnum(Kind.large_object_acl)) return error.InvalidChangeRecord;
+            if (raw < 1 or raw > @intFromEnum(Kind.large_object_default_acl)) return error.InvalidChangeRecord;
             return @enumFromInt(raw);
         }
 
@@ -2014,6 +2061,8 @@ pub fn Objects(comptime config: types.Config) type {
                 // Legacy owner-issued grants keep sub = 0. Delegated grants
                 // put their grantor OID in that key field, including in drops.
                 .large_object_acl => o.oid == 0 and o.target != 0,
+                .large_object_default_acl => o.target != 0 and o.sub == 0 and
+                    ((o.oid != 0) == (o.target == o.grantee)),
                 .relation, .schema_acl_state, .schema_owner, .role_settings, .large_object => o.oid == 0 and o.target != 0 and o.grantee == 0 and o.sub == 0,
                 .comment => o.oid == 0 and o.target != 0 and o.sub >= 0 and switch (o.grantee) {
                     class_relation => true,
@@ -2072,6 +2121,10 @@ pub fn Objects(comptime config: types.Config) type {
                     (o.sub == 0 or o.owner == @as(u32, @bitCast(o.sub))) and
                     o.flags != 0 and o.flags & ~large_object_privileges == 0 and (o.owner != o.grantee or (o.sub != 0 and o.grant_flags == 0)) and
                     o.grant_flags & ~o.flags == 0 and (o.grantee != public_role or o.grant_flags == 0),
+                .large_object_default_acl => !has_name and o.owner == o.target and o.role_count == 0 and
+                    o.text_len == 0 and o.split == 0 and (o.oid != 0 or o.flags != 0) and
+                    o.flags & ~large_object_privileges == 0 and o.grant_flags & ~o.flags == 0 and
+                    (o.grantee != public_role or o.grant_flags == 0),
                 .schema_acl => !has_name and o.owner != 0 and o.grant_flags == 0 and o.role_count == 0 and o.text_len == 0 and
                     (o.flags == priv_schema_usage or (o.flags == 0 and o.grantee == o.owner)),
                 .schema_acl_state, .schema_owner => !has_name and o.owner != 0 and o.flags == 0 and o.grant_flags == 0 and o.role_count == 0 and o.text_len == 0,
@@ -2313,6 +2366,7 @@ pub fn Objects(comptime config: types.Config) type {
                     if (!v.live) continue;
                     const existing = asObject(v);
                     if (!sameKey(&existing, key)) continue;
+                    if (v.kind == .large_object_default_acl and v.oid != key.oid) return error.ChangeRecordConflict;
                     v.* = .{};
                     return;
                 }
@@ -2365,6 +2419,15 @@ pub fn Objects(comptime config: types.Config) type {
                         const large_owner = object_owner orelse return error.ChangeRecordConflict;
                         if ((v.sub == 0) != (large_owner == v.owner) or
                             (grantee != public_role and !self.roleExists(grantee))) return error.ChangeRecordConflict;
+                    },
+                    .large_object_default_acl => {
+                        if (grantee != public_role and !self.roleExists(grantee)) return error.ChangeRecordConflict;
+                        if (v.oid == 0) {
+                            for (&self.items) |*entry| {
+                                if (entry.live and entry.kind == .large_object_default_acl and
+                                    entry.target == target and entry.oid != 0) break;
+                            } else return error.ChangeRecordConflict;
+                        }
                     },
                     .schema_acl => {
                         const original = ctx.objectPrivateSchemaOwner(target) orelse return error.ChangeRecordConflict;
