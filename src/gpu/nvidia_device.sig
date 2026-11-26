@@ -77,8 +77,12 @@ const CBUF_AT = 0x200;
 const SETUP_DWORDS = 64;
 const DWORDS_PER_DISPATCH = 8;
 /// Graphics dispatches a run takes (Caps.max_graphics), and the dwords
-/// each takes (the 3D engine's whole state, the draw, the waits).
-pub const MAX_GRAPHICS = 64;
+/// each takes (the 3D engine's whole state, the draw, the waits). As many
+/// as the engine's batch holds (gfxapi's MAX_OPS): each run starts and ends
+/// waiting for idle, and at 64 Unigine Superposition's 490 shadow draws a
+/// frame were eight runs, the GPU drained between each (a run's pushbuffer
+/// is then 1.2 MiB of host memory, a set's).
+pub const MAX_GRAPHICS = 256;
 const DWORDS_PER_GRAPHICS = gl3d.MAX_DWORDS + 16;
 const PB_DWORDS = SETUP_DWORDS + DWORDS_PER_DISPATCH * MAX_DISPATCHES + DWORDS_PER_GRAPHICS * MAX_GRAPHICS;
 /// Zeros after a program (the SMs' prefetch reads past its end; the
