@@ -2727,6 +2727,7 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "DependentObjects")) return "2BP01";
     if (equal(name, "UndefinedObject")) return "42704";
     if (equal(name, "UndefinedFile")) return "58P01";
+    if (equal(name, "FileAccessFailure")) return "58030";
     if (equal(name, "InvalidName")) return "42602";
     if (equal(name, "BadCopyFormat")) return "22P04";
     if (equal(name, "InvalidBinaryRepresentation")) return "22P03";

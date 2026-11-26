@@ -11,7 +11,7 @@ const Handle = if (windows) ?*anyopaque else linux.fd_t;
 const invalid: Handle = if (windows) @ptrFromInt(~@as(usize, 0)) else -1;
 /// FileNotFound is returned only by openExisting, and only when the path or a
 /// directory component does not exist; every other open failure is FileOpenFailed.
-pub const Error = error{ UnsupportedPlatform, InvalidPath, PathTooLong, FileNotFound, FileOpenFailed, DataDirectoryBusy, FileReadFailed, FileWriteFailed, FileSyncFailed, FileSeekFailed, FileTruncateFailed, FileRenameFailed, FileRemoveFailed, WriterPoisoned };
+pub const Error = error{ UnsupportedPlatform, InvalidPath, PathTooLong, FileNotFound, FileOpenFailed, DataDirectoryBusy, FileReadFailed, FileWriteFailed, FileSyncFailed, FileSeekFailed, FileTruncateFailed, FileRenameFailed, FileRemoveFailed, WriterPoisoned, FilePermissionDenied, NotRegularFile, FileCloseFailed };
 const Win = struct {
     extern "kernel32" fn CreateFileW([*:0]const u16, u32, u32, ?*anyopaque, u32, u32, ?*anyopaque) callconv(.winapi) ?*anyopaque;
     extern "kernel32" fn CloseHandle(?*anyopaque) callconv(.winapi) c_int;
@@ -21,6 +21,7 @@ const Win = struct {
     extern "kernel32" fn SetFilePointerEx(?*anyopaque, i64, ?*i64, u32) callconv(.winapi) c_int;
     extern "kernel32" fn SetEndOfFile(?*anyopaque) callconv(.winapi) c_int;
     extern "kernel32" fn GetLastError() callconv(.winapi) u32;
+    extern "kernel32" fn GetFileType(?*anyopaque) callconv(.winapi) u32;
     extern "kernel32" fn MoveFileExW([*:0]const u16, [*:0]const u16, u32) callconv(.winapi) c_int;
     extern "kernel32" fn DeleteFileW([*:0]const u16) callconv(.winapi) c_int;
 };
@@ -232,6 +233,10 @@ pub const File = struct {
         if (self.poisoned) return error.WriterPoisoned;
         errdefer self.poisoned = true;
         _ = try self.seek(0, 2);
+        try self.writeAll(bytes);
+    }
+
+    fn writeAll(self: *File, bytes: []const u8) Error!void {
         var done: usize = 0;
         while (done < bytes.len) {
             var count: usize = 0;
@@ -299,6 +304,120 @@ pub const File = struct {
             while (darwin.ftruncate(self.handle, @intCast(size)) != 0) {
                 if (darwin.errno(@as(c_int, -1)) != .INTR) return error.FileTruncateFailed;
             }
+        } else return error.UnsupportedPlatform;
+    }
+};
+
+/// Sequential regular-file transfers under the server process's credentials.
+/// These handles do not acquire the durable database writer lock.
+pub const StreamFile = struct {
+    pub fn open(path: []const u8, writing: bool) Error!usize {
+        var file: File = .{};
+        errdefer file.close();
+        if (windows) {
+            var buffer: [path_capacity]u16 = undefined;
+            const name = try widePath(path, &buffer);
+            // OPEN_ALWAYS leaves an existing file intact until its type is checked.
+            file.handle = Win.CreateFileW(name.ptr, if (writing) 0x40000000 else 0x80000000, 3, null, if (writing) 4 else 3, 0x80, null);
+            if (file.handle == invalid) return switch (Win.GetLastError()) {
+                2, 3 => error.FileNotFound,
+                5 => error.FilePermissionDenied,
+                else => error.FileOpenFailed,
+            };
+            if (Win.GetFileType(file.handle) != 1) return error.NotRegularFile;
+        } else if (builtin.os.tag == .linux) {
+            var buffer: [path_capacity]u8 = undefined;
+            const name = try narrowPath(path, &buffer);
+            var flags: linux.O = .{ .ACCMODE = if (writing) .WRONLY else .RDONLY, .CREAT = writing, .EXCL = writing, .CLOEXEC = true, .NONBLOCK = true };
+            var rc = linux.openat(linux.AT.FDCWD, name.ptr, flags, 0o644);
+            const created = writing and linux.errno(rc) == .SUCCESS;
+            if (writing and linux.errno(rc) == .EXIST) {
+                flags.CREAT = false;
+                flags.EXCL = false;
+                rc = linux.openat(linux.AT.FDCWD, name.ptr, flags, 0);
+            }
+            switch (linux.errno(rc)) {
+                .SUCCESS => file.handle = @intCast(rc),
+                .NOENT, .NOTDIR => return error.FileNotFound,
+                .ACCES, .PERM, .ROFS => return error.FilePermissionDenied,
+                .ISDIR, .NXIO => return error.NotRegularFile,
+                else => return error.FileOpenFailed,
+            }
+            var status: linux.Statx = undefined;
+            const info = linux.statx(file.handle, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &status);
+            if (linux.errno(info) != .SUCCESS or !status.mask.TYPE) return error.FileOpenFailed;
+            if (!linux.S.ISREG(status.mode)) return error.NotRegularFile;
+            // PostgreSQL exports new files as 0644 even with a restrictive umask.
+            if (created and linux.errno(linux.fchmod(file.handle, 0o644)) != .SUCCESS) return error.FilePermissionDenied;
+        } else if (builtin.os.tag == .macos) {
+            var buffer: [path_capacity]u8 = undefined;
+            const name = try narrowPath(path, &buffer);
+            var flags: darwin.O = .{ .ACCMODE = if (writing) .WRONLY else .RDONLY, .CREAT = writing, .EXCL = writing, .CLOEXEC = true, .NONBLOCK = true };
+            var fd = darwin.open(name.ptr, flags, @as(c_uint, 0o644));
+            const created = writing and fd >= 0;
+            if (writing and fd < 0 and darwin.errno(fd) == .EXIST) {
+                flags.CREAT = false;
+                flags.EXCL = false;
+                fd = darwin.open(name.ptr, flags, @as(c_uint, 0));
+            }
+            if (fd < 0) return switch (darwin.errno(fd)) {
+                .NOENT, .NOTDIR => error.FileNotFound,
+                .ACCES, .PERM, .ROFS => error.FilePermissionDenied,
+                .ISDIR, .NXIO => error.NotRegularFile,
+                else => error.FileOpenFailed,
+            };
+            file.handle = fd;
+            var status: darwin.Stat = undefined;
+            if (darwin.fstat(fd, &status) != 0) return error.FileOpenFailed;
+            if (!darwin.S.ISREG(status.mode)) return error.NotRegularFile;
+            if (created and darwin.fchmod(fd, 0o644) != 0) return error.FilePermissionDenied;
+        } else return error.UnsupportedPlatform;
+        if (writing) try file.truncate(0);
+        return if (windows) @intFromPtr(file.handle) else @intCast(file.handle);
+    }
+
+    fn handle(token: usize) Handle {
+        return if (windows) @ptrFromInt(token) else @intCast(token);
+    }
+
+    pub fn read(token: usize, output: []u8) Error!usize {
+        if (output.len == 0) return 0;
+        const fd = handle(token);
+        if (windows) {
+            var count: u32 = 0;
+            if (Win.ReadFile(fd, output.ptr, @intCast(@min(output.len, 0x7fffffff)), &count, null) == 0) return error.FileReadFailed;
+            return count;
+        } else if (builtin.os.tag == .linux) {
+            while (true) {
+                const rc = linux.read(fd, output.ptr, output.len);
+                switch (linux.errno(rc)) {
+                    .SUCCESS => return rc,
+                    .INTR => continue,
+                    else => return error.FileReadFailed,
+                }
+            }
+        } else if (builtin.os.tag == .macos) {
+            while (true) {
+                const count = darwin.read(fd, output.ptr, output.len);
+                if (count >= 0) return @intCast(count);
+                if (darwin.errno(count) != .INTR) return error.FileReadFailed;
+            }
+        } else return error.UnsupportedPlatform;
+    }
+
+    pub fn write(token: usize, input: []const u8) Error!void {
+        var file: File = .{ .handle = handle(token) };
+        try file.writeAll(input);
+    }
+
+    pub fn close(token: usize) Error!void {
+        const fd = handle(token);
+        if (windows) {
+            if (Win.CloseHandle(fd) == 0) return error.FileCloseFailed;
+        } else if (builtin.os.tag == .linux) {
+            if (linux.errno(linux.close(fd)) != .SUCCESS) return error.FileCloseFailed;
+        } else if (builtin.os.tag == .macos) {
+            if (darwin.close(fd) != 0) return error.FileCloseFailed;
         } else return error.UnsupportedPlatform;
     }
 };

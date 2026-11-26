@@ -108,7 +108,13 @@ pub const SequenceCall = enum { nextval, currval, setval, lastval, identity, reg
 /// missing unless `called`, which raises 42P01).
 pub const LargeObjectData = enum { create, read };
 
+pub const LargeObjectFileHook = struct {
+    authorize: *const fn (ptr: *anyopaque) Error!void,
+    call: *const fn (ptr: *anyopaque, operation: @import("large_object_file.sig").Operation, oid: u32, path: []const u8) Error!u32,
+};
+
 pub const SequenceHook = struct {
+    large_object_file: ?LargeObjectFileHook = null,
     large_object_truncate: ?*const fn (ptr: *anyopaque, fd: i32, length: i64) Error!i32 = null,
     large_object: ?*const fn (ptr: *anyopaque, create: bool, oid: u32) Error!u32 = null,
     large_object_data: ?*const fn (ptr: *anyopaque, operation: LargeObjectData, oid: u32, offset: i64, input: []const u8, output: []u8, requested: ?usize) Error!usize = null,

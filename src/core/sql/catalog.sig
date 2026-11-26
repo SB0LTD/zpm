@@ -134,6 +134,7 @@ const BuiltinCallback = struct {
     strict: bool = true,
     language: u32 = @import("operator_catalog.sig").internal_language_oid,
     source: ?[]const u8 = null,
+    owner_execute_only: bool = false,
 };
 
 /// Catalog identities of the tokenizer used by the simple configuration.
@@ -234,6 +235,9 @@ pub const builtin_callbacks = [_]BuiltinCallback{
     .{ .oid = 3460, .name = "lo_put", .args = &.{ 26, 20, 17 }, .result = 2278, .volatility = 'v', .source = "be_lo_put" },
     .{ .oid = 957, .name = "lo_creat", .args = &.{23}, .result = 26, .volatility = 'v', .source = "be_lo_creat" },
     .{ .oid = 964, .name = "lo_unlink", .args = &.{26}, .result = 23, .volatility = 'v', .source = "be_lo_unlink" },
+    .{ .oid = 764, .name = "lo_import", .args = &.{25}, .result = 26, .volatility = 'v', .source = "be_lo_import", .owner_execute_only = true },
+    .{ .oid = 767, .name = "lo_import", .args = &.{ 25, 26 }, .result = 26, .volatility = 'v', .source = "be_lo_import_with_oid", .owner_execute_only = true },
+    .{ .oid = 765, .name = "lo_export", .args = &.{ 26, 25 }, .result = 23, .volatility = 'v', .source = "be_lo_export", .owner_execute_only = true },
     .{ .oid = 3457, .name = "lo_from_bytea", .args = &.{ 26, 17 }, .result = 26, .volatility = 'v', .source = "be_lo_from_bytea" },
     .{ .oid = 3458, .name = "lo_get", .args = &.{26}, .result = 17, .volatility = 'v', .source = "be_lo_get" },
     .{ .oid = 3459, .name = "lo_get", .args = &.{ 26, 20, 23 }, .result = 17, .volatility = 'v', .source = "be_lo_get_fragment" },

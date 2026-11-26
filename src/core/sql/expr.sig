@@ -1281,6 +1281,25 @@ pub fn Eval(comptime config: types.Config) type {
             }
         }
 
+        fn evalLargeObjectFile(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
+            const hooks = ctx.session.sequences orelse return error.UnsupportedStatement;
+            const transfer = hooks.large_object_file orelse return error.UnsupportedStatement;
+            try transfer.authorize(hooks.ptr);
+            const first = try eval(ctx, n.b);
+            if (first == .null_value) return .null_value;
+            const next = node(ctx, n.b).next;
+            if (n.func == .lo_import and next == ast.none)
+                return .{ .integer = try transfer.call(hooks.ptr, .import_file, 0, first.text.slice()) };
+            const second = try eval(ctx, next);
+            if (second == .null_value) return .null_value;
+            const oid = @import("std").math.cast(u32, if (n.func == .lo_import) second.integer else first.integer) orelse
+                return error.NumericValueOutOfRange;
+            return .{ .integer = if (n.func == .lo_import)
+                try transfer.call(hooks.ptr, .import_file, oid, first.text.slice())
+            else
+                try transfer.call(hooks.ptr, .export_file, oid, second.text.slice()) };
+        }
+
         fn evalLargeObject(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
             switch (n.func) {
                 .lo_truncate, .lo_truncate64 => {
@@ -1404,7 +1423,7 @@ pub fn Eval(comptime config: types.Config) type {
                     return .{ .text = text };
                 },
                 .nextval, .currval, .setval, .lastval, .identity_next => return sequenceValue(ctx, n),
-                .lo_truncate, .lo_truncate64, .lo_from_bytea, .lo_get, .lo_create, .lo_creat, .lo_unlink => unreachable,
+                .lo_truncate, .lo_truncate64, .lo_from_bytea, .lo_get, .lo_create, .lo_creat, .lo_unlink, .lo_import, .lo_export => unreachable,
                 .current_database, .current_schema, .current_schemas, .pg_encoding_to_char, .to_regtype, .to_regclass, .to_regproc, .format_type, .pg_get_expr, .regclass_in, .regtype_in, .regclass_out, .regtype_out,
                 .to_regnamespace, .regnamespace_in, .regnamespace_out,
                 .acldefault, .pg_get_userbyid, .pg_tablespace_location, .pg_table_is_visible, .pg_get_indexdef, .pg_get_constraintdef, .pg_get_triggerdef, .pg_get_viewdef, .pg_get_statisticsobjdef_columns, .pg_relation_is_publishable, .pg_get_partkeydef => return catalogValue(ctx, n),
@@ -1702,6 +1721,7 @@ pub fn Eval(comptime config: types.Config) type {
                     return Io.atZone(&value, zone.text.slice(), ctx.session);
                 },
                 .function => switch (n.func) {
+                    .lo_import, .lo_export => return evalLargeObjectFile(ctx, n),
                     .lo_truncate, .lo_truncate64, .lo_from_bytea, .lo_get, .lo_create, .lo_creat, .lo_unlink => return evalLargeObject(ctx, n),
                     else => return evalFunction(ctx, n),
                 },

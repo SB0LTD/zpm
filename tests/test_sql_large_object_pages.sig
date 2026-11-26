@@ -439,6 +439,89 @@ fn truncateRecovery() !void {
     try expect(result.rows[0].cells[0].integer == 0);
 }
 
+const FileFixture = struct {
+    var input: [3001]u8 = undefined;
+    var output: [3001]u8 = undefined;
+    var offset: usize = 0;
+    var written: usize = 0;
+    var opens: usize = 0;
+    var closes: usize = 0;
+    var fail_read: bool = false;
+    var fail_close: bool = false;
+
+    pub fn open(path: []const u8, writing: bool) !usize {
+        if (std.mem.eql(u8, path, "absent")) return error.FileNotFound;
+        if (std.mem.eql(u8, path, "denied")) return error.FilePermissionDenied;
+        opens += 1;
+        offset = 0;
+        written = 0;
+        return if (writing) 2 else 1;
+    }
+
+    pub fn read(_: usize, bytes: []u8) !usize {
+        if (fail_read) return error.FileReadFailed;
+        const count = @min(17, @min(bytes.len, input.len - offset));
+        @memcpy(bytes[0..count], input[offset..][0..count]);
+        offset += count;
+        return count;
+    }
+
+    pub fn write(_: usize, bytes: []const u8) !void {
+        if (bytes.len > output.len - written) return error.FileWriteFailed;
+        @memcpy(output[written..][0..bytes.len], bytes);
+        written += bytes.len;
+    }
+
+    pub fn close(_: usize) !void {
+        closes += 1;
+        if (fail_close) return error.FileCloseFailed;
+    }
+};
+
+var file_db: DB = .{};
+var file_replay: DB = .{};
+var file_arena: Arena = .{};
+var file_replay_arena: Arena = .{};
+
+fn fileTransfers() !void {
+    try file_arena.bind(&file_db);
+    try file_replay_arena.bind(&file_replay);
+    const Access = @import("sql").LargeObjectFiles;
+    file_db.setLargeObjectFiles(Access.native(FileFixture));
+    for (&FileFixture.input, 0..) |*byte, index| byte.* = @truncate(index * 17);
+    var wal: [8192]u8 = undefined;
+    const creation = try executeWAL(&file_db, "SELECT lo_import('source',56000)", &wal);
+    try file_replay.applyChangeRecord(creation, &replay_scratch);
+    var result: DB.Result = .{};
+    try file_replay.execute("SELECT lo_get(56000)", &result);
+    try expect(std.mem.eql(u8, result.rows[0].cells[0].bytea.slice(), &FileFixture.input));
+    try file_db.execute("SELECT lo_export(56000,'output')", &result);
+    try expect(result.rows[0].cells[0].integer == 1);
+    try expect(FileFixture.written == FileFixture.input.len);
+    try expect(std.mem.eql(u8, &FileFixture.output, &FileFixture.input));
+    try expect(FileFixture.opens == FileFixture.closes);
+
+    try file_db.execute("CREATE ROLE file_reader", &result);
+    try file_db.execute("SET ROLE file_reader", &result);
+    const previous = FileFixture.opens;
+    if (file_db.execute("SELECT lo_import('source')", &result)) |_| return error.UnprivilegedFileImport else |err| try expect(err == error.InsufficientPrivilege);
+    if (file_db.execute("SELECT lo_export(56000,'output')", &result)) |_| return error.UnprivilegedFileExport else |err| try expect(err == error.InsufficientPrivilege);
+    try expect(FileFixture.opens == previous);
+    try file_db.execute("RESET ROLE", &result);
+    try file_db.execute("SELECT lo_unlink(56000)", &result);
+    if (file_db.execute("SELECT lo_import('absent',56001)", &result)) |_| return error.MissingFileAccepted else |err| try expect(err == error.UndefinedFile);
+    if (file_db.execute("SELECT lo_import('denied',56001)", &result)) |_| return error.DeniedFileAccepted else |err| try expect(err == error.InsufficientPrivilege);
+    FileFixture.fail_read = true;
+    if (file_db.execute("SELECT lo_import('source',56001)", &result)) |_| return error.FailedReadCommitted else |err| try expect(err == error.FileAccessFailure);
+    FileFixture.fail_read = false;
+    FileFixture.fail_close = true;
+    if (file_db.execute("SELECT lo_import('source',56001)", &result)) |_| return error.FailedCloseCommitted else |err| try expect(err == error.FileAccessFailure);
+    FileFixture.fail_close = false;
+    try file_db.execute("SELECT COUNT(*) FROM pg_largeobject_metadata WHERE oid=56001", &result);
+    try expect(result.rows[0].cells[0].integer == 0);
+    try expect(FileFixture.opens == FileFixture.closes);
+}
+
 pub fn main(init: std.process.Init) !void {
     try snapshotAndSparseRead();
     try atomicCapacityFailure();
@@ -448,6 +531,7 @@ pub fn main(init: std.process.Init) !void {
     try sqlPageRecovery();
     try compactRoundTrip();
     try truncateRecovery();
+    try fileTransfers();
     var line: [160]u8 = undefined;
     const report = try std.fmt.bufPrint(&line, "{{\"suite\":\"sql-large-object-pages\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, report);

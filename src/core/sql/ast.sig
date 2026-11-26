@@ -62,7 +62,7 @@ pub const Op = enum { add, sub, mul, div, mod, concat, eq, ne, lt, le, gt, ge, n
 pub const DateAddPart = enum { days, weeks, months, quarters, years };
 
 /// Built-in functions bound by name.
-pub const Func = enum { none, grouping, window_call, to_char, now, transaction_timestamp, statement_timestamp, clock_timestamp, current_timestamp, current_date, jsonb_typeof, jsonb_array_length, nextval, currval, setval, lastval, identity_next, lo_create, lo_creat, lo_unlink, lo_from_bytea, lo_get, lo_truncate, lo_truncate64, current_database, current_schema, to_regtype, to_regclass, format_type, pg_get_expr, regclass_in, regtype_in, regclass_out, regtype_out, round, abs, ceil, floor, trunc, sign, sqrt, greatest, least,
+pub const Func = enum { none, grouping, window_call, to_char, now, transaction_timestamp, statement_timestamp, clock_timestamp, current_timestamp, current_date, jsonb_typeof, jsonb_array_length, nextval, currval, setval, lastval, identity_next, lo_create, lo_creat, lo_unlink, lo_from_bytea, lo_get, lo_truncate, lo_truncate64, lo_import, lo_export, current_database, current_schema, to_regtype, to_regclass, format_type, pg_get_expr, regclass_in, regtype_in, regclass_out, regtype_out, round, abs, ceil, floor, trunc, sign, sqrt, greatest, least,
     // String functions (B11, functions_string.sig).
     lower, upper, initcap, char_length, octet_length, bit_length, substring, btrim, ltrim, rtrim, strpos, replace, left, right, repeat, reverse, lpad, rpad, split_part, starts_with, ascii, chr, translate, concat, concat_ws, overlay, to_hex,
     // Mathematical functions (B11, numeric_math.sig).
@@ -229,7 +229,7 @@ pub fn strictFunction(func: Func) bool {
     return switch (func) {
         .quote_ident, .quote_literal => true,
         .to_char, .round, .abs, .ceil, .floor, .trunc, .sign, .sqrt, .jsonb_typeof, .jsonb_array_length,
-        .nextval, .currval, .setval, .lastval, .identity_next, .lo_create, .lo_creat, .lo_unlink, .lo_from_bytea, .lo_get, .lo_truncate, .lo_truncate64,
+        .nextval, .currval, .setval, .lastval, .identity_next, .lo_create, .lo_creat, .lo_unlink, .lo_from_bytea, .lo_get, .lo_truncate, .lo_truncate64, .lo_import, .lo_export,
         .now, .transaction_timestamp, .statement_timestamp, .clock_timestamp,
         .current_timestamp, .current_date, .current_database, .current_schema, .current_schemas, .pg_encoding_to_char,
         .to_regtype, .to_regclass, .to_regproc, .pg_get_expr, .acldefault, .pg_get_userbyid, .pg_tablespace_location,
