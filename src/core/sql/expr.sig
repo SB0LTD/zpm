@@ -1179,6 +1179,413 @@ pub fn Eval(comptime config: types.Config) type {
             return .{ .jsonb = text };
         }
 
+        // Keep the wide operator and function temporaries out of scalar reads.
+        fn evalBinary(ctx: *const Context, n: *const ast.Node, id: u16) Error!V.Cell {
+            switch (n.op) {
+                .eq, .ne, .lt, .le, .gt, .ge, .is_distinct, .is_not_distinct, .contains, .contained, .exists, .overlap, .over_left, .over_right, .adjacent, .within_eq, .contains_eq, .same, .regex_match, .text_match => return boolCell(try truth(ctx, id)),
+                .distance => {
+                    const left = try eval(ctx, n.a);
+                    const right = try eval(ctx, n.b);
+                    if (left == .null_value or right == .null_value) return .null_value;
+                    return .{ .float8 = geometric.distance(left.point, right.point) };
+                },
+                .concat => {
+                    const left = try eval(ctx, n.a);
+                    const right = try eval(ctx, n.b);
+                    if (types.isArray(n.ty)) {
+                        // array_cat / array_append / array_prepend are not strict.
+                        const left_array = types.isArray(node(ctx, n.a).ty);
+                        const right_array = types.isArray(node(ctx, n.b).ty);
+                        const kind: array_eval.ArrayEval(config, @This()).Concat = if (left_array and right_array) .cat else if (left_array) .append else .prepend;
+                        return array_eval.ArrayEval(config, @This()).concat(kind, &left, &right, n.ty);
+                    }
+                    if (left == .null_value or right == .null_value) return .null_value;
+                    if (n.ty == .jsonb) {
+                        var out: J.Buffer = .{};
+                        try J.concatControlled(left.jsonb.slice(), right.jsonb.slice(), &out, ctx.session.control);
+                        var value: V.Text = .{};
+                        @memcpy(value.bytes[0..out.len], out.bytes[0..out.len]);
+                        value.len = out.len;
+                        return .{ .jsonb = value };
+                    }
+                    if (n.ty == .bytea) {
+                        var bytes: V.Text = .{};
+                        bytes.len = try bytea_module.concat(left.bytea.slice(), right.bytea.slice(), &bytes.bytes);
+                        return .{ .bytea = bytes };
+                    }
+                    var text: V.Text = .{};
+                    // anytextcat/textanycat cast booleans to 'true'/'false' (measured on PG18).
+                    try appendCell(&text, &left, true, ctx.session);
+                    try appendCell(&text, &right, true, ctx.session);
+                    return .{ .text = text };
+                },
+                .bit_and, .bit_or, .bit_xor, .shift_left, .shift_right => {
+                    // Range << and >> are boolean predicates.
+                    if (n.ty == .boolean) return boolCell(try truth(ctx, id));
+                    const left = try eval(ctx, n.a);
+                    const right = try eval(ctx, n.b);
+                    if (left == .null_value or right == .null_value) return .null_value;
+                    return .{ .integer = bitwise(n.op, n.ty, left.integer, right.integer) };
+                },
+                .add, .sub, .mul, .div, .mod => {
+                    // Preserve left-to-right evaluation, including a right
+                    // expression when the left is NULL. Borrow stable row
+                    // columns instead of copying the full tagged payload.
+                    var left_value: V.Cell = undefined;
+                    var right_value: V.Cell = undefined;
+                    const left = try evalRef(ctx, n.a, &left_value);
+                    const right = try evalRef(ctx, n.b, &right_value);
+                    if (left.* == .null_value or right.* == .null_value) return .null_value;
+                    if (left.* == .integer and right.* == .integer and value_module.integral(n.ty))
+                        return .{ .integer = try arithmetic(n.op, n.ty, left.integer, right.integer) };
+                    if (n.ty == .interval and (n.op == .mul or n.op == .div)) {
+                        const span = if (left.* == .interval) left.interval else right.interval;
+                        const factor = if (left.* == .interval) right.float8 else left.float8;
+                        return .{ .interval = if (n.op == .mul) try stats.intervalMultiply(span, factor) else try stats.intervalDivide(span, factor) };
+                    }
+                    return Io.arithmetic(n.op, left, right, n.ty, ctx.session);
+                },
+                .arrow, .arrow_text => {
+                    const left = try eval(ctx, n.a);
+                    const right = try eval(ctx, n.b);
+                    if (left == .null_value or right == .null_value) return .null_value;
+                    if (node(ctx, n.a).ty == .json) {
+                        var out: J.Buffer = .{};
+                        const selector: J.JsonSelector = if (right == .integer) .{ .index = right.integer } else .{ .field = right.text.slice() };
+                        if (!try J.extractJsonControlled(left.text.slice(), selector, n.op == .arrow_text, &out, ctx.session.control)) return .null_value;
+                        var value: V.Text = .{};
+                        @memcpy(value.bytes[0..out.len], out.bytes[0..out.len]);
+                        value.len = out.len;
+                        return .{ .text = value };
+                    }
+                    const bytes = left.jsonb.slice();
+                    const at = if (right == .integer) J.element(bytes, right.integer) else J.field(bytes, right.text.slice());
+                    return jsonResult(bytes, at, n.op == .arrow_text);
+                },
+                .path, .path_text => {
+                    const left = try eval(ctx, n.a);
+                    const right = try eval(ctx, n.b);
+                    if (left == .null_value or right == .null_value) return .null_value;
+                    if (node(ctx, n.a).ty == .json) {
+                        var out: J.Buffer = .{};
+                        if (!try J.extractJsonControlled(left.text.slice(), .{ .path = right.text.slice() }, n.op == .path_text, &out, ctx.session.control)) return .null_value;
+                        var value: V.Text = .{};
+                        @memcpy(value.bytes[0..out.len], out.bytes[0..out.len]);
+                        value.len = out.len;
+                        return .{ .text = value };
+                    }
+                    const bytes = left.jsonb.slice();
+                    return jsonResult(bytes, try J.path(bytes, right.text.slice()), n.op == .path_text);
+                },
+                else => unreachable,
+            }
+        }
+
+        fn evalLargeObject(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
+            switch (n.func) {
+                .lo_truncate, .lo_truncate64 => {
+                    const descriptor = try eval(ctx, n.b);
+                    const length = try eval(ctx, node(ctx, n.b).next);
+                    if (descriptor == .null_value or length == .null_value) return .null_value;
+                    const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
+                    const call = hook.large_object_truncate orelse return error.UnsupportedStatement;
+                    return .{ .integer = try call(hook.ptr, @intCast(descriptor.integer), length.integer) };
+                },
+                .lo_from_bytea, .lo_get => {
+                    const a = try eval(ctx, n.b);
+                    if (a == .null_value) return .null_value;
+                    const oid = @import("std").math.cast(u32, a.integer) orelse return error.NumericValueOutOfRange;
+                    const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
+                    const call = hook.large_object_data orelse return error.UnsupportedStatement;
+                    const b = node(ctx, n.b).next;
+                    if (n.func == .lo_from_bytea) {
+                        const data = try eval(ctx, b);
+                        if (data == .null_value) return .null_value;
+                        return .{ .integer = @intCast(try call(hook.ptr, .create, oid, 0, data.bytea.slice(), &.{}, null)) };
+                    }
+                    var offset: i64 = 0;
+                    var requested: ?usize = null;
+                    if (b != ast.none) {
+                        const start = try eval(ctx, b);
+                        const length = try eval(ctx, node(ctx, b).next);
+                        if (start == .null_value or length == .null_value) return .null_value;
+                        offset = start.integer;
+                        if (length.integer < 0) return error.InvalidParameterValue;
+                        requested = @intCast(length.integer);
+                    }
+                    var result: V.Cell = .{ .bytea = .{} };
+                    result.bytea.len = try call(hook.ptr, .read, oid, offset, &.{}, &result.bytea.bytes, requested);
+                    return result;
+                },
+                .lo_create, .lo_creat, .lo_unlink => {
+                    const arg = try eval(ctx, n.b);
+                    if (arg == .null_value) return .null_value;
+                    const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
+                    const call = hook.large_object orelse return error.UnsupportedStatement;
+                    const oid = if (n.func == .lo_creat) 0 else @import("std").math.cast(u32, arg.integer) orelse return error.NumericValueOutOfRange;
+                    return .{ .integer = try call(hook.ptr, n.func != .lo_unlink, oid) };
+                },
+                else => unreachable,
+            }
+        }
+
+        fn evalFunction(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
+            switch (n.func) {
+                .mysql_date_add => return mysqlDateAdd(ctx, n),
+                .mysql_last_insert_id => return .{ .numeric = Io.Numerics.fromInt(@intCast(ctx.session.mysql_last_insert_id)) },
+                .grouping => {
+                    var value:i64=0;var item=n.b;
+                    while(item!=none):(item=node(ctx,item).next) {
+                        const shift:u6=@intCast(n.integer-1-node(ctx,item).integer);
+                        value=value*2+@as(i64,@intCast((ctx.grouping_mask>>shift)&1));
+                    }
+                    return .{.integer=value};
+                },
+                .window_call => unreachable,
+                .greatest, .least => {
+                    var best: V.Cell = .null_value;
+                    var item = n.b;
+                    while (item != none) : (item = node(ctx, item).next) {
+                        const candidate = try eval(ctx, item);
+                        if (candidate == .null_value) continue;
+                        if (best == .null_value) { best = candidate; continue; }
+                        const order = V.compare(&candidate, &best);
+                        if ((n.func == .greatest and order > 0) or (n.func == .least and order < 0)) best = candidate;
+                    }
+                    return best;
+                },
+                .to_char => {
+                    const argument=try eval(ctx,n.b);const format=try eval(ctx,node(ctx,n.b).next);
+                    if(argument==.null_value or format==.null_value or format.text.len==0) return .null_value;
+                    const us=if(argument==.timestamp) argument.timestamp else argument.timestamptz;
+                    if(!temporal.finiteTimestamp(us)) return .null_value;
+                    const local=if(argument==.timestamptz) temporal.toLocal(&ctx.session.zone,us) else us;
+                    var text:V.Text=.{};
+                    text.len=try datetime_format.format(local,format.text.slice(),&text.bytes);
+                    return .{.text=text};
+                },
+                .abs, .ceil, .floor, .trunc, .sign, .sqrt => {
+                    if(n.planned_null) return .null_value;
+                    const argument=try eval(ctx,n.b);
+                    const scale_id=node(ctx,n.b).next;
+                    const scale:V.Cell=if(scale_id==none) .{.integer=0} else try eval(ctx,scale_id);
+                    if(argument==.null_value or scale==.null_value) return .null_value;
+                    if(n.ty==.numeric) return .{.numeric=switch(n.func){
+                        .abs=>Io.Numerics.absolute(&argument.numeric),.sign=>Io.Numerics.signum(&argument.numeric),
+                        .sqrt=>try Io.Numerics.sqrt(&argument.numeric),
+                        .ceil,.floor=>try Io.Numerics.directedInteger(&argument.numeric,n.func==.ceil),
+                        .trunc=>try Io.Numerics.trunc(&argument.numeric,@intCast(scale.integer)),else=>unreachable}};
+                    if(n.ty==.float4) return .{.float4=@abs(argument.float4)};
+                    if(n.ty==.float8) return .{.float8=switch(n.func){
+                        .sqrt=>blk:{if(argument.float8<0) return error.InvalidArgumentForPowerFunction;break :blk @sqrt(argument.float8);},
+                        .abs=>@abs(argument.float8),.ceil=>@ceil(argument.float8),.floor=>@floor(argument.float8),.trunc=>@trunc(argument.float8),
+                        .sign=>if(argument.float8>0) @as(f64,1) else if(argument.float8<0) -1 else 0,else=>unreachable}};
+                    if(argument.integer==(-0x7fffffffffffffff-1)) return error.IntegerOverflow;
+                    return .{.integer=try checkRange(if(argument.integer<0) -argument.integer else argument.integer,n.ty)};
+                },
+                .round => {
+                    const argument = try eval(ctx, n.b);
+                    const scale_id = node(ctx, n.b).next;
+                    const scale: V.Cell = if (scale_id == none) .{ .integer = 0 } else try eval(ctx, scale_id);
+                    if (argument == .null_value or scale == .null_value) return .null_value;
+                    if (n.ty == .float8) return .{ .float8 = float_text.rint(argument.float8) };
+                    return .{ .numeric = try Io.Numerics.round(&argument.numeric, @intCast(scale.integer)) };
+                },
+                .now, .transaction_timestamp, .statement_timestamp, .clock_timestamp, .current_timestamp, .current_date => return clockValue(ctx, n.func),
+                .jsonb_typeof, .jsonb_array_length => {
+                    const argument = try eval(ctx, n.b);
+                    if (argument == .null_value) return .null_value;
+                    const bytes = argument.jsonb.slice();
+                    if (n.func == .jsonb_array_length) return .{ .integer = try J.arrayLength(bytes) };
+                    var text: V.Text = .{};
+                    const name = J.typeName(bytes);
+                    @memcpy(text.bytes[0..name.len], name);
+                    text.len = name.len;
+                    return .{ .text = text };
+                },
+                .nextval, .currval, .setval, .lastval, .identity_next => return sequenceValue(ctx, n),
+                .lo_truncate, .lo_truncate64, .lo_from_bytea, .lo_get, .lo_create, .lo_creat, .lo_unlink => unreachable,
+                .current_database, .current_schema, .current_schemas, .pg_encoding_to_char, .to_regtype, .to_regclass, .to_regproc, .format_type, .pg_get_expr, .regclass_in, .regtype_in, .regclass_out, .regtype_out,
+                .to_regnamespace, .regnamespace_in, .regnamespace_out,
+                .acldefault, .pg_get_userbyid, .pg_tablespace_location, .pg_table_is_visible, .pg_get_indexdef, .pg_get_constraintdef, .pg_get_triggerdef, .pg_get_viewdef, .pg_get_statisticsobjdef_columns, .pg_relation_is_publishable, .pg_get_partkeydef => return catalogValue(ctx, n),
+                .pg_partition_ancestors, .array_subquery => return error.UnsupportedStatement,
+                .obj_description, .col_description, .shobj_description, .current_user, .session_user => return objectText(ctx, n),
+                .to_tsvector, .to_tsquery, .plainto_tsquery, .phraseto_tsquery => {
+                    const config_cell = try eval(ctx, n.b);
+                    const input = try eval(ctx, ctx.pool.nodes[n.b].next);
+                    if (config_cell == .null_value or input == .null_value) return .null_value;
+                    const TS = Io.TextSearch;
+                    _ = try TS.configByName(config_cell.text.slice());
+                    var out: TS.Out = .{};
+                    const text = input.text.slice();
+                    switch (n.func) {
+                        .to_tsvector => {
+                            try TS.toVector(text, &out, ctx.session.control);
+                            return .{ .tsvector = (try textCell(out.slice())).text };
+                        },
+                        .to_tsquery => try TS.toQuery(text, .to, &out),
+                        .plainto_tsquery => try TS.toQuery(text, .plain, &out),
+                        else => try TS.toQuery(text, .phrase, &out),
+                    }
+                    return .{ .tsquery = (try textCell(out.slice())).text };
+                },
+                .regexp_like => {
+                    const subject = try eval(ctx, n.b);
+                    const pattern = try eval(ctx, ctx.pool.nodes[n.b].next);
+                    const options_id = ctx.pool.nodes[ctx.pool.nodes[n.b].next].next;
+                    const options = if (options_id != none) try eval(ctx, options_id) else V.Cell{ .text = .{} };
+                    if (subject == .null_value or pattern == .null_value or options == .null_value) return .null_value;
+                    const parsed = try regex.parseOptions(options.text.slice(), .{});
+                    if (parsed.global) return error.InvalidParameterValue;
+                    return .{ .boolean = try regexMatch(ctx, subject.text.slice(), pattern.text.slice(), parsed.flags) };
+                },
+                .similar_to_escape => {
+                    const pattern = try eval(ctx, n.b);
+                    const escape_id = ctx.pool.nodes[n.b].next;
+                    const escape = if (escape_id != none) try eval(ctx, escape_id) else V.Cell.null_value;
+                    if (pattern == .null_value or (escape_id != none and escape == .null_value)) return .null_value;
+                    var converted: [3 * config.text_bytes + 23]u8 = undefined;
+                    return textCell(try regex.similarToRegex(pattern.text.slice(), if (escape_id == none) null else escape.text.slice(), &converted));
+                },
+                .pg_typeof => {
+                    // The argument is evaluated (its errors surface); its
+                    // bound type is the result.
+                    _ = try eval(ctx, n.b);
+                    return .{ .regtype = @intCast(n.integer) };
+                },
+                .pg_get_serial_sequence => {
+                    const table = try eval(ctx, n.b);
+                    const column = try eval(ctx, ctx.pool.nodes[n.b].next);
+                    if (table == .null_value or column == .null_value) return .null_value;
+                    const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
+                    const lookup = hook.serial_sequence orelse return error.UnsupportedStatement;
+                    var buffer: [value_module.serial_name_bytes]u8 = undefined;
+                    const length = (try lookup(hook.ptr, table.text.slice(), column.text.slice(), &buffer)) orelse return .null_value;
+                    return textCell(buffer[0..length]);
+                },
+                .lower, .upper, .initcap, .char_length, .octet_length, .bit_length, .substring, .btrim, .ltrim, .rtrim, .strpos, .replace,
+                .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .concat, .concat_ws, .quote_ident, .quote_literal,
+                .overlay, .to_hex => return builtins.Builtins(config, @This()).call(ctx, n),
+                .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .sind, .cosd, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => return builtins.Builtins(config, @This()).call(ctx, n),
+                .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .date_bin, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => return builtins.Builtins(config, @This()).call(ctx, n),
+                .tds_dateadd => {
+                    const number = try eval(ctx, n.b);
+                    const date = try eval(ctx, node(ctx, n.b).next);
+                    if (number == .null_value or date == .null_value) return .null_value;
+                    const amount = number.integer;
+                    if (amount < -2147483648 or amount > 2147483647) return error.IntegerOverflow;
+                    const first = temporal.dateOf(1, 1, 1);
+                    const last = temporal.dateOf(9999, 12, 31);
+                    if (date.date < first or date.date > last) return error.DatetimeFieldOverflow;
+                    const part: ast.DateAddPart = @enumFromInt(n.integer);
+                    const result = switch (part) {
+                        .days, .weeks => try temporal.datePlusDays(date.date, amount * (if (part == .weeks) @as(i64, 7) else 1)),
+                        .months, .quarters, .years => blk: {
+                            const months = amount * switch (part) { .months => @as(i64, 1), .quarters => 3, .years => 12, else => unreachable };
+                            if (months <= -120000 or months >= 120000) return error.DatetimeFieldOverflow;
+                            const timestamp = try temporal.dateToTimestamp(date.date);
+                            break :blk temporal.timestampToDate(try temporal.timestampPlus(timestamp, .{ .months = @intCast(months) }));
+                        },
+                    };
+                    if (result < first or result > last) return error.DatetimeFieldOverflow;
+                    return .{ .date = result };
+                },
+                .tds_isnull => {
+                    const value = try eval(ctx, n.b);
+                    return if (value == .null_value) eval(ctx, node(ctx, n.b).next) else value;
+                },
+                .overlaps, .overlaps_tz => return builtins.Builtins(config, @This()).call(ctx, n),
+                .to_date, .to_number, .to_timestamp => return builtins.Builtins(config, @This()).call(ctx, n),
+                .normalize, .is_normalized => return builtins.Builtins(config, @This()).call(ctx, n),
+                .array_constructor, .array_subscript, .array_any, .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper,
+                .array_append, .array_prepend, .array_cat, .array_to_string, .array_remove => return array_eval.ArrayEval(config, @This()).call(ctx, n),
+                .jsonb_set, .jsonb_set_lax, .jsonb_insert, .jsonb_delete_path, .jsonb_strip_nulls, .jsonb_pretty, .to_json, .to_jsonb, .jsonb_path_exists, .jsonb_path_match, .jsonb_path_query_array, .jsonb_path_query_first, .jsonb_exists_any, .jsonb_exists_all, .jsonb_minus_op, .jsonb_delete_path_op, .jsonb_exists_any_op, .jsonb_exists_all_op, .jsonb_path_exists_op, .jsonb_path_match_op => return json_eval.JsonEval(config, @This()).call(ctx, n),
+                .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => return range_eval.RangeEval(config, @This()).call(ctx, n),
+                .current_setting, .set_config, .pg_try_advisory_lock, .pg_try_advisory_lock_shared, .pg_try_advisory_xact_lock, .pg_try_advisory_xact_lock_shared, .pg_advisory_unlock, .pg_advisory_unlock_shared, .pg_backend_pid, .pg_is_in_recovery => return sessionFunction(ctx, n),
+                .xmlparse, .xmlserialize, .xml_is_well_formed, .xml_is_well_formed_document, .xml_is_well_formed_content => {
+                    const argument = try eval(ctx, n.b);
+                    if (argument == .null_value) return .null_value;
+                    const document = n.integer == 1;
+                    switch (n.func) {
+                        .xmlparse => {
+                            const bytes = argument.text.slice();
+                            if (document and !xml_module.validDocument(bytes)) return error.InvalidXmlDocument;
+                            if (!document and !xml_module.validContent(bytes)) return error.InvalidXmlContent;
+                            return .{ .xml = argument.text };
+                        },
+                        .xmlserialize => {
+                            if (document and !xml_module.validDocument(argument.xml.slice())) return error.NotAnXmlDocument;
+                            return cast(.{ .text = argument.xml }, .text, n.cast_type, n.typmod, ctx.session);
+                        },
+                        .xml_is_well_formed, .xml_is_well_formed_content => return .{ .boolean = xml_module.validContent(argument.text.slice()) },
+                        else => return .{ .boolean = xml_module.validDocument(argument.text.slice()) },
+                    }
+                },
+                .point_constructor, .box_constructor, .area, .center, .width, .height => {
+                    if (n.planned_null) return .null_value;
+                    const first = try eval(ctx, n.b);
+                    const second_id = node(ctx, n.b).next;
+                    const second: V.Cell = if (second_id == none) .null_value else try eval(ctx, second_id);
+                    if (first == .null_value or (second_id != none and second == .null_value)) return .null_value;
+                    return switch (n.func) {
+                        .point_constructor => .{ .point = .{ .x = first.float8, .y = second.float8 } },
+                        .box_constructor => .{ .box = geometric.fromCorners(first.point, second.point) },
+                        .area => .{ .float8 = geometric.area(first.box) },
+                        .width => .{ .float8 = geometric.width(first.box) },
+                        .height => .{ .float8 = geometric.height(first.box) },
+                        else => .{ .point = geometric.center(first.box) },
+                    };
+                },
+                .inet_host, .masklen, .inet_family, .inet_network, .broadcast, .netmask => {
+                    const argument = try eval(ctx, n.b);
+                    if (argument == .null_value) return .null_value;
+                    const address = &argument.inet;
+                    return switch (n.func) {
+                        .inet_host => blk: {
+                            var full = address.*;
+                            full.bits = full.maxBits();
+                            var buffer: [64]u8 = undefined;
+                            const shown = network.format(&full, false, &buffer);
+                            if (shown.len > config.text_bytes) return error.TextCapacity;
+                            var text: V.Text = .{ .len = shown.len };
+                            @memcpy(text.bytes[0..shown.len], shown);
+                            break :blk V.Cell{ .text = text };
+                        },
+                        .masklen => .{ .integer = address.bits },
+                        .inet_family => .{ .integer = address.family },
+                        .inet_network => .{ .inet = network.network(address) },
+                        .broadcast => .{ .inet = network.broadcast(address) },
+                        else => .{ .inet = network.netmask(address) },
+                    };
+                },
+                .aggregate_pair => {
+                    // Both inputs are evaluated; NULL skips the row (strict).
+                    const y = try eval(ctx, n.b);
+                    const x = try eval(ctx, node(ctx, n.b).next);
+                    if (y == .null_value or x == .null_value) return .null_value;
+                    if (comptime config.text_bytes < 16) {
+                        return error.WorkspaceCapacity;
+                    } else {
+                        var pair: V.Text = .{ .len = 16 };
+                        // Little-endian bytes through u64: the native SB0
+                        // compiler rejects array/float @bitCast.
+                        const y_bits: u64 = @bitCast(y.float8);
+                        const x_bits: u64 = @bitCast(x.float8);
+                        for (0..8) |i| {
+                            pair.bytes[i] = @truncate(y_bits >> @intCast(i * 8));
+                            pair.bytes[8 + i] = @truncate(x_bits >> @intCast(i * 8));
+                        }
+                        return .{ .text = pair };
+                    }
+                },
+                .routine => return routineCall(ctx, n),
+                .routine_param => return routineValue(ctx, n),
+                // Exec.collectAggregate / jsonTableRows read their members (B11).
+                .aggregate_input, .json_table, .json_table_passing, .json_table_column => return error.UnsupportedStatement,
+                .none, .mysql_ifnull => unreachable,
+            }
+        }
+
         pub fn eval(ctx: *const Context, id: u16) Error!V.Cell {
             try ctx.session.checkpoint();
             const n = node(ctx, id);
@@ -1218,104 +1625,7 @@ pub fn Eval(comptime config: types.Config) type {
                     if (n.op == .bit_not) return .{ .integer = try checkRange(~value.integer, n.ty) };
                     return Io.negate(&value, n.ty);
                 },
-                .binary => switch (n.op) {
-                    .eq, .ne, .lt, .le, .gt, .ge, .is_distinct, .is_not_distinct, .contains, .contained, .exists, .overlap, .over_left, .over_right, .adjacent, .within_eq, .contains_eq, .same, .regex_match, .text_match => return boolCell(try truth(ctx, id)),
-                    .distance => {
-                        const left = try eval(ctx, n.a);
-                        const right = try eval(ctx, n.b);
-                        if (left == .null_value or right == .null_value) return .null_value;
-                        return .{ .float8 = geometric.distance(left.point, right.point) };
-                    },
-                    .concat => {
-                        const left = try eval(ctx, n.a);
-                        const right = try eval(ctx, n.b);
-                        if (types.isArray(n.ty)) {
-                            // array_cat / array_append / array_prepend are not strict.
-                            const left_array = types.isArray(node(ctx, n.a).ty);
-                            const right_array = types.isArray(node(ctx, n.b).ty);
-                            const kind: array_eval.ArrayEval(config, @This()).Concat = if (left_array and right_array) .cat else if (left_array) .append else .prepend;
-                            return array_eval.ArrayEval(config, @This()).concat(kind, &left, &right, n.ty);
-                        }
-                        if (left == .null_value or right == .null_value) return .null_value;
-                        if (n.ty == .jsonb) {
-                            var out: J.Buffer = .{};
-                            try J.concatControlled(left.jsonb.slice(), right.jsonb.slice(), &out, ctx.session.control);
-                            var value: V.Text = .{};
-                            @memcpy(value.bytes[0..out.len], out.bytes[0..out.len]);
-                            value.len = out.len;
-                            return .{ .jsonb = value };
-                        }
-                        if (n.ty == .bytea) {
-                            var bytes: V.Text = .{};
-                            bytes.len = try bytea_module.concat(left.bytea.slice(), right.bytea.slice(), &bytes.bytes);
-                            return .{ .bytea = bytes };
-                        }
-                        var text: V.Text = .{};
-                        // anytextcat/textanycat cast booleans to 'true'/'false' (measured on PG18).
-                        try appendCell(&text, &left, true, ctx.session);
-                        try appendCell(&text, &right, true, ctx.session);
-                        return .{ .text = text };
-                    },
-                    .bit_and, .bit_or, .bit_xor, .shift_left, .shift_right => {
-                        // Range << and >> are boolean predicates.
-                        if (n.ty == .boolean) return boolCell(try truth(ctx, id));
-                        const left = try eval(ctx, n.a);
-                        const right = try eval(ctx, n.b);
-                        if (left == .null_value or right == .null_value) return .null_value;
-                        return .{ .integer = bitwise(n.op, n.ty, left.integer, right.integer) };
-                    },
-                    .add, .sub, .mul, .div, .mod => {
-                        // Preserve left-to-right evaluation, including a right
-                        // expression when the left is NULL. Borrow stable row
-                        // columns instead of copying the full tagged payload.
-                        var left_value: V.Cell = undefined;
-                        var right_value: V.Cell = undefined;
-                        const left = try evalRef(ctx, n.a, &left_value);
-                        const right = try evalRef(ctx, n.b, &right_value);
-                        if (left.* == .null_value or right.* == .null_value) return .null_value;
-                        if (left.* == .integer and right.* == .integer and value_module.integral(n.ty))
-                            return .{ .integer = try arithmetic(n.op, n.ty, left.integer, right.integer) };
-                        if (n.ty == .interval and (n.op == .mul or n.op == .div)) {
-                            const span = if (left.* == .interval) left.interval else right.interval;
-                            const factor = if (left.* == .interval) right.float8 else left.float8;
-                            return .{ .interval = if (n.op == .mul) try stats.intervalMultiply(span, factor) else try stats.intervalDivide(span, factor) };
-                        }
-                        return Io.arithmetic(n.op, left, right, n.ty, ctx.session);
-                    },
-                    .arrow, .arrow_text => {
-                        const left = try eval(ctx, n.a);
-                        const right = try eval(ctx, n.b);
-                        if (left == .null_value or right == .null_value) return .null_value;
-                        if (node(ctx, n.a).ty == .json) {
-                            var out: J.Buffer = .{};
-                            const selector: J.JsonSelector = if (right == .integer) .{ .index = right.integer } else .{ .field = right.text.slice() };
-                            if (!try J.extractJsonControlled(left.text.slice(), selector, n.op == .arrow_text, &out, ctx.session.control)) return .null_value;
-                            var value: V.Text = .{};
-                            @memcpy(value.bytes[0..out.len], out.bytes[0..out.len]);
-                            value.len = out.len;
-                            return .{ .text = value };
-                        }
-                        const bytes = left.jsonb.slice();
-                        const at = if (right == .integer) J.element(bytes, right.integer) else J.field(bytes, right.text.slice());
-                        return jsonResult(bytes, at, n.op == .arrow_text);
-                    },
-                    .path, .path_text => {
-                        const left = try eval(ctx, n.a);
-                        const right = try eval(ctx, n.b);
-                        if (left == .null_value or right == .null_value) return .null_value;
-                        if (node(ctx, n.a).ty == .json) {
-                            var out: J.Buffer = .{};
-                            if (!try J.extractJsonControlled(left.text.slice(), .{ .path = right.text.slice() }, n.op == .path_text, &out, ctx.session.control)) return .null_value;
-                            var value: V.Text = .{};
-                            @memcpy(value.bytes[0..out.len], out.bytes[0..out.len]);
-                            value.len = out.len;
-                            return .{ .text = value };
-                        }
-                        const bytes = left.jsonb.slice();
-                        return jsonResult(bytes, try J.path(bytes, right.text.slice()), n.op == .path_text);
-                    },
-                    else => unreachable,
-                },
+                .binary => return evalBinary(ctx, n, id),
                 .case_expr => {
                     var operand: V.Cell = .null_value;
                     if (n.a != none) operand = try eval(ctx, n.a);
@@ -1392,299 +1702,8 @@ pub fn Eval(comptime config: types.Config) type {
                     return Io.atZone(&value, zone.text.slice(), ctx.session);
                 },
                 .function => switch (n.func) {
-                    .mysql_date_add => return mysqlDateAdd(ctx, n),
-                    .mysql_last_insert_id => return .{ .numeric = Io.Numerics.fromInt(@intCast(ctx.session.mysql_last_insert_id)) },
-                    .grouping => {
-                        var value:i64=0;var item=n.b;
-                        while(item!=none):(item=node(ctx,item).next) {
-                            const shift:u6=@intCast(n.integer-1-node(ctx,item).integer);
-                            value=value*2+@as(i64,@intCast((ctx.grouping_mask>>shift)&1));
-                        }
-                        return .{.integer=value};
-                    },
-                    .window_call => unreachable,
-                    .greatest, .least => {
-                        var best: V.Cell = .null_value;
-                        var item = n.b;
-                        while (item != none) : (item = node(ctx, item).next) {
-                            const candidate = try eval(ctx, item);
-                            if (candidate == .null_value) continue;
-                            if (best == .null_value) { best = candidate; continue; }
-                            const order = V.compare(&candidate, &best);
-                            if ((n.func == .greatest and order > 0) or (n.func == .least and order < 0)) best = candidate;
-                        }
-                        return best;
-                    },
-                    .to_char => {
-                        const argument=try eval(ctx,n.b);const format=try eval(ctx,node(ctx,n.b).next);
-                        if(argument==.null_value or format==.null_value or format.text.len==0) return .null_value;
-                        const us=if(argument==.timestamp) argument.timestamp else argument.timestamptz;
-                        if(!temporal.finiteTimestamp(us)) return .null_value;
-                        const local=if(argument==.timestamptz) temporal.toLocal(&ctx.session.zone,us) else us;
-                        var text:V.Text=.{};
-                        text.len=try datetime_format.format(local,format.text.slice(),&text.bytes);
-                        return .{.text=text};
-                    },
-                    .abs, .ceil, .floor, .trunc, .sign, .sqrt => {
-                        if(n.planned_null) return .null_value;
-                        const argument=try eval(ctx,n.b);
-                        const scale_id=node(ctx,n.b).next;
-                        const scale:V.Cell=if(scale_id==none) .{.integer=0} else try eval(ctx,scale_id);
-                        if(argument==.null_value or scale==.null_value) return .null_value;
-                        if(n.ty==.numeric) return .{.numeric=switch(n.func){
-                            .abs=>Io.Numerics.absolute(&argument.numeric),.sign=>Io.Numerics.signum(&argument.numeric),
-                            .sqrt=>try Io.Numerics.sqrt(&argument.numeric),
-                            .ceil,.floor=>try Io.Numerics.directedInteger(&argument.numeric,n.func==.ceil),
-                            .trunc=>try Io.Numerics.trunc(&argument.numeric,@intCast(scale.integer)),else=>unreachable}};
-                        if(n.ty==.float4) return .{.float4=@abs(argument.float4)};
-                        if(n.ty==.float8) return .{.float8=switch(n.func){
-                            .sqrt=>blk:{if(argument.float8<0) return error.InvalidArgumentForPowerFunction;break :blk @sqrt(argument.float8);},
-                            .abs=>@abs(argument.float8),.ceil=>@ceil(argument.float8),.floor=>@floor(argument.float8),.trunc=>@trunc(argument.float8),
-                            .sign=>if(argument.float8>0) @as(f64,1) else if(argument.float8<0) -1 else 0,else=>unreachable}};
-                        if(argument.integer==(-0x7fffffffffffffff-1)) return error.IntegerOverflow;
-                        return .{.integer=try checkRange(if(argument.integer<0) -argument.integer else argument.integer,n.ty)};
-                    },
-                    .round => {
-                        const argument = try eval(ctx, n.b);
-                        const scale_id = node(ctx, n.b).next;
-                        const scale: V.Cell = if (scale_id == none) .{ .integer = 0 } else try eval(ctx, scale_id);
-                        if (argument == .null_value or scale == .null_value) return .null_value;
-                        if (n.ty == .float8) return .{ .float8 = float_text.rint(argument.float8) };
-                        return .{ .numeric = try Io.Numerics.round(&argument.numeric, @intCast(scale.integer)) };
-                    },
-                    .now, .transaction_timestamp, .statement_timestamp, .clock_timestamp, .current_timestamp, .current_date => return clockValue(ctx, n.func),
-                    .jsonb_typeof, .jsonb_array_length => {
-                        const argument = try eval(ctx, n.b);
-                        if (argument == .null_value) return .null_value;
-                        const bytes = argument.jsonb.slice();
-                        if (n.func == .jsonb_array_length) return .{ .integer = try J.arrayLength(bytes) };
-                        var text: V.Text = .{};
-                        const name = J.typeName(bytes);
-                        @memcpy(text.bytes[0..name.len], name);
-                        text.len = name.len;
-                        return .{ .text = text };
-                    },
-                    .nextval, .currval, .setval, .lastval, .identity_next => return sequenceValue(ctx, n),
-                    .lo_truncate, .lo_truncate64 => {
-                        const descriptor = try eval(ctx, n.b);
-                        const length = try eval(ctx, node(ctx, n.b).next);
-                        if (descriptor == .null_value or length == .null_value) return .null_value;
-                        const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
-                        const call = hook.large_object_truncate orelse return error.UnsupportedStatement;
-                        return .{ .integer = try call(hook.ptr, @intCast(descriptor.integer), length.integer) };
-                    },
-                    .lo_from_bytea, .lo_get => {
-                        const a = try eval(ctx, n.b);
-                        if (a == .null_value) return .null_value;
-                        const oid = @import("std").math.cast(u32, a.integer) orelse return error.NumericValueOutOfRange;
-                        const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
-                        const call = hook.large_object_data orelse return error.UnsupportedStatement;
-                        const b = node(ctx, n.b).next;
-                        if (n.func == .lo_from_bytea) {
-                            const data = try eval(ctx, b);
-                            if (data == .null_value) return .null_value;
-                            return .{ .integer = @intCast(try call(hook.ptr, .create, oid, 0, data.bytea.slice(), &.{}, null)) };
-                        }
-                        var offset: i64 = 0;
-                        var requested: ?usize = null;
-                        if (b != ast.none) {
-                            const start = try eval(ctx, b);
-                            const length = try eval(ctx, node(ctx, b).next);
-                            if (start == .null_value or length == .null_value) return .null_value;
-                            offset = start.integer;
-                            if (length.integer < 0) return error.InvalidParameterValue;
-                            requested = @intCast(length.integer);
-                        }
-                        var result: V.Cell = .{ .bytea = .{} };
-                        result.bytea.len = try call(hook.ptr, .read, oid, offset, &.{}, &result.bytea.bytes, requested);
-                        return result;
-                    },
-                    .lo_create, .lo_creat, .lo_unlink => {
-                        const arg = try eval(ctx, n.b);
-                        if (arg == .null_value) return .null_value;
-                        const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
-                        const call = hook.large_object orelse return error.UnsupportedStatement;
-                        const oid = if (n.func == .lo_creat) 0 else @import("std").math.cast(u32, arg.integer) orelse return error.NumericValueOutOfRange;
-                        return .{ .integer = try call(hook.ptr, n.func != .lo_unlink, oid) };
-                    },
-                    .current_database, .current_schema, .current_schemas, .pg_encoding_to_char, .to_regtype, .to_regclass, .to_regproc, .format_type, .pg_get_expr, .regclass_in, .regtype_in, .regclass_out, .regtype_out,
-                    .to_regnamespace, .regnamespace_in, .regnamespace_out,
-                    .acldefault, .pg_get_userbyid, .pg_tablespace_location, .pg_table_is_visible, .pg_get_indexdef, .pg_get_constraintdef, .pg_get_triggerdef, .pg_get_viewdef, .pg_get_statisticsobjdef_columns, .pg_relation_is_publishable, .pg_get_partkeydef => return catalogValue(ctx, n),
-                    .pg_partition_ancestors, .array_subquery => return error.UnsupportedStatement,
-                    .obj_description, .col_description, .shobj_description, .current_user, .session_user => return objectText(ctx, n),
-                    .to_tsvector, .to_tsquery, .plainto_tsquery, .phraseto_tsquery => {
-                        const config_cell = try eval(ctx, n.b);
-                        const input = try eval(ctx, ctx.pool.nodes[n.b].next);
-                        if (config_cell == .null_value or input == .null_value) return .null_value;
-                        const TS = Io.TextSearch;
-                        _ = try TS.configByName(config_cell.text.slice());
-                        var out: TS.Out = .{};
-                        const text = input.text.slice();
-                        switch (n.func) {
-                            .to_tsvector => {
-                                try TS.toVector(text, &out, ctx.session.control);
-                                return .{ .tsvector = (try textCell(out.slice())).text };
-                            },
-                            .to_tsquery => try TS.toQuery(text, .to, &out),
-                            .plainto_tsquery => try TS.toQuery(text, .plain, &out),
-                            else => try TS.toQuery(text, .phrase, &out),
-                        }
-                        return .{ .tsquery = (try textCell(out.slice())).text };
-                    },
-                    .regexp_like => {
-                        const subject = try eval(ctx, n.b);
-                        const pattern = try eval(ctx, ctx.pool.nodes[n.b].next);
-                        const options_id = ctx.pool.nodes[ctx.pool.nodes[n.b].next].next;
-                        const options = if (options_id != none) try eval(ctx, options_id) else V.Cell{ .text = .{} };
-                        if (subject == .null_value or pattern == .null_value or options == .null_value) return .null_value;
-                        const parsed = try regex.parseOptions(options.text.slice(), .{});
-                        if (parsed.global) return error.InvalidParameterValue;
-                        return .{ .boolean = try regexMatch(ctx, subject.text.slice(), pattern.text.slice(), parsed.flags) };
-                    },
-                    .similar_to_escape => {
-                        const pattern = try eval(ctx, n.b);
-                        const escape_id = ctx.pool.nodes[n.b].next;
-                        const escape = if (escape_id != none) try eval(ctx, escape_id) else V.Cell.null_value;
-                        if (pattern == .null_value or (escape_id != none and escape == .null_value)) return .null_value;
-                        var converted: [3 * config.text_bytes + 23]u8 = undefined;
-                        return textCell(try regex.similarToRegex(pattern.text.slice(), if (escape_id == none) null else escape.text.slice(), &converted));
-                    },
-                    .pg_typeof => {
-                        // The argument is evaluated (its errors surface); its
-                        // bound type is the result.
-                        _ = try eval(ctx, n.b);
-                        return .{ .regtype = @intCast(n.integer) };
-                    },
-                    .pg_get_serial_sequence => {
-                        const table = try eval(ctx, n.b);
-                        const column = try eval(ctx, ctx.pool.nodes[n.b].next);
-                        if (table == .null_value or column == .null_value) return .null_value;
-                        const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
-                        const lookup = hook.serial_sequence orelse return error.UnsupportedStatement;
-                        var buffer: [value_module.serial_name_bytes]u8 = undefined;
-                        const length = (try lookup(hook.ptr, table.text.slice(), column.text.slice(), &buffer)) orelse return .null_value;
-                        return textCell(buffer[0..length]);
-                    },
-                    .lower, .upper, .initcap, .char_length, .octet_length, .bit_length, .substring, .btrim, .ltrim, .rtrim, .strpos, .replace,
-                    .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .concat, .concat_ws, .quote_ident, .quote_literal,
-                    .overlay, .to_hex => return builtins.Builtins(config, @This()).call(ctx, n),
-                    .power, .ln, .log, .log10, .exp, .mod, .div, .pi, .degrees, .radians, .cbrt, .sin, .cos, .sind, .cosd, .tan, .cot, .asin, .acos, .atan, .atan2, .gcd, .lcm, .scale, .min_scale, .trim_scale => return builtins.Builtins(config, @This()).call(ctx, n),
-                    .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .date_bin, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => return builtins.Builtins(config, @This()).call(ctx, n),
-                    .tds_dateadd => {
-                        const number = try eval(ctx, n.b);
-                        const date = try eval(ctx, node(ctx, n.b).next);
-                        if (number == .null_value or date == .null_value) return .null_value;
-                        const amount = number.integer;
-                        if (amount < -2147483648 or amount > 2147483647) return error.IntegerOverflow;
-                        const first = temporal.dateOf(1, 1, 1);
-                        const last = temporal.dateOf(9999, 12, 31);
-                        if (date.date < first or date.date > last) return error.DatetimeFieldOverflow;
-                        const part: ast.DateAddPart = @enumFromInt(n.integer);
-                        const result = switch (part) {
-                            .days, .weeks => try temporal.datePlusDays(date.date, amount * (if (part == .weeks) @as(i64, 7) else 1)),
-                            .months, .quarters, .years => blk: {
-                                const months = amount * switch (part) { .months => @as(i64, 1), .quarters => 3, .years => 12, else => unreachable };
-                                if (months <= -120000 or months >= 120000) return error.DatetimeFieldOverflow;
-                                const timestamp = try temporal.dateToTimestamp(date.date);
-                                break :blk temporal.timestampToDate(try temporal.timestampPlus(timestamp, .{ .months = @intCast(months) }));
-                            },
-                        };
-                        if (result < first or result > last) return error.DatetimeFieldOverflow;
-                        return .{ .date = result };
-                    },
-                    .tds_isnull => {
-                        const value = try eval(ctx, n.b);
-                        return if (value == .null_value) eval(ctx, node(ctx, n.b).next) else value;
-                    },
-                    .overlaps, .overlaps_tz => return builtins.Builtins(config, @This()).call(ctx, n),
-                    .to_date, .to_number, .to_timestamp => return builtins.Builtins(config, @This()).call(ctx, n),
-                    .normalize, .is_normalized => return builtins.Builtins(config, @This()).call(ctx, n),
-                    .array_constructor, .array_subscript, .array_any, .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper,
-                    .array_append, .array_prepend, .array_cat, .array_to_string, .array_remove => return array_eval.ArrayEval(config, @This()).call(ctx, n),
-                    .jsonb_set, .jsonb_set_lax, .jsonb_insert, .jsonb_delete_path, .jsonb_strip_nulls, .jsonb_pretty, .to_json, .to_jsonb, .jsonb_path_exists, .jsonb_path_match, .jsonb_path_query_array, .jsonb_path_query_first, .jsonb_exists_any, .jsonb_exists_all, .jsonb_minus_op, .jsonb_delete_path_op, .jsonb_exists_any_op, .jsonb_exists_all_op, .jsonb_path_exists_op, .jsonb_path_match_op => return json_eval.JsonEval(config, @This()).call(ctx, n),
-                    .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => return range_eval.RangeEval(config, @This()).call(ctx, n),
-                    .current_setting, .set_config, .pg_try_advisory_lock, .pg_try_advisory_lock_shared, .pg_try_advisory_xact_lock, .pg_try_advisory_xact_lock_shared, .pg_advisory_unlock, .pg_advisory_unlock_shared, .pg_backend_pid, .pg_is_in_recovery => return sessionFunction(ctx, n),
-                    .xmlparse, .xmlserialize, .xml_is_well_formed, .xml_is_well_formed_document, .xml_is_well_formed_content => {
-                        const argument = try eval(ctx, n.b);
-                        if (argument == .null_value) return .null_value;
-                        const document = n.integer == 1;
-                        switch (n.func) {
-                            .xmlparse => {
-                                const bytes = argument.text.slice();
-                                if (document and !xml_module.validDocument(bytes)) return error.InvalidXmlDocument;
-                                if (!document and !xml_module.validContent(bytes)) return error.InvalidXmlContent;
-                                return .{ .xml = argument.text };
-                            },
-                            .xmlserialize => {
-                                if (document and !xml_module.validDocument(argument.xml.slice())) return error.NotAnXmlDocument;
-                                return cast(.{ .text = argument.xml }, .text, n.cast_type, n.typmod, ctx.session);
-                            },
-                            .xml_is_well_formed, .xml_is_well_formed_content => return .{ .boolean = xml_module.validContent(argument.text.slice()) },
-                            else => return .{ .boolean = xml_module.validDocument(argument.text.slice()) },
-                        }
-                    },
-                    .point_constructor, .box_constructor, .area, .center, .width, .height => {
-                        if (n.planned_null) return .null_value;
-                        const first = try eval(ctx, n.b);
-                        const second_id = node(ctx, n.b).next;
-                        const second: V.Cell = if (second_id == none) .null_value else try eval(ctx, second_id);
-                        if (first == .null_value or (second_id != none and second == .null_value)) return .null_value;
-                        return switch (n.func) {
-                            .point_constructor => .{ .point = .{ .x = first.float8, .y = second.float8 } },
-                            .box_constructor => .{ .box = geometric.fromCorners(first.point, second.point) },
-                            .area => .{ .float8 = geometric.area(first.box) },
-                            .width => .{ .float8 = geometric.width(first.box) },
-                            .height => .{ .float8 = geometric.height(first.box) },
-                            else => .{ .point = geometric.center(first.box) },
-                        };
-                    },
-                    .inet_host, .masklen, .inet_family, .inet_network, .broadcast, .netmask => {
-                        const argument = try eval(ctx, n.b);
-                        if (argument == .null_value) return .null_value;
-                        const address = &argument.inet;
-                        return switch (n.func) {
-                            .inet_host => blk: {
-                                var full = address.*;
-                                full.bits = full.maxBits();
-                                var buffer: [64]u8 = undefined;
-                                const shown = network.format(&full, false, &buffer);
-                                if (shown.len > config.text_bytes) return error.TextCapacity;
-                                var text: V.Text = .{ .len = shown.len };
-                                @memcpy(text.bytes[0..shown.len], shown);
-                                break :blk V.Cell{ .text = text };
-                            },
-                            .masklen => .{ .integer = address.bits },
-                            .inet_family => .{ .integer = address.family },
-                            .inet_network => .{ .inet = network.network(address) },
-                            .broadcast => .{ .inet = network.broadcast(address) },
-                            else => .{ .inet = network.netmask(address) },
-                        };
-                    },
-                    .aggregate_pair => {
-                        // Both inputs are evaluated; NULL skips the row (strict).
-                        const y = try eval(ctx, n.b);
-                        const x = try eval(ctx, node(ctx, n.b).next);
-                        if (y == .null_value or x == .null_value) return .null_value;
-                        if (comptime config.text_bytes < 16) {
-                            return error.WorkspaceCapacity;
-                        } else {
-                            var pair: V.Text = .{ .len = 16 };
-                            // Little-endian bytes through u64: the native SB0
-                            // compiler rejects array/float @bitCast.
-                            const y_bits: u64 = @bitCast(y.float8);
-                            const x_bits: u64 = @bitCast(x.float8);
-                            for (0..8) |i| {
-                                pair.bytes[i] = @truncate(y_bits >> @intCast(i * 8));
-                                pair.bytes[8 + i] = @truncate(x_bits >> @intCast(i * 8));
-                            }
-                            return .{ .text = pair };
-                        }
-                    },
-                    .routine => return routineCall(ctx, n),
-                    .routine_param => return routineValue(ctx, n),
-                    // Exec.collectAggregate / jsonTableRows read their members (B11).
-                    .aggregate_input, .json_table, .json_table_passing, .json_table_column => return error.UnsupportedStatement,
-                    .none, .mysql_ifnull => unreachable,
+                    .lo_truncate, .lo_truncate64, .lo_from_bytea, .lo_get, .lo_create, .lo_creat, .lo_unlink => return evalLargeObject(ctx, n),
+                    else => return evalFunction(ctx, n),
                 },
                 // $n of an EXECUTEd SQL prepared statement (tx-session lane).
                 .param => {

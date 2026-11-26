@@ -5775,7 +5775,8 @@ pub fn Binder(comptime config: types.Config) type {
             const statement = try P.parseNestedWithDialect(context.source, cte.dml_start, context.pool, context.dialect);
             var nested = context.*;
             nested.nested_dml = true;
-            const bound = try bindStatement(&nested, &statement);
+            var bound: Bound = undefined;
+            try bindStatement(&nested, &statement, &bound);
             const k = plans.dml_len;
             plans.dml[k] = switch (bound) {
                 .insert => |insert| .{ .insert = insert },
@@ -7577,19 +7578,26 @@ pub fn Binder(comptime config: types.Config) type {
         }
 
         pub fn bind(context: *const Context, statement: *const Ast.Statement) Error!Bound {
-            const bound = try bindStatement(context, statement);
+            var bound: Bound = undefined;
+            try bindInto(context, statement, &bound);
+            return bound;
+        }
+
+        /// Bind into caller-owned storage. The result is usable after success.
+        pub fn bindInto(context: *const Context, statement: *const Ast.Statement, bound: *Bound) Error!void {
+            try bindStatement(context, statement, bound);
             // Parent LIMIT/filter/joins can stop demand for a nested WindowAgg.
             // Until execution propagates that demand, nonrepeatable offset
             // windows are only safe in the root query plan.
+            const query_root: ?u16 = switch (bound.*) { .query => |root| root, else => null };
             if(context.plans) |plans| for(plans.items[0..plans.len],0..) |*plan,index| {
                 for(plan.windows[0..plan.window_count]) |win| if(plan.limit!=0 and (win.mutable_keys or !win.offset_repeatable or !win.offset_total)) {
-                    if(bound!=.query or bound.query!=index) return error.UnsupportedStatement;
+                    if (query_root == null or query_root.? != index) return error.UnsupportedStatement;
                 };
             };
-            if(context.describe_only) return bound;
-            try planOutputDemand(context,&bound);
-            try validatePlannedExpressions(context,&bound);
-            return bound;
+            if(context.describe_only) return;
+            try planOutputDemand(context,bound);
+            try validatePlannedExpressions(context,bound);
         }
 
         fn demandOutput(context:*const Context,plan_id:u16,column:?usize,changed:*bool) void {
@@ -7897,10 +7905,37 @@ pub fn Binder(comptime config: types.Config) type {
             return true;
         }
 
-        fn bindStatement(context: *const Context, statement: *const Ast.Statement) Error!Bound {
+        inline fn setBound(bound: *Bound, comptime kind: std.meta.Tag(Bound), payload: @FieldType(Bound, @tagName(kind))) void {
+            bound.* = @unionInit(Bound, @tagName(kind), payload);
+        }
+
+        inline fn setBoundValue(bound: *Bound, payload: Bound) void {
+            bound.* = payload;
+        }
+
+        fn bindStatement(context: *const Context, statement: *const Ast.Statement, bound: *Bound) Error!void {
             if (context.plans) |plans| if (!context.nested_dml) plans.reset();
-            switch (statement.*) {
-                .create_table => |*create| {
+            // Compile each alternative with its own scratch frame and
+            // pass the same result slot through the dispatcher.
+            const Handler = *const fn (*const Context, *const Ast.Statement, *Bound) Error!void;
+            const handler: Handler = switch (std.meta.activeTag(statement.*)) {
+                inline else => |kind| &StatementBinder(kind).run,
+            };
+            return handler(context, statement, bound);
+        }
+
+        fn StatementBinder(comptime kind: std.meta.Tag(Ast.Statement)) type {
+            return struct {
+                fn run(context: *const Context, statement: *const Ast.Statement, bound: *Bound) Error!void {
+                    return bindStatementKind(kind, context, statement, bound);
+                }
+            };
+        }
+
+        inline fn bindStatementKind(comptime kind: std.meta.Tag(Ast.Statement), context: *const Context, statement: *const Ast.Statement, bound: *Bound) Error!void {
+            switch (kind) {
+                .create_table => {
+                    const create = &statement.create_table;
                     const table_name = toName(context, create.name);
                     const postgres_acl = context.dialect == .postgres and context.namespace_create != null;
                     const namespace = if (postgres_acl)
@@ -7915,7 +7950,7 @@ pub fn Binder(comptime config: types.Config) type {
                         try privilege.check(privilege.ptr, context.session.role, namespace, context.snapshot, plain);
                     }
                     if (context.catalog.findIn(namespace, table_name.slice(), context.snapshot) != null) {
-                        if (create.if_not_exists) return .{ .noop = if (create.as_query != none) .create_table_as else .create_table };
+                        if (create.if_not_exists) return setBound(bound, .noop, if (create.as_query != none) .create_table_as else .create_table);
                         return error.TableExists;
                     }
                     // PRIMARY KEY and UNIQUE create an index through a lookup
@@ -7930,8 +7965,8 @@ pub fn Binder(comptime config: types.Config) type {
                         if (index_lookup) _ = try qualifierNamespace(context, create.schema);
                     }
                     if (create.invalid_definition) return error.Syntax;
-                    if (create.as_query != none) return bindCreateAs(context, create, table_name, namespace);
-                    if (create.partition_of) |parent| return bindPartitionOf(context, create, table_name, namespace, parent);
+                    if (create.as_query != none) return setBoundValue(bound, try bindCreateAs(context, create, table_name, namespace));
+                    if (create.partition_of) |parent| return setBoundValue(bound, try bindPartitionOf(context, create, table_name, namespace, parent));
                     if (create.inherits != null and (create.like != null or create.partition_by != .none)) return error.UnsupportedStatement;
                     var out: Create = .{ .name = table_name, .columns = @splat(.{}), .count = create.count, .namespace = namespace, .plain_definition = plain };
                     if (namespace != catalog.public_namespace) for (create.columns[0..create.count]) |*definition| {
@@ -8019,42 +8054,46 @@ pub fn Binder(comptime config: types.Config) type {
                         out.extras.relkind = 'p';
                         out.extras.partition = .{ .strategy = if (create.partition_by == .range) .range else .list, .key = key };
                     }
-                    return .{ .create_table = out };
+                    return setBound(bound, .create_table, out);
 
                 },
-                .drop_table => |drop| {
+                .drop_table => {
+                    const drop = statement.drop_table;
                     const wanted = toName(context, drop.name);
                     const namespace = qualifierNamespace(context, drop.schema) catch |err| {
-                        if (err == error.UndefinedSchema and drop.if_exists) return .{ .noop = .drop_table };
+                        if (err == error.UndefinedSchema and drop.if_exists) return setBound(bound, .noop, .drop_table);
                         return err;
                     };
                     const found = context.catalog.findIn(namespace, wanted.slice(), context.snapshot) orelse {
-                        if (drop.if_exists) return .{ .noop = .drop_table };
+                        if (drop.if_exists) return setBound(bound, .noop, .drop_table);
                         return error.TableNotFound;
                     };
                     if (found.kind != 'r' and found.kind != 'p') return error.WrongObjectType;
-                    if (drop.cascade) return .{ .drop_relation = .{ .slot = found.slot, .cascade = true, .command = .drop_table } };
-                    return .{ .drop_table = found.slot };
+                    if (drop.cascade) return setBound(bound, .drop_relation, .{ .slot = found.slot, .cascade = true, .command = .drop_table });
+                    return setBound(bound, .drop_table, found.slot);
                 },
-                .create_sequence => |*create| {
+                .create_sequence => {
+                    const create = &statement.create_sequence;
                     const namespace = try specifiedNamespace(context, create.name.schema);
                     const name = toName(context, create.name.name);
                     if (context.catalog.findIn(namespace, name.slice(), context.snapshot) != null or
                         indexNameTaken(context, namespace, name.slice())) {
-                        if (create.if_not_exists) return .{ .noop = .create_sequence };
+                        if (create.if_not_exists) return setBound(bound, .noop, .create_sequence);
                         return error.TableExists;
                     }
-                    return .{ .create_sequence = .{ .name = name, .namespace = namespace, .spec = try sequence.resolve(create.options) } };
+                    return setBound(bound, .create_sequence, .{ .name = name, .namespace = namespace, .spec = try sequence.resolve(create.options) });
                 },
-                .drop_sequence => |drop| {
+                .drop_sequence => {
+                    const drop = statement.drop_sequence;
                     const found = resolveRelation(context, drop.schema, drop.name) catch |err| {
-                        if (err == error.TableNotFound and drop.if_exists) return .{ .noop = .drop_sequence };
+                        if (err == error.TableNotFound and drop.if_exists) return setBound(bound, .noop, .drop_sequence);
                         return err;
                     };
                     if (found.kind != 'S') return error.WrongObjectType;
-                    return .{ .drop_sequence = found.slot };
+                    return setBound(bound, .drop_sequence, found.slot);
                 },
-                .insert => |*insert| {
+                .insert => {
+                    const insert = &statement.insert;
                     const index = try modifyingTable(context, try resolveQualified(context, insert.schema, insert.table), true);
                     const entry = &context.tables[index];
                     var mapping: [config.columns]usize = @splat(0);
@@ -8096,23 +8135,24 @@ pub fn Binder(comptime config: types.Config) type {
                     }
                     if (insert.returning.output and insert.conflict != null) return error.UnsupportedStatement;
                     out.returning = try bindReturning(context, index, &insert.returning, insert.alias, .insert);
-                    return .{ .insert = out };
+                    return setBound(bound, .insert, out);
                 },
-                .select => |index| {
+                .select => {
+                    const index = statement.select;
                     const q = &context.pool.queries[index];
                     if (partitionAncestorsTarget(context, q) != null) {
                         const plans = context.plans orelse return error.UnsupportedStatement;
                         plans.reset();
                         const root = try bindPlan(context, index, null, null, false);
                         try resolveUnknown(context, root);
-                        return .{ .query = root };
+                        return setBound(bound, .query, root);
                     }
                     // A system view runs on the general engine (scan-time rows).
                     if (q.from) |reference| if (viewOf(context, reference.schema, reference.name) != null) {
                         if (context.plans == null) return error.UnsupportedStatement;
                         const root = try bindPlan(context, index, null, null, false);
                         try resolveUnknown(context, root);
-                        return .{ .query = root };
+                        return setBound(bound, .query, root);
                     };
                     const selected = bindSelect(context, q) catch |err| {
                         if (err != error.TableNotFound or context.dialect != .postgres) return err;
@@ -8121,18 +8161,20 @@ pub fn Binder(comptime config: types.Config) type {
                         if (context.plans == null or q.lock.strength != .none) return error.UnsupportedStatement;
                         const root = try bindPlan(context, index, null, null, false);
                         try resolveUnknown(context, root);
-                        return .{ .query = root };
+                        return setBound(bound, .query, root);
                     };
-                    return .{ .select = selected };
+                    return setBound(bound, .select, selected);
                 },
-                .query => |index| {
+                .query => {
+                    const index = statement.query;
                     const plans = context.plans orelse return error.UnsupportedStatement;
                     plans.reset();
                     const root = try bindPlan(context, index, null, null, false);
                     try resolveUnknown(context, root);
-                    return .{ .query = root };
+                    return setBound(bound, .query, root);
                 },
-                .update => |*update| {
+                .update => {
+                    const update = &statement.update;
                     const index = try modifyingTable(context, try resolveQualified(context, update.schema, update.table), false);
                     const entry = &context.tables[index];
                     var scope = tableScope(context, index);
@@ -8163,9 +8205,10 @@ pub fn Binder(comptime config: types.Config) type {
                     try bindChecks(context, index, entry, &out.checks);
                     if (update.returning.output and out.from != none) return error.UnsupportedStatement;
                     out.returning = try bindReturning(context, index, &update.returning, update.alias, .update);
-                    return .{ .update = out };
+                    return setBound(bound, .update, out);
                 },
-                .delete => |*delete| {
+                .delete => {
+                    const delete = &statement.delete;
                     const index = try modifyingTable(context, try resolveQualified(context, delete.schema, delete.table), false);
                     var scope = tableScope(context, index);
                     if (delete.alias) |alias| scope.rels[0].name = toName(context, alias);
@@ -8176,61 +8219,94 @@ pub fn Binder(comptime config: types.Config) type {
                     if (delete.returning.output and out.using != none) return error.UnsupportedStatement;
                     out.returning = try bindReturning(context, index, &delete.returning, delete.alias, .delete);
                     if (out.using == none) out.key = primaryKey(context, &context.tables[index], out.where);
-                    return .{ .delete = out };
+                    return setBound(bound, .delete, out);
                 },
-                .control => |control| return .{ .control = control },
+                .control => {
+                    const control = statement.control;
+                    return setBound(bound, .control, control);
+                },
                 // Session commands run in Database (session.sig), never bound here.
                 .session => return error.UnsupportedStatement,
                 // Catalog objects run in the Database facade (catalog_objects.sig).
                 .catalog_object => return error.UnsupportedStatement,
                 // COPY runs through Database.copyInfo/copyBegin, never as a statement.
                 .copy => return error.UnsupportedStatement,
-                .truncate => |*truncate| return .{ .truncate = try bindTruncate(context, truncate) },
-                .alter_table => |*alter| return bindAlter(context, alter),
-                .create_schema => |*create| {
+                .truncate => {
+                    const truncate = &statement.truncate;
+                    return setBound(bound, .truncate, try bindTruncate(context, truncate));
+                },
+                .alter_table => {
+                    const alter = &statement.alter_table;
+                    return setBoundValue(bound, try bindAlter(context, alter));
+                },
+                .create_schema => {
+                    const create = &statement.create_schema;
                     const name = toName(context, create.name);
                     var exists = context.catalog.findSchema(name.slice(), context.snapshot) != null;
                     for (catalog.namespaces) |namespace| exists = exists or types.same(namespace.name, name.slice());
                     if (exists) {
-                        if (create.if_not_exists) return .{ .noop = .create_schema };
+                        if (create.if_not_exists) return setBound(bound, .noop, .create_schema);
                         return error.DuplicateSchema;
                     }
-                    return .{ .create_schema = name };
+                    return setBound(bound, .create_schema, name);
                 },
-                .drop_schema => |*drop| {
+                .drop_schema => {
+                    const drop = &statement.drop_schema;
                     const name = toName(context, drop.name);
                     for (catalog.namespaces) |namespace| if (types.same(namespace.name, name.slice())) return error.UnsupportedStatement;
                     const found = context.catalog.findSchema(name.slice(), context.snapshot) orelse {
-                        if (drop.if_exists) return .{ .noop = .drop_schema };
+                        if (drop.if_exists) return setBound(bound, .noop, .drop_schema);
                         return error.UndefinedSchema;
                     };
-                    return .{ .drop_schema = .{ .slot = found.slot, .oid = found.oid, .cascade = drop.cascade } };
+                    return setBound(bound, .drop_schema, .{ .slot = found.slot, .oid = found.oid, .cascade = drop.cascade });
                 },
-                .create_index => |*create| return bindCreateIndex(context, create),
-                .drop_index => |*drop| return bindDropIndex(context, drop),
-                .create_view => |*create| return bindCreateView(context, create),
-                .drop_view => |*drop| return bindDropView(context, &drop.drop, drop.materialized),
-                .refresh_view => |*refresh| return bindRefresh(context, refresh),
-                .merge => |*merge| return bindMerge(context, merge),
-                .set_constraints => |*set| return bindSetConstraints(context, set),
-                .alter_sequence => |*alter| {
+                .create_index => {
+                    const create = &statement.create_index;
+                    return setBoundValue(bound, try bindCreateIndex(context, create));
+                },
+                .drop_index => {
+                    const drop = &statement.drop_index;
+                    return setBoundValue(bound, try bindDropIndex(context, drop));
+                },
+                .create_view => {
+                    const create = &statement.create_view;
+                    return setBoundValue(bound, try bindCreateView(context, create));
+                },
+                .drop_view => {
+                    const drop = &statement.drop_view;
+                    return setBoundValue(bound, try bindDropView(context, &drop.drop, drop.materialized));
+                },
+                .refresh_view => {
+                    const refresh = &statement.refresh_view;
+                    return setBoundValue(bound, try bindRefresh(context, refresh));
+                },
+                .merge => {
+                    const merge = &statement.merge;
+                    return setBoundValue(bound, try bindMerge(context, merge));
+                },
+                .set_constraints => {
+                    const set = &statement.set_constraints;
+                    return setBoundValue(bound, try bindSetConstraints(context, set));
+                },
+                .alter_sequence => {
+                    const alter = &statement.alter_sequence;
                     const found = resolveRelation(context, alter.name.schema, alter.name.name) catch |err| {
-                        if (err == error.TableNotFound and alter.if_exists) return .{ .noop = .alter_sequence };
+                        if (err == error.TableNotFound and alter.if_exists) return setBound(bound, .noop, .alter_sequence);
                         return err;
                     };
                     if (found.kind != 'S') return error.WrongObjectType;
-                    var bound: AlterSequence = .{ .slot = found.slot, .options = alter.options };
+                    var sequence_binding: AlterSequence = .{ .slot = found.slot, .options = alter.options };
                     if (alter.owned_by) |owned_by| {
-                        bound.ownership = .{};
+                        sequence_binding.ownership = .{};
                         if (owned_by.column) |column| {
                             const target = try resolveRelation(context, owned_by.table.schema, owned_by.table.name);
                             if (target.kind != 'r' and target.kind != 'p') return error.WrongObjectType;
                             const table = &context.tables[target.slot];
                             const index = definitionColumn(table.columns[0..table.column_count], toName(context, column).slice()) orelse return error.ColumnNotFound;
-                            bound.ownership = .{ .table = table.oid, .column = index };
+                            sequence_binding.ownership = .{ .table = table.oid, .column = index };
                         }
                     }
-                    return .{ .alter_sequence = bound };
+                    return setBound(bound, .alter_sequence, sequence_binding);
                 },
             }
         }

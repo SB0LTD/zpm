@@ -1401,7 +1401,8 @@ pub fn Database(comptime config: Config) type {
                 const context:B.Context=.{.source=expanded,.tables=&db.tables,.catalog=&db.catalog,.snapshot=snapshot,
                     .pool=&self.workspace.nodes,.legacy=false,.dialect=self.dialect,.session=&self.session,.plans=&self.workspace.plans,.describe_only=describe_only,.routines=&db.objects,.params=params,
                     .user_type_catalog=&db.catalog_objects,.stored_source_start=source.len,.namespace_usage=.{.ptr=db,.check=&Self.bindNamespaceUsage}};
-                const bound=try B.bind(&context,&parsed);
+                var bound: B.Bound = undefined;
+                try B.bindInto(&context, &parsed, &bound);
                 // Detached reads never mutate: no data-modifying WITH (B11).
                 if(self.workspace.plans.dml_len!=0) return error.UnsupportedStatement;
                 // A settings scan observes the installed connection state.
@@ -3189,7 +3190,8 @@ pub fn Database(comptime config: Config) type {
             context.stored_source_start = original.len;
             if (explain) |options| context.describe_only = !options.analyze;
             if (parsed.* == .select and self.routine_frame == null and self.active_params == null) context.user_type_catalog = &self.catalog_objects;
-            const bound = try B.bind(&context, &statement_copy);
+            var bound: B.Bound = undefined;
+            try B.bindInto(&context, &statement_copy, &bound);
             if (self.txs[slot].read_only and (explain == null or explain.?.analyze)) try readOnlyCheck(&bound, &self.workspace.plans);
             try self.checkPrivileges(&bound, snap);
             try self.secureNewRows(&bound, source, snap);
@@ -3217,7 +3219,11 @@ pub fn Database(comptime config: Config) type {
                 },
                 else => {},
             }
-            const affected: usize = switch (bound) {
+            return self.runBoundMutation(slot, source, &bound, snap, result);
+        }
+
+        fn runBoundMutation(self: *Self, slot: u16, source: []const u8, bound: *const B.Bound, snap: Snapshot, result: *Result) Error!void {
+            const affected: usize = switch (bound.*) {
                 .noop => 0,
                 .create_table => |*create| blk: {
                     var definition = create.*;
@@ -3336,18 +3342,18 @@ pub fn Database(comptime config: Config) type {
                 },
                 .select, .query, .control => unreachable,
             };
-            const create_query_data = switch (bound) {
+            const create_query_data = switch (bound.*) {
                 .create_table => |*create| create.plan != ast.none,
                 else => false,
             };
-            self.outcome = .{ .affected = affected, .command = B.command(&bound), .create_query_data = create_query_data,
-                .noop = bound == .noop or bound == .legacy_attribute_options };
-            if (bound == .insert) {
+            self.outcome = .{ .affected = affected, .command = B.command(bound), .create_query_data = create_query_data,
+                .noop = bound.* == .noop or bound.* == .legacy_attribute_options };
+            if (bound.* == .insert) {
                 const tx = &self.txs[slot];
                 self.outcome.mysql_generated_id = tx.mysql_first_generated;
                 self.outcome.mysql_insert_id = if (tx.mysql_first_generated != 0) tx.mysql_first_generated else tx.mysql_explicit_insert_id;
             }
-            switch (bound) {
+            switch (bound.*) {
                 .insert => |*insert| if (insert.returning.count != 0) try self.returnRows(slot, source, &insert.returning, insert.table, insert.plan == ast.none, result.rows.len),
                 .update => |*update| if (update.returning.count != 0) try self.returnRows(slot, source, &update.returning, update.table, true, result.rows.len),
                 .delete => |*delete| if (delete.returning.count != 0) try self.returnRows(slot, source, &delete.returning, delete.table, true, result.rows.len),
@@ -7482,13 +7488,42 @@ pub fn Database(comptime config: Config) type {
             try sink.add(&.{ intCell(seq.last_value), intCell(seq.log_cnt), boolCell(seq.is_called) });
         }
 
-        fn fillViewRows(self:*const Self,session_values:*const value_module.Session,snapshot:Snapshot,pool:*A.Pool,view:catalog_module.View,sink:*X.RowSink) Error!void {
+        fn fillViewRows(self: *const Self, session_values: *const value_module.Session, snapshot: Snapshot, pool: *A.Pool, view: catalog_module.View, sink: *X.RowSink) Error!void {
+            // Object catalogs bypass the relation and type row builders.
+            return switch (view) {
+                .pg_largeobject => self.largeObjectRows(session_values, snapshot, sink),
+                // Built-in ACL defaults come from acldefault() and have no stored row.
+                .pg_default_acl, .pg_largeobject_metadata, .pg_roles, .pg_authid, .pg_auth_members,
+                .pg_db_role_setting, .pg_policy, .pg_policies, .pg_description, .pg_shdescription,
+                .pg_foreign_data_wrapper, .pg_foreign_server, .pg_publication, .pg_publication_rel,
+                .pg_publication_namespace, .pg_statistic_ext, .pg_extension, .pg_tables, .table_privileges,
+                => self.catalogObjectRows(session_values, snapshot, view, sink),
+                else => self.fillSchemaViewRows(session_values, snapshot, pool, view, sink),
+            };
+        }
+
+        fn largeObjectRows(self: *const Self, session_values: *const value_module.Session, snapshot: Snapshot, sink: *X.RowSink) Error!void {
+            if (!self.catalog_objects.superuser(session_values.role, snapshot)) return error.InsufficientPrivilege;
+            const pages = if (self.large_pages) |*store| store else return;
+            const include_data = sink.referencesColumn(2);
+            var cursor: large_object_pages.Pages.Cursor = .{};
+            while (cursor.next(pages, snapshot)) |item| {
+                var data: Cell = .null_value;
+                if (include_data) {
+                    data = .{ .bytea = .{} };
+                    const bytes = pages.versionBytes(item.version);
+                    if (bytes.len > data.bytea.bytes.len) return error.TextCapacity;
+                    data.bytea.len = bytes.len;
+                    @memcpy(data.bytea.bytes[0..bytes.len], bytes);
+                }
+                try sink.add(&.{ intCell(item.key.oid), intCell(item.key.page), data });
+            }
+        }
+
+        fn fillSchemaViewRows(self: *const Self, session_values: *const value_module.Session, snapshot: Snapshot, pool: *A.Pool, view: catalog_module.View, sink: *X.RowSink) Error!void {
             const include_class_acl = view == .pg_class and sink.referencesColumn(catalog_module.pg_class_acl_column);
             if (view == .pg_settings) return error.UnsupportedStatement;
             if (view == .sequence_state) return error.UnsupportedStatement;
-            // This catalog stores explicit ALTER DEFAULT PRIVILEGES entries.
-            // Built-in defaults come from acldefault() and do not create rows.
-            if (view == .pg_default_acl) return self.catalogObjectRows(session_values, snapshot, view, sink);
             // Parameter grants have no persisted objects. Stock tools still
             // discover the typed catalog before exporting global roles.
             if (view == .pg_parameter_acl) return;
@@ -7499,24 +7534,6 @@ pub fn Database(comptime config: Config) type {
             if (view == .pg_event_trigger) return;
             // Publication metadata does not create logical replication subscriptions.
             if (view == .pg_subscription) return;
-            if (view == .pg_largeobject) {
-                if (!self.catalog_objects.superuser(session_values.role, snapshot)) return error.InsufficientPrivilege;
-                const pages = if (self.large_pages) |*store| store else return;
-                const include_data = sink.referencesColumn(2);
-                var cursor: large_object_pages.Pages.Cursor = .{};
-                while (cursor.next(pages, snapshot)) |item| {
-                    var data: Cell = .null_value;
-                    if (include_data) {
-                        data = .{ .bytea = .{} };
-                        const bytes = pages.versionBytes(item.version);
-                        if (bytes.len > data.bytea.bytes.len) return error.TextCapacity;
-                        data.bytea.len = bytes.len;
-                        @memcpy(data.bytea.bytes[0..bytes.len], bytes);
-                    }
-                    try sink.add(&.{ intCell(item.key.oid), intCell(item.key.page), data });
-                }
-                return;
-            }
             // There are no security label providers.
             if (view == .pg_seclabel or view == .pg_shseclabel or view == .pg_seclabels) return;
             // Index comparisons use the store's typed comparator, with no
@@ -7710,7 +7727,6 @@ pub fn Database(comptime config: Config) type {
                         try sink.add(&.{ intCell(object.oid + 1 + order), intCell(object.oid), .{ .float4 = @floatFromInt(order) }, nameCell(label) });
                     }
                 },
-                .pg_largeobject_metadata, .pg_roles, .pg_authid, .pg_auth_members, .pg_db_role_setting, .pg_policy, .pg_policies, .pg_description, .pg_shdescription, .pg_foreign_data_wrapper, .pg_foreign_server, .pg_publication, .pg_publication_rel, .pg_publication_namespace, .pg_statistic_ext, .pg_extension, .pg_tables, .table_privileges => return self.catalogObjectRows(session_values, snapshot, view, sink),
                 .pg_namespace, .schemata => {
                     const include_acl = view == .pg_namespace and sink.referencesColumn(catalog_module.pg_namespace_acl_column);
                     for (catalog_module.namespaces) |namespace| {
@@ -11852,7 +11868,8 @@ pub fn Database(comptime config: Config) type {
             var context = self.bindContext(expanded, mode, snap);
             context.stored_source_start = text.len;
             context.describe_only = true;
-            _ = try B.bind(&context, &copy);
+            var bound: B.Bound = undefined;
+            try B.bindInto(&context, &copy, &bound);
             const entry = &state.prepared[index];
             entry.* = .{ .used = true, .count = prepare.count };
             @memcpy(entry.name.bytes[0..name.len], name.slice());
@@ -12127,7 +12144,8 @@ pub fn Database(comptime config: Config) type {
             const source = try expandRelations(self, &self.workspace, text, snap, parsed, self.session.role, &self.session);
             var context = self.bindContext(source, .standard, snap);
             context.stored_source_start = text.len;
-            const bound = try B.bind(&context, parsed);
+            var bound: B.Bound = undefined;
+            try B.bindInto(&context, parsed, &bound);
             const root = switch (bound) {
                 .query => |root| root,
                 else => return error.UnsupportedStatement,
@@ -12404,7 +12422,8 @@ pub fn Database(comptime config: Config) type {
                 const source = try expandRelations(self, &self.workspace, text, snap, &parsed, CO.bootstrap_role, &self.session);
                 var context = self.bindContext(source, .standard, snap);
                 context.stored_source_start = text.len;
-                const bound = try B.bind(&context, &parsed);
+                var bound: B.Bound = undefined;
+                try B.bindInto(&context, &parsed, &bound);
                 self.routine_frame = saved_frame;
                 switch (bound) {
                     .query => |root| {
@@ -13533,7 +13552,8 @@ pub fn Database(comptime config: Config) type {
             context.stored_source_start = source.len;
             context.describe_only=true;
             if (parsed == .select) context.user_type_catalog = &self.catalog_objects;
-            const bound = try B.bind(&context, &statement_copy);
+            var bound: B.Bound = undefined;
+            try B.bindInto(&context, &statement_copy, &bound);
             if (top.explain != null) {
                 try self.validateExplain(&bound);
                 explainHeader(result);

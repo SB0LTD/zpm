@@ -47,6 +47,20 @@ jobs:
           echo "SIG_LIB_DIR=$SIG_PREFIX/lib" >> "$GITHUB_ENV"
           "$SIG_BIN" version
 
+      - name: Test wide-cell SQL on a 4 MiB stack
+        run: |
+          set -euo pipefail
+          for optimize in Debug ReleaseSafe; do
+            output="$RUNNER_TEMP/wide-cell-$optimize"
+            "$SIG" build contract-sql-large-object-pages -Doptimize="$optimize" -j2 \
+              --prefix "$output" --Sig-lib-dir "$SIG_LIB_DIR"
+            (
+              ulimit -s 4096
+              ulimit -c 0
+              "$output/bin/contract-sql-large-object-pages"
+            )
+          done
+
       - name: Test ZPM library and transport graph with Sig
         run: |
           "$SIG" build test \

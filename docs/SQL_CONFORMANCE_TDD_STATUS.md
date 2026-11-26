@@ -1,5 +1,18 @@
 # SQL conformance TDD checkpoint
 
+## Wide-cell SQL binding on a 4 MiB stack
+
+The binder writes the selected statement into a caller-owned result slot.
+Each statement alternative has its own scratch frame, and data-modifying
+CTEs bind into an independent result slot. Statement execution, expression
+evaluation, and catalog scans keep scratch for unrelated paths out of the
+active call chain.
+
+ZPM CI runs the existing large-object page contract with 4 KiB cells under
+a hard 4 MiB Linux stack limit in both Debug and ReleaseSafe. The contract
+exercises typed literals, large-object calls and catalog scans, including
+failed writes, WAL replay, and checkpoint recovery.
+
 ## Native database copy and catalog qualification
 
 Large-object page support introduced a native build regression in
