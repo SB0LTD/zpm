@@ -443,10 +443,11 @@ pub const Options = struct {
     /// are LDC c[0x1][..], the constant cache's (a word each warp reads
     /// once, helper lanes too), not LDG; EXTRA_BANK1 says the bytes read.
     uni_bank: u8 = 0xff,
-    /// A compute kernel's straight-line runs list-scheduled (see
-    /// Ctx.schedule); off, the machine instructions stay in KIR's order. A
-    /// kernel the registers cannot hold scheduled is compiled again
-    /// without.
+    /// A kernel's or a stage's straight-line runs list-scheduled (see
+    /// Ctx.schedule: a pixel program's texture samples issued together, not
+    /// each waited for where it is used); off, the machine instructions
+    /// stay in KIR's order. A program the registers cannot hold scheduled
+    /// is compiled again without.
     schedule: bool = true,
 };
 
@@ -576,7 +577,7 @@ pub fn compileIn(k: *const kir.Kernel, caps: device.Caps, st: anytype, out: []u8
 pub fn compileText(k: *const kir.Kernel, caps: device.Caps, st: anytype, opts: Options) Error![]const u8 {
     return compileTextOnce(k, caps, st, opts) catch |e| {
         // (scheduled, it needed more registers than there are: as written)
-        if (e != error.TooManyRegs or !opts.schedule or opts.stage != .compute) return e;
+        if (e != error.TooManyRegs or !opts.schedule) return e;
         var o = opts;
         o.schedule = false;
         return compileTextOnce(k, caps, st, o);
@@ -588,11 +589,13 @@ fn compileTextOnce(k: *const kir.Kernel, caps: device.Caps, st: anytype, opts: O
     st.bank1 = 0;
     var c = CtxOf(@TypeOf(st.*)){ .w = st, .caps = caps, .gen = gen, .k = k, .opts = opts };
     try c.expand();
+    c.rename();
+    c.cse();
     c.forward();
     try c.analyze();
     try c.lower();
     c.dce();
-    if (opts.schedule and opts.stage == .compute) c.schedule();
+    if (opts.schedule) c.schedule();
     try c.liveness();
     c.stageLive();
     try c.allocate();
@@ -667,6 +670,175 @@ fn CtxOf(comptime St: type) type {
             c.n = x.n;
             c.nv_kir = x.nv;
             c.w.n_kir = @intCast(x.n);
+        }
+
+        /// A register written more than once in a straight-line stretch (no
+        /// control flow): each write before the stretch's last writes a new
+        /// register, and the reads up to the next write read it. The value
+        /// coming in and the one going out keep the register's name, so
+        /// nothing outside the stretch changes. DXBC reuses its temporaries
+        /// (a shadow map's taps: one register a tap's coordinate, then its
+        /// sample, then the next tap's coordinate): as one register, each
+        /// write waits for the reads before it, and the scheduler could
+        /// not start a tap's sample before the last tap's was used.
+        /// Registers of a vector (a sample's coordinates and channels, a
+        /// wide load's or store's) keep theirs. (Scratch: reads as the map,
+        /// writes as the last write's index + 1, def_at as the stamp.)
+        fn rename(c: *Ctx) void {
+            const w = c.w;
+            const code = w.insts[0..c.n];
+            var nv = c.nv_kir;
+            @memset(w.uniform[0..nv], false);
+            for (code) |in| {
+                if (vecWidth(in)) |n| {
+                    const base: ?u16 = if (in.op == .st) readsOf(in)[1] else if (in.dst != .none) @intFromEnum(in.dst) else null;
+                    if (base) |b| for (0..n) |j| {
+                        w.uniform[b + j] = true;
+                    };
+                }
+                if (in.op == .tex) if (readsOf(in)[1]) |b| for (0..kir.texCoords(in.aux)) |j| {
+                    w.uniform[b + j] = true;
+                };
+            }
+            const map = w.reads[0..w.reads.len];
+            const last = w.writes[0..w.writes.len];
+            const stamp = w.def_at[0..w.def_at.len];
+            @memset(stamp[0..nv], std.math.maxInt(u32));
+            var start: usize = 0;
+            var run: u32 = 0;
+            while (start < code.len) {
+                var end = start;
+                while (end < code.len and !stretchEnd(code[end])) end += 1;
+                // (the stretch [start, end): each register's last write in it)
+                for (code[start..end], start..) |in, i| {
+                    if (!renamable(w, in)) continue;
+                    const d = @intFromEnum(in.dst);
+                    stamp[d] = run;
+                    last[d] = @intCast(@min(i - start + 1, std.math.maxInt(u16)));
+                    map[d] = d;
+                }
+                if (end - start < std.math.maxInt(u16)) {
+                    for (code[start..end], start..) |*in, i| {
+                        // (the operands readsOf says it reads)
+                        const rd = readsOf(in.*);
+                        for ([_]*kir.Arg{ &in.a, &in.b, &in.c }) |arg| {
+                            if (arg.* != .reg or arg.reg == .none) continue;
+                            const v = @intFromEnum(arg.reg);
+                            if (stamp[v] != run or w.uniform[v]) continue;
+                            const read = for (rd) |x| {
+                                if (x == v) break true;
+                            } else false;
+                            if (read) arg.* = .{ .reg = @enumFromInt(map[v]) };
+                        }
+                        if (!renamable(w, in.*)) continue;
+                        const d = @intFromEnum(in.dst);
+                        if (last[d] == i - start + 1 or nv >= w.tys.len or nv + 1 >= NOV) {
+                            map[d] = d;
+                            continue;
+                        }
+                        const fresh: u16 = @intCast(nv);
+                        w.tys[fresh] = w.tys[d];
+                        w.uniform[fresh] = false;
+                        stamp[fresh] = std.math.maxInt(u32);
+                        nv += 1;
+                        map[d] = fresh;
+                        in.dst = @enumFromInt(fresh);
+                    }
+                }
+                run += 1;
+                start = end + 1;
+            }
+            c.nv_kir = nv;
+        }
+
+        /// The same computation again in a straight-line stretch (the same
+        /// op, type and operands, no operand written between, the first's
+        /// result still in its register, at most CSE_WINDOW ops back): a
+        /// copy of the first (`forward` then drops the copy). Pure ops
+        /// only, and a stage's loads of its constant buffer 1 (the draw's
+        /// uniforms, which nothing writes while it draws): a sample's
+        /// level and header, computed from its texture's descriptor each
+        /// sample, once a texture in a stretch (a shadow map's 36 taps).
+        /// A read of a copy whose source still holds the value reads the
+        /// source (so two samples' copies of one constant are the same
+        /// operand). (Scratch: def_at as each register's last write's index
+        /// + 1; reads as a copy's source, writes as the copy's index + 1.)
+        fn cse(c: *Ctx) void {
+            const w = c.w;
+            const code = w.insts[0..c.n];
+            if (code.len >= std.math.maxInt(u16)) return;
+            const lastw = w.def_at[0..w.def_at.len];
+            const alias = w.reads[0..w.reads.len];
+            const alias_at = w.writes[0..w.writes.len];
+            @memset(lastw[0..c.nv_kir], 0);
+            @memset(alias_at[0..c.nv_kir], 0);
+            var start: usize = 0;
+            for (code, 0..) |*in, j| {
+                if (stretchEnd(in.*)) {
+                    start = j + 1;
+                    continue;
+                }
+                defer if (writesDst(in.*)) {
+                    const n = vecWidth(in.*) orelse 1;
+                    const d = @intFromEnum(in.dst);
+                    for (0..n) |x| lastw[d + x] = @intCast(j + 1);
+                    if (in.op == .mov and in.a == .reg and in.a.reg != .none and n == 1 and !w.uniform[d] and w.tys[@intFromEnum(in.a.reg)] == w.tys[d]) {
+                        alias[d] = @intFromEnum(in.a.reg);
+                        alias_at[d] = @intCast(j + 1);
+                    } else alias_at[d] = 0;
+                };
+                // (reads of copies: their sources, while both hold)
+                const rd = readsOf(in.*);
+                for ([_]*kir.Arg{ &in.a, &in.b, &in.c }) |arg| {
+                    if (arg.* != .reg or arg.reg == .none) continue;
+                    const v = @intFromEnum(arg.reg);
+                    if (w.uniform[v] or alias_at[v] == 0 or alias_at[v] <= start) continue;
+                    if (lastw[v] != alias_at[v] or lastw[alias[v]] >= alias_at[v]) continue;
+                    const read = for (rd) |x| {
+                        if (x == v) break true;
+                    } else false;
+                    if (read) arg.* = .{ .reg = @enumFromInt(alias[v]) };
+                }
+                if (!c.pureOp(in.*) or !renamable(w, in.*)) continue;
+                const lo = if (j - start > CSE_WINDOW) j - CSE_WINDOW else start;
+                var i = j;
+                while (i > lo) {
+                    i -= 1;
+                    const e = code[i];
+                    if (e.op != in.op or e.ty != in.ty or e.aux != in.aux) continue;
+                    if (!sameArg(e.a, in.a) or !sameArg(e.b, in.b) or !sameArg(e.c, in.c)) continue;
+                    if (!renamable(w, e)) continue;
+                    if (w.tys[@intFromEnum(e.dst)] != w.tys[@intFromEnum(in.dst)]) continue;
+                    if (lastw[@intFromEnum(e.dst)] != i + 1) continue;
+                    const unchanged = for ([_]kir.Arg{ in.a, in.b, in.c }) |arg| {
+                        if (arg == .reg and arg.reg != .none and lastw[@intFromEnum(arg.reg)] > i) break false;
+                    } else true;
+                    if (!unchanged) continue;
+                    in.* = .{ .op = .mov, .ty = w.tys[@intFromEnum(in.dst)], .dst = in.dst, .a = .{ .reg = e.dst }, .b = kir.no, .c = kir.no, .aux = 0 };
+                    break;
+                }
+            }
+        }
+
+        /// What `cse` may compute once: an op whose result is its operands'
+        /// alone (no memory, no lanes'), or a stage's load of constant
+        /// buffer 1.
+        fn pureOp(c: *const Ctx, in: kir.Inst) bool {
+            return switch (in.op) {
+                .mov, .sel, .iadd, .isub, .imul, .imulhi, .imad, .ineg, .iabs, .imin, .imax, .@"and", .@"or", .xor, .not, .shl, .shr, .bfe, .dot4, .icmp, .fcmp, .pand, .por, .pnot, .fadd, .fsub, .fmul, .ffma, .fmad, .fmin, .fmax, .fabs, .fneg, .ffloor, .fceil, .ftrunc, .frne, .frcp, .frsq, .fexp2, .flog2, .fsin, .fcos, .cvt, .param => true,
+                .ld => blk: {
+                    if (c.opts.stage == .compute or c.opts.uni_bank == 0xff) break :blk false;
+                    const m: kir.Mem = @bitCast(in.aux);
+                    break :blk m.space == .global and m.binding == c.opts.uni_bank;
+                },
+                else => false,
+            };
+        }
+
+        /// A write `rename` may give a register of its own: a scalar's.
+        fn renamable(w: anytype, in: kir.Inst) bool {
+            if (!writesDst(in) or vecWidth(in) != null) return false;
+            return !w.uniform[@intFromEnum(in.dst)];
         }
 
         /// Copies of a value made only to be copied (`t = op ...; d = mov
@@ -3550,6 +3722,25 @@ fn readsOf(in: kir.Inst) [4]?u16 {
     return out;
 }
 
+/// How far back `cse` looks for the same computation (a shadow map's tap
+/// is about 50 ops).
+const CSE_WINDOW = 512;
+
+fn sameArg(a: kir.Arg, b: kir.Arg) bool {
+    return switch (a) {
+        .imm => |x| b == .imm and b.imm == x,
+        .reg => |v| b == .reg and b.reg == v,
+    };
+}
+
+/// Control flow: where `rename`'s straight-line stretches end.
+fn stretchEnd(in: kir.Inst) bool {
+    return switch (in.op) {
+        .@"if", .@"else", .endif, .loop, .endloop, .brk, .cont, .ret, .barrier => true,
+        else => false,
+    };
+}
+
 fn writesDst(in: kir.Inst) bool {
     return switch (in.op) {
         .st, .barrier, .@"if", .@"else", .endif, .loop, .brk, .cont, .endloop, .ret => false,
@@ -3613,6 +3804,10 @@ fn schedMem(m: *const MI) bool {
 fn schedLatency(m: *const MI) u32 {
     const op = m.op;
     if (std.mem.startsWith(u8, op, "LDG")) return 400;
+    // (a texture unit's sample or fetch: a memory round trip, and its
+    // filter's)
+    if (std.mem.startsWith(u8, op, "TEX") or std.mem.startsWith(u8, op, "TLD")) return 400;
+    if (std.mem.startsWith(u8, op, "IPA") or std.mem.startsWith(u8, op, "ALD")) return 20;
     if (std.mem.startsWith(u8, op, "LDS")) return 30;
     if (std.mem.startsWith(u8, op, "LDC")) return 20;
     if (std.mem.startsWith(u8, op, "S2R")) return 20;
