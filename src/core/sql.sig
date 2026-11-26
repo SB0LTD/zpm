@@ -1421,6 +1421,7 @@ pub fn Database(comptime config: Config) type {
                         .nextval,.currval,.setval,.lastval,.identity_next,.lo_create,.lo_creat,.lo_unlink,.lo_from_bytea,.lo_get,.lo_truncate,.lo_truncate64,.lo_import,.lo_export=>return error.UnsupportedStatement,
                         // These catalog lookups use the serialized database hook.
                         .to_regclass,.regclass_in,.regclass_out,.pg_get_serial_sequence,.pg_table_is_visible,.pg_get_indexdef,.pg_get_constraintdef,.pg_get_triggerdef,.pg_get_viewdef,.pg_partition_ancestors,
+                        .pg_get_function_arguments,.pg_get_function_identity_arguments,.pg_get_function_result,.pg_get_function_sqlbody,
                         .to_regnamespace,.regnamespace_in,.regnamespace_out,.to_regproc=>return error.UnsupportedStatement,
                         .pg_get_statisticsobjdef_columns,.pg_relation_is_publishable,.pg_get_partkeydef,.acldefault,.current_schemas=>return error.UnsupportedStatement,
                         .obj_description,.col_description,.shobj_description,.current_user,.session_user=>return error.UnsupportedStatement,
@@ -4273,20 +4274,29 @@ pub fn Database(comptime config: Config) type {
             return try pages.read(oid, length, at, output[0..@intCast(count)], snap);
         }
 
-        fn authorizeLargeObjectFile(ptr: *anyopaque) Error!void {
+        fn authorizeLargeObjectFile(ptr: *anyopaque, function: u32) Error!void {
             const self: *const Self = @ptrCast(@alignCast(ptr));
             if (self.startup_recovery_active or self.dialect != .postgres) return error.UnsupportedStatement;
             var current = try largeObjectView(self.seq_snap);
             current.csn = self.csn;
-            if (self.large_object_files == null or !self.privilegedRole(current)) return error.InsufficientPrivilege;
+            if (self.large_object_files == null or !CO.restrictedRoutine(function)) return error.InsufficientPrivilege;
+            if (self.privilegedRole(current)) return;
+            const owner_key: O.Object = .{ .kind = .builtin_routine_acl, .target = function, .grantee = CO.bootstrap_role };
+            if (self.catalog_objects.findKey(&owner_key, current) == null and
+                self.catalog_objects.memberOf(self.session.role, CO.bootstrap_role, true, current)) return;
+            for (&self.catalog_objects.items) |*entry| {
+                if (entry.kind != .builtin_routine_acl or entry.target != function or
+                    entry.flags & CO.priv_execute == 0 or !O.visible(entry, current)) continue;
+                if (entry.grantee == CO.public_role or self.catalog_objects.memberOf(self.session.role, entry.grantee, true, current)) return;
+            }
+            return error.InsufficientPrivilege;
         }
 
         const file_chunk_bytes = 8 * large_object_pages.page_bytes;
 
         fn largeObjectFileCall(ptr: *anyopaque, operation: large_object_file.Operation, oid: u32, path: []const u8) Error!u32 {
-            try authorizeLargeObjectFile(ptr);
             const self: *Self = @ptrCast(@alignCast(ptr));
-            const files = self.large_object_files.?;
+            const files = self.large_object_files orelse return error.UnsupportedStatement;
             const snap = try largeObjectView(self.seq_snap);
             return switch (operation) {
                 .import_file => self.importLargeObject(files, oid, path, snap),
@@ -5277,7 +5287,7 @@ pub fn Database(comptime config: Config) type {
                 }
                 for (&self.catalog_objects.items) |*o| {
                     const affected = (CO.userType(o.kind) or o.kind == .statistics or o.kind == .relation or o.kind == .large_object) and o.owner == oid or
-                        (o.kind == .schema_acl or o.kind == .large_object_acl or o.kind == .large_object_default_acl) and
+                        (o.kind == .schema_acl or o.kind == .large_object_acl or o.kind == .large_object_default_acl or o.kind == .builtin_routine_acl) and
                             (o.owner == oid or o.grantee == oid) or
                         o.kind == .role_settings and o.target == oid;
                     if (affected and O.visible(o, latest) != O.visible(o, snap)) return error.SerializationFailure;
@@ -5292,7 +5302,7 @@ pub fn Database(comptime config: Config) type {
                             writes += 1;
                         },
                         .role_settings => if (o.target == oid) { writes += 1; },
-                        .acl, .schema_acl, .large_object_acl, .large_object_default_acl => if (o.grantee == oid or o.owner == oid) return error.DependentObjects,
+                        .acl, .schema_acl, .large_object_acl, .large_object_default_acl, .builtin_routine_acl => if (o.grantee == oid or o.owner == oid) return error.DependentObjects,
                         .policy => {
                             for (o.roleList()) |listed| {
                                 if (listed == oid) return error.DependentObjects;
@@ -6375,6 +6385,7 @@ pub fn Database(comptime config: Config) type {
             const self: *Self = @ptrCast(@alignCast(ptr));
             const snap = self.seq_snap;
             const text: []const u8 = switch (kind) {
+                .function_arguments, .function_identity_arguments, .function_result, .function_sqlbody => return self.functionCatalogText(kind, object, snap, out),
                 .role_name => self.catalog_objects.roleName(object, snap) orelse return null,
                 .description => self.catalog_objects.description(object, classoid, sub, snap) orelse return null,
                 .shared_description => if (classoid == CO.class_authid) self.catalog_objects.description(object, classoid, 0, snap) orelse return null else return null,
@@ -6382,6 +6393,48 @@ pub fn Database(comptime config: Config) type {
             if (text.len > out.len) return error.TextCapacity;
             @memcpy(out[0..text.len], text);
             return text.len;
+        }
+
+        fn functionTypeName(oid: u32) Error![]const u8 {
+            return types.regtypeName(oid) orelse switch (oid) {
+                routine_catalog.void_oid => "void", routine_catalog.trigger_oid => "trigger", catalog_module.internal_type_oid => "internal",
+                else => error.UndefinedObject,
+            };
+        }
+
+        fn functionCatalogText(self: *const Self, kind: value_module.CatalogText, oid: u32, snap: Snapshot, out: []u8) Error!?usize {
+            // All supported SQL-language bodies use quoted source text;
+            // none has a SQL-standard BEGIN ATOMIC expression tree.
+            if (kind == .function_sqlbody) return null;
+            var args: []const u32 = &.{};
+            var names: []const Name = &.{};
+            var result: u32 = 0;
+            for (catalog_module.builtin_callbacks) |callback| {
+                if (callback.oid != oid) continue;
+                args = callback.args;
+                result = callback.result;
+                break;
+            } else for (&self.objects.routines) |*routine| {
+                if (!routine.live or routine.oid != oid or !routine.stamp.visible(snap)) continue;
+                if (kind == .function_result and routine.kind == 'p') return null;
+                args = routine.args();
+                names = routine.arg_names[0..routine.arg_count];
+                result = routine.return_oid;
+                break;
+            } else return null;
+            var writer: CatalogTextWriter = .{ .out = out, .quote_all = self.session.quote_all_identifiers };
+            if (kind == .function_result) {
+                writer.add(try functionTypeName(result));
+            } else for (args, 0..) |argument, index| {
+                if (index != 0) writer.add(", ");
+                if (names.len != 0 and names[index].len != 0) {
+                    writer.ident(names[index].slice());
+                    writer.add(" ");
+                }
+                writer.add(try functionTypeName(argument));
+            }
+            if (writer.shortened) return error.TextCapacity;
+            return writer.len;
         }
 
         fn catalogSchemaPath(ptr: *anyopaque, implicit: bool, names: *[2][]const u8) usize {
@@ -7590,6 +7643,7 @@ pub fn Database(comptime config: Config) type {
             // Object catalogs bypass the relation and type row builders.
             return switch (view) {
                 .pg_largeobject => self.largeObjectRows(session_values, snapshot, sink),
+                .pg_proc, .pg_trigger, .pg_rewrite, .pg_rules => self.objectViewRows(snapshot, view, sink),
                 // Built-in ACL defaults come from acldefault() and have no stored row.
                 .pg_default_acl, .pg_largeobject_metadata, .pg_roles, .pg_authid, .pg_auth_members,
                 .pg_db_role_setting, .pg_policy, .pg_policies, .pg_description, .pg_shdescription,
@@ -7789,7 +7843,6 @@ pub fn Database(comptime config: Config) type {
             const count = self.catalog.visibleRelations(snapshot, &relations);
             if (view == .pg_class or view == .pg_attribute) try self.compositeCatalogRows(view, snapshot, sink);
             switch (view) {
-                .pg_proc, .pg_trigger, .pg_rewrite, .pg_rules => return self.objectViewRows(snapshot, view, sink),
                 .pg_depend => return self.dependencyRows(session_values, snapshot, pool, relations[0..count], sink),
                 .pg_type => {
                     for (catalog_module.builtin_pseudo_types) |info| {
@@ -12599,7 +12652,141 @@ pub fn Database(comptime config: Config) type {
             return found;
         }
 
+        fn builtinRoutineGraph(self: *const Self, oid: u32, snap: Snapshot, edges: []LoAcl.Edge) LoAcl.Graph {
+            var graph: LoAcl.Graph = .{ .edges = edges, .owner = CO.bootstrap_role, .privileges = CO.priv_execute };
+            var owner_present = false;
+            for (&self.catalog_objects.items, 0..) |*entry, index| {
+                if (entry.kind != .builtin_routine_acl or entry.target != oid or !O.visible(entry, snap)) continue;
+                graph.add(.{ .grantor = entry.owner, .grantee = entry.grantee, .flags = entry.flags, .options = entry.grant_flags, .original = index });
+                owner_present = owner_present or (entry.owner == graph.owner and entry.grantee == graph.owner);
+            }
+            if (!owner_present) graph.add(.{ .grantor = graph.owner, .grantee = graph.owner, .flags = CO.priv_execute, .options = 0 });
+            return graph;
+        }
+
+        fn grantBuiltinRoutine(self: *Self, slot: u16, oid: u32, grant: *const R.ExecuteGrant, allow: bool, snap: Snapshot) Error!void {
+            const key: O.Object = .{ .kind = .builtin_routine_acl, .target = oid, .grantee = CO.bootstrap_role };
+            if (self.catalog_objects.pendingConflict(&key, snap)) |other| return self.objectPark(slot, other);
+            var latest = snap;
+            latest.csn = self.csn;
+            if (self.catalog_objects.findKey(&key, snap) != self.catalog_objects.findKey(&key, latest)) return error.SerializationFailure;
+            for (&self.catalog_objects.items) |*entry| {
+                if (!entry.used or entry.kind != .builtin_routine_acl or entry.target != oid) continue;
+                if (O.pendingOf(entry, snap)) |other| return self.objectPark(slot, other);
+                if (O.visible(entry, latest) != O.visible(entry, snap)) return error.SerializationFailure;
+            }
+            const role = if (grant.grantee.len == 0) CO.public_role else
+                self.catalog_objects.roleByName(grant.grantee.slice(), snap) orelse return error.UndefinedObject;
+            if (role == CO.public_role and allow and grant.option) return error.InvalidGrantOperation;
+            if (role != CO.public_role) {
+                if (self.catalog_objects.pendingReference(role, snap)) |other| return self.objectPark(slot, other);
+                if (self.catalog_objects.roleName(role, latest) == null) return error.SerializationFailure;
+            }
+            var edges: [O.capacity + 2]LoAcl.Edge = undefined;
+            var support: [edges.len]LoAcl.Graph.State = undefined;
+            var graph = self.builtinRoutineGraph(oid, snap, &edges);
+            const issuer = self.largeObjectGrantor(graph, CO.priv_execute, snap);
+            if (issuer.options == 0) {
+                var accessible = false;
+                for (graph.edges[0..graph.len]) |edge| {
+                    if (edge.flags != 0 and (edge.grantee == CO.public_role or self.catalog_objects.memberOf(self.session.role, edge.grantee, true, snap))) accessible = true;
+                }
+                if (!accessible) return error.InsufficientPrivilege;
+                self.largeObjectGrantWarning(!allow, false);
+                return;
+            }
+            const existing = graph.find(issuer.role, role);
+            if (allow and grant.option and issuer.role != graph.owner and role != graph.owner) {
+                graph.support(&support, role);
+                if (graph.supportedOptions(issuer.role, &support) & CO.priv_execute == 0) return error.InvalidGrantOperation;
+            }
+            const item = existing orelse blk: {
+                // Keep the owner marker even when its privileges are empty.
+                for (graph.edges[0..graph.len], 0..) |edge, index| {
+                    if (edge.grantor == issuer.role and edge.grantee == role) break :blk index;
+                }
+                if (!allow) return;
+                graph.add(.{ .grantor = issuer.role, .grantee = role, .flags = 0, .options = 0 });
+                break :blk graph.len - 1;
+            };
+            const edge = &graph.edges[item];
+            if (allow) {
+                edge.flags |= CO.priv_execute;
+                if (grant.option) edge.options |= CO.priv_execute;
+            } else {
+                edge.options = 0;
+                if (!grant.option) edge.flags = 0;
+                graph.support(&support, null);
+                for (graph.edges[0..graph.len], support[0..graph.len]) |*dependent, state| {
+                    if (dependent.flags & ~state.available == 0) continue;
+                    if (!grant.cascade) return error.DependentObjects;
+                    dependent.flags &= state.available;
+                    dependent.options &= state.available;
+                }
+            }
+            // Replace the common owner marker to serialize edits to this
+            // function's graph, including changes to different grantees.
+            var writes: usize = 0;
+            for (graph.edges[0..graph.len]) |entry| {
+                const marker = entry.grantor == graph.owner and entry.grantee == graph.owner;
+                if (marker or self.largeObjectGrantChanged(graph, entry))
+                    writes += @as(usize, @intFromBool(entry.original != null)) + @intFromBool(marker or entry.flags != 0);
+            }
+            try self.reserveWrites(slot, writes);
+            for (graph.edges[0..graph.len]) |entry| {
+                const marker = entry.grantor == graph.owner and entry.grantee == graph.owner;
+                if (marker or self.largeObjectGrantChanged(graph, entry)) {
+                    if (entry.original) |old| self.objectDelete(slot, old, snap);
+                }
+            }
+            for (graph.edges[0..graph.len]) |entry| {
+                const marker = entry.grantor == graph.owner and entry.grantee == graph.owner;
+                if (!marker and (entry.flags == 0 or !self.largeObjectGrantChanged(graph, entry))) continue;
+                var row: O.Object = .{ .kind = .builtin_routine_acl, .target = oid, .grantee = entry.grantee,
+                    .owner = entry.grantor, .sub = largeObjectGrantorKey(graph.owner, entry.grantor), .flags = entry.flags, .grant_flags = entry.options };
+                _ = try self.objectInsert(slot, &row, false, snap);
+            }
+        }
+
+        fn builtinRoutineAcl(self: *const Self, oid: u32, snapshot: Snapshot, values: ?*types.ValueBytes) Error!Cell {
+            var edges: [O.capacity + 1]LoAcl.Edge = undefined;
+            const graph = self.builtinRoutineGraph(oid, snapshot, &edges);
+            var emitted: [edges.len]LoAcl.Graph.State = undefined;
+            var steps: [edges.len]LoAcl.Graph.Step = undefined;
+            graph.start(&emitted);
+            var count: usize = 0;
+            while (graph.next(&emitted)) |step| {
+                steps[count] = step;
+                count += 1;
+            }
+            const Acl = @import("sql/catalog_acl.sig").Acl(V);
+            var inline_buffer: [config.text_bytes]u8 = undefined;
+            var writer = try Acl.CatalogWriter.start(&inline_buffer, values, @intCast(count));
+            for (steps[0..count]) |step| {
+                const entry = edges[step.index];
+                const grantee = if (entry.grantee == CO.public_role) "" else self.catalog_objects.roleName(entry.grantee, snapshot) orelse return error.UndefinedObject;
+                const grantor = self.catalog_objects.roleName(entry.grantor, snapshot) orelse return error.UndefinedObject;
+                try writer.add(grantee, if (entry.options != 0) "X*" else "X", grantor);
+            }
+            return writer.finish();
+        }
+
         fn grantRoutine(self: *Self, slot: u16, grant: *const R.ExecuteGrant, allow: bool, snap: Snapshot) Error!void {
+            if (!types.same(grant.schema.slice(), "public")) {
+                var found: ?u32 = null;
+                for (catalog_module.builtin_callbacks) |callback| {
+                    if (!callback.owner_execute_only or !types.same(callback.name, grant.routine.name.slice())) continue;
+                    if (grant.routine.has_args and !std.mem.eql(u32, callback.args, grant.routine.args[0..grant.routine.arg_count])) continue;
+                    if (found != null) return error.AmbiguousFunction;
+                    found = callback.oid;
+                }
+                if (found) |oid| {
+                    if (grant.routine.procedure) return error.WrongObjectType;
+                    return self.grantBuiltinRoutine(slot, oid, grant, allow, snap);
+                }
+                if (types.same(grant.schema.slice(), "pg_catalog")) return error.UndefinedFunction;
+            }
+            if (grant.option or grant.cascade) return error.UnsupportedStatement;
             const index = (try self.findRoutineTarget(slot, &grant.routine, snap)) orelse return error.UndefinedFunction;
             const old = &self.objects.routines[index];
             if (!self.ownsRoutine(old, snap)) return error.InsufficientPrivilege;
@@ -13358,6 +13545,17 @@ pub fn Database(comptime config: Config) type {
         }
 
         /// pg_proc, pg_trigger, pg_rewrite and pg_rules rows.
+        fn procRow(sink: *X.RowSink, base: *const [13]Cell) Error!void {
+            var cells: [23]Cell = undefined;
+            @memcpy(cells[0..13], base);
+            // Supported routines return one value, run as invoker, have no
+            // per-routine settings, transforms or planner support callback.
+            cells[13..].* = .{ boolCell(false), .null_value, boolCell(false), .null_value,
+                .{ .float4 = if (base[4].integer == operator_catalog.internal_language_oid) 1 else 100 },
+                .{ .float4 = 0 }, boolCell(false), .null_value, .{ .pg_internal_char = 'u' }, .{ .regproc = 0 } };
+            try sink.add(&cells);
+        }
+
         fn objectViewRows(self: *const Self, snapshot: Snapshot, view: catalog_module.View, sink: *X.RowSink) Error!void {
             switch (view) {
                 .pg_proc => {
@@ -13370,9 +13568,9 @@ pub fn Database(comptime config: Config) type {
                             argtypes.add(std.fmt.bufPrint(&digits, "{d}", .{oid}) catch unreachable);
                         }
                         const acl = if (callback.owner_execute_only and sink.referencesColumn(12))
-                            try @import("sql/catalog_acl.sig").Acl(V).ownerOnly(CO.bootstrap_name, "X")
+                            try self.builtinRoutineAcl(callback.oid, snapshot, sink.valueBytes())
                         else .null_value;
-                        try sink.add(&.{
+                        try procRow(sink, &.{
                             intCell(callback.oid), nameCell(callback.name), intCell(catalog_module.catalog_namespace),
                             .{ .pg_internal_char = 'f' }, intCell(callback.language), .{ .pg_internal_char = callback.volatility },
                             boolCell(callback.strict), intCell(@intCast(callback.args.len)), intCell(callback.result), nameCell(argtypes.slice()),
@@ -13382,7 +13580,7 @@ pub fn Database(comptime config: Config) type {
                     for (catalog_module.access_methods) |am| {
                         var args: [10]u8 = undefined;
                         const arg_oid = std.fmt.bufPrint(&args, "{d}", .{catalog_module.internal_type_oid}) catch unreachable;
-                        try sink.add(&.{
+                        try procRow(sink, &.{
                             intCell(am.handler), nameCell(am.handler_name), intCell(catalog_module.catalog_namespace),
                             .{ .pg_internal_char = 'f' }, intCell(operator_catalog.internal_language_oid), .{ .pg_internal_char = 'v' },
                             boolCell(true), intCell(1), intCell(am.result), nameCell(arg_oid), nameCell(am.handler_name),
@@ -13395,7 +13593,7 @@ pub fn Database(comptime config: Config) type {
                             std.fmt.bufPrint(&buffer, "{d}", .{op.right}) catch unreachable
                         else
                             std.fmt.bufPrint(&buffer, "{d} {d}", .{ op.left, op.right }) catch unreachable;
-                        try sink.add(&.{
+                        try procRow(sink, &.{
                             intCell(op.function_oid), nameCell(op.function_name), intCell(catalog_module.catalog_namespace),
                             .{ .pg_internal_char = 'f' }, intCell(operator_catalog.internal_language_oid), .{ .pg_internal_char = op.volatility },
                             boolCell(op.strict), intCell(if (op.left == 0) 1 else 2), intCell(op.result), nameCell(args),
@@ -13424,7 +13622,7 @@ pub fn Database(comptime config: Config) type {
                             at += length;
                         }
                         const language = if (routine.language == 0) catalog_module.sql_language_oid else catalog_module.plpgsql_language_oid;
-                        try sink.add(&.{ intCell(routine.oid), nameCell(routine.name.slice()), intCell(routine.namespace), .{ .pg_internal_char = routine.kind }, intCell(language), .{ .pg_internal_char = routine.volatility }, boolCell(routine.strict), intCell(@intCast(routine.arg_count)), intCell(routine.return_oid), nameCell(argtypes[0..at]), nameCell(routine.body.slice()), intCell(routine.owner), try self.routineAcl(routine, snapshot) });
+                        try procRow(sink, &.{ intCell(routine.oid), nameCell(routine.name.slice()), intCell(routine.namespace), .{ .pg_internal_char = routine.kind }, intCell(language), .{ .pg_internal_char = routine.volatility }, boolCell(routine.strict), intCell(@intCast(routine.arg_count)), intCell(routine.return_oid), nameCell(argtypes[0..at]), nameCell(routine.body.slice()), intCell(routine.owner), try self.routineAcl(routine, snapshot) });
                     }
                 },
                 .pg_trigger => for (&self.objects.triggers) |*trigger| {

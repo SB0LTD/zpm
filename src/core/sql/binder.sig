@@ -1438,6 +1438,10 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "col_description", .func = .col_description },
                 .{ .name = "shobj_description", .func = .shobj_description },
                 .{ .name = "pg_get_userbyid", .func = .pg_get_userbyid },
+                .{ .name = "pg_get_function_arguments", .func = .pg_get_function_arguments },
+                .{ .name = "pg_get_function_identity_arguments", .func = .pg_get_function_identity_arguments },
+                .{ .name = "pg_get_function_result", .func = .pg_get_function_result },
+                .{ .name = "pg_get_function_sqlbody", .func = .pg_get_function_sqlbody },
                 .{ .name = "pg_tablespace_location", .func = .pg_tablespace_location },
                 // Regular expressions (B11 text lane).
                 .{ .name = "regexp_like", .func = .regexp_like },
@@ -2451,6 +2455,11 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 .pg_tablespace_location => {
                     try bindSignature(context, n, &[_]ast.Type{.oid}, .text, true);
+                    n.constant = false;
+                },
+                .pg_get_function_arguments, .pg_get_function_identity_arguments, .pg_get_function_result, .pg_get_function_sqlbody => {
+                    if (context.dialect != .postgres) return error.UndefinedFunction;
+                    try bindSignature(context, n, &.{.oid}, .text, true);
                     n.constant = false;
                 },
                 .current_user, .session_user => {

@@ -109,7 +109,7 @@ pub const SequenceCall = enum { nextval, currval, setval, lastval, identity, reg
 pub const LargeObjectData = enum { create, read };
 
 pub const LargeObjectFileHook = struct {
-    authorize: *const fn (ptr: *anyopaque) Error!void,
+    authorize: *const fn (ptr: *anyopaque, function: u32) Error!void,
     call: *const fn (ptr: *anyopaque, operation: @import("large_object_file.sig").Operation, oid: u32, path: []const u8) Error!u32,
 };
 
@@ -186,7 +186,7 @@ pub const RoutineHook = struct {
     call: *const fn (ptr: *anyopaque, routine: usize, args: *const anyopaque, count: usize, out: *anyopaque) Error!void,
 };
 
-pub const CatalogText = enum { description, shared_description, role_name };
+pub const CatalogText = enum { description, shared_description, role_name, function_arguments, function_identity_arguments, function_result, function_sqlbody };
 
 pub const default_session: Session = .{};
 const SessionType = Session;

@@ -191,7 +191,7 @@ fn distantPages() !void {
 }
 
 const DB = @import("sql").Database(.{
-    .external_storage = true, .tables = 1, .columns = 8, .text_bytes = 4096,
+    .external_storage = true, .tables = 1, .columns = 8, .name_bytes = 63, .text_bytes = 4096,
     .rows_per_table = 4, .work_rows = 16, .result_rows = 16, .transactions = 4,
     .catalog_objects = 32, .tx_writes = 64,
 });
@@ -522,6 +522,105 @@ fn fileTransfers() !void {
     try expect(FileFixture.opens == FileFixture.closes);
 }
 
+var grant_db: DB = .{};
+var grant_replay: DB = .{};
+var grant_checkpoint: DB = .{};
+var grant_arena: Arena = .{};
+var grant_replay_arena: Arena = .{};
+var grant_checkpoint_arena: Arena = .{};
+
+fn grantBoth(statement: []const u8) !void {
+    var wal: [8192]u8 = undefined;
+    try grant_replay.applyChangeRecord(try executeWAL(&grant_db, statement, &wal), &replay_scratch);
+}
+
+fn deniedFile(db: *DB, statement: []const u8) !void {
+    var result: DB.Result = .{};
+    const before = FileFixture.opens;
+    if (db.execute(statement, &result)) |_| return error.UnauthorizedFileCall else |err| try expect(err == error.InsufficientPrivilege);
+    try expect(before == FileFixture.opens);
+}
+
+fn fileExecuteGrants() !void {
+    try grant_arena.bind(&grant_db);
+    try grant_replay_arena.bind(&grant_replay);
+    const Access = @import("sql").LargeObjectFiles;
+    grant_db.setLargeObjectFiles(Access.native(FileFixture));
+    grant_replay.setLargeObjectFiles(Access.native(FileFixture));
+    var result: DB.Result = .{};
+    try grant_db.execute("SELECT pg_get_function_arguments(767),pg_get_function_identity_arguments(765),pg_get_function_result(764),pg_get_function_sqlbody(764)", &result);
+    try expect(std.mem.eql(u8, result.rows[0].cells[0].text.slice(), "text, oid"));
+    try expect(std.mem.eql(u8, result.rows[0].cells[1].text.slice(), "oid, text"));
+    try expect(std.mem.eql(u8, result.rows[0].cells[2].text.slice(), "oid"));
+    try expect(result.rows[0].cells[3] == .null_value);
+    try grant_db.execute("SELECT p.proretset,p.prosecdef,p.procost,p.proparallel,p.prosupport,l.lanname FROM pg_proc p,pg_language l WHERE p.oid=764 AND l.oid=p.prolang", &result);
+    try expect(result.row_count == 1 and !result.rows[0].cells[0].boolean and !result.rows[0].cells[1].boolean);
+    try expect(result.rows[0].cells[2].float4 == 1 and result.rows[0].cells[3].pg_internal_char == 'u' and result.rows[0].cells[4].regproc == 0);
+    try expect(std.mem.eql(u8, result.rows[0].cells[5].text.slice(), "internal"));
+    try grantBoth("CREATE ROLE file_delegate");
+    try grantBoth("CREATE ROLE file_member");
+    try grantBoth("GRANT file_delegate TO file_member");
+    try grantBoth("GRANT EXECUTE ON FUNCTION pg_catalog.lo_import(text,oid) TO file_delegate WITH GRANT OPTION");
+    for ([_]*DB{ &grant_db, &grant_replay }) |db| {
+        try db.execute("SET ROLE file_member", &result);
+        try db.execute("SELECT lo_import(NULL::text,0::oid)", &result);
+        try expect(result.rows[0].cells[0] == .null_value);
+        try deniedFile(db, "SELECT lo_import(NULL::text)");
+        try deniedFile(db, "SELECT lo_export(NULL::oid,NULL::text)");
+        try db.execute("RESET ROLE", &result);
+    }
+    try grant_db.execute("SET ROLE file_delegate", &result);
+    try grantBoth("GRANT ALL ON FUNCTION lo_import(text,oid) TO file_member");
+    try grant_db.execute("RESET ROLE", &result);
+    if (grant_db.execute("REVOKE GRANT OPTION FOR EXECUTE ON FUNCTION lo_import(text,oid) FROM file_delegate", &result)) |_| return error.DependentGrantLost else |err| try expect(err == error.DependentObjects);
+    try grantBoth("REVOKE GRANT OPTION FOR EXECUTE ON FUNCTION lo_import(text,oid) FROM file_delegate CASCADE");
+    try grantBoth("REVOKE file_delegate FROM file_member");
+    try grant_replay.execute("SET ROLE file_member", &result);
+    try deniedFile(&grant_replay, "SELECT lo_import(NULL::text,0::oid)");
+    try grant_replay.execute("RESET ROLE", &result);
+    try grant_db.execute("SET ROLE file_delegate", &result);
+    var wal: [8192]u8 = undefined;
+    try grant_replay.applyChangeRecord(try executeWAL(&grant_db, "SELECT lo_import('source',56020)", &wal), &replay_scratch);
+    try grant_db.execute("RESET ROLE", &result);
+    try grantBoth("GRANT EXECUTE ON FUNCTION lo_export(oid,text) TO file_member");
+    try grant_db.execute("SET ROLE file_member", &result);
+    try deniedFile(&grant_db, "SELECT lo_export(56020,'output')");
+    try grant_db.execute("RESET ROLE", &result);
+    try grant_db.execute("SET ROLE file_delegate", &result);
+    try grantBoth("GRANT SELECT ON LARGE OBJECT 56020 TO file_member");
+    try grant_db.execute("RESET ROLE", &result);
+    try grant_db.execute("SET ROLE file_member", &result);
+    try grant_db.execute("SELECT lo_export(56020,'output')", &result);
+    try expect(FileFixture.written == FileFixture.input.len);
+    try grant_db.execute("RESET ROLE", &result);
+    try grantBoth("GRANT EXECUTE ON FUNCTION lo_import(text) TO PUBLIC");
+    const tx = try grant_db.begin();
+    try grant_db.statement(tx, "REVOKE EXECUTE ON FUNCTION lo_import(text) FROM PUBLIC", &result, .{});
+    grant_db.abort(tx);
+    try grant_db.execute("SET ROLE file_member", &result);
+    try grant_db.execute("SELECT lo_import(NULL::text)", &result);
+    try grant_db.execute("RESET ROLE", &result);
+    if (grant_db.execute("DROP ROLE file_member", &result)) |_| return error.GrantRoleDependencyLost else |err| try expect(err == error.DependentObjects);
+    var image: ImageBuffer = .{};
+    try DB.BaseSnapshot.write(&grant_db, &image, &wal);
+    try expect(std.mem.eql(u8, image.bytes[0..8], "RSBASE08"));
+    try grant_checkpoint_arena.bind(&grant_checkpoint);
+    try DB.BaseSnapshot.restore(&grant_checkpoint, &image, grant_db.csn, &wal, &replay_scratch);
+    grant_checkpoint.setLargeObjectFiles(Access.native(FileFixture));
+    try grant_checkpoint.execute("SET ROLE file_member", &result);
+    try grant_checkpoint.execute("SELECT lo_export(56020,'output')", &result);
+    try grant_checkpoint.execute("SELECT lo_import(NULL::text)", &result);
+    try grant_checkpoint.execute("RESET ROLE", &result);
+    const revoked = try executeWAL(&grant_db, "REVOKE ALL PRIVILEGES ON FUNCTION pg_catalog.lo_export(oid,text) FROM file_member", &wal);
+    try grant_replay.applyChangeRecord(revoked, &replay_scratch);
+    try grant_checkpoint.applyChangeRecord(revoked, &replay_scratch);
+    for ([_]*DB{ &grant_db, &grant_replay, &grant_checkpoint }) |db| {
+        try db.execute("SET ROLE file_member", &result);
+        try deniedFile(db, "SELECT lo_export(56020,'output')");
+        try db.execute("RESET ROLE", &result);
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     try snapshotAndSparseRead();
     try atomicCapacityFailure();
@@ -532,6 +631,7 @@ pub fn main(init: std.process.Init) !void {
     try compactRoundTrip();
     try truncateRecovery();
     try fileTransfers();
+    try fileExecuteGrants();
     var line: [160]u8 = undefined;
     const report = try std.fmt.bufPrint(&line, "{{\"suite\":\"sql-large-object-pages\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, report);
