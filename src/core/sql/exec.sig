@@ -143,6 +143,15 @@ pub fn Exec(comptime config: types.Config) type {
             pinned_cells: usize = 0,
             pinned_refs: usize = 0,
             dml_rows: [config.ctes]List = undefined,
+            value_backing: [types.catalogValueBytes(config)]u8 = undefined,
+            values: types.ValueBytes = .{},
+
+            fn setupValues(self: *Work, session: *const value_module.Session) value_module.Session {
+                self.values = .{ .bytes = &self.value_backing };
+                var active = session.*;
+                active.value_bytes = &self.values;
+                return active;
+            }
 
             fn reset(self: *Work) void {
                 self.cell_low = 0;
@@ -178,6 +187,10 @@ pub fn Exec(comptime config: types.Config) type {
                 wanted: u64,
             };
             const CatalogFilter = struct { context: E.Context, predicate: u16 };
+
+            pub fn valueBytes(self: *const RowSink) ?*types.ValueBytes {
+                return self.query.session.value_bytes;
+            }
 
             /// In a single bound query block, all column references are in
             /// this pool and their relation ordinals have one meaning.
@@ -5010,10 +5023,12 @@ pub fn Exec(comptime config: types.Config) type {
                 result.column_types[column] = types.dataTypeOf(p.tys[column]);
                 result.column_typmods[column] = p.typmods[column];
             }
-            result.row_count = list.count;
             for (work.refs[list.start..][0..list.count], 0..) |offset, index| {
-                @memcpy(result.rows[index].cells[0..p.count], work.cells[offset..][0..p.count]);
+                const output = result.rows[index].cells[0..p.count];
+                const input = work.cells[offset..][0..p.count];
+                if (work.values.used != 0) try result.copyCells(output, input) else @memcpy(output, input);
             }
+            result.row_count = list.count;
         }
         /// Runs a bound general query and leaves its output rows in `work`
         /// (INSERT ... SELECT); read them with rowAt until the next reset.
@@ -5029,7 +5044,8 @@ pub fn Exec(comptime config: types.Config) type {
 
         fn executeQuery(tables: *const [config.tables]S.Table, source: []const u8, pool: *const Ast.Pool, plans: *const B.Plans, root: u16, snap: storage.Snapshot, session: *const value_module.Session, work: *Work, committed_only: bool) Error!List {
             work.reset();
-            var runner: Query = .{ .tables = tables, .source = source, .pool = pool, .plans = plans, .snap = snap, .session = session, .work = work, .committed_only = committed_only };
+            const active = work.setupValues(session);
+            var runner: Query = .{ .tables = tables, .source = source, .pool = pool, .plans = plans, .snap = snap, .session = &active, .work = work, .committed_only = committed_only };
             runner.hook = .{ .ptr = &runner, .run = Query.subquery };
             return runner.run(root, null);
         }
@@ -5482,6 +5498,8 @@ pub fn Exec(comptime config: types.Config) type {
             for (query.targets[0..query.count]) |id| plain = plain and simple(pool, id);
             if (query.table == null) {
                 // No FROM: one row when WHERE holds and LIMIT allows it.
+                const active = work.setupValues(session);
+                ctx.session = &active;
                 var row: E.Row = undefined;
                 var produced = false;
                 if (query.limit != 0 and try keep(&ctx, query.where, null)) {
@@ -5496,8 +5514,11 @@ pub fn Exec(comptime config: types.Config) type {
                     observation.* = .{ .operation = if (query.limit == 0) .limit else .result, .rows = @intFromBool(produced) };
                 } else {
                     writeHeader(query, result);
+                    if (produced) {
+                        const output = result.rows[0].cells[0..query.count];
+                        if (work.values.used != 0) try result.copyCells(output, row[0..query.count]) else @memcpy(output, row[0..query.count]);
+                    }
                     result.row_count = @intFromBool(produced);
-                    if (produced) @memcpy(result.rows[0].cells[0..query.count], row[0..query.count]);
                 }
                 return;
             }

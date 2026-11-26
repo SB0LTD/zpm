@@ -114,7 +114,7 @@ pub fn ArrayText(comptime config: types.Config, comptime Io: type) type {
                     try out.bytes("NULL");
                     continue;
                 }
-                const text = try Io.format(&cell, false, session, &element);
+                const text = if (cell == .text) cell.text.slice() else try Io.format(&cell, false, session, &element);
                 if (!needsQuote(text)) {
                     try out.bytes(text);
                     continue;

@@ -35,6 +35,7 @@
 //! SessionCapacity (54000, "too many notifications in the NOTIFY queue")
 //! when the committed entries still unread plus every pending one would
 //! not fit, so publication never fails.
+const std = @import("std");
 const types = @import("types.sig");
 const mvcc = @import("mvcc.sig");
 const Error = types.Error;
@@ -303,6 +304,8 @@ pub fn Sessions(comptime config: types.Config) type {
             nominal_types: [config.columns]types.NominalColumnType = undefined,
             base: usize = 0,
             count: usize = 0,
+            value_base: usize = 0,
+            value_len: usize = 0,
             /// 0 before the first row, 1..count on a row, count+1 after the last.
             position: usize = 0,
         };
@@ -311,6 +314,8 @@ pub fn Sessions(comptime config: types.Config) type {
             slots: [config.cursors]Cursor = @splat(.{}),
             rows: [cursor_rows]Row = undefined,
             used_rows: usize = 0,
+            value_backing: [types.catalogValueBytes(config) / 2]u8 = undefined,
+            value_used: usize = 0,
 
             pub fn find(self: *const Cursors, session: u64, name: []const u8) ?usize {
                 for (&self.slots, 0..) |*cursor, index| {
@@ -330,13 +335,30 @@ pub fn Sessions(comptime config: types.Config) type {
                 if (!cursor.used) return;
                 const base = cursor.base;
                 const count = cursor.count;
+                const value_base = cursor.value_base;
+                const value_len = cursor.value_len;
                 cursor.* = .{};
                 if (count == 0) return;
                 var at = base;
                 while (at + count < self.used_rows) : (at += 1) self.rows[at] = self.rows[at + count];
                 self.used_rows -= count;
+                if (value_len != 0) {
+                    const tail = self.value_backing[value_base + value_len .. self.value_used];
+                    std.mem.copyForwards(u8, self.value_backing[value_base .. value_base + tail.len], tail);
+                    self.value_used -= value_len;
+                }
                 for (&self.slots) |*other| if (other.used and other.base > base) {
                     other.base -= count;
+                    if (other.value_len == 0 or value_len == 0) continue;
+                    for (self.rows[other.base..][0..other.count]) |*row| {
+                        for (row.cells[0..other.column_count]) |*cell| {
+                            if (V.largeBytes(cell)) |bytes| {
+                                const offset = @intFromPtr(bytes.ptr) - @intFromPtr(&self.value_backing);
+                                cell.* = V.largeCell(cell, self.value_backing[offset - value_len ..][0..bytes.len]);
+                            }
+                        }
+                    }
+                    other.value_base -= value_len;
                 };
             }
 
