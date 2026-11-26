@@ -31,6 +31,28 @@ fn expectWriterBusy(lock: *disk.WriterLock, path: []const u8) !void {
     if (lock.acquire(path)) |_| return error.ConcurrentWriterAccepted else |err| try check(err == error.DataDirectoryBusy);
 }
 
+fn testStreamFile(pid: u32) !void {
+    const stream = disk.StreamFile;
+    var name: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&name, "sig-out/db-file-contract-{d}.stream", .{pid});
+    var seed = try disk.File.createExclusive(path);
+    defer disk.remove(path) catch {};
+    defer seed.close();
+    try seed.appendAll("old file contents");
+    seed.close();
+
+    const output = try stream.open(path, true);
+    const written = stream.write(output, "a\x00b\xff");
+    try stream.close(output);
+    try written;
+
+    const input = try stream.open(path, false);
+    var buffer: [8]u8 = undefined;
+    const read = stream.read(input, &buffer);
+    try stream.close(input);
+    try check(std.mem.eql(u8, buffer[0..try read], "a\x00b\xff"));
+}
+
 fn testWriterLock(pid: u32, first_generation: []const u8, manifest: []const u8, temporary: []const u8) !void {
     var lock_buffer: [256]u8 = undefined;
     const lock_path = try std.fmt.bufPrint(&lock_buffer, "sig-out/db-file-contract-{d}.writer-lock", .{pid});
@@ -93,6 +115,7 @@ fn testWriterLock(pid: u32, first_generation: []const u8, manifest: []const u8, 
 
 pub fn main(init: std.process.Init) !void {
     const pid: u32 = if (builtin.os.tag == .windows) Win.GetCurrentProcessId() else if (builtin.os.tag == .macos) @intCast(std.c.getpid()) else @intCast(std.os.linux.getpid());
+    try testStreamFile(pid);
     var path_buffer: [256]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, "sig-out/db-file-contract-{d}.wal", .{pid});
     var snapshot_buffer: [256]u8 = undefined;

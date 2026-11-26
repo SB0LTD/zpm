@@ -1320,6 +1320,8 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "lo_creat", .func = .lo_creat },
                 .{ .name = "lo_unlink", .func = .lo_unlink },
                 .{ .name = "lo_from_bytea", .func = .lo_from_bytea },
+                .{ .name = "lo_import", .func = .lo_import },
+                .{ .name = "lo_export", .func = .lo_export },
                 .{ .name = "lo_get", .func = .lo_get },
                 .{ .name = "lo_truncate", .func = .lo_truncate },
                 .{ .name = "lo_truncate64", .func = .lo_truncate64 },
@@ -2257,6 +2259,13 @@ pub fn Binder(comptime config: types.Config) type {
                     const parameters: []const ast.Type = if (n.func == .lo_from_bytea) &.{ .oid, .bytea }
                         else if (count == 3) &.{ .oid, .int8, .int4 } else &.{.oid};
                     try bindSignature(context, n, parameters, if (n.func == .lo_from_bytea) .oid else .bytea, false);
+                    n.constant = false;
+                },
+                .lo_import, .lo_export => {
+                    if (context.dialect != .postgres) return error.UndefinedFunction;
+                    const parameters: []const ast.Type = if (n.func == .lo_export) &.{ .oid, .text }
+                        else if (count == 2) &.{ .text, .oid } else &.{.text};
+                    try bindSignature(context, n, parameters, if (n.func == .lo_import) .oid else .int4, false);
                     n.constant = false;
                 },
                 // Sequence functions (regclass arguments as text; volatile).
@@ -8424,7 +8433,7 @@ pub fn Binder(comptime config: types.Config) type {
             switch (n.kind) {
                 .scalar_subquery, .exists_subquery, .in_subquery => return true,
                 .function => switch (n.func) {
-                    .nextval, .setval, .currval, .lastval, .identity_next, .clock_timestamp, .lo_create, .lo_creat, .lo_unlink, .lo_from_bytea, .lo_get, .lo_truncate, .lo_truncate64 => return true,
+                    .nextval, .setval, .currval, .lastval, .identity_next, .clock_timestamp, .lo_create, .lo_creat, .lo_unlink, .lo_from_bytea, .lo_get, .lo_truncate, .lo_truncate64, .lo_import, .lo_export => return true,
                     else => {},
                 },
                 else => {},

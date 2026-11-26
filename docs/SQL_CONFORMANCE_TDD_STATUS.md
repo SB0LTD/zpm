@@ -1,5 +1,31 @@
 # SQL conformance TDD checkpoint
 
+## PostgreSQL server-side large-object files
+
+`lo_import(text)`, `lo_import(text, oid)`, and `lo_export(oid, text)`
+stream regular files through a caller-installed platform provider. The
+allocator-free engine uses a 16 KiB transfer buffer. Imported payloads use
+the existing large-object page WAL and compact checkpoint formats.
+Recovery reads the logged pages after the source file has disappeared.
+
+The effective SQL role must be a superuser, and the process must have
+operating-system permission to access the file. Missing paths, denied
+access, and stream failures return SQL errors. The provider follows
+symlinks and rejects nonregular streams. Export replaces existing file
+contents, retains their mode, and survives SQL rollback. Import observes
+read-only transactions and statement rollback.
+
+The built-in signatures expose owner-only EXECUTE ACLs. Delegating
+EXECUTE on these built-in functions remains open. Embedded callers
+install their provider explicitly. RAMSQL installs ZPM's native file
+provider for its server.
+
+The large-object contract injects short reads and read/close failures
+and verifies page WAL replay. The stock PG16/18 file qualification checks
+OS permissions, binary transfers, rollback, forced-process restart, and
+plain and custom archives in both directions.
+[PostgreSQL server-side functions](https://www.postgresql.org/docs/18/lo-funcs.html)
+
 ## Wide-cell SQL binding on a 4 MiB stack
 
 The binder writes the selected statement into a caller-owned result slot.
