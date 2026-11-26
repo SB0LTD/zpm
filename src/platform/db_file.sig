@@ -328,8 +328,14 @@ pub const StreamFile = struct {
         } else if (builtin.os.tag == .linux) {
             var buffer: [path_capacity]u8 = undefined;
             const name = try narrowPath(path, &buffer);
-            const flags: linux.O = .{ .ACCMODE = if (writing) .WRONLY else .RDONLY, .CREAT = writing, .CLOEXEC = true, .NONBLOCK = true };
-            const rc = linux.openat(linux.AT.FDCWD, name.ptr, flags, 0o644);
+            var flags: linux.O = .{ .ACCMODE = if (writing) .WRONLY else .RDONLY, .CREAT = writing, .EXCL = writing, .CLOEXEC = true, .NONBLOCK = true };
+            var rc = linux.openat(linux.AT.FDCWD, name.ptr, flags, 0o644);
+            const created = writing and linux.errno(rc) == .SUCCESS;
+            if (writing and linux.errno(rc) == .EXIST) {
+                flags.CREAT = false;
+                flags.EXCL = false;
+                rc = linux.openat(linux.AT.FDCWD, name.ptr, flags, 0);
+            }
             switch (linux.errno(rc)) {
                 .SUCCESS => file.handle = @intCast(rc),
                 .NOENT, .NOTDIR => return error.FileNotFound,
@@ -341,11 +347,19 @@ pub const StreamFile = struct {
             const info = linux.statx(file.handle, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &status);
             if (linux.errno(info) != .SUCCESS or !status.mask.TYPE) return error.FileOpenFailed;
             if (!linux.S.ISREG(status.mode)) return error.NotRegularFile;
+            // PostgreSQL exports new files as 0644 even with a restrictive umask.
+            if (created and linux.errno(linux.fchmod(file.handle, 0o644)) != .SUCCESS) return error.FilePermissionDenied;
         } else if (builtin.os.tag == .macos) {
             var buffer: [path_capacity]u8 = undefined;
             const name = try narrowPath(path, &buffer);
-            const flags: darwin.O = .{ .ACCMODE = if (writing) .WRONLY else .RDONLY, .CREAT = writing, .CLOEXEC = true, .NONBLOCK = true };
-            const fd = darwin.open(name.ptr, flags, @as(c_uint, 0o644));
+            var flags: darwin.O = .{ .ACCMODE = if (writing) .WRONLY else .RDONLY, .CREAT = writing, .EXCL = writing, .CLOEXEC = true, .NONBLOCK = true };
+            var fd = darwin.open(name.ptr, flags, @as(c_uint, 0o644));
+            const created = writing and fd >= 0;
+            if (writing and fd < 0 and darwin.errno(fd) == .EXIST) {
+                flags.CREAT = false;
+                flags.EXCL = false;
+                fd = darwin.open(name.ptr, flags, @as(c_uint, 0));
+            }
             if (fd < 0) return switch (darwin.errno(fd)) {
                 .NOENT, .NOTDIR => error.FileNotFound,
                 .ACCES, .PERM, .ROFS => error.FilePermissionDenied,
@@ -356,6 +370,7 @@ pub const StreamFile = struct {
             var status: darwin.Stat = undefined;
             if (darwin.fstat(fd, &status) != 0) return error.FileOpenFailed;
             if (!darwin.S.ISREG(status.mode)) return error.NotRegularFile;
+            if (created and darwin.fchmod(fd, 0o644) != 0) return error.FilePermissionDenied;
         } else return error.UnsupportedPlatform;
         if (writing) try file.truncate(0);
         return if (windows) @intFromPtr(file.handle) else @intCast(file.handle);
