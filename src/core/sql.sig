@@ -12351,7 +12351,7 @@ pub fn Database(comptime config: Config) type {
             switch (statement_value) {
                 .create_function, .create_procedure => |*definition| try self.createRoutine(slot, definition, snap),
                 .drop_function, .drop_procedure => |*drop| try self.dropRoutine(slot, drop, snap),
-                .grant_execute, .revoke_execute => |*grant| try self.grantRoutine(slot, grant, kind == .grant_execute, snap),
+                .grant_execute, .revoke_execute => |*grant| try self.grantRoutine(slot, source, grant, kind == .grant_execute, snap),
                 .call => |*call| try self.restartable(slot, snap, call, source),
                 .do_block => |*block| try self.restartable(slot, snap, block, source),
                 .create_trigger => |*definition| try self.createTrigger(slot, source, definition, snap),
@@ -12664,7 +12664,7 @@ pub fn Database(comptime config: Config) type {
             return graph;
         }
 
-        fn grantBuiltinRoutine(self: *Self, slot: u16, oid: u32, grant: *const R.ExecuteGrant, allow: bool, snap: Snapshot) Error!void {
+        fn checkBuiltinRoutineWriter(self: *Self, slot: u16, oid: u32, snap: Snapshot) Error!void {
             const key: O.Object = .{ .kind = .builtin_routine_acl, .target = oid, .grantee = CO.bootstrap_role };
             if (self.catalog_objects.pendingConflict(&key, snap)) |other| return self.objectPark(slot, other);
             var latest = snap;
@@ -12675,14 +12675,10 @@ pub fn Database(comptime config: Config) type {
                 if (O.pendingOf(entry, snap)) |other| return self.objectPark(slot, other);
                 if (O.visible(entry, latest) != O.visible(entry, snap)) return error.SerializationFailure;
             }
-            const role = if (grant.grantee.len == 0) CO.public_role else
-                self.catalog_objects.roleByName(grant.grantee.slice(), snap) orelse return error.UndefinedObject;
-            if (role == CO.public_role and allow and grant.option) return error.InvalidGrantOperation;
-            if (role != CO.public_role) {
-                if (self.catalog_objects.pendingReference(role, snap)) |other| return self.objectPark(slot, other);
-                if (self.catalog_objects.roleName(role, latest) == null) return error.SerializationFailure;
-            }
-            var edges: [O.capacity + 2]LoAcl.Edge = undefined;
+        }
+
+        fn grantBuiltinRoutine(self: *Self, slot: u16, oid: u32, grant: *const R.ExecuteGrant, roles: []const u32, allow: bool, snap: Snapshot) Error!void {
+            var edges: [O.capacity + CO.list_capacity + 1]LoAcl.Edge = undefined;
             var support: [edges.len]LoAcl.Graph.State = undefined;
             var graph = self.builtinRoutineGraph(oid, snap, &edges);
             const issuer = self.largeObjectGrantor(graph, CO.priv_execute, snap);
@@ -12695,27 +12691,32 @@ pub fn Database(comptime config: Config) type {
                 self.largeObjectGrantWarning(!allow, false);
                 return;
             }
-            const existing = graph.find(issuer.role, role);
-            if (allow and grant.option and issuer.role != graph.owner and role != graph.owner) {
-                graph.support(&support, role);
-                if (graph.supportedOptions(issuer.role, &support) & CO.priv_execute == 0) return error.InvalidGrantOperation;
-            }
-            const item = existing orelse blk: {
-                // Keep the owner marker even when its privileges are empty.
-                for (graph.edges[0..graph.len], 0..) |edge, index| {
-                    if (edge.grantor == issuer.role and edge.grantee == role) break :blk index;
+            for (roles) |role| {
+                const existing = graph.find(issuer.role, role);
+                const held_options = if (existing) |index| graph.edges[index].options else 0;
+                if (allow and grant.option and held_options == 0 and issuer.role != graph.owner and role != graph.owner) {
+                    graph.support(&support, role);
+                    if (graph.supportedOptions(issuer.role, &support) & CO.priv_execute == 0) return error.InvalidGrantOperation;
                 }
-                if (!allow) return;
-                graph.add(.{ .grantor = issuer.role, .grantee = role, .flags = 0, .options = 0 });
-                break :blk graph.len - 1;
-            };
-            const edge = &graph.edges[item];
-            if (allow) {
-                edge.flags |= CO.priv_execute;
-                if (grant.option) edge.options |= CO.priv_execute;
-            } else {
-                edge.options = 0;
-                if (!grant.option) edge.flags = 0;
+                const item = existing orelse blk: {
+                    // Keep the owner marker even when its privileges are empty.
+                    for (graph.edges[0..graph.len], 0..) |edge, index| {
+                        if (edge.grantor == issuer.role and edge.grantee == role) break :blk index;
+                    }
+                    if (!allow) continue;
+                    graph.add(.{ .grantor = issuer.role, .grantee = role, .flags = 0, .options = 0 });
+                    break :blk graph.len - 1;
+                };
+                const edge = &graph.edges[item];
+                if (allow) {
+                    edge.flags |= CO.priv_execute;
+                    if (grant.option) edge.options |= CO.priv_execute;
+                } else {
+                    edge.options = 0;
+                    if (!grant.option) edge.flags = 0;
+                }
+            }
+            if (!allow) {
                 graph.support(&support, null);
                 for (graph.edges[0..graph.len], support[0..graph.len]) |*dependent, state| {
                     if (dependent.flags & ~state.available == 0) continue;
@@ -12771,41 +12772,86 @@ pub fn Database(comptime config: Config) type {
             return writer.finish();
         }
 
-        fn grantRoutine(self: *Self, slot: u16, grant: *const R.ExecuteGrant, allow: bool, snap: Snapshot) Error!void {
-            if (!types.same(grant.schema.slice(), "public")) {
+        const ExecuteTarget = union(enum) { builtin: u32, routine: usize };
+
+        fn resolveExecuteTarget(self: *Self, slot: u16, execute_target: *const R.ExecuteTarget, snap: Snapshot) Error!ExecuteTarget {
+            if (!types.same(execute_target.schema.slice(), "public")) {
                 var found: ?u32 = null;
                 for (catalog_module.builtin_callbacks) |callback| {
-                    if (!callback.owner_execute_only or !types.same(callback.name, grant.routine.name.slice())) continue;
-                    if (grant.routine.has_args and !std.mem.eql(u32, callback.args, grant.routine.args[0..grant.routine.arg_count])) continue;
+                    if (!callback.owner_execute_only or !types.same(callback.name, execute_target.routine.name.slice())) continue;
+                    if (execute_target.routine.has_args and !std.mem.eql(u32, callback.args, execute_target.routine.args[0..execute_target.routine.arg_count])) continue;
                     if (found != null) return error.AmbiguousFunction;
                     found = callback.oid;
                 }
                 if (found) |oid| {
-                    if (grant.routine.procedure) return error.WrongObjectType;
-                    return self.grantBuiltinRoutine(slot, oid, grant, allow, snap);
+                    if (execute_target.routine.procedure) return error.WrongObjectType;
+                    return .{ .builtin = oid };
                 }
-                if (types.same(grant.schema.slice(), "pg_catalog")) return error.UndefinedFunction;
+                if (types.same(execute_target.schema.slice(), "pg_catalog")) return error.UndefinedFunction;
             }
-            if (grant.option or grant.cascade) return error.UnsupportedStatement;
-            const index = (try self.findRoutineTarget(slot, &grant.routine, snap)) orelse return error.UndefinedFunction;
-            const old = &self.objects.routines[index];
-            if (!self.ownsRoutine(old, snap)) return error.InsufficientPrivilege;
-            const role = if (grant.grantee.len == 0) CO.public_role else
-                self.catalog_objects.roleByName(grant.grantee.slice(), snap) orelse return error.UndefinedObject;
-            if (role != CO.public_role) {
-                if (self.catalog_objects.pendingReference(role, snap)) |other| return self.objectPark(slot, other);
-                var latest = snap;
-                latest.csn = self.csn;
-                if (self.catalog_objects.roleName(role, latest) == null) return error.SerializationFailure;
+            return .{ .routine = (try self.findRoutineTarget(slot, &execute_target.routine, snap)) orelse return error.UndefinedFunction };
+        }
+
+        fn grantRoutine(self: *Self, slot: u16, source: []const u8, grant: *const R.ExecuteGrant, allow: bool, snap: Snapshot) Error!void {
+            // PostgreSQL's object-privilege GRANTED BY clause must name the
+            // current user. It does not impersonate that role or override the
+            // owner/inherited grant-option selection used for ACL entries.
+            if (grant.grantor) |specified| {
+                if (specified.kind == .public) return error.UndefinedObject;
+                if (try self.objectRole(source, specified, snap) != self.session.role) return error.UnsupportedStatement;
             }
-            var acl = old.acl;
-            try acl.set(role, old.owner, allow);
-            try self.reserveWrites(slot, 2);
-            const next = try self.objectSlot(.routine);
-            try self.dropObject(slot, .routine, index, snap);
-            self.objects.routines[next] = old.*;
-            self.objects.routines[next].acl = acl;
-            self.createdObject(slot, .routine, next, snap);
+            var targets: [CO.list_capacity]ExecuteTarget = undefined;
+            var target_count: usize = 0;
+            for (grant.targets[0..grant.target_count]) |*item| {
+                const execute_target = try self.resolveExecuteTarget(slot, item, snap);
+                const duplicate = for (targets[0..target_count]) |earlier| {
+                    switch (execute_target) {
+                        .builtin => |oid| if (earlier == .builtin and earlier.builtin == oid) break true,
+                        .routine => |index| if (earlier == .routine and earlier.routine == index) break true,
+                    }
+                } else false;
+                if (duplicate) continue;
+                if (execute_target == .routine) {
+                    if (grant.option or grant.cascade) return error.UnsupportedStatement;
+                    if (!self.ownsRoutine(&self.objects.routines[execute_target.routine], snap)) return error.InsufficientPrivilege;
+                } else {
+                    try self.checkBuiltinRoutineWriter(slot, execute_target.builtin, snap);
+                }
+                targets[target_count] = execute_target;
+                target_count += 1;
+            }
+            var roles: [CO.list_capacity]u32 = undefined;
+            var role_count: usize = 0;
+            var latest = snap;
+            latest.csn = self.csn;
+            for (grant.grantees[0..grant.grantee_count]) |specified| {
+                const role = try self.objectRole(source, specified, snap);
+                if (std.mem.indexOfScalar(u32, roles[0..role_count], role) != null) continue;
+                if (role == CO.public_role and allow and grant.option) return error.InvalidGrantOperation;
+                if (role != CO.public_role) {
+                    if (self.catalog_objects.pendingReference(role, snap)) |other| return self.objectPark(slot, other);
+                    if (self.catalog_objects.roleName(role, latest) == null) return error.SerializationFailure;
+                }
+                roles[role_count] = role;
+                role_count += 1;
+            }
+            // Publish each execute_target once with all grantees. Repeated names and
+            // aliases refer to one MVCC version, and the surrounding statement
+            // boundary rolls every execute_target back if any later edit fails.
+            for (targets[0..target_count]) |execute_target| switch (execute_target) {
+                .builtin => |oid| try self.grantBuiltinRoutine(slot, oid, grant, roles[0..role_count], allow, snap),
+                .routine => |index| {
+                    const old = &self.objects.routines[index];
+                    var acl = old.acl;
+                    for (roles[0..role_count]) |role| try acl.set(role, old.owner, allow);
+                    try self.reserveWrites(slot, 2);
+                    const next = try self.objectSlot(.routine);
+                    try self.dropObject(slot, .routine, index, snap);
+                    self.objects.routines[next] = old.*;
+                    self.objects.routines[next].acl = acl;
+                    self.createdObject(slot, .routine, next, snap);
+                },
+            };
         }
 
         fn dropRoutine(self: *Self, slot: u16, drop: *const R.DropRoutine, snap: Snapshot) Error!void {

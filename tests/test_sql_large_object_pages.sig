@@ -193,7 +193,7 @@ fn distantPages() !void {
 const DB = @import("sql").Database(.{
     .external_storage = true, .tables = 1, .columns = 8, .name_bytes = 63, .text_bytes = 4096,
     .rows_per_table = 4, .work_rows = 16, .result_rows = 16, .transactions = 4,
-    .catalog_objects = 32, .tx_writes = 64,
+    .catalog_objects = 64, .tx_writes = 64,
 });
 const layout = large.Layout.plan(2) catch unreachable;
 const Arena = struct {
@@ -621,6 +621,82 @@ fn fileExecuteGrants() !void {
     }
 }
 
+var list_checkpoint: DB = .{};
+var list_checkpoint_arena: Arena = .{};
+
+fn grantEvery(statement: []const u8) !void {
+    var wal: [8192]u8 = undefined;
+    const frame = try executeWAL(&grant_db, statement, &wal);
+    try grant_replay.applyChangeRecord(frame, &replay_scratch);
+    try grant_checkpoint.applyChangeRecord(frame, &replay_scratch);
+}
+
+fn fileExecuteLists() !void {
+    var result: DB.Result = .{};
+    try grantEvery("CREATE ROLE list_a");
+    try grantEvery("CREATE ROLE list_b");
+    try grantEvery("CREATE ROLE list_leaf");
+    try grantEvery("CREATE ROLE list_revoked");
+    try grantEvery("CREATE ROLE \"PUBLIC\"");
+    const functions = "pg_catalog.lo_import(text),lo_import(text,oid),lo_export(oid,text)";
+    try grantEvery("GRANT EXECUTE ON FUNCTION " ++ functions ++ ",lo_import(text) TO list_a,GROUP list_b,list_a WITH GRANT OPTION GRANTED BY CURRENT_USER");
+    try grant_db.execute("SET ROLE list_a", &result);
+    try grantEvery("GRANT EXECUTE ON FUNCTION " ++ functions ++ " TO list_leaf,\"PUBLIC\" GRANTED BY CURRENT_ROLE");
+    try grant_db.execute("RESET ROLE", &result);
+    try grant_db.execute("SET ROLE list_b", &result);
+    try grantEvery("GRANT EXECUTE ON FUNCTION lo_import(text,oid) TO list_revoked GRANTED BY list_b");
+    try grant_db.execute("RESET ROLE", &result);
+    // The first function's edit must roll back if RESTRICT rejects a later one.
+    const before = grant_db.csn;
+    if (grant_db.execute("REVOKE EXECUTE ON FUNCTION lo_import(text),lo_import(text,oid) FROM list_b GRANTED BY CURRENT_USER RESTRICT", &result)) |_| return error.PartialListRevocation else |err| try expect(err == error.DependentObjects);
+    try expect(grant_db.csn == before);
+    try grant_db.execute("SET ROLE list_b", &result);
+    try grant_db.execute("SELECT lo_import(NULL::text)", &result);
+    if (grant_db.execute("GRANT EXECUTE ON FUNCTION lo_import(text) TO list_leaf GRANTED BY SESSION_USER", &result)) |_| return error.GrantorImpersonation else |err| try expect(err == error.UnsupportedStatement);
+    try grant_db.execute("RESET ROLE", &result);
+    try grantEvery("REVOKE ALL ON FUNCTION " ++ functions ++ " FROM list_b,list_b GRANTED BY SESSION_USER CASCADE");
+    try grant_db.execute("SET ROLE file_delegate", &result);
+    try grantEvery("GRANT SELECT ON LARGE OBJECT 56020 TO list_leaf,\"PUBLIC\"");
+    try grant_db.execute("RESET ROLE", &result);
+    for ([_]*DB{ &grant_db, &grant_replay, &grant_checkpoint }) |db| {
+        try db.execute("SELECT proacl::text FROM pg_proc WHERE oid=764", &result);
+        try expect(std.mem.count(u8, result.rows[0].cells[0].text.slice(), "list_a=X*/ramsql") == 1);
+        try db.execute("SET ROLE list_leaf", &result);
+        try db.execute("SELECT lo_import(NULL::text),lo_import(NULL::text,0::oid),lo_export(56020,'output')", &result);
+        try expect(result.rows[0].cells[2].integer == 1);
+        try db.execute("RESET ROLE", &result);
+        try db.execute("SET ROLE list_revoked", &result);
+        try deniedFile(db, "SELECT lo_import(NULL::text,0::oid)");
+        try db.execute("RESET ROLE", &result);
+        try db.execute("SET ROLE \"PUBLIC\"", &result);
+        try db.execute("SELECT lo_export(56020,'output')", &result);
+        try db.execute("RESET ROLE", &result);
+    }
+    const holder = try grant_db.begin();
+    const waiter = try grant_db.begin();
+    try grant_db.statement(holder, "GRANT EXECUTE ON FUNCTION lo_export(oid,text) TO list_b", &result, .{});
+    const waiting_grant = "GRANT EXECUTE ON FUNCTION lo_import(text),lo_export(oid,text) TO list_revoked GRANTED BY CURRENT_USER";
+    if (grant_db.statement(waiter, waiting_grant, &result, .{})) |_| return error.PendingFunctionListIgnored else |err| try expect(err == error.WouldBlock);
+    try expect(grant_db.parked(waiter) and grant_db.txs[waiter].write_len == 0);
+    grant_db.abort(holder);
+    try grant_db.statement(waiter, waiting_grant, &result, .{ .@"resume" = true });
+    grant_db.abort(waiter);
+    var image: ImageBuffer = .{};
+    var wal: [8192]u8 = undefined;
+    try DB.BaseSnapshot.write(&grant_db, &image, &wal);
+    try list_checkpoint_arena.bind(&list_checkpoint);
+    try DB.BaseSnapshot.restore(&list_checkpoint, &image, grant_db.csn, &wal, &replay_scratch);
+    list_checkpoint.setLargeObjectFiles(@import("sql").LargeObjectFiles.native(FileFixture));
+    try list_checkpoint.execute("SET ROLE list_leaf", &result);
+    try list_checkpoint.execute("SELECT lo_export(56020,'output')", &result);
+    try list_checkpoint.execute("RESET ROLE", &result);
+    const revoke = try executeWAL(&grant_db, "REVOKE EXECUTE ON FUNCTION " ++ functions ++ " FROM list_a GRANTED BY CURRENT_ROLE CASCADE", &wal);
+    try list_checkpoint.applyChangeRecord(revoke, &replay_scratch);
+    try list_checkpoint.execute("SET ROLE list_leaf", &result);
+    try deniedFile(&list_checkpoint, "SELECT lo_export(56020,'output')");
+    try list_checkpoint.execute("RESET ROLE", &result);
+}
+
 pub fn main(init: std.process.Init) !void {
     try snapshotAndSparseRead();
     try atomicCapacityFailure();
@@ -632,6 +708,7 @@ pub fn main(init: std.process.Init) !void {
     try truncateRecovery();
     try fileTransfers();
     try fileExecuteGrants();
+    try fileExecuteLists();
     var line: [160]u8 = undefined;
     const report = try std.fmt.bufPrint(&line, "{{\"suite\":\"sql-large-object-pages\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, report);
