@@ -17,6 +17,7 @@ const defaults_magic = "RSBASE04";
 const schemas_magic = "RSBASE05";
 const pages_magic = "RSBASE06";
 const large_defaults_magic = "RSBASE07";
+const builtin_acl_magic = "RSBASE08";
 const header_size = 24;
 const table_header_size = 8;
 const part_size = 5;
@@ -70,9 +71,13 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
             fn hasLargeDefaults(self: CatalogImage) bool {
                 return self.counts[4] != 0;
             }
+
+            fn hasBuiltinAcls(self: CatalogImage) bool {
+                return self.counts[5] != 0;
+            }
         };
 
-        const catalog_kinds = [_]objects.Kind{ .role, .large_object, .large_object_acl, .comment, .large_object_default_acl };
+        const catalog_kinds = [_]objects.Kind{ .role, .large_object, .large_object_acl, .comment, .large_object_default_acl, .builtin_routine_acl };
 
         fn writeCatalog(db: *const Database, sink: anytype, scratch: []u8, kind: objects.Kind) !void {
             const snap: storage.Snapshot = .{ .csn = db.csn };
@@ -158,7 +163,7 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
             for (&db.objects.routines) |*item| if (item.live and item.stamp.visible(snap)) return error.SnapshotUnsupportedState;
             for (&db.objects.triggers) |*item| if (item.live and item.stamp.visible(snap)) return error.SnapshotUnsupportedState;
             for (&db.objects.rules) |*item| if (item.live and item.stamp.visible(snap)) return error.SnapshotUnsupportedState;
-            if (image.hasObjects() and image.counts[1] == 0 and !image.hasLargeDefaults()) return error.SnapshotUnsupportedState;
+            if (image.hasObjects() and image.counts[1] == 0 and !image.hasLargeDefaults() and !image.hasBuiltinAcls()) return error.SnapshotUnsupportedState;
             return image;
         }
 
@@ -266,13 +271,13 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
                 try sink.appendAll(&header);
                 try writeTable(table, sink, scratch);
             } else {
-                @memcpy(header[0..8], if (catalog_image.hasLargeDefaults()) large_defaults_magic else if (with_pages) pages_magic else if (schema_count != 0) schemas_magic else if (with_defaults) defaults_magic else if (sequence_count == 0) multi_magic else sequence_magic);
+                @memcpy(header[0..8], if (catalog_image.hasBuiltinAcls()) builtin_acl_magic else if (catalog_image.hasLargeDefaults()) large_defaults_magic else if (with_pages) pages_magic else if (schema_count != 0) schemas_magic else if (with_defaults) defaults_magic else if (sequence_count == 0) multi_magic else sequence_magic);
                 std.mem.writeInt(u32, header[16..20], @intCast(selected.count), .little);
                 std.mem.writeInt(u32, header[20..24], @intCast(sequence_count), .little);
                 try sink.appendAll(&header);
                 if (with_pages) {
-                    var counts: [24]u8 = undefined;
-                    const groups: usize = if (catalog_image.hasLargeDefaults()) catalog_kinds.len else catalog_kinds.len - 1;
+                    var counts: [28]u8 = undefined;
+                    const groups: usize = if (catalog_image.hasBuiltinAcls()) 6 else if (catalog_image.hasLargeDefaults()) 5 else 4;
                     for (catalog_image.counts[0..groups], 0..) |count, index| std.mem.writeInt(u32, counts[index * 4 ..][0..4], count, .little);
                     std.mem.writeInt(u32, counts[groups * 4 ..][0..4], @intCast(catalog_image.pages), .little);
                     try sink.appendAll(counts[0..(groups + 1) * 4]);
@@ -389,14 +394,15 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
 
             var offset: u64 = header_size;
             var sequence_count: u32 = 0;
-            const with_large_defaults = std.mem.eql(u8, header[0..8], large_defaults_magic);
+            const with_builtin_acls = std.mem.eql(u8, header[0..8], builtin_acl_magic);
+            const with_large_defaults = with_builtin_acls or std.mem.eql(u8, header[0..8], large_defaults_magic);
             const with_pages = with_large_defaults or std.mem.eql(u8, header[0..8], pages_magic);
             const with_schemas = with_pages or std.mem.eql(u8, header[0..8], schemas_magic);
-            const groups: usize = if (with_large_defaults) catalog_kinds.len else catalog_kinds.len - 1;
+            const groups: usize = if (with_builtin_acls) 6 else if (with_large_defaults) 5 else 4;
             var counts: [catalog_kinds.len]u32 = @splat(0);
             var page_count: u32 = 0;
             if (with_pages) {
-                var encoded: [24]u8 = undefined;
+                var encoded: [28]u8 = undefined;
                 const encoded_len = (groups + 1) * 4;
                 try readExact(file, offset, encoded[0..encoded_len], length);
                 offset += encoded_len;
@@ -407,7 +413,8 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
                 }
                 page_count = std.mem.readInt(u32, encoded[groups * 4 ..][0..4], .little);
                 if (objects_total == 0 or objects_total > db.catalog_objects.items.len or
-                    (with_large_defaults and counts[4] == 0) or
+                    (with_builtin_acls and counts[5] == 0) or
+                    (!with_builtin_acls and with_large_defaults and counts[4] == 0) or
                     (page_count != 0 and (db.large_pages == null or page_count > db.large_pages.?.capacity())))
                     return error.InvalidSnapshotImage;
                 try restoreCatalog(db, file, length, &offset, scratch, replay, csn, .role, counts[0]);
@@ -457,7 +464,7 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
                 for (catalog_kinds[1..groups], counts[1..groups]) |kind, count| {
                     try restoreCatalog(db, file, length, &offset, scratch, replay, csn, kind, count);
                 }
-                if (counts[2] != 0) {
+                if (counts[2] != 0 or counts[5] != 0) {
                     replay.object_overlay.init(&db.catalog_objects);
                     try replay.object_overlay.verifyLargeObjectGrants();
                 }

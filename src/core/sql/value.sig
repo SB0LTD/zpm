@@ -109,7 +109,7 @@ pub const SequenceCall = enum { nextval, currval, setval, lastval, identity, reg
 pub const LargeObjectData = enum { create, read };
 
 pub const LargeObjectFileHook = struct {
-    authorize: *const fn (ptr: *anyopaque) Error!void,
+    authorize: *const fn (ptr: *anyopaque, function: u32) Error!void,
     call: *const fn (ptr: *anyopaque, operation: @import("large_object_file.sig").Operation, oid: u32, path: []const u8) Error!u32,
 };
 

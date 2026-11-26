@@ -2326,7 +2326,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         if (object.kind == .large_object and object.largeObjectLength() != 0 and db.large_pages == null)
                             return error.ChangeRecordConflict;
                         try scratch.object_overlay.create(&object, &object_check);
-                        check_large_object_grants = check_large_object_grants or object.kind == .large_object_acl;
+                        check_large_object_grants = check_large_object_grants or object.kind == .large_object_acl or object.kind == .builtin_routine_acl;
                     },
                     @intFromEnum(Op.object_drop) => {
                         const key = try O.decodeDrop(record, &reader.position);
@@ -2339,7 +2339,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         }
                         try scratch.object_overlay.drop(&key);
                         check_schema_owners = check_schema_owners or key.kind == .role;
-                        check_large_object_grants = check_large_object_grants or key.kind == .large_object_acl;
+                        check_large_object_grants = check_large_object_grants or key.kind == .large_object_acl or key.kind == .builtin_routine_acl;
                     },
                     @intFromEnum(Op.large_object_page) => {
                         const page = try decodeLargeObjectPage(&reader);
@@ -2453,7 +2453,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 .create_sequence => {},
                 .create_schema => if (!image.with_schemas) return error.InvalidChangeRecord,
                 .object_create => switch (image.catalog_kind orelse return error.InvalidChangeRecord) {
-                    .role, .large_object, .large_object_acl, .large_object_default_acl, .comment => {},
+                    .role, .large_object, .large_object_acl, .large_object_default_acl, .builtin_routine_acl, .comment => {},
                     else => return error.InvalidChangeRecord,
                 },
                 .catalog_counters, .catalog_counters_with_constraints, .catalog_counters_with_defaults => if (image.table_count > config.tables) return error.InvalidChangeRecord,

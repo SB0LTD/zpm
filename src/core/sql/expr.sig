@@ -1284,10 +1284,11 @@ pub fn Eval(comptime config: types.Config) type {
         fn evalLargeObjectFile(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
             const hooks = ctx.session.sequences orelse return error.UnsupportedStatement;
             const transfer = hooks.large_object_file orelse return error.UnsupportedStatement;
-            try transfer.authorize(hooks.ptr);
+            const next = node(ctx, n.b).next;
+            const function: u32 = if (n.func == .lo_export) 765 else if (next == ast.none) 764 else 767;
+            try transfer.authorize(hooks.ptr, function);
             const first = try eval(ctx, n.b);
             if (first == .null_value) return .null_value;
-            const next = node(ctx, n.b).next;
             if (n.func == .lo_import and next == ast.none)
                 return .{ .integer = try transfer.call(hooks.ptr, .import_file, 0, first.text.slice()) };
             const second = try eval(ctx, next);

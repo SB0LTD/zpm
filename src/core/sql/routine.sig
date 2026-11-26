@@ -90,8 +90,11 @@ pub fn Routines(comptime config: types.Config) type {
 
         pub const ExecuteGrant = struct {
             routine: DropRoutine = .{},
+            schema: Name = .{},
             /// An empty name denotes the PUBLIC keyword.
             grantee: Name = .{},
+            option: bool = false,
+            cascade: bool = false,
         };
 
         pub const DoBlock = struct { body: Text = .{} };
@@ -254,7 +257,20 @@ pub fn Routines(comptime config: types.Config) type {
             if (cursor.is("grant") or cursor.is("revoke")) {
                 const grant = cursor.is("grant");
                 cursor.advance() catch return null;
-                if (!cursor.is("execute")) return null;
+                if (!grant and cursor.is("grant")) {
+                    cursor.advance() catch return null;
+                    if (!cursor.is("option")) return null;
+                    cursor.advance() catch return null;
+                    if (!cursor.is("for")) return null;
+                    cursor.advance() catch return null;
+                }
+                if (cursor.is("execute")) return if (grant) .grant_execute else .revoke_execute;
+                if (!cursor.is("all")) return null;
+                cursor.advance() catch return null;
+                if (cursor.is("privileges")) cursor.advance() catch return null;
+                if (!cursor.is("on")) return null;
+                cursor.advance() catch return null;
+                if (!cursor.is("function") and !cursor.is("procedure")) return null;
                 return if (grant) .grant_execute else .revoke_execute;
             }
             if (cursor.is("do")) {
@@ -460,20 +476,34 @@ pub fn Routines(comptime config: types.Config) type {
 
         fn executeGrant(cursor: *Cursor, pool: anytype, out: *ExecuteGrant, comptime revoke: bool) Error!void {
             try cursor.expect(if (revoke) "revoke" else "grant");
-            try cursor.expect("execute");
+            if (revoke and try cursor.take("grant")) {
+                try cursor.expect("option");
+                try cursor.expect("for");
+                out.option = true;
+            }
+            if (try cursor.take("all")) _ = try cursor.take("privileges") else try cursor.expect("execute");
             try cursor.expect("on");
             out.routine.procedure = try cursor.take("procedure");
             if (!out.routine.procedure) try cursor.expect("function");
             out.routine.name = try cursor.identifier();
             if (try cursor.takeSymbol(.dot)) {
-                if (!types.same(out.routine.name.slice(), "public")) return error.UnsupportedStatement;
+                out.schema = out.routine.name;
+                if (!types.same(out.schema.slice(), "public") and !types.same(out.schema.slice(), "pg_catalog")) return error.UnsupportedStatement;
                 out.routine.name = try cursor.identifier();
             }
             try routineSignature(cursor, pool, &out.routine);
             try cursor.expect(if (revoke) "from" else "to");
             if (!try cursor.take("public")) out.grantee = try cursor.identifier();
-            if (cursor.is("cascade") or cursor.is("with") or cursor.is("granted") or cursor.symbol(.comma)) return error.UnsupportedStatement;
-            if (revoke) _ = try cursor.take("restrict");
+            if (!revoke and try cursor.take("with")) {
+                try cursor.expect("grant");
+                try cursor.expect("option");
+                out.option = true;
+            }
+            if (revoke) {
+                out.cascade = try cursor.take("cascade");
+                if (!out.cascade) _ = try cursor.take("restrict");
+            }
+            if (cursor.is("granted") or cursor.symbol(.comma)) return error.UnsupportedStatement;
             try finish(cursor);
         }
 

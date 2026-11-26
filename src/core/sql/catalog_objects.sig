@@ -80,12 +80,18 @@ pub const large_object_privileges = priv_select | priv_update;
 pub const large_object_explicit_acl: u32 = 1 << 31;
 /// Stored in grant_flags for an automatically generated large-object OID.
 pub const large_object_generated_oid: u32 = 1;
+pub const priv_execute: u32 = 1 << 7;
+
+/// Built-in routines whose default ACL excludes PUBLIC.
+pub fn restrictedRoutine(oid: u32) bool {
+    return oid == 764 or oid == 765 or oid == 767;
+}
 
 /// The plpgsql row of pg_extension (installed in every PostgreSQL
 /// database). PostgreSQL assigns its OID at initdb; ZPM fixes it.
 pub const plpgsql_extension_oid: u32 = 13001;
 
-pub const Kind = enum(u8) { role = 1, member = 2, acl = 3, relation = 4, policy = 5, comment = 6, fdw = 7, server = 8, publication = 9, domain = 10, enum_type = 11, composite_type = 12, statistics = 13, publication_table = 14, publication_schema = 15, schema_acl = 16, schema_acl_state = 17, schema_owner = 18, role_settings = 19, large_object = 20, large_object_acl = 21, large_object_default_acl = 22, _ };
+pub const Kind = enum(u8) { role = 1, member = 2, acl = 3, relation = 4, policy = 5, comment = 6, fdw = 7, server = 8, publication = 9, domain = 10, enum_type = 11, composite_type = 12, statistics = 13, publication_table = 14, publication_schema = 15, schema_acl = 16, schema_acl_state = 17, schema_owner = 18, role_settings = 19, large_object = 20, large_object_acl = 21, large_object_default_acl = 22, builtin_routine_acl = 23, _ };
 
 pub fn publicationMembership(kind: Kind) bool {
     return kind == .publication_table or kind == .publication_schema;
@@ -1637,7 +1643,7 @@ pub fn Objects(comptime config: types.Config) type {
                 .publication_table, .publication_schema => a.oid == b.oid and a.target == b.target and a.grantee == b.grantee,
                 .domain, .enum_type, .composite_type => a.oid == b.oid and a.target == b.target,
                 .member, .acl, .schema_acl, .large_object_default_acl => a.target == b.target and a.grantee == b.grantee,
-                .large_object_acl => a.target == b.target and a.grantee == b.grantee and a.sub == b.sub,
+                .large_object_acl, .builtin_routine_acl => a.target == b.target and a.grantee == b.grantee and a.sub == b.sub,
                 .relation, .schema_acl_state, .schema_owner, .role_settings, .large_object => a.target == b.target,
                 .comment => a.grantee == b.grantee and a.target == b.target and a.sub == b.sub,
                 _ => false,
@@ -2033,7 +2039,7 @@ pub fn Objects(comptime config: types.Config) type {
 
         fn decodeKind(cursor: Cursor) Error!Kind {
             const raw = try cursor.int(u8);
-            if (raw < 1 or raw > @intFromEnum(Kind.large_object_default_acl)) return error.InvalidChangeRecord;
+            if (raw < 1 or raw > @intFromEnum(Kind.builtin_routine_acl)) return error.InvalidChangeRecord;
             return @enumFromInt(raw);
         }
 
@@ -2061,6 +2067,7 @@ pub fn Objects(comptime config: types.Config) type {
                 // Legacy owner-issued grants keep sub = 0. Delegated grants
                 // put their grantor OID in that key field, including in drops.
                 .large_object_acl => o.oid == 0 and o.target != 0,
+                .builtin_routine_acl => o.oid == 0 and restrictedRoutine(o.target),
                 .large_object_default_acl => o.target != 0 and o.sub == 0 and
                     ((o.oid != 0) == (o.target == o.grantee)),
                 .relation, .schema_acl_state, .schema_owner, .role_settings, .large_object => o.oid == 0 and o.target != 0 and o.grantee == 0 and o.sub == 0,
@@ -2124,6 +2131,11 @@ pub fn Objects(comptime config: types.Config) type {
                 .large_object_default_acl => !has_name and o.owner == o.target and o.role_count == 0 and
                     o.text_len == 0 and o.split == 0 and (o.oid != 0 or o.flags != 0) and
                     o.flags & ~large_object_privileges == 0 and o.grant_flags & ~o.flags == 0 and
+                    (o.grantee != public_role or o.grant_flags == 0),
+                .builtin_routine_acl => !has_name and o.owner != 0 and o.role_count == 0 and o.text_len == 0 and o.split == 0 and
+                    o.sub == (if (o.owner == bootstrap_role) @as(i32, 0) else @as(i32, @bitCast(o.owner))) and
+                    (o.flags != 0 or (o.owner == bootstrap_role and o.grantee == bootstrap_role)) and
+                    o.flags & ~priv_execute == 0 and o.grant_flags & ~o.flags == 0 and
                     (o.grantee != public_role or o.grant_flags == 0),
                 .schema_acl => !has_name and o.owner != 0 and o.grant_flags == 0 and o.role_count == 0 and o.text_len == 0 and
                     (o.flags == priv_schema_usage or (o.flags == 0 and o.grantee == o.owner)),
@@ -2262,7 +2274,7 @@ pub fn Objects(comptime config: types.Config) type {
                 out.publication_all_tables = o.kind == .publication and o.flags & pub_all_tables != 0;
                 out.large_object_explicit_acl = o.kind == .large_object and o.flags & large_object_explicit_acl != 0;
                 if (o.kind == .large_object) out.large_object_length = o.largeObjectLength();
-                if (o.kind == .large_object_acl) {
+                if (o.kind == .large_object_acl or o.kind == .builtin_routine_acl) {
                     out.acl_flags = o.flags;
                     out.acl_options = o.grant_flags;
                 }
@@ -2429,6 +2441,9 @@ pub fn Objects(comptime config: types.Config) type {
                             } else return error.ChangeRecordConflict;
                         }
                     },
+                    .builtin_routine_acl => {
+                        if (grantee != public_role and !self.roleExists(grantee)) return error.ChangeRecordConflict;
+                    },
                     .schema_acl => {
                         const original = ctx.objectPrivateSchemaOwner(target) orelse return error.ChangeRecordConflict;
                         if (self.schemaOwner(target, original) != v.owner) return error.ChangeRecordConflict;
@@ -2501,17 +2516,21 @@ pub fn Objects(comptime config: types.Config) type {
             pub fn verifyLargeObjectGrants(self: *const Overlay) Error!void {
                 const acl = @import("large_object_acl.sig");
                 for (&self.items, 0..) |*entry, index| {
-                    if (!entry.live or entry.kind != .large_object_acl or entry.sub == 0) continue;
+                    if (!entry.live or (entry.kind != .large_object_acl and entry.kind != .builtin_routine_acl) or entry.sub == 0) continue;
                     for (self.items[0..index]) |*prior| {
-                        if (prior.live and prior.kind == .large_object_acl and prior.sub != 0 and prior.target == entry.target) break;
+                        if (prior.live and prior.kind == entry.kind and prior.sub != 0 and prior.target == entry.target) break;
                     } else {
                         var edges: [capacity]acl.Edge = undefined;
                         var support: [capacity]acl.Graph.State = undefined;
                         var graph: acl.Graph = .{ .edges = &edges, .owner = 0, .privileges = large_object_privileges };
+                        if (entry.kind == .builtin_routine_acl) {
+                            graph.owner = bootstrap_role;
+                            graph.privileges = priv_execute;
+                        }
                         for (&self.items) |*item| {
                             if (!item.live or item.target != entry.target) continue;
-                            if (item.kind == .large_object) graph.owner = item.owner;
-                            if (item.kind == .large_object_acl) graph.add(.{
+                            if (entry.kind == .large_object_acl and item.kind == .large_object) graph.owner = item.owner;
+                            if (item.kind == entry.kind) graph.add(.{
                                 .grantor = item.owner, .grantee = item.grantee, .flags = item.acl_flags, .options = item.acl_options,
                             });
                         }

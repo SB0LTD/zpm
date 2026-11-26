@@ -8,22 +8,38 @@ allocator-free engine uses a 16 KiB transfer buffer. Imported payloads use
 the existing large-object page WAL and compact checkpoint formats.
 Recovery reads the logged pages after the source file has disappeared.
 
-The effective SQL role must be a superuser, and the process must have
-operating-system permission to access the file. Missing paths, denied
+The effective SQL role needs EXECUTE on the selected overload, and the
+process must have operating-system permission to access the file. Missing paths, denied
 access, and stream failures return SQL errors. The provider follows
 symlinks and rejects nonregular streams. Export replaces existing file
 contents, retains their mode, and survives SQL rollback. Import observes
 read-only transactions and statement rollback.
 
-The built-in signatures expose owner-only EXECUTE ACLs. Delegating
-EXECUTE on these built-in functions remains open. Embedded callers
+The built-in signatures default to owner-only EXECUTE ACLs. GRANT and
+REVOKE EXECUTE (or ALL) support one signature and grantee per statement,
+including pg_catalog qualification, PUBLIC, inherited roles, WITH GRANT
+OPTION, REVOKE GRANT OPTION FOR, and RESTRICT/CASCADE. The existing
+owner-rooted grant graph rejects circular delegation and preserves
+independently supported grants. Export also requires SELECT on its large
+object; import creates objects owned by the effective caller.
+
+Function ACLs are MVCC catalog objects, with transactional rollback,
+role dependencies and validated WAL replay. pg_proc exposes the current
+typed ACL, while pg_init_privs retains the initial owner-only ACL.
+Compact checkpoint RSBASE08 carries these grants and accepts older
+formats. Function lists, grantee lists, GRANTED BY and generalized
+built-in function ACLs remain outside this increment. Embedded callers
 install their provider explicitly. RAMSQL installs ZPM's native file
 provider for its server.
 
 The large-object contract injects short reads and read/close failures
-and verifies page WAL replay. The stock PG16/18 file qualification checks
+and verifies page WAL replay. The 4 MiB Debug/ReleaseSafe contract checks
+overload isolation, inherited grants, grant-option cascades and compact
+checkpoint recovery. The stock PG16/18 file qualification checks
 OS permissions, binary transfers, rollback, forced-process restart, and
-plain and custom archives in both directions.
+plain and custom archives in both directions with ACLs enabled. It checks
+delegated file transfers, revoked access and uncommitted ACL rollback
+after a forced process kill. CI qualification is required before merge.
 [PostgreSQL server-side functions](https://www.postgresql.org/docs/18/lo-funcs.html)
 
 ## Wide-cell SQL binding on a 4 MiB stack
