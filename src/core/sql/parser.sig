@@ -1303,6 +1303,12 @@ pub fn Parser(comptime config: types.Config) type {
                 var local = false;
                 var session = false;
                 if (try self.takeWord("LOCAL")) local = true else session = try self.takeWord("SESSION");
+                if ((session or (local and try self.takeWord("SESSION"))) and try self.takeRaw("authorization")) {
+                    const value = try self.settingValue();
+                    if (value.kind == .number) return error.Syntax;
+                    try self.finish();
+                    return .{ .set = .{ .local = local, .name = .{ .special = .session_authorization }, .value = value } };
+                }
                 if (session and try self.takeRaw("characteristics")) {
                     try self.expectWord("AS");
                     try self.expectWord("TRANSACTION");
@@ -1379,6 +1385,11 @@ pub fn Parser(comptime config: types.Config) type {
         }
 
         fn settingName(self: *Self) Error!ast.SettingName {
+            if (self.rawWord("session") and wordIs(self.source, try self.peek(), "authorization")) {
+                try self.advance();
+                try self.advance();
+                return .{ .special = .session_authorization };
+            }
             if (try self.takeWord("TIME")) {
                 try self.expectWord("ZONE");
                 return .{ .special = .time_zone };

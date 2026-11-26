@@ -908,7 +908,7 @@ pub fn Store(comptime Raw: type) type {
                     self.settings.transaction_timeout_ms == 0 and !self.pending.active and !self.running_statement and self.read_context==null;
             }
             fn detachedIdentity(self: *const Connection) bool {
-                if (comptime has_engine_session) return self.engine_session.values.role == 0 and self.engine_session.session_role == 10;
+                if (comptime has_engine_session) return self.engine_session.values.role == 0 and self.engine_session.sessionUser() == 10;
                 return true;
             }
             /// No global Raw.session installation or mutable zone lookup hook.
@@ -983,6 +983,7 @@ pub fn Store(comptime Raw: type) type {
                 if (comptime has_engine_session) {
                     raw.session_state = &self.engine_session;
                     raw.settings_provider = .{ .context = @ptrCast(self), .show = &providerShow, .set = &providerSet };
+                    if (comptime @hasField(@TypeOf(raw.settings_provider.?), "warn")) raw.settings_provider.?.warn = &providerWarn;
                     if (comptime has_session and @hasField(Raw.SessionValues, "restricted_relation_kinds")) {
                         raw.session.restricted_relation_kinds = self.engine_session.values.restricted_relation_kinds;
                     }
@@ -1160,6 +1161,11 @@ pub fn Store(comptime Raw: type) type {
             fn warn(self: *Connection, state: []const u8, message: []const u8) void {
                 if (self.dialect != .postgres) return;
                 self.pending_notice = .{ .state = state, .message = message };
+            }
+
+            fn providerWarn(context: ?*anyopaque, state: []const u8, message: []const u8) void {
+                const self: *Connection = @ptrCast(@alignCast(context.?));
+                self.warn(state, message);
             }
 
             /// Current PostgreSQL idle limit in an open or failed block.
@@ -2004,7 +2010,7 @@ pub fn Store(comptime Raw: type) type {
                 if (self.id == 0 or !self.running_statement or self.failed or self.in_transaction or self.tx != null or
                     !self.autocommit or self.pending.active or self.dialect != .postgres) return false;
                 if (comptime has_engine_session) {
-                    if (self.engine_session.values.role != 0 or self.engine_session.session_role != 10) return false;
+                    if (self.engine_session.values.role != 0 or self.engine_session.sessionUser() != 10) return false;
                 }
                 const data_type: @TypeOf(@as(Result, undefined).column_types[0]) = switch (oid) {
                     20 => .integer, 21 => .smallint, 23 => .integer32, else => return false,

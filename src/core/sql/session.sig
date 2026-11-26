@@ -96,6 +96,8 @@ pub fn Sessions(comptime config: types.Config) type {
             /// SET ROLE (catalog-security lane): the role OID, 0 for NONE
             /// (current_user is then the session user).
             role: u32 = 0,
+            /// Zero retains the authenticated session user.
+            authorization: u32 = 0,
 
             pub fn publicSchemaOnPath(self: *const Values) bool {
                 const path = self.search_path.slice();
@@ -143,7 +145,7 @@ pub fn Sessions(comptime config: types.Config) type {
             startup: Values = .{},
             /// GUCs from the wire's startup options override role defaults.
             client_role_booleans: u32 = 0,
-            /// session_user as a role OID (catalog-security lane): the
+            /// Authenticated role OID (catalog-security lane): the
             /// bootstrap superuser (10) unless the caller installs another.
             session_role: u32 = 10,
             /// Savepoint level of the open transaction and the settings saved
@@ -159,6 +161,10 @@ pub fn Sessions(comptime config: types.Config) type {
             listen_action_count: usize = 0,
             /// Index in Notify.listeners once a LISTEN committed.
             listener: ?u16 = null,
+
+            pub fn sessionUser(self: *const State) u32 {
+                return if (self.values.authorization == 0) self.session_role else self.values.authorization;
+            }
 
             pub fn findPrepared(self: *const State, name: []const u8) ?usize {
                 for (&self.prepared, 0..) |*entry, index| {

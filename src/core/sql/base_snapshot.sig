@@ -441,6 +441,10 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
                 for (catalog_kinds[1..], counts[1..4]) |kind, count| {
                     try restoreCatalog(db, file, length, &offset, scratch, replay, csn, kind, count);
                 }
+                if (counts[2] != 0) {
+                    replay.object_overlay.init(&db.catalog_objects);
+                    try replay.object_overlay.verifyLargeObjectGrants();
+                }
                 try restorePages(db, file, length, &offset, scratch, csn, counts[4]);
             }
             const counters = try readPart(file, &offset, length, scratch, .catalog_counters);

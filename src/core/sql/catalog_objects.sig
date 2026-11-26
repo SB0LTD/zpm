@@ -322,6 +322,7 @@ pub const Grant = struct {
     /// GRANT role TO role (membership) instead of table privileges.
     membership: bool = false,
     schema: bool = false,
+    all_privileges: bool = false,
     privileges: u32 = 0,
     tables: [list_capacity]Qualified = @splat(.{}),
     table_count: usize = 0,
@@ -1136,6 +1137,7 @@ const Parser = struct {
                 if (out.membership) return error.Syntax;
                 if (privileges & ~large_object_privileges != 0) return error.InvalidGrantOperation;
                 out.privileges = if (all) large_object_privileges else privileges;
+                out.all_privileges = all;
                 while (true) {
                     if (out.large_object_count == list_capacity) return error.ProgramLimitExceeded;
                     out.large_objects[out.large_object_count] = try self.objectId();
@@ -1190,7 +1192,7 @@ const Parser = struct {
             }
         }
         if (try self.take("granted")) {
-            if (!out.membership or revoke) return error.UnsupportedStatement;
+            if (out.large_object_count == 0 and (!out.membership or revoke)) return error.UnsupportedStatement;
             try self.expect("by");
             out.grantor = try self.grantee();
         }
@@ -1587,7 +1589,8 @@ pub fn Objects(comptime config: types.Config) type {
                 .role, .policy, .fdw, .server, .publication, .statistics => a.oid == b.oid,
                 .publication_table, .publication_schema => a.oid == b.oid and a.target == b.target and a.grantee == b.grantee,
                 .domain, .enum_type, .composite_type => a.oid == b.oid and a.target == b.target,
-                .member, .acl, .schema_acl, .large_object_acl => a.target == b.target and a.grantee == b.grantee,
+                .member, .acl, .schema_acl => a.target == b.target and a.grantee == b.grantee,
+                .large_object_acl => a.target == b.target and a.grantee == b.grantee and a.sub == b.sub,
                 .relation, .schema_acl_state, .schema_owner, .role_settings, .large_object => a.target == b.target,
                 .comment => a.grantee == b.grantee and a.target == b.target and a.sub == b.sub,
                 _ => false,
@@ -2007,7 +2010,10 @@ pub fn Objects(comptime config: types.Config) type {
                 .statistics => o.oid != 0 and o.target != 0 and o.grantee != 0 and o.sub >= -1 and o.sub <= 10000,
                 .publication_table, .publication_schema => o.oid != 0 and o.target != 0 and o.grantee != 0 and o.sub == 0,
                 .member => o.oid != 0 and o.target != 0 and o.grantee != 0 and o.sub == 0,
-                .acl, .schema_acl, .large_object_acl => o.oid == 0 and o.target != 0 and o.sub == 0,
+                .acl, .schema_acl => o.oid == 0 and o.target != 0 and o.sub == 0,
+                // Legacy owner-issued grants keep sub = 0. Delegated grants
+                // put their grantor OID in that key field, including in drops.
+                .large_object_acl => o.oid == 0 and o.target != 0,
                 .relation, .schema_acl_state, .schema_owner, .role_settings, .large_object => o.oid == 0 and o.target != 0 and o.grantee == 0 and o.sub == 0,
                 .comment => o.oid == 0 and o.target != 0 and o.sub >= 0 and switch (o.grantee) {
                     class_relation => true,
@@ -2058,10 +2064,14 @@ pub fn Objects(comptime config: types.Config) type {
                 .acl => !has_name and o.flags != 0 and o.flags & ~table_privileges == 0 and o.grant_flags & ~o.flags == 0 and o.role_count == 0 and o.text_len == 0 and o.owner != 0,
                 .large_object => !has_name and o.owner != 0 and o.role_count == 0 and
                     (o.text_len == 0 or (o.text_len == 8 and o.largeObjectLength() != 0 and o.largeObjectLength() <= @import("large_object_pages.sig").max_size)) and o.split == 0 and
-                    (o.grant_flags == 0 or (o.grant_flags == large_object_generated_oid and o.target >= first_oid and o.target < 0xffff_ffff)) and
+                    o.grant_flags & ~(large_object_generated_oid | large_object_privileges) == 0 and
+                    (o.grant_flags & large_object_generated_oid == 0 or (o.target >= first_oid and o.target < 0xffff_ffff)) and
+                    o.grant_flags & large_object_privileges & ~o.flags == 0 and
                     (o.flags == 0 or (o.flags & large_object_explicit_acl != 0 and o.flags & ~(large_object_explicit_acl | large_object_privileges) == 0)),
-                .large_object_acl => !has_name and o.owner != 0 and o.role_count == 0 and o.text_len == 0 and o.grant_flags == 0 and
-                    o.flags != 0 and o.flags & ~large_object_privileges == 0 and o.owner != o.grantee,
+                .large_object_acl => !has_name and o.owner != 0 and o.role_count == 0 and o.text_len == 0 and
+                    (o.sub == 0 or o.owner == @as(u32, @bitCast(o.sub))) and
+                    o.flags != 0 and o.flags & ~large_object_privileges == 0 and (o.owner != o.grantee or (o.sub != 0 and o.grant_flags == 0)) and
+                    o.grant_flags & ~o.flags == 0 and (o.grantee != public_role or o.grant_flags == 0),
                 .schema_acl => !has_name and o.owner != 0 and o.grant_flags == 0 and o.role_count == 0 and o.text_len == 0 and
                     (o.flags == priv_schema_usage or (o.flags == 0 and o.grantee == o.owner)),
                 .schema_acl_state, .schema_owner => !has_name and o.owner != 0 and o.flags == 0 and o.grant_flags == 0 and o.role_count == 0 and o.text_len == 0,
@@ -2180,6 +2190,8 @@ pub fn Objects(comptime config: types.Config) type {
             publication_all_tables: bool = false,
             large_object_explicit_acl: bool = false,
             large_object_length: u64 = 0,
+            acl_flags: u32 = 0,
+            acl_options: u32 = 0,
             roles: [role_capacity]u32 = @splat(0),
             role_count: u8 = 0,
             name: V.Name = .{},
@@ -2197,6 +2209,10 @@ pub fn Objects(comptime config: types.Config) type {
                 out.publication_all_tables = o.kind == .publication and o.flags & pub_all_tables != 0;
                 out.large_object_explicit_acl = o.kind == .large_object and o.flags & large_object_explicit_acl != 0;
                 if (o.kind == .large_object) out.large_object_length = o.largeObjectLength();
+                if (o.kind == .large_object_acl) {
+                    out.acl_flags = o.flags;
+                    out.acl_options = o.grant_flags;
+                }
                 if (o.kind == .statistics) out.last_statistics_column = o.text[o.text_len - 1];
                 if (userType(o.kind)) {
                     const name = o.arrayName();
@@ -2285,7 +2301,7 @@ pub fn Objects(comptime config: types.Config) type {
                     // A decoded version is not yet an entry: mark it taken.
                     v.used = true;
                     if (width != 0) ctx.noteObjectOid(o.oid + width - 1);
-                    if (o.kind == .large_object and o.grant_flags == large_object_generated_oid) ctx.noteObjectOid(o.target);
+                    if (o.kind == .large_object and o.grant_flags & large_object_generated_oid != 0) ctx.noteObjectOid(o.target);
                     return;
                 };
                 return error.ChangeRecordConflict;
@@ -2346,7 +2362,9 @@ pub fn Objects(comptime config: types.Config) type {
                                 break;
                             }
                         }
-                        if (object_owner != v.owner or (grantee != public_role and !self.roleExists(grantee))) return error.ChangeRecordConflict;
+                        const large_owner = object_owner orelse return error.ChangeRecordConflict;
+                        if ((v.sub == 0) != (large_owner == v.owner) or
+                            (grantee != public_role and !self.roleExists(grantee))) return error.ChangeRecordConflict;
                     },
                     .schema_acl => {
                         const original = ctx.objectPrivateSchemaOwner(target) orelse return error.ChangeRecordConflict;
@@ -2412,6 +2430,33 @@ pub fn Objects(comptime config: types.Config) type {
                 for (&self.items) |*v| {
                     if (!v.live) continue;
                     try self.references(v, ctx);
+                }
+            }
+
+            /// A frame or sealed base image must leave every delegated grant
+            /// supported by an unbroken grant-option path from the owner.
+            pub fn verifyLargeObjectGrants(self: *const Overlay) Error!void {
+                const acl = @import("large_object_acl.sig");
+                for (&self.items, 0..) |*entry, index| {
+                    if (!entry.live or entry.kind != .large_object_acl or entry.sub == 0) continue;
+                    for (self.items[0..index]) |*prior| {
+                        if (prior.live and prior.kind == .large_object_acl and prior.sub != 0 and prior.target == entry.target) break;
+                    } else {
+                        var edges: [capacity]acl.Edge = undefined;
+                        var support: [capacity]acl.Graph.State = undefined;
+                        var graph: acl.Graph = .{ .edges = &edges, .owner = 0, .privileges = large_object_privileges };
+                        for (&self.items) |*item| {
+                            if (!item.live or item.target != entry.target) continue;
+                            if (item.kind == .large_object) graph.owner = item.owner;
+                            if (item.kind == .large_object_acl) graph.add(.{
+                                .grantor = item.owner, .grantee = item.grantee, .flags = item.acl_flags, .options = item.acl_options,
+                            });
+                        }
+                        graph.support(&support, null);
+                        for (edges[0..graph.len], support[0..graph.len]) |edge, state| {
+                            if (edge.flags & ~state.available != 0) return error.ChangeRecordConflict;
+                        }
+                    }
                 }
             }
         };
