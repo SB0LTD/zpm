@@ -2282,16 +2282,19 @@ pub fn Database(comptime config: Config) type {
             }
         };
 
-        const CopySpans = [config.tables * storage_fields.len + 3]StorageSpan;
+        const CopySpans = [3 + if (config.external_storage) config.tables * storage_fields.len else 0]StorageSpan;
 
         fn boundCopySpans(self: *const Self) Error!CopySpans {
             var spans: CopySpans = undefined;
             spans[0] = .{ .start = @intFromPtr(self), .end = @intFromPtr(self) + @sizeOf(Self) };
-            spans[1] = try StorageSpan.of(self.workspace.query.refs);
+            // The instance span already covers inline references and banks.
+            spans[1] = if (comptime config.external_storage) try StorageSpan.of(self.workspace.query.refs) else .{ .start = 0, .end = 0 };
             spans[spans.len - 1] = if (comptime config.external_workspace) try StorageSpan.of(self.workspace.query.cells) else .{ .start = 0, .end = 0 };
-            for (&self.tables, 0..) |*table, bank| {
-                inline for (storage_fields, 0..) |field, index| {
-                    spans[2 + bank * storage_fields.len + index] = try StorageSpan.of(@field(table, field));
+            if (comptime config.external_storage) {
+                for (&self.tables, 0..) |*table, bank| {
+                    inline for (storage_fields, 0..) |field, index| {
+                        spans[2 + bank * storage_fields.len + index] = try StorageSpan.of(@field(table, field));
+                    }
                 }
             }
             return spans;

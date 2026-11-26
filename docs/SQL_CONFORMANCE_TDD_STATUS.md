@@ -1,5 +1,17 @@
 # SQL conformance TDD checkpoint
 
+## Native database copy qualification
+
+Large-object page support introduced a native build regression in
+`copyFromInto` for inline databases. The ownership check now uses the
+database instance span for inline banks and references. It records
+separate spans for caller-owned storage and scratch when configured.
+
+The existing layout ordering, summary, dense grouping, and rollup
+contracts exercise inline copies. The runtime workspace and compact scan
+contracts cover externally bound buffers, and the large-object page
+contract checks that a copy retains the payload.
+
 ## PostgreSQL large-object default privileges
 
 `ALTER DEFAULT PRIVILEGES ... ON LARGE OBJECTS` supports SELECT and
