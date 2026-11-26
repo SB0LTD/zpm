@@ -16,6 +16,7 @@ const defaults_magic = "RSBASE04";
 // Version 5 inserts a schema count and checked definitions before tables.
 const schemas_magic = "RSBASE05";
 const pages_magic = "RSBASE06";
+const large_defaults_magic = "RSBASE07";
 const header_size = 24;
 const table_header_size = 8;
 const part_size = 5;
@@ -65,18 +66,26 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
                 for (self.counts) |count| if (count != 0) return true;
                 return false;
             }
+
+            fn hasLargeDefaults(self: CatalogImage) bool {
+                return self.counts[4] != 0;
+            }
         };
 
-        const catalog_kinds = [_]objects.Kind{ .role, .large_object, .large_object_acl, .comment };
+        const catalog_kinds = [_]objects.Kind{ .role, .large_object, .large_object_acl, .comment, .large_object_default_acl };
 
         fn writeCatalog(db: *const Database, sink: anytype, scratch: []u8, kind: objects.Kind) !void {
             const snap: storage.Snapshot = .{ .csn = db.csn };
-            for (&db.catalog_objects.items) |*object| {
-                if (object.kind != kind or !O.visible(object, snap)) continue;
-                var writer = try change_log.Writer.init(scratch, 0);
-                try writer.op(.object_create);
-                try O.encodeCreate(&writer, object);
-                try appendPart(sink, .object_create, scratch[0..try writer.finish()]);
+            const passes: usize = if (kind == .large_object_default_acl) 2 else 1;
+            for (0..passes) |pass| {
+                for (&db.catalog_objects.items) |*object| {
+                    if (object.kind != kind or !O.visible(object, snap)) continue;
+                    if (passes == 2 and (object.oid == 0) != (pass == 1)) continue;
+                    var writer = try change_log.Writer.init(scratch, 0);
+                    try writer.op(.object_create);
+                    try O.encodeCreate(&writer, object);
+                    try appendPart(sink, .object_create, scratch[0..try writer.finish()]);
+                }
             }
         }
 
@@ -149,7 +158,7 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
             for (&db.objects.routines) |*item| if (item.live and item.stamp.visible(snap)) return error.SnapshotUnsupportedState;
             for (&db.objects.triggers) |*item| if (item.live and item.stamp.visible(snap)) return error.SnapshotUnsupportedState;
             for (&db.objects.rules) |*item| if (item.live and item.stamp.visible(snap)) return error.SnapshotUnsupportedState;
-            if (image.hasObjects() and image.counts[1] == 0) return error.SnapshotUnsupportedState;
+            if (image.hasObjects() and image.counts[1] == 0 and !image.hasLargeDefaults()) return error.SnapshotUnsupportedState;
             return image;
         }
 
@@ -257,15 +266,16 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
                 try sink.appendAll(&header);
                 try writeTable(table, sink, scratch);
             } else {
-                @memcpy(header[0..8], if (with_pages) pages_magic else if (schema_count != 0) schemas_magic else if (with_defaults) defaults_magic else if (sequence_count == 0) multi_magic else sequence_magic);
+                @memcpy(header[0..8], if (catalog_image.hasLargeDefaults()) large_defaults_magic else if (with_pages) pages_magic else if (schema_count != 0) schemas_magic else if (with_defaults) defaults_magic else if (sequence_count == 0) multi_magic else sequence_magic);
                 std.mem.writeInt(u32, header[16..20], @intCast(selected.count), .little);
                 std.mem.writeInt(u32, header[20..24], @intCast(sequence_count), .little);
                 try sink.appendAll(&header);
                 if (with_pages) {
-                    var counts: [20]u8 = undefined;
-                    for (catalog_image.counts, 0..) |count, index| std.mem.writeInt(u32, counts[index * 4 ..][0..4], count, .little);
-                    std.mem.writeInt(u32, counts[16..20], @intCast(catalog_image.pages), .little);
-                    try sink.appendAll(&counts);
+                    var counts: [24]u8 = undefined;
+                    const groups: usize = if (catalog_image.hasLargeDefaults()) catalog_kinds.len else catalog_kinds.len - 1;
+                    for (catalog_image.counts[0..groups], 0..) |count, index| std.mem.writeInt(u32, counts[index * 4 ..][0..4], count, .little);
+                    std.mem.writeInt(u32, counts[groups * 4 ..][0..4], @intCast(catalog_image.pages), .little);
+                    try sink.appendAll(counts[0..(groups + 1) * 4]);
                     try writeCatalog(db, sink, scratch, .role);
                 }
                 if (with_pages or schema_count != 0) {
@@ -379,20 +389,26 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
 
             var offset: u64 = header_size;
             var sequence_count: u32 = 0;
-            const with_pages = std.mem.eql(u8, header[0..8], pages_magic);
+            const with_large_defaults = std.mem.eql(u8, header[0..8], large_defaults_magic);
+            const with_pages = with_large_defaults or std.mem.eql(u8, header[0..8], pages_magic);
             const with_schemas = with_pages or std.mem.eql(u8, header[0..8], schemas_magic);
-            var counts: [5]u32 = @splat(0);
+            const groups: usize = if (with_large_defaults) catalog_kinds.len else catalog_kinds.len - 1;
+            var counts: [catalog_kinds.len]u32 = @splat(0);
+            var page_count: u32 = 0;
             if (with_pages) {
-                var encoded: [20]u8 = undefined;
-                try readExact(file, offset, &encoded, length);
-                offset += encoded.len;
+                var encoded: [24]u8 = undefined;
+                const encoded_len = (groups + 1) * 4;
+                try readExact(file, offset, encoded[0..encoded_len], length);
+                offset += encoded_len;
                 var objects_total: u64 = 0;
-                for (&counts, 0..) |*count, index| {
+                for (counts[0..groups], 0..) |*count, index| {
                     count.* = std.mem.readInt(u32, encoded[index * 4 ..][0..4], .little);
-                    if (index < catalog_kinds.len) objects_total += count.*;
+                    objects_total += count.*;
                 }
+                page_count = std.mem.readInt(u32, encoded[groups * 4 ..][0..4], .little);
                 if (objects_total == 0 or objects_total > db.catalog_objects.items.len or
-                    (counts[4] != 0 and (db.large_pages == null or counts[4] > db.large_pages.?.capacity())))
+                    (with_large_defaults and counts[4] == 0) or
+                    (page_count != 0 and (db.large_pages == null or page_count > db.large_pages.?.capacity())))
                     return error.InvalidSnapshotImage;
                 try restoreCatalog(db, file, length, &offset, scratch, replay, csn, .role, counts[0]);
             }
@@ -438,14 +454,14 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
             }
             if (with_defaults and !validSequenceOwnership(db)) return error.InvalidSnapshotImage;
             if (with_pages) {
-                for (catalog_kinds[1..], counts[1..4]) |kind, count| {
+                for (catalog_kinds[1..groups], counts[1..groups]) |kind, count| {
                     try restoreCatalog(db, file, length, &offset, scratch, replay, csn, kind, count);
                 }
                 if (counts[2] != 0) {
                     replay.object_overlay.init(&db.catalog_objects);
                     try replay.object_overlay.verifyLargeObjectGrants();
                 }
-                try restorePages(db, file, length, &offset, scratch, csn, counts[4]);
+                try restorePages(db, file, length, &offset, scratch, csn, page_count);
             }
             const counters = try readPart(file, &offset, length, scratch, .catalog_counters);
             if (offset != length or try file.length() != length) return error.InvalidSnapshotImage;

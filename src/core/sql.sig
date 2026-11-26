@@ -4330,14 +4330,13 @@ pub fn Database(comptime config: Config) type {
                             self.catalog_objects.pendingConflict(&key, snap) == null) break;
                     }
                 } else if (try self.lockLargeObject(slot, oid, snap) != null) return error.PrimaryKeyViolation;
-                try self.reserveWrites(slot, 1);
                 var item: O.Object = .{
                     .kind = .large_object,
                     .target = object_oid,
                     .owner = role,
                     .grant_flags = if (oid == 0) CO.large_object_generated_oid else 0,
                 };
-                _ = try self.objectInsert(slot, &item, false, original_snap);
+                try self.insertLargeObject(slot, &item, snap, original_snap);
                 return object_oid;
             }
 
@@ -4378,12 +4377,160 @@ pub fn Database(comptime config: Config) type {
             return privileges;
         }
 
+        fn checkLargeAclRole(self: *Self, slot: u16, role: u32, snap: Snapshot) Error!void {
+            if (role == CO.public_role) return;
+            const key: O.Object = .{ .kind = .role, .oid = role };
+            if (self.catalog_objects.pendingConflict(&key, snap)) |other| return self.objectPark(slot, other);
+            var latest = snap;
+            latest.csn = self.csn;
+            if (self.catalog_objects.roleFlags(role, latest) == null) return error.SerializationFailure;
+        }
+
+        /// The owner entry has the pg_default_acl OID. The remaining
+        /// versions are grants issued by that role to named grantees or PUBLIC.
+        fn lockLargeDefaults(self: *Self, slot: u16, role: u32, snap: Snapshot) Error!?usize {
+            var latest = snap;
+            latest.csn = self.csn;
+            var parent: ?usize = null;
+            for (&self.catalog_objects.items, 0..) |*row, index| {
+                if (!row.used or row.kind != .large_object_default_acl or row.target != role) continue;
+                if (O.pendingOf(row, snap)) |other| return self.objectPark(slot, other);
+                const visible = O.visible(row, snap);
+                if (visible != O.visible(row, latest)) return error.SerializationFailure;
+                if (visible and row.oid != 0) parent = index;
+            }
+            return parent;
+        }
+
+        fn insertLargeObject(self: *Self, slot: u16, object: *O.Object, visible: Snapshot, write: Snapshot) Error!void {
+            var current = visible;
+            current.csn = self.csn;
+            const key: O.Object = .{ .kind = .large_object_default_acl, .target = object.owner, .grantee = object.owner };
+            const parent = self.catalog_objects.findKey(&key, current);
+            var writes: usize = 1;
+            if (parent) |index| {
+                const defaults = &self.catalog_objects.items[index];
+                object.flags = CO.large_object_explicit_acl | defaults.flags;
+                object.grant_flags |= defaults.grant_flags;
+                for (&self.catalog_objects.items) |*entry| {
+                    if (entry.kind != .large_object_default_acl or entry.target != object.owner or
+                        entry.oid != 0 or !O.visible(entry, current)) continue;
+                    try self.checkLargeAclRole(slot, entry.grantee, current);
+                    writes += 1;
+                }
+            }
+            try self.reserveWrites(slot, writes);
+            _ = try self.objectInsert(slot, object, false, write);
+            if (parent != null) {
+                for (&self.catalog_objects.items) |*entry| {
+                    if (entry.kind != .large_object_default_acl or entry.target != object.owner or
+                        entry.oid != 0 or !O.visible(entry, current)) continue;
+                    var grant: O.Object = .{
+                        .kind = .large_object_acl, .target = object.target, .owner = object.owner, .grantee = entry.grantee,
+                        .flags = entry.flags, .grant_flags = entry.grant_flags,
+                    };
+                    _ = try self.objectInsert(slot, &grant, false, write);
+                }
+            }
+        }
+
+        fn alterLargeObjectDefaults(self: *Self, slot: u16, source: []const u8, change: *const CO.LargeObjectDefaults, snap: Snapshot) Error!void {
+            var owners: [CO.list_capacity]u32 = undefined;
+            var owner_count: usize = 0;
+            if (change.count == 0) {
+                owners[0] = self.session.role;
+                owner_count = 1;
+            }
+            for (change.owners[0..change.count]) |name| {
+                const role = try self.objectRole(source, name, snap);
+                if (!self.ownsLargeObject(role, snap)) return error.InsufficientPrivilege;
+                if (std.mem.indexOfScalar(u32, owners[0..owner_count], role) != null) continue;
+                owners[owner_count] = role;
+                owner_count += 1;
+            }
+            var grantees: [CO.list_capacity]u32 = undefined;
+            var count: usize = 0;
+            for (change.grant.grantees[0..change.grant.grantee_count]) |name| {
+                const role = try self.objectRole(source, name, snap);
+                if (std.mem.indexOfScalar(u32, grantees[0..count], role) != null) continue;
+                if (role == CO.public_role and !change.revoke and change.grant.option) return error.InvalidGrantOperation;
+                try self.checkLargeAclRole(slot, role, snap);
+                grantees[count] = role;
+                count += 1;
+            }
+            for (owners[0..owner_count]) |owner| {
+                try self.checkLargeAclRole(slot, owner, snap);
+                try self.changeLargeDefaults(slot, owner, grantees[0..count], &change.grant, change.revoke, snap);
+            }
+        }
+
+        fn changeLargeDefaults(self: *Self, slot: u16, owner: u32, grantees: []const u32, grant: *const CO.Grant, revoke: bool, snap: Snapshot) Error!void {
+            const prior = try self.lockLargeDefaults(slot, owner, snap);
+            var parent: O.Object = .{ .kind = .large_object_default_acl, .target = owner, .owner = owner, .grantee = owner, .flags = CO.large_object_privileges };
+            if (prior) |index| parent = self.catalog_objects.items[index];
+            const owner_flags = parent.flags;
+            const owner_options = parent.grant_flags;
+            var children: usize = 0;
+            for (&self.catalog_objects.items) |*row| {
+                if (row.kind == .large_object_default_acl and row.target == owner and row.oid == 0 and O.visible(row, snap)) children += 1;
+            }
+            const Edit = struct { role: u32, old: ?usize, flags: u32, options: u32 };
+            var edits: [CO.list_capacity]Edit = undefined;
+            var used: usize = 0;
+            var writes: usize = 0;
+            for (grantees) |role| {
+                if (role == owner) {
+                    updateLargeDefaultMask(&parent.flags, &parent.grant_flags, grant, revoke);
+                    continue;
+                }
+                const key: O.Object = .{ .kind = .large_object_default_acl, .target = owner, .grantee = role };
+                const old = self.catalog_objects.findKey(&key, snap);
+                const flags = if (old) |index| self.catalog_objects.items[index].flags else 0;
+                const options = if (old) |index| self.catalog_objects.items[index].grant_flags else 0;
+                var edit: Edit = .{ .role = role, .old = old, .flags = flags, .options = options };
+                updateLargeDefaultMask(&edit.flags, &edit.options, grant, revoke);
+                if (edit.flags == flags and edit.options == options) continue;
+                if (old != null) { children -= 1; writes += 1; }
+                if (edit.flags != 0) { children += 1; writes += 1; }
+                edits[used] = edit;
+                used += 1;
+            }
+            const keep = children != 0 or parent.flags != CO.large_object_privileges or parent.grant_flags != 0;
+            const replace = prior == null or parent.flags != owner_flags or parent.grant_flags != owner_options;
+            try self.reserveWrites(slot, writes + @as(usize, @intFromBool(keep and replace)) +
+                @intFromBool(prior != null and (!keep or replace)));
+            if (prior) |index| {
+                if (!keep or replace) self.objectDelete(slot, index, snap);
+            }
+            if (keep and replace) _ = try self.objectInsert(slot, &parent, prior == null, snap);
+            for (edits[0..used]) |edit| {
+                if (edit.old) |index| self.objectDelete(slot, index, snap);
+                if (edit.flags == 0) continue;
+                var row: O.Object = .{
+                    .kind = .large_object_default_acl, .target = owner, .owner = owner, .grantee = edit.role,
+                    .flags = edit.flags, .grant_flags = edit.options,
+                };
+                _ = try self.objectInsert(slot, &row, false, snap);
+            }
+        }
+
+        fn updateLargeDefaultMask(flags: *u32, options: *u32, grant: *const CO.Grant, revoke: bool) void {
+            if (revoke) {
+                options.* &= ~grant.privileges;
+                if (!grant.option) flags.* &= ~grant.privileges;
+            } else {
+                flags.* |= grant.privileges;
+                if (grant.option) options.* |= grant.privileges;
+            }
+        }
+
         const LoAcl = @import("sql/large_object_acl.sig");
 
         fn largeObjectGrantGraph(self: *const Self, object: *const O.Object, snap: Snapshot, edges: []LoAcl.Edge) LoAcl.Graph {
             var graph: LoAcl.Graph = .{ .edges = edges, .owner = object.owner, .privileges = CO.large_object_privileges };
+            const kind: CO.Kind = if (object.kind == .large_object) .large_object_acl else .large_object_default_acl;
             for (&self.catalog_objects.items, 0..) |*entry, index| {
-                if (entry.kind != .large_object_acl or entry.target != object.target or !O.visible(entry, snap)) continue;
+                if (entry.kind != kind or entry.target != object.target or entry.oid != 0 or !O.visible(entry, snap)) continue;
                 graph.add(.{
                     .grantor = entry.owner, .grantee = entry.grantee, .flags = entry.flags,
                     .options = entry.grant_flags, .original = index,
@@ -4611,6 +4758,10 @@ pub fn Database(comptime config: Config) type {
                 .drop_role => |*drop| blk: {
                     try self.dropRoles(slot, source, drop, snap);
                     break :blk .drop_role;
+                },
+                .alter_large_object_defaults => |*change| blk: {
+                    try self.alterLargeObjectDefaults(slot, source, change, snap);
+                    break :blk .alter_default_privileges;
                 },
                 .grant => |*grant| blk: {
                     if (grant.membership) {
@@ -5019,7 +5170,8 @@ pub fn Database(comptime config: Config) type {
                 }
                 for (&self.catalog_objects.items) |*o| {
                     const affected = (CO.userType(o.kind) or o.kind == .statistics or o.kind == .relation or o.kind == .large_object) and o.owner == oid or
-                        (o.kind == .schema_acl or o.kind == .large_object_acl) and (o.owner == oid or o.grantee == oid) or
+                        (o.kind == .schema_acl or o.kind == .large_object_acl or o.kind == .large_object_default_acl) and
+                            (o.owner == oid or o.grantee == oid) or
                         o.kind == .role_settings and o.target == oid;
                     if (affected and O.visible(o, latest) != O.visible(o, snap)) return error.SerializationFailure;
                     if (!O.visible(o, snap)) continue;
@@ -5033,7 +5185,7 @@ pub fn Database(comptime config: Config) type {
                             writes += 1;
                         },
                         .role_settings => if (o.target == oid) { writes += 1; },
-                        .acl, .schema_acl, .large_object_acl => if (o.grantee == oid or o.owner == oid) return error.DependentObjects,
+                        .acl, .schema_acl, .large_object_acl, .large_object_default_acl => if (o.grantee == oid or o.owner == oid) return error.DependentObjects,
                         .policy => {
                             for (o.roleList()) |listed| {
                                 if (listed == oid) return error.DependentObjects;
@@ -6045,9 +6197,9 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn largeObjectAcl(self: *const Self, object: *const O.Object, snapshot: Snapshot, values: ?*types.ValueBytes) Error!Cell {
-            if (object.flags & CO.large_object_explicit_acl == 0) return .null_value;
+            if (object.kind == .large_object and object.flags & CO.large_object_explicit_acl == 0) return .null_value;
             const owner = self.catalog_objects.roleName(object.owner, snapshot) orelse return error.UndefinedObject;
-            const owner_flags = largeObjectOwnerPrivileges(object);
+            const owner_flags = object.flags & CO.large_object_privileges;
             var edges: [O.capacity]LoAcl.Edge = undefined;
             const graph = self.largeObjectGrantGraph(object, snapshot, &edges);
             var emitted: [O.capacity]LoAcl.Graph.State = undefined;
@@ -6155,6 +6307,14 @@ pub fn Database(comptime config: Config) type {
         fn catalogObjectRows(self: *const Self, session_values: *const value_module.Session, snapshot: Snapshot, view: catalog_module.View, sink: *X.RowSink) Error!void {
             const database = session_values.database;
             switch (view) {
+                .pg_default_acl => {
+                    const include_acl = sink.referencesColumn(4);
+                    for (&self.catalog_objects.items) |*entry| {
+                        if (entry.kind != .large_object_default_acl or entry.oid == 0 or !O.visible(entry, snapshot)) continue;
+                        const acl = if (include_acl) try self.largeObjectAcl(entry, snapshot, sink.valueBytes()) else .null_value;
+                        try sink.add(&.{ intCell(entry.oid), intCell(entry.owner), intCell(0), .{ .pg_internal_char = 'L' }, acl });
+                    }
+                },
                 .pg_largeobject_metadata => {
                     const include_acl = sink.referencesColumn(2);
                     for (&self.catalog_objects.items) |*entry| {
@@ -7325,7 +7485,7 @@ pub fn Database(comptime config: Config) type {
             if (view == .sequence_state) return error.UnsupportedStatement;
             // This catalog stores explicit ALTER DEFAULT PRIVILEGES entries.
             // Built-in defaults come from acldefault() and do not create rows.
-            if (view == .pg_default_acl) return;
+            if (view == .pg_default_acl) return self.catalogObjectRows(session_values, snapshot, view, sink);
             // Parameter grants have no persisted objects. Stock tools still
             // discover the typed catalog before exporting global roles.
             if (view == .pg_parameter_acl) return;

@@ -1767,7 +1767,62 @@ fn largeObjectAclValues() !void {
     try expect("SELECT COUNT(*) FROM lo_acl_value", "0");
 }
 
+fn largeObjectDefaultPrivileges() !void {
+    try reset();
+    try run("CREATE ROLE lo_creator");
+    try run("CREATE ROLE lo_default_reader");
+    try run("CREATE ROLE lo_default_member");
+    const owner = try roleOid("lo_creator");
+    const reader = try roleOid("lo_default_reader");
+    const catalog = "SELECT defaclnamespace,defaclobjtype,defaclacl::text FROM pg_default_acl";
+    const visible = "SELECT oid,lomacl::text FROM pg_largeobject_metadata ORDER BY oid";
+    try as("lo_creator");
+    try run("SELECT lo_create(56300)");
+    try run("ALTER DEFAULT PRIVILEGES GRANT SELECT ON LARGE OBJECTS TO lo_default_reader WITH GRANT OPTION");
+    try run("SELECT lo_create(56301)");
+    try expect(catalog, "0|L|{lo_creator=rw/lo_creator,lo_default_reader=r*/lo_creator}");
+    const def_oid = try std.fmt.parseInt(u32, try query(&db, "SELECT oid FROM pg_default_acl"), 10);
+    try check(def_oid >= 16384);
+    var encoded: [128]u8 = undefined;
+    try replayFails(objectRecord(&encoded, 71, 22, def_oid, owner, owner, 0, ""), error.ChangeRecordConflict);
+    try run("ALTER DEFAULT PRIVILEGES REVOKE GRANT OPTION FOR SELECT ON LARGE OBJECTS FROM lo_default_reader RESTRICT");
+    try check(def_oid == try std.fmt.parseInt(u32, try query(&db, "SELECT oid FROM pg_default_acl"), 10));
+    try run("SELECT lo_create(56302)");
+    try run("ALTER DEFAULT PRIVILEGES REVOKE SELECT ON LARGE OBJECTS FROM lo_default_reader CASCADE");
+    try expect(catalog, "");
+    try run("SELECT lo_create(56303)");
+    const rows_expected = "56300|NULL;56301|{lo_creator=rw/lo_creator,lo_default_reader=r*/lo_creator};56302|{lo_creator=rw/lo_creator,lo_default_reader=r/lo_creator};56303|NULL";
+    try expect(visible, rows_expected);
+    try same(try query(&replica, visible), rows_expected);
+    forceRole(reader);
+    try fails("ALTER DEFAULT PRIVILEGES FOR ROLE lo_creator GRANT SELECT ON LARGE OBJECTS TO PUBLIC", error.InsufficientPrivilege);
+    forceRole(owner);
+    try fails("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON LARGE OBJECTS TO PUBLIC", error.InvalidGrantOperation);
+    try fails("ALTER DEFAULT PRIVILEGES GRANT SELECT ON LARGE OBJECTS TO PUBLIC WITH GRANT OPTION", error.InvalidGrantOperation);
+    try run("ALTER DEFAULT PRIVILEGES REVOKE SELECT ON LARGE OBJECTS FROM CURRENT_ROLE");
+    try fails("SELECT lo_from_bytea(56304,''::bytea)", error.InsufficientPrivilege);
+    try expect("SELECT COUNT(*) FROM pg_largeobject_metadata WHERE oid=56304", "0");
+    try run("ALTER DEFAULT PRIVILEGES GRANT SELECT ON LARGE OBJECTS TO CURRENT_ROLE");
+    try expect(catalog, "");
+    try as("ramsql");
+
+    try run("GRANT lo_creator TO lo_default_member");
+    try as("lo_default_member");
+    try run("ALTER DEFAULT PRIVILEGES FOR USER lo_creator GRANT SELECT ON LARGE OBJECTS TO PUBLIC");
+    try run("SELECT lo_create(56305)");
+    try expect("SELECT lomacl::text FROM pg_largeobject_metadata WHERE oid=56305", "NULL");
+    try as("lo_creator");
+    try run("SELECT lo_create(56306)");
+    try expect("SELECT lomacl::text FROM pg_largeobject_metadata WHERE oid=56306", "{lo_creator=rw/lo_creator,=r/lo_creator}");
+    try as("ramsql");
+    try run("ALTER DEFAULT PRIVILEGES FOR ROLE lo_creator,lo_default_member GRANT SELECT ON LARGE OBJECTS TO lo_default_reader");
+    try expect("SELECT COUNT(*) FROM pg_default_acl", "2");
+    try fails("DROP ROLE lo_default_reader", error.DependentObjects);
+    try same(try query(&replica, "SELECT COUNT(*) FROM pg_default_acl"), "2");
+}
+
 pub fn main() !void {
+    try largeObjectDefaultPrivileges();
     try largeObjectAclValues();
     try largeObjectDelegation();
     try largeObjectMetadata();
