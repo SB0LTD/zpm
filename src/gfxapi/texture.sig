@@ -690,6 +690,21 @@ pub fn sampleArray(k: *kir.Kernel, slot: Slot, s: Arg, t: Arg, layer: ?Arg, kind
     // one level's read, or (trilinear) two in a loop's two passes, each
     // weighted: the code of one read either way
     const tri = k.op2(.pand, .pred, r(k.op1(.pnot, .pred, r(nomip))), r(k.op2(.pand, .pred, r(lin_mip), r(k.cmp(.u32, .ne, r(d2), r(d1))))));
+    // (a level the program fixes at 0 or below: sample_c_lz,
+    // SampleLevel(.., 0), a vertex shader's base. It is magnified, one
+    // level read, unless the sampler's MinLOD is above the magnification
+    // point; then the nearer level below alone is read, not two blended.
+    // One read in straight-line code, no loop: a pixel shader's taps (a
+    // shadow map's 36) are then issued together, not one round trip each)
+    if (fixedLow(lod)) {
+        const cv = sampleLayerLevel(k, slot, d, level1, slice, s, t, linear, kind, off);
+        if (slot.shadow != null) {
+            const valid = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(d.fmt), u(F_VALID))), u(0));
+            return .{ r(k.sel(.f32, r(valid), cv[0], f(0))), f(0), f(0), f(1) };
+        }
+        if (hwOf(slot, kind) != null or hwCubeOf(slot, kind) != null) return cv;
+        return finish(k, d, cv, kind);
+    }
     const lvl = k.reg(.u32);
     k.set(lvl, .mov, r(level1), no, no);
     const wgt = k.reg(.f32);
@@ -726,6 +741,19 @@ pub fn sampleArray(k: *kir.Kernel, slot: Slot, s: Arg, t: Arg, layer: ?Arg, kind
     // an unbound texture's header (0, 0, 0, 1))
     if (hwOf(slot, kind) != null or hwCubeOf(slot, kind) != null) return out;
     return finish(k, d, out, kind);
+}
+
+/// λ known when the program is built, at 0 or below (the base level, or
+/// a level given as such a constant).
+fn fixedLow(lod: Lod) bool {
+    return switch (lod) {
+        .base => true,
+        .level => |x| switch (x) {
+            .imm => |bits| @as(f32, @bitCast(bits)) <= 0,
+            .reg => false,
+        },
+        .grad => false,
+    };
 }
 
 fn depthAt(k: *kir.Kernel, slot: Slot, level: V) V {

@@ -2816,6 +2816,64 @@ test "copies dropped where nothing between needs them (kir_sm120.forward), kept 
     try same(caps, &k, .{ 2, 1, 1 }, &.{}, 2 * NT, null);
 }
 
+test "a register reused in a stretch (kir_sm120.rename) and the same computation again (kir_sm120.cse): taps through one register, repeats kept apart where an operand or the first result was written between" {
+    const caps = caseCaps(false);
+    fillInts(0x5e1);
+    var k = newKernel("reuse", .{ 64, 1, 1 });
+    const A = k.binding();
+    const Bb = k.binding();
+    _ = k.binding();
+    const O = k.binding();
+    const t = lin(&k);
+    const off = k.op2(.shl, .u32, r(t), u(2));
+    // a shadow map's taps as DXBC writes them: one register the tap's
+    // address, then its value, then the next tap's address; the sum in
+    // one register too
+    const x = k.reg(.u32);
+    const sum = k.reg(.u32);
+    k.set(sum, .mov, u(0), no, no);
+    for (0..6) |tap| {
+        k.set(x, .iadd, r(off), u(@intCast(tap * 4)), no);
+        k.set(x, .@"and", r(x), u(0xff), no);
+        k.set(x, .mov, r(k.load(.u32, kir.global(A, 32), r(x))), no, no);
+        // (the same level-like work each tap, through copies)
+        const c0 = k.mov(.u32, u(7));
+        const c1 = k.mov(.u32, r(c0));
+        const lvl = k.op2(.imax, .u32, r(k.op2(.imin, .u32, r(c1), r(k.load(.u32, kir.global(Bb, 32), u(16))))), u(1));
+        k.set(sum, .iadd, r(sum), r(k.op2(.xor, .u32, r(x), r(lvl))), no);
+    }
+    // the same op twice with an operand written between: two values
+    const y = k.mov(.u32, r(sum));
+    const p1 = k.op2(.imul, .u32, r(y), u(3));
+    k.set(y, .iadd, r(y), u(5), no);
+    const p2 = k.op2(.imul, .u32, r(y), u(3));
+    // the same op twice with the first's result written between
+    const q = k.op2(.@"or", .u32, r(sum), u(0x30));
+    const keep = k.mov(.u32, r(q));
+    k.set(q, .iadd, r(q), u(1), no);
+    const q2 = k.op2(.@"or", .u32, r(sum), u(0x30));
+    // a register read and written by one op, again and again, then read
+    // after a loop that changes it
+    const z = k.mov(.u32, r(t));
+    for (0..4) |_| k.set(z, .imad, r(z), u(5), u(3));
+    const i = k.mov(.u32, u(0));
+    k.loop();
+    {
+        k.set(z, .xor, r(z), r(i), no);
+        k.set(i, .iadd, r(i), u(1), no);
+        k.brk(r(k.cmp(.u32, .ge, r(i), u(3))));
+    }
+    k.endloop();
+    const ob = k.op2(.shl, .u32, r(t), u(4));
+    const outs = [_]kir.V{ sum, k.op2(.xor, .u32, r(p1), r(p2)), k.op2(.iadd, .u32, r(keep), r(k.op2(.xor, .u32, r(q), r(q2)))), z };
+    for (outs, 0..) |v, j| {
+        var m = kir.global(O, 32);
+        m.imm = @intCast(4 * j);
+        k.store(.u32, m, r(ob), r(v));
+    }
+    try same(caps, &k, .{ 2, 1, 1 }, &.{}, 4 * NT, null);
+}
+
 test "ids, parameters and predicates past the six registers" {
     try idsParams();
 }
