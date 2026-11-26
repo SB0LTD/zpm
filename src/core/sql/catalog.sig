@@ -221,6 +221,10 @@ pub const builtin_callbacks = [_]BuiltinCallback{
     simple_template.init, simple_template.lexize,
     int4range_canonical, int8range_canonical, daterange_canonical,
     .{ .oid = 3778, .name = "pg_tablespace_location", .args = &.{26}, .result = 25, .volatility = 's' },
+    .{ .oid = 2162, .name = "pg_get_function_arguments", .args = &.{26}, .result = 25, .volatility = 's' },
+    .{ .oid = 2165, .name = "pg_get_function_result", .args = &.{26}, .result = 25, .volatility = 's' },
+    .{ .oid = 2232, .name = "pg_get_function_identity_arguments", .args = &.{26}, .result = 25, .volatility = 's' },
+    .{ .oid = 6197, .name = "pg_get_function_sqlbody", .args = &.{26}, .result = 25, .volatility = 's' },
     .{ .oid = 715, .name = "lo_create", .args = &.{26}, .result = 26, .volatility = 'v', .source = "be_lo_create" },
     .{ .oid = 952, .name = "lo_open", .args = &.{ 26, 23 }, .result = 23, .volatility = 'v', .source = "be_lo_open" },
     .{ .oid = 953, .name = "lo_close", .args = &.{23}, .result = 23, .volatility = 'v', .source = "be_lo_close" },
@@ -342,7 +346,12 @@ const pg_indexes_columns = [_]ViewColumn{ col("schemaname", .name), col("tablena
 const pg_views_columns = [_]ViewColumn{ col("schemaname", .name), col("viewname", .name), col("viewowner", .name), col("definition", .text) };
 const pg_matviews_columns = [_]ViewColumn{ col("schemaname", .name), col("matviewname", .name), col("matviewowner", .name), col("tablespace", .name), col("hasindexes", .boolean), col("ispopulated", .boolean), col("definition", .text) };
 const pg_inherits_columns = [_]ViewColumn{ col("inhrelid", .oid), col("inhparent", .oid), col("inhseqno", .int4), col("inhdetachpending", .boolean) };
-const pg_proc_columns = [_]ViewColumn{ col("oid", .oid), col("proname", .name), col("pronamespace", .oid), col("prokind", .pg_internal_char), col("prolang", .oid), col("provolatile", .pg_internal_char), col("proisstrict", .boolean), col("pronargs", .int2), col("prorettype", .oid), col("proargtypes", .text), col("prosrc", .text), col("proowner", .oid), col("proacl", types.arrayType(.aclitem).?) };
+const pg_proc_columns = [_]ViewColumn{
+    col("oid", .oid), col("proname", .name), col("pronamespace", .oid), col("prokind", .pg_internal_char), col("prolang", .oid), col("provolatile", .pg_internal_char), col("proisstrict", .boolean), col("pronargs", .int2), col("prorettype", .oid), col("proargtypes", .text), col("prosrc", .text), col("proowner", .oid), col("proacl", types.arrayType(.aclitem).?),
+    col("proretset", .boolean), col("probin", .text), col("prosecdef", .boolean), col("proconfig", types.arrayType(.text).?),
+    col("procost", .float4), col("prorows", .float4), col("proleakproof", .boolean), col("protrftypes", types.arrayType(.oid).?),
+    col("proparallel", .pg_internal_char), col("prosupport", .regproc),
+};
 const pg_init_privs_columns = [_]ViewColumn{ col("objoid", .oid), col("classoid", .oid), col("objsubid", .int4), col("privtype", .pg_internal_char), col("initprivs", types.arrayType(.aclitem).?) };
 const pg_default_acl_columns = [_]ViewColumn{
     col("oid", .oid), col("defaclrole", .oid), col("defaclnamespace", .oid),

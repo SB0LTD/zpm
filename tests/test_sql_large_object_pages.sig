@@ -191,7 +191,7 @@ fn distantPages() !void {
 }
 
 const DB = @import("sql").Database(.{
-    .external_storage = true, .tables = 1, .columns = 8, .text_bytes = 4096,
+    .external_storage = true, .tables = 1, .columns = 8, .name_bytes = 63, .text_bytes = 4096,
     .rows_per_table = 4, .work_rows = 16, .result_rows = 16, .transactions = 4,
     .catalog_objects = 32, .tx_writes = 64,
 });
@@ -548,6 +548,15 @@ fn fileExecuteGrants() !void {
     grant_db.setLargeObjectFiles(Access.native(FileFixture));
     grant_replay.setLargeObjectFiles(Access.native(FileFixture));
     var result: DB.Result = .{};
+    try grant_db.execute("SELECT pg_get_function_arguments(767),pg_get_function_identity_arguments(765),pg_get_function_result(764),pg_get_function_sqlbody(764)", &result);
+    try expect(std.mem.eql(u8, result.rows[0].cells[0].text.slice(), "text, oid"));
+    try expect(std.mem.eql(u8, result.rows[0].cells[1].text.slice(), "oid, text"));
+    try expect(std.mem.eql(u8, result.rows[0].cells[2].text.slice(), "oid"));
+    try expect(result.rows[0].cells[3] == .null_value);
+    try grant_db.execute("SELECT p.proretset,p.prosecdef,p.procost,p.proparallel,p.prosupport,l.lanname FROM pg_proc p,pg_language l WHERE p.oid=764 AND l.oid=p.prolang", &result);
+    try expect(result.row_count == 1 and !result.rows[0].cells[0].boolean and !result.rows[0].cells[1].boolean);
+    try expect(result.rows[0].cells[2].float4 == 1 and result.rows[0].cells[3].pg_internal_char == 'u' and result.rows[0].cells[4].regproc == 0);
+    try expect(std.mem.eql(u8, result.rows[0].cells[5].text.slice(), "internal"));
     try grantBoth("CREATE ROLE file_delegate");
     try grantBoth("CREATE ROLE file_member");
     try grantBoth("GRANT file_delegate TO file_member");

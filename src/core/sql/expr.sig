@@ -1281,6 +1281,23 @@ pub fn Eval(comptime config: types.Config) type {
             }
         }
 
+        fn functionCatalogValue(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
+            const first = try eval(ctx, n.b);
+            if (first == .null_value) return .null_value;
+            const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
+            const get_text = hook.catalog_text orelse return error.UnsupportedStatement;
+            const kind: value_module.CatalogText = switch (n.func) {
+                .pg_get_function_arguments => .function_arguments,
+                .pg_get_function_identity_arguments => .function_identity_arguments,
+                .pg_get_function_result => .function_result,
+                else => .function_sqlbody,
+            };
+            const oid = @import("std").math.cast(u32, first.integer) orelse return error.NumericValueOutOfRange;
+            var buffer: [config.text_bytes]u8 = undefined;
+            const used = try get_text(hook.ptr, kind, oid, 0, 0, &buffer) orelse return .null_value;
+            return textCell(buffer[0..used]);
+        }
+
         fn evalLargeObjectFile(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
             const hooks = ctx.session.sequences orelse return error.UnsupportedStatement;
             const transfer = hooks.large_object_file orelse return error.UnsupportedStatement;
@@ -1428,6 +1445,7 @@ pub fn Eval(comptime config: types.Config) type {
                 .current_database, .current_schema, .current_schemas, .pg_encoding_to_char, .to_regtype, .to_regclass, .to_regproc, .format_type, .pg_get_expr, .regclass_in, .regtype_in, .regclass_out, .regtype_out,
                 .to_regnamespace, .regnamespace_in, .regnamespace_out,
                 .acldefault, .pg_get_userbyid, .pg_tablespace_location, .pg_table_is_visible, .pg_get_indexdef, .pg_get_constraintdef, .pg_get_triggerdef, .pg_get_viewdef, .pg_get_statisticsobjdef_columns, .pg_relation_is_publishable, .pg_get_partkeydef => return catalogValue(ctx, n),
+                .pg_get_function_arguments, .pg_get_function_identity_arguments, .pg_get_function_result, .pg_get_function_sqlbody => return functionCatalogValue(ctx, n),
                 .pg_partition_ancestors, .array_subquery => return error.UnsupportedStatement,
                 .obj_description, .col_description, .shobj_description, .current_user, .session_user => return objectText(ctx, n),
                 .to_tsvector, .to_tsquery, .plainto_tsquery, .phraseto_tsquery => {

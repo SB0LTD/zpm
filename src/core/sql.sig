@@ -1421,6 +1421,7 @@ pub fn Database(comptime config: Config) type {
                         .nextval,.currval,.setval,.lastval,.identity_next,.lo_create,.lo_creat,.lo_unlink,.lo_from_bytea,.lo_get,.lo_truncate,.lo_truncate64,.lo_import,.lo_export=>return error.UnsupportedStatement,
                         // These catalog lookups use the serialized database hook.
                         .to_regclass,.regclass_in,.regclass_out,.pg_get_serial_sequence,.pg_table_is_visible,.pg_get_indexdef,.pg_get_constraintdef,.pg_get_triggerdef,.pg_get_viewdef,.pg_partition_ancestors,
+                        .pg_get_function_arguments,.pg_get_function_identity_arguments,.pg_get_function_result,.pg_get_function_sqlbody,
                         .to_regnamespace,.regnamespace_in,.regnamespace_out,.to_regproc=>return error.UnsupportedStatement,
                         .pg_get_statisticsobjdef_columns,.pg_relation_is_publishable,.pg_get_partkeydef,.acldefault,.current_schemas=>return error.UnsupportedStatement,
                         .obj_description,.col_description,.shobj_description,.current_user,.session_user=>return error.UnsupportedStatement,
@@ -6384,6 +6385,7 @@ pub fn Database(comptime config: Config) type {
             const self: *Self = @ptrCast(@alignCast(ptr));
             const snap = self.seq_snap;
             const text: []const u8 = switch (kind) {
+                .function_arguments, .function_identity_arguments, .function_result, .function_sqlbody => return self.functionCatalogText(kind, object, snap, out),
                 .role_name => self.catalog_objects.roleName(object, snap) orelse return null,
                 .description => self.catalog_objects.description(object, classoid, sub, snap) orelse return null,
                 .shared_description => if (classoid == CO.class_authid) self.catalog_objects.description(object, classoid, 0, snap) orelse return null else return null,
@@ -6391,6 +6393,48 @@ pub fn Database(comptime config: Config) type {
             if (text.len > out.len) return error.TextCapacity;
             @memcpy(out[0..text.len], text);
             return text.len;
+        }
+
+        fn functionTypeName(oid: u32) Error![]const u8 {
+            return types.regtypeName(oid) orelse switch (oid) {
+                routine_catalog.void_oid => "void", routine_catalog.trigger_oid => "trigger", catalog_module.internal_type_oid => "internal",
+                else => error.UndefinedObject,
+            };
+        }
+
+        fn functionCatalogText(self: *const Self, kind: value_module.CatalogText, oid: u32, snap: Snapshot, out: []u8) Error!?usize {
+            // All supported SQL-language bodies use quoted source text;
+            // none has a SQL-standard BEGIN ATOMIC expression tree.
+            if (kind == .function_sqlbody) return null;
+            var args: []const u32 = &.{};
+            var names: []const Name = &.{};
+            var result: u32 = 0;
+            for (catalog_module.builtin_callbacks) |callback| {
+                if (callback.oid != oid) continue;
+                args = callback.args;
+                result = callback.result;
+                break;
+            } else for (&self.objects.routines) |*routine| {
+                if (!routine.live or routine.oid != oid or !routine.stamp.visible(snap)) continue;
+                if (kind == .function_result and routine.kind == 'p') return null;
+                args = routine.args();
+                names = routine.arg_names[0..routine.arg_count];
+                result = routine.return_oid;
+                break;
+            } else return null;
+            var writer: CatalogTextWriter = .{ .out = out, .quote_all = self.session.quote_all_identifiers };
+            if (kind == .function_result) {
+                writer.add(try functionTypeName(result));
+            } else for (args, 0..) |argument, index| {
+                if (index != 0) writer.add(", ");
+                if (names.len != 0 and names[index].len != 0) {
+                    writer.ident(names[index].slice());
+                    writer.add(" ");
+                }
+                writer.add(try functionTypeName(argument));
+            }
+            if (writer.shortened) return error.TextCapacity;
+            return writer.len;
         }
 
         fn catalogSchemaPath(ptr: *anyopaque, implicit: bool, names: *[2][]const u8) usize {
@@ -7599,6 +7643,7 @@ pub fn Database(comptime config: Config) type {
             // Object catalogs bypass the relation and type row builders.
             return switch (view) {
                 .pg_largeobject => self.largeObjectRows(session_values, snapshot, sink),
+                .pg_proc, .pg_trigger, .pg_rewrite, .pg_rules => self.objectViewRows(snapshot, view, sink),
                 // Built-in ACL defaults come from acldefault() and have no stored row.
                 .pg_default_acl, .pg_largeobject_metadata, .pg_roles, .pg_authid, .pg_auth_members,
                 .pg_db_role_setting, .pg_policy, .pg_policies, .pg_description, .pg_shdescription,
@@ -7798,7 +7843,6 @@ pub fn Database(comptime config: Config) type {
             const count = self.catalog.visibleRelations(snapshot, &relations);
             if (view == .pg_class or view == .pg_attribute) try self.compositeCatalogRows(view, snapshot, sink);
             switch (view) {
-                .pg_proc, .pg_trigger, .pg_rewrite, .pg_rules => return self.objectViewRows(snapshot, view, sink),
                 .pg_depend => return self.dependencyRows(session_values, snapshot, pool, relations[0..count], sink),
                 .pg_type => {
                     for (catalog_module.builtin_pseudo_types) |info| {
@@ -13501,6 +13545,17 @@ pub fn Database(comptime config: Config) type {
         }
 
         /// pg_proc, pg_trigger, pg_rewrite and pg_rules rows.
+        fn procRow(sink: *X.RowSink, base: *const [13]Cell) Error!void {
+            var cells: [23]Cell = undefined;
+            @memcpy(cells[0..13], base);
+            // Supported routines return one value, run as invoker, have no
+            // per-routine settings, transforms or planner support callback.
+            cells[13..].* = .{ boolCell(false), .null_value, boolCell(false), .null_value,
+                .{ .float4 = if (base[4].integer == operator_catalog.internal_language_oid) 1 else 100 },
+                .{ .float4 = 0 }, boolCell(false), .null_value, .{ .pg_internal_char = 'u' }, .{ .regproc = 0 } };
+            try sink.add(&cells);
+        }
+
         fn objectViewRows(self: *const Self, snapshot: Snapshot, view: catalog_module.View, sink: *X.RowSink) Error!void {
             switch (view) {
                 .pg_proc => {
@@ -13515,7 +13570,7 @@ pub fn Database(comptime config: Config) type {
                         const acl = if (callback.owner_execute_only and sink.referencesColumn(12))
                             try self.builtinRoutineAcl(callback.oid, snapshot, sink.valueBytes())
                         else .null_value;
-                        try sink.add(&.{
+                        try procRow(sink, &.{
                             intCell(callback.oid), nameCell(callback.name), intCell(catalog_module.catalog_namespace),
                             .{ .pg_internal_char = 'f' }, intCell(callback.language), .{ .pg_internal_char = callback.volatility },
                             boolCell(callback.strict), intCell(@intCast(callback.args.len)), intCell(callback.result), nameCell(argtypes.slice()),
@@ -13525,7 +13580,7 @@ pub fn Database(comptime config: Config) type {
                     for (catalog_module.access_methods) |am| {
                         var args: [10]u8 = undefined;
                         const arg_oid = std.fmt.bufPrint(&args, "{d}", .{catalog_module.internal_type_oid}) catch unreachable;
-                        try sink.add(&.{
+                        try procRow(sink, &.{
                             intCell(am.handler), nameCell(am.handler_name), intCell(catalog_module.catalog_namespace),
                             .{ .pg_internal_char = 'f' }, intCell(operator_catalog.internal_language_oid), .{ .pg_internal_char = 'v' },
                             boolCell(true), intCell(1), intCell(am.result), nameCell(arg_oid), nameCell(am.handler_name),
@@ -13538,7 +13593,7 @@ pub fn Database(comptime config: Config) type {
                             std.fmt.bufPrint(&buffer, "{d}", .{op.right}) catch unreachable
                         else
                             std.fmt.bufPrint(&buffer, "{d} {d}", .{ op.left, op.right }) catch unreachable;
-                        try sink.add(&.{
+                        try procRow(sink, &.{
                             intCell(op.function_oid), nameCell(op.function_name), intCell(catalog_module.catalog_namespace),
                             .{ .pg_internal_char = 'f' }, intCell(operator_catalog.internal_language_oid), .{ .pg_internal_char = op.volatility },
                             boolCell(op.strict), intCell(if (op.left == 0) 1 else 2), intCell(op.result), nameCell(args),
@@ -13567,7 +13622,7 @@ pub fn Database(comptime config: Config) type {
                             at += length;
                         }
                         const language = if (routine.language == 0) catalog_module.sql_language_oid else catalog_module.plpgsql_language_oid;
-                        try sink.add(&.{ intCell(routine.oid), nameCell(routine.name.slice()), intCell(routine.namespace), .{ .pg_internal_char = routine.kind }, intCell(language), .{ .pg_internal_char = routine.volatility }, boolCell(routine.strict), intCell(@intCast(routine.arg_count)), intCell(routine.return_oid), nameCell(argtypes[0..at]), nameCell(routine.body.slice()), intCell(routine.owner), try self.routineAcl(routine, snapshot) });
+                        try procRow(sink, &.{ intCell(routine.oid), nameCell(routine.name.slice()), intCell(routine.namespace), .{ .pg_internal_char = routine.kind }, intCell(language), .{ .pg_internal_char = routine.volatility }, boolCell(routine.strict), intCell(@intCast(routine.arg_count)), intCell(routine.return_oid), nameCell(argtypes[0..at]), nameCell(routine.body.slice()), intCell(routine.owner), try self.routineAcl(routine, snapshot) });
                     }
                 },
                 .pg_trigger => for (&self.objects.triggers) |*trigger| {

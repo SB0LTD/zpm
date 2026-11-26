@@ -136,7 +136,8 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     // Full text search (B11 text lane, text_search.sig): the first argument
     // is the regconfig name.
     to_tsvector, to_tsquery, plainto_tsquery, phraseto_tsquery, mysql_ifnull, mysql_date_add, mysql_last_insert_id, sind, cosd, acldefault, pg_encoding_to_char, current_schemas, array_remove, to_regproc,
-    quote_ident, quote_literal, pg_get_userbyid, pg_tablespace_location };
+    quote_ident, quote_literal, pg_get_userbyid, pg_tablespace_location,
+    pg_get_function_arguments, pg_get_function_identity_arguments, pg_get_function_result, pg_get_function_sqlbody };
 
 /// JSON_TABLE column flags (Node.integer of a json_table_column).
 pub const JsonTableColumn = struct {
@@ -233,6 +234,7 @@ pub fn strictFunction(func: Func) bool {
         .now, .transaction_timestamp, .statement_timestamp, .clock_timestamp,
         .current_timestamp, .current_date, .current_database, .current_schema, .current_schemas, .pg_encoding_to_char,
         .to_regtype, .to_regclass, .to_regproc, .pg_get_expr, .acldefault, .pg_get_userbyid, .pg_tablespace_location,
+        .pg_get_function_arguments, .pg_get_function_identity_arguments, .pg_get_function_result, .pg_get_function_sqlbody,
         .regclass_in, .regtype_in, .regclass_out, .regtype_out, .to_regnamespace, .regnamespace_in, .regnamespace_out => true,
         .lower, .upper, .initcap, .char_length, .octet_length, .bit_length, .substring, .btrim, .ltrim, .rtrim, .strpos, .replace,
         .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .overlay, .to_hex => true,

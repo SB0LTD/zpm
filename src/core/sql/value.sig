@@ -186,7 +186,7 @@ pub const RoutineHook = struct {
     call: *const fn (ptr: *anyopaque, routine: usize, args: *const anyopaque, count: usize, out: *anyopaque) Error!void,
 };
 
-pub const CatalogText = enum { description, shared_description, role_name };
+pub const CatalogText = enum { description, shared_description, role_name, function_arguments, function_identity_arguments, function_result, function_sqlbody };
 
 pub const default_session: Session = .{};
 const SessionType = Session;

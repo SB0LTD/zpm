@@ -26,6 +26,10 @@ object; import creates objects owned by the effective caller.
 Function ACLs are MVCC catalog objects, with transactional rollback,
 role dependencies and validated WAL replay. pg_proc exposes the current
 typed ACL, while pg_init_privs retains the initial owner-only ACL.
+Function discovery exposes invoker, scalar-result, cost, parallel-safety
+and empty configuration/transform/support metadata. The function argument,
+identity-argument and result renderers use registered signatures; supported
+quoted SQL bodies have no SQL-standard body expression tree.
 Compact checkpoint RSBASE08 carries these grants and accepts older
 formats. Function lists, grantee lists, GRANTED BY and generalized
 built-in function ACLs remain outside this increment. Embedded callers
