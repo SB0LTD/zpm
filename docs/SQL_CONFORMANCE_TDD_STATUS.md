@@ -1,6 +1,6 @@
 # SQL conformance TDD checkpoint
 
-## Native database copy qualification
+## Native database copy and catalog qualification
 
 Large-object page support introduced a native build regression in
 `copyFromInto` for inline databases. The ownership check now uses the
@@ -11,6 +11,10 @@ The existing layout ordering, summary, dense grouping, and rollup
 contracts exercise inline copies. The runtime workspace and compact scan
 contracts cover externally bound buffers, and the large-object page
 contract checks that a copy retains the payload.
+
+Type catalog enumeration reuses the row temporary across PostgreSQL type
+entries. The large-object page contract queries the catalog with 4 KiB
+text cells and runs in Debug on Linux's default 8 MiB process stack.
 
 ## PostgreSQL large-object default privileges
 

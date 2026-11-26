@@ -7674,8 +7674,8 @@ pub fn Database(comptime config: Config) type {
                     for (catalog_module.builtin_pseudo_types) |info| {
                         try sink.add(&.{ intCell(info.oid), nameCell(info.name), intCell(catalog_module.catalog_namespace), intCell(info.bytes), .{ .pg_internal_char = 'p' }, nameCell("P"), intCell(0), nameCell(","), nameCell(info.input), intCell(0), intCell(0), intCell(CO.bootstrap_role), intCell(-1), boolCell(false), intCell(0), intCell(0), .null_value, boolCell(true), .{ .pg_internal_char = info.storage } });
                     }
-                    inline for (@typeInfo(DataType).@"enum".field_names) |field| {
-                        const data_type = @field(DataType, field);
+                    // Reuse the wide row temporary across type entries.
+                    for (std.enums.values(DataType)) |data_type| {
                         if (data_type == .mysql_bigint_unsigned) continue;
                         const info = types.typeInfo(data_type);
                         const category: [1]u8 = .{info.category};
