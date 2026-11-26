@@ -334,33 +334,52 @@ pub fn Database(comptime config: Config) type {
             /// of a built-in type while keeping their nominal wire identity.
             has_nominal_types: bool = false,
             nominal_types: [types.projectionColumns(config)]types.NominalColumnType = undefined,
+            values: types.ValueBytes = .{},
             rows: if (config.external_results) []ResultRow else [types.resultRows(config)]ResultRow = if (config.external_results) &.{} else @splat(.{}),
             pub const default_row_capacity = types.resultRows(config);
             pub const external_rows = config.external_results;
+            pub const value_bytes = types.catalogValueBytes(config) / 2;
 
             pub fn storageBytesFor(rows: usize) Error!usize {
                 if (rows == 0 or rows > 0x7fffffff) return error.InvalidParameterValue;
                 const amount = @mulWithOverflow(rows, @sizeOf(ResultRow));
                 const header = @sizeOf(Result) - (if (config.external_results) 0 else @sizeOf([types.resultRows(config)]ResultRow));
-                const total = @addWithOverflow(header, amount[0]);
-                if (amount[1] != 0 or total[1] != 0) return error.InvalidParameterValue;
+                const backing = @addWithOverflow(amount[0], if (config.external_results) value_bytes else 0);
+                const total = @addWithOverflow(header, backing[0]);
+                if (amount[1] != 0 or backing[1] != 0 or total[1] != 0) return error.InvalidParameterValue;
                 return total[0];
             }
 
             pub fn rowBytes(rows: usize) Error!usize {
                 _ = try storageBytesFor(rows);
-                return rows * @sizeOf(ResultRow);
+                return rows * @sizeOf(ResultRow) + if (config.external_results) value_bytes else 0;
             }
 
             pub fn bindMemory(self: *Result, bytes: []u8, rows: usize) Error!void {
                 if (comptime !config.external_results) @compileError("result binding requires external_results");
-                if (bytes.len < try rowBytes(rows)) return error.WorkspaceCapacity;
+                const capacity = try rowBytes(rows);
+                if (bytes.len < capacity) return error.WorkspaceCapacity;
                 const values = try storageView(ResultRow, bytes, 0, rows);
                 const start = @intFromPtr(values.ptr);
                 const own = @intFromPtr(self);
-                if (start < own + @sizeOf(Result) and own < start + rows * @sizeOf(ResultRow)) return error.InvalidParameterValue;
+                if (start < own + @sizeOf(Result) and own < start + capacity) return error.InvalidParameterValue;
                 self.rows = values;
+                self.values = .{ .bytes = bytes[rows * @sizeOf(ResultRow)..capacity] };
                 self.clear(0);
+            }
+
+            /// Optional storage for wide values on inline-result builds.
+            /// The caller keeps it disjoint from the result and its rows
+            /// and retains it until clear or until it no longer uses them.
+            pub fn bindValueMemory(self: *Result, bytes: []u8) void {
+                self.values = .{ .bytes = bytes };
+                self.clear(0);
+            }
+
+            pub fn copyCells(self: *Result, output: []Cell, input: []const Cell) Error!void {
+                for (output, input) |*destination, *value| {
+                    destination.* = if (V.largeBytes(value)) |bytes| V.largeCell(value, try self.values.copy(bytes)) else value.*;
+                }
             }
 
             pub const default_session: *const value_module.Session = &value_module.default_session;
@@ -428,6 +447,7 @@ pub fn Database(comptime config: Config) type {
 
             /// Only active ranges are observable; avoid clearing unused row capacity.
             pub fn clear(self: *Result, affected: usize) void {
+                self.values.used = 0;
                 self.column_count = 0;
                 self.row_count = 0;
                 self.affected_rows = affected;
@@ -470,6 +490,8 @@ pub fn Database(comptime config: Config) type {
             pub fn copyFromChecked(self: *Result, source: *const Result) Error!void {
                 if (self == source) return;
                 if (source.row_count > self.rows.len) return error.RowCapacity;
+                if (source.values.used != 0 and source.values.used > self.values.bytes.len) return error.WorkspaceCapacity;
+                self.values.used = 0;
                 self.column_count = source.column_count;
                 self.row_count = source.row_count;
                 self.affected_rows = source.affected_rows;
@@ -484,7 +506,9 @@ pub fn Database(comptime config: Config) type {
                 @memcpy(self.column_types[0..source.column_count], source.column_types[0..source.column_count]);
                 @memcpy(self.column_typmods[0..source.column_count], source.column_typmods[0..source.column_count]);
                 for (0..source.row_count) |row| {
-                    @memcpy(self.rows[row].cells[0..source.column_count], source.rows[row].cells[0..source.column_count]);
+                    const output = self.rows[row].cells[0..source.column_count];
+                    const input = source.rows[row].cells[0..source.column_count];
+                    if (source.values.used != 0) try self.copyCells(output, input) else @memcpy(output, input);
                 }
             }
         };
@@ -871,7 +895,7 @@ pub fn Database(comptime config: Config) type {
             }
 
             fn put(cache: *Cache, context: *const ReadContext, hash: u64, result: *const Result) Error!void {
-                if (result.command != .select or result.row_count > cache.rows_per_entry or !cache.lock()) return;
+                if (result.command != .select or result.values.used != 0 or result.row_count > cache.rows_per_entry or !cache.lock()) return;
                 defer cache.unlock();
                 const first = cache.bucket(hash);
                 const end = @min(first + ways, cache.entries.len);
@@ -2376,6 +2400,7 @@ pub fn Database(comptime config: Config) type {
             self.session_counter = 0;
             self.cursors.slots = @splat(.{});
             self.cursors.used_rows = 0;
+            self.cursors.value_used = 0;
             self.notify = .{};
             self.ssi = .{};
             self.active_params = null;
@@ -6017,7 +6042,7 @@ pub fn Database(comptime config: Config) type {
             return .{ .array = output };
         }
 
-        fn largeObjectAcl(self: *const Self, object: *const O.Object, snapshot: Snapshot) Error!Cell {
+        fn largeObjectAcl(self: *const Self, object: *const O.Object, snapshot: Snapshot, values: ?*types.ValueBytes) Error!Cell {
             if (object.flags & CO.large_object_explicit_acl == 0) return .null_value;
             const owner = self.catalog_objects.roleName(object.owner, snapshot) orelse return error.UndefinedObject;
             const owner_flags = largeObjectOwnerPrivileges(object);
@@ -6032,18 +6057,18 @@ pub fn Database(comptime config: Config) type {
                 count += 1;
             }
             const Acl = @import("sql/catalog_acl.sig").Acl(V);
-            var output: Text = .{};
-            var writer = try Acl.begin(&output, @intCast(count + @intFromBool(owner_flags != 0)));
+            var inline_buffer: [config.text_bytes]u8 = undefined;
+            var writer = try Acl.CatalogWriter.start(&inline_buffer, values, @intCast(count + @intFromBool(owner_flags != 0)));
             var letters: [4]u8 = undefined;
-            if (owner_flags != 0) try Acl.append(&writer, owner, largeObjectPermissionLetters(owner_flags, object.grant_flags, &letters), owner);
+            if (owner_flags != 0) try writer.add(owner, largeObjectPermissionLetters(owner_flags, object.grant_flags, &letters), owner);
             for (steps[0..count]) |step| {
                 const entry = &edges[step.index];
                 const grantee = if (entry.grantee == CO.public_role) "" else
                     self.catalog_objects.roleName(entry.grantee, snapshot) orelse return error.UndefinedObject;
                 const grantor = self.catalog_objects.roleName(entry.grantor, snapshot) orelse return error.UndefinedObject;
-                try Acl.append(&writer, grantee, largeObjectPermissionLetters(step.flags, entry.options, &letters), grantor);
+                try writer.add(grantee, largeObjectPermissionLetters(step.flags, entry.options, &letters), grantor);
             }
-            return .{ .array = output };
+            return writer.finish();
         }
 
         fn largeObjectPermissionLetters(flags: u32, options: u32, letters: *[4]u8) []const u8 {
@@ -6132,7 +6157,7 @@ pub fn Database(comptime config: Config) type {
                     const include_acl = sink.referencesColumn(2);
                     for (&self.catalog_objects.items) |*entry| {
                         if (entry.kind != .large_object or !O.visible(entry, snapshot)) continue;
-                        const acl = if (include_acl) try self.largeObjectAcl(entry, snapshot) else .null_value;
+                        const acl = if (include_acl) try self.largeObjectAcl(entry, snapshot, sink.valueBytes()) else .null_value;
                         try sink.add(&.{ intCell(entry.target), intCell(entry.owner), acl });
                     }
                 },
@@ -11558,8 +11583,22 @@ pub fn Database(comptime config: Config) type {
             const rows = result.row_count;
             if (rows > Sess.cursor_row_capacity - self.cursors.used_rows) return error.SessionCapacity;
             const columns = result.column_count;
+            var values: types.ValueBytes = .{ .bytes = &self.cursors.value_backing, .used = self.cursors.value_used };
+            const value_base = values.used;
+            if (result.values.used > values.available().len) return error.SessionCapacity;
+            for (0..rows) |row| {
+                const destination = self.cursors.rows[self.cursors.used_rows + row].cells[0..columns];
+                const input = result.rows[row].cells[0..columns];
+                if (result.values.used == 0) {
+                    @memcpy(destination, input);
+                } else {
+                    for (destination, input) |*to, *from| {
+                        to.* = if (V.largeBytes(from)) |bytes| V.largeCell(from, try values.copy(bytes)) else from.*;
+                    }
+                }
+            }
             const cursor = &self.cursors.slots[index];
-            cursor.* = .{ .used = true, .session = state.id, .hold = declare.hold, .scroll = declare.scroll orelse true, .epoch = tx.epoch, .slot = slot, .depth = tx.userSavepoints(), .column_count = columns, .base = self.cursors.used_rows, .count = rows };
+            cursor.* = .{ .used = true, .session = state.id, .hold = declare.hold, .scroll = declare.scroll orelse true, .epoch = tx.epoch, .slot = slot, .depth = tx.userSavepoints(), .column_count = columns, .base = self.cursors.used_rows, .count = rows, .value_base = value_base, .value_len = values.used - value_base };
             @memcpy(cursor.name.bytes[0..name.len], name.slice());
             cursor.name.len = name.len;
             @memcpy(cursor.names[0..columns], result.column_names[0..columns]);
@@ -11567,8 +11606,8 @@ pub fn Database(comptime config: Config) type {
             @memcpy(cursor.typmods[0..columns], result.column_typmods[0..columns]);
             cursor.has_nominal_types = result.has_nominal_types;
             if (result.has_nominal_types) @memcpy(cursor.nominal_types[0..columns], result.nominal_types[0..columns]);
-            for (0..rows) |row| @memcpy(self.cursors.rows[cursor.base + row].cells[0..columns], result.rows[row].cells[0..columns]);
             self.cursors.used_rows += rows;
+            self.cursors.value_used = values.used;
             result.clear(0);
             self.outcome = .{ .command = .declare_cursor };
         }
@@ -11612,7 +11651,9 @@ pub fn Database(comptime config: Config) type {
             if (cursor.has_nominal_types) result.setNominalTypes(cursor.nominal_types[0..columns]);
             for (0..step.rows) |row| {
                 const at = if (step.backward) step.first - row else step.first + row;
-                @memcpy(result.rows[row].cells[0..columns], self.cursors.rows[cursor.base + at - 1].cells[0..columns]);
+                const output = result.rows[row].cells[0..columns];
+                const input = self.cursors.rows[cursor.base + at - 1].cells[0..columns];
+                if (cursor.value_len != 0) try result.copyCells(output, input) else @memcpy(output, input);
             }
             result.row_count = step.rows;
             cursor.position = step.position;

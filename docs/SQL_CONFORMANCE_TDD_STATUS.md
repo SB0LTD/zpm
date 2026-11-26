@@ -1,5 +1,24 @@
 # SQL conformance TDD checkpoint
 
+## PostgreSQL large-object ACL values
+
+`pg_largeobject_metadata.lomacl` and `acldefault('L', owner)` keep their
+PostgreSQL `aclitem[]` type. Large arrays, array items and text casts use
+caller-backed query and result bytes. The PostgreSQL writer can encode a
+large value directly into its response buffer. The inline cell layout
+and the stored user-column widths stay the same.
+
+Query results and held cursors keep their own copies after the query
+workspace is reused. Catalog, query, result, cursor and wire budgets
+still apply. Embedded callers with inline result rows can attach wide
+value storage with `Result.bindValueMemory`.
+
+The default build fixture uses 63-byte role names, a mixed-case delegated
+grantor, an ACL item over 128 bytes, and an ACL over 1,088 bytes. It checks
+typed arrays, text casts, ordering, binary TEXT projection, cursor
+compaction, and stock PG16 and PG18 archive round trips in both directions.
+[PostgreSQL large-object catalog discovery](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/bin/pg_dump/pg_dump.c)
+
 ## PostgreSQL large-object privileges and ownership
 
 Large-object ACLs retain the grantor, grantee, SELECT/UPDATE mask, and
@@ -26,9 +45,8 @@ recovery, and revocation across checkpoint WAL replay.
 
 Server-side file import/export and large-object default-privilege DDL
 remain open. Roles, large-object metadata and ACL versions use the
-shared catalog budget. Displaying or dumping an ACL still uses the
-configured inline cell size (`Config.text_bytes`). Large ACLs can
-require a wider text profile even when their grants fit the catalog.
+shared catalog budget. The large-object ACL value checkpoint covers
+display and archive output for large ACLs.
 [PostgreSQL large-object permissions](https://www.postgresql.org/docs/18/lo-implementation.html)
 [PostgreSQL ownership transfers](https://www.postgresql.org/docs/18/sql-alterlargeobject.html)
 

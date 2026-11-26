@@ -508,6 +508,7 @@ pub fn Eval(comptime config: types.Config) type {
             const used = try get_name(hook.ptr, .role_name, owner, 0, 0, &buffer);
             const name = if (used) |len| buffer[0..len] else @import("std").fmt.bufPrint(&buffer, "{d}", .{owner}) catch unreachable;
             return switch (kind) {
+                'L' => Acl.catalogOwner(name, privileges, ctx.session.value_bytes),
                 'd' => Acl.publicAndOwner(name, privileges, "Tc"),
                 'f', 'T', 'l' => Acl.publicAndOwner(name, privileges, privileges),
                 else => Acl.ownerOnly(name, privileges),

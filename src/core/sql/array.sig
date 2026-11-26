@@ -1,7 +1,7 @@
 //! PostgreSQL arrays (Layer 0), after arrayfuncs.c.
 //!
-//! An array value lives inline in one cell's caller-owned byte budget
-//! (Config.text_bytes); anything larger is TextCapacity (54000). Layout:
+//! Stored arrays live inline in one cell. Catalog queries can stage larger
+//! arrays in caller-owned query and result storage. Both use this layout:
 //!   [0] element DataType ordinal, [1] ndim (0..6), [2] flags (bit 0: some
 //!   element is NULL), [3] 0, then ndim x {dim u32, lbound i32} (native
 //!   byte order), then every element in row-major order: 0 for NULL, or 1
@@ -17,6 +17,7 @@
 //! sorts after every value), then fewer elements first, then fewer
 //! dimensions, then smaller dimensions and lower bounds. Equality (array_eq)
 //! is ordering equality, and hashing is consistent with it.
+const std = @import("std");
 const types = @import("types.sig");
 const numeric = @import("numeric.sig");
 const role_defaults = @import("role_defaults.sig");
@@ -133,6 +134,19 @@ pub fn Arrays(comptime V: type) type {
             return header_bytes + @as(usize, bytes[1]) * 8;
         }
 
+        pub fn writeHeader(out: []u8, layout: *const Shape) Error!usize {
+            const len = header_bytes + layout.ndim * @as(usize, 8);
+            if (len > out.len) return error.TextCapacity;
+            out[0..4].* = .{ @intFromEnum(layout.element), @intCast(layout.ndim), 0, 0 };
+            var at: usize = header_bytes;
+            for (0..layout.ndim) |dim| {
+                std.mem.writeInt(u32, out[at..][0..4], layout.dims[dim], .little);
+                std.mem.writeInt(i32, out[at + 4 ..][0..4], layout.lbounds[dim], .little);
+                at += 8;
+            }
+            return len;
+        }
+
         fn put(out: *Text, bytes: []const u8) Error!void {
             if (bytes.len > capacity - out.len) return error.TextCapacity;
             @memcpy(out.bytes[out.len..][0..bytes.len], bytes);
@@ -167,12 +181,7 @@ pub fn Arrays(comptime V: type) type {
 
             pub fn begin(out: *Text, layout: *const Shape) Error!Writer {
                 const total = try layout.checkedCount();
-                out.len = 0;
-                try put(out, &.{ @intFromEnum(layout.element), @intCast(layout.ndim), 0, 0 });
-                for (0..layout.ndim) |dim| {
-                    try putInt(out, u32, layout.dims[dim]);
-                    try putInt(out, i32, layout.lbounds[dim]);
-                }
+                out.len = try writeHeader(&out.bytes, layout);
                 return .{ .out = out, .element = layout.element, .expected = total };
             }
 
@@ -280,8 +289,7 @@ pub fn Arrays(comptime V: type) type {
 
         fn takeText(bytes: []const u8, at: *usize) Text {
             const len = getInt(u16, bytes, at);
-            var text: Text = .{ .len = len };
-            @memcpy(text.bytes[0..len], bytes[at.*..][0..len]);
+            const text = Text.fromValueBytes(bytes[at.*..][0..len]);
             at.* += len;
             return text;
         }

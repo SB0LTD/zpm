@@ -1,6 +1,7 @@
 //! Shared SQL configuration, errors, command tags and cell values (Layer 0).
 //! Sub-files of `sql.sig` import each other relatively; nothing outside the
 //! `sql` module imports this file directly.
+const std = @import("std");
 const numeric = @import("numeric.sig");
 const temporal = @import("temporal.sig");
 const jsonb = @import("jsonb.sig");
@@ -1188,6 +1189,34 @@ pub fn bytesOrder(a: []const u8, b: []const u8) i8 {
     return if (a.len < b.len) -1 else if (a.len > b.len) 1 else 0;
 }
 
+/// Caller-owned bytes for values that outgrow a cell during query execution.
+/// References into this region remain valid until its owning scope resets it.
+pub const ValueBytes = struct {
+    bytes: []u8 = &.{},
+    used: usize = 0,
+
+    pub fn available(self: *const ValueBytes) []u8 {
+        return self.bytes[self.used..];
+    }
+
+    pub fn copy(self: *ValueBytes, value: []const u8) Error![]const u8 {
+        if (value.len > self.bytes.len - self.used) return error.WorkspaceCapacity;
+        const out = self.available()[0..value.len];
+        @memcpy(out, value);
+        self.used += out.len;
+        return out;
+    }
+};
+
+/// Budget for an ordered snapshot of the catalog's large-object ACLs.
+/// A grant can split into two entries, names can double their quote bytes,
+/// and array_out may escape the ACL item again. Include sort keys and the
+/// owner default arrays. Other operators share this ordinary byte workspace.
+pub fn catalogValueBytes(comptime config: Config) usize {
+    const escaped_item = 8 * @as(usize, @min(config.name_bytes, pg_name_bytes - 1)) + 24;
+    return (config.catalog_objects + 1) * (8 * escaped_item + 64);
+}
+
 pub fn Values(comptime config: Config) type {
     return struct {
         pub const Name = struct {
@@ -1200,13 +1229,56 @@ pub fn Values(comptime config: Config) type {
         };
 
         pub const Text = struct {
+            pub const inline_capacity = config.text_bytes;
             bytes: [config.text_bytes]u8 = @splat(0),
             len: usize = 0,
 
+            /// Large read-only payloads use the initial bytes for a pointer.
+            /// The length carries the discriminator, preserving the cell size.
+            pub fn indirect(self: *const Text) bool {
+                return self.len > config.text_bytes;
+            }
+
             pub fn slice(self: *const Text) []const u8 {
+                if (comptime config.text_bytes >= @sizeOf(usize)) {
+                    if (self.indirect()) {
+                        const address = std.mem.readInt(usize, self.bytes[0..@sizeOf(usize)], .little);
+                        const ptr: [*]const u8 = @ptrFromInt(address);
+                        return ptr[0..self.len];
+                    }
+                }
                 return self.bytes[0..self.len];
             }
+
+            /// Small payloads remain self-contained. A large payload's
+            /// owner must keep the bytes stable for the lifetime of the cell.
+            pub fn fromValueBytes(value: []const u8) Text {
+                var out: Text = .{ .len = value.len };
+                if (value.len <= config.text_bytes) {
+                    @memcpy(out.bytes[0..value.len], value);
+                } else if (comptime config.text_bytes >= @sizeOf(usize)) {
+                    std.mem.writeInt(usize, out.bytes[0..@sizeOf(usize)], @intFromPtr(value.ptr), .little);
+                } else unreachable;
+                return out;
+            }
         };
+
+        pub fn largeBytes(value: *const Cell) ?[]const u8 {
+            return switch (value.*) {
+                .text, .array, .bpchar => |*text| if (text.indirect()) text.slice() else null,
+                else => null,
+            };
+        }
+
+        pub fn largeCell(value: *const Cell, bytes: []const u8) Cell {
+            const text = Text.fromValueBytes(bytes);
+            return switch (value.*) {
+                .text => .{ .text = text },
+                .array => .{ .array = text },
+                .bpchar => .{ .bpchar = text },
+                else => unreachable,
+            };
+        }
 
         /// BIT and BIT VARYING values (bit_string.sig).
         pub const BitString = bit_string.Bits(config.text_bytes);
@@ -1505,6 +1577,8 @@ pub fn Values(comptime config: Config) type {
 
         /// Stored-value checks: NOT NULL, exact type tag and integer ranges.
         pub fn validate(column: *const Column, value: *const Cell) Error!void {
+            // User-table values and WAL own all their bytes inline.
+            if (largeBytes(value) != null) return error.TextCapacity;
             if (value.* == .null_value) {
                 if (column.not_null) return error.NotNullViolation;
                 return;

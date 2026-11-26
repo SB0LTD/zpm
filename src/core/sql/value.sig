@@ -72,6 +72,8 @@ pub const Session = struct {
     mysql_keep_zero: bool = false,
     mysql_last_insert_id: u64 = 0,
     control: ?*types.ExecutionControl = null,
+    /// Caller-backed bytes for catalog values and their text casts.
+    value_bytes: ?*types.ValueBytes = null,
     /// Values of $1..$n while an EXECUTEd SQL prepared statement runs
     /// ([Config.statement_parameters]Cell of the Database; tx-session lane).
     params: ?*const anyopaque = null,
@@ -537,7 +539,7 @@ pub fn Io(comptime config: types.Config) type {
                 .null_value => buffer[0..0],
                 .integer => |value| integerText(value, buffer),
                 .boolean => |value| copy(buffer, if (verbose) (if (value) "true" else "false") else (if (value) "t" else "f")),
-                .text => |*value| copy(buffer, value.slice()),
+                .text => |*value| if (value.len > buffer.len) error.TextCapacity else copy(buffer, value.slice()),
                 .float4 => |value| float_text.format(f32, value, session.extra_float_digits, buffer),
                 .float8 => |value| float_text.format(f64, value, session.extra_float_digits, buffer),
                 .numeric => |*value| N.format(value, buffer),
@@ -550,7 +552,9 @@ pub fn Io(comptime config: types.Config) type {
                     try J.render(value.slice(), 0, &out);
                     break :blk buffer[0..out.len];
                 },
-                .bpchar => |*value| if (value.len != 0 and value.bytes[0] == 0)
+                .bpchar => |*value| if (value.len > buffer.len)
+                    error.TextCapacity
+                else if (value.len != 0 and value.slice()[0] == 0)
                     buffer[0..0]
                 else
                     copy(buffer, value.slice()),
@@ -616,9 +620,22 @@ pub fn Io(comptime config: types.Config) type {
 
         pub fn toText(cell: *const V.Cell, verbose: bool, session: *const Session) Error!V.Cell {
             if (cell.* == .null_value) return .null_value;
+            if (cell.* == .text) return cell.*;
+            if (comptime config.text_bytes >= @sizeOf(usize)) {
+                if (V.largeBytes(cell) != null or (aclArray(cell) and session.value_bytes != null)) {
+                    const arena = session.value_bytes orelse return error.TextCapacity;
+                    const rendered = try format(cell, verbose, session, arena.available());
+                    if (rendered.len > config.text_bytes) arena.used += rendered.len;
+                    return .{ .text = V.Text.fromValueBytes(rendered) };
+                }
+            }
             var text: V.Text = .{};
             try appendCell(&text, cell, verbose, session);
             return .{ .text = text };
+        }
+
+        fn aclArray(cell: *const V.Cell) bool {
+            return cell.* == .array and V.Arrays.elementType(cell.array.slice()) == .aclitem;
         }
 
         fn clipName(bytes: []const u8) []const u8 {
@@ -1044,6 +1061,10 @@ pub fn Io(comptime config: types.Config) type {
                     else => return error.CannotCoerce,
                 },
                 .text, .name => blk: {
+                    if (V.largeBytes(&cell) != null or aclArray(&cell)) {
+                        const text = try toText(&cell, true, session);
+                        break :blk if (to == .name) try textCell(clipName(text.text.slice())) else text;
+                    }
                     if (cell == .text) {
                         const bytes = cell.text.slice();
                         break :blk try textCell(if (to == .name) clipName(bytes) else bytes);
@@ -1101,18 +1122,12 @@ pub fn Io(comptime config: types.Config) type {
                 .unknown => cell,
                 .varchar => switch (cell) {
                     .text => cell,
-                    else => blk: {
-                        var buffer: [format_bytes]u8 = undefined;
-                        break :blk try textCell(try format(&cell, true, session, &buffer));
-                    },
+                    else => try toText(&cell, true, session),
                 },
                 .bpchar => switch (cell) {
                     .text => |value| V.Cell{ .bpchar = value },
                     .bpchar => cell,
-                    else => blk: {
-                        var buffer: [format_bytes]u8 = undefined;
-                        break :blk V.Cell{ .bpchar = (try textCell(try format(&cell, true, session, &buffer))).text };
-                    },
+                    else => .{ .bpchar = (try toText(&cell, true, session)).text },
                 },
                 .uuid => switch (cell) {
                     .uuid => cell,

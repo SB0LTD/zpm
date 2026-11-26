@@ -1730,7 +1730,45 @@ fn largeObjectDelegation() !void {
     try run("RESET SESSION AUTHORIZATION");
 }
 
+fn largeObjectAclValues() !void {
+    try reset();
+    const first = "wide_first_" ++ "a" ** 20;
+    const second = "wide_second_" ++ "b" ** 19;
+    const third = "wide_third_" ++ "c" ** 20;
+    try run("CREATE ROLE " ++ first);
+    try run("CREATE ROLE " ++ second);
+    try run("CREATE ROLE " ++ third);
+    try run("SELECT lo_create(56001)");
+    try run("ALTER LARGE OBJECT 56001 OWNER TO " ++ first);
+    try run("GRANT SELECT ON LARGE OBJECT 56001 TO " ++ second ++ "," ++ third);
+    const expected = "{" ++ first ++ "=rw/" ++ first ++ "," ++ second ++ "=r/" ++ first ++ "," ++ third ++ "=r/" ++ first ++ "}";
+    try check(expected.len > 128);
+
+    var original: DB.Result = .{};
+    var copy: DB.Result = .{};
+    var original_bytes: [DB.Result.value_bytes]u8 = undefined;
+    var copied_bytes: [DB.Result.value_bytes]u8 = undefined;
+    original.bindValueMemory(&original_bytes);
+    copy.bindValueMemory(&copied_bytes);
+    const projection = "SELECT lomacl,lomacl::text FROM pg_largeobject_metadata ORDER BY lomacl::text";
+    try db.execute(projection, &original);
+    try check(original.row_count == 1 and original.column_count == 2);
+    try same(original.rows[0].cells[1].text.slice(), expected);
+    try copy.copyFromChecked(&original);
+
+    try run("REVOKE SELECT ON LARGE OBJECT 56001 FROM " ++ second);
+    try db.execute(projection, &original);
+    try same(copy.rows[0].cells[1].text.slice(), expected);
+    var buffer: [512]u8 = undefined;
+    try same(try DB.Io.format(&copy.rows[0].cells[0], false, DB.Result.default_session, &buffer), expected);
+
+    try run("CREATE TABLE lo_acl_value(value text)");
+    try fails("INSERT INTO lo_acl_value SELECT lomacl::text FROM pg_largeobject_metadata", error.TextCapacity);
+    try expect("SELECT COUNT(*) FROM lo_acl_value", "0");
+}
+
 pub fn main() !void {
+    try largeObjectAclValues();
     try largeObjectDelegation();
     try largeObjectMetadata();
     try namespaceAclProjection();
