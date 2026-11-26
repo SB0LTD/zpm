@@ -5023,12 +5023,12 @@ pub fn Exec(comptime config: types.Config) type {
                 result.column_types[column] = types.dataTypeOf(p.tys[column]);
                 result.column_typmods[column] = p.typmods[column];
             }
-            result.row_count = list.count;
             for (work.refs[list.start..][0..list.count], 0..) |offset, index| {
                 const output = result.rows[index].cells[0..p.count];
                 const input = work.cells[offset..][0..p.count];
                 if (work.values.used != 0) try result.copyCells(output, input) else @memcpy(output, input);
             }
+            result.row_count = list.count;
         }
         /// Runs a bound general query and leaves its output rows in `work`
         /// (INSERT ... SELECT); read them with rowAt until the next reset.
@@ -5514,11 +5514,11 @@ pub fn Exec(comptime config: types.Config) type {
                     observation.* = .{ .operation = if (query.limit == 0) .limit else .result, .rows = @intFromBool(produced) };
                 } else {
                     writeHeader(query, result);
-                    result.row_count = @intFromBool(produced);
                     if (produced) {
                         const output = result.rows[0].cells[0..query.count];
                         if (work.values.used != 0) try result.copyCells(output, row[0..query.count]) else @memcpy(output, row[0..query.count]);
                     }
+                    result.row_count = @intFromBool(produced);
                 }
                 return;
             }

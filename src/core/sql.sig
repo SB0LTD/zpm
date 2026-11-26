@@ -1,7 +1,7 @@
 //! Bounded, allocation-free in-memory SQL (Layer 0).
 //!
 //! Database and result storage belong entirely to the caller. Identifiers and
-//! text cells are copied inline; neither statements nor results borrow database
+//! stored text cells are copied inline; neither statements nor results borrow database
 //! storage. Callers serialize the default database methods. Independent
 //! ReadContext instances may execute on threads while the caller holds shared
 //! immutable ownership and excludes all database/schema mutations.
@@ -357,14 +357,16 @@ pub fn Database(comptime config: Config) type {
 
             pub fn bindMemory(self: *Result, bytes: []u8, rows: usize) Error!void {
                 if (comptime !config.external_results) @compileError("result binding requires external_results");
-                const capacity = try rowBytes(rows);
-                if (bytes.len < capacity) return error.WorkspaceCapacity;
+                const requested = try rowBytes(rows);
+                const row_end = rows * @sizeOf(ResultRow);
+                if (bytes.len < row_end) return error.WorkspaceCapacity;
+                const capacity = @min(requested, bytes.len);
                 const values = try storageView(ResultRow, bytes, 0, rows);
                 const start = @intFromPtr(values.ptr);
                 const own = @intFromPtr(self);
                 if (start < own + @sizeOf(Result) and own < start + capacity) return error.InvalidParameterValue;
                 self.rows = values;
-                self.values = .{ .bytes = bytes[rows * @sizeOf(ResultRow)..capacity] };
+                self.values = .{ .bytes = bytes[row_end..capacity] };
                 self.clear(0);
             }
 
