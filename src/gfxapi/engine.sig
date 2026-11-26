@@ -4543,8 +4543,14 @@ pub const Engine = struct {
             _ = e.toRows(img, "the CPU took its bytes as rows (a texture re-specified or copied by the CPU)");
     }
 
-    /// Whether a batch not known done uses img.
+    /// Whether a batch not known done uses img. The device is asked only
+    /// for an image a batch not yet known done used: its fence is a system
+    /// call (17 us in Galaxy's VM), and most writes are to buffers no
+    /// batch reads (Direct3D's constant buffers, copied into each draw's
+    /// uniforms by the CPU): Unigine Superposition's 22,000 writes a
+    /// second spent 0.4 s a second asking.
     pub fn busy(e: *Engine, img: *const Image) bool {
+        if (img.lastBatch() <= e.done_upto) return false;
         e.poll();
         return img.lastBatch() > e.done_upto;
     }
