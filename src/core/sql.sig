@@ -8463,12 +8463,32 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn postgresRuleDefinition(ptr: *anyopaque, oid: u32, pretty: bool, out: []u8) Error!?usize {
-            const self: *const Self = @ptrCast(@alignCast(ptr));
+            const self: *Self = @ptrCast(@alignCast(ptr));
             for (&self.objects.rules) |*rule| {
                 if (rule.live and rule.oid == oid and rule.stamp.visible(self.seq_snap))
                     return self.ruleDefinition(rule, self.seq_snap, pretty, out);
             }
-            return null;
+            // pg_rewrite exposes a view's implicit _RETURN rule at its
+            // relation OID. Deparse the actual stored SELECT using the same
+            // snapshot, dependency qualification and renamed-column edits as
+            // pg_get_viewdef. The output belongs to the caller, including the
+            // wide-cell retry; no additional query-sized stack buffer is used.
+            const slot = self.visibleTableSlot(oid, self.seq_snap) orelse return null;
+            const view = &self.tables[slot];
+            if (view.relkind != 'v' and view.relkind != 'm') return null;
+            var text: CatalogTextWriter = .{ .out = out, .quote_all = self.session.quote_all_identifiers };
+            text.add("CREATE RULE ");
+            text.ident("_RETURN");
+            text.add(" AS\n    ON SELECT TO ");
+            if (!pretty or !self.inRelationSearchPath(view.namespace, view.name.slice())) {
+                text.ident(self.namespaceName(view.namespace));
+                text.add(".");
+            }
+            text.ident(view.name.slice());
+            text.add(" DO INSTEAD ");
+            if (text.shortened) return error.TextCapacity;
+            const query_len = (try postgresViewDefinition(ptr, oid, pretty, out[text.len..])) orelse return null;
+            return text.len + query_len;
         }
 
         fn postgresTriggerDefinition(ptr: *anyopaque, oid: u32, pretty: bool, out: []u8) Error!?usize {

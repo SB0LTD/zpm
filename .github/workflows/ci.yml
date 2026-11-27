@@ -12,7 +12,10 @@ permissions:
 jobs:
   native-sig:
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    # Run 46029049805 completed 497 library build/test steps and the CLI tests,
+    # then reached the 50-minute deadline before argv forwarding completed.
+    # Keep every check; leave room for cold compilation and final CLI probes.
+    timeout-minutes: 75
     steps:
       - name: Free disk space
         run: |
@@ -61,13 +64,21 @@ jobs:
             )
           done
 
-      - name: Test routine privileges in Debug and ReleaseSafe
+      - name: Test routine privileges on a 4 MiB stack in Debug and ReleaseSafe
         run: |
           set -euo pipefail
           for optimize in Debug ReleaseSafe; do
             "$SIG" build run-contract-sql-base-snapshot -Doptimize="$optimize" -j2 \
               --Sig-lib-dir "$SIG_LIB_DIR"
-            "$SIG" build run-contract-sql-routines run-contract-sql-catalog-security \
+            output="$RUNNER_TEMP/routines-$optimize"
+            "$SIG" build contract-sql-routines --prefix "$output" \
+              -Doptimize="$optimize" -j2 --Sig-lib-dir "$SIG_LIB_DIR"
+            (
+              ulimit -s 4096
+              ulimit -c 0
+              "$output/bin/contract-sql-routines"
+            )
+            "$SIG" build run-contract-sql-catalog-security \
               -Doptimize="$optimize" -j2 --Sig-lib-dir "$SIG_LIB_DIR"
           done
 

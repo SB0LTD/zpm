@@ -20,6 +20,9 @@ const Small = sql.Database(.{ .tables = 2, .columns = 4, .rows_per_table = 8, .n
 var assertions: usize = 0;
 var db: DB = .{};
 var replica: DB = .{};
+/// Malformed-WAL target: fixed caller-owned storage, reused between probes.
+/// Two automatic DB values made changeRecords alone exceed a 4 MiB stack.
+var crafted_replay: DB = .{};
 var scratch: DB.ReplayScratch = .{};
 var record: [65536]u8 = undefined;
 var records_applied: usize = 0;
@@ -830,7 +833,8 @@ fn changeRecords() !void {
     @memcpy(good[0..used], record[0..used]);
     const length = used;
     try check(good[8] == 60);
-    var fresh: DB = .{};
+    const fresh = &crafted_replay;
+    fresh.* = .{};
     var copy: [512]u8 = undefined;
     // Truncated payload, flipped kind, bad language, unknown type OID.
     for ([_]usize{ 13, 14, 20 }) |cut| {
@@ -874,9 +878,9 @@ fn changeRecords() !void {
     try db.executeChanges("CREATE FUNCTION rt() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$", &result, &record, &used, null, null);
     used = 0;
     try db.executeChanges("CREATE TRIGGER rtt BEFORE INSERT ON tdd_a FOR EACH ROW EXECUTE FUNCTION rt()", &result, &record, &used, null, null);
-    var empty: DB = .{};
-    if (empty.applyChangeRecord(record[0..used], &scratch)) |_| try check(false) else |err| try check(err == error.ChangeRecordConflict);
-    try check(empty.tableCount() == 0 and empty.oid_counter == 0);
+    fresh.* = .{};
+    if (fresh.applyChangeRecord(record[0..used], &scratch)) |_| try check(false) else |err| try check(err == error.ChangeRecordConflict);
+    try check(fresh.tableCount() == 0 and fresh.oid_counter == 0);
 }
 
 fn triggerDefinitions() !void {
@@ -1484,6 +1488,44 @@ fn routineDefaultWalValidation() !void {
     try sameState(&.{"SELECT defaclacl::text FROM pg_default_acl WHERE defaclobjtype='f'"});
 }
 
+fn viewReturnRuleDiscovery() !void {
+    reset();
+    try run("CREATE SCHEMA \"Rule Space\"");
+    try run("CREATE TABLE rule_source (\"a\"\"b\" INT,v INT)");
+    try run("INSERT INTO rule_source VALUES (1,7),(2,-3)");
+    try run("CREATE VIEW \"Rule Space\".\"The Returning View\" (\"Renamed Column\",v) AS SELECT \"a\"\"b\" AS \"old name\",v FROM public.rule_source WHERE v>0");
+    const probe = "SELECT pg_get_ruledef(r.oid) FROM pg_rewrite r JOIN pg_class c ON c.oid=r.ev_class WHERE c.relname='The Returning View'";
+    try expect(probe, "CREATE RULE \"_RETURN\" AS\n    ON SELECT TO \"Rule Space\".\"The Returning View\" DO INSTEAD SELECT \"a\"\"b\" AS \"Renamed Column\",v FROM public.rule_source WHERE v>0\n;");
+    try expect("SELECT count(*) FROM pg_rules", "0");
+    try expect("SELECT pg_get_ruledef('public.rule_source'::regclass)", "NULL");
+    try expect("SELECT \"Renamed Column\",v FROM \"Rule Space\".\"The Returning View\"", "1|7");
+    var result: DB.Result = .{};
+    var short_values: [8]u8 = undefined;
+    result.bindValueMemory(&short_values);
+    const before = db.csn;
+    if (db.execute(probe, &result)) |_| return error.ReturnRuleBudgetIgnored else |err| try check(err == error.WorkspaceCapacity);
+    try check(db.csn == before and db.usage().transactions == 0);
+    try expect(probe, "CREATE RULE \"_RETURN\" AS\n    ON SELECT TO \"Rule Space\".\"The Returning View\" DO INSTEAD SELECT \"a\"\"b\" AS \"Renamed Column\",v FROM public.rule_source WHERE v>0\n;");
+    try run("CREATE MATERIALIZED VIEW rule_mat AS SELECT 1 AS n");
+    try expect("SELECT pg_get_ruledef(oid,true) FROM pg_rewrite WHERE ev_class='rule_mat'::regclass", "CREATE RULE \"_RETURN\" AS\n    ON SELECT TO rule_mat DO INSTEAD SELECT 1 AS n\n;");
+    try run("SET quote_all_identifiers=on");
+    try expect("SELECT pg_get_ruledef(oid,true) FROM pg_rewrite WHERE ev_class='public.rule_mat'::regclass", "CREATE RULE \"_RETURN\" AS\n    ON SELECT TO \"rule_mat\" DO INSTEAD SELECT 1 AS n\n;");
+    try run("RESET quote_all_identifiers");
+    try run("DROP VIEW \"Rule Space\".\"The Returning View\"");
+    try run("CREATE VIEW \"Rule Space\".\"The Returning View\" AS SELECT \"a\"\"b\" AS \"Renamed Column\",v FROM public.rule_source WHERE v>=7");
+    try expect(probe, "CREATE RULE \"_RETURN\" AS\n    ON SELECT TO \"Rule Space\".\"The Returning View\" DO INSTEAD SELECT \"a\"\"b\" AS \"Renamed Column\",v FROM public.rule_source WHERE v>=7\n;");
+    const transaction = try db.begin();
+    try statement(transaction, "DROP VIEW \"Rule Space\".\"The Returning View\"");
+    try same(try rows(transaction, "SELECT count(*) FROM pg_rewrite WHERE ev_class=(SELECT oid FROM pg_class WHERE relname='The Returning View')"), "0");
+    db.abort(transaction);
+    try expect("SELECT count(*) FROM pg_rewrite WHERE ev_class=(SELECT oid FROM pg_class WHERE relname='The Returning View')", "1");
+    try sameState(&.{probe, "SELECT pg_get_ruledef(oid,true) FROM pg_rewrite WHERE ev_class='rule_mat'::regclass"});
+    try run("DROP VIEW \"Rule Space\".\"The Returning View\"");
+    try expect("SELECT count(*) FROM pg_rewrite WHERE rulename='_RETURN'", "1");
+    try run("DROP MATERIALIZED VIEW rule_mat");
+    try expect("SELECT count(*) FROM pg_rewrite", "0");
+}
+
 pub fn main() !void {
     try routineDiscovery();
     try executeLists();
@@ -1497,6 +1539,7 @@ pub fn main() !void {
     try routineDefaultCapacity();
     try routineDefaultWalValidation();
     try routineOwnership();
+    try viewReturnRuleDiscovery();
     try ruleAndTriggerDiscovery();
     try bodyValidationSetting();
     try oraclePrograms();

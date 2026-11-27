@@ -1,5 +1,48 @@
 # SQL conformance TDD checkpoint
 
+## View _RETURN rule definitions — qualified, 27 November 2026
+
+The failing contract reproduced a non-null pg_rewrite row whose pg_get_ruledef
+returned NULL. View and materialized-view return rules now render their actual
+stored SELECT through the existing pg_get_viewdef writer, including namespace
+qualification, quoted identifiers and declared column aliases. Wide output uses
+the caller's value region; insufficient space fails without clipping or publishing
+a transaction. pg_rules continues to exclude implicit view rules.
+
+Contracts exercise materialized views, quoted names, column aliases, drop/recreate,
+rollback, WAL replay, unknown OIDs and exhausted result memory. The stock PG16/18
+archive fixtures execute both pretty/non-pretty deparsed SELECT actions with an
+empty search_path, comparing rows and column names/types with the real view before
+dump and after restore/reopen. Formatting is not claimed byte-identical to native
+PostgreSQL. Native PostgreSQL 18.3 independently confirms the _RETURN rule shape.
+Stock PG16 and PG18 each pass all 48 tooling, 10 large-object and 13 file/routine
+checks in [CI 46033230142](https://github.com/SB0LTD/ramsql/actions/runs/46033230142),
+including deparsed SELECT actions and both archive directions. The unchanged
+strict inventory passes 106/106 in
+[CI 46033234852](https://github.com/SB0LTD/ramsql/actions/runs/46033234852).
+Windows Debug and ReleaseSafe each pass 1,096 assertions / 340 WAL records, including
+diagnostic 4 MiB PE copies. Linux CI passes the stricter routine and wide-cell
+4 MiB gates in both modes. The complete library, transport and CLI workflow passes
+in [ZPM CI 46036894578](https://github.com/SB0LTD/zpm/actions/runs/46036894578),
+including the real argv-forwarding and child-exit probes. The release matrix is
+separate; its publication remains conditional on every required native lane.
+
+An additional Windows diagnostic found a 4,698,600-byte frame in the existing
+changeRecords test, caused by two automatic complete DB fixtures. Its malformed
+WAL probes now reuse fixed caller-owned storage, retaining all assertions. The
+routine suite joins the 4 MiB Debug/ReleaseSafe CI gate; the gate is not increased.
+The corrected test frame measures 114,168 bytes. The earlier full source run
+46029049805 completed 497 library build/test steps and the CLI test/build graph,
+but hit its
+50-minute cold-build deadline before the final argv-forwarding probe. It is not a
+full workflow pass. CI now allows 75 minutes without removing any check; this
+budget-only change leaves the qualified production sources and tests unchanged.
+
+This does not implement arbitrary CREATE RULE actions. Named routine namespaces,
+broader search_path behavior, CREATE OR REPLACE VIEW and ALTER VIEW column rename
+also remain open. The last two forms explicitly reject with 0A000 in the current
+parser; the fixture uses supported DROP/CREATE and declared view-column aliases.
+
 ## Routine catalog checkpoints and stock archives - qualified, 27 November 2026
 
 RSBASE10 preserves live SQL/PLpgSQL functions, procedures, delegated EXECUTE ACLs,
