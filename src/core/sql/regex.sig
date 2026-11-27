@@ -30,14 +30,21 @@
 //! leading embedded options `(?bcefimnpqstwx)`. Group and lookaround
 //! nesting beyond the caller's depth limit (Config.expr_depth) is 54001.
 //!
-//! Character semantics are the C strategy of regc_pg_locale.c (this
-//! database's collation is C): classes contain ASCII characters only
-//! (cntrl also 0x80-0x9f), and case-insensitive matching folds ASCII
-//! letters only. Malformed patterns are 2201B (InvalidRegularExpression);
+//! Character semantics are the libc wide-character strategy of
+//! regc_pg_locale.c (PG_REGEX_STRATEGY_LIBC_WIDE) for the C.UTF-8 ctype,
+//! the one upper/lower use (unicode_case.sig): ASCII keeps the C
+//! behaviour; non-ASCII characters belong to classes per iswalpha,
+//! iswupper, ... of C.UTF-8 (digit, xdigit, blank and ascii are ASCII
+//! only; cntrl is 0-0x1f and 0x7f-0x9f); a case-insensitive character
+//! stands for allcases(): towlower and towupper of it (not the character
+//! itself), in brackets too, and a bracket range adds the case variants
+//! of its members; back references compare towlower of each character.
+//! Malformed patterns are 2201B (InvalidRegularExpression);
 //! a program beyond `states` instructions, a subexpression tree beyond its
 //! node capacity, more than `states` groups or iteration end points beyond
 //! the caller's workspace are 54000.
 const types = @import("types.sig");
+const unicode_case = @import("unicode_case.sig");
 const Error = types.Error;
 
 /// Compilation flags: regcomp's cflags. `ere` clears REG_ADVF (no ARE
@@ -113,16 +120,18 @@ const Assertion = enum(u8) { bol, eol, bos, eos, word_start, word_end, boundary,
 const Look = enum(u8) { ahead, ahead_not, behind, behind_not };
 
 /// One program step. Jumps are relative (`x`, `y`) so copying or shifting
-/// a block keeps it valid. char: `arg` code point (`fold`: ASCII case
-/// insensitive, arg lower case); set: `arg` set index; assert: an
+/// a block keeps it valid. char: `arg` code point (`fold`: either `arg`
+/// or the code point `x`, allcases()); set: `arg` set index; assert: an
 /// Assertion; look: a Look over the sub-program after it, which ends with
 /// its own `match`, continuing at `x`; fail: never matches (a back
 /// reference to a group removed by `{0}`).
 const Inst = struct { op: Op = .match, fold: bool = false, arg: u32 = 0, x: i32 = 0, y: i32 = 0 };
 
-/// A bracket expression or class escape: an ASCII bitmap, `high` for every
-/// non-ASCII character, then explicit non-ASCII ranges; `negated` last.
-const Set = struct { ascii: [2]u64 = .{ 0, 0 }, high: bool = false, range_start: u32 = 0, range_count: u32 = 0, negated: bool = false };
+/// A bracket expression or class escape: an ASCII bitmap; for non-ASCII
+/// characters the classes they may belong to (`classes`, one bit per
+/// Class) or fall outside of (`not_classes`, \W and the like) and explicit
+/// ranges; `negated` last.
+const Set = struct { ascii: [2]u64 = .{ 0, 0 }, classes: u16 = 0, not_classes: u16 = 0, range_start: u32 = 0, range_count: u32 = 0, negated: bool = false };
 
 // ---- subexpression tree (regguts.h subre) --------------------------------
 
@@ -240,7 +249,35 @@ fn isWord(c: u32) bool {
     return isAlpha(c) or isDigit(c) or c == '_';
 }
 
-/// pg_ascii_tolower for the C strategy.
+/// Membership of a non-ASCII character in a class (C.UTF-8).
+fn highClassHas(class: Class, c: u32) bool {
+    return switch (class) {
+        .alnum, .alpha, .word => unicode_case.isAlnum(c),
+        .upper => unicode_case.highUpper(c),
+        .lower => unicode_case.highLower(c),
+        .space => unicode_case.highSpace(c),
+        .punct => unicode_case.highPunct(c),
+        .print => unicode_case.highPrint(c),
+        .graph => unicode_case.highGraph(c),
+        .cntrl => c <= 0x9f,
+        .ascii, .blank, .digit, .xdigit => false,
+    };
+}
+
+/// A word character of \m \M \y \Y (alnum or `_`).
+fn wordChar(c: u32) bool {
+    return if (c < 128) isWord(c) else unicode_case.isAlnum(c);
+}
+
+/// The byte length of an expanded-syntax white space character at `at`
+/// (iscspace), 0 when there is none.
+fn spaceAt(src: []const u8, at: usize) usize {
+    const ch = decode(src, at);
+    if (ch.cp < 128) return if (isSpace(ch.cp)) 1 else 0;
+    return if (unicode_case.highSpace(ch.cp)) ch.len else 0;
+}
+
+/// ASCII lower case (hexadecimal digits).
 fn fold(c: u32) u32 {
     return if (isUpper(c)) c + 32 else c;
 }
@@ -496,8 +533,8 @@ pub fn Regex(comptime states: usize) type {
             fn skipIgnorable(self: *Compiler) void {
                 while (self.more()) {
                     const byte = self.src[self.at];
-                    if (self.flags.expanded and isSpace(byte)) {
-                        self.at += 1;
+                    if (self.flags.expanded and spaceAt(self.src, self.at) != 0) {
+                        self.at += spaceAt(self.src, self.at);
                     } else if (self.flags.expanded and byte == '#') {
                         while (self.more() and self.src[self.at] != '\n') self.at += 1;
                     } else if (!self.flags.ere and byte == '(' and self.peek(1) == '?' and self.peek(2) == '#') {
@@ -509,9 +546,16 @@ pub fn Regex(comptime states: usize) type {
             }
 
             fn literal(self: *Compiler, cp: u32) Error!void {
-                if (self.flags.icase and isAlpha(cp)) {
-                    _ = try self.emit(.{ .op = .char, .fold = true, .arg = fold(cp) });
-                } else _ = try self.emit(.{ .op = .char, .arg = cp });
+                if (!self.flags.icase) {
+                    _ = try self.emit(.{ .op = .char, .arg = cp });
+                    return;
+                }
+                // allcases(): towlower and towupper, not cp itself.
+                const lower = unicode_case.toLower(cp);
+                const upper = unicode_case.toUpper(cp);
+                if (lower == upper) {
+                    _ = try self.emit(.{ .op = .char, .arg = lower });
+                } else _ = try self.emit(.{ .op = .char, .fold = true, .arg = lower, .x = @intCast(upper) });
             }
 
             fn newSet(self: *Compiler) Error!*Set {
@@ -526,7 +570,8 @@ pub fn Regex(comptime states: usize) type {
                 set.ascii[c >> 6] |= @as(u64, 1) << @intCast(c & 63);
             }
 
-            /// Adds [low, high] (with ASCII case variants when insensitive).
+            /// range(): [low, high] and, when insensitive, the case variants
+            /// of its members that fall outside it.
             fn addRange(self: *Compiler, set: *Set, low: u32, high: u32) Error!void {
                 var c = low;
                 while (c <= high and c < 128) : (c += 1) {
@@ -540,7 +585,58 @@ pub fn Regex(comptime states: usize) type {
                     re.ranges[re.range_len] = .{ @max(low, 128), high };
                     re.range_len += 1;
                     set.range_count += 1;
+                    if (self.flags.icase) {
+                        try self.addCaseRuns(set, &unicode_case.lower_runs, low, high);
+                        try self.addCaseRuns(set, &unicode_case.upper_runs, low, high);
+                    }
                 }
+            }
+
+            /// The mappings of `runs` for members of [low, high] (non-ASCII
+            /// ones; ASCII maps within ASCII) that leave the range.
+            fn addCaseRuns(self: *Compiler, set: *Set, runs: []const unicode_case.Run, low: u32, high: u32) Error!void {
+                const from = @max(low, 128);
+                for (runs) |run| {
+                    if (run.end < from or run.start > high) continue;
+                    var c = run.start;
+                    if (c < from) c += (from - c + run.stride - 1) / run.stride * run.stride;
+                    while (c <= run.end and c <= high) : (c += run.stride) {
+                        const target: u32 = @intCast(@as(i64, c) + run.delta);
+                        if (target < low or target > high) try self.addChar(set, target);
+                    }
+                }
+            }
+
+            /// allcases(): towlower and towupper of `c`.
+            fn addCases(self: *Compiler, set: *Set, c: u32) Error!void {
+                const lower = unicode_case.toLower(c);
+                const upper = unicode_case.toUpper(c);
+                try self.addChar(set, lower);
+                if (upper != lower) try self.addChar(set, upper);
+            }
+
+            /// One character, merged into the newest set's ranges.
+            fn addChar(self: *Compiler, set: *Set, c: u32) Error!void {
+                if (c < 128) {
+                    addAscii(set, c);
+                    return;
+                }
+                const re = self.re;
+                for (re.ranges[set.range_start..][0..set.range_count]) |*range| {
+                    if (c >= range[0] and c <= range[1]) return;
+                    if (c == range[1] + 1) {
+                        range[1] = c;
+                        return;
+                    }
+                    if (c + 1 == range[0]) {
+                        range[0] = c;
+                        return;
+                    }
+                }
+                if (re.range_len == range_capacity) return error.ProgramLimitExceeded;
+                re.ranges[re.range_len] = .{ c, c };
+                re.range_len += 1;
+                set.range_count += 1;
             }
 
             fn addClass(self: *Compiler, set: *Set, class_in: Class, complement: bool) Error!void {
@@ -549,9 +645,8 @@ pub fn Regex(comptime states: usize) type {
                 for (0..128) |c| {
                     if (classHas(class, @intCast(c)) != complement) addAscii(set, @intCast(c));
                 }
-                if (complement) {
-                    set.high = true;
-                } else if (class == .cntrl) try self.addRange(set, 0x80, 0x9f);
+                const bit = @as(u16, 1) << @intCast(@intFromEnum(class));
+                if (complement) set.not_classes |= bit else set.classes |= bit;
             }
 
             /// An escape's result: a character, a class (complemented or
@@ -691,16 +786,23 @@ pub fn Regex(comptime states: usize) type {
                     first = false;
                     var start: u32 = 0;
                     var rangeable = true;
+                    // A plain character alone is onechr() (allcases when
+                    // insensitive); a collating element or a range is range().
+                    var plain = true;
                     if (byte == '[' and (self.peek(1) == '.' or self.peek(1) == '=' or self.peek(1) == ':')) {
                         const kind = self.peek(1).?;
                         self.at += 2;
                         const name = try self.bracketName(kind);
                         switch (kind) {
-                            '.' => start = try element(name),
+                            '.' => {
+                                start = try element(name);
+                                plain = false;
+                            },
                             '=' => {
-                                // eclass: in C the character itself.
+                                // eclass: the character itself, or
+                                // allcases() when insensitive.
                                 const c = try element(name);
-                                try self.addRange(set, c, c);
+                                if (self.flags.icase) try self.addCases(set, c) else try self.addRange(set, c, c);
                                 continue;
                             },
                             else => {
@@ -755,7 +857,9 @@ pub fn Regex(comptime states: usize) type {
                         }
                         if (end < start) return fail();
                     }
-                    try self.addRange(set, start, end);
+                    if (plain and !is_range and self.flags.icase) {
+                        try self.addCases(set, start);
+                    } else try self.addRange(set, start, end);
                 }
                 // In NLSTOP mode a complemented bracket never matches newline.
                 if (set.negated and self.flags.nlstop) addAscii(set, '\n');
@@ -829,7 +933,7 @@ pub fn Regex(comptime states: usize) type {
                         // A bound without an operand; `{` before a non-digit is literal.
                         var probe = self.at + 1;
                         if (self.flags.expanded) {
-                            while (probe < self.src.len and isSpace(self.src[probe])) probe += 1;
+                            while (probe < self.src.len and spaceAt(self.src, probe) != 0) probe += spaceAt(self.src, probe);
                         }
                         if (probe < self.src.len and isDigit(self.src[probe])) return fail();
                         self.at += 1;
@@ -1070,7 +1174,7 @@ pub fn Regex(comptime states: usize) type {
                     '{' => {
                         var probe = self.at + 1;
                         if (self.flags.expanded) {
-                            while (probe < self.src.len and isSpace(self.src[probe])) probe += 1;
+                            while (probe < self.src.len and spaceAt(self.src, probe) != 0) probe += spaceAt(self.src, probe);
                         }
                         if (probe >= self.src.len or !isDigit(self.src[probe])) return .{};
                         self.at += 1;
@@ -1499,13 +1603,24 @@ pub fn Regex(comptime states: usize) type {
             var hit = false;
             if (cp < 128) {
                 hit = set.ascii[cp >> 6] & (@as(u64, 1) << @intCast(cp & 63)) != 0;
-            } else if (set.high) {
-                hit = true;
-            } else for (self.ranges[set.range_start..][0..set.range_count]) |range| {
-                if (cp >= range[0] and cp <= range[1]) {
-                    hit = true;
-                    break;
+            } else {
+                if (set.classes | set.not_classes != 0) {
+                    for (0..class_names.len) |class_index| {
+                        const bit = @as(u16, 1) << @intCast(class_index);
+                        if (set.classes & bit == 0 and set.not_classes & bit == 0) continue;
+                        const member = highClassHas(@enumFromInt(class_index), cp);
+                        if ((set.classes & bit != 0 and member) or (set.not_classes & bit != 0 and !member)) {
+                            hit = true;
+                            break;
+                        }
+                    }
                 }
+                if (!hit) for (self.ranges[set.range_start..][0..set.range_count]) |range| {
+                    if (cp >= range[0] and cp <= range[1]) {
+                        hit = true;
+                        break;
+                    }
+                };
             }
             return hit != set.negated;
         }
@@ -1517,7 +1632,7 @@ pub fn Regex(comptime states: usize) type {
         }
 
         fn wordAt(cp: ?u32) bool {
-            return if (cp) |c| isWord(c) else false;
+            return if (cp) |c| wordChar(c) else false;
         }
 
         fn holds(self: *const Self, assertion: Assertion, text: []const u8, at: usize) bool {
@@ -1582,7 +1697,7 @@ pub fn Regex(comptime states: usize) type {
 
         fn consumes(self: *const Self, inst: Inst, cp: u32) bool {
             return switch (inst.op) {
-                .char => (if (inst.fold) fold(cp) else cp) == inst.arg,
+                .char => cp == inst.arg or (inst.fold and cp == @as(u32, @intCast(inst.x))),
                 .any => !(self.flags.nlstop and cp == '\n'),
                 .set => self.inSet(inst.arg, cp),
                 else => false,
@@ -1801,7 +1916,7 @@ pub fn Regex(comptime states: usize) type {
         }
 
         fn sameChar(self: *const Self, a: u32, b: u32) bool {
-            return a == b or (self.flags.icase and fold(a) == fold(b));
+            return a == b or (self.flags.icase and unicode_case.toLower(a) == unicode_case.toLower(b));
         }
 
         /// Compares the captured text `ref` with the text at `at`; the

@@ -27,6 +27,7 @@ const xml_module = @import("xml.sig");
 const json_eval = @import("json_eval.sig");
 const regex_eval = @import("regex_eval.sig");
 const regex = @import("regex.sig");
+const unicode_case = @import("unicode_case.sig");
 const flat_record = @import("flat_record.sig");
 const Error = types.Error;
 const none = ast.none;
@@ -254,8 +255,12 @@ fn likeMatch(text: []const u8, pattern: []const u8, escape: []const u8, insensit
             if (literal_at == pattern.len) return error.InvalidEscapeSequence;
             const literal_width = @min(utf8Length(pattern[literal_at]), pattern.len - literal_at);
             const text_width = @min(utf8Length(text[t]), text.len - t);
+            // ILIKE compares lower() of both sides (C.UTF-8 towlower, one
+            // character for one, so per character is the same).
             const matched = if (insensitive and literal_width == 1 and text_width == 1)
                 types.lower(pattern[literal_at]) == types.lower(text[t])
+            else if (insensitive)
+                unicode_case.toLower(regex.decode(pattern, literal_at).cp) == unicode_case.toLower(regex.decode(text, t).cp)
             else text_width == literal_width and @import("std").mem.eql(u8, pattern[literal_at..][0..literal_width], text[t..][0..text_width]);
             if (matched) {
                 p = literal_at + literal_width;

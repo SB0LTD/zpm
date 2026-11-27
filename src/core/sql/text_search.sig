@@ -11,12 +11,14 @@
 //! bounded caller-stack tables. Nothing allocates.
 //!
 //! The parser's state tables are a mechanical translation of
-//! wparser_def.c (PostgreSQL 18.3). Character classes follow this
-//! database's C ctype under UTF-8 (TParser's pgwstr path): non-ASCII
-//! characters are letters and alphanumerics and nothing else. Two
-//! configurations exist: `simple` (every token type except blank, tag,
-//! protocol and entity maps to the simple dictionary, which folds ASCII
-//! letters to lower case) and `english` (wave 4 text-json lane: the word
+//! wparser_def.c (PostgreSQL 18.3). Character classes follow the C.UTF-8
+//! ctype (TParser's wide-character path, wave 4 text-json lane): iswalpha
+//! and iswspace for non-ASCII characters (unicode_case.sig), digits ASCII
+//! only, and p_isspecial (zero-width characters and spacing combining
+//! marks continue a word). Two configurations exist: `simple` (every
+//! token type except blank, tag, protocol and entity maps to the simple
+//! dictionary, which lower-cases with towlower like lower()) and
+//! `english` (wave 4 text-json lane: the word
 //! token types map to english_stem, the Snowball English stemmer with the
 //! english stop-word list, snowball_english.sig; the others to simple).
 //! The other built-in Snowball configurations are 0A000; unknown names
@@ -25,6 +27,8 @@
 const std = @import("std");
 const types = @import("types.sig");
 const snowball_english = @import("snowball_english.sig");
+const unicode_case = @import("unicode_case.sig");
+const functions_string = @import("functions_string.sig");
 const Error = types.Error;
 
 // ---- default parser ----------------------------------------------------------
@@ -133,8 +137,19 @@ pub const Parser = struct {
         return self.state().charlen == 1 and self.byteAt() < 0x80;
     }
 
+    /// The code point of the current character (two bytes or more).
+    fn wide(self: *Parser) u32 {
+        const at = self.state().posbyte;
+        const len = self.state().charlen;
+        const lead = self.str[at];
+        var cp: u32 = lead & (@as(u32, 0x7f) >> @intCast(len));
+        for (self.str[at + 1 .. at + len]) |byte| cp = (cp << 6) | (byte & 0x3f);
+        return cp;
+    }
+
     fn isAlpha(self: *Parser) bool {
-        if (self.state().charlen != 1) return self.state().charlen > 1;
+        if (self.state().charlen > 1) return unicode_case.isAlnum(self.wide());
+        if (self.state().charlen != 1) return false;
         const b = self.byteAt();
         if (b >= 0x80) return true;
         return (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z');
@@ -147,6 +162,7 @@ pub const Parser = struct {
     }
 
     fn isSpace(self: *Parser) bool {
+        if (self.state().charlen > 1) return unicode_case.highSpace(self.wide());
         if (self.state().charlen != 1) return false;
         const b = self.byteAt();
         return b == ' ' or (b >= 9 and b <= 13);
@@ -184,9 +200,9 @@ pub const Parser = struct {
             .digit => self.isDigit(),
             .notalnum => !(self.isAlpha() or self.isDigit()),
             .space => self.isSpace(),
-            // pg_dsplen() == 0 or a spacing combining mark: never reached
-            // for a character that is not already a letter in C ctype.
-            .special => false,
+            // pg_dsplen() == 0 or a spacing combining mark (always after
+            // an alpha or alnum test with the same target).
+            .special => self.state().charlen > 1 and unicode_case.textSearchSpecial(self.wide()),
             .stophost => blk: {
                 if (!self.wanthost) break :blk false;
                 self.wanthost = false;
@@ -1430,17 +1446,20 @@ pub fn TextSearch(comptime text_bytes: usize, comptime depth_limit: usize) type 
             try writeVector(&vector, out, max_positions_per_lexeme);
         }
 
-        /// Lexizes one token with the built-in simple dictionary under C ctype.
-        fn simpleLexize(word: []const u8, buffer: []u8) []const u8 {
-            for (word, 0..) |byte, index| buffer[index] = if (byte >= 'A' and byte <= 'Z') byte + 32 else byte;
-            return buffer[0..word.len];
+        /// Lexizes one token with the built-in simple dictionary:
+        /// lowerstr (towlower per character, as lower()); a result beyond
+        /// `buffer` is 54000.
+        fn simpleLexize(word: []const u8, buffer: []u8) Error![]const u8 {
+            var out: functions_string.Out = .{ .bytes = buffer };
+            try functions_string.mapCase(word, .lower, &out, null);
+            return out.slice();
         }
 
         /// english_stem (dict_snowball): the lower-cased word, nothing for
         /// a stop word, else its Snowball stem (words over 1000 bytes are
         /// only lower-cased).
-        fn englishLexize(word: []const u8, buffer: []u8, stemmed: []u8) ?[]const u8 {
-            const lower = simpleLexize(word, buffer);
+        fn englishLexize(word: []const u8, buffer: []u8, stemmed: []u8) Error!?[]const u8 {
+            const lower = try simpleLexize(word, buffer);
             if (lower.len > snowball_english.max_word) return lower;
             if (lower.len == 0) return null;
             for (snowball_english.stop_words) |stop| if (std.mem.eql(u8, stop, lower)) return null;
@@ -1469,9 +1488,9 @@ pub fn TextSearch(comptime text_bytes: usize, comptime depth_limit: usize) type 
                 if (token.bytes.len >= max_word) continue;
                 position += 1;
                 const lexeme = if (config == .english and englishStemmed(token.kind))
-                    englishLexize(token.bytes, &buffer, &stemmed) orelse continue
+                    (try englishLexize(token.bytes, &buffer, &stemmed)) orelse continue
                 else
-                    simpleLexize(token.bytes, &buffer);
+                    try simpleLexize(token.bytes, &buffer);
                 const entry = try vector.add(lexeme);
                 // Positions beyond 16383 are recorded as 16383.
                 try vector.addPosition(entry, @intCast(@min(position, max_position)));

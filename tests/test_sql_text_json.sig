@@ -394,6 +394,18 @@ fn textSearchEnglish() !void {
 fn caseMapping() !void {
     // upper / lower / initcap over every hundredth chunk of code points.
     try battery(&batteries.case_mapping_battery);
+    // The same C.UTF-8 ctype in regular expressions (classes, allcases()
+    // folding, ranges, back references, word boundaries) and in the text
+    // search parser and dictionaries.
+    try battery(&batteries.regex_wide_battery);
+    try battery(&batteries.ts_wide_battery);
+    // ILIKE compares lower() of both sides.
+    try rows("SELECT 'É' ILIKE 'é', 'ǅ' ILIKE 'ǆ', chr(8490) ILIKE 'k', 'K' ILIKE chr(8490), 'ÉCOLE' ILIKE 'é%', 'école' ILIKE '_COLE', 'ß' ILIKE 'SS', 'É' LIKE 'é'", "t|t|t|t|t|t|f|f");
+    try rows("SELECT 'Straße' ILIKE '%STRASSE', 'ΣΊΣΥΦΟΣ' ILIKE 'σίσυφοσ', 'ÀB' NOT ILIKE 'àb', 'x' || chr(304) ILIKE 'XI'", "f|t|f|t");
+    // Case variants of a bracket range are merged into its ranges.
+    try rows("SELECT 'Ж' ~* '[а-я]', 'ǅ' ~* '[\\u0100-\\u024f]', 'k' ~* '[\\u2100-\\u21ff]'", "t|t|t");
+    // A lexeme growing under towlower beyond the text capacity is 54000.
+    try rejects("SELECT to_tsvector('simple', repeat('\xc8\xba', 256))", error.TextCapacity);
     try rows("SELECT upper('\xc3\xa9t\xc3\xa9'), lower('\xc3\x89T\xc3\x89'), initcap('\xc3\xa9l\xc3\xa8ve-\xc3\xa9COLE')", "\xc3\x89T\xc3\x89|\xc3\xa9t\xc3\xa9|\xc3\x89l\xc3\xa8ve-\xc3\x89cole");
     try meta(0, "upper", 25, -1);
     // A result beyond the text capacity is 54000 (two-byte to three-byte
