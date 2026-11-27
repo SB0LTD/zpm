@@ -1945,6 +1945,9 @@ pub fn Database(comptime config: Config) type {
         routine_frame: ?*R.Frame = null,
         routine_depth: usize = 0,
         routine_nested: usize = 0,
+        /// The last RAISE / ASSERT description, until a handler takes it
+        /// (B11 wave 4: SQLSTATE, SQLERRM, GET STACKED DIAGNOSTICS).
+        routine_diag: R.Diagnostics = .{},
         /// Write-set index where the running statement's writes begin (its
         /// AFTER ROW triggers read them); kept across a park.
         statement_start: usize = 0,
@@ -10509,6 +10512,7 @@ pub fn Database(comptime config: Config) type {
             self.routine_frame = null;
             self.routine_depth = 0;
             self.routine_nested = 0;
+            self.routine_diag.active = false;
             self.installRole();
         }
 
@@ -12315,6 +12319,21 @@ pub fn Database(comptime config: Config) type {
         pub fn routineRollback(self: *Self, mark: RoutineMark) void {
             M.abortSlice(self, self.routine_slot, mark.writes, mark.locks);
             self.wake_epoch +%= 1;
+        }
+
+        /// RAISE / ASSERT: the description of the error about to be raised.
+        pub fn routineRaise(self: *Self, diag: *const R.Diagnostics) void {
+            self.routine_diag = diag.*;
+            self.routine_diag.active = true;
+        }
+
+        /// What a handler that caught an error sees: the pending RAISE /
+        /// ASSERT description when it raised that error, else the error's own.
+        pub fn routineDiagnostics(self: *Self, err: Error, out: *R.Diagnostics) void {
+            if (self.routine_diag.active and self.routine_diag.err == err) {
+                out.* = self.routine_diag;
+            } else R.Diagnostics.describe(err, out);
+            self.routine_diag.active = false;
         }
 
         fn enterRoutine(self: *Self) Error!void {

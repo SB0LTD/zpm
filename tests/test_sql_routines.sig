@@ -477,7 +477,7 @@ fn plpgsqlFunctions() !void {
     try run("CREATE FUNCTION case_gap(x INT) RETURNS INT LANGUAGE plpgsql AS $$BEGIN CASE x WHEN 1 THEN RETURN 1; END CASE; RETURN 0; END$$");
     try fails("SELECT case_gap(2)", error.CaseNotFound);
     try run("CREATE FUNCTION asserted(x INT) RETURNS INT LANGUAGE plpgsql AS $$BEGIN ASSERT x > 0, 'positive'; RETURN x; END$$");
-    try fails("SELECT asserted(0)", error.RaiseException);
+    try fails("SELECT asserted(0)", error.AssertFailure);
     try run("CREATE FUNCTION raises(x INT) RETURNS INT LANGUAGE plpgsql AS $$BEGIN IF x = 1 THEN RAISE division_by_zero; END IF; RAISE NOTICE 'x is %', x; RAISE EXCEPTION USING ERRCODE = 'unique_violation'; END$$");
     try fails("SELECT raises(1)", error.DivisionByZero);
     try fails("SELECT raises(2)", error.PrimaryKeyViolation);

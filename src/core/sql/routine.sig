@@ -976,34 +976,190 @@ pub fn Routines(comptime config: types.Config) type {
             typmod: i32 = -1,
         };
 
-        /// Exception condition names and SQLSTATEs the handlers and RAISE
-        /// accept (others are 42704).
-        const Condition = struct { name: []const u8, state: []const u8, err: Error };
+        /// Exception condition names (PostgreSQL's plerrcodes.h) and the
+        /// SQLSTATE of each engine error, for handlers, RAISE, SQLSTATE /
+        /// SQLERRM and GET STACKED DIAGNOSTICS. The first entry of an error
+        /// is its SQLSTATE; the first entry of a state is the error RAISE
+        /// SQLSTATE / ERRCODE raises. `message` is PostgreSQL's fixed
+        /// message text where it has no variable parts (else empty: SQLERRM
+        /// reports the engine's diagnostic text). Unknown names are 42704.
+        const Condition = struct { name: []const u8, state: []const u8, err: Error, message: []const u8 = "" };
         const conditions = [_]Condition{
-            .{ .name = "division_by_zero", .state = "22012", .err = error.DivisionByZero },
+            .{ .name = "division_by_zero", .state = "22012", .err = error.DivisionByZero, .message = "division by zero" },
             .{ .name = "unique_violation", .state = "23505", .err = error.PrimaryKeyViolation },
             .{ .name = "not_null_violation", .state = "23502", .err = error.NotNullViolation },
             .{ .name = "check_violation", .state = "23514", .err = error.CheckViolation },
             .{ .name = "foreign_key_violation", .state = "23503", .err = error.ForeignKeyViolation },
             .{ .name = "exclusion_violation", .state = "23P01", .err = error.ExclusionViolation },
             .{ .name = "raise_exception", .state = "P0001", .err = error.RaiseException },
-            .{ .name = "no_data_found", .state = "P0002", .err = error.NoDataFound },
-            .{ .name = "too_many_rows", .state = "P0003", .err = error.TooManyRows },
+            .{ .name = "no_data_found", .state = "P0002", .err = error.NoDataFound, .message = "query returned no rows" },
+            .{ .name = "too_many_rows", .state = "P0003", .err = error.TooManyRows, .message = "query returned more than one row" },
+            .{ .name = "assert_failure", .state = "P0004", .err = error.AssertFailure, .message = "assertion failed" },
             .{ .name = "numeric_value_out_of_range", .state = "22003", .err = error.NumericValueOutOfRange },
             .{ .name = "numeric_value_out_of_range", .state = "22003", .err = error.IntegerOverflow },
             .{ .name = "invalid_text_representation", .state = "22P02", .err = error.InvalidTextRepresentation },
             .{ .name = "string_data_right_truncation", .state = "22001", .err = error.StringDataRightTruncation },
             .{ .name = "null_value_not_allowed", .state = "22004", .err = error.NullValueNotAllowed },
-            .{ .name = "case_not_found", .state = "20000", .err = error.CaseNotFound },
+            .{ .name = "null_value_not_allowed", .state = "22004", .err = error.NullWindowFrameOffset },
+            .{ .name = "case_not_found", .state = "20000", .err = error.CaseNotFound, .message = "case not found" },
             .{ .name = "cardinality_violation", .state = "21000", .err = error.CardinalityViolation },
             .{ .name = "undefined_table", .state = "42P01", .err = error.TableNotFound },
             .{ .name = "undefined_column", .state = "42703", .err = error.ColumnNotFound },
             .{ .name = "undefined_function", .state = "42883", .err = error.UndefinedFunction },
             .{ .name = "datatype_mismatch", .state = "42804", .err = error.TypeMismatch },
             .{ .name = "invalid_parameter_value", .state = "22023", .err = error.InvalidParameterValue },
+            .{ .name = "invalid_parameter_value", .state = "22023", .err = error.InvalidSettingValue },
             .{ .name = "program_limit_exceeded", .state = "54000", .err = error.ProgramLimitExceeded },
-            .{ .name = "assert_failure", .state = "P0004", .err = error.RaiseException },
+            .{ .name = "program_limit_exceeded", .state = "54000", .err = error.TableCapacity },
+            .{ .name = "program_limit_exceeded", .state = "54000", .err = error.ColumnCapacity },
+            .{ .name = "program_limit_exceeded", .state = "54000", .err = error.RowCapacity },
+            .{ .name = "program_limit_exceeded", .state = "54000", .err = error.NameCapacity },
+            .{ .name = "program_limit_exceeded", .state = "54000", .err = error.TextCapacity },
+            .{ .name = "program_limit_exceeded", .state = "54000", .err = error.WorkspaceCapacity },
+            .{ .name = "program_limit_exceeded", .state = "54000", .err = error.NumericCapacity },
+            .{ .name = "program_limit_exceeded", .state = "54000", .err = error.IndexCapacity },
+            .{ .name = "program_limit_exceeded", .state = "54000", .err = error.SessionCapacity },
+            .{ .name = "statement_too_complex", .state = "54001", .err = error.StatementTooComplex },
+            .{ .name = "statement_too_complex", .state = "54001", .err = error.StackDepthExceeded },
+            .{ .name = "out_of_memory", .state = "53200", .err = error.WriteSetCapacity },
+            .{ .name = "out_of_memory", .state = "53200", .err = error.LockCapacity },
+            .{ .name = "out_of_memory", .state = "53200", .err = error.VersionCapacity },
+            .{ .name = "feature_not_supported", .state = "0A000", .err = error.UnsupportedStatement },
+            .{ .name = "data_exception", .state = "22000", .err = error.DataException },
+            .{ .name = "error_in_assignment", .state = "22005", .err = error.ErrorInAssignment },
+            .{ .name = "invalid_datetime_format", .state = "22007", .err = error.InvalidDatetimeFormat },
+            .{ .name = "datetime_field_overflow", .state = "22008", .err = error.DatetimeFieldOverflow },
+            .{ .name = "invalid_time_zone_displacement_value", .state = "22009", .err = error.InvalidTimeZoneDisplacement },
+            .{ .name = "invalid_use_of_escape_character", .state = "2200C", .err = error.InvalidEscapeCharacterUse },
+            .{ .name = "sequence_generator_limit_exceeded", .state = "2200H", .err = error.SequenceLimit },
+            .{ .name = "not_an_xml_document", .state = "2200L", .err = error.NotAnXmlDocument },
+            .{ .name = "invalid_xml_document", .state = "2200M", .err = error.InvalidXmlDocument },
+            .{ .name = "invalid_xml_content", .state = "2200N", .err = error.InvalidXmlContent },
+            .{ .name = "substring_error", .state = "22011", .err = error.SubstringError },
+            .{ .name = "invalid_preceding_or_following_size", .state = "22013", .err = error.InvalidWindowFrameOffset },
+            .{ .name = "invalid_argument_for_ntile_function", .state = "22014", .err = error.InvalidArgumentForNtile },
+            .{ .name = "interval_field_overflow", .state = "22015", .err = error.IntervalFieldOverflow },
+            .{ .name = "invalid_argument_for_nth_value_function", .state = "22016", .err = error.InvalidArgumentForNthValue },
+            .{ .name = "invalid_regular_expression", .state = "2201B", .err = error.InvalidRegularExpression },
+            .{ .name = "invalid_argument_for_logarithm", .state = "2201E", .err = error.InvalidArgumentForLogarithm },
+            .{ .name = "invalid_argument_for_power_function", .state = "2201F", .err = error.InvalidArgumentForPowerFunction },
+            .{ .name = "invalid_row_count_in_limit_clause", .state = "2201W", .err = error.InvalidRowCountInLimit },
+            .{ .name = "invalid_row_count_in_result_offset_clause", .state = "2201X", .err = error.InvalidRowCountInResultOffset },
+            .{ .name = "character_not_in_repertoire", .state = "22021", .err = error.CharacterNotInRepertoire },
+            .{ .name = "invalid_escape_sequence", .state = "22025", .err = error.InvalidEscapeSequence },
+            .{ .name = "string_data_length_mismatch", .state = "22026", .err = error.StringDataLengthMismatch },
+            .{ .name = "array_subscript_error", .state = "2202E", .err = error.ArraySubscriptError },
+            .{ .name = "invalid_tablesample_repeat", .state = "2202G", .err = error.InvalidTablesampleRepeat },
+            .{ .name = "invalid_tablesample_argument", .state = "2202H", .err = error.InvalidTablesampleArgument },
+            .{ .name = "invalid_sql_json_subscript", .state = "22033", .err = error.InvalidSqlJsonSubscript },
+            .{ .name = "more_than_one_sql_json_item", .state = "22034", .err = error.MoreThanOneSqlJsonItem },
+            .{ .name = "no_sql_json_item", .state = "22035", .err = error.NoSqlJsonItem },
+            .{ .name = "non_numeric_sql_json_item", .state = "22036", .err = error.NonNumericSqlJsonItem },
+            .{ .name = "singleton_sql_json_item_required", .state = "22038", .err = error.SingletonSqlJsonItemRequired },
+            .{ .name = "sql_json_array_not_found", .state = "22039", .err = error.SqlJsonArrayNotFound },
+            .{ .name = "sql_json_member_not_found", .state = "2203A", .err = error.SqlJsonMemberNotFound },
+            .{ .name = "sql_json_number_not_found", .state = "2203B", .err = error.SqlJsonNumberNotFound },
+            .{ .name = "sql_json_object_not_found", .state = "2203C", .err = error.SqlJsonObjectNotFound },
+            .{ .name = "sql_json_scalar_required", .state = "2203F", .err = error.SqlJsonScalarRequired },
+            .{ .name = "sql_json_item_cannot_be_cast_to_target_type", .state = "2203G", .err = error.SqlJsonItemCannotBeCast },
+            .{ .name = "invalid_binary_representation", .state = "22P03", .err = error.InvalidBinaryRepresentation },
+            .{ .name = "bad_copy_file_format", .state = "22P04", .err = error.BadCopyFormat },
+            .{ .name = "untranslatable_character", .state = "22P05", .err = error.UntranslatableCharacter },
+            .{ .name = "active_sql_transaction", .state = "25001", .err = error.ActiveSqlTransaction },
+            .{ .name = "read_only_sql_transaction", .state = "25006", .err = error.ReadOnlyTransaction },
+            .{ .name = "no_active_sql_transaction", .state = "25P01", .err = error.NoActiveTransaction },
+            .{ .name = "invalid_sql_statement_name", .state = "26000", .err = error.StatementNotFound },
+            .{ .name = "dependent_objects_still_exist", .state = "2BP01", .err = error.DependentObjects },
+            .{ .name = "function_executed_no_return_statement", .state = "2F005", .err = error.FunctionExecutedNoReturn, .message = "control reached end of function without RETURN" },
+            .{ .name = "invalid_cursor_name", .state = "34000", .err = error.PortalNotFound },
+            .{ .name = "invalid_savepoint_specification", .state = "3B001", .err = error.SavepointNotFound },
+            .{ .name = "invalid_schema_name", .state = "3F000", .err = error.UndefinedSchema },
+            .{ .name = "serialization_failure", .state = "40001", .err = error.SerializationFailure },
+            .{ .name = "deadlock_detected", .state = "40P01", .err = error.DeadlockDetected },
+            .{ .name = "insufficient_privilege", .state = "42501", .err = error.InsufficientPrivilege },
+            .{ .name = "syntax_error", .state = "42601", .err = error.Syntax },
+            .{ .name = "invalid_name", .state = "42602", .err = error.InvalidName },
+            .{ .name = "duplicate_column", .state = "42701", .err = error.DuplicateColumn },
+            .{ .name = "ambiguous_column", .state = "42702", .err = error.AmbiguousColumn },
+            .{ .name = "undefined_object", .state = "42704", .err = error.UndefinedObject },
+            .{ .name = "undefined_object", .state = "42704", .err = error.UndefinedSetting },
+            .{ .name = "duplicate_object", .state = "42710", .err = error.DuplicateObject },
+            .{ .name = "duplicate_function", .state = "42723", .err = error.DuplicateFunction },
+            .{ .name = "ambiguous_function", .state = "42725", .err = error.AmbiguousFunction },
+            .{ .name = "grouping_error", .state = "42803", .err = error.GroupingError },
+            .{ .name = "wrong_object_type", .state = "42809", .err = error.WrongObjectType },
+            .{ .name = "invalid_foreign_key", .state = "42830", .err = error.InvalidForeignKey },
+            .{ .name = "cannot_coerce", .state = "42846", .err = error.CannotCoerce },
+            .{ .name = "generated_always", .state = "428C9", .err = error.GeneratedAlways },
+            .{ .name = "reserved_name", .state = "42939", .err = error.ReservedName },
+            .{ .name = "undefined_parameter", .state = "42P02", .err = error.UndefinedParameter },
+            .{ .name = "duplicate_cursor", .state = "42P03", .err = error.DuplicatePortal },
+            .{ .name = "duplicate_prepared_statement", .state = "42P05", .err = error.DuplicateStatement },
+            .{ .name = "duplicate_schema", .state = "42P06", .err = error.DuplicateSchema },
+            .{ .name = "duplicate_table", .state = "42P07", .err = error.TableExists },
+            .{ .name = "invalid_column_reference", .state = "42P10", .err = error.InvalidColumnReference },
+            .{ .name = "invalid_function_definition", .state = "42P13", .err = error.InvalidFunctionDefinition },
+            .{ .name = "invalid_table_definition", .state = "42P16", .err = error.InvalidTableDefinition },
+            .{ .name = "invalid_object_definition", .state = "42P17", .err = error.InvalidObjectDefinition },
+            .{ .name = "indeterminate_datatype", .state = "42P18", .err = error.IndeterminateDatatype },
+            .{ .name = "windowing_error", .state = "42P20", .err = error.WindowingError },
+            .{ .name = "collation_mismatch", .state = "42P21", .err = error.CollationMismatch },
+            .{ .name = "object_not_in_prerequisite_state", .state = "55000", .err = error.ObjectNotInPrerequisiteState },
+            .{ .name = "object_not_in_prerequisite_state", .state = "55000", .err = error.SequenceNotReady },
+            .{ .name = "object_in_use", .state = "55006", .err = error.ObjectInUse },
+            .{ .name = "lock_not_available", .state = "55P03", .err = error.LockNotAvailable },
+            .{ .name = "query_canceled", .state = "57014", .err = error.QueryCanceled },
+            .{ .name = "invalid_grant_operation", .state = "0LP01", .err = error.InvalidGrantOperation },
+            .{ .name = "stacked_diagnostics_accessed_without_active_handler", .state = "0Z002", .err = error.StackedDiagnosticsAccessedWithoutActiveHandler },
+            .{ .name = "invalid_transaction_termination", .state = "2D000", .err = error.InvalidTransactionTermination },
         };
+
+        /// What a handler sees of the error it caught (SQLSTATE, SQLERRM and
+        /// GET STACKED DIAGNOSTICS). RAISE and ASSERT fill one in the host
+        /// (routineRaise) before raising; other errors are described from
+        /// the conditions table (routineDiagnostics).
+        pub const Diagnostics = struct {
+            active: bool = false,
+            err: Error = error.RaiseException,
+            state: [5]u8 = "P0001".*,
+            message: V.Text = .{},
+            detail: V.Text = .{},
+            hint: V.Text = .{},
+            column: V.Text = .{},
+            constraint: V.Text = .{},
+            datatype: V.Text = .{},
+            table: V.Text = .{},
+            schema: V.Text = .{},
+
+            /// The error's own description (no RAISE text).
+            pub fn describe(err: Error, out: *Diagnostics) void {
+                out.* = .{ .err = err };
+                const found = errorIndex(err);
+                out.state = if (found) |index| conditions[index].state[0..5].* else "XX000".*;
+                const message = if (found) |index| (if (conditions[index].message.len != 0) conditions[index].message else @errorName(err)) else @errorName(err);
+                setText(&out.message, message);
+            }
+        };
+
+        pub fn setText(out: *V.Text, bytes: []const u8) void {
+            const length = @min(bytes.len, config.text_bytes);
+            @memcpy(out.bytes[0..length], bytes[0..length]);
+            out.len = length;
+        }
+
+        fn errorIndex(err: Error) ?usize {
+            for (conditions, 0..) |entry, index| if (entry.err == err) return index;
+            return null;
+        }
+
+        /// A condition's SQLSTATE matches the error's own, or its class when
+        /// the condition is a class (`data_exception`, SQLSTATE '22000').
+        fn stateCovers(condition: []const u8, err: Error) bool {
+            const index = errorIndex(err) orelse return false;
+            const state = conditions[index].state;
+            if (types.same(condition, state)) return true;
+            return types.same(condition[2..5], "000") and types.same(condition[0..2], state[0..2]);
+        }
 
         /// Errors an EXCEPTION handler never catches (PostgreSQL: cancel
         /// and the work budget end the statement; a lock wait restarts it).
@@ -1027,6 +1183,8 @@ pub fn Routines(comptime config: types.Config) type {
                 record: Record = .none,
                 /// The error a running handler caught (RAISE without arguments).
                 handling: ?Error = null,
+                /// Its description (GET STACKED DIAGNOSTICS, re-RAISE).
+                diag: ?*const Diagnostics = null,
 
                 /// Validates (`check`) or runs the routine body.
                 pub fn execute(self: *Self, mode: Mode) Error!void {
@@ -1126,7 +1284,7 @@ pub fn Routines(comptime config: types.Config) type {
 
                 // ---- expressions ------------------------------------------
 
-                const Stops = struct { then: bool = false, loop: bool = false, comma: bool = false, dots: bool = false, when: bool = false, into: bool = false, semicolon: bool = true };
+                const Stops = struct { then: bool = false, loop: bool = false, comma: bool = false, dots: bool = false, when: bool = false, into: bool = false, semicolon: bool = true, using: bool = false };
 
                 /// Scans one expression from the cursor; the cursor stops at
                 /// the terminating token. Returns its span.
@@ -1143,6 +1301,7 @@ pub fn Routines(comptime config: types.Config) type {
                             if (stops.loop and c.is("loop")) break;
                             if (stops.when and c.is("when")) break;
                             if (stops.into and c.is("into")) break;
+                            if (stops.using and c.is("using")) break;
                             if (stops.dots) if (dotsAt(c)) |at| {
                                 if (at == begin) return error.Syntax;
                                 c.* = try Cursor.init(c.source, at + 2);
@@ -1242,7 +1401,8 @@ pub fn Routines(comptime config: types.Config) type {
                                 } else {
                                     const condition = try c.identifier();
                                     if (types.same(condition.slice(), "others")) {
-                                        matches = matches or caught != null;
+                                        // OTHERS excludes ASSERT_FAILURE (and QUERY_CANCELED).
+                                        matches = matches or (caught != null and caught.? != error.AssertFailure);
                                     } else {
                                         if (!knownCondition(condition.slice())) return error.UndefinedObject;
                                         if (caught) |err| matches = matches or nameMatches(condition.slice(), err);
@@ -1254,10 +1414,7 @@ pub fn Routines(comptime config: types.Config) type {
                             const run_handler = mode == .run and caught != null and matches and !handled;
                             if (run_handler) {
                                 handled = true;
-                                const previous = self.handling;
-                                self.handling = caught;
-                                defer self.handling = previous;
-                                signal = try self.statementList(.run);
+                                signal = try self.handler(caught.?);
                             } else _ = try self.statementList(if (mode == .check) .check else .skip);
                         }
                         if (caught) |err| if (!handled) return err;
@@ -1280,13 +1437,37 @@ pub fn Routines(comptime config: types.Config) type {
                 }
 
                 fn stateMatches(state: []const u8, err: Error) bool {
-                    for (conditions) |entry| if (types.same(entry.state, state) and entry.err == err) return true;
-                    return false;
+                    return stateCovers(state, err);
                 }
 
                 fn nameMatches(name: []const u8, err: Error) bool {
-                    for (conditions) |entry| if (types.same(entry.name, name) and entry.err == err) return true;
+                    for (conditions) |entry| if (types.same(entry.name, name) and stateCovers(entry.state, err)) return true;
                     return false;
+                }
+
+                /// Runs a matching handler: SQLSTATE and SQLERRM are its own
+                /// variables and GET STACKED DIAGNOSTICS reads `diag`. Kept
+                /// out of block() so only a running handler holds them.
+                noinline fn handler(self: *Self, err: Error) Error!Signal {
+                    var diag: Diagnostics = undefined;
+                    self.host.routineDiagnostics(err, &diag);
+                    const previous_diag = self.diag;
+                    const previous = self.handling;
+                    self.diag = &diag;
+                    self.handling = err;
+                    const saved = self.frame.variables.count;
+                    defer {
+                        self.diag = previous_diag;
+                        self.handling = previous;
+                        self.frame.variables.count = saved;
+                    }
+                    const state = try self.frame.declare("sqlstate", .text, -1);
+                    var cell: V.Cell = .{ .text = .{} };
+                    setText(&cell.text, &diag.state);
+                    self.frame.cells[state] = cell;
+                    const message = try self.frame.declare("sqlerrm", .text, -1);
+                    self.frame.cells[message] = .{ .text = diag.message };
+                    return self.statementList(.run);
                 }
 
                 fn knownCondition(name: []const u8) bool {
@@ -1696,12 +1877,17 @@ pub fn Routines(comptime config: types.Config) type {
                     return .returned;
                 }
 
-                fn raiseStatement(self: *Self, mode: Mode) Error!Signal {
+                noinline fn raiseStatement(self: *Self, mode: Mode) Error!Signal {
                     const c = &self.cursor;
                     try c.expect("raise");
                     if (c.symbol(.semicolon)) {
                         try c.advance();
-                        if (mode == .run) return self.handling orelse error.Syntax;
+                        if (mode == .run) {
+                            // Re-raise: the caught error keeps its description.
+                            const err = self.handling orelse return error.Syntax;
+                            if (self.diag) |diag| self.host.routineRaise(diag);
+                            return err;
+                        }
                         return .normal;
                     }
                     var exception = true;
@@ -1709,7 +1895,12 @@ pub fn Routines(comptime config: types.Config) type {
                         if (c.is(level)) exception = false;
                     }
                     if (!exception or c.is("exception")) try c.advance();
+                    // Only a raised error's description is kept (no notice channel).
+                    const describe = mode == .run and exception;
+                    var diag: Diagnostics = .{ .active = true };
                     var raised: Error = error.RaiseException;
+                    var has_message = false;
+                    var condition_text: ?[]const u8 = null;
                     if (c.current.kind == .string) {
                         var buffer: [config.text_bytes]u8 = undefined;
                         const len = try c.string(&buffer);
@@ -1724,46 +1915,107 @@ pub fn Routines(comptime config: types.Config) type {
                             placeholders += 1;
                         }
                         var given: usize = 0;
+                        var spans: [config.routine_args]Span = undefined;
                         while (try c.takeSymbol(.comma)) {
-                            const span = try self.expression(.{ .comma = true });
-                            _ = try self.evaluate(span, mode, null);
+                            const span = try self.expression(.{ .comma = true, .using = true });
+                            if (given < spans.len) spans[given] = span;
                             given += 1;
                         }
                         if (given != placeholders) return error.Syntax;
+                        if (given > spans.len) return error.ColumnCapacity;
+                        has_message = true;
+                        if (describe) {
+                            try self.format(buffer[0..len], spans[0..given], &diag.message);
+                        } else for (spans[0..given]) |span| {
+                            _ = try self.evaluate(span, mode, null);
+                        }
                     } else if (try c.take("sqlstate")) {
                         var buffer: [8]u8 = undefined;
                         const len = try c.string(&buffer);
                         if (len != 5) return error.Syntax;
                         const found = stateIndex(buffer[0..5]) orelse return error.UnsupportedStatement;
                         raised = conditions[found].err;
+                        diag.state = buffer[0..5].*;
+                        setText(&diag.message, buffer[0..5]);
+                        has_message = true;
                     } else if (c.current.kind == .word and !c.is("using")) {
                         const condition = try c.identifier();
                         const found = conditionIndex(condition.slice()) orelse return error.UndefinedObject;
                         raised = conditions[found].err;
+                        condition_text = conditions[found].name;
+                        diag.state = conditions[found].state[0..5].*;
                     }
                     if (try c.take("using")) while (true) {
-                        const option = try c.identifier();
+                        const option = try c.anyIdentifier();
                         if (!try c.takeSymbol(.eq)) {
                             if (!try self.assignOperator()) return error.Syntax;
                         }
                         const span = try self.expression(.{ .comma = true });
-                        if (types.same(option.slice(), "errcode")) {
+                        const o = option.slice();
+                        if (types.same(o, "errcode")) {
                             // A literal condition name or SQLSTATE.
                             var probe = try Cursor.init(self.source[0..span.end], span.start);
                             var buffer: [64]u8 = undefined;
                             const len = probe.string(&buffer) catch return error.UnsupportedStatement;
                             const by_name = conditionIndex(buffer[0..len]);
                             const by_state: ?usize = if (len == 5) stateIndex(buffer[0..5]) else null;
-                            const found = by_name orelse by_state orelse return error.UnsupportedStatement;
+                            const found = by_name orelse by_state orelse return if (len == 5) error.UnsupportedStatement else error.UndefinedObject;
                             raised = conditions[found].err;
-                        } else if (!types.same(option.slice(), "message") and !types.same(option.slice(), "detail") and !types.same(option.slice(), "hint")) {
-                            return error.UnsupportedStatement;
-                        } else _ = try self.evaluate(span, mode, null);
+                            diag.state = if (by_name == null) buffer[0..5].* else conditions[found].state[0..5].*;
+                        } else {
+                            const field: ?*V.Text = if (types.same(o, "message")) &diag.message else if (types.same(o, "detail")) &diag.detail else if (types.same(o, "hint")) &diag.hint else if (types.same(o, "column")) &diag.column else if (types.same(o, "constraint")) &diag.constraint else if (types.same(o, "datatype")) &diag.datatype else if (types.same(o, "table")) &diag.table else if (types.same(o, "schema")) &diag.schema else null;
+                            const out = field orelse return error.UnsupportedStatement;
+                            // MESSAGE beside a format string is 42601.
+                            if (types.same(o, "message") and has_message) return error.Syntax;
+                            if (describe) {
+                                const text_column: V.Column = .{ .data_type = .text };
+                                const value = try self.evaluate(span, mode, &text_column);
+                                // A NULL option is 22004 in PostgreSQL.
+                                if (value != .text) return error.NullValueNotAllowed;
+                                out.* = value.text;
+                            } else _ = try self.evaluate(span, mode, null);
+                            if (types.same(o, "message")) has_message = true;
+                        }
                         if (!try c.takeSymbol(.comma)) break;
                     };
                     try c.expectSymbol(.semicolon);
-                    if (mode == .run and exception) return raised;
+                    if (describe) {
+                        diag.err = raised;
+                        // Without a message: the condition name, else the SQLSTATE.
+                        if (!has_message) {
+                            if (condition_text) |name| setText(&diag.message, name) else if (raised == error.RaiseException and types.same(&diag.state, "P0001")) setText(&diag.message, "raise_exception") else setText(&diag.message, &diag.state);
+                        }
+                        self.host.routineRaise(&diag);
+                        return raised;
+                    }
                     return .normal;
+                }
+
+                /// RAISE's message: each `%` takes the next argument's text
+                /// (`<NULL>` for NULL), `%%` is a literal `%`.
+                fn format(self: *Self, pattern: []const u8, spans: []const Span, out: *V.Text) Error!void {
+                    out.* = .{};
+                    var used: usize = 0;
+                    var next: usize = 0;
+                    var at: usize = 0;
+                    const text_column: V.Column = .{ .data_type = .text };
+                    while (at < pattern.len) : (at += 1) {
+                        var piece: []const u8 = pattern[at .. at + 1];
+                        var value: V.Cell = .null_value;
+                        if (pattern[at] == '%') {
+                            if (at + 1 < pattern.len and pattern[at + 1] == '%') {
+                                at += 1;
+                            } else {
+                                value = try self.evaluate(spans[next], .run, &text_column);
+                                next += 1;
+                                piece = if (value == .text) value.text.slice() else "<NULL>";
+                            }
+                        }
+                        if (piece.len > out.bytes.len - used) return error.TextCapacity;
+                        @memcpy(out.bytes[used..][0..piece.len], piece);
+                        used += piece.len;
+                    }
+                    out.len = used;
                 }
 
                 fn conditionIndex(name: []const u8) ?usize {
@@ -1823,23 +2075,58 @@ pub fn Routines(comptime config: types.Config) type {
                     if (mode != .run) return .normal;
                     const column: V.Column = .{ .data_type = .boolean };
                     const value = try self.evaluate(condition, .run, &column);
-                    // NULL or false: assert_failure (P0004 is reported as P0001 here).
-                    if (value != .boolean or !value.boolean) return error.RaiseException;
-                    return .normal;
+                    // NULL or false: assert_failure (P0004), with the message
+                    // (its text) or PostgreSQL's "assertion failed".
+                    if (value == .boolean and value.boolean) return .normal;
+                    return self.assertFailed(message);
                 }
 
+                noinline fn assertFailed(self: *Self, message: ?Span) Error {
+                    var diag: Diagnostics = .{ .active = true, .err = error.AssertFailure, .state = "P0004".* };
+                    setText(&diag.message, "assertion failed");
+                    if (message) |span| {
+                        const text_column: V.Column = .{ .data_type = .text };
+                        const text = try self.evaluate(span, .run, &text_column);
+                        if (text == .text) diag.message = text.text;
+                    }
+                    self.host.routineRaise(&diag);
+                    return error.AssertFailure;
+                }
+
+                /// GET [CURRENT] DIAGNOSTICS (ROW_COUNT) and GET STACKED
+                /// DIAGNOSTICS inside a handler (the caught error's SQLSTATE,
+                /// message, detail, hint and RAISE USING names; 0Z002 outside
+                /// a handler). PG_CONTEXT, PG_EXCEPTION_CONTEXT and
+                /// PG_ROUTINE_OID are 0A000.
                 fn diagnosticsStatement(self: *Self, mode: Mode) Error!Signal {
                     const c = &self.cursor;
                     try c.expect("get");
-                    _ = try c.take("current");
+                    const stacked = try c.take("stacked");
+                    if (!stacked) _ = try c.take("current");
                     try c.expect("diagnostics");
+                    if (stacked and mode == .run and self.diag == null) return error.StackedDiagnosticsAccessedWithoutActiveHandler;
                     while (true) {
                         const place = try self.target(mode);
                         if (!try c.takeSymbol(.eq)) {
                             if (!try self.assignOperator()) return error.Syntax;
                         }
-                        if (!try c.take("row_count")) return error.UnsupportedStatement;
-                        if (mode == .run) try self.storeCast(place, .{ .integer = @intCast(self.frame.row_count) }, .int8);
+                        const item = try c.anyIdentifier();
+                        const i = item.slice();
+                        if (!stacked) {
+                            if (!types.same(i, "row_count")) return if (types.same(i, "pg_context") or types.same(i, "pg_routine_oid")) error.UnsupportedStatement else error.Syntax;
+                            if (mode == .run) try self.storeCast(place, .{ .integer = @intCast(self.frame.row_count) }, .int8);
+                        } else {
+                            if (types.same(i, "pg_exception_context")) return error.UnsupportedStatement;
+                            const diag = self.diag;
+                            const value: ?*const V.Text = if (diag == null) null else if (types.same(i, "message_text")) &diag.?.message else if (types.same(i, "pg_exception_detail")) &diag.?.detail else if (types.same(i, "pg_exception_hint")) &diag.?.hint else if (types.same(i, "column_name")) &diag.?.column else if (types.same(i, "constraint_name")) &diag.?.constraint else if (types.same(i, "pg_datatype_name")) &diag.?.datatype else if (types.same(i, "table_name")) &diag.?.table else if (types.same(i, "schema_name")) &diag.?.schema else null;
+                            const known = types.same(i, "returned_sqlstate") or types.same(i, "message_text") or types.same(i, "pg_exception_detail") or types.same(i, "pg_exception_hint") or types.same(i, "column_name") or types.same(i, "constraint_name") or types.same(i, "pg_datatype_name") or types.same(i, "table_name") or types.same(i, "schema_name");
+                            if (!known) return error.Syntax;
+                            if (mode == .run) {
+                                var cell: V.Cell = .{ .text = .{} };
+                                if (value) |text| cell.text = text.* else setText(&cell.text, &diag.?.state);
+                                try self.storeCast(place, cell, .text);
+                            }
+                        }
                         if (!try c.takeSymbol(.comma)) break;
                     }
                     try c.expectSymbol(.semicolon);

@@ -2781,6 +2781,9 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "DuplicateFunction")) return "42723";
     if (equal(name, "InvalidFunctionDefinition")) return "42P13";
     if (equal(name, "RaiseException")) return "P0001";
+    if (equal(name, "AssertFailure")) return "P0004";
+    if (equal(name, "StackedDiagnosticsAccessedWithoutActiveHandler")) return "0Z002";
+    if (equal(name, "InvalidTransactionTermination")) return "2D000";
     if (equal(name, "NoDataFound")) return "P0002";
     if (equal(name, "TooManyRows")) return "P0003";
     if (equal(name, "FunctionExecutedNoReturn")) return "2F005";
