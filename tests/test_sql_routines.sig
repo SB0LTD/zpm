@@ -1093,7 +1093,7 @@ fn routineGrantCapacity() !void {
 }
 
 fn routineDefaultCapacity() !void {
-    const Defaults = sql.Database(.{ .tables = 1, .columns = 2, .rows_per_table = 1, .work_rows = 8, .result_rows = 1, .expr_nodes = 128, .catalog_objects = 8, .routines = 1, .routine_acl_entries = 1 });
+    const Defaults = sql.Database(.{ .tables = 1, .columns = 2, .rows_per_table = 1, .work_rows = 8, .result_rows = 1, .expr_nodes = 128, .catalog_objects = 16, .routines = 1, .routine_acl_entries = 1 });
     var limited_defaults: Defaults = .{};
     var result: Defaults.Result = .{};
     try limited_defaults.execute("CREATE ROLE default_a", &result);
@@ -1104,6 +1104,17 @@ fn routineDefaultCapacity() !void {
     try check(limited_defaults.oid_counter == before);
     try limited_defaults.execute("SELECT count(*) FROM pg_proc WHERE proname='default_overflow'", &result);
     try check(result.rows[0].cells[0].integer == 0 and limited_defaults.usage().transactions == 0);
+    try limited_defaults.execute("ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM default_b", &result);
+    try limited_defaults.execute("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO default_a WITH GRANT OPTION", &result);
+    // The same role in two scopes occupies only one materialized ACL slot.
+    try limited_defaults.execute("CREATE FUNCTION default_fits() RETURNS INT LANGUAGE SQL AS 'SELECT 1'", &result);
+    try limited_defaults.execute("SELECT proacl::text LIKE '%default_a=X*/ramsql%' FROM pg_proc WHERE proname='default_fits'", &result);
+    try check(result.rows[0].cells[0].boolean);
+    try limited_defaults.execute("DROP FUNCTION default_fits()", &result);
+    try limited_defaults.execute("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO default_b", &result);
+    const merged_before = limited_defaults.oid_counter;
+    if (limited_defaults.execute("CREATE FUNCTION merged_overflow() RETURNS INT LANGUAGE SQL AS 'SELECT 1'", &result)) |_| return error.MergedDefaultCapacityIgnored else |err| try check(err == error.ProgramLimitExceeded);
+    try check(limited_defaults.oid_counter == merged_before and limited_defaults.usage().transactions == 0);
 }
 
 fn routineReadOnly() !void {
@@ -1260,6 +1271,91 @@ fn routineDefaultPrivileges() !void {
     try sameState(&.{acl, "SELECT defaclobjtype::text,defaclacl::text FROM pg_default_acl ORDER BY defaclrole", "SELECT proname,proacl::text FROM pg_proc WHERE pronamespace=2200 ORDER BY proname"});
 }
 
+fn routineSchemaDefaults() !void {
+    reset();
+    try run("CREATE ROLE schema_reader");
+    try run("CREATE ROLE schema_leaf");
+    try run("CREATE SCHEMA other_defaults");
+    try run("CREATE SCHEMA \"Quoted Defaults\"");
+    // A schema REVOKE cannot remove the built-in global PUBLIC grant.
+    try run("ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC");
+    try expect("SELECT count(*) FROM pg_default_acl", "0");
+    try run("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO PUBLIC");
+    try run("CREATE FUNCTION redundant_schema() RETURNS INT LANGUAGE SQL AS 'SELECT 1'");
+    try expect("SELECT proacl IS NULL FROM pg_proc WHERE proname='redundant_schema'", "t");
+    try run("ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC");
+    try run("ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC");
+    try run("ALTER DEFAULT PRIVILEGES IN SCHEMA other_defaults GRANT EXECUTE ON FUNCTIONS TO schema_leaf");
+    try run("CREATE FUNCTION isolated_schema() RETURNS INT LANGUAGE SQL AS 'SELECT 2'");
+    try run("SET ROLE schema_leaf");
+    try fails("SELECT isolated_schema()", error.InsufficientPrivilege);
+    try run("RESET ROLE");
+    try run("ALTER DEFAULT PRIVILEGES IN SCHEMA public,public GRANT EXECUTE ON ROUTINES TO schema_reader WITH GRANT OPTION");
+    try expect("SELECT defaclacl::text FROM pg_default_acl WHERE defaclnamespace=2200", "{schema_reader=X*/ramsql}");
+    try run("CREATE FUNCTION schema_exec() RETURNS INT LANGUAGE SQL AS 'SELECT 3'");
+    try run("CREATE PROCEDURE schema_proc() LANGUAGE SQL AS 'SELECT 1'");
+    try expect("SELECT proacl::text FROM pg_proc WHERE proname='schema_exec'", "{ramsql=X/ramsql,schema_reader=X*/ramsql}");
+    try run("SET ROLE schema_reader");
+    try expect("SELECT schema_exec()", "3");
+    try run("CALL schema_proc()");
+    try run("GRANT EXECUTE ON FUNCTION schema_exec() TO schema_leaf");
+    try run("RESET ROLE");
+    // Merge duplicate grantees, including options, across both scopes.
+    try run("ALTER DEFAULT PRIVILEGES GRANT EXECUTE ON FUNCTIONS TO schema_reader WITH GRANT OPTION");
+    try run("ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE GRANT OPTION FOR EXECUTE ON FUNCTIONS FROM schema_reader");
+    try run("CREATE FUNCTION merged_schema() RETURNS INT LANGUAGE SQL AS 'SELECT 4'");
+    try expect("SELECT proacl::text FROM pg_proc WHERE proname='merged_schema'", "{ramsql=X/ramsql,schema_reader=X*/ramsql}");
+    try run("ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE EXECUTE ON FUNCTIONS FROM schema_reader");
+    try run("CREATE FUNCTION global_survives() RETURNS INT LANGUAGE SQL AS 'SELECT 5'");
+    try run("SET ROLE schema_reader");
+    try expect("SELECT global_survives()", "5");
+    try run("RESET ROLE");
+    try run("ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM schema_reader");
+    try run("CREATE FUNCTION future_denied() RETURNS INT LANGUAGE SQL AS 'SELECT 6'");
+    try run("SET ROLE schema_reader");
+    try fails("SELECT future_denied()", error.InsufficientPrivilege);
+    try expect("SELECT schema_exec()", "3");
+    try run("RESET ROLE");
+    const before = "SELECT count(*) FROM pg_default_acl";
+    try rejects("ALTER DEFAULT PRIVILEGES IN SCHEMA public,absent_defaults GRANT EXECUTE ON FUNCTIONS TO schema_reader", error.UndefinedSchema, before, "2");
+    try fails("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO PUBLIC WITH GRANT OPTION", error.InvalidGrantOperation);
+    try fails("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON LARGE OBJECTS TO schema_reader", error.InvalidGrantOperation);
+    try run("ALTER DEFAULT PRIVILEGES IN SCHEMA other_defaults,\"Quoted Defaults\" GRANT EXECUTE ON FUNCTIONS TO schema_reader");
+    try run("DROP SCHEMA other_defaults");
+    try expect("SELECT count(*) FROM pg_default_acl", "2");
+    try run("DROP SCHEMA \"Quoted Defaults\"");
+    try expect("SELECT count(*) FROM pg_default_acl", "1");
+    const schema_tx = try db.begin();
+    try statement(schema_tx, "CREATE SCHEMA own_schema_defaults");
+    try statement(schema_tx, "ALTER DEFAULT PRIVILEGES IN SCHEMA own_schema_defaults GRANT EXECUTE ON FUNCTIONS TO schema_reader");
+    try commit(schema_tx);
+    try run("DROP SCHEMA own_schema_defaults");
+    // A pending default cannot outlive its namespace, and a pending drop
+    // cannot accept another transaction's default template.
+    try run("CREATE SCHEMA default_race");
+    const writer = try db.begin();
+    try statement(writer, "ALTER DEFAULT PRIVILEGES IN SCHEMA default_race GRANT EXECUTE ON FUNCTIONS TO schema_reader");
+    const dropper = try db.begin();
+    try statementFails(dropper, "DROP SCHEMA default_race", error.WouldBlock);
+    db.abort(dropper);
+    db.abort(writer);
+    const deleting = try db.begin();
+    try statement(deleting, "DROP SCHEMA default_race");
+    const editor = try db.begin();
+    try statementFails(editor, "ALTER DEFAULT PRIVILEGES IN SCHEMA default_race GRANT EXECUTE ON FUNCTIONS TO schema_reader", error.WouldBlock);
+    db.abort(editor);
+    db.abort(deleting);
+    const own = try db.begin();
+    try statement(own, "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO schema_leaf");
+    try statement(own, "CREATE FUNCTION schema_rollback() RETURNS INT LANGUAGE SQL AS 'SELECT 7'");
+    db.abort(own);
+    try expect("SELECT count(*) FROM pg_proc WHERE proname='schema_rollback'", "0");
+    // OID reservations need not roll back; the next committed creation
+    // carries the allocation high-water mark to the replica.
+    try run("CREATE FUNCTION schema_after_abort() RETURNS INT LANGUAGE SQL AS 'SELECT 8'");
+    try sameState(&.{"SELECT defaclnamespace,defaclacl::text FROM pg_default_acl ORDER BY defaclnamespace", "SELECT proname,proacl::text FROM pg_proc WHERE pronamespace=2200 ORDER BY proname"});
+}
+
 fn routineDefaultWalValidation() !void {
     reset();
     try run("CREATE ROLE wal_default");
@@ -1281,15 +1377,19 @@ fn routineDefaultWalValidation() !void {
     const at = std.mem.indexOf(u8, record[0..used], &key).?;
     const before = replica.csn;
     var bad: [65536]u8 = undefined;
-    for (0..3) |variant| {
+    for (0..5) |variant| {
         @memcpy(bad[0..used], record[0..used]);
         switch (variant) {
             0 => std.mem.writeInt(u32, bad[at + 21 ..][0..4], (1 << 31) | (1 << 7), .little),
             1 => std.mem.writeInt(u32, bad[at + 9 ..][0..4], 0x0fffffff, .little),
-            else => {
+            2 => {
                 std.mem.writeInt(u32, bad[at + 5 ..][0..4], scope, .little);
                 std.mem.writeInt(u32, bad[at + 17 ..][0..4], scope, .little);
             },
+            // A nonexistent namespace and a valid namespace without the
+            // matching scoped parent both fail before publication.
+            3 => std.mem.writeInt(u32, bad[at + 13 ..][0..4], 0x0fffffff, .little),
+            else => std.mem.writeInt(u32, bad[at + 13 ..][0..4], 2200, .little),
         }
         if (replica.applyChangeRecord(bad[0..used], &scratch)) |_| return error.InvalidRoutineDefaultsAccepted else |err|
             try check(err == if (variant == 0) error.InvalidChangeRecord else error.ChangeRecordConflict);
@@ -1310,6 +1410,7 @@ pub fn main() !void {
     try routineReadOnly();
     try routineQualification();
     try routineDefaultPrivileges();
+    try routineSchemaDefaults();
     try routineDefaultCapacity();
     try routineDefaultWalValidation();
     try bodyValidationSetting();

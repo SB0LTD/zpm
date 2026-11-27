@@ -100,8 +100,8 @@ pub fn defaultAcl(kind: Kind) bool {
     return kind == .large_object_default_acl or kind == .routine_default_acl;
 }
 
-pub fn defaultAclFlags(kind: Kind) u32 {
-    return if (kind == .routine_default_acl) priv_execute | routine_default_public else large_object_privileges;
+pub fn defaultAclFlags(kind: Kind, namespace: u32) u32 {
+    return if (kind == .routine_default_acl) (if (namespace == 0) priv_execute | routine_default_public else 0) else large_object_privileges;
 }
 
 pub fn publicationMembership(kind: Kind) bool {
@@ -437,6 +437,8 @@ pub const CreateDomain = struct { name: Qualified, spec: Domain };
 pub const LargeObjectDefaults = struct {
     owners: [list_capacity]Grantee = @splat(.{}),
     count: usize = 0,
+    schemas: [list_capacity]Ident = @splat(.{}),
+    schema_count: usize = 0,
     revoke: bool = false,
     grant: Grant = .{},
 };
@@ -1117,7 +1119,6 @@ const Parser = struct {
 
     fn largeObjectDefaults(self: *Parser) Error!LargeObjectDefaults {
         var out: LargeObjectDefaults = .{};
-        var has_schema = false;
         while (true) {
             if (try self.take("for")) {
                 if (out.count != 0) return error.Syntax;
@@ -1131,11 +1132,12 @@ const Parser = struct {
                     if (!try self.takeSymbol(.comma)) break;
                 }
             } else if (try self.take("in")) {
-                if (has_schema) return error.Syntax;
+                if (out.schema_count != 0) return error.Syntax;
                 try self.expect("schema");
-                has_schema = true;
                 while (true) {
-                    _ = try self.ident();
+                    if (out.schema_count == list_capacity) return error.ProgramLimitExceeded;
+                    out.schemas[out.schema_count] = try self.ident();
+                    out.schema_count += 1;
                     if (!try self.takeSymbol(.comma)) break;
                 }
             } else break;
@@ -1143,7 +1145,7 @@ const Parser = struct {
         out.revoke = try self.take("revoke");
         if (!out.revoke) try self.expect("grant");
         out.grant = try self.grant(out.revoke, true, true);
-        if (has_schema) return if (out.grant.routine_defaults) error.UnsupportedStatement else error.InvalidGrantOperation;
+        if (out.schema_count != 0 and !out.grant.routine_defaults) return error.InvalidGrantOperation;
         return out;
     }
 
@@ -1661,8 +1663,8 @@ pub fn Objects(comptime config: types.Config) type {
                 .role, .policy, .fdw, .server, .publication, .statistics => a.oid == b.oid,
                 .publication_table, .publication_schema => a.oid == b.oid and a.target == b.target and a.grantee == b.grantee,
                 .domain, .enum_type, .composite_type => a.oid == b.oid and a.target == b.target,
-                .member, .acl, .schema_acl, .large_object_default_acl, .routine_default_acl => a.target == b.target and a.grantee == b.grantee,
-                .large_object_acl, .builtin_routine_acl => a.target == b.target and a.grantee == b.grantee and a.sub == b.sub,
+                .member, .acl, .schema_acl, .large_object_default_acl => a.target == b.target and a.grantee == b.grantee,
+                .large_object_acl, .builtin_routine_acl, .routine_default_acl => a.target == b.target and a.grantee == b.grantee and a.sub == b.sub,
                 .relation, .schema_acl_state, .schema_owner, .role_settings, .large_object => a.target == b.target,
                 .comment => a.grantee == b.grantee and a.target == b.target and a.sub == b.sub,
                 _ => false,
@@ -1741,7 +1743,8 @@ pub fn Objects(comptime config: types.Config) type {
                 const large_object = o.kind == .large_object or o.kind == .large_object_acl or
                     (o.kind == .comment and o.grantee == class_large_object);
                 if (o.owner == oid or (!large_object and (o.oid == oid or o.target == oid or o.grantee == oid)) or
-                    (o.kind == .large_object_acl and o.grantee == oid)) return other;
+                    (o.kind == .large_object_acl and o.grantee == oid) or
+                    (o.kind == .routine_default_acl and @as(u32, @bitCast(o.sub)) == oid)) return other;
                 for (o.roleList()) |role| if (role == oid) return other;
             }
             return null;
@@ -2087,7 +2090,7 @@ pub fn Objects(comptime config: types.Config) type {
                 // put their grantor OID in that key field, including in drops.
                 .large_object_acl => o.oid == 0 and o.target != 0,
                 .builtin_routine_acl => o.oid == 0 and restrictedRoutine(o.target),
-                .large_object_default_acl, .routine_default_acl => o.target != 0 and o.sub == 0 and
+                .large_object_default_acl, .routine_default_acl => o.target != 0 and (o.kind == .routine_default_acl or o.sub == 0) and
                     ((o.oid != 0) == (o.target == o.grantee)),
                 .relation, .schema_acl_state, .schema_owner, .role_settings, .large_object => o.oid == 0 and o.target != 0 and o.grantee == 0 and o.sub == 0,
                 .comment => o.oid == 0 and o.target != 0 and o.sub >= 0 and switch (o.grantee) {
@@ -2458,10 +2461,11 @@ pub fn Objects(comptime config: types.Config) type {
                     },
                     .large_object_default_acl, .routine_default_acl => {
                         if (grantee != public_role and !self.roleExists(grantee)) return error.ChangeRecordConflict;
+                        if (v.kind == .routine_default_acl and v.sub != 0 and !ctx.objectSchemaLive(@as(u32, @bitCast(v.sub)))) return error.ChangeRecordConflict;
                         if (v.oid == 0) {
                             for (&self.items) |*entry| {
                                 if (entry.live and entry.kind == v.kind and
-                                    entry.target == target and entry.oid != 0) break;
+                                    entry.target == target and entry.sub == v.sub and entry.oid != 0) break;
                             } else return error.ChangeRecordConflict;
                         }
                     },

@@ -1,5 +1,26 @@
 # SQL conformance TDD checkpoint
 
+## Per-schema routine default privileges — candidate, 27 November 2026
+
+IN SCHEMA now resolves bounded, deduplicated schema lists and stores the namespace
+in the routine-default catalog key. Global defaults replace the built-in ACL;
+schema defaults add grants/options, merging duplicate grantees before checking
+the routine ACL budget. Schema REVOKE cannot remove global privileges. Existing
+routines retain their ACLs; effective built-in defaults retain a null proacl.
+
+Schema removal deletes its default ACLs and serializes against pending template
+edits. WAL validates the namespace and the matching scoped parent before
+publication. RSBASE09 restores named schemas before their default ACLs; no format
+change or heap allocation is needed. The contracts cover functions/procedures,
+namespace isolation, rollback, capacity, grant options, schema lists, schema-drop
+races and malformed WAL. Local Debug initially passed 1,018 assertions / 299 WAL
+records and 2,512 checkpoint assertions. Additional capacity/transaction tests
+and Debug/ReleaseSafe, 4 MiB stack and native PG16/18 archive CI are pending.
+
+Routine creation in arbitrary namespaces and other default-privilege object
+classes remain open. This candidate must not be marked qualified or merged until
+the stock clients pass plain/custom archives in both directions on PG16 and PG18.
+
 ## Global routine default privileges — 27 November 2026
 
 The failing contract reproduced ALTER DEFAULT PRIVILEGES rejecting EXECUTE on
