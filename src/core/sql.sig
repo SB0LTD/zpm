@@ -3427,7 +3427,10 @@ pub fn Database(comptime config: Config) type {
             }
             try self.serializableSnapshot(slot);
             self.workspace.security_check = ast.none;
+            // View check options belong to this statement only: a later
+            // write that does not come through body() (COPY) checks none.
             self.workspace.view_check_count = 0;
+            defer self.workspace.view_check_count = 0;
             // Catalog objects (B11 wave 3); a READ ONLY transaction writes none (25006).
             if (parsed.* == .catalog_object) {
                 if (self.txs[slot].read_only) return error.ReadOnlyTransaction;
