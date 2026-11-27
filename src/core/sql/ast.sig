@@ -174,7 +174,12 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     substring_regex, substring_similar,
     // jsonb_path_query (and jsonb_path_query_tz): the items of a path as a
     // set (wave 4 text-json; json_eval.sig rows).
-    jsonb_path_query };
+    jsonb_path_query,
+    // JSON_EXISTS / JSON_VALUE / JSON_QUERY (wave 4 text-json): `a` the
+    // context item, `b` -> next PASSING values (json_table_passing), `c`
+    // a json_table_column describing the path, RETURNING type, wrapper,
+    // quotes and ON EMPTY / ON ERROR; `integer` 0 EXISTS, 1 VALUE, 2 QUERY.
+    json_query_function };
 
 
 /// mr_call variants: the range accessors applied to a multirange's span.

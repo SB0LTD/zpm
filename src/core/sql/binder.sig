@@ -2365,6 +2365,7 @@ pub fn Binder(comptime config: types.Config) type {
             }
             // Built by linkAggregateInput with typed members (B11).
             if (n.func == .aggregate_input) return;
+            if (n.func == .json_query_function) return bindJsonQueryFunction(context, scope, n);
             // Named notation and VARIADIC reach user routines only (B11
             // wave 4; built-in functions have no parameter names here).
             if (n.func == .none and n.window == none and !n.within_group and n.order == none and namedArguments(context, n)) {
@@ -2797,6 +2798,7 @@ pub fn Binder(comptime config: types.Config) type {
                     try typeRegexFunction(context, n, count);
                 },
                 .substring_regex, .substring_similar => try typeRegexFunction(context, n, count),
+                .json_query_function => unreachable, // bindJsonQueryFunction
                 .jsonb_path_query => {
                     const seen = scope.set_calls orelse return error.UnsupportedStatement;
                     seen.* +|= 1;
@@ -7722,7 +7724,7 @@ pub fn Binder(comptime config: types.Config) type {
             switch (context.node(table.a).ty) {
                 .jsonb => {},
                 .unknown, .json, .text, .varchar, .bpchar, .name => table.a = try convert(context, table.a, .jsonb, -1, .explicit),
-                else => return error.TypeMismatch,
+                else => return error.CannotCoerce,
             }
             try typeExpr(context, &inner, table.c);
             try coerce(context, table.c, .jsonpath);
@@ -7783,6 +7785,57 @@ pub fn Binder(comptime config: types.Config) type {
             p.count = count;
             p.width = count;
             return id;
+        }
+
+        /// JSON_EXISTS / JSON_VALUE / JSON_QUERY (wave 4 text-json): the
+        /// context item becomes jsonb (an untyped or string item is parsed,
+        /// json converts), the path jsonpath, PASSING values keep their
+        /// types, DEFAULT expressions convert to the result type. The
+        /// clauses follow the JSON_TABLE column rules.
+        fn bindJsonQueryFunction(context: *const Context, scope: *const Scope, n: *ast.Node) Error!void {
+            if (context.dialect != .postgres) return error.UndefinedFunction;
+            try typeExpr(context, scope, n.a);
+            switch (context.node(n.a).ty) {
+                .jsonb => {},
+                .unknown, .json, .text, .varchar, .bpchar, .name => n.a = try convert(context, n.a, .jsonb, -1, .explicit),
+                else => return error.CannotCoerce,
+            }
+            var entry = n.b;
+            while (entry != none) : (entry = context.node(entry).next) {
+                const passing = context.node(entry);
+                try typeExpr(context, scope, passing.b);
+                if (context.node(passing.b).ty == .unknown) try coerce(context, passing.b, .text);
+                passing.ty = context.node(passing.b).ty;
+            }
+            const column = context.node(n.c);
+            try typeExpr(context, scope, column.a);
+            try coerce(context, column.a, .jsonpath);
+            if (context.node(column.a).ty != .jsonpath and !value.stringType(context.node(column.a).ty)) return error.UndefinedFunction;
+            const spec = ast.JsonTableColumn.decode(column.integer);
+            const B = ast.JsonTableColumn.Behavior;
+            if (spec.kind == .exists) {
+                if (spec.on_empty != .unspecified) return error.Syntax;
+                switch (spec.on_error) {
+                    .unspecified, .error_value, .true_value, .false_value, .unknown => {},
+                    else => return error.Syntax,
+                }
+            } else {
+                for ([_]B{ spec.on_empty, spec.on_error }) |behavior| switch (behavior) {
+                    .unspecified, .null_value, .error_value, .default_value => {},
+                    .empty_array, .empty_object => if (n.integer != 2) return error.Syntax,
+                    else => return error.Syntax,
+                };
+                if (spec.wrapper != .unspecified and spec.wrapper != .without and spec.quotes == .omit) return error.Syntax;
+            }
+            const ty = column.cast_type;
+            const typmod = column.typmod;
+            for ([_]*u16{ &column.b, &column.c }) |slot| if (slot.* != none) {
+                try typeExpr(context, scope, slot.*);
+                slot.* = try convert(context, slot.*, ty, typmod, .assignment);
+            };
+            n.ty = ty;
+            n.typmod = typmod;
+            n.constant = false;
         }
 
         fn partitionAncestorsName(context: *const Context, name: ast.Ident, schema: ?ast.Ident) bool {

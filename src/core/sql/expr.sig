@@ -1635,6 +1635,7 @@ pub fn Eval(comptime config: types.Config) type {
                 .regexp_match, .regexp_replace, .regexp_split_to_array, .regexp_count, .regexp_instr, .regexp_substr, .substring_regex, .substring_similar => return regex_eval.RegexEval(config, @This()).call(ctx, n),
                 // A set-returning call reads the value exec is expanding.
                 .regexp_matches, .regexp_split_to_table, .jsonb_path_query => return if (ctx.set_value) |current| current.* else error.UnsupportedStatement,
+                .json_query_function => return json_eval.JsonEval(config, @This()).queryFunction(ctx, n),
                 .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => return range_eval.RangeEval(config, @This()).call(ctx, n),
                 .current_setting, .set_config, .pg_try_advisory_lock, .pg_try_advisory_lock_shared, .pg_try_advisory_xact_lock, .pg_try_advisory_xact_lock_shared, .pg_advisory_unlock, .pg_advisory_unlock_shared, .pg_backend_pid, .pg_is_in_recovery => return sessionFunction(ctx, n),
                 .pg_notify, .pg_advisory_lock, .pg_advisory_lock_shared, .pg_advisory_xact_lock, .pg_advisory_xact_lock_shared, .pg_advisory_unlock_all => return sessionFunction(ctx, n),

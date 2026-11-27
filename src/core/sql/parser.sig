@@ -4365,6 +4365,10 @@ pub fn Parser(comptime config: types.Config) type {
                     .text = .{ .start = name.span.start, .end = end, .len = end - name.span.start } });
             }
             if (!name.quoted and (types.keyword(raw_name, "nextval") or types.keyword(raw_name, "setval"))) self.pool.complex = true;
+            if (self.tokens.dialect == .postgres and !name.quoted) {
+                const which: ?u8 = if (types.keyword(raw_name, "json_exists")) 0 else if (types.keyword(raw_name, "json_value")) 1 else if (types.keyword(raw_name, "json_query")) 2 else null;
+                if (which) |kind| return self.jsonQueryFunction(name, kind);
+            }
             // Set-returning built-ins expand on the general engine (wave 4).
             if (!name.quoted and (types.keyword(raw_name, "regexp_matches") or types.keyword(raw_name, "regexp_split_to_table") or
                 types.keyword(raw_name, "jsonb_path_query") or types.keyword(raw_name, "jsonb_path_query_tz"))) self.pool.complex = true;
@@ -4578,6 +4582,82 @@ pub fn Parser(comptime config: types.Config) type {
                 spec.format_json = true;
             }
             if (try self.takeRaw("path")) column.a = try self.jsonPathLiteral();
+            try self.jsonColumnClauses(&column, &spec);
+            column.integer = spec.encode();
+            return self.pool.add(column);
+        }
+
+        /// [FORMAT JSON [ENCODING UTF8]] after a JSON value expression.
+        fn jsonFormat(self: *Self) Error!bool {
+            if (!try self.takeRaw("format")) return false;
+            if (!try self.takeRaw("json")) return error.Syntax;
+            if (try self.takeRaw("encoding")) {
+                if (!try self.takeRaw("utf8")) return error.Syntax;
+            }
+            return true;
+        }
+
+        /// JSON_EXISTS / JSON_VALUE / JSON_QUERY (wave 4 text-json) after
+        /// `(`: context item [FORMAT JSON], path [PASSING value AS name,
+        /// ...] [RETURNING type [FORMAT JSON]] [wrapper] [quotes]
+        /// [behavior ON EMPTY] [behavior ON ERROR].
+        fn jsonQueryFunction(self: *Self, name: ast.Ident, which: u8) Error!u16 {
+            try self.enter();
+            defer self.leave();
+            const context_item = try self.expression();
+            _ = try self.jsonFormat();
+            try self.expectSymbol(.comma);
+            const path = try self.expression();
+            var list: ArgList = .{};
+            if (try self.takeRaw("passing")) {
+                while (true) {
+                    const value_node = try self.expression();
+                    _ = try self.jsonFormat();
+                    try self.expectWord("AS");
+                    const variable = try self.label();
+                    list.push(self.pool, try self.pool.add(.{ .kind = .function, .func = .json_table_passing, .name = variable, .b = value_node }));
+                    if (!try self.takeSymbol(.comma)) break;
+                }
+            }
+            var column: ast.Node = .{ .kind = .function, .func = .json_table_column, .name = name, .a = path };
+            var spec: ast.JsonTableColumn = .{};
+            switch (which) {
+                0 => {
+                    spec.kind = .exists;
+                    column.cast_type = .boolean;
+                },
+                1 => column.cast_type = .text,
+                else => {
+                    spec.format_json = true;
+                    column.cast_type = .jsonb;
+                },
+            }
+            if (which != 0 and try self.takeRaw("returning")) {
+                const type_spec = try self.typeName();
+                column.cast_type = type_spec.ty;
+                column.typmod = type_spec.typmod;
+                _ = try self.jsonFormat();
+            }
+            if (which == 1) {
+                // JSON_VALUE has no wrapper or quotes clauses.
+                if (self.isWord("WITH") or self.rawWord("without") or self.rawWord("keep") or self.rawWord("omit")) return error.Syntax;
+            }
+            try self.jsonColumnClauses(&column, &spec);
+            try self.expectSymbol(.rparen);
+            column.integer = spec.encode();
+            const column_id = try self.pool.add(column);
+            for ([_]u16{ path, column.b, column.c }) |member| if (member != none) try self.pool.raise(column_id, member);
+            const node = try self.pool.add(.{ .kind = .function, .func = .json_query_function, .name = name, .a = context_item, .b = list.head, .c = column_id, .integer = which });
+            try self.pool.raise(node, context_item);
+            try self.pool.raise(node, column_id);
+            var item = list.head;
+            while (item != none) : (item = self.pool.nodes[item].next) try self.pool.raise(node, item);
+            return node;
+        }
+
+        /// The wrapper, quotes and ON EMPTY / ON ERROR clauses of a
+        /// JSON_TABLE column or SQL/JSON query function.
+        fn jsonColumnClauses(self: *Self, column: *ast.Node, spec: *ast.JsonTableColumn) Error!void {
             if (spec.kind == .regular) {
                 if (try self.takeRaw("without")) {
                     _ = try self.takeRaw("array");
@@ -4639,8 +4719,6 @@ pub fn Parser(comptime config: types.Config) type {
                     column.c = expression_node;
                 } else return error.Syntax;
             }
-            column.integer = spec.encode();
-            return self.pool.add(column);
         }
 
         /// `ORDER BY key [ASC|DESC] [NULLS FIRST|LAST], ...` of an aggregate
