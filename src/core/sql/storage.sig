@@ -2064,6 +2064,94 @@ pub fn Storage(comptime config: types.Config) type {
             rebuildHints(destination);
         }
 
+        /// ALTER COLUMN TYPE (ddl-alter, wave 5): copyRelayout without the
+        /// index rebuild. The caller rewrites the converted cells of each
+        /// row's kept version (setVersionCell), drops every other version
+        /// (pruneRow) and then calls finishRelayout.
+        pub fn copyRelayoutPending(destination: *Table, source: *const Table, sources: []const u8, fills: []const V.Cell) void {
+            destination.truncate_csn = source.truncate_csn;
+            destination.pending_truncate = source.pending_truncate;
+            destination.seqscan_hint.slot = 0;
+            destination.next_rowid = source.next_rowid;
+            destination.row_generation = source.row_generation;
+            destination.row_high = source.row_high;
+            destination.row_used = source.row_used;
+            destination.version_high = source.version_high;
+            destination.version_used = source.version_used;
+            destination.version_free = source.version_free;
+            @memcpy(destination.rows[0..source.row_high], source.rows[0..source.row_high]);
+            for (source.versions[0..source.version_high], destination.versions[0..source.version_high], 0..) |*from, *to, version| {
+                to.* = from.*;
+                if (from.rowLink() != 0) relayoutVersion(destination, source, version, sources, fills);
+            }
+        }
+
+        /// Overwrites one cell of a version in place (a table rewrite or
+        /// its replay; never a version another snapshot reads).
+        pub fn setVersionCell(table: *Table, version: usize, column: usize, cell: V.Cell) void {
+            mutableVersionRow(table, version)[column] = cell;
+        }
+
+        /// Keeps only version `keep` of row `slot` (null: the row goes).
+        /// The indexes are rebuilt afterwards (finishRelayout).
+        pub fn pruneRow(table: *Table, slot: u32, keep: ?u32) void {
+            const row = &table.rows[slot];
+            var ref = row.newest;
+            while (ref != 0) {
+                const version: u32 = ref - 1;
+                ref = table.versions[version].olderLink();
+                if (keep != null and keep.? == version) continue;
+                freeVersion(table, version);
+            }
+            if (keep) |version| {
+                row.newest = version + 1;
+                table.versions[version].setOlderLink(0);
+                return;
+            }
+            row.newest = 0;
+            table.row_generation +%= 1;
+            row.generation = table.row_generation;
+            table.row_used -= 1;
+        }
+
+        /// The newest version of row `row` that is committed or was created
+        /// by transaction (`slot`, `epoch`) before command `cid` (op 105).
+        pub fn versionBefore(table: *const Table, row: usize, slot: u16, epoch: u32, cid: u32) ?u32 {
+            var ref = table.rows[row].newest;
+            while (ref != 0) {
+                const version = &table.versions[ref - 1];
+                if (version.creationCsn() != 0) return ref - 1;
+                if (version.pendingCreation()) |creation| {
+                    if (creation.tx.slot == slot and creation.tx.epoch == epoch and creation.cid < cid) return ref - 1;
+                }
+                ref = version.olderLink();
+            }
+            return null;
+        }
+
+        /// Index and hint rebuild after copyRelayoutPending or redefinePending.
+        pub fn finishRelayout(table: *Table) void {
+            rebuildIndexes(table);
+            rebuildHints(table);
+        }
+
+        /// Replay of ALTER COLUMN TYPE (op 105): redefine without the index
+        /// rebuild; the rewritten rows are set next, then finishRelayout.
+        pub fn redefinePending(table: *Table, name: V.Name, columns: []const V.Column, constraints: []const Constraint, extras: *const Extras, sources: []const u8, fills: []const V.Cell) void {
+            for (table.versions[0..table.version_high], 0..) |*entry, version| {
+                if (entry.rowLink() != 0) relayoutVersion(table, table, version, sources, fills);
+            }
+            table.name = name;
+            table.column_count = columns.len;
+            @memcpy(table.columns[0..columns.len], columns);
+            table.primary_column = null;
+            for (columns, 0..) |column, index| if (column.primary_key) {
+                table.primary_column = index;
+            };
+            setConstraints(table, constraints);
+            setExtras(table, extras);
+        }
+
         /// Replay of ALTER TABLE in place (replay keeps no old snapshots):
         /// relayout every version, install the definition, rebuild indexes.
         pub fn redefine(table: *Table, name: V.Name, columns: []const V.Column, constraints: []const Constraint, extras: *const Extras, sources: []const u8, fills: []const V.Cell) void {

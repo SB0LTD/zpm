@@ -56,6 +56,13 @@
 //!                     reserved). A dropped table's triggers and rules are
 //!                     dropped by their own ops first; a dropped routine has
 //!                     no trigger left.
+//!   105 alter_table_rewrite (ddl-alter, wave 5): ALTER COLUMN TYPE. Op 12's
+//!                     layout, where a rewritten column's source is 0xfe
+//!                     followed by its old column index u8, then the
+//!                     rewritten table: row_count u32 (every live row) and
+//!                     per row rowid u64 + its complete new row (as op 4),
+//!                     each live rowid exactly once, in any order. Op 12
+//!                     records stay byte-identical; 106-114 stay reserved.
 //!   115 view_check_option (B11 wave 5): oid u32, option u8 (1 LOCAL, 2
 //!                     CASCADED). Written right after the op 1 / op 12 that
 //!                     defines a view with WITH CHECK OPTION; a definition
@@ -180,7 +187,7 @@ pub const default_identity_format_version: u16 = 6;
 /// older definitions stay byte-identical.
 pub const not_valid_format_version: u16 = 7;
 
-pub const Op = enum(u8) { create_table = 1, drop_table = 2, insert = 3, update = 4, delete = 5, catalog_counters = 6, create_sequence = 7, drop_sequence = 8, sequence = 9, truncate = 11, alter_table = 12, create_sequence_cached = 13, alter_sequence = 14, create_schema = 15, drop_schema = 16, catalog_counters_with_constraints = 17, create_owned_schema = 18, create_private_schema = 19, catalog_counters_with_defaults = 20, create_scoped_identity_sequence = 21, create_scoped_sequence = 22, alter_sequence_ownership = 23, create_scoped_serial_sequence = 24, create_routine = 60, drop_routine = 61, create_trigger = 62, drop_trigger = 63, create_rule = 64, drop_rule = 65, object_create = 70, object_drop = 71, large_object_page = 72, create_routine_extended = 80, create_rule_action = 85, view_check_option = 115, create_trigger_extended = 120,
+pub const Op = enum(u8) { create_table = 1, drop_table = 2, insert = 3, update = 4, delete = 5, catalog_counters = 6, create_sequence = 7, drop_sequence = 8, sequence = 9, truncate = 11, alter_table = 12, create_sequence_cached = 13, alter_sequence = 14, create_schema = 15, drop_schema = 16, catalog_counters_with_constraints = 17, create_owned_schema = 18, create_private_schema = 19, catalog_counters_with_defaults = 20, create_scoped_identity_sequence = 21, create_scoped_sequence = 22, alter_sequence_ownership = 23, create_scoped_serial_sequence = 24, create_routine = 60, drop_routine = 61, create_trigger = 62, drop_trigger = 63, create_rule = 64, drop_rule = 65, object_create = 70, object_drop = 71, large_object_page = 72, create_routine_extended = 80, create_rule_action = 85, alter_table_rewrite = 105, view_check_option = 115, create_trigger_extended = 120,
     // B11 wave 5 (composite lane): user casts.
     create_cast = 121, drop_cast = 122 };
 
@@ -724,6 +731,30 @@ pub fn ChangeLog(comptime config: types.Config) type {
             try encodeViewOptions(writer, table);
         }
 
+        /// ALTER COLUMN TYPE (op 105): the definition, each new column's
+        /// source (0xfe + old index for a rewritten one) and the row count;
+        /// encodeRewriteRow follows for each of the `rows` rows.
+        pub fn encodeAlterRewrite(writer: *Writer, table: *const S.Table, sources: []const u8, fills: []const V.Cell, rewritten: []const bool, rows: u32) Error!void {
+            try writer.op(.alter_table_rewrite);
+            try writer.int(u32, table.oid);
+            try encodeDefinition(writer, table);
+            for (sources, 0..) |origin, column| {
+                if (rewritten[column]) {
+                    try writer.int(u8, 0xfe);
+                    try writer.int(u8, origin);
+                    continue;
+                }
+                try writer.int(u8, origin);
+                if (origin == 0xff) try encodeValue(writer, &fills[column]);
+            }
+            try writer.int(u32, rows);
+        }
+
+        pub fn encodeRewriteRow(writer: *Writer, rowid: u64, cells: []const V.Cell) Error!void {
+            try writer.int(u64, rowid);
+            try encodeCells(writer, cells);
+        }
+
         pub fn encodeRow(writer: *Writer, tag: Op, oid: u32, rowid: u64, cells: []const V.Cell) Error!void {
             try writer.op(tag);
             try writer.int(u32, oid);
@@ -825,6 +856,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
             table: u8 = 0,
             live: bool = false,
             has_key: bool = false,
+            /// Listed by the current op 105 (each row once, ddl-alter).
+            rewritten: bool = false,
             rowid: u64 = 0,
             key_offset: u32 = 0,
         };
@@ -2037,6 +2070,56 @@ pub fn ChangeLog(comptime config: types.Config) type {
             return if (a <= b) b - a < a_len else a - b < b_len;
         }
 
+        /// Op 105's rows (ddl-alter, wave 5): exactly the table's live rows,
+        /// each once, complete and typed by the new definition, with unique
+        /// keys. A rewritten key column leaves the database's key index
+        /// stale, so the overlay then holds every row and key of the table.
+        fn validateRewriteRows(db: anytype, scratch: *Scratch, record: []const u8, reader: *Reader, index: u8, rewritten: *const [config.columns]bool, row: *V.Row) Error!void {
+            const vt = &scratch.tables[index];
+            var any = false;
+            for (rewritten[0..vt.column_count]) |flag| any = any or flag;
+            if (!any) return error.InvalidChangeRecord;
+            const count = try reader.int(u32);
+            if (count != vt.live_rows) return error.ChangeRecordConflict;
+            const rekey = if (vt.primary) |column| rewritten[column] else false;
+            for (&scratch.rows) |*entry| {
+                if (entry.epoch == scratch.epoch and entry.table == index) entry.rewritten = false;
+            }
+            if (rekey) {
+                var position: usize = 0;
+                while (position < overlay_capacity) {
+                    const entry = &scratch.keys[position];
+                    if (entry.epoch == scratch.epoch and entry.table == index) {
+                        removeKeyAt(scratch, position);
+                        continue;
+                    }
+                    position += 1;
+                }
+            }
+            for (0..count) |_| {
+                const rowid = try reader.int(u64);
+                if (!rowExists(db, scratch, index, rowid)) return error.ChangeRecordConflict;
+                const existing = findRow(scratch, index, rowid);
+                if (existing) |position| if (scratch.rows[position].rewritten) return error.InvalidChangeRecord;
+                var key_offset: u32 = 0;
+                try decodeRow(reader, vt, row, &key_offset);
+                if (vt.primary) |column| {
+                    const base = vt.base;
+                    if (rekey) vt.base = false;
+                    const taken = keyTaken(db, scratch, record, index, &row.cells[column], rowid);
+                    vt.base = base;
+                    if (try taken) return error.ChangeRecordConflict;
+                    if (!rekey) if (existing) |position| if (scratch.rows[position].has_key) {
+                        const old = try valueAt(record, scratch.rows[position].key_offset);
+                        removeKey(scratch, index, V.hash(&old), rowid);
+                    };
+                    try putKey(scratch, index, V.hash(&row.cells[column]), rowid);
+                }
+                try putRow(scratch, .{ .epoch = scratch.epoch, .table = index, .live = true, .has_key = vt.primary != null, .rowid = rowid, .key_offset = key_offset, .rewritten = true });
+            }
+            if (rekey) vt.base = false;
+        }
+
         fn validateLatePrimary(db: anytype, scratch: *Scratch, record: []const u8, index: usize, columns: []const u8, definitions: []const V.Column) Error!void {
             if (!db.replayQuiescent()) return error.ChangeRecordConflict;
             const table = &db.tables[index];
@@ -2207,7 +2290,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         scratch.tables[index].base = false;
                         purge(scratch, index);
                     },
-                    @intFromEnum(Op.alter_table) => {
+                    @intFromEnum(Op.alter_table), @intFromEnum(Op.alter_table_rewrite) => {
                         const index = try findVTable(scratch, try reader.int(u32));
                         if (S.anyIntegralBank(&db.tables)) return error.ChangeRecordConflict;
                         const vt = &scratch.tables[index];
@@ -2216,10 +2299,22 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         if (definition.namespace != vt.namespace) return error.ChangeRecordConflict;
                         try compositeColumns(scratch, &definition);
                         if (!types.same(definition.name.slice(), vt.name.slice()) and nameTaken(scratch, definition.name.slice(), vt.namespace)) return error.ChangeRecordConflict;
+                        // ALTER COLUMN TYPE (op 105, ddl-alter): 0xfe marks a
+                        // rewritten column, followed by its old position.
+                        const rewrite = tag == @intFromEnum(Op.alter_table_rewrite);
+                        var rewritten: [config.columns]bool = @splat(false);
                         var sources: [config.columns]u8 = undefined;
                         var used: [config.columns]bool = @splat(false);
                         for (definition.columns[0..definition.count], 0..) |*column, position| {
-                            const origin = try reader.int(u8);
+                            var origin = try reader.int(u8);
+                            if (rewrite and origin == 0xfe) {
+                                origin = try reader.int(u8);
+                                if (origin >= vt.column_count or used[origin]) return error.ChangeRecordConflict;
+                                used[origin] = true;
+                                sources[position] = origin;
+                                rewritten[position] = true;
+                                continue;
+                            }
                             sources[position] = origin;
                             if (origin == 0xff) {
                                 const fill = (try decodeValue(&reader)).cell;
@@ -2240,6 +2335,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                             primary = position;
                         };
                         const late = definition.keyed() and !vt.keyed;
+                        if (late and rewrite) return error.ChangeRecordConflict;
                         if (late) {
                             const base = &db.tables[index];
                             if (vt.mutated or !vt.base or definition.primary_index_oid == 0 or
@@ -2292,6 +2388,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         vt.primary = primary;
                         vt.keyed = definition.keyed();
                         vt.primary_index_oid = definition.primary_index_oid;
+                        if (rewrite) try validateRewriteRows(db, scratch, record, &reader, index, &rewritten, &row);
                     },
                     @intFromEnum(Op.view_check_option) => {
                         const index = try findVTable(scratch, try reader.int(u32));
@@ -2705,16 +2802,25 @@ pub fn ChangeLog(comptime config: types.Config) type {
                             break;
                         };
                     },
-                    @intFromEnum(Op.alter_table) => {
+                    @intFromEnum(Op.alter_table), @intFromEnum(Op.alter_table_rewrite) => {
                         const table = try tableByOid(db, try reader.int(u32));
                         var definition: Definition = .{ .oid = table.oid, .name = .{}, .columns = @splat(.{}), .count = 0 };
                         try decodeDefinition(&reader, &definition);
                         const prior = ConstraintIdentities.from(table.primary_constraint_oid, table.constraints[0..table.constraint_count]);
                         try resolveConstraintOids(&definition, &prior, &db.next_constraint_oid);
+                        const rewrite = tag == @intFromEnum(Op.alter_table_rewrite);
                         var sources: [config.columns]u8 = undefined;
+                        // A rewritten column starts NULL; op 105's rows set it.
+                        var layout: [config.columns]u8 = undefined;
                         var fills: [config.columns]V.Cell = @splat(.null_value);
                         for (0..definition.count) |position| {
                             sources[position] = try reader.int(u8);
+                            layout[position] = sources[position];
+                            if (rewrite and sources[position] == 0xfe) {
+                                sources[position] = try reader.int(u8);
+                                layout[position] = 0xff;
+                                continue;
+                            }
                             if (sources[position] == 0xff) fills[position] = (try decodeValue(&reader)).cell;
                         }
                         try resolveDefaultOids(&definition, table.columns[0..table.column_count], sources[0..definition.count], &db.next_default_oid);
@@ -2727,7 +2833,26 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         if (identity) for (definition.extras.indexes[0..definition.extras.index_count]) |*index| {
                             if (!S.keysFit(table, index)) return error.ChangeRecordConflict;
                         };
-                        S.redefine(table, definition.name, definition.columns[0..definition.count], definition.constraints[0..definition.constraint_count], &definition.extras, sources[0..definition.count], fills[0..definition.count]);
+                        if (rewrite) {
+                            S.redefinePending(table, definition.name, definition.columns[0..definition.count], definition.constraints[0..definition.constraint_count], &definition.extras, layout[0..definition.count], fills[0..definition.count]);
+                            // Replay keeps no old snapshots: each row keeps its
+                            // current version, which takes its rewritten row.
+                            for (0..table.row_high) |slot| {
+                                if (table.rows[slot].newest == 0) continue;
+                                S.pruneRow(table, @intCast(slot), S.visible(table, slot));
+                            }
+                            const rows = try reader.int(u32);
+                            for (0..rows) |_| {
+                                const rowid = try reader.int(u64);
+                                const columns = try reader.int(u8);
+                                row = .{};
+                                for (0..columns) |position| row.cells[position] = (try decodeValue(&reader)).cell;
+                                const slot = S.findRow(table, rowid) orelse return error.ChangeRecordConflict;
+                                const version = S.visible(table, slot) orelse return error.ChangeRecordConflict;
+                                for (0..columns) |position| S.setVersionCell(table, version, position, row.cells[position]);
+                            }
+                            S.finishRelayout(table);
+                        } else S.redefine(table, definition.name, definition.columns[0..definition.count], definition.constraints[0..definition.constraint_count], &definition.extras, sources[0..definition.count], fills[0..definition.count]);
                         table.primary_constraint_oid = definition.primary_constraint_oid;
                         table.primary_index_oid = definition.primary_index_oid;
                         db.oid_counter = @max(db.oid_counter, indexOidWidth(&definition.extras), explicitPrimaryHighWater(&definition));

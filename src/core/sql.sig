@@ -1015,6 +1015,9 @@ pub fn Database(comptime config: Config) type {
             foldable_defaults: bool = false,
             sources: [config.columns]u8 = @splat(0),
             fills: [config.columns]V.Cell = @splat(.null_value),
+            /// ALTER COLUMN TYPE (ddl-alter, wave 5): the columns this ALTER
+            /// rewrote; encoded as op 105 with the rewritten rows.
+            rewritten: [config.columns]bool = @splat(false),
         };
 
         /// Statement-scoped scratch inside caller-owned database storage.
@@ -11594,6 +11597,10 @@ pub fn Database(comptime config: Config) type {
             if (alter.partition_parent) |parent| try self.lockTable(slot, parent, if (alter.attach) .share_update_exclusive else .access_exclusive);
             try self.lockTable(slot, alter.table, .access_exclusive);
             if (alter.partition_default) |default| try self.lockTable(slot, default, .access_exclusive);
+            // Views using a dropped or retyped column, and foreign keys of
+            // other tables referencing a dropped column (ddl-alter, wave 5).
+            if (alter.view_check) try self.alterViewCheck(slot, alter, snap);
+            if (alter.drop_cascade) try self.dropReferencingKeys(slot, alter, snap);
             const tx = &self.txs[slot];
             try self.reserveWrites(slot, 3 + 2 * config.columns);
             var destination: ?usize = null;
@@ -11638,7 +11645,18 @@ pub fn Database(comptime config: Config) type {
             if (S.keyed(copy)) copy.primary_index_oid = source.primary_index_oid;
             try self.assignConstraintOids(copy, source);
             try C.assignDefaultOids(copy.columns[0..copy.column_count], source.columns[0..source.column_count], alter.sources[0..alter.count], &self.next_default_oid);
-            S.copyRelayout(copy, source, alter.sources[0..alter.count], fills[0..alter.count]);
+            // ALTER COLUMN TYPE rewrites the table (ddl-alter, wave 5).
+            var rewritten: [config.columns]bool = @splat(false);
+            var rewriting = false;
+            for (alter.rewrites[0..alter.count], 0..) |id, column| if (id != ast.none) {
+                rewritten[column] = true;
+                rewriting = true;
+            };
+            if (rewriting) {
+                S.copyRelayoutPending(copy, source, alter.sources[0..alter.count], fills[0..alter.count]);
+                try self.rewriteRows(slot, copy, source, alter, snap);
+                S.finishRelayout(copy);
+            } else S.copyRelayout(copy, source, alter.sources[0..alter.count], fills[0..alter.count]);
             copy.live = true;
             copy.pending_create = true;
             source.pending_drop = true;
@@ -11647,6 +11665,7 @@ pub fn Database(comptime config: Config) type {
                 .foldable_defaults = alter.identity != null or alter.sets_defaults,
                 .sources = alter.sources,
                 .fills = fills,
+                .rewritten = rewritten,
             };
             tx.push(.{ .kind = .alter_table, .table = @intCast(index), .old = @intCast(alter.table), .new = snap.cid }) catch unreachable;
             var changes: [K.max_changes]K.Change = undefined;
@@ -11673,6 +11692,35 @@ pub fn Database(comptime config: Config) type {
             try self.remapColumnComments(slot, source.oid, alter.sources[0..alter.count], snap);
             try self.remapColumnAcls(slot, source.oid, alter.sources[0..alter.count], snap);
             try self.remapStatistics(slot, source.oid, alter.sources[0..alter.count], snap);
+            if (rewriting) {
+                // A rewritten single-column primary key stays unique (23505).
+                if (copy.primary_column) |column| if (rewritten[column]) {
+                    var row_scratch: S.VersionRowScratch = undefined;
+                    for (0..copy.row_high) |row| {
+                        if (copy.rows[row].newest == 0) continue;
+                        const version = S.visibleAt(copy, row, validation_snap) orelse continue;
+                        try self.session.checkpoint();
+                        const cells = S.borrowVersionRow(copy, version, &row_scratch);
+                        switch (S.primaryKeyCheck(copy, &cells[column], @intCast(row), validation_snap)) {
+                            .free, .wait => {},
+                            .taken => return error.PrimaryKeyViolation,
+                        }
+                    }
+                };
+                // Foreign keys of other tables over a rewritten key (23503).
+                try self.rewrittenReferences(alter.table, index, &rewritten, validation_snap);
+                // An identity column's sequence takes its new type.
+                for (copy.columns[0..copy.column_count], 0..) |*column, position| {
+                    if (!rewritten[position]) continue;
+                    switch (column.default_kind) {
+                        .identity_always, .identity_by_default => {},
+                        else => continue,
+                    }
+                    const type_oid = types.typeOid(column.data_type);
+                    const sequence_index = self.ownedSequence(copy.oid, @intCast(position), snap) orelse continue;
+                    if (self.seqs[sequence_index].spec.type_oid != type_oid) try self.alterSequence(slot, sequence_index, .{ .type_oid = type_oid }, null, snap);
+                }
+            }
             if (alter.identity) |identity| try self.createSequence(slot, copy.namespace, identity.name, identity.spec, copy.oid, identity.column, false, snap);
             // DROP IDENTITY / RESTART: the column's own sequence (ddl-dml).
             if (alter.restart_identity) |column| {
@@ -11682,6 +11730,169 @@ pub fn Database(comptime config: Config) type {
             if (alter.drop_identity) |column| {
                 const position = self.ownedSequence(copy.oid, column, snap) orelse return error.UndefinedObject;
                 try self.dropSequence(slot, position, snap);
+            }
+        }
+
+        /// ALTER COLUMN TYPE (ddl-alter, wave 5), as PostgreSQL's table
+        /// rewrite: each row's version visible to the latest snapshot (and
+        /// this transaction's own writes) is converted in the copy and every
+        /// other version is dropped. A transaction snapshot that sees a row
+        /// differently cannot keep reading it consistently (40001).
+        fn rewriteRows(self: *Self, slot: u16, copy: *S.Table, source: *const S.Table, alter: *const B.AlterTable, snap: Snapshot) Error!void {
+            var latest = snap;
+            latest.csn = self.csn;
+            const isolation_snapshot = transactionSnapshot(self.txs[slot].isolation);
+            const ctx = self.evalContext(alter.rewrite_source);
+            var row_scratch: S.VersionRowScratch = undefined;
+            for (0..copy.row_high) |row| {
+                if (copy.rows[row].newest == 0) continue;
+                try self.session.checkpoint();
+                const kept = S.visibleAt(source, row, latest);
+                if (isolation_snapshot and S.visibleAt(source, row, snap) != kept) return error.SerializationFailure;
+                if (kept) |version| {
+                    const old_cells = S.borrowVersionRow(source, version, &row_scratch);
+                    for (alter.rewrites[0..alter.count], 0..) |id, column| {
+                        if (id == ast.none) continue;
+                        var sub = ctx;
+                        const span = alter.rewrite_spans[column];
+                        if (span.len != 0) sub.source = span.slice(alter.rewrite_source);
+                        sub.row = old_cells;
+                        const value = try E.eval(&sub, id);
+                        S.setVersionCell(copy, version, column, try D.store(&copy.columns[column], value, &self.session));
+                    }
+                }
+                S.pruneRow(copy, @intCast(row), kept);
+            }
+        }
+
+        /// Views reading `alter.table` that use a column this ALTER drops
+        /// or retypes (ddl-alter, wave 5): a retyped one is 0A000 ("cannot
+        /// alter type of a column used by a view or rule"); a dropped one
+        /// is 2BP01, or with CASCADE the view (and its dependents) is
+        /// dropped. Usage is the view query's bound column references.
+        fn alterViewCheck(self: *Self, slot: u16, alter: *const B.AlterTable, snap: Snapshot) Error!void {
+            const source = &self.tables[alter.table];
+            var kept: [config.columns]bool = @splat(false);
+            var retyped: [config.columns]bool = @splat(false);
+            for (alter.sources[0..alter.count], 0..) |origin, column| {
+                if (origin == 0xff) continue;
+                kept[origin] = true;
+                if (alter.rewrites[column] != ast.none) retyped[origin] = true;
+            }
+            var relations: [K.relation_rows]K.Found = undefined;
+            const count = self.catalog.visibleRelations(snap, &relations);
+            for (relations[0..count]) |found| {
+                if (found.kind == 'S' or found.slot == alter.table) continue;
+                const view = &self.tables[found.slot];
+                if (view.pending_drop or (view.relkind != 'v' and view.relkind != 'm')) continue;
+                var depends = false;
+                for (view.depends[0..view.depend_count]) |oid| depends = depends or oid == source.oid;
+                if (!depends) continue;
+                var columns_used: B.ColumnUsage = .{ .table = alter.table };
+                try self.viewColumnUsage(slot, found.slot, &columns_used, snap);
+                var dropped = false;
+                for (0..source.column_count) |column| {
+                    if (!columns_used.used[column]) continue;
+                    if (retyped[column]) return error.UnsupportedStatement;
+                    if (!kept[column]) dropped = true;
+                }
+                if (!dropped) continue;
+                if (!alter.drop_cascade) return error.DependentObjects;
+                _ = try self.dropTable(slot, found.slot, true, snap);
+            }
+        }
+
+        /// Binds view `view`'s stored query as a nested statement, recording
+        /// which columns of `usage.table` it references.
+        fn viewColumnUsage(self: *Self, slot: u16, view: usize, columns_used: *B.ColumnUsage, snap: Snapshot) Error!void {
+            const mark = try self.nestedEnter(slot);
+            defer self.nestedLeave(slot, mark);
+            const text = self.tables[view].query.slice();
+            var parsed = try P.parse(text, &self.workspace.nodes, .standard);
+            switch (parsed) {
+                .select, .query => {},
+                else => return error.UnsupportedStatement,
+            }
+            const expanded = try expandRelations(self, &self.workspace, text, snap, &parsed, CO.bootstrap_role, &self.session);
+            if (parsed == .select) {
+                const top = parsed.select;
+                parsed = .{ .query = top };
+                self.workspace.nodes.complex = true;
+            }
+            var context = self.bindContext(expanded, .standard, snap);
+            context.stored_source_start = text.len;
+            context.column_usage = columns_used;
+            var bound: B.Bound = undefined;
+            try B.bindInto(&context, &parsed, &bound);
+        }
+
+        /// DROP COLUMN ... CASCADE: foreign keys of other tables that
+        /// reference a dropped column are dropped from those tables.
+        fn dropReferencingKeys(self: *Self, slot: u16, alter: *const B.AlterTable, snap: Snapshot) Error!void {
+            const source = &self.tables[alter.table];
+            var kept: [config.columns]bool = @splat(false);
+            for (alter.sources[0..alter.count]) |origin| if (origin != 0xff) {
+                kept[origin] = true;
+            };
+            var relations: [K.relation_rows]K.Found = undefined;
+            const count = self.catalog.visibleRelations(snap, &relations);
+            for (relations[0..count]) |found| {
+                if (found.kind == 'S' or found.slot == alter.table) continue;
+                const other = &self.tables[found.slot];
+                if (other.pending_drop) continue;
+                var affected = false;
+                for (other.constraints[0..other.constraint_count]) |*constraint| {
+                    if (constraint.kind != .foreign or constraint.ref_oid != source.oid) continue;
+                    for (constraint.refColumns()) |column| affected = affected or !kept[column];
+                }
+                if (!affected) continue;
+                const context = self.bindContext("", .standard, snap);
+                var change = B.identityAlter(&context, found.slot);
+                var at: usize = 0;
+                for (change.constraints[0..change.constraint_count]) |constraint| {
+                    if (constraint.kind == .foreign and constraint.ref_oid == source.oid) {
+                        var dropped = false;
+                        for (constraint.refColumns()) |column| dropped = dropped or !kept[column];
+                        if (dropped) continue;
+                    }
+                    change.constraints[at] = constraint;
+                    at += 1;
+                }
+                change.constraint_count = at;
+                try self.alterTable(slot, &change, snap);
+            }
+        }
+
+        /// After a rewrite of table `index`: every row of another table
+        /// whose foreign key references a rewritten column must still find
+        /// its key (23503), as PostgreSQL re-validates those constraints.
+        fn rewrittenReferences(self: *Self, old_index: usize, index: usize, rewritten: *const [config.columns]bool, snap: Snapshot) Error!void {
+            const table = &self.tables[index];
+            var relations: [K.relation_rows]K.Found = undefined;
+            const count = self.catalog.visibleRelations(snap, &relations);
+            var row_scratch: S.VersionRowScratch = undefined;
+            for (relations[0..count]) |found| {
+                if (found.kind == 'S') continue;
+                // The statement still sees the old slot: its rows are the copy's.
+                const other_index = if (found.slot == old_index) index else found.slot;
+                const other = &self.tables[other_index];
+                for (other.constraints[0..other.constraint_count]) |*constraint| {
+                    if (constraint.kind != .foreign or constraint.ref_oid != table.oid or constraint.not_enforced) continue;
+                    var touched = false;
+                    for (constraint.refColumns()) |column| touched = touched or rewritten[column];
+                    if (!touched) continue;
+                    for (0..other.row_high) |row| {
+                        if (other.rows[row].newest == 0) continue;
+                        const version = S.visibleAt(other, row, snap) orelse continue;
+                        try self.session.checkpoint();
+                        const cells = S.borrowVersionRow(other, version, &row_scratch);
+                        var has_null = false;
+                        for (constraint.keyColumns()) |column| has_null = has_null or cells[column] == .null_value;
+                        if (has_null) continue;
+                        // The exclusive lock leaves no writer on the rewritten table.
+                        if (liveKey(table, constraint.refColumns(), cells, constraint.keyColumns(), snap) == .missing) return error.ForeignKeyViolation;
+                    }
+                }
             }
         }
 
@@ -13672,6 +13883,32 @@ pub fn Database(comptime config: Config) type {
             return source;
         }
 
+        /// ALTER COLUMN TYPE (op 105): the copy's rows as the ALTER left
+        /// them. Each row kept one version then (committed, or this
+        /// transaction's from an earlier command); later commands of the
+        /// transaction only add newer versions, encoded by their own entries.
+        fn encodeRewrite(self: *const Self, writer: *change_log.Writer, slot: u16, index: usize, cid: u32) Error!void {
+            const table = &self.tables[index];
+            const alter = &self.alters[index];
+            const epoch = self.txs[slot].epoch;
+            var rows: u32 = 0;
+            for (0..table.row_high) |row| {
+                if (rewriteVersion(table, row, slot, epoch, cid) != null) rows += 1;
+            }
+            try C.encodeAlterRewrite(writer, table, alter.sources[0..table.column_count], alter.fills[0..table.column_count], alter.rewritten[0..table.column_count], rows);
+            var row_scratch: S.VersionRowScratch = undefined;
+            for (0..table.row_high) |row| {
+                const version = rewriteVersion(table, row, slot, epoch, cid) orelse continue;
+                try C.encodeRewriteRow(writer, table.rows[row].rowid, S.versionValues(table, version, &row_scratch));
+            }
+        }
+
+        /// The version of row `row` a rewrite at command `cid` of the
+        /// transaction in `slot` kept, if any.
+        fn rewriteVersion(table: *const S.Table, row: usize, slot: u16, epoch: u32, cid: u32) ?u32 {
+            return S.versionBefore(table, row, slot, epoch, cid);
+        }
+
         /// Encode writes and their dependencies; rolled-back slices were truncated.
         fn encodeWrites(self: *const Self, writer: *change_log.Writer, slot: u16) Error!void {
             const tx = &self.txs[slot];
@@ -13708,6 +13945,12 @@ pub fn Database(comptime config: Config) type {
                         // The fresh CREATE carries these defaults if a later
                         // primary key was folded into the definition.
                         if (alter.foldable_defaults and self.createForWal(entry.table, tx.writes[0..tx.write_len]) != table) continue;
+                        var rewrite = false;
+                        for (alter.rewritten[0..table.column_count]) |flag| rewrite = rewrite or flag;
+                        if (rewrite) {
+                            try self.encodeRewrite(writer, slot, entry.table, entry.new);
+                            continue;
+                        }
                         try C.encodeAlter(writer, table, alter.sources[0..table.column_count], alter.fills[0..table.column_count]);
                     },
                     .catalog_insert, .catalog_delete => {},

@@ -1182,7 +1182,7 @@ pub fn Ast(comptime config: types.Config) type {
         /// COLUMN follow it as add_constraint actions.
         pub const AlterAction = union(enum) {
             add_column: struct { column: ColumnDef, if_not_exists: bool = false },
-            drop_column: struct { name: Ident, if_exists: bool = false },
+            drop_column: struct { name: Ident, if_exists: bool = false, cascade: bool = false },
             rename_column: struct { from: Ident, to: Ident },
             set_default: struct { column: Ident, expression: Span },
             drop_default: Ident,
@@ -1211,7 +1211,20 @@ pub fn Ast(comptime config: types.Config) type {
             restart_identity: struct { column: Ident, value: ?i64 = null },
             /// ALTER CONSTRAINT name [NOT] ENFORCED.
             alter_enforced: struct { name: Ident, enforced: bool },
+            /// ALTER [COLUMN] c [SET DATA] TYPE t [COLLATE n] [USING expr]
+            /// (ddl-alter, wave 5). `collation` is a collation.lookup value
+            /// (0: no clause); `using` is the expression's source span.
+            alter_type: struct { column: Ident, type_name: TypeName, typmod: i32 = -1, collation: u8 = 0, using: Span = .{} },
+            /// ALTER [COLUMN] c SET STATISTICS n / SET STORAGE s / SET
+            /// COMPRESSION m (ddl-alter): checked, nothing is stored.
+            column_option: struct { column: Ident, option: ColumnOption, value: i64 = 0 },
+            /// ALTER CONSTRAINT name [[NOT] DEFERRABLE] [INITIALLY
+            /// {DEFERRED | IMMEDIATE}] (ddl-alter): 0 unset, 1 no, 2 yes.
+            alter_deferrable: struct { name: Ident, deferrable: u8 = 0, deferred: u8 = 0 },
         };
+
+        /// SET STORAGE / SET COMPRESSION / SET STATISTICS (ddl-alter).
+        pub const ColumnOption = enum(u8) { statistics, storage_plain, storage_external, storage_extended, storage_main, storage_default, compression_pglz, compression_lz4, compression_default };
 
         /// ALTER TABLE [IF EXISTS] [ONLY] name action [, ...] | RENAME ...
         pub const AlterTable = struct {

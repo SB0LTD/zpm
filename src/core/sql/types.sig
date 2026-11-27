@@ -614,6 +614,9 @@ pub const Error = error{
     /// (an XPath namespace with an empty name cannot be registered; B11
     /// wave 5 xml).
     InternalError,
+    /// SQLSTATE 42611: an invalid column definition, such as USING on a
+    /// generated column's ALTER COLUMN TYPE (ddl-alter, wave 5).
+    InvalidColumnDefinition,
 };
 
 /// Caller-owned execution accounting and interrupt polling. This is independent

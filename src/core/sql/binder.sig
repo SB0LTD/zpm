@@ -334,6 +334,17 @@ pub fn Binder(comptime config: types.Config) type {
             drop_identity: ?u8 = null,
             restart_identity: ?u8 = null,
             restart_value: ?i64 = null,
+            /// ALTER COLUMN TYPE (ddl-alter, wave 5): per new column, the
+            /// bound expression over the old row that rewrites it (none:
+            /// kept). `rewrite_source` is the text they were bound against.
+            rewrites: [config.columns]u16 = @splat(none),
+            rewrite_spans: [config.columns]ast.Span = @splat(.{}),
+            rewrite_source: []const u8 = "",
+            /// DROP COLUMN ... CASCADE: dependent views are dropped (ddl-alter).
+            drop_cascade: bool = false,
+            /// Views reading the table are checked column by column by the
+            /// engine (dropped or retyped columns they use).
+            view_check: bool = false,
         };
 
         /// CREATE SCHEMA name [AUTHORIZATION role] (ddl-dml, wave 4).
@@ -352,7 +363,13 @@ pub fn Binder(comptime config: types.Config) type {
             check: *const fn (*const anyopaque, u32, u32, storage.Snapshot, bool) Error!void,
         };
 
+        /// Columns of base table slot `table` a bound query references
+        /// (view dependencies of DROP COLUMN / ALTER COLUMN TYPE, ddl-alter).
+        pub const ColumnUsage = struct { table: usize, used: [config.columns]bool = @splat(false) };
+
         pub const Context = struct {
+            /// Records column references of one base table (ddl-alter).
+            column_usage: ?*ColumnUsage = null,
             source: []const u8,
             tables: *const [config.tables]S.Table,
             catalog: *const K,
@@ -5002,6 +5019,30 @@ pub fn Binder(comptime config: types.Config) type {
             return data_type == .smallint or data_type == .integer32 or data_type == .integer;
         }
 
+        /// SET STATISTICS / STORAGE / COMPRESSION (ddl-alter): PostgreSQL's
+        /// checks; nothing is stored.
+        fn checkColumnOption(context: *const Context, columns: []const V.Column, option: anytype) Error!void {
+            const wanted = toName(context, option.column);
+            for (columns) |*column| {
+                if (!types.same(column.name.slice(), wanted.slice())) continue;
+                switch (option.option) {
+                    // "statistics target -2 is too low" (22023); above
+                    // 10000 PostgreSQL lowers it with a warning.
+                    .statistics => if (option.value < -1) return error.InvalidParameterValue,
+                    // Fixed-length types "can only have storage PLAIN" (42804).
+                    .storage_external, .storage_extended, .storage_main => if (!varlenaColumn(column.data_type)) return error.TypeMismatch,
+                    .storage_plain, .storage_default, .compression_pglz, .compression_lz4, .compression_default => {},
+                }
+                return;
+            }
+            return error.ColumnNotFound;
+        }
+
+        /// A variable-length (typlen -1) type: storage other than PLAIN.
+        fn varlenaColumn(data_type: types.DataType) bool {
+            return types.typeInfo(data_type).len < 0;
+        }
+
         fn identityName(table: V.Name, column: V.Name) Error!V.Name {
             const parts = [_][]const u8{ table.slice(), "_", column.slice(), "_seq" };
             var out: V.Name = .{};
@@ -7841,6 +7882,9 @@ pub fn Binder(comptime config: types.Config) type {
 
         fn bindColumn(context: *const Context, scope: *const Scope, n: *ast.Node, owner: *const Scope, level: u8, relation: usize, column: usize) void {
             const rel = &owner.rels[relation];
+            if (context.column_usage) |usage| if (rel.table) |table| {
+                if (table == usage.table and column < config.columns) usage.used[column] = true;
+            };
             n.relation = @intCast(relation);
             n.column = @intCast(column);
             n.level = level;
@@ -11898,6 +11942,201 @@ pub fn Binder(comptime config: types.Config) type {
             }
         }
 
+        /// ALTER COLUMN TYPE (ddl-alter, wave 5), PostgreSQL's
+        /// ATPrepAlterColumnType: the new column definition and the
+        /// expression that converts each old row's value (USING, or the
+        /// column itself) with an assignment cast (42804 when none exists).
+        /// Constraints, indexes and the default over the column are checked
+        /// again over the rewritten rows; views using it are 0A000 (engine).
+        fn bindAlterType(context: *const Context, entry: *const S.Table, index: usize, out: *AlterTable, change: anytype) Error!void {
+            if (context.dialect != .postgres) return error.UnsupportedStatement;
+            const position = alterColumn(out, toName(context, change.column).slice()) orelse return error.ColumnNotFound;
+            const origin = out.sources[position];
+            // A column added by this statement has no rows to convert.
+            if (origin == 0xff) return error.UnsupportedStatement;
+            // "cannot alter type of column twice" (0A000).
+            if (out.rewrites[position] != none) return error.UnsupportedStatement;
+            // Inheritance members recurse in PostgreSQL (outside the subset).
+            if (entry.parent != 0 or hasChildren(context, entry.oid)) return error.UnsupportedStatement;
+            const column = &out.columns[position];
+            if (column.data_type == .mysql_bigint_unsigned) return error.UnsupportedStatement;
+            // "cannot specify USING when altering type of generated column" (42611).
+            if (column.default_kind == .generated and change.using.len != 0) return error.InvalidColumnDefinition;
+            // "cannot alter type of a column used by a generated column" (0A000).
+            for (out.columns[0..out.count], 0..) |*other, at| {
+                if (at == position or other.default_kind != .generated) continue;
+                const seen = try textColumns(context, other.expression.slice(), out.columns[0..out.count]);
+                if (seen[position]) return error.UnsupportedStatement;
+            }
+            var definition: Ast.ColumnDef = .{ .type_name = change.type_name, .typmod = change.typmod };
+            if (change.type_name == .int4) definition.type_name = .int4;
+            var target = column.*;
+            target.data_type = columnType(context, &definition);
+            target.typmod = change.typmod;
+            if (target.data_type == .mysql_bigint_unsigned) return error.UnsupportedStatement;
+            // An identity column stays an integer (22023).
+            switch (column.default_kind) {
+                .identity_always, .identity_by_default => if (!integerColumn(target.data_type)) return error.InvalidParameterValue,
+                else => {},
+            }
+            // The conversion, bound over the old row.
+            var sub = context.*;
+            var span: ast.Span = .{};
+            const id = if (change.using.len != 0) blk: {
+                span = change.using;
+                sub.source = change.using.slice(context.source);
+                const parsed = try P.parseExpression(sub.source, context.pool);
+                // "cannot use subquery in transform expression" (0A000).
+                try generatedSubqueries(&sub, parsed);
+                const scope = tableScope(&sub, index);
+                // Aggregates (42803) and window functions (42P20) fail here.
+                try typeExpr(&sub, &scope, parsed);
+                break :blk parsed;
+            } else blk: {
+                const scope = tableScope(&sub, index);
+                break :blk try columnNode(&sub, &scope, 0, origin);
+            };
+            const converted = try assignment(&sub, id, &target);
+            out.rewrites[position] = converted;
+            out.rewrite_spans[position] = span;
+            // The default must still be assignable (42804).
+            if (target.default_kind == .default) _ = try bindExpressionText(context, &target, null, -1);
+            column.* = target;
+            out.check_not_null[position] = target.not_null;
+            // Constraints over the column are checked again.
+            for (out.constraints[0..out.constraint_count], 0..) |*constraint, at| {
+                var uses = false;
+                if (constraint.kind == .check) {
+                    const seen = try textColumns(context, constraint.expression.slice(), out.columns[0..out.count]);
+                    uses = seen[position];
+                } else for (constraint.keyColumns()) |key| {
+                    uses = uses or key == position;
+                }
+                if (constraint.kind == .foreign) for (constraint.keyColumns(), constraint.refColumns()) |key, referenced| {
+                    if (key != position) continue;
+                    // "foreign key constraint cannot be implemented" (42804).
+                    const parent_index = if (constraint.ref_oid == entry.oid) index else (visibleOid(context, constraint.ref_oid) orelse continue);
+                    const parent_column = if (constraint.ref_oid == entry.oid) out.columns[referenced] else context.tables[parent_index].columns[referenced];
+                    if (V.cellTag(parent_column.data_type) != V.cellTag(target.data_type)) return error.TypeMismatch;
+                };
+                if (uses and !constraint.not_enforced and !constraint.not_valid) out.check_constraint[at] = true;
+            }
+            // Other tables' foreign keys referencing the column (42804).
+            var slots: [K.relation_rows]usize = undefined;
+            const count = visibleTables(context, &slots);
+            for (slots[0..count]) |slot| {
+                const other = &context.tables[slot];
+                if (other.oid == entry.oid) continue;
+                for (other.constraints[0..other.constraint_count]) |*constraint| {
+                    if (constraint.kind != .foreign or constraint.ref_oid != entry.oid) continue;
+                    for (constraint.keyColumns(), constraint.refColumns()) |key, referenced| {
+                        if (referenced == origin and V.cellTag(other.columns[key].data_type) != V.cellTag(target.data_type)) return error.TypeMismatch;
+                    }
+                }
+            }
+        }
+
+        /// The visible table slot with OID `oid`.
+        fn visibleOid(context: *const Context, oid: u32) ?usize {
+            var slots: [K.relation_rows]usize = undefined;
+            const count = visibleTables(context, &slots);
+            for (slots[0..count]) |slot| if (context.tables[slot].oid == oid) return slot;
+            return null;
+        }
+
+        /// DROP COLUMN of new column `first` (ddl-alter, wave 5: generated
+        /// columns over it are dropped first under CASCADE, 2BP01 otherwise).
+        fn dropAlterColumn(context: *const Context, entry: *const S.Table, out: *AlterTable, first: usize, cascade: bool) Error!void {
+            var position = first;
+            const dropped = out.columns[position].name;
+            while (true) {
+                var dependent: ?usize = null;
+                for (out.columns[0..out.count], 0..) |*column, other| {
+                    if (other == position or column.default_kind != .generated) continue;
+                    const seen = try textColumns(context, column.expression.slice(), out.columns[0..out.count]);
+                    if (seen[position]) {
+                        dependent = other;
+                        break;
+                    }
+                }
+                const other = dependent orelse break;
+                if (!cascade) return error.DependentObjects;
+                try dropAlterColumn(context, entry, out, other, cascade);
+                position = alterColumn(out, dropped.slice()) orelse return error.ColumnNotFound;
+            }
+            // A table keeps at least one column; identity columns
+            // keep their positions (their sequences record them).
+            if (out.count == 1) return error.UnsupportedStatement;
+            for (out.columns[position..out.count]) |*column| switch (column.default_kind) {
+                .identity_always, .identity_by_default => return error.UnsupportedStatement,
+                else => {},
+            };
+            for (out.columns[0..out.count], 0..) |*column, other| {
+                if (other == position or column.default_kind != .generated) continue;
+                const seen = try textColumns(context, column.expression.slice(), out.columns[0..out.count]);
+                if (seen[position]) return error.DependentObjects;
+            }
+            // Other tables' foreign keys referencing it: 2BP01 (CASCADE:
+            // the engine drops those constraints, ddl-alter).
+            if (!cascade and out.sources[position] != 0xff and referencedColumn(context, entry, out.sources[position])) return error.DependentObjects;
+            // Indexes over the column go with it (PostgreSQL drops them).
+            var kept: usize = 0;
+            for (out.extras.indexes[0..out.extras.index_count]) |*candidate| {
+                var uses = false;
+                for (candidate.keyColumns()) |key| uses = uses or key == position;
+                for (candidate.includes[0..candidate.include_count]) |key| uses = uses or key == position;
+                for ([_][]const u8{ candidate.expressions.slice(), candidate.predicate.slice() }) |text| {
+                    var parts = std_split(text);
+                    while (parts.next()) |part| {
+                        const seen = try textColumns(context, part, out.columns[0..out.count]);
+                        uses = uses or seen[position];
+                    }
+                }
+                if (uses) continue;
+                var copy = candidate.*;
+                for (copy.keys[0..copy.key_count]) |*key| if (key.* != S.expression_key and key.* > position) {
+                    key.* -= 1;
+                };
+                for (copy.includes[0..copy.include_count]) |*key| if (key.* > position) {
+                    key.* -= 1;
+                };
+                out.extras.indexes[kept] = copy;
+                kept += 1;
+            }
+            out.extras.index_count = kept;
+            // Constraints over the column go with it.
+            var at: usize = 0;
+            while (at < out.constraint_count) {
+                const constraint = &out.constraints[at];
+                var uses = false;
+                if (constraint.kind == .check) {
+                    const seen = try textColumns(context, constraint.expression.slice(), out.columns[0..out.count]);
+                    uses = seen[position];
+                } else for (constraint.keyColumns()) |key| {
+                    if (key == position) uses = true;
+                }
+                if (uses) {
+                    removeConstraint(out, at);
+                    continue;
+                }
+                for (constraint.columns[0..constraint.column_count]) |*key| {
+                    if (key.* > position) key.* -= 1;
+                }
+                at += 1;
+            }
+            var column = position;
+            while (column + 1 < out.count) : (column += 1) {
+                out.columns[column] = out.columns[column + 1];
+                out.sources[column] = out.sources[column + 1];
+                out.fills[column] = out.fills[column + 1];
+                out.check_not_null[column] = out.check_not_null[column + 1];
+                out.rewrites[column] = out.rewrites[column + 1];
+                out.rewrite_spans[column] = out.rewrite_spans[column + 1];
+            }
+            out.rewrites[out.count - 1] = none;
+            out.count -= 1;
+        }
+
         fn bindAlter(context: *const Context, alter: *const Ast.AlterTable) Error!Bound {
             const wanted = toName(context, alter.table.name);
             const namespace = relationPathNamespace(context, alter.table.schema, alter.table.name) catch |err| {
@@ -11918,7 +12157,8 @@ pub fn Binder(comptime config: types.Config) type {
             var sets_defaults = alter.count != 0;
             var has_legacy_options = false;
             for (alter.actions[0..alter.count]) |*action| {
-                const legacy = action.* == .legacy_attribute_options;
+                // SET STATISTICS / STORAGE / COMPRESSION store nothing either.
+                const legacy = action.* == .legacy_attribute_options or action.* == .column_option;
                 has_legacy_options = has_legacy_options or legacy;
                 only_legacy_options = only_legacy_options and legacy;
                 sets_defaults = sets_defaults and (legacy or action.* == .set_default);
@@ -11932,6 +12172,9 @@ pub fn Binder(comptime config: types.Config) type {
                 const entry = &context.tables[index];
                 const validation: ?Error = blk: {
                     checkLegacyAttributeColumns(context, alter, entry.columns[0..entry.column_count]) catch |err| break :blk err;
+                    for (alter.actions[0..alter.count]) |*action| if (action.* == .column_option) {
+                        checkColumnOption(context, entry.columns[0..entry.column_count], &action.column_option) catch |err| break :blk err;
+                    };
                     break :blk null;
                 };
                 return .{ .legacy_attribute_options = .{ .table = index, .validation = validation } };
@@ -11949,11 +12192,14 @@ pub fn Binder(comptime config: types.Config) type {
                 else => {},
             };
             // Views keep their stored text: their tables keep column names.
+            // Dropped and retyped columns are checked against each view's
+            // column usage by the engine (ddl-alter, wave 5).
             if (dependentViews(context, entry.oid)) for (alter.actions[0..alter.count]) |*action| switch (action.*) {
-                .drop_column => return error.DependentObjects,
+                .drop_column, .alter_type => out.view_check = true,
                 .rename_column, .rename_table => return error.UnsupportedStatement,
                 else => {},
             };
+            out.rewrite_source = context.source;
             for (alter.actions[0..alter.count]) |*action| switch (action.*) {
                 .add_column => |*add| {
                     const definition = &add.column;
@@ -11994,73 +12240,8 @@ pub fn Binder(comptime config: types.Config) type {
                         if (drop.if_exists) continue;
                         return error.ColumnNotFound;
                     };
-                    // A table keeps at least one column; identity columns
-                    // keep their positions (their sequences record them).
-                    if (out.count == 1) return error.UnsupportedStatement;
-                    for (out.columns[position..out.count]) |*column| switch (column.default_kind) {
-                        .identity_always, .identity_by_default => return error.UnsupportedStatement,
-                        else => {},
-                    };
-                    for (out.columns[0..out.count], 0..) |*column, other| {
-                        if (other == position or column.default_kind != .generated) continue;
-                        const seen = try textColumns(context, column.expression.slice(), out.columns[0..out.count]);
-                        if (seen[position]) return error.DependentObjects;
-                    }
-                    // Other tables' foreign keys referencing it: 2BP01.
-                    if (referencedColumn(context, entry, out.sources[position])) return error.DependentObjects;
-                    // Indexes over the column go with it (PostgreSQL drops them).
-                    var kept: usize = 0;
-                    for (out.extras.indexes[0..out.extras.index_count]) |*candidate| {
-                        var uses = false;
-                        for (candidate.keyColumns()) |key| uses = uses or key == position;
-                        for (candidate.includes[0..candidate.include_count]) |key| uses = uses or key == position;
-                        for ([_][]const u8{ candidate.expressions.slice(), candidate.predicate.slice() }) |text| {
-                            var parts = std_split(text);
-                            while (parts.next()) |part| {
-                                const seen = try textColumns(context, part, out.columns[0..out.count]);
-                                uses = uses or seen[position];
-                            }
-                        }
-                        if (uses) continue;
-                        var copy = candidate.*;
-                        for (copy.keys[0..copy.key_count]) |*key| if (key.* != S.expression_key and key.* > position) {
-                            key.* -= 1;
-                        };
-                        for (copy.includes[0..copy.include_count]) |*key| if (key.* > position) {
-                            key.* -= 1;
-                        };
-                        out.extras.indexes[kept] = copy;
-                        kept += 1;
-                    }
-                    out.extras.index_count = kept;
-                    // Constraints over the column go with it.
-                    var at: usize = 0;
-                    while (at < out.constraint_count) {
-                        const constraint = &out.constraints[at];
-                        var uses = false;
-                        if (constraint.kind == .check) {
-                            const seen = try textColumns(context, constraint.expression.slice(), out.columns[0..out.count]);
-                            uses = seen[position];
-                        } else for (constraint.keyColumns()) |key| {
-                            if (key == position) uses = true;
-                        }
-                        if (uses) {
-                            removeConstraint(&out, at);
-                            continue;
-                        }
-                        for (constraint.columns[0..constraint.column_count]) |*key| {
-                            if (key.* > position) key.* -= 1;
-                        }
-                        at += 1;
-                    }
-                    var column = position;
-                    while (column + 1 < out.count) : (column += 1) {
-                        out.columns[column] = out.columns[column + 1];
-                        out.sources[column] = out.sources[column + 1];
-                        out.fills[column] = out.fills[column + 1];
-                        out.check_not_null[column] = out.check_not_null[column + 1];
-                    }
-                    out.count -= 1;
+                    if (drop.cascade) out.drop_cascade = true;
+                    try dropAlterColumn(context, entry, &out, position, drop.cascade);
                 },
                 .rename_column => |*rename| {
                     const from = toName(context, rename.from);
@@ -12268,6 +12449,33 @@ pub fn Binder(comptime config: types.Config) type {
                         if (constraint.kind == .check and hasChildren(context, entry.oid)) return error.UnsupportedStatement;
                         constraint.not_valid = false;
                         out.check_constraint[at] = true;
+                        break;
+                    }
+                    if (!named) {
+                        const pkey = objectName(out.name.slice(), "", "pkey");
+                        if (entry.primary_column != null and types.same(pkey.slice(), name.slice())) return error.WrongObjectType;
+                        return error.UndefinedObject;
+                    }
+                },
+                // ddl-alter (wave 5): ALTER COLUMN TYPE, column storage
+                // options and ALTER CONSTRAINT [NOT] DEFERRABLE.
+                .alter_type => |*change| try bindAlterType(context, entry, index, &out, change),
+                .column_option => |*option| try checkColumnOption(context, out.columns[0..out.count], option),
+                .alter_deferrable => |*timing| {
+                    // PostgreSQL 18 changes the timing of foreign keys only
+                    // (42809); 42704 when the table has no such constraint.
+                    const name = toName(context, timing.name);
+                    var named = false;
+                    for (out.constraints[0..out.constraint_count]) |*constraint| {
+                        if (!types.same(constraint.name.slice(), name.slice())) continue;
+                        named = true;
+                        if (constraint.kind != .foreign) return error.WrongObjectType;
+                        // As processCASbits: both attributes are replaced,
+                        // INITIALLY DEFERRED implies DEFERRABLE and NOT
+                        // DEFERRABLE INITIALLY DEFERRED is 42601.
+                        if (timing.deferrable == 1 and timing.deferred == 2) return error.Syntax;
+                        constraint.deferrable = timing.deferrable == 2 or timing.deferred == 2;
+                        constraint.initially_deferred = timing.deferred == 2;
                         break;
                     }
                     if (!named) {
