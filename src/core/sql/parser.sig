@@ -727,15 +727,49 @@ pub fn Parser(comptime config: types.Config) type {
                 }
                 try self.expectSymbol(.rparen);
             }
+            // WITH (check_option = local | cascaded) (B11 wave 5); other
+            // view options stay outside the subset (0A000).
+            if (!materialized and try self.takeWord("WITH")) {
+                try self.expectSymbol(.lparen);
+                if (!try self.takeRaw("check_option")) return error.UnsupportedStatement;
+                if (!try self.takeSymbol(.eq)) return error.Syntax;
+                out.check_option = try self.checkOptionValue();
+                try self.expectSymbol(.rparen);
+            }
             try self.expectWord("AS");
             if (!self.isWord("SELECT") and !self.isWord("WITH")) return error.UnsupportedStatement;
             const start = self.tokenStart();
             out.query = try self.query();
             out.text = try self.storedSpan(start);
             if (materialized) out.with_data = try self.withData();
-            if (!materialized and self.isWord("WITH")) return error.UnsupportedStatement;
+            // WITH [CASCADED | LOCAL] CHECK OPTION (F311-04, F751).
+            if (!materialized and try self.takeWord("WITH")) {
+                out.check_option = 2;
+                if (try self.takeRaw("local")) out.check_option = 1 else _ = try self.takeRaw("cascaded");
+                if (!try self.takeRaw("check") or !try self.takeRaw("option")) return error.Syntax;
+            }
             try self.finish();
             return out;
+        }
+
+        /// A check_option reloption value: local or cascaded, quoted or not
+        /// (22023 otherwise, PostgreSQL's invalid value for the option).
+        fn checkOptionValue(self: *Self) Error!u8 {
+            const token = self.current;
+            var buffer: [16]u8 = undefined;
+            const text: []const u8 = switch (token.kind) {
+                .string => blk: {
+                    if (token.len > buffer.len) return error.InvalidParameterValue;
+                    lexer.decodeQuoted(self.source, token.quoted(), &buffer);
+                    break :blk buffer[0..token.len];
+                },
+                .word, .quoted_word => token.raw(self.source),
+                else => return error.Syntax,
+            };
+            try self.advance();
+            if (types.keyword(text, "local")) return 1;
+            if (types.keyword(text, "cascaded")) return 2;
+            return error.InvalidParameterValue;
         }
 
         /// A query block of a stored view text inside `source` from `start`

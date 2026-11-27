@@ -1001,6 +1001,13 @@ pub fn Database(comptime config: Config) type {
             security_start: usize = 0,
             security_len: usize = 0,
             security_table: usize = 0,
+            /// WITH CHECK OPTION conditions of the views an INSERT / UPDATE
+            /// writes through (B11 wave 5), rewritten over the base table
+            /// `view_check_table` (relation named `view_check_alias`).
+            view_checks: [config.tables]u16 = undefined,
+            view_check_count: usize = 0,
+            view_check_table: usize = 0,
+            view_check_alias: ?ast.Ident = null,
             /// Bytes of `expansion` the running statement uses (a nested
             /// statement saves and restores them, B11 wave 4).
             expansion_used: usize = 0,
@@ -3420,6 +3427,7 @@ pub fn Database(comptime config: Config) type {
             }
             try self.serializableSnapshot(slot);
             self.workspace.security_check = ast.none;
+            self.workspace.view_check_count = 0;
             // Catalog objects (B11 wave 3); a READ ONLY transaction writes none (25006).
             if (parsed.* == .catalog_object) {
                 if (self.txs[slot].read_only) return error.ReadOnlyTransaction;
@@ -3472,6 +3480,7 @@ pub fn Database(comptime config: Config) type {
             if (parsed.* == .select and self.routine_frame == null and self.active_params == null) context.user_type_catalog = &self.catalog_objects;
             var bound: B.Bound = undefined;
             try B.bindInto(&context, &statement_copy, &bound);
+            if (self.workspace.view_check_count != 0) try self.bindViewChecks(&context, &bound);
             if (self.txs[slot].read_only and (explain == null or explain.?.analyze)) try readOnlyCheck(&bound, &self.workspace.plans);
             if (view_owner) |owner| {
                 // The view's owner needs the privileges on the base relation.
@@ -6836,6 +6845,34 @@ pub fn Database(comptime config: Config) type {
             sub.row = cells;
             const verdict = try E.eval(&sub, id);
             if (verdict != .boolean or !verdict.boolean) return error.InsufficientPrivilege;
+        }
+
+        /// Binds the collected WITH CHECK OPTION conditions over the bound
+        /// INSERT / UPDATE target (B11 wave 5); other statements check none.
+        fn bindViewChecks(self: *Self, context: *const B.Context, bound: *const B.Bound) Error!void {
+            const table_slot = switch (bound.*) {
+                .insert => |*insert| insert.table,
+                .update => |*update| update.table,
+                else => {
+                    self.workspace.view_check_count = 0;
+                    return;
+                },
+            };
+            self.workspace.view_check_table = table_slot;
+            for (self.workspace.view_checks[0..self.workspace.view_check_count]) |*check| check.* = try B.bindViewCheck(context, check.*, table_slot, self.workspace.view_check_alias);
+        }
+
+        /// A new row written through views with WITH CHECK OPTION must make
+        /// every collected condition TRUE (44000 for FALSE or NULL, as
+        /// PostgreSQL's ExecWithCheckOptions), after its constraints.
+        fn viewChecks(self: *Self, ctx: *const E.Context, table_slot: usize, cells: *const E.Row) Error!void {
+            if (self.workspace.view_check_count == 0 or table_slot != self.workspace.view_check_table) return;
+            var sub = ctx.*;
+            sub.row = cells;
+            for (self.workspace.view_checks[0..self.workspace.view_check_count]) |id| {
+                const verdict = try E.eval(&sub, id);
+                if (verdict != .boolean or !verdict.boolean) return error.WithCheckOptionViolation;
+            }
         }
 
         /// With row_security disabled, access requiring any policy errors,
@@ -10371,6 +10408,7 @@ pub fn Database(comptime config: Config) type {
             if (try self.uniqueTaken(slot, table_index, &cells, 0xffffffff, null, snap)) |_| return error.PrimaryKeyViolation;
             try self.exclusionTaken(slot, table_index, &cells, 0xffffffff, null, snap);
             try self.checkReferences(slot, table_index, &cells, null, snap);
+            try self.viewChecks(ctx, table_index, &cells);
             try self.appendRow(slot, table_index, &cells, snap);
             if (auto) |column| {
                 const tx = &self.txs[slot];
@@ -11756,6 +11794,7 @@ pub fn Database(comptime config: Config) type {
             // A referential action of this statement may have replaced it.
             if (table.versions[old].hasDeletion()) return true;
             _ = tx;
+            try self.viewChecks(ctx, update.table, &cells);
             try self.placeUpdate(slot, update.table, row, old, &cells, snap);
             if (mysqlAutoColumn(table)) |column| {
                 if (update.values[column] != ast.none) try self.mysqlSetCounter(slot,
@@ -16279,6 +16318,10 @@ pub fn Database(comptime config: Config) type {
             };
             var view = first_view;
             var depth: usize = 0;
+            // WITH CHECK OPTION (F311-04, F751): a view's own condition when
+            // it has the option, and every view's below a CASCADED one.
+            var cascade = false;
+            self.workspace.view_check_count = 0;
             while (true) : (depth += 1) {
                 if (depth == config.tables) return error.StackDepthExceeded;
                 // Every view on the way to the base relation is restricted.
@@ -16355,6 +16398,18 @@ pub fn Database(comptime config: Config) type {
                         delete.only = delete.only or shape.item.only;
                     },
                     else => return error.UnsupportedStatement,
+                }
+                if (event != tg.tg_delete) {
+                    // Conditions of the views above read this view's columns.
+                    for (self.workspace.view_checks[0..self.workspace.view_check_count]) |check| try self.substituteView(current, view, &shape, names[0..name_count], check);
+                    const option = self.tables[view].check_option;
+                    if ((option != 0 or cascade) and shape.where != ast.none) {
+                        if (self.workspace.view_check_count == config.tables) return error.StackDepthExceeded;
+                        self.workspace.view_checks[self.workspace.view_check_count] = try copyTree(&self.workspace.nodes, shape.where);
+                        self.workspace.view_check_count += 1;
+                    }
+                    if (option == 2) cascade = true;
+                    self.workspace.view_check_alias = shape.item.alias;
                 }
                 const base = try self.viewBase(text.bytes[0..text.len], &shape.item);
                 if (self.tables[base].relkind != 'v') break;

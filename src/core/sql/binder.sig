@@ -11044,6 +11044,8 @@ pub fn Binder(comptime config: types.Config) type {
                 out.columns[index] = column;
             }
             const text = create.text.slice(context.source);
+            if (create.check_option != 0) try checkOptionUpdatable(context, create.query, plan);
+            out.extras.check_option = create.check_option;
             out.extras.relkind = if (create.materialized) 'm' else 'v';
             if (text.len > out.extras.query.bytes.len) {
                 out.extras.query.len = try lexer.compactDefinition(text, &out.extras.query.bytes);
@@ -11076,6 +11078,7 @@ pub fn Binder(comptime config: types.Config) type {
                 // silently change an existing dependent view's row shape.
                 if (out.count != old.column_count and dependentViews(context, old.oid)) return error.UnsupportedStatement;
                 var replacement = alterOf(context, found.slot, .create_view);
+                replacement.extras.check_option = out.extras.check_option;
                 replacement.extras.query = out.extras.query;
                 replacement.extras.depends = out.extras.depends;
                 replacement.extras.depend_count = out.extras.depend_count;
@@ -11087,6 +11090,49 @@ pub fn Binder(comptime config: types.Config) type {
                 return .{ .alter_table = replacement };
             };
             return .{ .create_table = out };
+        }
+
+        /// WITH CHECK OPTION needs an automatically updatable view
+        /// (PostgreSQL's view_query_is_auto_updatable with updatable
+        /// columns): one FROM item that is a table or a view, no DISTINCT,
+        /// grouping, HAVING, set operation, WITH, LIMIT / OFFSET, aggregate
+        /// or window target, and at least one plain column (0A000).
+        fn checkOptionUpdatable(context: *const Context, query: u16, plan: *const Plan) Error!void {
+            const q = &context.pool.queries[query];
+            if (q.distinct or q.distinct_on_count != 0 or q.group_count != 0 or q.grouping_sets != none or q.rollup or q.having != none or
+                q.set_op != .none or q.cte_count != 0 or q.limit_present or q.offset_present or q.item_count != 1) return error.UnsupportedStatement;
+            const item = &q.items[0];
+            // A view in FROM was expanded into a derived table (item.view).
+            if ((item.query != none and !item.view) or item.function != none or item.sample_method != 0 or item.column_aliases != none) return error.UnsupportedStatement;
+            if (plan.source_count != 1 or plan.grouped or plan.window_count != 0) return error.UnsupportedStatement;
+            if (!item.view) {
+                const table = plan.sources[0].table orelse return error.UnsupportedStatement;
+                const kind = context.tables[table].relkind;
+                if (kind != 'r' and kind != 'p') return error.UnsupportedStatement;
+            }
+            var plain = false;
+            for (q.targets[0..q.count]) |*target| {
+                if (target.star) {
+                    plain = true;
+                    continue;
+                }
+                const n = context.node(target.expr);
+                if (n.kind == .aggregate or (n.kind == .function and n.window != none)) return error.UnsupportedStatement;
+                plain = plain or n.kind == .column;
+            }
+            if (!plain) return error.UnsupportedStatement;
+        }
+
+        /// A view's check option condition, already rewritten over the
+        /// statement's target table (B11 wave 5): bound like a CHECK
+        /// constraint over the row, the relation named by `alias` when the
+        /// base item had one.
+        pub fn bindViewCheck(context: *const Context, id: u16, table: usize, alias: ?ast.Ident) Error!u16 {
+            var scope = tableScope(context, table);
+            if (alias) |name| scope.rels[0].name = toName(context, name);
+            try typeExpr(context, &scope, id);
+            try booleanArgument(context, id);
+            return id;
         }
 
         /// DROP VIEW / DROP MATERIALIZED VIEW (42809 for another kind).

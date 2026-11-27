@@ -775,6 +775,9 @@ pub fn Ast(comptime config: types.Config) type {
             query: u16 = none,
             text: Span = .{},
             with_data: bool = true,
+            /// WITH [LOCAL | CASCADED] CHECK OPTION or WITH (check_option =
+            /// ...) (B11 wave 5): 0 none, 1 LOCAL, 2 CASCADED.
+            check_option: u8 = 0,
         };
 
         /// MERGE INTO target [AS alias] USING source ON condition WHEN ...

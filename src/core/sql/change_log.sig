@@ -56,6 +56,11 @@
 //!                     reserved). A dropped table's triggers and rules are
 //!                     dropped by their own ops first; a dropped routine has
 //!                     no trigger left.
+//!   115 view_check_option (B11 wave 5): oid u32, option u8 (1 LOCAL, 2
+//!                     CASCADED). Written right after the op 1 / op 12 that
+//!                     defines a view with WITH CHECK OPTION; a definition
+//!                     replayed without it has none, so older records stay
+//!                     byte-identical. 116-119 stay reserved.
 //!    85 create_rule_action (B11 wave 4): a rule with INSERT / UPDATE /
 //!                     DELETE actions, payload_len u32 + payload: the op 64
 //!                     payload, flags u8 (1: parenthesized actions) and the
@@ -164,7 +169,7 @@ pub const default_identity_format_version: u16 = 6;
 /// older definitions stay byte-identical.
 pub const not_valid_format_version: u16 = 7;
 
-pub const Op = enum(u8) { create_table = 1, drop_table = 2, insert = 3, update = 4, delete = 5, catalog_counters = 6, create_sequence = 7, drop_sequence = 8, sequence = 9, truncate = 11, alter_table = 12, create_sequence_cached = 13, alter_sequence = 14, create_schema = 15, drop_schema = 16, catalog_counters_with_constraints = 17, create_owned_schema = 18, create_private_schema = 19, catalog_counters_with_defaults = 20, create_scoped_identity_sequence = 21, create_scoped_sequence = 22, alter_sequence_ownership = 23, create_scoped_serial_sequence = 24, create_routine = 60, drop_routine = 61, create_trigger = 62, drop_trigger = 63, create_rule = 64, drop_rule = 65, object_create = 70, object_drop = 71, large_object_page = 72, create_routine_extended = 80, create_rule_action = 85 };
+pub const Op = enum(u8) { create_table = 1, drop_table = 2, insert = 3, update = 4, delete = 5, catalog_counters = 6, create_sequence = 7, drop_sequence = 8, sequence = 9, truncate = 11, alter_table = 12, create_sequence_cached = 13, alter_sequence = 14, create_schema = 15, drop_schema = 16, catalog_counters_with_constraints = 17, create_owned_schema = 18, create_private_schema = 19, catalog_counters_with_defaults = 20, create_scoped_identity_sequence = 21, create_scoped_sequence = 22, alter_sequence_ownership = 23, create_scoped_serial_sequence = 24, create_routine = 60, drop_routine = 61, create_trigger = 62, drop_trigger = 63, create_rule = 64, drop_rule = 65, object_create = 70, object_drop = 71, large_object_page = 72, create_routine_extended = 80, create_rule_action = 85, view_check_option = 115 };
 
 fn Unsigned(comptime T: type) type {
     return switch (T) {
@@ -506,6 +511,15 @@ pub fn ChangeLog(comptime config: types.Config) type {
             try writer.op(.create_table);
             try writer.int(u32, table.oid);
             try encodeDefinition(writer, table);
+            try encodeViewOptions(writer, table);
+        }
+
+        /// Op 115 after a view definition with a check option.
+        fn encodeViewOptions(writer: *Writer, table: *const S.Table) Error!void {
+            if (table.relkind != 'v' or table.check_option == 0) return;
+            try writer.op(.view_check_option);
+            try writer.int(u32, table.oid);
+            try writer.int(u8, table.check_option);
         }
 
         /// Name, format version, columns and (version 2) namespace and
@@ -678,6 +692,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 try writer.int(u8, origin);
                 if (origin == 0xff) try encodeValue(writer, &fills[column]);
             }
+            try encodeViewOptions(writer, table);
         }
 
         pub fn encodeRow(writer: *Writer, tag: Op, oid: u32, rowid: u64, cells: []const V.Cell) Error!void {
@@ -2187,6 +2202,12 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         vt.keyed = definition.keyed();
                         vt.primary_index_oid = definition.primary_index_oid;
                     },
+                    @intFromEnum(Op.view_check_option) => {
+                        const index = try findVTable(scratch, try reader.int(u32));
+                        if (scratch.tables[index].relkind != 'v') return error.InvalidChangeRecord;
+                        const option = try reader.int(u8);
+                        if (option == 0 or option > 2) return error.InvalidChangeRecord;
+                    },
                     @intFromEnum(Op.truncate) => {
                         // Every database row and every row created so far by
                         // this record is gone; later inserts may reuse keys.
@@ -2611,6 +2632,10 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         db.oid_counter = @max(db.oid_counter, indexOidWidth(&definition.extras), explicitPrimaryHighWater(&definition));
                         S.rebuildCommitted(table, csn);
                         try db.replayAlter((@intFromPtr(table) - @intFromPtr(&db.tables[0])) / @sizeOf(S.Table), old_count, csn);
+                    },
+                    @intFromEnum(Op.view_check_option) => {
+                        const table = try tableByOid(db, try reader.int(u32));
+                        table.check_option = try reader.int(u8);
                     },
                     @intFromEnum(Op.truncate) => {
                         const table = try tableByOid(db, try reader.int(u32));

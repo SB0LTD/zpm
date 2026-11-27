@@ -572,6 +572,9 @@ pub fn Storage(comptime config: types.Config) type {
             query: QueryText = .{},
             /// A materialized view created WITH NO DATA is unpopulated.
             populated: bool = true,
+            /// A view's WITH CHECK OPTION (F311-04, F751, B11 wave 5): 0
+            /// none, 1 LOCAL, 2 CASCADED. Durable as change-log op 115.
+            check_option: u8 = 0,
             /// OIDs of the relations a view reads (DROP dependency checks).
             depend_count: usize = 0,
             depends: [config.tables]u32 = @splat(0),
@@ -800,10 +803,11 @@ pub fn Storage(comptime config: types.Config) type {
             depends: [config.tables]u32 = @splat(0),
             parent: u32 = 0,
             partition: Partition = .{},
+            check_option: u8 = 0,
         };
 
         pub fn extrasOf(table: *const Table) Extras {
-            return .{ .relkind = table.relkind, .index_count = table.index_count, .indexes = table.indexes, .query = table.query, .populated = table.populated, .depend_count = table.depend_count, .depends = table.depends, .parent = table.parent, .partition = table.partition };
+            return .{ .relkind = table.relkind, .index_count = table.index_count, .indexes = table.indexes, .query = table.query, .populated = table.populated, .depend_count = table.depend_count, .depends = table.depends, .parent = table.parent, .partition = table.partition, .check_option = table.check_option };
         }
 
         /// Installs the extras after reset(); index entries are rebuilt by
@@ -822,6 +826,7 @@ pub fn Storage(comptime config: types.Config) type {
             table.depends = extras.depends;
             table.parent = extras.parent;
             table.partition = extras.partition;
+            table.check_option = extras.check_option;
         }
 
         /// Whether a partition bound admits a key value (NULL only into a
