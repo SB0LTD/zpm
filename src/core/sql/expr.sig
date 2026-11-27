@@ -663,6 +663,10 @@ pub fn Eval(comptime config: types.Config) type {
                 .regtype_out => {
                     const data_type = if (first.integer >= 0 and first.integer <= 0xffffffff) types.typeFromOid(@intCast(first.integer)) else null;
                     if (data_type != null) return formatType(first.integer, null, ctx.session.quote_all_identifiers);
+                    if (first.integer >= 0 and first.integer <= 0xffffffff) if (ctx.session.sequences) |hook| if (hook.type_name) |name| {
+                        var buffer: [config.text_bytes]u8 = undefined;
+                        if (try name(hook.ptr, @intCast(first.integer), &buffer)) |length| return textCell(buffer[0..length]);
+                    };
                     return digitsCell(first.integer);
                 },
                 .regclass_out => {

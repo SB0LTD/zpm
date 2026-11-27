@@ -454,11 +454,54 @@ fn routineConfig() !void {
     try idle();
 }
 
+// ---- S071: SQL paths for routines and types --------------------------------------
+
+/// Functions and types resolve through search_path: the earlier schema's
+/// routine of a name wins; a domain is found anywhere in an expression and
+/// pg_typeof reports it (schema-qualified when the path does not find it);
+/// pg_catalog listed after a schema lets that schema's functions with the
+/// built-in's input types hide it; a user function also takes calls no
+/// built-in of its name accepts.
+fn sqlPaths() !void {
+    reset();
+    try run("CREATE SCHEMA s1");
+    try run("CREATE SCHEMA s2");
+    try run("CREATE FUNCTION s1.f() RETURNS TEXT LANGUAGE SQL AS $$SELECT 's1'$$");
+    try run("CREATE FUNCTION s2.f() RETURNS TEXT LANGUAGE SQL AS $$SELECT 's2'$$");
+    try run("CREATE DOMAIN s2.d AS INT CHECK (VALUE > 0)");
+    try run("SET search_path TO s2, s1, public");
+    try returns("SELECT f()", "s2");
+    try returns("SELECT CAST(1 AS d), pg_typeof(CAST(1 AS d))::text", "1|d");
+    try returns("SELECT pg_typeof(CAST(1 AS s2.d))::text, pg_typeof(1::d + 1)::text", "d|integer");
+    try returns("SELECT x::text FROM (SELECT pg_typeof(CAST(2 AS d)) AS x) s", "d");
+    try fails("SELECT CAST(0 AS d)", error.CheckViolation);
+    try fails("SELECT 1 + CAST(-1 AS d)", error.CheckViolation);
+    try run("SET search_path TO s1, s2, public");
+    try returns("SELECT f()", "s1");
+    try run("SET search_path TO public");
+    try fails("SELECT f()", error.UndefinedFunction);
+    try returns("SELECT s2.f(), pg_typeof(CAST(1 AS s2.d))::text", "s2|s2.d");
+    // pg_catalog's place on the path.
+    try run("CREATE FUNCTION public.lower(t TEXT) RETURNS TEXT LANGUAGE SQL AS $$SELECT 'mine:' || t$$");
+    try run("CREATE FUNCTION public.length(i INT) RETURNS INT LANGUAGE SQL AS $$SELECT -1$$");
+    try run("CREATE FUNCTION public.abs(i INT) RETURNS INT LANGUAGE SQL AS $$SELECT 99$$");
+    try returns("SELECT lower('ABC'), abs(-3), length('abc'), length(5)", "abc|3|3|-1");
+    try run("SET search_path = public, pg_catalog");
+    try returns("SELECT lower('ABC'), lower('ABC'::text), pg_catalog.lower('ABC')", "mine:ABC|mine:ABC|abc");
+    try returns("SELECT abs(-3), abs(-3.5), length('abc'), length(5)", "99|3.5|3|-1");
+    try run("SET search_path = pg_catalog, public");
+    try returns("SELECT lower('ABC'), abs(-3)", "abc|3");
+    try run("RESET search_path");
+    try sameState(&.{ "SELECT s1.f(), s2.f()", "SELECT lower('X'), length(5)" });
+    try idle();
+}
+
 pub fn main() !void {
     try schemaStatements();
     try dynamicStatements();
     try assignmentConversion();
     try routineContext();
     try routineConfig();
+    try sqlPaths();
     std.debug.print("routines-trig: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });
 }

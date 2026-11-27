@@ -899,7 +899,10 @@ pub fn Store(comptime Raw: type) type {
             /// Session values (zone, clocks) for output formatting.
             pub fn valueSession(self: *Connection) *const Raw.SessionValues {
                 if(comptime @hasDecl(Raw,"ReadContext")) if(self.read_context) |context| return &context.session;
-                return &self.db().session;
+                const raw = self.db();
+                // Catalog names for regproc / regtype text (B11 wave 5).
+                if (comptime @hasDecl(Raw, "installOutputHooks")) raw.installOutputHooks();
+                return &raw.session;
             }
             pub fn detachedReadEligible(self:*const Connection) bool {
                 // Detached reads run as the bootstrap superuser: a session

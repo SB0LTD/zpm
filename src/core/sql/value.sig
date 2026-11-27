@@ -170,6 +170,9 @@ pub const SequenceHook = struct {
     /// session cursor `name` (34000 when there is none) passes its columns
     /// to `sink`, then with `fetch` the rows of FETCH FORWARD `count`.
     xml_cursor: ?*const fn (ptr: *anyopaque, name: []const u8, count: i64, fetch: bool, sink: *const XmlQuerySink) Error!void = null,
+    /// A user type's regtype output (domains, enums, composite types;
+    /// schema-qualified when the search path does not find it; S071).
+    type_name: ?*const fn (ptr: *anyopaque, oid: u32, out: []u8) Error!?usize = null,
 };
 
 /// The receiver of an xml_query (B11 wave 5 xml lane).
@@ -675,7 +678,13 @@ pub fn Io(comptime config: types.Config) type {
                 .box => |value| geometric.formatBox(value, session.extra_float_digits, buffer),
                 .xml => |*value| try xml.output(value.slice(), buffer),
                 // regtypeout: the type's SQL name, or the number.
-                .regtype => |oid| if (types.regtypeName(oid)) |name| copy(buffer, name) else integerText(oid, buffer),
+                .regtype => |oid| blk: {
+                    if (types.regtypeName(oid)) |name| break :blk copy(buffer, name);
+                    if (session.sequences) |hook| if (hook.type_name) |name| {
+                        if (try name(hook.ptr, oid, buffer)) |used| break :blk buffer[0..used];
+                    };
+                    break :blk integerText(oid, buffer);
+                },
                 .regproc => |oid| blk: {
                     if (session.regproc_numeric_output) break :blk integerText(oid, buffer);
                     if (oid == 0) break :blk copy(buffer, "-");

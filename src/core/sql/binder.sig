@@ -392,6 +392,10 @@ pub fn Binder(comptime config: types.Config) type {
             /// public when it is on the path.
             routine_path: []const u32 = &.{},
             routine_path_known: bool = false,
+            /// How many `routine_path` namespaces precede an explicitly
+            /// listed pg_catalog (0: pg_catalog is searched first; S071,
+            /// B11 wave 5).
+            catalog_rank: usize = 0,
             /// The FROM item's call node bindTableFunction binds: it may be
             /// a set-returning routine or return a record (B11 wave 4).
             table_function: u16 = none,
@@ -2433,6 +2437,35 @@ pub fn Binder(comptime config: types.Config) type {
         }
 
         fn typeFunction(context: *const Context, scope: *const Scope, n: *ast.Node) Error!void {
+            const unqualified = n.qualifier.len == 0 and n.func != .routine;
+            typeFunctionCall(context, scope, n) catch |err| {
+                // No built-in takes these arguments: a user function of the
+                // name may (PostgreSQL's candidates span every schema).
+                const builtin = unqualified and n.func != .none and n.func != .routine;
+                if (err != error.UndefinedFunction or !builtin or n.kind != .function or !userRoutineNamed(context, n)) return err;
+                if (n.window != none or n.within_group or n.order != none or n.distinct or n.star or n.c != none) return err;
+                var count: usize = 0;
+                var item = n.b;
+                while (item != none) : (item = context.node(item).next) count += 1;
+                n.func = .none;
+                return bindRoutineCall(context, n, count);
+            };
+            try catalogPlacement(context, n);
+        }
+
+        /// A visible user routine of the call's name on the search path.
+        fn userRoutineNamed(context: *const Context, n: *const ast.Node) bool {
+            const set = context.routines orelse return false;
+            if (!context.routine_path_known) return false;
+            const name = toName(context, n.name);
+            for (&set.routines) |*routine| {
+                if (!routine.live or routine.kind != 'f' or !routine.stamp.visible(context.snapshot) or !types.same(routine.name.slice(), name.slice())) continue;
+                if (std.mem.indexOfScalar(u32, context.routine_path, routine.namespace) != null) return true;
+            }
+            return false;
+        }
+
+        fn typeFunctionCall(context: *const Context, scope: *const Scope, n: *ast.Node) Error!void {
             // SQL/XML publishing parts (B11 wave 4): names, not calls.
             if (n.func == .xml_name) {
                 n.ty = .text;
@@ -2892,6 +2925,10 @@ pub fn Binder(comptime config: types.Config) type {
                         .regnamespace => 4089,
                         .none => if (argument.ty == .unknown) 705 else types.typeOid(types.dataTypeOf(argument.ty)),
                     };
+                    // A domain cast's type is the domain (S071).
+                    if (argument.kind == .cast and argument.domain_cast) {
+                        if (try domainIndex(context, argument)) |index| n.integer = context.user_type_catalog.?.items[index].oid;
+                    }
                     n.ty = .regtype;
                     n.constant = false;
                 },
@@ -5332,7 +5369,9 @@ pub fn Binder(comptime config: types.Config) type {
                 .cast => {
                     n.date_bound=false;
                     if (n.flat_record_cast) return;
-                    if (n.cast_type == .unknown) return error.UnsupportedStatement;
+                    // A domain named anywhere in an expression (S071, B11
+                    // wave 5); other user types only as a projected root.
+                    if (n.cast_type == .unknown and !try bindDomainCast(context, n)) return error.UnsupportedStatement;
                     if (ast.regKind(n.typmod) != .none) return regCast(context, scope, n);
                     if (n.typmod == ast.mysql_integer_cast_typmod) {
                         if (context.dialect != .mysql or (n.cast_type == .mysql_bigint_unsigned and config.numeric_digits < 20))
@@ -6091,6 +6130,67 @@ pub fn Binder(comptime config: types.Config) type {
             n.flat_record_cast = true;
             n.constant = true;
             n.integer = object.composite_field_count;
+        }
+
+        /// The domain a cast names (unqualified: the search path's first
+        /// schema with a user type of that name), or null.
+        fn domainIndex(context: *const Context, n: *const ast.Node) Error!?usize {
+            const user_types = context.user_type_catalog orelse return null;
+            const name = toName(context, n.name);
+            const namespace = if (n.qualifier.len == 0 and context.routine_path_known) blk: {
+                for (context.routine_path) |candidate| {
+                    if (user_types.byName(.domain, candidate, name.slice(), context.snapshot) != null or
+                        user_types.byName(.enum_type, candidate, name.slice(), context.snapshot) != null or
+                        user_types.byName(.composite_type, candidate, name.slice(), context.snapshot) != null) break :blk candidate;
+                }
+                break :blk catalog.public_namespace;
+            } else try qualifierNamespace(context, if (n.qualifier.len == 0) null else n.qualifier);
+            return user_types.byName(.domain, namespace, name.slice(), context.snapshot);
+        }
+
+        /// A cast to a domain inside an expression: the base type's cast
+        /// with the domain's constraint; false for other user types.
+        fn bindDomainCast(context: *const Context, n: *ast.Node) Error!bool {
+            if (context.dialect != .postgres or context.user_type_catalog == null or n.name.len == 0) return false;
+            const index = (try domainIndex(context, n)) orelse return false;
+            const info = context.user_type_catalog.?.items[index].domain;
+            n.cast_type = info.base;
+            n.domain_cast = true;
+            n.domain_not_null = info.not_null;
+            n.domain_comparison = info.comparison;
+            n.integer = info.bound;
+            return true;
+        }
+
+        /// pg_catalog placed after a schema of the search path (S071):
+        /// a user function there with the same input types as the
+        /// built-in the call bound hides it, as PostgreSQL's candidate
+        /// list keeps the earlier schema's function of a signature.
+        fn catalogPlacement(context: *const Context, n: *ast.Node) Error!void {
+            if (context.catalog_rank == 0 or n.kind != .function or n.qualifier.len != 0 or n.func == .none or n.func == .routine) return;
+            if (n.window != none or n.within_group or n.order != none or n.distinct or n.star or n.c != none) return;
+            const set = context.routines orelse return;
+            const name = toName(context, n.name);
+            var arg_types: [config.routine_args]types.Type = undefined;
+            var count: usize = 0;
+            var item = n.b;
+            while (item != none) : (item = context.node(item).next) {
+                if (count == arg_types.len) return;
+                arg_types[count] = context.node(item).ty;
+                count += 1;
+            }
+            const path = context.routine_path[0..@min(context.catalog_rank, context.routine_path.len)];
+            for (&set.routines, 0..) |*routine, index| {
+                if (!routine.live or !routine.stamp.visible(context.snapshot) or routine.kind != 'f') continue;
+                if (!types.same(routine.name.slice(), name.slice()) or routine.arg_count != count) continue;
+                if (std.mem.indexOfScalar(u32, path, routine.namespace) == null or routineHidden(set, index, context.routine_path, context.snapshot)) continue;
+                const same_types = for (routine.args(), arg_types[0..count]) |oid, ty| {
+                    if (types.typeFromOid(oid) != types.dataTypeOf(ty)) break false;
+                } else true;
+                if (!same_types) continue;
+                n.func = .none;
+                return bindRoutineCall(context, n, count);
+            }
         }
 
         fn bindUserTypeCast(context: *const Context, scope: *const Scope, target: u16) Error!?types.NominalColumnType {

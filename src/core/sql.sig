@@ -1566,6 +1566,8 @@ pub fn Database(comptime config: Config) type {
                 // Metadata-only Describe does not call evaluation hooks.
                 if(!describe_only) for(self.workspace.nodes.nodes[0..self.workspace.nodes.len]) |node| {
                     if (node.ty == .regproc or types.elementType(node.ty) == .regproc) return error.UnsupportedStatement;
+                    // A user type's regtype name needs the catalog hook (S071).
+                    if (node.ty == .regtype or types.elementType(node.ty) == .regtype) return error.UnsupportedStatement;
                     switch(node.func) {
                         .nextval,.currval,.setval,.lastval,.identity_next,.lo_create,.lo_creat,.lo_unlink,.lo_from_bytea,.lo_get,.lo_truncate,.lo_truncate64,.lo_import,.lo_export=>return error.UnsupportedStatement,
                         // These catalog lookups use the serialized database hook.
@@ -2021,6 +2023,8 @@ pub fn Database(comptime config: Config) type {
         default_sequences: Q.Session = .{},
         sequence_session: ?*Q.Session = null,
         seq_hook: value_module.SequenceHook = undefined,
+        /// Output-formatting hook (installOutputHooks).
+        output_hook: value_module.SequenceHook = undefined,
         seq_slot: u16 = 0,
         seq_snap: Snapshot = .{ .csn = 0 },
         txs: [config.transactions]M.Tx = @splat(.{}),
@@ -2654,6 +2658,7 @@ pub fn Database(comptime config: Config) type {
             self.sequence_session = null;
             self.default_sequences = .{};
             self.seq_hook = undefined; // installed before a sequence expression
+            self.output_hook = undefined; // installed before output formatting
             self.seq_slot = 0;
             self.seq_snap = .{ .csn = 0 };
             self.wake_epoch = 0;
@@ -3432,8 +3437,9 @@ pub fn Database(comptime config: Config) type {
 
         fn bindContext(self: *Self, source: []const u8, mode: ParseMode, snap: Snapshot) B.Context {
             self.routine_path_len = self.routinePath(snap, &self.routine_path_items);
+            const catalog_rank = self.routineCatalogRank(snap);
             const inlined = self.workspace.inline_count != 0 and source.ptr == &self.workspace.expansion and source.len == self.workspace.inline_source_len;
-            return .{ .inline_calls = if (inlined) self.workspace.inline_calls[0..self.workspace.inline_count] else &.{}, .routine_path = self.routine_path_items[0..self.routine_path_len], .routine_path_known = true, .source = source, .tables = &self.tables, .catalog = &self.catalog, .snapshot = snap, .pool = &self.workspace.nodes, .legacy = mode == .legacy_alpha, .dialect = self.dialect, .session = &self.session, .plans = &self.workspace.plans, .params = self.active_params,
+            return .{ .inline_calls = if (inlined) self.workspace.inline_calls[0..self.workspace.inline_count] else &.{}, .routine_path = self.routine_path_items[0..self.routine_path_len], .routine_path_known = true, .catalog_rank = catalog_rank, .source = source, .tables = &self.tables, .catalog = &self.catalog, .snapshot = snap, .pool = &self.workspace.nodes, .legacy = mode == .legacy_alpha, .dialect = self.dialect, .session = &self.session, .plans = &self.workspace.plans, .params = self.active_params,
                 .routines = &self.objects, .variables = if (self.routine_frame) |frame| &frame.variables else null,
                 .namespace_usage = .{ .ptr = self, .check = &bindNamespaceUsage },
                 .namespace_create = .{ .ptr = self, .check = &bindNamespaceCreate } };
@@ -3511,7 +3517,9 @@ pub fn Database(comptime config: Config) type {
             var context = self.bindContext(source, mode, snap);
             context.stored_source_start = original.len;
             if (explain) |options| context.describe_only = !options.analyze;
-            if (parsed.* == .select and self.routine_frame == null and self.active_params == null) context.user_type_catalog = &self.catalog_objects;
+            // Domains resolve in any query (S071, B11 wave 5); enum and
+            // composite values only as a simple SELECT's projected roots.
+            if ((parsed.* == .select or statement_copy == .query) and self.routine_frame == null and self.active_params == null) context.user_type_catalog = &self.catalog_objects;
             var bound: B.Bound = undefined;
             try B.bindInto(&context, &statement_copy, &bound);
             if (self.workspace.view_check_count != 0) try self.bindViewChecks(&context, &bound);
@@ -7732,6 +7740,36 @@ pub fn Database(comptime config: Config) type {
             return writer.len;
         }
 
+        /// regtype output of a user type: its name, qualified when the
+        /// search path's first schema holding a type of that name is
+        /// another one (S071, B11 wave 5).
+        fn postgresTypeName(ptr: *anyopaque, oid: u32, out: []u8) Error!?usize {
+            const self: *const Self = @ptrCast(@alignCast(ptr));
+            // Output formatting can follow the statement: read the latest
+            // committed catalog (and the statement's own changes).
+            var snap = self.seq_snap;
+            snap.csn = @max(snap.csn, self.csn);
+            const kinds = [_]CO.Kind{ .domain, .enum_type, .composite_type };
+            const found = for (kinds) |kind| {
+                if (self.catalog_objects.byOid(kind, oid, snap)) |index| break index;
+            } else return null;
+            const object = &self.catalog_objects.items[found];
+            const name = object.name.slice();
+            var path: [routine_path_capacity]u32 = undefined;
+            const count = self.routinePath(snap, &path);
+            const first = for (path[0..count]) |namespace| {
+                if (self.catalog_objects.userTypeNameTaken(namespace, name, snap)) break namespace;
+            } else null;
+            var writer: CatalogTextWriter = .{ .out = out, .quote_all = self.session.quote_all_identifiers };
+            if (first == null or first.? != object.target) {
+                writer.ident(self.namespaceName(object.target));
+                writer.add(".");
+            }
+            writer.ident(name);
+            if (writer.shortened) return error.TextCapacity;
+            return writer.len;
+        }
+
         fn writeNamespaceName(self: *const Self, name: []const u8, out: []u8) Error!usize {
             var text: CatalogTextWriter = .{ .out = out, .quote_all = self.session.quote_all_identifiers };
             text.ident(name);
@@ -11420,8 +11458,16 @@ pub fn Database(comptime config: Config) type {
             return info;
         }
 
+        /// Catalog names for output formatted after the statement (regproc
+        /// and regtype text; the Store's wire session has no statement
+        /// hooks then; S071, B11 wave 5).
+        pub fn installOutputHooks(self: *Self) void {
+            self.output_hook = .{ .ptr = self, .call = &sequenceCall, .relation_name = &relationName, .routine_name = &postgresRoutineName, .type_name = &postgresTypeName };
+            self.session.sequences = &self.output_hook;
+        }
+
         fn statementHooks(self: *Self, slot: u16, snap: Snapshot) void {
-            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .large_object = &largeObjectCall, .large_object_data = &largeObjectDataCall, .large_object_truncate = &truncateLargeObject, .large_object_file = .{ .authorize = &authorizeLargeObjectFile, .call = &largeObjectFileCall }, .relation_name = &relationName, .relation_display_name = &relationDisplayName, .catalog_text = &catalogText, .schema_path = &catalogSchemaPath, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .view_definition = &postgresViewDefinition, .trigger_definition = &postgresTriggerDefinition, .rule_definition = &postgresRuleDefinition, .statistics_columns = &postgresStatisticsColumns, .relation_publishable = &relationPublishable, .partition_key_definition = &postgresPartitionKey, .partition_ancestors = &postgresPartitionAncestors, .namespace_lookup = &postgresNamespaceLookup, .namespace_name = &postgresNamespaceName, .routine_lookup = &postgresRoutineLookup, .routine_name = &postgresRoutineName, .xml_query = &xmlQuery, .xml_cursor = &xmlCursor };
+            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .large_object = &largeObjectCall, .large_object_data = &largeObjectDataCall, .large_object_truncate = &truncateLargeObject, .large_object_file = .{ .authorize = &authorizeLargeObjectFile, .call = &largeObjectFileCall }, .relation_name = &relationName, .relation_display_name = &relationDisplayName, .catalog_text = &catalogText, .schema_path = &catalogSchemaPath, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .view_definition = &postgresViewDefinition, .trigger_definition = &postgresTriggerDefinition, .rule_definition = &postgresRuleDefinition, .statistics_columns = &postgresStatisticsColumns, .relation_publishable = &relationPublishable, .partition_key_definition = &postgresPartitionKey, .partition_ancestors = &postgresPartitionAncestors, .namespace_lookup = &postgresNamespaceLookup, .namespace_name = &postgresNamespaceName, .routine_lookup = &postgresRoutineLookup, .routine_name = &postgresRoutineName, .xml_query = &xmlQuery, .xml_cursor = &xmlCursor, .type_name = &postgresTypeName };
             self.session.sequences = &self.seq_hook;
             // A statement starts with the whole XML scratch region free.
             self.xml_region = .{ .bytes = &self.xml_backing };
@@ -13546,6 +13592,32 @@ pub fn Database(comptime config: Config) type {
                 count += 1;
             }
             return count;
+        }
+
+        /// How many routinePath namespaces precede pg_catalog when the
+        /// search path lists it explicitly (0 when it does not: it is then
+        /// searched first; S071, B11 wave 5).
+        fn routineCatalogRank(self: *const Self, snap: Snapshot) usize {
+            const values = if (self.session_state) |state| &state.values else &self.default_session_state.values;
+            var items = std.mem.splitSequence(u8, values.search_path.slice(), ", ");
+            var seen: [routine_path_capacity]u32 = undefined;
+            var count: usize = 0;
+            while (items.next()) |raw| {
+                var item = raw;
+                if (item.len >= 2 and item[0] == '"' and item[item.len - 1] == '"') item = item[1 .. item.len - 1];
+                if (types.same(item, "pg_catalog")) return count;
+                if (item.len == 0 or types.same(item, "pg_temp")) continue;
+                const namespace: u32 = if (types.same(item, "public")) catalog_module.public_namespace else blk: {
+                    const name = if (types.same(item, "$user")) (self.catalog_objects.roleName(self.session.role, snap) orelse continue) else item;
+                    const found = self.catalog.findSchema(name, snap) orelse continue;
+                    break :blk found.oid;
+                };
+                if (std.mem.indexOfScalar(u32, seen[0..count], namespace) != null) continue;
+                if (count == seen.len) break;
+                seen[count] = namespace;
+                count += 1;
+            }
+            return 0;
         }
 
         /// The first schema of the search path holding a relation (table,
