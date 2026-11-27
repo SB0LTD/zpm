@@ -18,6 +18,7 @@ const schemas_magic = "RSBASE05";
 const pages_magic = "RSBASE06";
 const large_defaults_magic = "RSBASE07";
 const builtin_acl_magic = "RSBASE08";
+const routine_defaults_magic = "RSBASE09";
 const header_size = 24;
 const table_header_size = 8;
 const part_size = 5;
@@ -75,13 +76,17 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
             fn hasBuiltinAcls(self: CatalogImage) bool {
                 return self.counts[5] != 0;
             }
+
+            fn hasRoutineDefaults(self: CatalogImage) bool {
+                return self.counts[6] != 0;
+            }
         };
 
-        const catalog_kinds = [_]objects.Kind{ .role, .large_object, .large_object_acl, .comment, .large_object_default_acl, .builtin_routine_acl };
+        const catalog_kinds = [_]objects.Kind{ .role, .large_object, .large_object_acl, .comment, .large_object_default_acl, .builtin_routine_acl, .routine_default_acl };
 
         fn writeCatalog(db: *const Database, sink: anytype, scratch: []u8, kind: objects.Kind) !void {
             const snap: storage.Snapshot = .{ .csn = db.csn };
-            const passes: usize = if (kind == .large_object_default_acl) 2 else 1;
+            const passes: usize = if (objects.defaultAcl(kind)) 2 else 1;
             for (0..passes) |pass| {
                 for (&db.catalog_objects.items) |*object| {
                     if (object.kind != kind or !O.visible(object, snap)) continue;
@@ -163,7 +168,7 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
             for (&db.objects.routines) |*item| if (item.live and item.stamp.visible(snap)) return error.SnapshotUnsupportedState;
             for (&db.objects.triggers) |*item| if (item.live and item.stamp.visible(snap)) return error.SnapshotUnsupportedState;
             for (&db.objects.rules) |*item| if (item.live and item.stamp.visible(snap)) return error.SnapshotUnsupportedState;
-            if (image.hasObjects() and image.counts[1] == 0 and !image.hasLargeDefaults() and !image.hasBuiltinAcls()) return error.SnapshotUnsupportedState;
+            if (image.hasObjects() and image.counts[1] == 0 and !image.hasLargeDefaults() and !image.hasBuiltinAcls() and !image.hasRoutineDefaults()) return error.SnapshotUnsupportedState;
             return image;
         }
 
@@ -271,13 +276,13 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
                 try sink.appendAll(&header);
                 try writeTable(table, sink, scratch);
             } else {
-                @memcpy(header[0..8], if (catalog_image.hasBuiltinAcls()) builtin_acl_magic else if (catalog_image.hasLargeDefaults()) large_defaults_magic else if (with_pages) pages_magic else if (schema_count != 0) schemas_magic else if (with_defaults) defaults_magic else if (sequence_count == 0) multi_magic else sequence_magic);
+                @memcpy(header[0..8], if (catalog_image.hasRoutineDefaults()) routine_defaults_magic else if (catalog_image.hasBuiltinAcls()) builtin_acl_magic else if (catalog_image.hasLargeDefaults()) large_defaults_magic else if (with_pages) pages_magic else if (schema_count != 0) schemas_magic else if (with_defaults) defaults_magic else if (sequence_count == 0) multi_magic else sequence_magic);
                 std.mem.writeInt(u32, header[16..20], @intCast(selected.count), .little);
                 std.mem.writeInt(u32, header[20..24], @intCast(sequence_count), .little);
                 try sink.appendAll(&header);
                 if (with_pages) {
-                    var counts: [28]u8 = undefined;
-                    const groups: usize = if (catalog_image.hasBuiltinAcls()) 6 else if (catalog_image.hasLargeDefaults()) 5 else 4;
+                    var counts: [32]u8 = undefined;
+                    const groups: usize = if (catalog_image.hasRoutineDefaults()) 7 else if (catalog_image.hasBuiltinAcls()) 6 else if (catalog_image.hasLargeDefaults()) 5 else 4;
                     for (catalog_image.counts[0..groups], 0..) |count, index| std.mem.writeInt(u32, counts[index * 4 ..][0..4], count, .little);
                     std.mem.writeInt(u32, counts[groups * 4 ..][0..4], @intCast(catalog_image.pages), .little);
                     try sink.appendAll(counts[0..(groups + 1) * 4]);
@@ -394,15 +399,16 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
 
             var offset: u64 = header_size;
             var sequence_count: u32 = 0;
-            const with_builtin_acls = std.mem.eql(u8, header[0..8], builtin_acl_magic);
+            const with_routine_defaults = std.mem.eql(u8, header[0..8], routine_defaults_magic);
+            const with_builtin_acls = with_routine_defaults or std.mem.eql(u8, header[0..8], builtin_acl_magic);
             const with_large_defaults = with_builtin_acls or std.mem.eql(u8, header[0..8], large_defaults_magic);
             const with_pages = with_large_defaults or std.mem.eql(u8, header[0..8], pages_magic);
             const with_schemas = with_pages or std.mem.eql(u8, header[0..8], schemas_magic);
-            const groups: usize = if (with_builtin_acls) 6 else if (with_large_defaults) 5 else 4;
+            const groups: usize = if (with_routine_defaults) 7 else if (with_builtin_acls) 6 else if (with_large_defaults) 5 else 4;
             var counts: [catalog_kinds.len]u32 = @splat(0);
             var page_count: u32 = 0;
             if (with_pages) {
-                var encoded: [28]u8 = undefined;
+                var encoded: [32]u8 = undefined;
                 const encoded_len = (groups + 1) * 4;
                 try readExact(file, offset, encoded[0..encoded_len], length);
                 offset += encoded_len;
@@ -413,7 +419,8 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
                 }
                 page_count = std.mem.readInt(u32, encoded[groups * 4 ..][0..4], .little);
                 if (objects_total == 0 or objects_total > db.catalog_objects.items.len or
-                    (with_builtin_acls and counts[5] == 0) or
+                    (with_routine_defaults and counts[6] == 0) or
+                    (!with_routine_defaults and with_builtin_acls and counts[5] == 0) or
                     (!with_builtin_acls and with_large_defaults and counts[4] == 0) or
                     (page_count != 0 and (db.large_pages == null or page_count > db.large_pages.?.capacity())))
                     return error.InvalidSnapshotImage;

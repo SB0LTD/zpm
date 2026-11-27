@@ -2453,7 +2453,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 .create_sequence => {},
                 .create_schema => if (!image.with_schemas) return error.InvalidChangeRecord,
                 .object_create => switch (image.catalog_kind orelse return error.InvalidChangeRecord) {
-                    .role, .large_object, .large_object_acl, .large_object_default_acl, .builtin_routine_acl, .comment => {},
+                    .role, .large_object, .large_object_acl, .large_object_default_acl, .builtin_routine_acl, .routine_default_acl, .comment => {},
                     else => return error.InvalidChangeRecord,
                 },
                 .catalog_counters, .catalog_counters_with_constraints, .catalog_counters_with_defaults => if (image.table_count > config.tables) return error.InvalidChangeRecord,

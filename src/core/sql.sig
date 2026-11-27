@@ -4504,12 +4504,12 @@ pub fn Database(comptime config: Config) type {
 
         /// The owner entry has the pg_default_acl OID. The remaining
         /// versions are grants issued by that role to named grantees or PUBLIC.
-        fn lockLargeDefaults(self: *Self, slot: u16, role: u32, snap: Snapshot) Error!?usize {
+        fn lockDefaults(self: *Self, slot: u16, kind: CO.Kind, role: u32, snap: Snapshot) Error!?usize {
             var latest = snap;
             latest.csn = self.csn;
             var parent: ?usize = null;
             for (&self.catalog_objects.items, 0..) |*row, index| {
-                if (!row.used or row.kind != .large_object_default_acl or row.target != role) continue;
+                if (!row.used or row.kind != kind or row.target != role) continue;
                 if (O.pendingOf(row, snap)) |other| return self.objectPark(slot, other);
                 const visible = O.visible(row, snap);
                 if (visible != O.visible(row, latest)) return error.SerializationFailure;
@@ -4577,19 +4577,21 @@ pub fn Database(comptime config: Config) type {
             }
             for (owners[0..owner_count]) |owner| {
                 try self.checkLargeAclRole(slot, owner, snap);
-                try self.changeLargeDefaults(slot, owner, grantees[0..count], &change.grant, change.revoke, snap);
+                const kind: CO.Kind = if (change.grant.routine_defaults) .routine_default_acl else .large_object_default_acl;
+                try self.changeDefaults(slot, kind, owner, grantees[0..count], &change.grant, change.revoke, snap);
             }
         }
 
-        fn changeLargeDefaults(self: *Self, slot: u16, owner: u32, grantees: []const u32, grant: *const CO.Grant, revoke: bool, snap: Snapshot) Error!void {
-            const prior = try self.lockLargeDefaults(slot, owner, snap);
-            var parent: O.Object = .{ .kind = .large_object_default_acl, .target = owner, .owner = owner, .grantee = owner, .flags = CO.large_object_privileges };
+        fn changeDefaults(self: *Self, slot: u16, kind: CO.Kind, owner: u32, grantees: []const u32, grant: *const CO.Grant, revoke: bool, snap: Snapshot) Error!void {
+            const prior = try self.lockDefaults(slot, kind, owner, snap);
+            const initial = CO.defaultAclFlags(kind);
+            var parent: O.Object = .{ .kind = kind, .target = owner, .owner = owner, .grantee = owner, .flags = initial };
             if (prior) |index| parent = self.catalog_objects.items[index];
             const owner_flags = parent.flags;
             const owner_options = parent.grant_flags;
             var children: usize = 0;
             for (&self.catalog_objects.items) |*row| {
-                if (row.kind == .large_object_default_acl and row.target == owner and row.oid == 0 and O.visible(row, snap)) children += 1;
+                if (row.kind == kind and row.target == owner and row.oid == 0 and O.visible(row, snap)) children += 1;
             }
             const Edit = struct { role: u32, old: ?usize, flags: u32, options: u32 };
             var edits: [CO.list_capacity]Edit = undefined;
@@ -4600,7 +4602,12 @@ pub fn Database(comptime config: Config) type {
                     updateLargeDefaultMask(&parent.flags, &parent.grant_flags, grant, revoke);
                     continue;
                 }
-                const key: O.Object = .{ .kind = .large_object_default_acl, .target = owner, .grantee = role };
+                if (kind == .routine_default_acl and role == CO.public_role) {
+                    if (!revoke) parent.flags |= CO.routine_default_public
+                    else if (!grant.option) parent.flags &= ~CO.routine_default_public;
+                    continue;
+                }
+                const key: O.Object = .{ .kind = kind, .target = owner, .grantee = role };
                 const old = self.catalog_objects.findKey(&key, snap);
                 const flags = if (old) |index| self.catalog_objects.items[index].flags else 0;
                 const options = if (old) |index| self.catalog_objects.items[index].grant_flags else 0;
@@ -4612,7 +4619,7 @@ pub fn Database(comptime config: Config) type {
                 edits[used] = edit;
                 used += 1;
             }
-            const keep = children != 0 or parent.flags != CO.large_object_privileges or parent.grant_flags != 0;
+            const keep = children != 0 or parent.flags != initial or parent.grant_flags != 0;
             const replace = prior == null or parent.flags != owner_flags or parent.grant_flags != owner_options;
             try self.reserveWrites(slot, writes + @as(usize, @intFromBool(keep and replace)) +
                 @intFromBool(prior != null and (!keep or replace)));
@@ -4624,7 +4631,7 @@ pub fn Database(comptime config: Config) type {
                 if (edit.old) |index| self.objectDelete(slot, index, snap);
                 if (edit.flags == 0) continue;
                 var row: O.Object = .{
-                    .kind = .large_object_default_acl, .target = owner, .owner = owner, .grantee = edit.role,
+                    .kind = kind, .target = owner, .owner = owner, .grantee = edit.role,
                     .flags = edit.flags, .grant_flags = edit.options,
                 };
                 _ = try self.objectInsert(slot, &row, false, snap);
@@ -5291,7 +5298,7 @@ pub fn Database(comptime config: Config) type {
                 }
                 for (&self.catalog_objects.items) |*o| {
                     const affected = (CO.userType(o.kind) or o.kind == .statistics or o.kind == .relation or o.kind == .large_object) and o.owner == oid or
-                        (o.kind == .schema_acl or o.kind == .large_object_acl or o.kind == .large_object_default_acl or o.kind == .builtin_routine_acl) and
+                        (o.kind == .schema_acl or o.kind == .large_object_acl or CO.defaultAcl(o.kind) or o.kind == .builtin_routine_acl) and
                             (o.owner == oid or o.grantee == oid) or
                         o.kind == .role_settings and o.target == oid;
                     if (affected and O.visible(o, latest) != O.visible(o, snap)) return error.SerializationFailure;
@@ -5306,7 +5313,7 @@ pub fn Database(comptime config: Config) type {
                             writes += 1;
                         },
                         .role_settings => if (o.target == oid) { writes += 1; },
-                        .acl, .schema_acl, .large_object_acl, .large_object_default_acl, .builtin_routine_acl => if (o.grantee == oid or o.owner == oid) return error.DependentObjects,
+                        .acl, .schema_acl, .large_object_acl, .large_object_default_acl, .routine_default_acl, .builtin_routine_acl => if (o.grantee == oid or o.owner == oid) return error.DependentObjects,
                         .policy => {
                             for (o.roleList()) |listed| {
                                 if (listed == oid) return error.DependentObjects;
@@ -6474,9 +6481,12 @@ pub fn Database(comptime config: Config) type {
                 .pg_default_acl => {
                     const include_acl = sink.referencesColumn(4);
                     for (&self.catalog_objects.items) |*entry| {
-                        if (entry.kind != .large_object_default_acl or entry.oid == 0 or !O.visible(entry, snapshot)) continue;
-                        const acl = if (include_acl) try self.largeObjectAcl(entry, snapshot, sink.valueBytes()) else .null_value;
-                        try sink.add(&.{ intCell(entry.oid), intCell(entry.owner), intCell(0), .{ .pg_internal_char = 'L' }, acl });
+                        if (!CO.defaultAcl(entry.kind) or entry.oid == 0 or !O.visible(entry, snapshot)) continue;
+                        const routine = entry.kind == .routine_default_acl;
+                        const acl = if (!include_acl) .null_value else if (routine)
+                            try self.routineDefaultAcl(entry, snapshot, sink.valueBytes()) else
+                            try self.largeObjectAcl(entry, snapshot, sink.valueBytes());
+                        try sink.add(&.{ intCell(entry.oid), intCell(entry.owner), intCell(0), .{ .pg_internal_char = if (routine) 'f' else 'L' }, acl });
                     }
                 },
                 .pg_largeobject_metadata => {
@@ -12476,6 +12486,45 @@ pub fn Database(comptime config: Config) type {
             }
         }
 
+        fn newRoutineAcl(self: *Self, slot: u16, owner: u32, snap: Snapshot) Error!RC.ExecuteAcl {
+            // Catalog defaults use the latest committed state plus our own
+            // earlier commands; a concurrent template edit does not lock a
+            // creator out of the previously committed defaults.
+            var current = snap;
+            current.csn = self.csn;
+            const key: O.Object = .{ .kind = .routine_default_acl, .target = owner, .grantee = owner };
+            const prior = self.catalog_objects.findKey(&key, current) orelse return .{};
+            const parent = &self.catalog_objects.items[prior];
+            var acl: RC.ExecuteAcl = .{
+                .explicit = true, .owner = parent.flags & CO.priv_execute != 0,
+                .owner_option = parent.grant_flags & CO.priv_execute != 0,
+                .public = parent.flags & CO.routine_default_public != 0,
+            };
+            for (&self.catalog_objects.items) |*entry| {
+                if (entry.kind != .routine_default_acl or entry.target != owner or entry.oid != 0 or !O.visible(entry, current)) continue;
+                try self.checkLargeAclRole(slot, entry.grantee, current);
+                if (acl.count == acl.grantees.len) return error.ProgramLimitExceeded;
+                acl.grantees[acl.count] = entry.grantee;
+                acl.options[acl.count] = entry.grant_flags & CO.priv_execute != 0;
+                acl.count += 1;
+            }
+            return acl;
+        }
+
+        fn routineDefaultAcl(self: *const Self, parent: *const O.Object, snap: Snapshot, values: ?*types.ValueBytes) Error!Cell {
+            var edges: [O.capacity + 2]LoAcl.Edge = undefined;
+            var graph: LoAcl.Graph = .{ .edges = &edges, .owner = parent.owner, .privileges = CO.priv_execute };
+            graph.add(.{ .grantor = parent.owner, .grantee = CO.public_role,
+                .flags = if (parent.flags & CO.routine_default_public != 0) CO.priv_execute else 0, .options = 0 });
+            graph.add(.{ .grantor = parent.owner, .grantee = parent.owner,
+                .flags = parent.flags & CO.priv_execute, .options = parent.grant_flags });
+            for (&self.catalog_objects.items) |*entry| {
+                if (entry.kind != .routine_default_acl or entry.target != parent.owner or entry.oid != 0 or !O.visible(entry, snap)) continue;
+                graph.add(.{ .grantor = parent.owner, .grantee = entry.grantee, .flags = entry.flags, .options = entry.grant_flags });
+            }
+            return self.executeAclCell(edges.len, graph, snap, values);
+        }
+
         /// CREATE [OR REPLACE] FUNCTION / PROCEDURE: validates the signature
         /// and optionally analyzes the quoted body before writing its version.
         fn createRoutine(self: *Self, slot: u16, definition: *const R.CreateRoutine, snap: Snapshot) Error!void {
@@ -12498,16 +12547,16 @@ pub fn Database(comptime config: Config) type {
                 }
             }
             const owner = if (existing) |old| self.objects.routines[old].owner else self.session.role;
-            if (self.catalog_objects.pendingReference(owner, snap)) |other| return self.objectPark(slot, other);
+            try self.checkLargeAclRole(slot, owner, snap);
             var latest = snap;
             latest.csn = self.csn;
             if (self.catalog_objects.roleName(owner, latest) == null) return error.SerializationFailure;
             if (definition.return_oid == tg.trigger_oid and (definition.language == 0 or definition.arg_count != 0)) return error.InvalidFunctionDefinition;
             if (self.sessionState().values.check_function_bodies) try self.validateRoutine(definition, snap);
+            const acl: RC.ExecuteAcl = if (existing) |old| self.objects.routines[old].acl else try self.newRoutineAcl(slot, owner, snap);
             try self.reserveWrites(slot, 2);
             const index = try self.objectSlot(.routine);
             const oid = if (existing) |old| self.objects.routines[old].oid else try self.takeOid();
-            const acl: RC.ExecuteAcl = if (existing) |old| self.objects.routines[old].acl else .{};
             if (existing) |old| try self.dropObject(slot, .routine, old, snap);
             const item = &self.objects.routines[index];
             item.* = .{ .oid = oid, .namespace = namespace, .owner = owner, .acl = acl, .name = definition.name, .kind = kind, .language = definition.language, .volatility = definition.volatility, .strict = definition.strict, .arg_count = definition.arg_count, .return_oid = definition.return_oid, .return_typmod = definition.return_typmod, .body = definition.body };

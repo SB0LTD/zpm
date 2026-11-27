@@ -100,9 +100,16 @@ mixed function/procedure targets. CREATE accepts unqualified or public-qualified
 names, as do CALL, DROP and expression calls. An explicit public qualifier
 resolves user routines before built-in name classification. Empty search paths
 do not implicitly search public; explicit qualifiers still work. Other
-namespaces, ALL ROUTINES IN SCHEMA and routine default ACLs remain
+namespaces and ALL ROUTINES IN SCHEMA remain
 open. CREATE/DROP and privilege changes return 25006 in read-only transactions;
 read-only CALL/DO remain available.
+
+Global ALTER DEFAULT PRIVILEGES ON FUNCTIONS/ROUTINES supports EXECUTE,
+PUBLIC, grant options and FOR ROLE/USER lists for future functions/procedures.
+Defaults are taken from the actual creator, with committed catalog visibility
+and the creator's own prior changes. Existing objects and OR REPLACE keep their
+ACL. Per-schema defaults remain unsupported. The TDD checkpoint records current
+qualification and remaining privilege-family scope.
 
 `pg_proc.proacl` is a typed ACL array rendered in grant-dependency order, using
 caller-owned value storage for ACLs larger than an inline cell. Every edge retains

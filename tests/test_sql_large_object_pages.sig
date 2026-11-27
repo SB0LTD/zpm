@@ -697,6 +697,40 @@ fn fileExecuteLists() !void {
     try list_checkpoint.execute("RESET ROLE", &result);
 }
 
+var routine_default_db: DB = .{};
+var routine_default_copy: DB = .{};
+var routine_default_arena: Arena = .{};
+var routine_default_copy_arena: Arena = .{};
+
+fn routineDefaultCheckpoint() !void {
+    try routine_default_arena.bind(&routine_default_db);
+    var result: DB.Result = .{};
+    try routine_default_db.execute("CREATE ROLE default_member", &result);
+    try routine_default_db.execute("CREATE ROLE default_recipient", &result);
+    try routine_default_db.execute("ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC", &result);
+    try routine_default_db.execute("ALTER DEFAULT PRIVILEGES GRANT EXECUTE ON ROUTINES TO default_member WITH GRANT OPTION", &result);
+    var image: ImageBuffer = .{};
+    var wal: [8192]u8 = undefined;
+    try DB.BaseSnapshot.write(&routine_default_db, &image, &wal);
+    try expect(std.mem.eql(u8, image.bytes[0..8], "RSBASE09"));
+    try routine_default_copy_arena.bind(&routine_default_copy);
+    try DB.BaseSnapshot.restore(&routine_default_copy, &image, routine_default_db.csn, &wal, &replay_scratch);
+    try routine_default_copy.execute("CREATE FUNCTION restored_default() RETURNS INT LANGUAGE SQL AS 'SELECT 7'", &result);
+    try routine_default_copy.execute("SET ROLE default_member", &result);
+    try routine_default_copy.execute("SELECT restored_default()", &result);
+    try expect(result.rows[0].cells[0].integer == 7);
+    try routine_default_copy.execute("GRANT EXECUTE ON FUNCTION restored_default() TO default_recipient", &result);
+    try routine_default_copy.execute("RESET ROLE", &result);
+    try routine_default_copy.execute("SET ROLE default_recipient", &result);
+    try routine_default_copy.execute("SELECT restored_default()", &result);
+    try expect(result.rows[0].cells[0].integer == 7);
+    try routine_default_copy.execute("RESET ROLE", &result);
+    // The existing compact format still rejects live routines explicitly.
+    var unsupported: ImageBuffer = .{};
+    if (DB.BaseSnapshot.write(&routine_default_copy, &unsupported, &wal)) |_| return error.RoutineImageSilentlyDropped else |err| try expect(err == error.SnapshotUnsupportedState);
+    try expect(unsupported.used == 0);
+}
+
 pub fn main(init: std.process.Init) !void {
     try snapshotAndSparseRead();
     try atomicCapacityFailure();
@@ -709,6 +743,7 @@ pub fn main(init: std.process.Init) !void {
     try fileTransfers();
     try fileExecuteGrants();
     try fileExecuteLists();
+    try routineDefaultCheckpoint();
     var line: [160]u8 = undefined;
     const report = try std.fmt.bufPrint(&line, "{{\"suite\":\"sql-large-object-pages\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, report);
