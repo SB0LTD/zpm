@@ -908,7 +908,10 @@ pub fn Store(comptime Raw: type) type {
                     self.settings.transaction_timeout_ms == 0 and !self.pending.active and !self.running_statement and self.read_context==null;
             }
             fn detachedIdentity(self: *const Connection) bool {
-                if (comptime has_engine_session) return self.engine_session.values.role == 0 and self.engine_session.sessionUser() == 10;
+                // A search_path over user schemas resolves names on the
+                // serialized path (ddl-dml, wave 4).
+                if (comptime has_engine_session) return self.engine_session.values.role == 0 and self.engine_session.sessionUser() == 10 and
+                    self.engine_session.values.simplePath();
                 return true;
             }
             /// No global Raw.session installation or mutable zone lookup hook.
@@ -942,7 +945,8 @@ pub fn Store(comptime Raw: type) type {
                     self.store.max_query_work != 0 or self.settings.statement_timeout_ms != 0 or
                     self.settings.lock_timeout_ms != 0 or self.settings.xml_document or self.settings.date_order != .mdy or
                     !same(self.settings.timeZone(), "UTC") or settings.isolation != .read_committed or
-                    settings.read_only or settings.deferrable or !same(settings.search_path.slice(), "\"$user\", public")) return false;
+                    settings.read_only or settings.deferrable or !same(settings.search_path.slice(), "\"$user\", public") or
+                    !same(settings.text_search_config.slice(), "pg_catalog.english")) return false;
                 for (&settings.custom) |*entry| if (entry.used) return false;
                 return true;
             }

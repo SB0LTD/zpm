@@ -410,3 +410,235 @@ pub fn formatMac(value: *const Mac, buffer: []u8) []const u8 {
     }
     return buffer[0..at];
 }
+
+// ---- B11 wave 4 (types-ext): macaddr8 and inet arithmetic ------------------------
+
+pub const Mac8 = [8]u8;
+
+/// macaddr8_in (mac8.c): pairs of hex digits, optionally separated by one
+/// consistent ':' '-' or '.'; six bytes become EUI-64 with FF:FE inserted.
+/// Leading spaces are skipped; after six or eight bytes only spaces may
+/// follow, and a single trailing character after the last pair is
+/// ignored as by PostgreSQL's two-character scan.
+pub fn parseMac8(input: []const u8) Error!Mac8 {
+    var at: usize = 0;
+    while (at < input.len and space(input[at])) at += 1;
+    var bytes: [8]u8 = undefined;
+    var count: usize = 0;
+    var separator: u8 = 0;
+    while (at + 1 < input.len) {
+        const high = hexValue(input[at]) orelse return error.InvalidTextRepresentation;
+        const low = hexValue(input[at + 1]) orelse return error.InvalidTextRepresentation;
+        at += 2;
+        if (count == 8) return error.InvalidTextRepresentation;
+        bytes[count] = high << 4 | low;
+        count += 1;
+        if (at < input.len and (input[at] == ':' or input[at] == '-' or input[at] == '.')) {
+            if (separator == 0) {
+                separator = input[at];
+            } else if (separator != input[at]) return error.InvalidTextRepresentation;
+            at += 1;
+        }
+        if ((count == 6 or count == 8) and at < input.len and space(input[at])) {
+            while (at < input.len and space(input[at])) at += 1;
+            if (at < input.len) return error.InvalidTextRepresentation;
+        }
+    }
+    if (count == 6) return .{ bytes[0], bytes[1], bytes[2], 0xff, 0xfe, bytes[3], bytes[4], bytes[5] };
+    if (count != 8) return error.InvalidTextRepresentation;
+    return bytes;
+}
+
+pub fn formatMac8(value: *const Mac8, buffer: []u8) []const u8 {
+    const alphabet = "0123456789abcdef";
+    var at: usize = 0;
+    for (value, 0..) |byte, index| {
+        if (index != 0) {
+            buffer[at] = ':';
+            at += 1;
+        }
+        buffer[at] = alphabet[byte >> 4];
+        buffer[at + 1] = alphabet[byte & 15];
+        at += 2;
+    }
+    return buffer[0..at];
+}
+
+/// macaddrtomacaddr8: FF:FE in the middle.
+pub fn mac8FromMac(value: *const Mac) Mac8 {
+    return .{ value[0], value[1], value[2], 0xff, 0xfe, value[3], value[4], value[5] };
+}
+
+/// macaddr8tomacaddr: only EUI-64 addresses with FF:FE convert (22003).
+pub fn macFromMac8(value: *const Mac8) Error!Mac {
+    if (value[3] != 0xff or value[4] != 0xfe) return error.NumericValueOutOfRange;
+    return .{ value[0], value[1], value[2], value[5], value[6], value[7] };
+}
+
+/// inet + int8 / inet - int8 (internal_inetpl): 22003 when the address
+/// leaves its family's range. The result is inet with the same netmask.
+pub fn add(value: *const Inet, addend_in: i64) Error!Inet {
+    var out = value.*;
+    out.cidr = false;
+    var addend = addend_in;
+    var carry: i32 = 0;
+    var index = value.size();
+    while (index > 0) {
+        index -= 1;
+        carry = @as(i32, value.address[index]) + @as(i32, @intCast(addend & 0xff)) + carry;
+        out.address[index] = @intCast(carry & 0xff);
+        carry >>= 8;
+        addend &= ~@as(i64, 0xff);
+        addend = @divTrunc(addend, 0x100);
+    }
+    if (!((addend == 0 and carry == 0) or (addend == -1 and carry == 1))) return error.NumericValueOutOfRange;
+    return out;
+}
+
+/// inet - inet (inetmi): an int8 in two's complement over the address
+/// bytes; different families are 22023, a wider result is 22003.
+pub fn difference(a: *const Inet, b: *const Inet) Error!i64 {
+    if (a.family != b.family) return error.InvalidParameterValue;
+    var result: u64 = 0;
+    var carry: u32 = 1;
+    var byte: usize = 0;
+    var index = a.size();
+    while (index > 0) {
+        index -= 1;
+        carry = @as(u32, a.address[index]) + (~@as(u32, b.address[index]) & 0xff) + carry;
+        const low: u8 = @truncate(carry);
+        if (byte < 8) {
+            result |= @as(u64, low) << @intCast(byte * 8);
+        } else {
+            const negative = result >> 63 != 0;
+            if (if (negative) low != 0xff else low != 0) return error.NumericValueOutOfRange;
+        }
+        carry >>= 8;
+        byte += 1;
+    }
+    if (carry == 0 and byte < 8) result |= ~@as(u64, 0) << @intCast(byte * 8);
+    return @bitCast(result);
+}
+
+pub const Bitwise = enum { both, either, not };
+
+/// inet & inet, inet | inet (same family, else 22023; the longer netmask)
+/// and ~inet; results are inet.
+pub fn bitwise(kind: Bitwise, a: *const Inet, b: *const Inet) Error!Inet {
+    if (kind != .not and a.family != b.family) return error.InvalidParameterValue;
+    var out = a.*;
+    out.cidr = false;
+    for (0..a.size()) |index| out.address[index] = switch (kind) {
+        .both => a.address[index] & b.address[index],
+        .either => a.address[index] | b.address[index],
+        .not => ~a.address[index],
+    };
+    if (kind != .not) out.bits = @max(a.bits, b.bits);
+    return out;
+}
+
+/// hostmask(): the host bits set, full length.
+pub fn hostmask(value: *const Inet) Inet {
+    var out: Inet = .{ .family = value.family, .bits = value.maxBits() };
+    var bit: usize = value.bits;
+    while (bit < @as(usize, value.size()) * 8) : (bit += 1) out.address[bit / 8] |= @as(u8, 0x80) >> @intCast(bit % 8);
+    return out;
+}
+
+/// set_masklen(inet|cidr, int): -1 is the full length, others outside
+/// 0..max are 22023; a cidr clears the bits right of the new mask.
+pub fn setMasklen(value: *const Inet, bits_in: i64) Error!Inet {
+    const bits: i64 = if (bits_in == -1) value.maxBits() else bits_in;
+    if (bits < 0 or bits > value.maxBits()) return error.InvalidParameterValue;
+    var out = value.*;
+    out.bits = @intCast(bits);
+    if (value.cidr) out = network(&out);
+    return out;
+}
+
+/// inet_merge: the smallest cidr containing both (22023 across families).
+pub fn merge(a: *const Inet, b: *const Inet) Error!Inet {
+    if (a.family != b.family) return error.InvalidParameterValue;
+    var common: usize = 0;
+    const limit = @min(a.bits, b.bits);
+    while (common < limit) : (common += 1) {
+        const mask = @as(u8, 0x80) >> @intCast(common % 8);
+        if ((a.address[common / 8] & mask) != (b.address[common / 8] & mask)) break;
+    }
+    var out = a.*;
+    out.bits = @intCast(common);
+    return network(&out);
+}
+
+/// abbrev(cidr) (inet_cidr_ntop): IPv4 prints the octets the mask covers;
+/// IPv6 the words it covers, with :: for the longest zero run.
+pub fn abbrevCidr(value: *const Inet, buffer: []u8) []const u8 {
+    var out: Out = .{ .buffer = buffer };
+    const bits: usize = value.bits;
+    if (value.family == 4) {
+        if (bits == 0) out.byte('0');
+        var octet: usize = 0;
+        while (octet < bits / 8) : (octet += 1) {
+            out.decimal(value.address[octet]);
+            if (octet + 1 < bits / 8) out.byte('.');
+        }
+        const rest = bits % 8;
+        if (rest != 0) {
+            if (out.len != 0) out.byte('.');
+            const mask: u8 = @truncate(@as(u16, 0xff00) >> @intCast(rest));
+            out.decimal(value.address[octet] & mask);
+        }
+    } else if (bits == 0) {
+        out.byte(':');
+        out.byte(':');
+    } else {
+        var bytes = value.address;
+        const kept = (bits + 7) / 8;
+        for (kept..16) |index| bytes[index] = 0;
+        if (bits % 8 != 0) bytes[kept - 1] &= @truncate(@as(u16, 0xff00) >> @intCast(bits % 8));
+        var words = (bits + 15) / 16;
+        if (words == 1) words = 2;
+        var zero_start: usize = 0;
+        var zero_len: usize = 0;
+        var run_start: usize = 0;
+        var run_len: usize = 0;
+        for (0..words) |word| {
+            if (bytes[word * 2] | bytes[word * 2 + 1] == 0) {
+                if (run_len == 0) run_start = word;
+                run_len += 1;
+            } else if (run_len != 0 and zero_len < run_len) {
+                zero_start = run_start;
+                zero_len = run_len;
+                run_len = 0;
+            }
+        }
+        if (run_len != 0 and zero_len < run_len) {
+            zero_start = run_start;
+            zero_len = run_len;
+        }
+        const ipv4 = zero_len != words and zero_start == 0 and (zero_len == 6 or (zero_len == 5 and bytes[10] == 0xff and bytes[11] == 0xff) or
+            (zero_len == 7 and bytes[14] != 0 and bytes[15] != 1));
+        var word: usize = 0;
+        while (word < words) : (word += 1) {
+            if (zero_len != 0 and word >= zero_start and word < zero_start + zero_len) {
+                if (word == zero_start) out.byte(':');
+                if (word == words - 1) out.byte(':');
+                continue;
+            }
+            if (ipv4 and word > 5) {
+                out.byte(if (word == 6) ':' else '.');
+                out.decimal(bytes[word * 2]);
+                if (word != 7 or bits > 120) {
+                    out.byte('.');
+                    out.decimal(bytes[word * 2 + 1]);
+                }
+            } else {
+                if (out.len != 0) out.byte(':');
+                out.hex(@as(u16, bytes[word * 2]) << 8 | bytes[word * 2 + 1]);
+            }
+        }
+    }
+    out.byte('/');
+    out.decimal(@intCast(bits));
+    return buffer[0..out.len];
+}

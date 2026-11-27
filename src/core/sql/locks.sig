@@ -120,7 +120,10 @@ pub fn Locks(comptime config: types.Config) type {
 
         /// An advisory holder: `session` owns it; transaction-level holders
         /// also name their transaction slot. `count` acquisitions.
-        pub const AdvisoryHolder = struct { session: u64 = 0, slot: u16 = 0, xact: bool = false, exclusive: bool = false, count: u32 = 0 };
+        pub const AdvisoryHolder = struct { session: u64 = 0, slot: u16 = 0, xact: bool = false, exclusive: bool = false, count: u32 = 0,
+            /// Session-level acquisitions of the running statement `statement`
+            /// (its epoch << 32 | command id), undone when it parks (B11 wave 4).
+            statement: u64 = 0, statement_count: u32 = 0 };
 
         pub const Advisory = struct {
             used: bool = false,
@@ -372,6 +375,42 @@ pub fn Locks(comptime config: types.Config) type {
                 return true;
             }
             return false;
+        }
+
+        /// Notes a session-level acquisition of table entry `index` by the
+        /// running statement `statement` (B11 wave 4).
+        pub fn noteStatementAdvisory(self: *Self, index: usize, session: u64, exclusive: bool, statement: u64) void {
+            if (index >= config.advisory_locks) return;
+            const entry = &self.advisory[index];
+            for (entry.holders[0..entry.count]) |*holder| {
+                if (holder.xact or holder.session != session or holder.exclusive != exclusive) continue;
+                if (holder.statement != statement) {
+                    holder.statement = statement;
+                    holder.statement_count = 0;
+                }
+                holder.statement_count += 1;
+                return;
+            }
+        }
+
+        /// A statement that parks in a blocking pg_advisory_lock re-runs from
+        /// the start when re-delivered: its earlier session-level
+        /// acquisitions are undone so they are counted once.
+        pub fn undoStatementAdvisory(self: *Self, session: u64, statement: u64) void {
+            for (&self.advisory) |*entry| {
+                if (!entry.used) continue;
+                var position: usize = 0;
+                while (position < entry.count) {
+                    const holder = &entry.holders[position];
+                    if (holder.xact or holder.session != session or holder.statement != statement or holder.statement_count == 0) {
+                        position += 1;
+                        continue;
+                    }
+                    holder.count -|= holder.statement_count;
+                    holder.statement_count = 0;
+                    if (holder.count == 0) dropHolder(entry, position) else position += 1;
+                }
+            }
         }
 
         /// pg_advisory_unlock_all / session end: every session-level lock.

@@ -179,6 +179,9 @@ pub const Config = struct {
     /// Savepoint levels of one transaction that can change engine
     /// settings (each keeps the level's starting values).
     setting_snapshots: usize = 4,
+    /// Schemas the search path resolves (ddl-dml, wave 4): existing schemas
+    /// of search_path beyond this many are not searched.
+    search_path_schemas: usize = 8,
     /// LISTEN channels per session (also its pending LISTEN/UNLISTEN
     /// actions), listening sessions, committed notifications not yet read
     /// by every listener, uncommitted NOTIFY entries of all transactions
@@ -235,6 +238,13 @@ pub const Config = struct {
     /// ProgramLimitExceeded (54000). Bracket sets and their non-ASCII
     /// ranges are sized from it.
     regex_states: usize = 512,
+    /// Statements running inside an executing statement at once (B11 wave
+    /// 4, nested.sig): the SQL of trigger functions and of functions called
+    /// from expressions, and rule actions. Deeper is StackDepthExceeded
+    /// (54001). Each one keeps the suspended statement's node pool, plans
+    /// and expansion text in the free query workspace (WorkspaceCapacity,
+    /// 54000, when they do not fit).
+    nested_statements: usize = 8,
 };
 
 pub fn workRows(comptime config: Config) usize {
@@ -530,6 +540,33 @@ pub const Error = error{
     /// SQLSTATE 2200C: more than two escape-double-quote separators in a
     /// SIMILAR TO pattern (B11 text).
     InvalidEscapeCharacterUse,
+    // Routines (B11 wave 4, routines-sig lane).
+    /// SQLSTATE P0004: a PL/pgSQL ASSERT whose condition is false or NULL.
+    AssertFailure,
+    /// SQLSTATE 0Z002: GET STACKED DIAGNOSTICS outside an exception handler.
+    StackedDiagnosticsAccessedWithoutActiveHandler,
+    /// SQLSTATE 2D000: COMMIT / ROLLBACK inside a procedure where it is
+    /// not allowed (a transaction block, or below a function call).
+    InvalidTransactionTermination,
+    /// SQLSTATE 2200T: XMLPI target "xml" or content with "?>" (B11 wave 4).
+    InvalidXmlProcessingInstruction,
+    /// SQLSTATE 2200S: XMLCOMMENT text with "--" or a trailing "-".
+    InvalidXmlComment,
+    /// SQLSTATE 27000: an UPDATE or DELETE target row was already changed
+    /// by a statement its own triggers or functions ran (B11 wave 4).
+    TriggeredDataChangeViolation,
+    /// SQLSTATE 44000: a new row of an auto-updatable view violates its
+    /// WITH CHECK OPTION (B11 wave 4).
+    WithCheckOptionViolation,
+    /// SQLSTATE 23001: a key an ON DELETE / ON UPDATE RESTRICT foreign key
+    /// still references when the statement ends (ddl-dml, wave 4).
+    RestrictViolation,
+    /// SQLSTATE 22030: a duplicate key where JSON object keys must be
+    /// unique (wave 4 text-json).
+    DuplicateJsonObjectKeyValue,
+    /// SQLSTATE 2200F: an empty string where one is not allowed
+    /// (array_to_tsvector lexemes; wave 4 text-json).
+    ZeroLengthCharacterString,
 };
 
 /// Caller-owned execution accounting and interrupt polling. This is independent
@@ -590,12 +627,21 @@ pub const Dialect = enum { postgres, mysql, tds };
 /// `integer32` int4 (INTEGER); the others are named after PostgreSQL.
 /// The unnamed values are array types: the element's ordinal with
 /// array_bit set (arrayData/elementData); there are no arrays of arrays.
-pub const DataType = enum(u8) { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, mysql_bigint_unsigned, pg_internal_char, aclitem, xid, regproc, _ };
+pub const DataType = enum(u8) { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, mysql_bigint_unsigned, pg_internal_char, aclitem, xid, regproc,
+    // B11 wave-4 types-ext: the void pseudo-type (function results only).
+    void,
+    macaddr8,
+    lseg, line, path, polygon, circle,
+    int4multirange, int8multirange, nummultirange, datemultirange, tsmultirange, tstzmultirange, _ };
 
 /// Bound expression type. `unknown` is an untyped string or NULL literal
 /// that has not been resolved by context yet. Unnamed values are array
 /// types, encoded like DataType's (arrayType/elementType).
-pub const Type = enum(u8) { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, mysql_bigint_unsigned, pg_internal_char, aclitem, xid, regproc, _ };
+pub const Type = enum(u8) { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, mysql_bigint_unsigned, pg_internal_char, aclitem, xid, regproc,
+    void,
+    macaddr8,
+    lseg, line, path, polygon, circle,
+    int4multirange, int8multirange, nummultirange, datemultirange, tsmultirange, tstzmultirange, _ };
 
 /// Array types set this bit over the element type's ordinal.
 pub const array_bit: u8 = 0x80;
@@ -611,7 +657,7 @@ pub const catalog_anyarray_oid: u32 = 2277;
 /// The array type of a named element type (null for an array).
 pub fn arrayData(element: DataType) ?DataType {
     const raw = @intFromEnum(element);
-    if (element == .mysql_bigint_unsigned or raw >= data_type_count) return null;
+    if (element == .mysql_bigint_unsigned or element == .void or raw >= data_type_count) return null;
     return @enumFromInt(raw | array_bit);
 }
 
@@ -620,12 +666,12 @@ pub fn elementData(data_type: DataType) ?DataType {
     const raw = @intFromEnum(data_type);
     if (raw < array_bit or raw & ~array_bit >= data_type_count) return null;
     const element: DataType = @enumFromInt(raw & ~array_bit);
-    return if (element == .mysql_bigint_unsigned) null else element;
+    return if (element == .mysql_bigint_unsigned or element == .void) null else element;
 }
 
 pub fn arrayType(element: Type) ?Type {
     const raw = @intFromEnum(element);
-    if (element == .unknown or element == .mysql_bigint_unsigned or raw >= type_count) return null;
+    if (element == .unknown or element == .mysql_bigint_unsigned or element == .void or raw >= type_count) return null;
     return @enumFromInt(raw | array_bit);
 }
 
@@ -633,11 +679,20 @@ pub fn elementType(ty: Type) ?Type {
     const raw = @intFromEnum(ty);
     if (raw < array_bit or raw & ~array_bit >= type_count or raw & ~array_bit == 0) return null;
     const element: Type = @enumFromInt(raw & ~array_bit);
-    return if (element == .mysql_bigint_unsigned) null else element;
+    return if (element == .mysql_bigint_unsigned or element == .void) null else element;
 }
 
 pub fn isArray(ty: Type) bool {
     return elementType(ty) != null;
+}
+
+/// Types of the B11 wave-4 types-ext lane without a btree or hash
+/// operator class: ORDER BY, GROUP BY and DISTINCT over them are 42883.
+pub fn unorderable(ty: Type) bool {
+    return switch (ty) {
+        .void, .lseg, .line, .path, .polygon, .circle => true,
+        else => false,
+    };
 }
 
 /// The subtype of a built-in range type (null otherwise).
@@ -721,6 +776,19 @@ pub fn dataTypeOf(ty: Type) DataType {
         .tsquery => .tsquery,
         .pg_internal_char => .pg_internal_char,
         .aclitem => .aclitem,
+        .void => .void,
+        .macaddr8 => .macaddr8,
+        .lseg => .lseg,
+        .line => .line,
+        .path => .path,
+        .polygon => .polygon,
+        .circle => .circle,
+        .int4multirange => .int4multirange,
+        .int8multirange => .int8multirange,
+        .nummultirange => .nummultirange,
+        .datemultirange => .datemultirange,
+        .tsmultirange => .tsmultirange,
+        .tstzmultirange => .tstzmultirange,
         _ => if (elementType(ty)) |element| arrayData(dataTypeOf(element)).? else .text,
     };
 }
@@ -776,6 +844,19 @@ pub fn typeOfData(data_type: DataType) Type {
         .tsquery => .tsquery,
         .pg_internal_char => .pg_internal_char,
         .aclitem => .aclitem,
+        .void => .void,
+        .macaddr8 => .macaddr8,
+        .lseg => .lseg,
+        .line => .line,
+        .path => .path,
+        .polygon => .polygon,
+        .circle => .circle,
+        .int4multirange => .int4multirange,
+        .int8multirange => .int8multirange,
+        .nummultirange => .nummultirange,
+        .datemultirange => .datemultirange,
+        .tsmultirange => .tsmultirange,
+        .tstzmultirange => .tstzmultirange,
         _ => if (elementData(data_type)) |element| arrayType(typeOfData(element)).? else .text,
     };
 }
@@ -887,6 +968,19 @@ fn baseInfo(data_type: DataType) TypeInfo {
         .regtype => .{ .oid = 2206, .name = "regtype", .len = 4, .category = 'N', .array = 2211 },
         .tsvector => .{ .oid = 3614, .name = "tsvector", .len = -1, .category = 'U', .array = 3643 },
         .tsquery => .{ .oid = 3615, .name = "tsquery", .len = -1, .category = 'U', .array = 3645 },
+        .void => .{ .oid = 2278, .name = "void", .len = 4, .category = 'P', .array = 0 },
+        .macaddr8 => .{ .oid = 774, .name = "macaddr8", .len = 8, .category = 'U', .array = 775 },
+        .lseg => .{ .oid = 601, .name = "lseg", .len = 32, .category = 'G', .array = 1018, .alignment = 'd' },
+        .line => .{ .oid = 628, .name = "line", .len = 24, .category = 'G', .array = 629, .alignment = 'd' },
+        .path => .{ .oid = 602, .name = "path", .len = -1, .category = 'G', .array = 1019, .alignment = 'd' },
+        .polygon => .{ .oid = 604, .name = "polygon", .len = -1, .category = 'G', .array = 1027, .alignment = 'd' },
+        .circle => .{ .oid = 718, .name = "circle", .len = 24, .category = 'G', .array = 719, .alignment = 'd' },
+        .int4multirange => .{ .oid = 4451, .name = "int4multirange", .len = -1, .category = 'R', .array = 6150 },
+        .int8multirange => .{ .oid = 4536, .name = "int8multirange", .len = -1, .category = 'R', .array = 6157, .alignment = 'd' },
+        .nummultirange => .{ .oid = 4532, .name = "nummultirange", .len = -1, .category = 'R', .array = 6151 },
+        .datemultirange => .{ .oid = 4535, .name = "datemultirange", .len = -1, .category = 'R', .array = 6155 },
+        .tsmultirange => .{ .oid = 4533, .name = "tsmultirange", .len = -1, .category = 'R', .array = 6152, .alignment = 'd' },
+        .tstzmultirange => .{ .oid = 4534, .name = "tstzmultirange", .len = -1, .category = 'R', .array = 6153, .alignment = 'd' },
         _ => .{ .oid = 0, .name = "", .len = -1, .category = 'A', .array = 0 },
     };
 }
@@ -970,6 +1064,19 @@ fn baseSqlName(data_type: DataType) []const u8 {
         .tsquery => "tsquery",
         .aclitem => "aclitem",
         .pg_internal_char => "\"char\"",
+        .void => "void",
+        .macaddr8 => "macaddr8",
+        .lseg => "lseg",
+        .line => "line",
+        .path => "path",
+        .polygon => "polygon",
+        .circle => "circle",
+        .int4multirange => "int4multirange",
+        .int8multirange => "int8multirange",
+        .nummultirange => "nummultirange",
+        .datemultirange => "datemultirange",
+        .tsmultirange => "tsmultirange",
+        .tstzmultirange => "tstzmultirange",
         _ => "",
     };
 }
@@ -1019,6 +1126,14 @@ pub fn typeInputName(data_type: DataType) []const u8 {
         .tsquery => "tsqueryin",
         .aclitem => "aclitemin",
         .pg_internal_char => "charin",
+        .void => "void_in",
+        .macaddr8 => "macaddr8_in",
+        .lseg => "lseg_in",
+        .line => "line_in",
+        .path => "path_in",
+        .polygon => "poly_in",
+        .circle => "circle_in",
+        .int4multirange, .int8multirange, .nummultirange, .datemultirange, .tsmultirange, .tstzmultirange => "multirange_in",
         _ => "array_in",
     };
 }
@@ -1290,7 +1405,9 @@ pub fn Values(comptime config: Config) type {
         /// `jsonb` holds the canonical binary (jsonb.sig) in a Text.
         /// varchar is `text`; `bpchar` (CHAR(n)) holds its padded bytes and
         /// compares/hashes without trailing spaces.
-        pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar, uuid, bytea, time, timetz, bits, money, pg_lsn, xid8, array, range, inet, macaddr, point, box, xml, regtype, tsvector, tsquery, pg_internal_char, regproc };
+        pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar, uuid, bytea, time, timetz, bits, money, pg_lsn, xid8, array, range, inet, macaddr, point, box, xml, regtype, tsvector, tsquery, pg_internal_char, regproc,
+            // B11 wave-4 types-ext.
+            macaddr8, geo, multirange };
 
         pub const Cell = union(CellTag) {
             null_value: void,
@@ -1339,6 +1456,12 @@ pub fn Values(comptime config: Config) type {
             tsquery: Text,
             pg_internal_char: u8,
             regproc: u32,
+            /// macaddr8: eight bytes (network.sig).
+            macaddr8: network.Mac8,
+            /// lseg, line, path, polygon and circle (geometry.sig layout).
+            geo: Text,
+            /// Built-in multiranges (multirange.sig layout).
+            multirange: Text,
         };
 
         /// Range values of these cells (range.sig).
@@ -1346,6 +1469,9 @@ pub fn Values(comptime config: Config) type {
 
         /// Array values of these cells (array.sig).
         pub const Arrays = array_module.Arrays(@This());
+
+        /// Multirange values of these cells (multirange.sig).
+        pub const Multiranges = @import("multirange.sig").Multiranges(@This());
 
         pub const Row = struct {
             cells: [config.columns]Cell = @splat(.null_value),
@@ -1404,6 +1530,11 @@ pub fn Values(comptime config: Config) type {
                 .tsvector => .tsvector,
                 .tsquery => .tsquery,
                 .pg_internal_char => .pg_internal_char,
+                // void values are the empty text (void_out).
+                .void => .text,
+                .macaddr8 => .macaddr8,
+                .lseg, .line, .path, .polygon, .circle => .geo,
+                .int4multirange, .int8multirange, .nummultirange, .datemultirange, .tsmultirange, .tstzmultirange => .multirange,
                 _ => .array,
             };
         }
@@ -1443,6 +1574,10 @@ pub fn Values(comptime config: Config) type {
                 .range => |*value| Ranges.compare(value.slice(), right.range.slice()),
                 .inet => |*value| network.compare(value, &right.inet),
                 .macaddr => |*value| bytesOrder(value, &right.macaddr),
+                .macaddr8 => |*value| bytesOrder(value, &right.macaddr8),
+                // No ordering operators (42883); bytes keep internal equality.
+                .geo => |*value| bytesOrder(value.slice(), right.geo.slice()),
+                .multirange => |*value| Multiranges.compare(value.slice(), right.multirange.slice()),
                 .point => |value| geometric.comparePoints(value, right.point),
                 .box => |value| geometric.compareBoxes(value, right.box),
                 .xml => |*value| bytesOrder(value.slice(), right.xml.slice()),
@@ -1527,6 +1662,15 @@ pub fn Values(comptime config: Config) type {
                     mix(&code, tag);
                     for (bytes) |byte| code = (code ^ byte) *% 1099511628211;
                 },
+                .macaddr8 => |*bytes| {
+                    mix(&code, tag);
+                    for (bytes) |byte| code = (code ^ byte) *% 1099511628211;
+                },
+                .geo => |*bytes| {
+                    mix(&code, tag);
+                    for (bytes.slice()) |byte| code = (code ^ byte) *% 1099511628211;
+                },
+                .multirange => |*set| return wordHash(Multiranges.hash(set.slice()), tag),
                 .point => |point| {
                     mix(&code, tag);
                     mix(&code, @bitCast(normalFloat(point.x)));

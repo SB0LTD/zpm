@@ -202,8 +202,9 @@ fn collectionAggregates() !void {
     try same(try metadata(&result), "array_agg:1015");
     // Errors: untyped polymorphic input (42804), unequal sub-arrays (2202E),
     // a NULL sub-array (22004), ORDER BY on a non-aggregate (42809),
-    // DISTINCT with an ORDER BY outside the arguments (42P10), window forms
-    // and operators without a sorted input (0A000).
+    // DISTINCT with an ORDER BY outside the arguments (42P10), and ORDER BY
+    // inside a window aggregate (0A000). array_agg windows and ROLLUP
+    // (types-ext lane, B11 wave 4) are contract-sql-types-ext's.
     try rejects("SELECT array_agg('a')", error.TypeMismatch);
     try rejects("SELECT array_agg(a) FROM (VALUES (ARRAY[1]), (ARRAY[1,2])) AS t(a)", error.ArraySubscriptError);
     try rejects("SELECT array_agg(a) FROM w", error.NullValueNotAllowed);
@@ -211,8 +212,8 @@ fn collectionAggregates() !void {
     try rejects("SELECT lower('A' ORDER BY 1)", error.WrongObjectType);
     try rejects("SELECT array_agg(DISTINCT v ORDER BY id) FROM tdd_a", error.InvalidColumnReference);
     try rejects("SELECT array_agg(v ORDER BY id) OVER () FROM tdd_a", error.UnsupportedStatement);
-    try rejects("SELECT array_agg(v) OVER () FROM tdd_a", error.UnsupportedStatement);
-    try rejects("SELECT g, array_agg(v) FROM tdd_a GROUP BY ROLLUP(g)", error.UnsupportedStatement);
+    try expect("SELECT id, array_agg(v) OVER (ORDER BY id) FROM tdd_a ORDER BY id", "1|{10};2|{10,20};3|{10,20,30};4|{10,20,30,NULL}");
+    try expect("SELECT g, array_agg(v ORDER BY id) FROM tdd_a GROUP BY ROLLUP(g) ORDER BY g NULLS LAST", "1|{10,20};2|{30,NULL};NULL|{10,20,30,NULL}");
     try rejects("SELECT string_agg(id, ',') FROM tdd_a", error.UndefinedFunction);
     try rejects("SELECT string_agg(s) FROM w", error.UndefinedFunction);
     try rejects("SELECT array_agg(j ORDER BY j) FROM w", error.UndefinedFunction);
@@ -438,7 +439,8 @@ fn jsonPath() !void {
     try rejects("SELECT jsonb_path_query_first('\"x\"', '$.double()')", error.NonNumericSqlJsonItem);
     try rejects("SELECT jsonb_path_query_first('\"NaN\"', '$.double()')", error.NonNumericSqlJsonItem);
     try rejects("SELECT jsonb_path_query_first('2.5', '$.boolean()')", error.NonNumericSqlJsonItem);
-    try rejects("SELECT jsonb_path_query_first('{}', '$.keyvalue()')", error.UnsupportedStatement);
+    // keyvalue() and like_regex (wave 4 text-json; native PostgreSQL 18.7).
+    try expect("SELECT jsonb_path_query_first('{}', '$.keyvalue()')", "NULL");
     try rejects("SELECT jsonb_path_query_first('\"2024-01-01\"', '$.datetime()')", error.UnsupportedStatement);
     // .** levels, filters, exists, starts with, comparison semantics.
     try expect("SELECT jsonb_path_query_array('{\"a\":{\"b\":{\"c\":1}}}', '$.**.c'), jsonb_path_query_array('{\"a\":{\"b\":{\"c\":1}}}', '$.**{2}'), jsonb_path_query_array('{\"a\":{\"b\":{\"c\":1}}}', '$.**{last}')", "[1]|[{\"c\": 1}]|[1]");
@@ -446,7 +448,7 @@ fn jsonPath() !void {
     try expect("SELECT jsonb_path_query_array('[{\"a\":1},{\"b\":2}]', '$[*] ? (exists(@.a))'), jsonb_path_query_array('[\"abc\",\"xbc\",1]', '$[*] ? (@ starts with \"ab\")'), jsonb_path_query_array('[1,\"a\",null]', '$[*] ? (@ != 1)'), jsonb_path_query_array('[\"a\",\"c\"]', '$[*] ? (@ < \"b\")')", "[{\"a\": 1}]|[\"abc\"]|[null]|[\"a\"]");
     try expect("SELECT jsonb_path_query_array('[1,2,3]', '$[*] ? (@ > 1 || @ == null)'), jsonb_path_query_array('[1,\"x\"]', '$[*] ? ((@ > 0) is unknown)'), jsonb_path_query_first('[1,2]', '$[*] > 1'), jsonb_path_query_first('[\"x\"]', 'strict $[*] > 1')", "[2, 3]|[\"x\"]|true|null");
     try expect("SELECT jsonb_path_match('[1,2]', 'exists($[*] ? (@ == 2))'), jsonb_path_match('{\"a\":[true]}', '$.a[0]'), jsonb_path_query_first('{\"a\":1}', '$.a == 1'), jsonb_path_query_first('{\"a\":\"1\"}', '$.a == 1')", "t|t|true|null");
-    try rejects("SELECT jsonb_path_exists('\"abc\"', '$ ? (@ like_regex \"a\")')", error.UnsupportedStatement);
+    try expect("SELECT jsonb_path_exists('\"abc\"', '$ ? (@ like_regex \"a\")')", "t");
     try rejects("SELECT jsonb_path_match('[true,false]', '$[*]')", error.SingletonSqlJsonItemRequired);
     try expect("SELECT jsonb_path_match('[1,2]', '$[*] > 0'), jsonb_path_match('[]', '$[*] > 0')", "t|f");
     // Capacities: parsed nodes (54001) and held items (54000).
@@ -492,7 +494,8 @@ fn jsonTable() !void {
     try rejects("SELECT * FROM JSON_TABLE('[{\"a\":[1,2]}]', '$[*]' COLUMNS (a INT PATH '$.a[*]' ERROR ON ERROR)) AS t", error.MoreThanOneSqlJsonItem);
     try rejects("SELECT * FROM JSON_TABLE('[{\"a\":[1]}]', '$[*]' COLUMNS (a INT PATH '$.a' ERROR ON ERROR)) AS t", error.SqlJsonScalarRequired);
     try rejects("SELECT * FROM JSON_TABLE('[{}]', '$[*]' COLUMNS (a INT PATH '$.a' ERROR ON EMPTY ERROR ON ERROR)) AS t", error.NoSqlJsonItem);
-    try expect("SELECT * FROM JSON_TABLE('[{}]', '$[*]' COLUMNS (a INT PATH '$.a' ERROR ON EMPTY, b INT PATH '$.b' ERROR ON EMPTY DEFAULT 3 ON ERROR)) AS t", "NULL|3");
+    // ERROR ON EMPTY raises whatever ON ERROR says (native PostgreSQL 18.7).
+    try rejects("SELECT * FROM JSON_TABLE('[{}]', '$[*]' COLUMNS (a INT PATH '$.a' ERROR ON EMPTY, b INT PATH '$.b' ERROR ON EMPTY DEFAULT 3 ON ERROR)) AS t", error.NoSqlJsonItem);
     try expect("SELECT * FROM JSON_TABLE('[1]', '$[*]' COLUMNS (e1 BOOLEAN EXISTS PATH 'strict $.a', e2 BOOLEAN EXISTS PATH 'strict $.a' TRUE ON ERROR, e3 BOOLEAN EXISTS PATH 'strict $.a' UNKNOWN ON ERROR, e4 INT EXISTS PATH '$', e5 TEXT EXISTS PATH '$.a')) AS t", "f|t|NULL|1|false");
     try rejects("SELECT * FROM JSON_TABLE('[1]', '$[*]' COLUMNS (e BOOLEAN EXISTS PATH 'strict $.a' ERROR ON ERROR)) AS t", error.SqlJsonMemberNotFound);
     // Errors at parse and bind time.
@@ -502,7 +505,8 @@ fn jsonTable() !void {
     try rejects("SELECT * FROM JSON_TABLE('[1]', '$[*]' COLUMNS (v INT EXISTS NULL ON EMPTY)) AS t", error.Syntax);
     try rejects("SELECT * FROM JSON_TABLE('[1]', '$[*]' COLUMNS (v INT TRUE ON ERROR)) AS t", error.Syntax);
     try rejects("SELECT * FROM JSON_TABLE('[1]', '$[*]' COLUMNS (v INT NULL ON ERROR NULL ON EMPTY)) AS t", error.Syntax);
-    try rejects("SELECT * FROM JSON_TABLE(1, '$' COLUMNS (a INT)) AS t", error.TypeMismatch);
+    // A context item of another type cannot be coerced (42846, native 18.7).
+    try rejects("SELECT * FROM JSON_TABLE(1, '$' COLUMNS (a INT)) AS t", error.CannotCoerce);
     try rejects("SELECT * FROM JSON_TABLE('[]', '$' || '' COLUMNS (a INT)) AS t", error.Syntax);
     try rejects("SELECT * FROM JSON_TABLE('[]', '$.' COLUMNS (a INT)) AS t", error.Syntax);
     try rejects("SELECT * FROM JSON_TABLE('[]', '$' COLUMNS (a INT PATH '@')) AS t", error.Syntax);

@@ -32,8 +32,8 @@ OUT = os.path.join(ROOT, ".sm120-sweep")
 MODULES = [
     "--dep", "nvidia", "--dep", "gpu", "--dep", "lfm3_nv_matrix", "--dep", "lfm3_nv_ops", "--dep", "lfm3_kir", "-Mroot=tools/sm120_sweep.sig",
     "--dep", "gpu", "--dep", "quantized_linear", "-Mlfm3_kir=src/core/lfm3_kir.sig",
-    "--dep", "nvidia", "--dep", "adreno", "-Mgpu=src/gpu/gpu.sig",
-    "-Madreno=src/adreno/adreno.sig",
+    "--dep", "nvidia", "--dep", "adreno", "--dep", "amdgpu", "--dep", "lfm3_nv_matrix", "-Mgpu=src/gpu/gpu.sig",
+    "-Madreno=src/adreno/adreno.sig", "-Mamdgpu=src/amdgpu/amdgpu.sig",
     "--dep", "nvidia", "--dep", "quantized_linear", "-Mlfm3_nv_matrix=src/core/lfm3_nv_matrix.sig",
     "--dep", "nvidia", "--dep", "lfm3_executor", "-Mlfm3_nv_ops=src/core/lfm3_nv_ops.sig",
     "--dep", "sig_math", "--dep", "gguf", "--dep", "lfm3_plan", "--dep", "quantized_linear", "--dep", "transformer_ops",

@@ -134,6 +134,43 @@ pub fn Arrays(comptime V: type) type {
             return header_bytes + @as(usize, bytes[1]) * 8;
         }
 
+        /// Offset of the first element (B11 wave 4: item-wise rewrites).
+        pub fn bodyOffset(bytes: []const u8) usize {
+            return bodyStart(bytes);
+        }
+
+        /// The offset after `count` elements starting at `at`; `nulls` is
+        /// set when one of them is NULL.
+        pub fn skipElements(bytes: []const u8, at_in: usize, element: DataType, count: usize, nulls: *bool) usize {
+            var at = at_in;
+            for (0..count) |_| {
+                const flag = bytes[at];
+                at += 1;
+                if (flag == 0) nulls.* = true;
+                if (flag == 1) _ = decode(bytes, &at, element);
+            }
+            return at;
+        }
+
+        /// Compares two runs of `count` elements (array_cmp element order:
+        /// NULL after every value, two NULLs equal).
+        pub fn compareRuns(a: []const u8, a_at: usize, b: []const u8, b_at: usize, element: DataType, count: usize) i8 {
+            var x: Reader = .{ .bytes = a, .element = element, .at = a_at, .total = count };
+            var y: Reader = .{ .bytes = b, .element = element, .at = b_at, .total = count };
+            var p: Cell = undefined;
+            var q: Cell = undefined;
+            while (x.next(&p) and y.next(&q)) {
+                const p_null = p == .null_value;
+                const q_null = q == .null_value;
+                if (p_null and q_null) continue;
+                if (p_null) return 1;
+                if (q_null) return -1;
+                const order = V.compare(&p, &q);
+                if (order != 0) return order;
+            }
+            return 0;
+        }
+
         pub fn writeHeader(out: []u8, layout: *const Shape) Error!usize {
             const len = header_bytes + layout.ndim * @as(usize, 8);
             if (len > out.len) return error.TextCapacity;
@@ -244,7 +281,7 @@ pub fn Arrays(comptime V: type) type {
                     else => try putInt(out, i64, value),
                 },
                 .boolean => |value| try put(out, &.{@intFromBool(value)}),
-                .text, .jsonb, .bpchar, .bytea, .range, .xml, .tsvector, .tsquery => |*text| try putText(out, text.slice()),
+                .text, .jsonb, .bpchar, .bytea, .range, .xml, .tsvector, .tsquery, .geo, .multirange => |*text| try putText(out, text.slice()),
                 .float4 => |value| try putInt(out, u32, @bitCast(value)),
                 .float8 => |value| try putInt(out, u64, @bitCast(value)),
                 .numeric => |*value| {
@@ -276,6 +313,7 @@ pub fn Arrays(comptime V: type) type {
                     try put(out, &value.address);
                 },
                 .macaddr => |*value| try put(out, value),
+                .macaddr8 => |*value| try put(out, value),
                 .regtype, .regproc => |value| try putInt(out, u32, value),
                 .pg_internal_char => |value| try putInt(out, u8, value),
                 .point => |value| {
@@ -313,6 +351,8 @@ pub fn Arrays(comptime V: type) type {
                 .bytea => .{ .bytea = takeText(bytes, at) },
                 .range => .{ .range = takeText(bytes, at) },
                 .xml => .{ .xml = takeText(bytes, at) },
+                .geo => .{ .geo = takeText(bytes, at) },
+                .multirange => .{ .multirange = takeText(bytes, at) },
                 .regtype => .{ .regtype = getInt(u32, bytes, at) },
                 .regproc => .{ .regproc = getInt(u32, bytes, at) },
                 .pg_internal_char => .{ .pg_internal_char = getInt(u8, bytes, at) },
@@ -365,6 +405,10 @@ pub fn Arrays(comptime V: type) type {
                 .macaddr => blk: {
                     at.* += 6;
                     break :blk .{ .macaddr = bytes[at.* - 6 ..][0..6].* };
+                },
+                .macaddr8 => blk: {
+                    at.* += 8;
+                    break :blk .{ .macaddr8 = bytes[at.* - 8 ..][0..8].* };
                 },
                 .point => blk: {
                     const x: f64 = @bitCast(getInt(u64, bytes, at));

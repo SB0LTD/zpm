@@ -19,12 +19,15 @@ const bytea_module = @import("bytea.sig");
 const builtins = @import("functions_eval.sig");
 const stats = @import("aggregates_stat.sig");
 const array_eval = @import("array_eval.sig");
+const types_ext_eval = @import("types_ext_eval.sig");
 const range_eval = @import("range_eval.sig");
 const network = @import("network.sig");
 const geometric = @import("geometric.sig");
 const xml_module = @import("xml.sig");
 const json_eval = @import("json_eval.sig");
+const regex_eval = @import("regex_eval.sig");
 const regex = @import("regex.sig");
+const unicode_case = @import("unicode_case.sig");
 const flat_record = @import("flat_record.sig");
 const Error = types.Error;
 const none = ast.none;
@@ -252,8 +255,12 @@ fn likeMatch(text: []const u8, pattern: []const u8, escape: []const u8, insensit
             if (literal_at == pattern.len) return error.InvalidEscapeSequence;
             const literal_width = @min(utf8Length(pattern[literal_at]), pattern.len - literal_at);
             const text_width = @min(utf8Length(text[t]), text.len - t);
+            // ILIKE compares lower() of both sides (C.UTF-8 towlower, one
+            // character for one, so per character is the same).
             const matched = if (insensitive and literal_width == 1 and text_width == 1)
                 types.lower(pattern[literal_at]) == types.lower(text[t])
+            else if (insensitive)
+                unicode_case.toLower(regex.decode(pattern, literal_at).cp) == unicode_case.toLower(regex.decode(text, t).cp)
             else text_width == literal_width and @import("std").mem.eql(u8, pattern[literal_at..][0..literal_width], text[t..][0..text_width]);
             if (matched) {
                 p = literal_at + literal_width;
@@ -308,6 +315,9 @@ pub fn Eval(comptime config: types.Config) type {
             /// Routine frame (B11 wave 3) read by routine_param nodes; the
             /// innermost context with one wins, else Session.routine_frame.
             frame: ?*const Frame = null,
+            /// The current value of the select list's set-returning call
+            /// (wave 4 text-json; Exec.projectSet).
+            set_value: ?*const V.Cell = null,
         };
 
         /// Values of a running routine: parameters / PL/pgSQL variables and
@@ -346,14 +356,39 @@ pub fn Eval(comptime config: types.Config) type {
             const hook = ctx.session.routines orelse return error.UnsupportedStatement;
             var args: [config.routine_args]V.Cell = undefined;
             var count: usize = 0;
+            // Inputs taking their DEFAULT (B11 wave 4), evaluated by the hook.
+            var defaulted: u64 = 0;
             var item = n.b;
             while (item != none) : (item = node(ctx, item).next) {
-                if (count == args.len) return error.ColumnCapacity;
-                args[count] = try eval(ctx, item);
+                if (count == args.len or count == 64) return error.ColumnCapacity;
+                if (node(ctx, item).kind == .default_value) {
+                    defaulted |= @as(u64, 1) << @intCast(count);
+                    args[count] = .null_value;
+                } else args[count] = try eval(ctx, item);
                 count += 1;
             }
             var out: V.Cell = .null_value;
-            try hook.call(hook.ptr, @intCast(n.integer), &args, count, &out);
+            if (n.c != none) {
+                // An inlined SQL body (B11 wave 4): its plan runs as a
+                // correlated scalar subquery over the arguments' frame.
+                const prepare = hook.prepare orelse return error.UnsupportedStatement;
+                if (!try prepare(hook.ptr, @intCast(n.integer), &args, count, defaulted)) return .null_value;
+                // Without a subquery runner (the row paths of INSERT /
+                // UPDATE / DELETE) the body runs as nested statements under
+                // the same snapshot rules (B11 wave 4).
+                const run = ctx.hook orelse {
+                    try hook.call(hook.ptr, @intCast(n.integer), &args, count, &out);
+                    return out;
+                };
+                const frame: Frame = .{ .cells = &args, .count = count };
+                var inner = ctx.*;
+                inner.frame = &frame;
+                return run.run(run.ptr, &inner, n.c);
+            }
+            if (defaulted != 0) {
+                const call = hook.call_defaults orelse return error.UnsupportedStatement;
+                try call(hook.ptr, @intCast(n.integer), &args, count, defaulted, &out);
+            } else try hook.call(hook.ptr, @intCast(n.integer), &args, count, &out);
             return out;
         }
 
@@ -535,7 +570,7 @@ pub fn Eval(comptime config: types.Config) type {
         fn currentSchemas(ctx: *const Context, implicit: bool) Error!V.Cell {
             const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
             const read = hook.schema_path orelse return error.UnsupportedStatement;
-            var names: [2][]const u8 = undefined;
+            var names: [value_module.schema_path_names][]const u8 = undefined;
             const count = read(hook.ptr, implicit, &names);
             var result: V.Text = .{};
             var writer = try V.Arrays.Writer.begin(&result, &.{
@@ -561,7 +596,13 @@ pub fn Eval(comptime config: types.Config) type {
         fn catalogValue(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
             switch (n.func) {
                 .current_database => return textCell(ctx.session.database),
-                .current_schema => return if (ctx.session.public_schema_on_path) textCell("public") else .null_value,
+                // The first schema of the search path (ddl-dml, wave 4).
+                .current_schema => {
+                    const hook = ctx.session.sequences orelse return if (ctx.session.public_schema_on_path) textCell("public") else .null_value;
+                    const read = hook.schema_path orelse return if (ctx.session.public_schema_on_path) textCell("public") else .null_value;
+                    var names: [value_module.schema_path_names][]const u8 = undefined;
+                    return if (read(hook.ptr, false, &names) == 0) .null_value else textCell(names[0]);
+                },
                 else => {},
             }
             const first = try eval(ctx, n.b);
@@ -850,25 +891,38 @@ pub fn Eval(comptime config: types.Config) type {
                     out.len = reply.len;
                     return .{ .text = out };
                 },
+                // void results (B11 wave 4): the empty text of void_out.
+                .pg_notify => {
+                    if (args[0] == .null_value) return error.InvalidParameterValue;
+                    const payload = if (args[1] == .null_value) "" else args[1].text.slice();
+                    _ = try hook.call(hook.ptr, .notify, args[0].text.slice(), payload, 0, 0, 0, &out.bytes);
+                    return .{ .text = .{} };
+                },
+                .pg_advisory_unlock_all => {
+                    _ = try hook.call(hook.ptr, .advisory_unlock_all, "", "", 0, 0, 0, &out.bytes);
+                    return .{ .text = .{} };
+                },
                 else => {},
             }
             for (args[0..count]) |arg| if (arg == .null_value) return .null_value;
             var flags: u8 = 0;
             switch (n.func) {
-                .pg_try_advisory_lock_shared, .pg_try_advisory_xact_lock_shared, .pg_advisory_unlock_shared => flags |= 1,
+                .pg_try_advisory_lock_shared, .pg_try_advisory_xact_lock_shared, .pg_advisory_unlock_shared, .pg_advisory_lock_shared, .pg_advisory_xact_lock_shared => flags |= 1,
                 else => {},
             }
             switch (n.func) {
-                .pg_try_advisory_xact_lock, .pg_try_advisory_xact_lock_shared => flags |= 2,
+                .pg_try_advisory_xact_lock, .pg_try_advisory_xact_lock_shared, .pg_advisory_xact_lock, .pg_advisory_xact_lock_shared => flags |= 2,
                 else => {},
             }
             if (count == 2) flags |= 4;
             const kind: value_module.SessionCall = switch (n.func) {
                 .pg_advisory_unlock, .pg_advisory_unlock_shared => .advisory_unlock,
+                .pg_advisory_lock, .pg_advisory_lock_shared, .pg_advisory_xact_lock, .pg_advisory_xact_lock_shared => .advisory_lock,
                 else => .advisory_try_lock,
             };
             const second: i64 = if (count == 2) args[1].integer else 0;
             const reply = try hook.call(hook.ptr, kind, "", "", args[0].integer, second, flags, &out.bytes);
+            if (kind == .advisory_lock) return .{ .text = .{} };
             return .{ .boolean = reply.integer != 0 };
         }
 
@@ -1048,6 +1102,7 @@ pub fn Eval(comptime config: types.Config) type {
                         const left = try eval(ctx, n.a);
                         const right = try eval(ctx, n.b);
                         if (left == .null_value or right == .null_value) return null;
+                        if (n.integer == 1 or n.integer == 2) return try textMatchText(ctx, &left, &right, n.integer == 2);
                         const vector = if (left == .tsvector) left.tsvector.slice() else right.tsvector.slice();
                         const query = if (left == .tsquery) left.tsquery.slice() else right.tsquery.slice();
                         return try Io.TextSearch.matches(vector, query, ctx.session.control);
@@ -1159,10 +1214,101 @@ pub fn Eval(comptime config: types.Config) type {
             };
         }
 
+        /// length(tsvector), strip, setweight, tsvector_to_array,
+        /// array_to_tsvector, ts_delete, ts_filter and numnode.
+        fn textSearchUtility(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
+            const TS = Io.TextSearch;
+            var args: [3]V.Cell = undefined;
+            var count: usize = 0;
+            var item = n.b;
+            while (item != none) : (item = node(ctx, item).next) {
+                if (count == args.len) return error.UndefinedFunction;
+                args[count] = try eval(ctx, item);
+                if (args[count] == .null_value) return .null_value;
+                count += 1;
+            }
+            var out: TS.Out = .{};
+            const A = V.Arrays;
+            var list: [config.text_bytes / 2 + 2]?[]const u8 = undefined;
+            switch (n.func) {
+                .tsvector_length => return .{ .integer = @intCast(try TS.lexemeCount(args[0].tsvector.slice())) },
+                .ts_numnode => return .{ .integer = @intCast(try TS.queryItemCount(args[0].tsquery.slice())) },
+                .ts_strip => try TS.editVector(args[0].tsvector.slice(), .strip, &out),
+                .ts_setweight => {
+                    const weight = try TS.weightCode(args[1].pg_internal_char);
+                    var only: ?[]const ?[]const u8 = null;
+                    if (count == 3) {
+                        const total = A.textSlices(args[2].array.slice(), &list);
+                        if (total > list.len) return error.ProgramLimitExceeded;
+                        only = list[0..total];
+                    }
+                    try TS.editVector(args[0].tsvector.slice(), .{ .setweight = .{ .weight = weight, .only = only } }, &out);
+                },
+                .ts_delete => {
+                    var single: [1]?[]const u8 = undefined;
+                    var victims: []const ?[]const u8 = undefined;
+                    if (args[1] == .array) {
+                        const total = A.textSlices(args[1].array.slice(), &list);
+                        if (total > list.len) return error.ProgramLimitExceeded;
+                        victims = list[0..total];
+                    } else {
+                        single[0] = args[1].text.slice();
+                        victims = &single;
+                    }
+                    try TS.editVector(args[0].tsvector.slice(), .{ .delete = victims }, &out);
+                },
+                .ts_filter => {
+                    var mask: u4 = 0;
+                    var reader = A.Reader.init(args[1].array.slice());
+                    var element: V.Cell = undefined;
+                    while (reader.next(&element)) {
+                        if (element == .null_value) return error.NullValueNotAllowed;
+                        mask |= @as(u4, 1) << @intCast(try TS.weightCode(element.pg_internal_char));
+                    }
+                    try TS.editVector(args[0].tsvector.slice(), .{ .filter = mask }, &out);
+                },
+                .array_to_tsvector => {
+                    const total = A.textSlices(args[0].array.slice(), &list);
+                    if (total > list.len) return error.ProgramLimitExceeded;
+                    try TS.vectorOfLexemes(list[0..total], &out);
+                },
+                .tsvector_to_array => {
+                    var vector: TS.Vector = .{};
+                    const total = try TS.lexemes(args[0].tsvector.slice(), &vector);
+                    var result: V.Text = .{};
+                    var writer = try A.Writer.begin(&result, &.{ .element = .text, .ndim = if (total == 0) 0 else 1, .dims = .{ @intCast(total), 0, 0, 0, 0, 0 } });
+                    for (0..total) |index| {
+                        const cell = try textCell(TS.lexemeAt(&vector, index));
+                        try writer.append(&cell);
+                    }
+                    return .{ .array = result };
+                },
+                else => return error.UnsupportedStatement,
+            }
+            return .{ .tsvector = (try textCell(out.slice())).text };
+        }
+
+        fn defaultTextSearch(ctx: *const Context) Io.TextSearch.Configuration {
+            return if (ctx.session.text_search_config == 0) .simple else .english;
+        }
+
+        /// ts_match_tq / ts_match_tt: to_tsvector(text) @@ query, the query
+        /// plainto_tsquery(text) for text @@ text (default configuration).
+        fn textMatchText(ctx: *const Context, left: *const V.Cell, right: *const V.Cell, plain: bool) Error!bool {
+            const TS = Io.TextSearch;
+            const ts_config = defaultTextSearch(ctx);
+            var vector: TS.Out = .{};
+            try TS.toVector(left.text.slice(), ts_config, &vector, ctx.session.control);
+            if (!plain) return TS.matches(vector.slice(), right.tsquery.slice(), ctx.session.control);
+            var query: TS.Out = .{};
+            try TS.toQuery(right.text.slice(), .plain, ts_config, &query);
+            return TS.matches(vector.slice(), query.slice(), ctx.session.control);
+        }
+
         /// Compiles `pattern` (an ARE under `flags`) and searches `subject`;
         /// every text position of the simulation is a checkpoint.
         fn regexMatch(ctx: *const Context, subject: []const u8, pattern: []const u8, flags: regex.Flags) Error!bool {
-            var program: regex.Regex(config.regex_states) = .{};
+            var program: regex.Matcher(config.regex_states, config.text_bytes) = .{};
             try program.compile(pattern, flags, config.expr_depth);
             return program.search(subject, ctx.session.control);
         }
@@ -1242,6 +1388,11 @@ pub fn Eval(comptime config: types.Config) type {
                         return array_eval.ArrayEval(config, @This()).concat(kind, &left, &right, n.ty);
                     }
                     if (left == .null_value or right == .null_value) return .null_value;
+                    if (n.ty == .tsvector) {
+                        var out: Io.TextSearch.Out = .{};
+                        try Io.TextSearch.concatVectors(left.tsvector.slice(), right.tsvector.slice(), &out);
+                        return .{ .tsvector = (try textCell(out.slice())).text };
+                    }
                     if (n.ty == .jsonb) {
                         var out: J.Buffer = .{};
                         try J.concatControlled(left.jsonb.slice(), right.jsonb.slice(), &out, ctx.session.control);
@@ -1474,21 +1625,23 @@ pub fn Eval(comptime config: types.Config) type {
                 .pg_partition_ancestors, .array_subquery => return error.UnsupportedStatement,
                 .obj_description, .col_description, .shobj_description, .current_user, .session_user => return objectText(ctx, n),
                 .to_tsvector, .to_tsquery, .plainto_tsquery, .phraseto_tsquery => {
-                    const config_cell = try eval(ctx, n.b);
-                    const input = try eval(ctx, ctx.pool.nodes[n.b].next);
-                    if (config_cell == .null_value or input == .null_value) return .null_value;
                     const TS = Io.TextSearch;
-                    _ = try TS.configByName(config_cell.text.slice());
+                    // One argument: default_text_search_config.
+                    const default_config = n.integer == 1;
+                    const config_cell = if (default_config) V.Cell{ .text = .{} } else try eval(ctx, n.b);
+                    const input = try eval(ctx, if (default_config) n.b else ctx.pool.nodes[n.b].next);
+                    if (config_cell == .null_value or input == .null_value) return .null_value;
+                    const ts_config = if (default_config) defaultTextSearch(ctx) else try TS.configByName(config_cell.text.slice());
                     var out: TS.Out = .{};
                     const text = input.text.slice();
                     switch (n.func) {
                         .to_tsvector => {
-                            try TS.toVector(text, &out, ctx.session.control);
+                            try TS.toVector(text, ts_config, &out, ctx.session.control);
                             return .{ .tsvector = (try textCell(out.slice())).text };
                         },
-                        .to_tsquery => try TS.toQuery(text, .to, &out),
-                        .plainto_tsquery => try TS.toQuery(text, .plain, &out),
-                        else => try TS.toQuery(text, .phrase, &out),
+                        .to_tsquery => try TS.toQuery(text, .to, ts_config, &out),
+                        .plainto_tsquery => try TS.toQuery(text, .plain, ts_config, &out),
+                        else => try TS.toQuery(text, .phrase, ts_config, &out),
                     }
                     return .{ .tsquery = (try textCell(out.slice())).text };
                 },
@@ -1562,9 +1715,50 @@ pub fn Eval(comptime config: types.Config) type {
                 .normalize, .is_normalized => return builtins.Builtins(config, @This()).call(ctx, n),
                 .array_constructor, .array_subscript, .array_any, .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper,
                 .array_append, .array_prepend, .array_cat, .array_to_string, .array_remove => return array_eval.ArrayEval(config, @This()).call(ctx, n),
+                .array_position, .array_positions, .array_replace, .trim_array, .array_fill, .array_reverse, .array_sort, .array_sample, .array_shuffle,
+                .string_to_array, .array_width_bucket, .array_set => return array_eval.ArrayEval(config, @This()).call(ctx, n),
+                .ext_op, .inet_abbrev, .set_masklen, .hostmask, .inet_merge, .inet_same_family, .macaddr8_set7bit, .to_macaddr8, .to_macaddr, .mac_trunc, .geo_call => return types_ext_eval.TypesExt(config, @This()).call(ctx, n),
+                .multirange_constructor, .multirange_of, .range_merge, .mr_call => return types_ext_eval.TypesExt(config, @This()).call(ctx, n),
+                .xmlelement, .xmlforest, .xmlconcat, .xmlcomment, .xmlpi, .xmlroot => return types_ext_eval.TypesExt(config, @This()).xmlCall(ctx, n),
+                .xml_name, .xml_attribute => return error.UnsupportedStatement,
                 .jsonb_set, .jsonb_set_lax, .jsonb_insert, .jsonb_delete_path, .jsonb_strip_nulls, .jsonb_pretty, .to_json, .to_jsonb, .jsonb_path_exists, .jsonb_path_match, .jsonb_path_query_array, .jsonb_path_query_first, .jsonb_exists_any, .jsonb_exists_all, .jsonb_minus_op, .jsonb_delete_path_op, .jsonb_exists_any_op, .jsonb_exists_all_op, .jsonb_path_exists_op, .jsonb_path_match_op => return json_eval.JsonEval(config, @This()).call(ctx, n),
+                .regexp_match, .regexp_replace, .regexp_split_to_array, .regexp_count, .regexp_instr, .regexp_substr, .substring_regex, .substring_similar => return regex_eval.RegexEval(config, @This()).call(ctx, n),
+                // A set-returning call reads the value exec is expanding.
+                .regexp_matches, .regexp_split_to_table, .jsonb_path_query => return if (ctx.set_value) |current| current.* else error.UnsupportedStatement,
+                .json_query_function => return json_eval.JsonEval(config, @This()).queryFunction(ctx, n),
+                .json_constructor => return json_eval.JsonEval(config, @This()).constructor(ctx, n),
+                .tsvector_length, .ts_strip, .ts_setweight, .tsvector_to_array, .array_to_tsvector, .ts_delete, .ts_filter, .ts_numnode => return textSearchUtility(ctx, n),
+                .is_json => {
+                    // ExecEvalJsonIsPredicate: invalid text is false; jsonb
+                    // keys are always unique.
+                    const operand = try eval(ctx, n.b);
+                    if (operand == .null_value) return .null_value;
+                    // jsonb tags: 5 array, 6 object.
+                    var tag: u8 = undefined;
+                    var unique = true;
+                    if (operand == .jsonb) {
+                        tag = operand.jsonb.slice()[0];
+                    } else {
+                        const bytes = if (operand == .bpchar) operand.bpchar.slice() else operand.text.slice();
+                        const inspected = J.inspectJson(bytes, ctx.session.control) catch |err| switch (err) {
+                            error.InvalidTextRepresentation => return .{ .boolean = n.integer & 8 != 0 },
+                            else => return err,
+                        };
+                        tag = @intFromEnum(inspected.tag);
+                        unique = inspected.unique;
+                    }
+                    const kind_ok = switch (n.integer & 3) {
+                        0 => true,
+                        1 => tag == 5,
+                        2 => tag == 6,
+                        else => tag != 5 and tag != 6,
+                    };
+                    const holds = kind_ok and (n.integer & 4 == 0 or unique);
+                    return .{ .boolean = holds != (n.integer & 8 != 0) };
+                },
                 .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => return range_eval.RangeEval(config, @This()).call(ctx, n),
                 .current_setting, .set_config, .pg_try_advisory_lock, .pg_try_advisory_lock_shared, .pg_try_advisory_xact_lock, .pg_try_advisory_xact_lock_shared, .pg_advisory_unlock, .pg_advisory_unlock_shared, .pg_backend_pid, .pg_is_in_recovery => return sessionFunction(ctx, n),
+                .pg_notify, .pg_advisory_lock, .pg_advisory_lock_shared, .pg_advisory_xact_lock, .pg_advisory_xact_lock_shared, .pg_advisory_unlock_all => return sessionFunction(ctx, n),
                 .xmlparse, .xmlserialize, .xml_is_well_formed, .xml_is_well_formed_document, .xml_is_well_formed_content => {
                     const argument = try eval(ctx, n.b);
                     if (argument == .null_value) return .null_value;
@@ -1705,6 +1899,8 @@ pub fn Eval(comptime config: types.Config) type {
                 .values_row, .default_value => return error.Syntax,
                 .row_constructor => return error.UnsupportedStatement,
                 .row_compare, .row_in => return boolCell(try truth(ctx, id)),
+                // Unwrapped by binding (only user routine calls accept one).
+                .named_argument => return error.UnsupportedStatement,
                 .and_op, .or_op, .not_op, .test_op, .between, .in_list, .like => return boolCell(try truth(ctx, id)),
                 .unary => {
                     const value = try eval(ctx, n.a);

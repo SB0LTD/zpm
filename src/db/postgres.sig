@@ -2493,7 +2493,10 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                 .refresh_materialized_view => "REFRESH MATERIALIZED VIEW",
                 .create_index => "CREATE INDEX",
                 .create_view => "CREATE VIEW",
+                .drop_view => "DROP VIEW",
+                .drop_materialized_view => "DROP MATERIALIZED VIEW",
                 .drop_table => "drop",
+                .drop_index => "DROP INDEX",
                 .create_sequence => "create_sequence",
                 .drop_sequence => "drop_sequence",
                 .truncate => "truncate",
@@ -2556,7 +2559,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                 try w.append("MOVE ");
                 try w.number(@intCast(affected));
             } else if (equal(completed_command, "close_cursor")) {
-                try w.append("CLOSE CURSOR");
+                try w.append(if (deallocateAll(source)) "CLOSE CURSOR ALL" else "CLOSE CURSOR");
             } else if (equal(completed_command, "prepare")) {
                 try w.append("PREPARE");
             } else if (equal(completed_command, "deallocate")) {
@@ -2601,7 +2604,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             } else if (equal(completed_command, "merge")) {
                 try w.append("MERGE ");
                 try w.number(@intCast(affected));
-            } else if (isCommand(completed_command, source, "create")) try w.append("CREATE TABLE") else if (isCommand(completed_command, source, "drop")) try w.append("DROP TABLE") else if (equal(completed_command, "savepoint")) try w.append("SAVEPOINT") else if (equal(completed_command, "release")) try w.append("RELEASE") else if (equal(completed_command, "show")) try w.append("SHOW") else if (equal(completed_command, "reset")) try w.append("RESET") else if (equal(completed_command, "set")) try w.append("SET") else if (equal(completed_command, "begin")) try w.append("BEGIN") else if (equal(completed_command, "commit")) try w.append(if (rolled_back) "ROLLBACK" else "COMMIT") else if (equal(completed_command, "rollback")) try w.append("ROLLBACK") else if (word(source, "begin") or word(source, "start")) try w.append("BEGIN") else if (word(source, "commit") or word(source, "end")) try w.append(if (rolled_back) "ROLLBACK" else "COMMIT") else if (word(source, "rollback") or word(source, "abort")) try w.append("ROLLBACK") else if (word(source, "set")) try w.append("SET") else if (word(source, "deallocate")) try w.append("DEALLOCATE") else try w.append("OK");
+            } else if (isCommand(completed_command, source, "create")) try w.append("CREATE TABLE") else if (isCommand(completed_command, source, "drop")) try w.append("DROP TABLE") else if (equal(completed_command, "savepoint")) try w.append("SAVEPOINT") else if (equal(completed_command, "release")) try w.append("RELEASE") else if (equal(completed_command, "show")) try w.append("SHOW") else if (equal(completed_command, "reset")) try w.append("RESET") else if (equal(completed_command, "set")) try w.append("SET") else if (equal(completed_command, "begin")) try w.append(if (word(source, "start")) "START TRANSACTION" else "BEGIN") else if (equal(completed_command, "commit")) try w.append(if (rolled_back) "ROLLBACK" else "COMMIT") else if (equal(completed_command, "rollback")) try w.append("ROLLBACK") else if (word(source, "begin")) try w.append("BEGIN") else if (word(source, "start")) try w.append("START TRANSACTION") else if (word(source, "commit") or word(source, "end")) try w.append(if (rolled_back) "ROLLBACK" else "COMMIT") else if (word(source, "rollback") or word(source, "abort")) try w.append("ROLLBACK") else if (word(source, "set")) try w.append("SET") else if (word(source, "deallocate")) try w.append("DEALLOCATE") else try w.append("OK");
             try w.byte(0);
             w.end(p);
         }
@@ -2758,6 +2761,7 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "NotNullViolation")) return "23502";
     if (equal(name, "CheckViolation")) return "23514";
     if (equal(name, "ForeignKeyViolation")) return "23503";
+    if (equal(name, "RestrictViolation")) return "23001";
     if (equal(name, "ExclusionViolation")) return "23P01";
     if (equal(name, "IndexCapacity")) return "54000";
     if (equal(name, "InvalidForeignKey")) return "42830";
@@ -2772,21 +2776,31 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "InvalidXmlContent")) return "2200N";
     if (equal(name, "InvalidXmlDocument")) return "2200M";
     if (equal(name, "NotAnXmlDocument")) return "2200L";
+    if (equal(name, "InvalidXmlProcessingInstruction")) return "2200T";
+    if (equal(name, "InvalidXmlComment")) return "2200S";
     if (equal(name, "CollationMismatch")) return "42P21";
     if (equal(name, "InvalidRegularExpression")) return "2201B";
     if (equal(name, "InvalidEscapeCharacterUse")) return "2200C";
     if (equal(name, "InvalidTablesampleArgument")) return "2202H";
     if (equal(name, "InvalidTablesampleRepeat")) return "2202G";
+    // Nested statements, views and rules (B11 wave 4).
+    if (equal(name, "TriggeredDataChangeViolation")) return "27000";
+    if (equal(name, "WithCheckOptionViolation")) return "44000";
     // Routines, triggers and rules (B11 wave 3).
     if (equal(name, "DuplicateFunction")) return "42723";
     if (equal(name, "InvalidFunctionDefinition")) return "42P13";
     if (equal(name, "RaiseException")) return "P0001";
+    if (equal(name, "AssertFailure")) return "P0004";
+    if (equal(name, "StackedDiagnosticsAccessedWithoutActiveHandler")) return "0Z002";
+    if (equal(name, "InvalidTransactionTermination")) return "2D000";
     if (equal(name, "NoDataFound")) return "P0002";
     if (equal(name, "TooManyRows")) return "P0003";
     if (equal(name, "FunctionExecutedNoReturn")) return "2F005";
     if (equal(name, "CaseNotFound")) return "20000";
     if (equal(name, "StackDepthExceeded")) return "54001";
     if (equal(name, "NullValueNotAllowed")) return "22004";
+    if (equal(name, "DuplicateJsonObjectKeyValue")) return "22030";
+    if (equal(name, "ZeroLengthCharacterString")) return "2200F";
     if (equal(name, "ErrorInAssignment")) return "22005";
     if (equal(name, "SqlJsonArrayNotFound")) return "22039";
     if (equal(name, "SqlJsonMemberNotFound")) return "2203A";

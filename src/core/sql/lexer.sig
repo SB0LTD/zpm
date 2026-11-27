@@ -233,6 +233,20 @@ pub const Keyword = enum {
     jsonpath,
     tsvector,
     tsquery,
+    // B11 wave-4 types-ext.
+    void,
+    macaddr8,
+    lseg,
+    line,
+    path,
+    polygon,
+    circle,
+    int4multirange,
+    int8multirange,
+    nummultirange,
+    datemultirange,
+    tsmultirange,
+    tstzmultirange,
 };
 
 /// Words that cannot be unquoted identifiers.
@@ -256,12 +270,12 @@ pub fn keywordOf(comptime text: []const u8) Keyword {
 }
 
 pub fn classify(word: []const u8) Keyword {
-    if (word.len < 2 or word.len > 12) return .none;
-    var name: [12]u8 = undefined;
+    if (word.len < 2 or word.len > 14) return .none;
+    var name: [14]u8 = undefined;
     for (word, 0..) |byte, index| name[index] = types.lower(byte);
     // Only keywords of the word's length are compared (bucketed at comptime).
     switch (word.len) {
-        inline 2...12 => |length| {
+        inline 2...14 => |length| {
             @setEvalBranchQuota(20000);
             const wanted = name[0..length];
             inline for (@typeInfo(Keyword).@"enum".field_names) |field| {

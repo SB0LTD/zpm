@@ -1,5 +1,11 @@
 # SQL JSON and aggregates (conformance lane B11, wave 3: json-agg)
 
+> Wave 4 (`w4/text-json`) closes much of what the tables below list as
+> not covered (back references, BREs, the regexp_* functions, english text
+> search, SQL/JSON query functions, constructors, like_regex, keyvalue(),
+> jsonb_path_query) and moves the engine to the C.UTF-8 ctype; see "Text and
+> JSON (lane B11 wave 4, text-json)" in SQL_CONFORMANCE_TDD_STATUS.md.
+
 Branch `b11/json-agg` closes six smoke programs of the 118-program
 inventory test-first: PG.AGG.COLLECTION, PG.JSON.AGG, PG.AGG.ORDERED_SET,
 PG.JSONB.MODIFY, PG.JSON.PATH and PG.JSON.TABLE. On its base (main

@@ -149,8 +149,9 @@ pub fn Collect(comptime config: types.Config) type {
         }
 
         /// json_object_agg `{ "k" : v, ... }` / jsonb_object_agg (keys
-        /// sorted, the last duplicate wins). A NULL key is 22004.
-        pub fn objectAgg(rows: Rows, key_ty: Type, value_ty: Type, jsonb: bool, session: *const Session) Error!V.Cell {
+        /// sorted, the last duplicate wins). A NULL key is 22004; with
+        /// `unique` (the *_unique variants) a repeated key is 22030.
+        pub fn objectAgg(rows: Rows, key_ty: Type, value_ty: Type, jsonb: bool, unique: bool, session: *const Session) Error!V.Cell {
             if (rows.handles.len == 0) return .null_value;
             var buffer: [JB.buffer_bytes]u8 = undefined;
             var out: json_build.Out = .{ .bytes = &buffer };
@@ -160,6 +161,18 @@ pub fn Collect(comptime config: types.Config) type {
                 const key = rows.at(index, 0);
                 if (key.* == .null_value) return error.NullValueNotAllowed;
                 if (index != 0) try out.append(", ");
+                if (unique) {
+                    var mine: [JB.buffer_bytes]u8 = undefined;
+                    var rendered: json_build.Out = .{ .bytes = &mine };
+                    try JB.append(&rendered, key, key_ty, true, jsonb, session);
+                    for (0..index) |earlier| {
+                        try poll(session);
+                        var theirs: [JB.buffer_bytes]u8 = undefined;
+                        var other: json_build.Out = .{ .bytes = &theirs };
+                        try JB.append(&other, rows.at(earlier, 0), key_ty, true, jsonb, session);
+                        if (types.same(rendered.slice(), other.slice())) return error.DuplicateJsonObjectKeyValue;
+                    }
+                }
                 try JB.append(&out, key, key_ty, true, jsonb, session);
                 try out.append(if (jsonb) ": " else " : ");
                 try JB.append(&out, rows.at(index, 1), value_ty, false, jsonb, session);

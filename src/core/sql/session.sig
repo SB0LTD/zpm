@@ -89,6 +89,8 @@ pub fn Sessions(comptime config: types.Config) type {
             restricted_relation_kinds: RelationKinds = .{},
             restriction_text: SettingText = .{},
             search_path: SettingText = SettingText.literal("\"$user\", public"),
+            /// default_text_search_config, canonical (wave 4 text-json).
+            text_search_config: SettingText = SettingText.literal("pg_catalog.english"),
             /// Origin bits for the named engine settings in pg_settings.
             client_settings: u8 = 0,
             session_settings: u8 = 0,
@@ -100,9 +102,42 @@ pub fn Sessions(comptime config: types.Config) type {
             /// Zero retains the authenticated session user.
             authorization: u32 = 0,
 
+            /// `public` is an element of search_path (ddl-dml, wave 4: other
+            /// schemas resolve through Database.pathNamespaces).
             pub fn publicSchemaOnPath(self: *const Values) bool {
-                const path = self.search_path.slice();
-                return path.len != 0 and !types.same(path, "\"\"");
+                var rest = self.search_path.slice();
+                while (rest.len != 0) {
+                    const end = indexOfSeparator(rest);
+                    var item = rest[0..end];
+                    if (item.len >= 2 and item[0] == '"' and item[item.len - 1] == '"') item = item[1 .. item.len - 1];
+                    if (types.same(item, "public")) return true;
+                    rest = if (end + 2 <= rest.len) rest[end + 2 ..] else rest[rest.len..];
+                }
+                return false;
+            }
+
+            /// search_path lists only "$user", public, pg_catalog and pg_temp:
+            /// the resolution detached reads implement (ddl-dml, wave 4).
+            pub fn simplePath(self: *const Values) bool {
+                var rest = self.search_path.slice();
+                while (rest.len != 0) {
+                    const end = indexOfSeparator(rest);
+                    var item = rest[0..end];
+                    if (item.len >= 2 and item[0] == '"' and item[item.len - 1] == '"') item = item[1 .. item.len - 1];
+                    if (item.len != 0 and !types.same(item, "public") and !types.same(item, "$user") and
+                        !types.same(item, "pg_catalog") and !types.same(item, "pg_temp")) return false;
+                    rest = if (end + 2 <= rest.len) rest[end + 2 ..] else rest[rest.len..];
+                }
+                return true;
+            }
+
+            fn indexOfSeparator(text: []const u8) usize {
+                var quoted = false;
+                for (text, 0..) |byte, index| {
+                    if (byte == '"') quoted = !quoted;
+                    if (!quoted and byte == ',' and index + 1 < text.len and text[index + 1] == ' ') return index;
+                }
+                return text.len;
             }
 
             pub fn findCustom(self: *const Values, name: []const u8) ?usize {

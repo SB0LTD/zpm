@@ -2942,6 +2942,64 @@ test "temporaries written again past branches (kir_sm120.webs): each web a unit 
     try testing.expect(bin.regs < 2 * N);
 }
 
+test "constants in uniform registers (kir_sm120.uniformConsts): every read shape, a's place swapped into b's, the same bits" {
+    const caps = caseCaps(false);
+    fillFloats(0x7c3);
+    var k = newKernel("uconsts", .{ 64, 1, 1 });
+    const A = k.binding();
+    _ = k.binding();
+    _ = k.binding();
+    const O = k.binding();
+    const t = lin(&k);
+    const off = k.op2(.shl, .u32, r(t), u(2));
+    const x = k.load(.f32, kir.global(A, 32), r(off));
+    const y = k.op2(.fadd, .f32, r(x), kf(0.75));
+    const xi = k.op2(.@"and", .u32, r(t), u(0x3f));
+    // (each parameter read in one shape: an LDC each, then an LDCU)
+    const pf = [_]kir.V{ k.param(.f32, 0), k.param(.f32, 1), k.param(.f32, 2), k.param(.f32, 3), k.param(.f32, 4), k.param(.f32, 5) };
+    const pi = [_]kir.V{ k.param(.u32, 6), k.param(.u32, 7), k.param(.u32, 8), k.param(.u32, 9) };
+    const pair = [_]kir.V{ k.param(.f32, 10), k.param(.f32, 11) };
+    var outs: [16]kir.V = undefined;
+    var n: usize = 0;
+    // b's place, a's (swapped), c's
+    outs[n] = k.op2(.fmul, .f32, r(x), r(pf[0]));
+    n += 1;
+    outs[n] = k.op2(.fadd, .f32, r(pf[1]), r(y));
+    n += 1;
+    outs[n] = k.op3(.ffma, .f32, r(x), r(y), r(pf[2]));
+    n += 1;
+    outs[n] = k.op2(.fmax, .f32, r(pf[3]), r(x));
+    n += 1;
+    outs[n] = k.sel(.f32, r(k.cmp(.f32, .lt, r(x), r(pf[4]))), r(x), r(y));
+    n += 1;
+    outs[n] = k.op2(.@"and", .u32, r(pi[0]), r(xi));
+    n += 1;
+    outs[n] = k.op2(.shl, .u32, r(xi), r(pi[1]));
+    n += 1;
+    outs[n] = k.op3(.imad, .u32, r(pi[2]), r(xi), r(t));
+    n += 1;
+    outs[n] = k.sel(.u32, r(k.cmp(.u32, .ge, r(xi), r(pi[3]))), r(t), r(xi));
+    n += 1;
+    // two constants in one instruction (one stays general), and one read
+    // twice there (it stays general)
+    outs[n] = k.op2(.fmul, .f32, r(pf[5]), r(k.op2(.fmul, .f32, r(pf[5]), r(pf[5]))));
+    n += 1;
+    outs[n] = k.op2(.fmul, .f32, r(pair[0]), r(pair[1]));
+    n += 1;
+    for (outs[0..n], 0..) |v, j| {
+        var m = kir.global(O, 32);
+        m.imm = @intCast(4 * j);
+        k.store(if (j < 5 or j >= 9) .f32 else .u32, m, r(k.op2(.shl, .u32, r(t), u(6))), r(v));
+    }
+    const params = [_]u32{ @bitCast(@as(f32, 1.5)), @bitCast(@as(f32, -0.375)), @bitCast(@as(f32, 3.0e-3)), @bitCast(@as(f32, 0.5)), @bitCast(@as(f32, 0.25)), @bitCast(@as(f32, -2.0)), 0x2a, 3, 7, 33, @bitCast(@as(f32, 0.625)), @bitCast(@as(f32, -12.5)) };
+    try same(caps, &k, .{ 2, 1, 1 }, &params, 16 * 2 * 64, null);
+    _ = try kir_sm120.compileIn(&k, caps, &T.st, &T.code, .{});
+    // (all but pf[5], read twice by one instruction, and one of the pair)
+    try testing.expectEqual(@as(u32, 10), T.st.stats.uconsts);
+    const text = try kir_sm120.compileText(&k, caps, &T.st, .{});
+    try testing.expect(std.mem.indexOf(u8, text, "LDCU UR") != null);
+}
+
 test "ids, parameters and predicates past the six registers" {
     try idsParams();
 }

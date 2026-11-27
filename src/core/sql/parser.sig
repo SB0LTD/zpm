@@ -464,8 +464,18 @@ pub fn Parser(comptime config: types.Config) type {
                 if (self.mode == .standard and try self.takeWord("SEQUENCE")) return .{ .create_sequence = try self.createSequence() };
                 if (self.mode == .standard and try self.takeRaw("schema")) {
                     var out: Ast.CreateSchema = .{ .if_not_exists = try self.ifNotExists() };
-                    out.name = try self.identifier();
-                    // AUTHORIZATION and schema elements are outside the subset.
+                    // [name] [AUTHORIZATION role_spec] (ddl-dml, wave 4).
+                    if (!self.rawWord("authorization")) out.name = try self.identifier() else out.named = false;
+                    if (try self.takeRaw("authorization")) {
+                        if (try self.takeRaw("current_user") or try self.takeRaw("current_role")) {
+                            out.owner_special = 1;
+                        } else if (try self.takeRaw("session_user")) {
+                            out.owner_special = 2;
+                        } else out.owner = try self.identifier();
+                        // Without a name the schema is named after a named role.
+                        if (!out.named) out.name = out.owner orelse return error.UnsupportedStatement;
+                    } else if (!out.named) return error.Syntax;
+                    // Schema elements are outside the subset.
                     if (self.current.kind != .end and !self.isSymbol(.semicolon)) return error.UnsupportedStatement;
                     try self.finish();
                     return .{ .create_schema = out };
@@ -477,8 +487,8 @@ pub fn Parser(comptime config: types.Config) type {
                     const index = try self.takeRaw("index");
                     const materialized = !index and try self.takeRaw("materialized");
                     if (!index and !try self.takeRaw("view")) return error.Syntax;
-                    if (index) _ = try self.takeRaw("concurrently");
-                    var drop: Ast.Drop = .{ .if_exists = try self.ifExists(), .name = undefined };
+                    const concurrently = index and try self.takeRaw("concurrently");
+                    var drop: Ast.Drop = .{ .if_exists = try self.ifExists(), .name = undefined, .concurrently = concurrently };
                     const reference = try self.qualifiedName();
                     drop.name = reference.name;
                     drop.schema = reference.schema;
@@ -576,7 +586,21 @@ pub fn Parser(comptime config: types.Config) type {
                 return .{ .control = try self.preparedTransaction(.prepare) };
             }
             if (self.mode == .standard) if (try self.sessionCommand()) |command| return .{ .session = command };
+            // A word that starts no PostgreSQL statement is a syntax error
+            // (42601), not an unsupported command (ddl-dml, wave 4).
+            if (self.mode == .standard and self.tokens.dialect == .postgres and !self.statementKeyword()) return error.Syntax;
             return .{ .control = try self.controlStatement() };
+        }
+
+        /// The first token can start a statement of PostgreSQL's grammar
+        /// (gram.y stmt).
+        fn statementKeyword(self: *const Self) bool {
+            if (self.current.kind == .end) return true;
+            if (self.current.kind == .symbol) return self.current.symbol == .lparen;
+            if (self.current.kind != .word) return false;
+            const words = [_][]const u8{ "abort", "alter", "analyze", "analyse", "begin", "call", "checkpoint", "close", "cluster", "comment", "commit", "copy", "create", "deallocate", "declare", "delete", "discard", "do", "drop", "end", "execute", "explain", "fetch", "grant", "import", "insert", "listen", "load", "lock", "merge", "move", "notify", "prepare", "reassign", "refresh", "reindex", "release", "reset", "revoke", "rollback", "savepoint", "security", "select", "set", "show", "start", "table", "truncate", "unlisten", "update", "vacuum", "values", "with" };
+            inline for (words) |word| if (self.rawWord(word)) return true;
+            return false;
         }
 
         /// `[CASCADE | RESTRICT]`: true for CASCADE.
@@ -632,7 +656,7 @@ pub fn Parser(comptime config: types.Config) type {
 
         fn createIndex(self: *Self, unique: bool) Error!Ast.CreateIndex {
             var out: Ast.CreateIndex = .{ .unique = unique };
-            if (try self.takeRaw("concurrently")) return error.UnsupportedStatement;
+            out.concurrently = try self.takeRaw("concurrently");
             out.if_not_exists = try self.ifNotExists();
             if (!self.isWord("ON")) out.name = try self.identifier();
             if (out.if_not_exists and out.name == null) return error.Syntax;
@@ -849,11 +873,35 @@ pub fn Parser(comptime config: types.Config) type {
             _ = try self.takeWord("ONLY");
             out.table = try self.qualifiedName();
             _ = try self.takeSymbol(.star);
+            // ATTACH / DETACH PARTITION stand alone (gram.y partition_cmd).
+            if (self.mode == .standard and try self.takeRaw("attach")) {
+                if (!try self.takeRaw("partition")) return error.Syntax;
+                const table = try self.qualifiedName();
+                var bound: Ast.PartitionBound = .{};
+                try self.partitionBound(&bound);
+                try pushAction(&out, .{ .attach_partition = .{ .table = table, .bound = bound } });
+                try self.finish();
+                return out;
+            }
+            if (self.mode == .standard and try self.takeRaw("detach")) {
+                if (!try self.takeRaw("partition")) return error.Syntax;
+                const table = try self.qualifiedName();
+                const concurrently = try self.takeRaw("concurrently");
+                // FINALIZE completes an interrupted concurrent detach, which
+                // never remains pending here.
+                if (self.rawWord("finalize")) return error.UnsupportedStatement;
+                try pushAction(&out, .{ .detach_partition = .{ .table = table, .concurrently = concurrently } });
+                try self.finish();
+                return out;
+            }
             if (try self.takeRaw("rename")) {
                 if (try self.takeWord("TO")) {
                     try pushAction(&out, .{ .rename_table = try self.identifier() });
+                } else if (try self.takeWord("CONSTRAINT")) {
+                    const from = try self.identifier();
+                    try self.expectWord("TO");
+                    try pushAction(&out, .{ .rename_constraint = .{ .from = from, .to = try self.identifier() } });
                 } else {
-                    if (self.isWord("CONSTRAINT")) return error.UnsupportedStatement;
                     _ = try self.takeRaw("column");
                     const from = try self.identifier();
                     try self.expectWord("TO");
@@ -877,6 +925,19 @@ pub fn Parser(comptime config: types.Config) type {
                         try pushAction(&out, .{ .add_column = .{ .column = column, .if_not_exists = conditional } });
                         for (constraints[0..constraint_count]) |constraint| try pushAction(&out, .{ .add_constraint = constraint });
                     }
+                } else if (self.mode == .standard and self.rawWord("alter") and (try self.peek()).isWord("CONSTRAINT")) {
+                    try self.advance();
+                    try self.advance();
+                    const constraint = try self.identifier();
+                    const enforced = if (self.isWord("NOT") and wordIs(self.source, try self.peek(), "enforced")) blk: {
+                        try self.advance();
+                        try self.advance();
+                        break :blk false;
+                    } else if (try self.takeRaw("enforced")) true else return error.UnsupportedStatement;
+                    try pushAction(&out, .{ .alter_enforced = .{ .name = constraint, .enforced = enforced } });
+                } else if (self.mode == .standard and try self.takeRaw("validate")) {
+                    try self.expectWord("CONSTRAINT");
+                    try pushAction(&out, .{ .validate_constraint = try self.identifier() });
                 } else if (try self.takeWord("DROP")) {
                     if (try self.takeWord("CONSTRAINT")) {
                         const conditional = try self.ifExists();
@@ -911,7 +972,14 @@ pub fn Parser(comptime config: types.Config) type {
                         }
                         try pushAction(&out, action);
                     } else if (try self.takeWord("SET")) {
-                        if (try self.takeWord("DEFAULT")) {
+                        if (self.mode == .standard and try self.takeWord("GENERATED")) {
+                            const always = try self.takeWord("ALWAYS");
+                            if (!always) {
+                                try self.expectWord("BY");
+                                try self.expectWord("DEFAULT");
+                            }
+                            try pushAction(&out, .{ .set_generated = .{ .column = name, .always = always } });
+                        } else if (try self.takeWord("DEFAULT")) {
                             const start = self.tokenStart();
                             _ = try self.expression();
                             try pushAction(&out, .{ .set_default = .{ .column = name, .expression = try self.storedSpan(start) } });
@@ -931,7 +999,17 @@ pub fn Parser(comptime config: types.Config) type {
                         } else if (try self.takeWord("NOT")) {
                             try self.expectWord("NULL");
                             try pushAction(&out, .{ .drop_not_null = name });
+                        } else if (self.mode == .standard and try self.takeWord("IDENTITY")) {
+                            try pushAction(&out, .{ .drop_identity = .{ .column = name, .if_exists = try self.ifExists() } });
+                        } else if (self.mode == .standard and try self.takeRaw("expression")) {
+                            try pushAction(&out, .{ .drop_expression = .{ .column = name, .if_exists = try self.ifExists() } });
                         } else return error.UnsupportedStatement;
+                    } else if (self.mode == .standard and try self.takeRaw("restart")) {
+                        var value: ?i64 = null;
+                        if (try self.takeWord("WITH") or self.current.kind == .integer or self.isSymbol(.minus) or self.isSymbol(.plus)) {
+                            value = try self.signedInteger();
+                        }
+                        try pushAction(&out, .{ .restart_identity = .{ .column = name, .value = value } });
                     } else return error.UnsupportedStatement;
                 } else return error.Syntax;
                 if (!try self.takeSymbol(.comma)) break;
@@ -976,10 +1054,12 @@ pub fn Parser(comptime config: types.Config) type {
             var out: Ast.Truncate = .{};
             _ = try self.takeWord("TABLE");
             while (true) {
-                _ = try self.takeRaw("only");
+                const only = try self.takeRaw("only");
                 if (out.count == config.tables) return error.TableCapacity;
                 out.tables[out.count] = try self.qualifiedName();
+                out.only[out.count] = only;
                 out.count += 1;
+                // `name *` names the children explicitly (ONLY name * is ONLY).
                 _ = try self.takeSymbol(.star);
                 if (!try self.takeSymbol(.comma)) break;
             }
@@ -989,7 +1069,8 @@ pub fn Parser(comptime config: types.Config) type {
             } else if (try self.takeRaw("continue")) {
                 if (!try self.takeRaw("identity")) return error.Syntax;
             }
-            if (!try self.takeRaw("cascade")) _ = try self.takeRaw("restrict");
+            out.cascade = try self.takeRaw("cascade");
+            if (!out.cascade) _ = try self.takeRaw("restrict");
             try self.finish();
             return out;
         }
@@ -1338,6 +1419,13 @@ pub fn Parser(comptime config: types.Config) type {
                     if (!try self.takeWord("LOCAL")) value = try self.settingValue();
                     try self.finish();
                     return .{ .set = .{ .local = local, .name = .{ .special = .time_zone }, .value = value } };
+                }
+                // SET SCHEMA 'name': search_path (ddl-dml, wave 4).
+                if (self.rawWord("schema") and (try self.peek()).kind == .string) {
+                    try self.advance();
+                    const value = try self.settingValue();
+                    try self.finish();
+                    return .{ .set = .{ .local = local, .name = .{ .special = .schema }, .value = value } };
                 }
                 if (self.rawWord("xml") and wordIs(self.source, try self.peek(), "option")) {
                     try self.advance();
@@ -1746,6 +1834,8 @@ pub fn Parser(comptime config: types.Config) type {
                 .integer, .int, .int4, .bigint, .int8, .smallint, .int2, .boolean, .@"bool", .text, .numeric, .decimal, .real, .float4, .float8, .float, .double, .name, .oid, .date, .timestamp, .timestamptz, .interval, .json, .jsonb, .regclass, .regtype, .regnamespace, .regproc => true,
                 .varchar, .character, .char, .bpchar, .uuid, .bytea, .time, .timetz, .bit, .varbit, .money => true,
                 .pg_lsn, .xid8, .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange, .inet, .cidr, .macaddr, .point, .box, .xml, .jsonpath, .tsvector, .tsquery => true,
+                .void, .macaddr8, .lseg, .line, .path, .polygon, .circle => true,
+                .int4multirange, .int8multirange, .nummultirange, .datemultirange, .tsmultirange, .tstzmultirange => true,
                 else => false,
             };
         }
@@ -1888,7 +1978,7 @@ pub fn Parser(comptime config: types.Config) type {
             }
             if (array) {
                 if (ast.regKind(spec.typmod) != .none) return error.UnsupportedStatement;
-                if (!types.isArray(spec.ty)) spec.ty = types.arrayType(spec.ty) orelse return error.Syntax;
+                if (!types.isArray(spec.ty)) spec.ty = types.arrayType(spec.ty) orelse return if (spec.ty == .void) error.UndefinedObject else error.Syntax;
             }
             return spec;
         }
@@ -1990,6 +2080,19 @@ pub fn Parser(comptime config: types.Config) type {
                 .jsonpath => .{ .ty = .jsonpath },
                 .tsvector => .{ .ty = .tsvector },
                 .tsquery => .{ .ty = .tsquery },
+                .void => .{ .ty = .void },
+                .macaddr8 => .{ .ty = .macaddr8 },
+                .lseg => .{ .ty = .lseg },
+                .line => .{ .ty = .line },
+                .path => .{ .ty = .path },
+                .polygon => .{ .ty = .polygon },
+                .circle => .{ .ty = .circle },
+                .int4multirange => .{ .ty = .int4multirange },
+                .int8multirange => .{ .ty = .int8multirange },
+                .nummultirange => .{ .ty = .nummultirange },
+                .datemultirange => .{ .ty = .datemultirange },
+                .tsmultirange => .{ .ty = .tsmultirange },
+                .tstzmultirange => .{ .ty = .tstzmultirange },
                 .character, .char => blk: {
                     const varying = try self.takeWord("VARYING");
                     break :blk .{ .ty = if (varying) .varchar else .bpchar, .typmod = try self.characterLength(!varying) };
@@ -2180,7 +2283,43 @@ pub fn Parser(comptime config: types.Config) type {
         /// A table constraint element ([CONSTRAINT name] CHECK (...) |
         /// UNIQUE [NULLS [NOT] DISTINCT] (...) | PRIMARY KEY (...)), or null
         /// when the element is a column definition.
+        /// A table constraint, then NOT VALID (ddl-dml, wave 4).
         fn tableConstraint(self: *Self) Error!?Ast.ConstraintDef {
+            var out = (try self.tableConstraintBody()) orelse return null;
+            try self.constraintAttributes(&out);
+            return out;
+        }
+
+        /// [NOT] ENFORCED and NOT VALID after a constraint, in any order;
+        /// enforceability is for CHECK and FOREIGN KEY only (42601).
+        fn constraintAttributes(self: *Self, out: *Ast.ConstraintDef) Error!void {
+            while (true) {
+                if (self.isWord("NOT") and wordIs(self.source, try self.peek(), "valid")) {
+                    try self.advance();
+                    try self.advance();
+                    out.not_valid = true;
+                } else if (self.isWord("NOT") and wordIs(self.source, try self.peek(), "enforced")) {
+                    try self.advance();
+                    try self.advance();
+                    if (out.kind != .check and out.kind != .foreign) return error.Syntax;
+                    out.not_enforced = true;
+                } else if (try self.takeRaw("enforced")) {
+                    if (out.kind != .check and out.kind != .foreign) return error.Syntax;
+                    out.not_enforced = false;
+                } else return;
+            }
+        }
+
+        /// A column constraint's [NOT] ENFORCED.
+        fn enforceability(self: *Self, out: *Ast.ConstraintDef) Error!void {
+            if (self.isWord("NOT") and wordIs(self.source, try self.peek(), "enforced")) {
+                try self.advance();
+                try self.advance();
+                out.not_enforced = true;
+            } else _ = try self.takeRaw("enforced");
+        }
+
+        fn tableConstraintBody(self: *Self) Error!?Ast.ConstraintDef {
             if (self.mode != .standard) return null;
             var name: ?ast.Ident = null;
             if (try self.takeWord("CONSTRAINT")) {
@@ -2326,6 +2465,8 @@ pub fn Parser(comptime config: types.Config) type {
                 const spec = try self.typeName();
                 // regclass/regtype columns are outside the subset.
                 if (spec.typmod < -1) return error.UnsupportedStatement;
+                // A column cannot have the void pseudo-type (42P16).
+                if (spec.ty == .void) return error.InvalidTableDefinition;
                 column.type_name = if (mysql_bigint and spec.ty == .int8 and try self.takeRaw("unsigned")) .mysql_bigint_unsigned else spec.ty;
                 column.typmod = spec.typmod;
             }
@@ -2389,7 +2530,8 @@ pub fn Parser(comptime config: types.Config) type {
                     has_not_null = true;
                     column.not_null = true;
                 } else if (try self.takeWord("PRIMARY")) {
-                    if (has_primary.*) {if(if_not_exists) invalid.*=true else return error.Syntax;}
+                    // Multiple primary keys: 42P16, as PostgreSQL (ddl-dml).
+                    if (has_primary.*) {if(if_not_exists) invalid.*=true else return error.InvalidTableDefinition;}
                     try self.expectWord("KEY");
                     has_primary.* = true;
                     column.primary_key = true;
@@ -2400,7 +2542,9 @@ pub fn Parser(comptime config: types.Config) type {
                         try pushConstraint(sink, definition);
                     }
                 } else if (self.mode == .standard and try self.takeRaw("check")) {
-                    try pushConstraint(sink, try self.checkConstraint(name));
+                    var definition = try self.checkConstraint(name);
+                    try self.enforceability(&definition);
+                    try pushConstraint(sink, definition);
                 } else if (self.mode == .standard and try self.takeRaw("unique")) {
                     var definition: Ast.ConstraintDef = .{ .name = name, .kind = .unique, .nulls_not_distinct = try self.nullsDistinct(), .column_count = 1 };
                     definition.columns[0] = column.name;
@@ -2410,6 +2554,7 @@ pub fn Parser(comptime config: types.Config) type {
                     var definition: Ast.ConstraintDef = .{ .name = name, .kind = .foreign, .column_count = 1 };
                     definition.columns[0] = column.name;
                     try self.references(&definition);
+                    try self.enforceability(&definition);
                     try pushConstraint(sink, definition);
                 } else if (self.mode == .standard and (self.rawWord("deferrable") or self.rawWord("initially") or (self.isWord("NOT") and wordIs(self.source, try self.peek(), "deferrable")))) {
                     // After an unnamed column PRIMARY KEY: a deferrable
@@ -2465,7 +2610,9 @@ pub fn Parser(comptime config: types.Config) type {
             try self.expectSymbol(.lparen);
             var has_primary = false;
             const sink: ConstraintSink = .{ .items = out.constraints[0..], .count = &out.constraint_count };
-            while (true) {
+            // An empty element list (CREATE TABLE child () INHERITS (parent)).
+            const empty = self.mode == .standard and self.isSymbol(.rparen);
+            while (!empty) {
                 if (self.mode == .standard and self.isWord("LIKE")) {
                     try self.advance();
                     if (out.like != null) return error.UnsupportedStatement;
@@ -2511,6 +2658,8 @@ pub fn Parser(comptime config: types.Config) type {
                 if (!try self.takeSymbol(.comma)) break;
             }
             try self.expectSymbol(.rparen);
+            // A table without columns is outside the subset.
+            if (empty and !self.rawWord("inherits")) return error.UnsupportedStatement;
             if (self.mode == .standard and try self.takeRaw("inherits")) {
                 try self.expectSymbol(.lparen);
                 out.inherits = try self.qualifiedName();
@@ -3288,7 +3437,7 @@ pub fn Parser(comptime config: types.Config) type {
                         if (self.mode == .standard and self.tokens.dialect == .postgres and !self.pool.complex and n.kind == .function) {
                             var buf: [64]u8 = undefined;
                             if (identText(self.source, n.name, &buf)) |name| {
-                                if (types.same(name, "unnest")) self.pool.complex = true;
+                                if (types.same(name, "unnest") or types.same(name, "generate_subscripts")) self.pool.complex = true;
                             }
                         }
                         target.expression_end = self.previous_end;
@@ -3453,11 +3602,14 @@ pub fn Parser(comptime config: types.Config) type {
                 self.pool.complex = true;
             } else {
                 if (self.mode == .standard and try self.takeWord("ONLY")) item.only = true;
+                // ONLY (name): the parenthesized form (S111, ddl-dml).
+                const wrapped = item.only and try self.takeSymbol(.lparen);
                 item.name = try self.identifier();
                 if (self.mode == .standard and try self.takeSymbol(.dot)) {
                     item.schema = item.name;
                     item.name = try self.identifier();
                 }
+                if (wrapped) try self.expectSymbol(.rparen);
                 // A function call in FROM (B11), implicitly LATERAL, with
                 // optional WITH ORDINALITY.
                 if (self.mode == .standard and !item.only and self.isSymbol(.lparen)) {
@@ -3569,7 +3721,18 @@ pub fn Parser(comptime config: types.Config) type {
             if (self.mode != .standard or !self.isSymbol(.lparen)) {
                 if (count.* == config.columns) return error.DuplicateColumn;
                 const column = try self.identifier();
+                if (self.mode == .standard and self.isSymbol(.lbracket)) return self.subscriptedSetItem(items, count, column);
                 try self.expectSymbol(.eq);
+                // A plain assignment after a subscripted one: 42601.
+                if (self.mode == .standard) for (items[0..count.*]) |*item| {
+                    const previous = &self.pool.nodes[item.value];
+                    if (previous.kind != .function or previous.func != .array_set) continue;
+                    var a: [64]u8 = undefined;
+                    var b: [64]u8 = undefined;
+                    const left = identText(self.source, item.column, &a) orelse continue;
+                    const right = identText(self.source, column, &b) orelse continue;
+                    if (types.same(left, right)) return error.Syntax;
+                };
                 items[count.*] = .{ .column = column, .value = try self.valueItem() };
                 count.* += 1;
                 return;
@@ -3597,6 +3760,133 @@ pub fn Parser(comptime config: types.Config) type {
                 count.* += 1;
             }
             try self.expectSymbol(.rparen);
+        }
+
+        /// `column[...] = value` (B11 wave 4): the column becomes
+        /// array_set(column, value, subscripts...). Further subscripted
+        /// assignments to the same column apply to the previous result.
+        fn subscriptedSetItem(self: *Self, items: *[config.columns]Ast.Assignment, count: *usize, column: ast.Ident) Error!void {
+            const base = try self.pool.add(.{ .kind = .column, .name = column });
+            const node = try self.subscriptTail(base);
+            try self.expectSymbol(.eq);
+            const assigned = try self.valueItem();
+            if (self.pool.nodes[assigned].kind == .default_value) return error.UnsupportedStatement;
+            self.pool.nodes[node].func = .array_set;
+            self.pool.nodes[assigned].next = self.pool.nodes[base].next;
+            self.pool.nodes[base].next = assigned;
+            try self.pool.raise(node, assigned);
+            var wanted_buffer: [64]u8 = undefined;
+            const wanted = identText(self.source, column, &wanted_buffer);
+            for (items[0..count.*]) |*item| {
+                var buffer: [64]u8 = undefined;
+                const name = identText(self.source, item.column, &buffer);
+                if (wanted == null or name == null or !types.same(wanted.?, name.?)) continue;
+                const previous = &self.pool.nodes[item.value];
+                // A plain assignment of the same column: 42601.
+                if (previous.kind != .function or previous.func != .array_set) return error.Syntax;
+                const next = self.pool.nodes[base].next;
+                self.pool.nodes[base] = self.pool.nodes[item.value];
+                self.pool.nodes[base].next = next;
+                item.value = node;
+                return;
+            }
+            items[count.*] = .{ .column = column, .value = node };
+            count.* += 1;
+        }
+
+        /// An xml_attribute node: `expr [AS name]`; without AS the value must
+        /// be a column reference, whose name it takes (42601 otherwise).
+        fn xmlAttribute(self: *Self) Error!u16 {
+            const value_node = try self.expression();
+            var attribute_name: ast.Ident = .{};
+            if (try self.takeWord("AS")) {
+                attribute_name = if (self.current.kind == .quoted_word) try self.identifier() else try self.label();
+            } else {
+                const n = self.pool.nodes[value_node];
+                if (n.kind != .column) return error.Syntax;
+                attribute_name = n.name;
+            }
+            const node = try self.pool.add(.{ .kind = .function, .func = .xml_attribute, .name = attribute_name, .b = value_node });
+            try self.pool.raise(node, value_node);
+            return node;
+        }
+
+        /// XMLELEMENT(NAME n [, XMLATTRIBUTES(...)] [, content ...]),
+        /// XMLFOREST(expr [AS n], ...), XMLPI(NAME n [, content]) and
+        /// XMLROOT(xml, VERSION v | NO VALUE [, STANDALONE YES | NO | NO VALUE]).
+        fn xmlPublishing(self: *Self) Error!u16 {
+            const word = self.current;
+            const call_name = try self.identifier();
+            try self.expectSymbol(.lparen);
+            var items: [64]u16 = undefined;
+            var count: usize = 0;
+            var call: ast.Node = .{ .kind = .function, .name = call_name };
+            if (wordIs(self.source, word, "xmlforest")) {
+                call.func = .xmlforest;
+                while (true) {
+                    if (count == items.len) return error.StatementTooComplex;
+                    items[count] = try self.xmlAttribute();
+                    count += 1;
+                    if (!try self.takeSymbol(.comma)) break;
+                }
+            } else if (wordIs(self.source, word, "xmlroot")) {
+                call.func = .xmlroot;
+                items[0] = try self.expression();
+                count = 1;
+                try self.expectSymbol(.comma);
+                if (!try self.takeRaw("version")) return error.Syntax;
+                var flags: i64 = 0;
+                if (try self.takeWord("NO")) {
+                    if (!try self.takeWord("VALUE")) return error.Syntax;
+                } else {
+                    items[1] = try self.expression();
+                    count = 2;
+                    flags |= 1;
+                }
+                if (try self.takeSymbol(.comma)) {
+                    if (!try self.takeRaw("standalone")) return error.Syntax;
+                    if (try self.takeWord("NO")) {
+                        flags |= if (try self.takeWord("VALUE")) @as(i64, 3) << 1 else @as(i64, 2) << 1;
+                    } else if (try self.takeRaw("yes")) {
+                        flags |= @as(i64, 1) << 1;
+                    } else return error.Syntax;
+                }
+                call.integer = flags;
+            } else {
+                const pi = wordIs(self.source, word, "xmlpi");
+                call.func = if (pi) .xmlpi else .xmlelement;
+                if (!try self.takeRaw("name")) return error.Syntax;
+                const element = if (self.current.kind == .quoted_word) try self.identifier() else try self.label();
+                items[0] = try self.pool.add(.{ .kind = .function, .func = .xml_name, .name = element });
+                count = 1;
+                var attributes: usize = 0;
+                while (try self.takeSymbol(.comma)) {
+                    if (count == items.len) return error.StatementTooComplex;
+                    if (!pi and count == 1 and self.rawWord("xmlattributes") and lparenNext(try self.peek())) {
+                        try self.advance();
+                        try self.expectSymbol(.lparen);
+                        while (true) {
+                            if (count == items.len) return error.StatementTooComplex;
+                            items[count] = try self.xmlAttribute();
+                            count += 1;
+                            attributes += 1;
+                            if (!try self.takeSymbol(.comma)) break;
+                        }
+                        try self.expectSymbol(.rparen);
+                        continue;
+                    }
+                    if (pi and count == 2) return error.Syntax;
+                    items[count] = try self.expression();
+                    count += 1;
+                }
+                call.integer = @intCast(attributes);
+            }
+            try self.expectSymbol(.rparen);
+            for (0..count) |index| self.pool.nodes[items[index]].next = if (index + 1 < count) items[index + 1] else none;
+            call.b = items[0];
+            const node = try self.pool.add(call);
+            for (items[0..count]) |item| try self.pool.raise(node, item);
+            return node;
         }
 
         /// PostgreSQL reserved and type/function-name keywords the tokenizer
@@ -3760,6 +4050,27 @@ pub fn Parser(comptime config: types.Config) type {
                 }
                 if (self.mode == .standard and (self.rawWord("normalized") or self.rawWord("nfc") or self.rawWord("nfd") or self.rawWord("nfkc") or self.rawWord("nfkd"))) {
                     left = try self.normalizedTail(left, negated);
+                    continue;
+                }
+                if (self.mode == .standard and self.tokens.dialect == .postgres and try self.takeRaw("json")) {
+                    // IS [NOT] JSON [VALUE|ARRAY|OBJECT|SCALAR] [WITH|WITHOUT UNIQUE [KEYS]].
+                    var flags: i64 = if (negated) 8 else 0;
+                    if (try self.takeRaw("value")) {} else if (try self.takeRaw("array")) {
+                        flags |= 1;
+                    } else if (try self.takeRaw("object")) {
+                        flags |= 2;
+                    } else if (try self.takeRaw("scalar")) flags |= 3;
+                    if (try self.takeRaw("with")) {
+                        if (!try self.takeRaw("unique")) return error.Syntax;
+                        _ = try self.takeRaw("keys");
+                        flags |= 4;
+                    } else if (try self.takeRaw("without")) {
+                        if (!try self.takeRaw("unique")) return error.Syntax;
+                        _ = try self.takeRaw("keys");
+                    }
+                    const node = try self.pool.add(.{ .kind = .function, .func = .is_json, .b = left, .integer = flags });
+                    try self.pool.raise(node, left);
+                    left = node;
                     continue;
                 }
                 const kind: ast.Test = if (try self.takeWord("NULL"))
@@ -4197,6 +4508,8 @@ pub fn Parser(comptime config: types.Config) type {
                 "regr_count", "regr_sxx", "regr_syy", "regr_sxy", "regr_avgx", "regr_avgy", "regr_slope", "regr_intercept",
                 "regr_r2", "bit_and", "bit_or", "bit_xor",
                 "array_agg", "string_agg", "json_agg", "jsonb_agg", "json_object_agg", "jsonb_object_agg",
+                "json_agg_strict", "jsonb_agg_strict", "json_object_agg_strict", "jsonb_object_agg_strict", "json_object_agg_unique",
+                "jsonb_object_agg_unique", "json_object_agg_unique_strict", "jsonb_object_agg_unique_strict",
                 "percentile_cont", "percentile_disc", "mode" }) |word| {
                 if (types.keyword(raw, word)) return true;
             }
@@ -4218,6 +4531,17 @@ pub fn Parser(comptime config: types.Config) type {
                     .text = .{ .start = name.span.start, .end = end, .len = end - name.span.start } });
             }
             if (!name.quoted and (types.keyword(raw_name, "nextval") or types.keyword(raw_name, "setval"))) self.pool.complex = true;
+            if (self.tokens.dialect == .postgres and !name.quoted) {
+                const which: ?u8 = if (types.keyword(raw_name, "json_exists")) 0 else if (types.keyword(raw_name, "json_value")) 1 else if (types.keyword(raw_name, "json_query")) 2 else null;
+                if (which) |kind| return self.jsonQueryFunction(name, kind);
+                const form: ?u8 = if (types.keyword(raw_name, "json_object")) 0 else if (types.keyword(raw_name, "json_array")) 1 else if (types.keyword(raw_name, "json_scalar")) 2 else if (types.keyword(raw_name, "json_serialize")) 3 else null;
+                if (form) |shape| return self.jsonConstructor(name, shape);
+                if (types.keyword(raw_name, "json_arrayagg")) return self.jsonAggregate(name, false);
+                if (types.keyword(raw_name, "json_objectagg")) return self.jsonAggregate(name, true);
+            }
+            // Set-returning built-ins expand on the general engine (wave 4).
+            if (!name.quoted and (types.keyword(raw_name, "regexp_matches") or types.keyword(raw_name, "regexp_split_to_table") or
+                types.keyword(raw_name, "jsonb_path_query") or types.keyword(raw_name, "jsonb_path_query_tz"))) self.pool.complex = true;
             var call: ast.Node = .{ .kind = .function, .name = name };
             if (self.tokens.dialect == .tds and !name.quoted and types.keyword(raw_name, "isnull")) {
                 self.last_native_syntax = name.span.start;
@@ -4225,6 +4549,7 @@ pub fn Parser(comptime config: types.Config) type {
             }
             var first: u16 = none;
             var close_end = self.current.end;
+            var notation: CallNotation = .{};
             if (try self.takeSymbol(.star)) {
                 call.star = true;
                 close_end = self.current.end;
@@ -4233,14 +4558,14 @@ pub fn Parser(comptime config: types.Config) type {
                 if (self.mode == .standard and try self.takeWord("DISTINCT")) {
                     call.distinct = true;
                 } else if (self.mode == .standard) _ = try self.takeWord("ALL");
-                first = try self.expression();
+                first = try self.callArgument(&notation);
                 call.b = first;
             }
             const node = try self.pool.add(call);
             if (first != none) {
                 var last = first;
                 while (try self.takeSymbol(.comma)) {
-                    const item = try self.expression();
+                    const item = try self.callArgument(&notation);
                     self.pool.nodes[last].next = item;
                     try self.pool.raise(node, item);
                     last = item;
@@ -4284,6 +4609,45 @@ pub fn Parser(comptime config: types.Config) type {
             }
             if (n.distinct or n.c != none or self.aggregateName(name)) self.pool.complex = true;
             return node;
+        }
+
+        const CallNotation = struct { named: bool = false, variadic: bool = false };
+
+        /// One call argument: `[VARIADIC] [name => | name :=] expr` (B11
+        /// wave 4). Named and VARIADIC arguments are wrapped in a
+        /// named_argument node; a positional argument after a named one,
+        /// or any argument after VARIADIC, is 42601.
+        fn callArgument(self: *Self, notation: *CallNotation) Error!u16 {
+            if (self.mode != .standard or self.tokens.dialect != .postgres) return self.expression();
+            const variadic = self.rawWord("variadic");
+            if (notation.variadic) return error.Syntax;
+            if (variadic) {
+                try self.advance();
+                notation.variadic = true;
+            }
+            var name: ast.Ident = .{};
+            if (try self.namedArgumentAhead()) {
+                name = try self.identifier();
+                try self.advance();
+                try self.advance();
+                notation.named = true;
+            } else if (notation.named) return error.Syntax;
+            const value = try self.expression();
+            if (!variadic and name.len == 0) return value;
+            const node = try self.pool.add(.{ .kind = .named_argument, .name = name, .a = value, .integer = @intFromBool(variadic) });
+            try self.pool.raise(node, value);
+            return node;
+        }
+
+        /// `name =>` or `name :=` at the cursor (adjacent symbols).
+        fn namedArgumentAhead(self: *Self) Error!bool {
+            if (self.current.kind != .word and self.current.kind != .quoted_word) return false;
+            const next = try self.peek();
+            if (next.kind != .symbol or (next.symbol != .eq and next.symbol != .colon)) return false;
+            var copy = self.after_peek;
+            const third = try copy.next();
+            if (third.kind != .symbol or third.start != next.end) return false;
+            return (next.symbol == .eq and third.symbol == .gt) or (next.symbol == .colon and third.symbol == .eq);
         }
 
         fn tdsDateAdd(self: *Self, name: ast.Ident) Error!u16 {
@@ -4388,6 +4752,217 @@ pub fn Parser(comptime config: types.Config) type {
                 spec.format_json = true;
             }
             if (try self.takeRaw("path")) column.a = try self.jsonPathLiteral();
+            try self.jsonColumnClauses(&column, &spec);
+            column.integer = spec.encode();
+            return self.pool.add(column);
+        }
+
+        /// [FORMAT JSON [ENCODING UTF8]] after a JSON value expression.
+        fn jsonFormat(self: *Self) Error!bool {
+            if (!try self.takeRaw("format")) return false;
+            if (!try self.takeRaw("json")) return error.Syntax;
+            if (try self.takeRaw("encoding")) {
+                if (!try self.takeRaw("utf8")) return error.Syntax;
+            }
+            return true;
+        }
+
+        /// JSON_EXISTS / JSON_VALUE / JSON_QUERY (wave 4 text-json) after
+        /// `(`: context item [FORMAT JSON], path [PASSING value AS name,
+        /// ...] [RETURNING type [FORMAT JSON]] [wrapper] [quotes]
+        /// [behavior ON EMPTY] [behavior ON ERROR].
+        fn jsonQueryFunction(self: *Self, name: ast.Ident, which: u8) Error!u16 {
+            try self.enter();
+            defer self.leave();
+            const context_item = try self.expression();
+            _ = try self.jsonFormat();
+            try self.expectSymbol(.comma);
+            const path = try self.expression();
+            var list: ArgList = .{};
+            if (try self.takeRaw("passing")) {
+                while (true) {
+                    const value_node = try self.expression();
+                    _ = try self.jsonFormat();
+                    try self.expectWord("AS");
+                    const variable = try self.label();
+                    list.push(self.pool, try self.pool.add(.{ .kind = .function, .func = .json_table_passing, .name = variable, .b = value_node }));
+                    if (!try self.takeSymbol(.comma)) break;
+                }
+            }
+            var column: ast.Node = .{ .kind = .function, .func = .json_table_column, .name = name, .a = path };
+            var spec: ast.JsonTableColumn = .{};
+            switch (which) {
+                0 => {
+                    spec.kind = .exists;
+                    column.cast_type = .boolean;
+                },
+                1 => column.cast_type = .text,
+                else => {
+                    spec.format_json = true;
+                    column.cast_type = .jsonb;
+                },
+            }
+            if (which != 0 and try self.takeRaw("returning")) {
+                const type_spec = try self.typeName();
+                column.cast_type = type_spec.ty;
+                column.typmod = type_spec.typmod;
+                _ = try self.jsonFormat();
+            }
+            if (which == 1) {
+                // JSON_VALUE has no wrapper or quotes clauses.
+                if (self.isWord("WITH") or self.rawWord("without") or self.rawWord("keep") or self.rawWord("omit")) return error.Syntax;
+            }
+            try self.jsonColumnClauses(&column, &spec);
+            try self.expectSymbol(.rparen);
+            column.integer = spec.encode();
+            const column_id = try self.pool.add(column);
+            for ([_]u16{ path, column.b, column.c }) |member| if (member != none) try self.pool.raise(column_id, member);
+            const node = try self.pool.add(.{ .kind = .function, .func = .json_query_function, .name = name, .a = context_item, .b = list.head, .c = column_id, .integer = which });
+            try self.pool.raise(node, context_item);
+            try self.pool.raise(node, column_id);
+            var item = list.head;
+            while (item != none) : (item = self.pool.nodes[item].next) try self.pool.raise(node, item);
+            return node;
+        }
+
+        /// A constructor value [FORMAT JSON] (a FORMAT JSON value is read
+        /// as json).
+        fn jsonValueArgument(self: *Self) Error!u16 {
+            const value_node = try self.expression();
+            if (try self.jsonFormat()) return self.pool.add(.{ .kind = .cast, .cast_type = .json, .a = value_node });
+            return value_node;
+        }
+
+        /// NULL ON NULL / ABSENT ON NULL (true for ABSENT), or null.
+        fn jsonNullClause(self: *Self) Error!?bool {
+            var absent = false;
+            if (self.isWord("NULL") and (try self.peek()).isWord("ON")) {
+                try self.advance();
+            } else if (try self.takeRaw("absent")) {
+                absent = true;
+            } else return null;
+            try self.expectWord("ON");
+            try self.expectWord("NULL");
+            return absent;
+        }
+
+        /// WITH UNIQUE [KEYS] (true) / WITHOUT UNIQUE [KEYS] (false), or null.
+        fn jsonUniqueClause(self: *Self) Error!?bool {
+            var unique = true;
+            if (self.isWord("WITH") and wordIs(self.source, try self.peek(), "unique")) {
+                try self.advance();
+            } else if (try self.takeRaw("without")) {
+                unique = false;
+            } else return null;
+            if (!try self.takeRaw("unique")) return error.Syntax;
+            _ = try self.takeRaw("keys");
+            return unique;
+        }
+
+        /// JSON_OBJECT / JSON_ARRAY / JSON_SCALAR / JSON_SERIALIZE after
+        /// `(` (wave 4 text-json).
+        fn jsonConstructor(self: *Self, name: ast.Ident, form: u8) Error!u16 {
+            try self.enter();
+            defer self.leave();
+            var list: ArgList = .{};
+            var flags: i64 = form;
+            // JSON_ARRAY defaults to ABSENT ON NULL.
+            if (form == 1) flags |= 4;
+            var node: ast.Node = .{ .kind = .function, .func = .json_constructor, .name = name, .cast_type = if (form == 3) .text else .json };
+            const clause = struct {
+                fn starts(parser: *Self) Error!bool {
+                    return parser.isSymbol(.rparen) or parser.rawWord("returning") or parser.rawWord("absent") or parser.rawWord("without") or
+                        (parser.isWord("NULL") and (try parser.peek()).isWord("ON")) or
+                        (parser.isWord("WITH") and wordIs(parser.source, try parser.peek(), "unique"));
+                }
+            };
+            switch (form) {
+                0, 1 => if (!try clause.starts(self)) {
+                    while (true) {
+                        if (form == 0) {
+                            list.push(self.pool, try self.expression());
+                            if (!try self.takeRaw("value") and !try self.takeSymbol(.colon)) return error.Syntax;
+                        }
+                        list.push(self.pool, try self.jsonValueArgument());
+                        if (!try self.takeSymbol(.comma)) break;
+                    }
+                },
+                else => list.push(self.pool, try self.jsonValueArgument()),
+            }
+            if (form <= 1) {
+                if (try self.jsonNullClause()) |absent| flags = if (absent) flags | 4 else flags & ~@as(i64, 4);
+                if (form == 0) {
+                    if (try self.jsonUniqueClause()) |unique| {
+                        if (unique) flags |= 8;
+                    }
+                }
+            }
+            if (try self.takeRaw("returning")) {
+                const type_spec = try self.typeName();
+                node.cast_type = type_spec.ty;
+                node.typmod = type_spec.typmod;
+                _ = try self.jsonFormat();
+            }
+            try self.expectSymbol(.rparen);
+            node.b = list.head;
+            node.integer = flags;
+            const id = try self.pool.add(node);
+            var item = list.head;
+            while (item != none) : (item = self.pool.nodes[item].next) try self.pool.raise(id, item);
+            return id;
+        }
+
+        /// JSON_ARRAYAGG(value [FORMAT JSON] [ORDER BY ...] [ABSENT|NULL ON
+        /// NULL] [RETURNING type]) and JSON_OBJECTAGG(key VALUE|: value
+        /// [NULL|ABSENT ON NULL] [WITH|WITHOUT UNIQUE [KEYS]] [RETURNING
+        /// type]): aggregate calls named so, `integer` bit 0 ABSENT ON
+        /// NULL, bit 1 WITH UNIQUE KEYS, bit 2 RETURNING jsonb.
+        fn jsonAggregate(self: *Self, name: ast.Ident, object: bool) Error!u16 {
+            var flags: i64 = if (object) 0 else 1;
+            const node = try self.pool.add(.{ .kind = .function, .name = name });
+            const first = if (object) try self.expression() else try self.jsonValueArgument();
+            self.pool.nodes[node].b = first;
+            try self.pool.raise(node, first);
+            if (object) {
+                if (!try self.takeRaw("value") and !try self.takeSymbol(.colon)) return error.Syntax;
+                const second = try self.jsonValueArgument();
+                self.pool.nodes[first].next = second;
+                try self.pool.raise(node, second);
+            } else if (self.isWord("ORDER")) self.pool.nodes[node].order = try self.aggregateOrder(node);
+            if (try self.jsonNullClause()) |absent| flags = if (absent) flags | 1 else flags & ~@as(i64, 1);
+            if (object) {
+                if (try self.jsonUniqueClause()) |unique| {
+                    if (unique) flags |= 2;
+                }
+            }
+            if (try self.takeRaw("returning")) {
+                const type_spec = try self.typeName();
+                switch (type_spec.ty) {
+                    .json => {},
+                    .jsonb => flags |= 4,
+                    else => return error.UnsupportedStatement,
+                }
+                _ = try self.jsonFormat();
+            }
+            try self.expectSymbol(.rparen);
+            if (self.isWord("FILTER") and lparenNext(try self.peek())) {
+                try self.advance();
+                try self.advance();
+                try self.expectWord("WHERE");
+                const filter = try self.expression();
+                try self.expectSymbol(.rparen);
+                self.pool.nodes[node].c = filter;
+                try self.pool.raise(node, filter);
+            }
+            if (try self.takeWord("OVER")) self.pool.nodes[node].window = try self.windowSpec(node, true);
+            self.pool.nodes[node].integer = flags;
+            self.pool.complex = true;
+            return node;
+        }
+
+        /// The wrapper, quotes and ON EMPTY / ON ERROR clauses of a
+        /// JSON_TABLE column or SQL/JSON query function.
+        fn jsonColumnClauses(self: *Self, column: *ast.Node, spec: *ast.JsonTableColumn) Error!void {
             if (spec.kind == .regular) {
                 if (try self.takeRaw("without")) {
                     _ = try self.takeRaw("array");
@@ -4449,8 +5024,6 @@ pub fn Parser(comptime config: types.Config) type {
                     column.c = expression_node;
                 } else return error.Syntax;
             }
-            column.integer = spec.encode();
-            return self.pool.add(column);
         }
 
         /// `ORDER BY key [ASC|DESC] [NULLS FIRST|LAST], ...` of an aggregate
@@ -4699,7 +5272,13 @@ pub fn Parser(comptime config: types.Config) type {
                 },
                 .substring => if (!self.isSymbol(.rparen)) {
                     list.push(self.pool, try self.expression());
-                    if (try self.takeWord("FROM")) {
+                    if (self.mode == .standard and try self.takeRaw("similar")) {
+                        // substring(x SIMILAR pattern ESCAPE escape) is
+                        // substring(x, pattern, escape) (wave 4 text-json).
+                        list.push(self.pool, try self.expression());
+                        if (!try self.takeRaw("escape")) return error.Syntax;
+                        list.push(self.pool, try self.expression());
+                    } else if (try self.takeWord("FROM")) {
                         const start = try self.expression();
                         list.push(self.pool, start);
                         if (try self.takeWord("FOR")) list.push(self.pool, try self.expression());
@@ -4925,6 +5504,10 @@ pub fn Parser(comptime config: types.Config) type {
                     try self.expectSymbol(.rparen);
                     return self.pool.add(call);
                 }
+                // SQL/XML publishing forms (B11 wave 4).
+                if (self.mode == .standard and lparenNext(try self.peek()) and (wordIs(self.source, token, "xmlelement") or wordIs(self.source, token, "xmlforest") or
+                    wordIs(self.source, token, "xmlpi") or wordIs(self.source, token, "xmlroot")))
+                    return self.xmlPublishing();
                 // Array literals and PostgreSQL's ARRAY(query) constructor.
                 if (self.mode == .standard and wordIs(self.source, token, "array")) {
                     const after = try self.peek();

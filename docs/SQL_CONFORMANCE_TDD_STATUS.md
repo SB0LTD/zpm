@@ -16,6 +16,146 @@ ALTER VIEW rename, normalized dependency graphs and experimental packed-bank
 definition rewrites remain open. See [scope and contracts](SQL_VIEWS.md).
 PG16/18 stock round trips, strict inventory and complete source CI are pending
 for this candidate; the qualified checkpoint below remains the release baseline.
+## Text and JSON (lane B11 wave 4, text-json) — 27 November 2026
+
+Branch `w4/text-json` closes most of the regular-expression, text-search
+and SQL/JSON gaps left by waves 3 (`b11/text`, `b11/json-agg`).
+`contract-sql-text-json` (tests/test_sql_text_json.sig, batteries in
+tests/sql_text_json_batteries.sig) checks values, result names, OIDs and
+typmods, NULLs, exact SQLSTATEs with statement atomicity, work budgets and
+cancellation points, and change-record replay into a replica. Every
+expectation was checked against native PostgreSQL 18.7, case by case: the
+batteries are psql output, never edited by hand.
+
+- **Character semantics (ctype)**: the engine follows glibc's C.UTF-8
+  ctype under the libc provider, the locale of the feature-probe oracle.
+  upper/lower/initcap use towupper/towlower per character and iswalnum
+  word boundaries; regular expressions use regc_pg_locale.c's libc wide
+  strategy (non-ASCII classes per iswalpha, iswupper, ... ; `\w` and the
+  word constraints use alnum; a case-insensitive character is allcases(),
+  towlower and towupper but not the character itself; bracket ranges add
+  the case variants of their members; back references compare towlower);
+  the text search parser classifies non-ASCII characters with iswalpha /
+  iswspace and p_isspecial, and its dictionaries lower-case with towlower;
+  ILIKE compares lower() of both sides. The tables (unicode_case.sig) were
+  extracted from native PostgreSQL 18.7. Sorting is unchanged: C.UTF-8
+  collates by code point, as C does for UTF-8. Six non-ASCII entries of
+  contract-sql-text and two of the new batteries, first written for a C
+  database, now hold the C.UTF-8 result.
+- **Regular expressions** (regex.sig rewritten after regcomp.c /
+  regexec.c): a subexpression tree with PostgreSQL's LONGER / SHORTER /
+  MIXED preferences, leftmost start then longest or shortest match by the
+  tree, and cdissect-style dissection, so back references (also inside
+  quantified groups, `{0}`-removed groups never match), BREs (`(?b)` and
+  regexp option `b`), quoted patterns (`q`), lookarounds nested to any depth (54001
+  beyond Config.expr_depth) and capture positions all behave as in
+  PostgreSQL. Matching stays a Pike VM per subexpression; dissection
+  spends one work checkpoint per candidate split.
+- **Regex functions**: regexp_match, regexp_matches (set-returning, in FROM
+  with ORDINALITY and in the select list), regexp_replace (flags, start,
+  N), regexp_split_to_array / regexp_split_to_table, regexp_count,
+  regexp_instr, regexp_substr, `substring(... FROM pattern)` and
+  `substring(... SIMILAR ... ESCAPE ...)`.
+- **Full text search**: the english configuration (a port of Snowball
+  2.2.0's English stemmer, snowball_english.sig, and PostgreSQL's english
+  stop-word list; stop words keep their positions and become phrase
+  gaps); `default_text_search_config` (session setting, SET / SET LOCAL /
+  RESET, SHOW, pg_settings; default `pg_catalog.english`, other Snowball
+  configurations 0A000, unknown names 22023); the one-argument to_tsvector
+  / to_tsquery / plainto_tsquery / phraseto_tsquery; `text @@ tsquery` and
+  `text @@ text` (two untyped operands now resolve to text @@ text);
+  length(tsvector), strip, setweight (with and without lexemes), ts_delete
+  (text and text[]), ts_filter, tsvector_to_array, array_to_tsvector,
+  numnode and `tsvector || tsvector`.
+- **SQL/JSON**: jsonpath like_regex (flags i, s, m, q; x is 0A000 as in
+  PostgreSQL) and keyvalue() (ids from PostgreSQL's jsonb binary layout);
+  jsonb_path_query as a set-returning function (FROM and select list) and
+  the `_tz` variants; JSON_EXISTS, JSON_VALUE and JSON_QUERY as
+  expressions (PASSING, RETURNING, FORMAT JSON, wrappers, quotes, ON EMPTY
+  / ON ERROR with DEFAULT expressions); IS [NOT] JSON [VALUE | ARRAY |
+  OBJECT | SCALAR] [WITH | WITHOUT UNIQUE [KEYS]]; JSON_OBJECT (`VALUE`
+  and `:`), JSON_ARRAY, JSON_SCALAR, JSON_SERIALIZE with NULL / ABSENT ON
+  NULL, WITH UNIQUE KEYS, RETURNING and FORMAT JSON; JSON_OBJECTAGG and
+  JSON_ARRAYAGG (ORDER BY, NULL clauses, UNIQUE, RETURNING json / jsonb);
+  json[b]_agg_strict and json[b]_object_agg_strict / _unique /
+  _unique_strict.
+
+Open, each 0A000 here: JSON_TABLE NESTED PATH; the jsonpath datetime
+methods (datetime(), date(), time[_tz](), timestamp[_tz]()); jsonb
+subscript assignment; JSON_ARRAYAGG / JSON_OBJECTAGG RETURNING a string
+type; ts_rank, ts_rank_cd, ts_headline, websearch_to_tsquery, querytree,
+tsvector / tsquery comparison and ordering operators and their binary
+wire forms; Snowball configurations other than english. Collations other
+than the C-equivalent built-ins are untouched: column collations need a
+table-definition format change (ddl-dml lane), and pg_collation, COLLATION
+FOR, 42P22 and CREATE COLLATION were not started.
+
+Deviations kept on purpose: JSON_SERIALIZE(jsonb) returns the jsonb text
+(PostgreSQL 18.7 returns a corrupt '\x01'); JSON_OBJECT WITH UNIQUE KEYS
+checks at most 64 keys (54000 beyond); a lexeme or case-mapped value that
+grows past Config.text_bytes is 54000; regex dissection end points are
+bounded by the caller's workspace (54000).
+
+New SQLSTATE mappings: 22030 (DuplicateJsonObjectKeyValue) and 2200F
+(ZeroLengthCharacterString). Change records: no new op, value tag or
+format; the new values are stored in existing json, jsonb, tsvector and
+text columns and replay unchanged. No new Config constant.
+
+## Extended types (lane B11 wave 4, types-ext) — 27 November 2026
+
+Branch `w4/types-ext` closes most of the advanced-types gaps of wave 2.
+`contract-sql-types-ext` (tests/test_sql_types_ext.sig) checks values,
+result OIDs and typmods, NULLs, exact SQLSTATEs, statement atomicity, wire
+send/receive and change-record replay into a replica. Every expectation
+was checked against native PostgreSQL 18.7.
+
+- **void**: the pseudo-type (OID 2278, empty output, no operators, no
+  columns: 42P16) and the void-returning session functions `pg_notify`,
+  `pg_advisory_lock[_shared]`, `pg_advisory_xact_lock[_shared]` and
+  `pg_advisory_unlock_all`. A conflicting blocking advisory request parks the
+  statement (WouldBlock) waiting for the holders' transactions; a holder
+  outside any transaction wakes it through unlock. A parked statement's
+  session-level grants are undone so its re-delivery counts them once.
+  `pg_sleep` is not provided.
+- **Arrays**: `array_position(s)`, `array_replace`, `trim_array`,
+  `array_fill`, `array_reverse`, `array_sort`, `array_sample`,
+  `array_shuffle` (a session PRNG through the session hook),
+  `string_to_array`, `width_bucket(anycompatible, anycompatiblearray)`,
+  `generate_subscripts`, `unnest` of several arrays in FROM (WITH
+  ORDINALITY), several set-returning targets in lockstep, `UPDATE ... SET
+  a[i] = v` / `a[i:j] = v` (one-dimensional arrays extend with NULLs),
+  `array_agg`/`string_agg` as window functions (frames, exclusions, FILTER),
+  and collecting or DISTINCT aggregates in GROUPING SETS / ROLLUP / CUBE
+  through a sorted grouping-set path.
+- **Multiranges**: the six built-in multirange types (change-record value
+  tag 40, rebuilt and checked canonical on replay; multirange_send/recv),
+  constructors, `multirange(range)`, accessors, `range_merge`, the
+  operators with ranges and elements, ordering/hashing, `unnest`,
+  `range_agg` and `range_intersect_agg`. MIN/MAX over ranges stay 42883, as
+  in PostgreSQL 18.
+- **Geometry**: lseg, line, path, polygon and circle (value tag 41,
+  validated on replay; their send/recv forms), every geo_ops function
+  PostgreSQL 18 lists by name, the casts between geometric types, and the
+  operators `+ - * /`, `= < > <= >= <>`, `~=`, `<->`, `@>`, `<@`, `&&`,
+  `<< >> &< &>` for their PostgreSQL signatures. point/box/lseg/line take
+  subscripts. Operators that need new lexer tokens (`@-@`, `@@`, `#`, `##`,
+  `?#`, `?-`, `?|`, `?-|`, `?||`, `<<|`, `|>>`, `&<|`, `|&>`, `<^`, `>^`) and
+  polygon `&&`/`@>`/`<<` remain open, as does element assignment into
+  point/box columns.
+- **Network**: macaddr8 (OID 774, value tag 46) with its seven input
+  layouts, macaddr <-> macaddr8, `trunc`, `macaddr8_set7bit`, the bitwise
+  operators, `inet + - int8`, `inet - inet`, `abbrev`, `set_masklen`,
+  `hostmask`, `inet_merge` and `inet_same_family`.
+- **XML**: XMLELEMENT/XMLATTRIBUTES, XMLFOREST, XMLCONCAT, XMLAGG (ORDER
+  BY), XMLPI, XMLCOMMENT, XMLTEXT and XMLROOT with PostgreSQL's name
+  escaping and value mapping (2200T, 2200S). XPath (`xpath`,
+  `xpath_exists`, XMLEXISTS), XMLTABLE and `XMLSERIALIZE ... INDENT` remain
+  open: no libxml2 replacement was written in this wave.
+
+Change records: value tags 40 (multirange), 41 (geometry) and 46
+(macaddr8); older records never use them and replay unchanged. No new op.
+The built-in pg_type view grows from 99 to 123 rows; the types-advanced
+and text contract workspaces grow to 256 rows to scan it.
 
 ## View _RETURN rule definitions — qualified, 27 November 2026
 

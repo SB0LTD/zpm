@@ -137,7 +137,72 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     // is the regconfig name.
     to_tsvector, to_tsquery, plainto_tsquery, phraseto_tsquery, mysql_ifnull, mysql_date_add, mysql_last_insert_id, sind, cosd, acldefault, pg_encoding_to_char, current_schemas, array_remove, to_regproc,
     quote_ident, quote_literal, pg_get_userbyid, pg_tablespace_location,
-    pg_get_function_arguments, pg_get_function_identity_arguments, pg_get_function_result, pg_get_function_sqlbody };
+    pg_get_function_arguments, pg_get_function_identity_arguments, pg_get_function_result, pg_get_function_sqlbody,
+    // void-returning session functions (B11 wave-4 types-ext, Database
+    // session hook; volatile).
+    pg_notify, pg_advisory_lock, pg_advisory_lock_shared, pg_advisory_xact_lock, pg_advisory_xact_lock_shared, pg_advisory_unlock_all,
+    // Arrays (B11 wave-4 types-ext, array_eval.sig): the remaining
+    // array_userfuncs.c functions, width_bucket(anycompatible,
+    // anycompatiblearray) and the element / slice assignment of UPDATE
+    // SET a[...] = v (array_set: `b` the base, the new value, then the
+    // subscripts; its layout in `integer` as for array_subscript).
+    array_position, array_positions, array_replace, trim_array, array_fill, array_reverse, array_sort, array_sample, array_shuffle,
+    string_to_array, array_width_bucket, array_set,
+    // Types-ext operators and functions (B11 wave 4, types_ext_eval.sig):
+    // ext_op is an operator call (`integer` the Op, the operands in `b`),
+    // named ?column?; then the network and macaddr8 functions.
+    ext_op, inet_abbrev, set_masklen, hostmask, inet_merge, inet_same_family, macaddr8_set7bit, to_macaddr8, to_macaddr, mac_trunc,
+    // Geometric functions over the B11 wave-4 types (`integer` a GeoFn).
+    geo_call,
+    // Multiranges (B11 wave 4): the int4multirange(...) family (result
+    // type in the node), multirange(anyrange), range_merge, and the range
+    // accessors over a multirange (`integer` a MultirangeFn).
+    multirange_constructor, multirange_of, range_merge, mr_call,
+    // SQL/XML publishing (B11 wave 4, xml_publish.sig): XMLELEMENT (`b` an
+    // xml_name, then xml_attribute nodes, `integer` their count, then the
+    // content), XMLFOREST (xml_attribute nodes), XMLCONCAT, XMLCOMMENT,
+    // XMLPI (xml_name, optional content) and XMLROOT (`integer`: bit 0
+    // a version argument, bits 1-2 standalone 0 absent / 1 yes / 2 no /
+    // 3 no value). xml_name carries an identifier in `name`; an
+    // xml_attribute its name and value (`b`). Neither is a value.
+    xmlelement, xmlforest, xmlconcat, xmlcomment, xmlpi, xmlroot, xml_name, xml_attribute,
+    // Regular-expression functions (wave 4 text-json lane, regex_eval.sig):
+    // substring_regex is substring(text, text) and substring_similar
+    // substring(text, text, text) (SIMILAR ... ESCAPE). regexp_matches and
+    // regexp_split_to_table return sets (FROM items or one target).
+    regexp_match, regexp_matches, regexp_replace, regexp_split_to_array, regexp_split_to_table, regexp_count, regexp_instr, regexp_substr,
+    substring_regex, substring_similar,
+    // jsonb_path_query (and jsonb_path_query_tz): the items of a path as a
+    // set (wave 4 text-json; json_eval.sig rows).
+    jsonb_path_query,
+    // JSON_EXISTS / JSON_VALUE / JSON_QUERY (wave 4 text-json): `a` the
+    // context item, `b` -> next PASSING values (json_table_passing), `c`
+    // a json_table_column describing the path, RETURNING type, wrapper,
+    // quotes and ON EMPTY / ON ERROR; `integer` 0 EXISTS, 1 VALUE, 2 QUERY.
+    json_query_function,
+    // expr IS [NOT] JSON [VALUE|ARRAY|OBJECT|SCALAR] [WITH|WITHOUT UNIQUE
+    // [KEYS]] (wave 4 text-json): `b` the operand, `integer` bits 0-1 the
+    // item type (value, array, object, scalar), bit 2 WITH UNIQUE KEYS,
+    // bit 3 NOT.
+    is_json,
+    // JSON_OBJECT / JSON_ARRAY / JSON_SCALAR / JSON_SERIALIZE (wave 4
+    // text-json): `b` -> next the arguments (object: key, value pairs);
+    // `integer` bits 0-1 the form (0 object, 1 array, 2 scalar, 3
+    // serialize), bit 2 ABSENT ON NULL, bit 3 WITH UNIQUE KEYS; the
+    // RETURNING type in cast_type / typmod.
+    json_constructor,
+    // tsvector / tsquery utilities (wave 4 text-json, text_search.sig):
+    // length(tsvector), strip, setweight (2 or 3 arguments),
+    // tsvector_to_array, array_to_tsvector, ts_delete (text or text[]),
+    // ts_filter and numnode.
+    tsvector_length, ts_strip, ts_setweight, tsvector_to_array, array_to_tsvector, ts_delete, ts_filter, ts_numnode };
+
+
+/// mr_call variants: the range accessors applied to a multirange's span.
+pub const MultirangeFn = enum(u8) { lower, upper, isempty, lower_inc, upper_inc, lower_inf, upper_inf };
+
+/// geo_call variants (types_ext_eval.sig), chosen by name and arguments.
+pub const GeoFn = enum(u8) { area, center, length, npoints, radius, diameter, isclosed, isopen, pclose, popen, slope, diagonal, bound_box, box, circle, line, lseg, path, polygon, point, ishorizontal, isvertical, isparallel, isperp, pt_contained_circle, pt_contained_poly };
 
 /// JSON_TABLE column flags (Node.integer of a json_table_column).
 pub const JsonTableColumn = struct {
@@ -214,6 +279,9 @@ pub fn immutableBuiltin(func: Func) bool {
         .overlaps, .aggregate_pair, .normalize, .is_normalized, .mysql_date_add => true,
         .array_constructor, .array_subscript, .array_any, .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper,
         .array_append, .array_prepend, .array_cat, .array_remove => true,
+        .array_position, .array_positions, .array_replace, .trim_array, .array_fill, .array_reverse, .array_sort, .string_to_array, .array_width_bucket, .array_set => true,
+        .ext_op, .inet_abbrev, .set_masklen, .hostmask, .inet_merge, .inet_same_family, .macaddr8_set7bit, .to_macaddr8, .to_macaddr, .mac_trunc, .geo_call => true,
+        .multirange_constructor, .multirange_of, .range_merge, .mr_call => true,
         .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => true,
         .inet_host, .masklen, .inet_family, .inet_network, .broadcast, .netmask => true,
         .point_constructor, .box_constructor, .area, .center, .width, .height => true,
@@ -221,6 +289,8 @@ pub fn immutableBuiltin(func: Func) bool {
         // to_json / to_jsonb are STABLE (timestamptz output).
         .to_json, .to_jsonb => false,
         .regexp_like, .similar_to_escape => true,
+        .regexp_match, .regexp_replace, .regexp_split_to_array, .regexp_count, .regexp_instr, .regexp_substr, .substring_regex, .substring_similar => true,
+        .tsvector_length, .ts_strip, .ts_setweight, .tsvector_to_array, .array_to_tsvector, .ts_delete, .ts_filter, .ts_numnode => true,
         .to_tsvector, .to_tsquery, .plainto_tsquery, .phraseto_tsquery => true,
         else => jsonFunction(func),
     };
@@ -235,6 +305,7 @@ pub fn strictFunction(func: Func) bool {
         .current_timestamp, .current_date, .current_database, .current_schema, .current_schemas, .pg_encoding_to_char,
         .to_regtype, .to_regclass, .to_regproc, .pg_get_expr, .acldefault, .pg_get_userbyid, .pg_tablespace_location,
         .pg_get_function_arguments, .pg_get_function_identity_arguments, .pg_get_function_result, .pg_get_function_sqlbody,
+        .pg_advisory_lock, .pg_advisory_lock_shared, .pg_advisory_xact_lock, .pg_advisory_xact_lock_shared,
         .regclass_in, .regtype_in, .regclass_out, .regtype_out, .to_regnamespace, .regnamespace_in, .regnamespace_out => true,
         .lower, .upper, .initcap, .char_length, .octet_length, .bit_length, .substring, .btrim, .ltrim, .rtrim, .strpos, .replace,
         .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .overlay, .to_hex => true,
@@ -242,6 +313,10 @@ pub fn strictFunction(func: Func) bool {
         .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .date_bin, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => true,
         .to_date, .to_number, .to_timestamp, .aggregate_pair, .normalize, .is_normalized => true,
         .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper => true,
+        .trim_array, .array_reverse, .array_sort, .array_sample, .array_shuffle => true,
+        .ext_op, .inet_abbrev, .set_masklen, .hostmask, .inet_merge, .inet_same_family, .macaddr8_set7bit, .to_macaddr8, .to_macaddr, .mac_trunc, .geo_call => true,
+        .multirange_of, .range_merge, .mr_call => true,
+        .xmlcomment, .xmlpi => true,
         .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => true,
         .inet_host, .masklen, .inet_family, .inet_network, .broadcast, .netmask => true,
         .point_constructor, .box_constructor, .area, .center, .width, .height => true,
@@ -250,9 +325,17 @@ pub fn strictFunction(func: Func) bool {
         .jsonb_set_lax => false,
         .pg_get_serial_sequence, .pg_table_is_visible, .pg_get_indexdef, .pg_get_constraintdef, .pg_get_triggerdef, .pg_get_ruledef, .pg_get_viewdef, .pg_partition_ancestors, .pg_get_statisticsobjdef_columns, .pg_relation_is_publishable, .pg_get_partkeydef => true,
         .regexp_like, .similar_to_escape => true,
+        .regexp_match, .regexp_matches, .regexp_replace, .regexp_split_to_array, .regexp_split_to_table, .regexp_count, .regexp_instr, .regexp_substr, .substring_regex, .substring_similar => true,
+        .tsvector_length, .ts_strip, .ts_setweight, .tsvector_to_array, .array_to_tsvector, .ts_delete, .ts_filter, .ts_numnode => true,
         .to_tsvector, .to_tsquery, .plainto_tsquery, .phraseto_tsquery => true,
         else => jsonFunction(func),
     };
+}
+
+/// Set-returning built-ins (wave 4 text-json): bound only as a FROM item
+/// or inside one target of a select list.
+pub fn setFunction(func: Func) bool {
+    return func == .regexp_matches or func == .regexp_split_to_table or func == .jsonb_path_query;
 }
 
 /// Cast typmods marking `::regclass` / `::regtype` (OID-valued casts).
@@ -286,7 +369,11 @@ pub const Agg = enum { none, count, count_star, sum, avg, min, max, bool_and, bo
     // their ORDER BY / WITHIN GROUP keys) and so run only on the sorted
     // grouping operator; the other operators reject them with 0A000.
     array_agg, string_agg, json_agg, jsonb_agg, json_object_agg, jsonb_object_agg,
-    percentile_cont, percentile_disc, mode, hypothetical_rank, hypothetical_dense_rank, hypothetical_percent_rank, hypothetical_cume_dist };
+    percentile_cont, percentile_disc, mode, hypothetical_rank, hypothetical_dense_rank, hypothetical_percent_rank, hypothetical_cume_dist,
+    // Multirange aggregates (B11 wave 4): collecting, not ordered-set.
+    range_agg, range_intersect_agg,
+    // XMLAGG (B11 wave 4): collecting.
+    xmlagg };
 
 /// Aggregates that need their group's whole input (Exec.collectAggregate).
 pub fn collectingAggregate(agg: Agg) bool {
@@ -295,7 +382,7 @@ pub fn collectingAggregate(agg: Agg) bool {
 
 /// Ordered-set and hypothetical-set aggregates (WITHIN GROUP).
 pub fn orderedSetAggregate(agg: Agg) bool {
-    return @intFromEnum(agg) >= @intFromEnum(Agg.percentile_cont);
+    return @intFromEnum(agg) >= @intFromEnum(Agg.percentile_cont) and @intFromEnum(agg) <= @intFromEnum(Agg.hypothetical_cume_dist);
 }
 
 /// Two-argument (Y, X) aggregates; their argument is an aggregate_pair node.
@@ -366,6 +453,10 @@ pub const NodeKind = enum {
     /// Bound flat IN candidates: row_compare nodes in `b` -> next.
     /// Each owns a separate left expression, as PostgreSQL's OR expansion does.
     row_in,
+    /// A function-call argument in named notation (`name => a`, `name :=
+    /// a`) or marked VARIADIC (`integer` 1; `name` empty when positional).
+    /// Only user routine calls accept it; binding unwraps it (B11 wave 4).
+    named_argument,
 };
 
 /// Children by kind: unary/not/test/cast `a`; binary/and/or/nullif `a`,`b`;
@@ -578,6 +669,12 @@ pub fn Ast(comptime config: types.Config) type {
             on_update: ForeignAction = .no_action,
             /// EXCLUDE: operator per element (1 `=`, 2 `&&`).
             operators: [config.columns]u8 = undefined,
+            /// NOT VALID (ddl-dml, wave 4): ALTER TABLE ADD skips the
+            /// existing rows of a CHECK or FOREIGN KEY constraint.
+            not_valid: bool = false,
+            /// NOT ENFORCED (PostgreSQL 18): a CHECK or FOREIGN KEY never
+            /// checked.
+            not_enforced: bool = false,
         };
 
         /// LIKE source [INCLUDING | EXCLUDING option ...] inside CREATE TABLE:
@@ -636,6 +733,9 @@ pub fn Ast(comptime config: types.Config) type {
         pub const IndexElement = struct { column: ?Ident = null, expression: Span = .{}, node: u16 = none, descending: bool = false, nulls_first: ?bool = null };
         pub const CreateIndex = struct {
             unique: bool = false,
+            /// CREATE INDEX CONCURRENTLY (ddl-dml, wave 4): never inside a
+            /// transaction block (25001).
+            concurrently: bool = false,
             if_not_exists: bool = false,
             name: ?Ident = null,
             table: TableRef = .{},
@@ -706,10 +806,18 @@ pub fn Ast(comptime config: types.Config) type {
             options: sequence.Options = .{},
         };
 
-        pub const Drop = struct { name: Ident, if_exists: bool = false, schema: ?Ident = null, cascade: bool = false };
+        pub const Drop = struct { name: Ident, if_exists: bool = false, schema: ?Ident = null, cascade: bool = false, concurrently: bool = false };
 
         /// CREATE SCHEMA [IF NOT EXISTS] name.
-        pub const CreateSchema = struct { name: Ident = .{}, if_not_exists: bool = false };
+        pub const CreateSchema = struct {
+            name: Ident = .{},
+            if_not_exists: bool = false,
+            /// AUTHORIZATION role (ddl-dml, wave 4): a role name, or 1
+            /// CURRENT_USER / CURRENT_ROLE, 2 SESSION_USER.
+            owner: ?Ident = null,
+            owner_special: u8 = 0,
+            named: bool = true,
+        };
 
         /// DROP SCHEMA [IF EXISTS] name [CASCADE | RESTRICT].
         pub const DropSchema = struct { name: Ident = .{}, if_exists: bool = false, cascade: bool = false };
@@ -972,6 +1080,10 @@ pub fn Ast(comptime config: types.Config) type {
             tables: [config.tables]TableRef = undefined,
             count: usize = 0,
             restart_identity: bool = false,
+            /// TRUNCATE ONLY name: no inheritance children (ddl-dml, wave 4).
+            only: [config.tables]bool = @splat(false),
+            /// CASCADE: tables referencing a truncated table are truncated.
+            cascade: bool = false,
         };
 
         /// One ALTER TABLE action. Column-level CHECK / UNIQUE of an ADD
@@ -994,6 +1106,19 @@ pub fn Ast(comptime config: types.Config) type {
             add_constraint: ConstraintDef,
             drop_constraint: struct { name: Ident, if_exists: bool = false },
             rename_table: Ident,
+            // ddl-dml (wave 4): ALTER TABLE parent ATTACH / DETACH PARTITION.
+            attach_partition: struct { table: TableRef, bound: PartitionBound },
+            detach_partition: struct { table: TableRef, concurrently: bool = false },
+            rename_constraint: struct { from: Ident, to: Ident },
+            validate_constraint: Ident,
+            // ALTER [COLUMN] c DROP IDENTITY / DROP EXPRESSION [IF EXISTS],
+            // SET GENERATED { ALWAYS | BY DEFAULT }, RESTART [[WITH] n].
+            drop_identity: struct { column: Ident, if_exists: bool = false },
+            drop_expression: struct { column: Ident, if_exists: bool = false },
+            set_generated: struct { column: Ident, always: bool },
+            restart_identity: struct { column: Ident, value: ?i64 = null },
+            /// ALTER CONSTRAINT name [NOT] ENFORCED.
+            alter_enforced: struct { name: Ident, enforced: bool },
         };
 
         /// ALTER TABLE [IF EXISTS] [ONLY] name action [, ...] | RENAME ...
@@ -1123,7 +1248,7 @@ pub const Characteristics = struct {
 /// TIME ZONE, XML OPTION and TRANSACTION ISOLATION LEVEL.
 pub const SettingName = struct {
     ident: Ident = .{},
-    special: enum { none, time_zone, xml_option, transaction_isolation, session_authorization } = .none,
+    special: enum { none, time_zone, xml_option, transaction_isolation, session_authorization, schema } = .none,
 };
 
 /// SET value: DEFAULT, LOCAL (TIME ZONE LOCAL), a word, a string literal or

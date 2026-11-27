@@ -10,6 +10,7 @@ const types = @import("types.sig");
 const ast = @import("ast.sig");
 const array = @import("array.sig");
 const value = @import("value.sig");
+const geometry = @import("geometry.sig");
 const Error = types.Error;
 const none = ast.none;
 
@@ -55,8 +56,572 @@ pub fn ArrayEval(comptime config: types.Config, comptime E: type) type {
                 },
                 .array_to_string => toString(ctx, n),
                 .array_remove => remove(ctx, n),
+                .array_position, .array_positions => findPosition(ctx, n),
+                .array_replace => replace(ctx, n),
+                .trim_array => trim(ctx, n),
+                .array_fill => fill(ctx, n),
+                .array_reverse, .array_shuffle, .array_sample => permute(ctx, n),
+                .array_sort => sort(ctx, n),
+                .string_to_array => split(ctx, n),
+                .array_width_bucket => widthBucket(ctx, n),
+                .array_set => assign(ctx, n),
                 else => measure(ctx, n),
             };
+        }
+
+        // ---- B11 wave-4 types-ext: array_userfuncs.c --------------------------
+
+        fn notDistinct(a: *const V.Cell, b: *const V.Cell) bool {
+            const a_null = a.* == .null_value;
+            const b_null = b.* == .null_value;
+            if (a_null or b_null) return a_null and b_null;
+            return V.compare(a, b) == 0;
+        }
+
+        /// array_position(array, value [, start]) / array_positions(array,
+        /// value): one-dimensional arrays only (0A000), IS NOT DISTINCT FROM
+        /// matching, positions in the array's own subscripts.
+        fn findPosition(ctx: *const E.Context, n: *const ast.Node) Error!V.Cell {
+            const source = try E.eval(ctx, n.b);
+            const needle_id = node(ctx, n.b).next;
+            const needle = try E.eval(ctx, needle_id);
+            const start_id = node(ctx, needle_id).next;
+            const start: V.Cell = if (start_id == none) .null_value else try E.eval(ctx, start_id);
+            if (source == .null_value) return .null_value;
+            const bytes = source.array.slice();
+            const shape = A.shape(bytes);
+            if (shape.ndim > 1) return error.UnsupportedStatement;
+            const all = n.func == .array_positions;
+            if (shape.ndim == 0) return if (all) empty(.integer32) else .null_value;
+            if (start_id != none and start == .null_value) return error.NullValueNotAllowed;
+            const minimum: i64 = if (start_id == none) shape.lbounds[0] else start.integer;
+            var found: usize = 0;
+            var result: V.Text = .{};
+            var writer: A.Writer = undefined;
+            // array_positions: count, then write.
+            for (0..@as(usize, if (all) 2 else 1)) |pass| {
+                if (all and pass == 1) writer = try A.Writer.begin(&result, &.{ .element = .integer32, .ndim = if (found == 0) 0 else 1, .dims = .{ @intCast(found), 0, 0, 0, 0, 0 } });
+                var reader = A.Reader.init(bytes);
+                var cell: V.Cell = undefined;
+                var index: i64 = shape.lbounds[0];
+                while (reader.next(&cell)) : (index += 1) {
+                    try ctx.session.checkpoint();
+                    if (index < minimum or !notDistinct(&cell, &needle)) continue;
+                    if (!all) return .{ .integer = index };
+                    if (pass == 0) found += 1 else try writer.append(&.{ .integer = index });
+                }
+                if (!all) return .null_value;
+                if (found == 0) return empty(.integer32);
+            }
+            return .{ .array = result };
+        }
+
+        /// array_replace(array, search, replacement): every element not
+        /// distinct from `search`, at any dimension.
+        fn replace(ctx: *const E.Context, n: *const ast.Node) Error!V.Cell {
+            const source = try E.eval(ctx, n.b);
+            const search_id = node(ctx, n.b).next;
+            const search = try E.eval(ctx, search_id);
+            const replacement = try E.eval(ctx, node(ctx, search_id).next);
+            if (source == .null_value) return .null_value;
+            const shape = A.shape(source.array.slice());
+            if (shape.ndim == 0) return source;
+            var result: V.Text = .{};
+            var writer = try A.Writer.begin(&result, &shape);
+            var reader = A.Reader.init(source.array.slice());
+            var cell: V.Cell = undefined;
+            while (reader.next(&cell)) {
+                try ctx.session.checkpoint();
+                try writer.append(if (notDistinct(&cell, &search)) &replacement else &cell);
+            }
+            return .{ .array = result };
+        }
+
+        /// Writes `shape`'s header and then raw element bytes copied from
+        /// `source` ranges; `nulls` sets the header flag.
+        fn rawBegin(out: *V.Text, shape: *const array.Shape) Error!void {
+            _ = try shape.checkedCount();
+            out.len = try A.writeHeader(&out.bytes, shape);
+        }
+
+        fn rawCopy(out: *V.Text, bytes: []const u8) Error!void {
+            try A.putBytes(out, bytes);
+        }
+
+        fn rawFinish(out: *V.Text, nulls: bool) V.Cell {
+            if (nulls) out.bytes[2] |= 1;
+            return .{ .array = out.* };
+        }
+
+        /// trim_array(array, n): drops the last n items of the first
+        /// dimension (2202E unless 0 <= n <= its length).
+        fn trim(ctx: *const E.Context, n: *const ast.Node) Error!V.Cell {
+            const source = try E.eval(ctx, n.b);
+            const count = try E.eval(ctx, node(ctx, n.b).next);
+            if (source == .null_value or count == .null_value) return .null_value;
+            const bytes = source.array.slice();
+            const shape = A.shape(bytes);
+            const length: i64 = if (shape.ndim == 0) 0 else shape.dims[0];
+            if (count.integer < 0 or count.integer > length) return error.ArraySubscriptError;
+            if (count.integer == 0) return source;
+            if (count.integer == length) return empty(shape.element);
+            var layout = shape;
+            layout.dims[0] = @intCast(length - count.integer);
+            // A slice: every lower bound becomes 1.
+            for (0..layout.ndim) |dim| layout.lbounds[dim] = 1;
+            const kept = layout.count();
+            var nulls = false;
+            const start = A.bodyOffset(bytes);
+            const end = A.skipElements(bytes, start, shape.element, kept, &nulls);
+            var result: V.Text = .{};
+            try rawBegin(&result, &layout);
+            try rawCopy(&result, bytes[start..end]);
+            return rawFinish(&result, nulls);
+        }
+
+        /// array_fill(value, dims [, lbounds]).
+        fn fill(ctx: *const E.Context, n: *const ast.Node) Error!V.Cell {
+            const value_cell = try E.eval(ctx, n.b);
+            const dims_id = node(ctx, n.b).next;
+            const dims = try E.eval(ctx, dims_id);
+            const bounds_id = node(ctx, dims_id).next;
+            const bounds: V.Cell = if (bounds_id == none) .null_value else try E.eval(ctx, bounds_id);
+            if (dims == .null_value or (bounds_id != none and bounds == .null_value)) return error.NullValueNotAllowed;
+            var layout: array.Shape = .{ .element = elementData(n.ty) };
+            const dims_shape = A.shape(dims.array.slice());
+            if (dims_shape.ndim > 1) return error.ArraySubscriptError;
+            if (dims_shape.ndim == 1 and dims_shape.lbounds[0] != 1) return error.ArraySubscriptError;
+            if (dims_shape.has_nulls) return error.NullValueNotAllowed;
+            const ndim: usize = if (dims_shape.ndim == 0) 0 else dims_shape.dims[0];
+            if (ndim > array.max_dims) return error.ProgramLimitExceeded;
+            if (bounds_id != none) {
+                const bounds_shape = A.shape(bounds.array.slice());
+                if (bounds_shape.ndim > 1) return error.ArraySubscriptError;
+                if (bounds_shape.ndim == 1 and bounds_shape.lbounds[0] != 1) return error.ArraySubscriptError;
+                if (bounds_shape.has_nulls) return error.NullValueNotAllowed;
+                const bounds_count: usize = if (bounds_shape.ndim == 0) 0 else bounds_shape.dims[0];
+                if (bounds_count != ndim) return error.ArraySubscriptError;
+            }
+            if (ndim == 0) return empty(layout.element);
+            layout.ndim = ndim;
+            var reader = A.Reader.init(dims.array.slice());
+            var cell: V.Cell = undefined;
+            var dim: usize = 0;
+            var zero = false;
+            while (reader.next(&cell)) : (dim += 1) {
+                if (cell.integer < 0) return error.ProgramLimitExceeded;
+                if (cell.integer == 0) zero = true;
+                layout.dims[dim] = @intCast(cell.integer);
+            }
+            if (bounds_id != none) {
+                reader = A.Reader.init(bounds.array.slice());
+                dim = 0;
+                while (reader.next(&cell)) : (dim += 1) layout.lbounds[dim] = @intCast(cell.integer);
+            }
+            _ = try layout.checkedCount();
+            if (zero) return empty(layout.element);
+            var result: V.Text = .{};
+            var writer = try A.Writer.begin(&result, &layout);
+            while (!writer.complete()) {
+                try ctx.session.checkpoint();
+                try writer.append(&value_cell);
+            }
+            return .{ .array = result };
+        }
+
+        /// Byte ranges of the first-dimension items of an array.
+        const Items = struct {
+            bytes: []const u8,
+            element: types.DataType,
+            count: usize,
+            inner: usize,
+            body: usize,
+
+            fn of(bytes: []const u8) Items {
+                const shape = A.shape(bytes);
+                const count: usize = if (shape.ndim == 0) 0 else shape.dims[0];
+                return .{ .bytes = bytes, .element = shape.element, .count = count, .inner = if (count == 0) 0 else shape.count() / count, .body = A.bodyOffset(bytes) };
+            }
+
+            /// [start, end) of item `index` in `buffer` (same layout).
+            fn range(self: *const Items, buffer: []const u8, index: usize) [2]usize {
+                var ignored = false;
+                const start = A.skipElements(buffer, self.body, self.element, index * self.inner, &ignored);
+                return .{ start, A.skipElements(buffer, start, self.element, self.inner, &ignored) };
+            }
+        };
+
+        fn reverseBytes(bytes: []u8) void {
+            var i: usize = 0;
+            var j: usize = bytes.len;
+            while (i + 1 < j) {
+                j -= 1;
+                const t = bytes[i];
+                bytes[i] = bytes[j];
+                bytes[j] = t;
+                i += 1;
+            }
+        }
+
+        /// Swaps items i < j of `out` (same layout as `items`) in place.
+        fn swapItems(items: *const Items, out: *V.Text, i: usize, j: usize) void {
+            if (i == j) return;
+            const a = items.range(out.bytes[0..out.len], i);
+            const b = items.range(out.bytes[0..out.len], j);
+            // [A][mid][B] -> [B][mid][A] by reversals.
+            const region = out.bytes[a[0]..b[1]];
+            const a_len = a[1] - a[0];
+            const b_len = b[1] - b[0];
+            const mid_len = b[0] - a[1];
+            reverseBytes(region);
+            reverseBytes(region[0..b_len]);
+            reverseBytes(region[b_len..][0..mid_len]);
+            reverseBytes(region[b_len + mid_len ..][0..a_len]);
+        }
+
+        fn randomBelow(ctx: *const E.Context, bound: usize) Error!usize {
+            const hook = ctx.session.engine orelse return error.UnsupportedStatement;
+            var scratch: [1]u8 = undefined;
+            const reply = try hook.call(hook.ptr, .random, "", "", 0, 0, 0, &scratch);
+            const word: u64 = @bitCast(reply.integer);
+            return @intCast(word % @as(u64, @intCast(bound)));
+        }
+
+        /// array_reverse, array_shuffle and array_sample reorder the items
+        /// of the first dimension; a sample keeps its first n items of a
+        /// shuffle (22023 unless 0 <= n <= length) with lower bound 1.
+        fn permute(ctx: *const E.Context, n: *const ast.Node) Error!V.Cell {
+            const source = try E.eval(ctx, n.b);
+            const size: V.Cell = if (n.func == .array_sample) try E.eval(ctx, node(ctx, n.b).next) else .null_value;
+            if (source == .null_value or (n.func == .array_sample and size == .null_value)) return .null_value;
+            const bytes = source.array.slice();
+            const items = Items.of(bytes);
+            if (n.func == .array_sample and (size.integer < 0 or size.integer > items.count)) return error.InvalidParameterValue;
+            if (items.count == 0) return if (n.func == .array_sample) empty(items.element) else source;
+            var result: V.Text = .{};
+            result.len = bytes.len;
+            if (bytes.len > result.bytes.len) return error.TextCapacity;
+            @memcpy(result.bytes[0..bytes.len], bytes);
+            switch (n.func) {
+                .array_reverse => {
+                    var i: usize = 0;
+                    var j: usize = items.count - 1;
+                    while (i < j) : ({
+                        i += 1;
+                        j -= 1;
+                    }) {
+                        try ctx.session.checkpoint();
+                        swapItems(&items, &result, i, j);
+                    }
+                    return .{ .array = result };
+                },
+                else => {
+                    // Fisher-Yates over the items; a sample fixes its prefix.
+                    const wanted: usize = if (n.func == .array_sample) @intCast(size.integer) else items.count;
+                    for (0..@min(wanted, items.count - 1)) |i| {
+                        try ctx.session.checkpoint();
+                        const j = i + try randomBelow(ctx, items.count - i);
+                        swapItems(&items, &result, i, j);
+                    }
+                    if (n.func == .array_shuffle) return .{ .array = result };
+                    if (wanted == 0) return empty(items.element);
+                    var layout = A.shape(bytes);
+                    layout.dims[0] = @intCast(wanted);
+                    layout.lbounds[0] = 1;
+                    var nulls = false;
+                    const start = items.body;
+                    const end = A.skipElements(result.bytes[0..result.len], start, items.element, wanted * items.inner, &nulls);
+                    var sample: V.Text = .{};
+                    try rawBegin(&sample, &layout);
+                    try rawCopy(&sample, result.bytes[start..end]);
+                    return rawFinish(&sample, nulls);
+                },
+            }
+        }
+
+        /// array_sort(array [, descending [, nulls_first]]): a stable sort
+        /// of the first-dimension items (sub-arrays compare as arrays);
+        /// NULLs last ascending and first descending unless nulls_first.
+        fn sort(ctx: *const E.Context, n: *const ast.Node) Error!V.Cell {
+            const source = try E.eval(ctx, n.b);
+            var descending = false;
+            var item = node(ctx, n.b).next;
+            var position_index: usize = 0;
+            var nulls_first: ?bool = null;
+            while (item != none) : ({
+                item = node(ctx, item).next;
+                position_index += 1;
+            }) {
+                const flag = try E.eval(ctx, item);
+                if (flag == .null_value) return .null_value;
+                if (position_index == 0) descending = flag.boolean else nulls_first = flag.boolean;
+            }
+            if (source == .null_value) return .null_value;
+            const first_nulls = nulls_first orelse descending;
+            const bytes = source.array.slice();
+            const items = Items.of(bytes);
+            if (items.count < 2) return source;
+            if (n.integer != 0) return error.UnsupportedStatement;
+            // Insertion sort into the output buffer: item i is inserted after
+            // every earlier item that does not order after it.
+            var result: V.Text = .{};
+            result.len = items.body;
+            @memcpy(result.bytes[0..items.body], bytes[0..items.body]);
+            var placed: usize = 0;
+            for (0..items.count) |i| {
+                const from = items.range(bytes, i);
+                var at = items.body;
+                var k: usize = 0;
+                while (k < placed) : (k += 1) {
+                    try ctx.session.checkpoint();
+                    var ignored = false;
+                    const next = A.skipElements(result.bytes[0..result.len], at, items.element, items.inner, &ignored);
+                    if (orderItems(bytes, from[0], result.bytes[0..result.len], at, items.element, items.inner, descending, first_nulls) < 0) break;
+                    at = next;
+                }
+                const len = from[1] - from[0];
+                if (len > result.bytes.len - result.len) return error.TextCapacity;
+                const tail = result.len - at;
+                // Shift the tail right (backwards copy) and insert.
+                var index = tail;
+                while (index > 0) {
+                    index -= 1;
+                    result.bytes[at + len + index] = result.bytes[at + index];
+                }
+                @memcpy(result.bytes[at..][0..len], bytes[from[0]..from[1]]);
+                result.len += len;
+                placed += 1;
+            }
+            return .{ .array = result };
+        }
+
+        /// The sort order of item `a` before item `b` (-1, 0, 1).
+        fn orderItems(a: []const u8, a_at: usize, b: []const u8, b_at: usize, element: types.DataType, inner: usize, descending: bool, nulls_first: bool) i8 {
+            if (inner == 1) {
+                const a_null = a[a_at] == 0;
+                const b_null = b[b_at] == 0;
+                if (a_null or b_null) {
+                    if (a_null and b_null) return 0;
+                    return if (a_null == nulls_first) -1 else 1;
+                }
+            }
+            const order = A.compareRuns(a, a_at, b, b_at, element, inner);
+            return if (descending) -order else order;
+        }
+
+        /// string_to_array(text, delimiter [, null_string]).
+        fn split(ctx: *const E.Context, n: *const ast.Node) Error!V.Cell {
+            const text = try E.eval(ctx, n.b);
+            const delimiter_id = node(ctx, n.b).next;
+            const delimiter = try E.eval(ctx, delimiter_id);
+            const null_id = node(ctx, delimiter_id).next;
+            const null_text: V.Cell = if (null_id == none) .null_value else try E.eval(ctx, null_id);
+            if (text == .null_value) return .null_value;
+            const input = text.text.slice();
+            if (input.len == 0) return empty(.text);
+            // Two passes: count, then write.
+            var count: usize = 0;
+            var result: V.Text = .{};
+            var writer: A.Writer = undefined;
+            for (0..2) |pass| {
+                if (pass == 1) writer = try A.Writer.begin(&result, &.{ .element = .text, .ndim = 1, .dims = .{ @intCast(count), 0, 0, 0, 0, 0 } });
+                var at: usize = 0;
+                while (at <= input.len) {
+                    try ctx.session.checkpoint();
+                    var end: usize = undefined;
+                    var next: usize = undefined;
+                    if (delimiter == .null_value) {
+                        if (at == input.len) break;
+                        end = at + utf8Length(input[at]);
+                        if (end > input.len) end = input.len;
+                        next = end;
+                    } else {
+                        const separator = delimiter.text.slice();
+                        if (separator.len == 0) {
+                            end = input.len;
+                        } else end = if (@import("std").mem.indexOfPos(u8, input, at, separator)) |found| found else input.len;
+                        next = if (end == input.len) input.len + 1 else end + separator.len;
+                    }
+                    if (pass == 0) {
+                        count += 1;
+                    } else {
+                        const piece = input[at..end];
+                        const cell: V.Cell = if (null_text != .null_value and types.same(piece, null_text.text.slice())) .null_value else try textCell(piece);
+                        try writer.append(&cell);
+                    }
+                    at = next;
+                }
+            }
+            return .{ .array = result };
+        }
+
+        fn utf8Length(lead: u8) usize {
+            if (lead < 0x80) return 1;
+            if (lead >= 0xf0) return 4;
+            if (lead >= 0xe0) return 3;
+            if (lead >= 0xc0) return 2;
+            return 1;
+        }
+
+        /// width_bucket(operand, thresholds): PostgreSQL's binary search
+        /// (thresholds are assumed sorted).
+        fn widthBucket(ctx: *const E.Context, n: *const ast.Node) Error!V.Cell {
+            const operand = try E.eval(ctx, n.b);
+            const thresholds = try E.eval(ctx, node(ctx, n.b).next);
+            if (operand == .null_value or thresholds == .null_value) return .null_value;
+            const bytes = thresholds.array.slice();
+            const shape = A.shape(bytes);
+            if (shape.ndim > 1) return error.ArraySubscriptError;
+            if (shape.has_nulls) return error.NullValueNotAllowed;
+            const items = Items.of(bytes);
+            var left: usize = 0;
+            var right: usize = items.count;
+            while (left < right) {
+                try ctx.session.checkpoint();
+                const middle = left + (right - left) / 2;
+                var at = items.range(bytes, middle)[0];
+                at += 1;
+                const value_cell = A.decodeElement(bytes, &at, items.element);
+                if (V.compare(&operand, &value_cell) < 0) right = middle else left = middle + 1;
+            }
+            return .{ .integer = @intCast(left) };
+        }
+
+        /// UPDATE SET a[...] = v (array_set_element / array_set_slice): a
+        /// NULL base is an empty array; a one-dimensional (or empty) array
+        /// extends with NULLs, other subscripts must be in range (2202E).
+        fn assign(ctx: *const E.Context, n: *const ast.Node) Error!V.Cell {
+            const base = try E.eval(ctx, n.b);
+            const value_id = node(ctx, n.b).next;
+            const assigned = try E.eval(ctx, value_id);
+            const layout = array.Subscripts.decode(n.integer);
+            var lower: [array.max_dims]?i64 = @splat(null);
+            var upper: [array.max_dims]?i64 = @splat(null);
+            var item = node(ctx, value_id).next;
+            for (0..layout.count) |index| {
+                const flag = layout.flags[index];
+                for ([_]u3{ array.Subscripts.lower_flag, array.Subscripts.upper_flag }) |which| {
+                    if (flag & which == 0) continue;
+                    const cell = try E.eval(ctx, item);
+                    item = node(ctx, item).next;
+                    if (cell == .null_value) return error.NullValueNotAllowed;
+                    if (which == array.Subscripts.lower_flag) lower[index] = cell.integer else upper[index] = cell.integer;
+                }
+            }
+            const element = elementData(n.ty);
+            var source_bytes: []const u8 = &.{};
+            var empty_bytes: V.Text = .{};
+            if (base == .null_value) {
+                empty_bytes.len = try A.writeHeader(&empty_bytes.bytes, &.{ .element = element });
+                source_bytes = empty_bytes.bytes[0..empty_bytes.len];
+            } else source_bytes = base.array.slice();
+            const shape = A.shape(source_bytes);
+            const slice = layout.slice();
+            // Assigning NULL to a slice leaves the array unchanged.
+            if (slice and assigned == .null_value) return base;
+            var target = shape;
+            var low: [array.max_dims]i64 = undefined;
+            var high: [array.max_dims]i64 = undefined;
+            if (shape.ndim == 0) {
+                // An empty array takes the subscripts' shape.
+                if (!slice) {
+                    target.ndim = layout.count;
+                    for (0..layout.count) |dim| {
+                        low[dim] = lower[dim].?;
+                        high[dim] = lower[dim].?;
+                    }
+                } else {
+                    const value_shape = A.shape(assigned.array.slice());
+                    target.ndim = layout.count;
+                    for (0..layout.count) |dim| {
+                        low[dim] = lower[dim] orelse return error.ArraySubscriptError;
+                        high[dim] = upper[dim] orelse return error.ArraySubscriptError;
+                        if (layout.flags[dim] & array.Subscripts.slice_flag == 0) {
+                            high[dim] = low[dim];
+                            low[dim] = 1;
+                        }
+                    }
+                    _ = value_shape;
+                }
+                for (0..target.ndim) |dim| {
+                    if (high[dim] < low[dim]) return error.ArraySubscriptError;
+                    if (high[dim] - low[dim] + 1 > 2147483647 or low[dim] < -2147483648 or high[dim] > 2147483647) return error.ProgramLimitExceeded;
+                    target.lbounds[dim] = @intCast(low[dim]);
+                    target.dims[dim] = @intCast(high[dim] - low[dim] + 1);
+                }
+            } else {
+                if (layout.count != shape.ndim) {
+                    if (!slice or layout.count > shape.ndim) return error.ArraySubscriptError;
+                }
+                for (0..shape.ndim) |dim| {
+                    var from: i64 = shape.lbounds[dim];
+                    var to: i64 = shape.upper(dim);
+                    if (dim < layout.count) {
+                        const flag = layout.flags[dim];
+                        if (!slice) {
+                            from = lower[dim].?;
+                            to = from;
+                        } else if (flag & array.Subscripts.slice_flag == 0) {
+                            from = 1;
+                            to = lower[dim].?;
+                        } else {
+                            if (lower[dim]) |bound| from = bound;
+                            if (upper[dim]) |bound| to = bound;
+                        }
+                    }
+                    if (to < from) return error.ArraySubscriptError;
+                    low[dim] = from;
+                    high[dim] = to;
+                    if (shape.ndim == 1) {
+                        // One dimension: extend to cover the assignment.
+                        const new_low = @min(from, @as(i64, shape.lbounds[0]));
+                        const new_high = @max(to, shape.upper(0));
+                        if (new_high - new_low + 1 > 2147483647 or new_high > 2147483647 or new_low < -2147483648) return error.ProgramLimitExceeded;
+                        target.lbounds[0] = @intCast(new_low);
+                        target.dims[0] = @intCast(new_high - new_low + 1);
+                    } else if (from < shape.lbounds[dim] or to > shape.upper(dim)) return error.ArraySubscriptError;
+                }
+            }
+            _ = try target.checkedCount();
+            // The slice source supplies its elements in row-major order.
+            var feed: A.Reader = undefined;
+            if (slice) {
+                feed = A.Reader.init(assigned.array.slice());
+                var needed: usize = 1;
+                for (0..target.ndim) |dim| needed *= @intCast(high[dim] - low[dim] + 1);
+                if (feed.total < needed) return error.ArraySubscriptError;
+            }
+            var result: V.Text = .{};
+            var writer = try A.Writer.begin(&result, &target);
+            var old = A.Reader.init(source_bytes);
+            var position: [array.max_dims]i64 = undefined;
+            for (0..target.ndim) |dim| position[dim] = target.lbounds[dim];
+            var cell: V.Cell = undefined;
+            while (!writer.complete()) {
+                try ctx.session.checkpoint();
+                var inside_old = shape.ndim != 0;
+                var inside_new = true;
+                for (0..target.ndim) |dim| {
+                    if (shape.ndim != 0 and (position[dim] < shape.lbounds[dim] or position[dim] > shape.upper(dim))) inside_old = false;
+                    if (position[dim] < low[dim] or position[dim] > high[dim]) inside_new = false;
+                }
+                var old_value: V.Cell = .null_value;
+                if (inside_old) _ = old.next(&old_value);
+                if (inside_new) {
+                    if (slice) {
+                        _ = feed.next(&cell);
+                        try writer.append(&cell);
+                    } else try writer.append(&assigned);
+                } else try writer.append(&old_value);
+                var dim = target.ndim;
+                while (dim > 0) {
+                    dim -= 1;
+                    position[dim] += 1;
+                    if (position[dim] <= @as(i64, target.lbounds[dim]) + target.dims[dim] - 1) break;
+                    position[dim] = target.lbounds[dim];
+                }
+            }
+            return .{ .array = result };
         }
 
         /// ARRAY[...]: elements, or sub-arrays of matching dimensions and
@@ -140,6 +705,23 @@ pub fn ArrayEval(comptime config: types.Config, comptime E: type) type {
                 }
             }
             if (any_null) return .null_value;
+            if (base == .point or base == .box or base == .geo) {
+                // point[0..1], box/lseg[0..1] (corners), line[0..2]; a
+                // second subscript or one out of range is NULL.
+                if (layout.count != 1) return .null_value;
+                const index = lower[0].?;
+                switch (base) {
+                    .point => |p| return if (index == 0) .{ .float8 = p.x } else if (index == 1) .{ .float8 = p.y } else .null_value,
+                    .box => |b| return if (index == 0) .{ .point = b.high } else if (index == 1) .{ .point = b.low } else .null_value,
+                    else => {
+                        const bytes = base.geo.slice();
+                        const limit: i64 = if (geometry.kindOf(bytes) == .line) 3 else 2;
+                        if (index < 0 or index >= limit) return .null_value;
+                        if (geometry.kindOf(bytes) == .line) return .{ .float8 = geometry.word(bytes, @intCast(index)) };
+                        return .{ .point = .{ .x = geometry.word(bytes, @intCast(index * 2)), .y = geometry.word(bytes, @intCast(index * 2 + 1)) } };
+                    },
+                }
+            }
             if (node(ctx, n.b).ty == .name) {
                 // PostgreSQL treats name as a fixed-length zero-padded byte
                 // array, with a zero-based index and a "char" result.

@@ -127,6 +127,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addContract(ctx, test_sql, "contract-sql-types", "tests/test_sql_types.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-types-core", "tests/test_sql_types_core.sig", &.{importEntry("sql", "src/core/sql.sig"), importEntry("pg_types", "src/db/pg_types.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-types-advanced", "tests/test_sql_types_advanced.sig", &.{importEntry("sql", "src/core/sql.sig"), importEntry("pg_types", "src/db/pg_types.sig")});
+    _ = try addContract(ctx, test_sql, "contract-sql-types-ext", "tests/test_sql_types_ext.sig", &.{importEntry("sql", "src/core/sql.sig"), importEntry("pg_types", "src/db/pg_types.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-json-operators", "tests/test_sql_json_operators.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-json-canonical", "tests/test_sql_json_canonical.sig", &.{importEntry("jsonb", "src/core/sql/jsonb.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-query", "tests/test_sql_query.sig", &.{importEntry("sql", "src/core/sql.sig")});
@@ -184,11 +185,15 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addContract(ctx, test_sql, "contract-sql-runtime-workspace", "tests/test_sql_runtime_workspace.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-ddl-core", "tests/test_sql_ddl_core.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-schema-objects", "tests/test_sql_schema_objects.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    _ = try addContract(ctx, test_sql, "contract-sql-ddl-dml", "tests/test_sql_ddl_dml.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-index-external", "tests/test_sql_index_external.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-routines", "tests/test_sql_routines.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    _ = try addContract(ctx, test_sql, "contract-sql-routines-sig", "tests/test_sql_routines_sig.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    _ = try addContract(ctx, test_sql, "contract-sql-nested-stmts", "tests/test_sql_nested_stmts.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-json-agg", "tests/test_sql_json_agg.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-catalog-security", "tests/test_sql_catalog_security.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-text", "tests/test_sql_text.sig", &.{importEntry("sql", "src/core/sql.sig"), importEntry("pg_types", "src/db/pg_types.sig")});
+    _ = try addContract(ctx, test_sql, "contract-sql-text-json", "tests/test_sql_text_json.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try ctx.addModule("packed_integer", "src/core/packed_integer.sig");
     const test_packed = try ctx.addStep("test-packed-integer", "Execute immutable packed integer column contracts", &noopStep);
     try ctx.addDependency(test_all, test_packed);
@@ -268,6 +273,12 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("postgres", "src/db/postgres.sig"), importEntry("scram", "src/db/scram.sig"),
     });
     _ = try addContract(ctx, test_sql, "contract-sql-composite-catalog", "tests/test_sql_composite_catalog.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    // Generated SQL-standard feature probes (tests/sql_conformance/generate_feature_contract.py):
+    // fails only when a probe the committed scoreboard records as passing regresses.
+    _ = try addContract(ctx, test_sql, "contract-sql-features", "tests/test_sql_features.sig", &.{
+        importEntry("sql", "src/core/sql.sig"),       importEntry("db_store", "src/db/store.sig"),
+        importEntry("postgres", "src/db/postgres.sig"), importEntry("scram", "src/db/scram.sig"),
+    });
     _ = try ctx.addModule("resource_observation", "src/core/resource_observation.sig");
     const machine_resources=try ctx.addModule("machine_resources", "src/platform/machine_resources.sig");
     try wire(ctx,machine_resources,"resource_observation","src/core/resource_observation.sig");

@@ -25,6 +25,7 @@ const value = @import("value.sig");
 const sequence = @import("sequence.sig");
 const parser = @import("parser.sig");
 const array_module = @import("array.sig");
+const multirange_module = @import("multirange.sig");
 const routine_catalog = @import("routine_catalog.sig");
 const collation = @import("collation.sig");
 const catalog_objects = @import("catalog_objects.sig");
@@ -255,7 +256,7 @@ pub fn Binder(comptime config: types.Config) type {
             alter_table: AlterTable,
             legacy_attribute_options: struct { table: usize, validation: ?Error },
             alter_sequence: AlterSequence,
-            create_schema: V.Name,
+            create_schema: CreateSchema,
             drop_schema: DropSchema,
             drop_relation: DropRelation,
             refresh_view: Refresh,
@@ -313,7 +314,23 @@ pub fn Binder(comptime config: types.Config) type {
             command: types.CommandTag = .alter_table,
             /// CREATE UNIQUE INDEX: existing rows are checked for this index.
             check_index: ?usize = null,
+            /// ATTACH / DETACH PARTITION (ddl-dml, wave 4): the partitioned
+            /// table, locked as PostgreSQL does (SHARE UPDATE EXCLUSIVE for
+            /// ATTACH, ACCESS EXCLUSIVE for DETACH); ATTACH checks every row
+            /// against the new bound and a DEFAULT partition's rows against
+            /// the bound it gives up.
+            partition_parent: ?usize = null,
+            attach: bool = false,
+            partition_default: ?usize = null,
+            /// DROP IDENTITY drops the column's sequence; RESTART restarts
+            /// it (ddl-dml, wave 4).
+            drop_identity: ?u8 = null,
+            restart_identity: ?u8 = null,
+            restart_value: ?i64 = null,
         };
+
+        /// CREATE SCHEMA name [AUTHORIZATION role] (ddl-dml, wave 4).
+        pub const CreateSchema = struct { name: V.Name, owner: ?V.Name = null, owner_special: u8 = 0 };
 
         /// TRUNCATE targets: distinct table slots in statement order.
         pub const Truncate = struct { tables: [config.tables]u8 = undefined, count: usize = 0, restart_identity: bool = false };
@@ -357,15 +374,33 @@ pub fn Binder(comptime config: types.Config) type {
             /// Binding a data-modifying WITH entry (B11): plans of the
             /// enclosing statement stay in place.
             nested_dml: bool = false,
+            /// An INSERT / UPDATE / DELETE target may be a view (B11 wave 4:
+            /// its INSTEAD OF triggers run the statement over its columns).
+            view_target: bool = false,
             /// Declared parameter types of an EXECUTEd SQL prepared
             /// statement ($n nodes; their values are in the session).
             params: ?*const Parameters = null,
             // Routines (B11 wave 3).
             /// User functions resolvable by name; null: none.
             routines: ?*const RC.Set = null,
+            /// Namespaces unqualified user routines resolve in, in
+            /// search_path order (B11 wave 4); without `routine_path_known`
+            /// public when it is on the path.
+            routine_path: []const u32 = &.{},
+            routine_path_known: bool = false,
+            /// The FROM item's call node bindTableFunction binds: it may be
+            /// a set-returning routine or return a record (B11 wave 4).
+            table_function: u16 = none,
+            /// Parsed copies of SQL routine bodies for inlining, one per
+            /// call node and candidate routine (Database.expandRelations).
+            inline_calls: []const InlineCall = &.{},
             /// Variables of the running routine (parameters, PL/pgSQL
             /// variables, NEW/OLD): names that no column binds read them.
             variables: ?*const RoutineVariables = null,
+            /// UPDATE / DELETE through an inheritance parent or partitioned
+            /// table (ddl-dml, wave 4): the member table this binding
+            /// targets instead of the named one, which keeps naming it.
+            family_target: ?usize = null,
 
             fn node(self: *const Context, id: u16) *ast.Node {
                 return &self.pool.nodes[id];
@@ -401,6 +436,11 @@ pub fn Binder(comptime config: types.Config) type {
 
         pub const no_cte: u8 = 0xff;
         pub const group_relation = ast.groupRelation(config);
+
+        /// A SQL routine body appended to the statement for call `node`
+        /// (B11 wave 4): `query` is its parsed SELECT over pool nodes
+        /// [low, high).
+        pub const InlineCall = struct { node: u16 = none, routine: u16 = 0, query: u16 = 0, low: u16 = 0, high: u16 = 0 };
 
         /// One routine variable visible to expressions (B11 wave 3).
         pub const RoutineVariable = struct { name: V.Name = .{}, ty: ast.Type = .int4, typmod: i32 = -1 };
@@ -486,11 +526,17 @@ pub fn Binder(comptime config: types.Config) type {
             window_defs:u16=none,
             saw_aggregate: ?*bool = null,
             ctes: ?*const CteEnv = null,
+            /// Set-returning calls may appear (one select-list target): the
+            /// count of those seen (wave 4 text-json).
+            set_calls: ?*u8 = null,
         };
 
         pub const SortKey = struct { column: u16, descending: bool, nulls_first: bool };
 
-        pub const Agg = struct { kind: ast.Agg, arg: u16, filter: u16, distinct: bool, arg_ty: ast.Type, ty: ast.Type };
+        pub const Agg = struct { kind: ast.Agg, arg: u16, filter: u16, distinct: bool, arg_ty: ast.Type, ty: ast.Type,
+            /// JSON aggregates (wave 4 text-json): bit 0 strict (ABSENT ON
+            /// NULL), bit 1 unique keys.
+            variant: u8 = 0 };
 
         /// One FROM item of a plan, joined to the items before it.
         pub const Source = struct {
@@ -523,6 +569,8 @@ pub fn Binder(comptime config: types.Config) type {
             argument:u16=none,result:u16=0,output_node:u16=none,
             deferred_arg:u16=none,deferred_filter:u16=none,filter_column:u16=none,
             offset_arg:u16=none,default_arg:u16=none,offset_repeatable:bool=true,offset_total:bool=true,offset_prefix:bool=false,
+            /// string_agg's delimiter as a window aggregate (B11 wave 4).
+            second_arg:u16=none,
             partition:[config.columns]u16=undefined,partition_count:usize=0,
             order:[config.columns]SortKey=undefined,order_count:usize=0,
             frame:Ast.Frame=.default,
@@ -536,7 +584,14 @@ pub fn Binder(comptime config: types.Config) type {
         /// FROM (one row).
         pub const Series = enum { none, integer, numeric, timestamp,
             // JSON_TABLE (B11 json-agg lane): `function` is the table node.
-            json_table, partition_ancestors, options_to_table, unnest };
+            json_table, partition_ancestors, options_to_table, unnest,
+            // A user routine in FROM (B11 wave 4): Exec.routineRows.
+            routine,
+            // generate_subscripts(anyarray, int4 [, bool]) (B11 wave 4).
+            subscripts,
+            // A set-returning built-in in FROM (wave 4 text-json):
+            // `function` is the call (regexp_matches, regexp_split_to_table).
+            set_function };
 
         /// A bound query block of the general engine (design §4.9). Its
         /// materialized rows are `width` cells: the `count` visible output
@@ -578,6 +633,13 @@ pub fn Binder(comptime config: types.Config) type {
             targets: [2 * types.projectionColumns(config)]u16 = undefined,
             /// One top-level set-returning UNNEST target, expanded after WHERE.
             unnest_column: u16 = none,
+            /// Every top-level set-returning target (unnest, generate_subscripts;
+            /// B11 wave 4); `unnest_column` is the first. They run in lockstep.
+            srf_set: std.StaticBitSet(types.projectionColumns(config)) = .empty,
+            /// The set-returning call inside target `unnest_column` when it is
+            /// not UNNEST (wave 4 text-json; exec evaluates the target once
+            /// per produced value).
+            set_call: u16 = none,
             count: usize = 0,
             width: usize = 0,
             names: [types.projectionColumns(config)]V.Name = undefined,
@@ -854,6 +916,8 @@ pub fn Binder(comptime config: types.Config) type {
             if (geometricType(left) or geometricType(right) or left == .xml or right == .xml) return error.UndefinedFunction;
             // tsvector / tsquery comparison operators are not provided.
             if (left == .tsvector or right == .tsvector or left == .tsquery or right == .tsquery) return error.UndefinedFunction;
+            if (types.unorderable(left) or types.unorderable(right)) return error.UndefinedFunction;
+            if ((left == .macaddr and right == .macaddr8) or (left == .macaddr8 and right == .macaddr)) return error.AmbiguousFunction;
             if (left == right) return;
             if (value.integral(left) and value.integral(right)) return;
             if (context.legacy) {
@@ -1129,12 +1193,27 @@ pub fn Binder(comptime config: types.Config) type {
             return ty == .tsvector or ty == .tsquery;
         }
 
+        fn textOrUnknown(ty: ast.Type) bool {
+            return ty == .unknown or value.characterType(ty);
+        }
+
         /// @@: tsvector @@ tsquery and tsquery @@ tsvector (an untyped side
-        /// takes the other operand type). text @@ tsquery and text @@ text
-        /// use default_text_search_config (pg_catalog.english): 0A000.
+        /// takes the other operand type), text @@ tsquery (`integer` 1:
+        /// to_tsvector of the text) and text @@ text (`integer` 2, also for
+        /// two untyped operands: to_tsvector @@ plainto_tsquery), both
+        /// under default_text_search_config.
         fn textMatchOperator(context: *const Context, n: *ast.Node) Error!void {
             const left = context.node(n.a).ty;
             const right = context.node(n.b).ty;
+            if (textOrUnknown(left) and (right == .tsquery or textOrUnknown(right))) {
+                n.a = try convert(context, n.a, .text, -1, .implicit);
+                if (right != .tsquery) n.b = try convert(context, n.b, .text, -1, .implicit);
+                if (context.node(n.a).ty != .text or (right != .tsquery and context.node(n.b).ty != .text)) return error.UndefinedFunction;
+                n.integer = if (right == .tsquery) 1 else 2;
+                n.ty = .boolean;
+                n.constant = false;
+                return;
+            }
             if (left == .tsvector or right == .tsquery) {
                 if (left == .unknown) return error.UnsupportedStatement;
                 try coerce(context, n.b, .tsquery);
@@ -1153,14 +1232,121 @@ pub fn Binder(comptime config: types.Config) type {
         /// to_tsvector / to_tsquery / plainto_tsquery / phraseto_tsquery
         /// (regconfig, text). The configuration is an untyped literal
         /// (regconfig input, checked now when constant); the one-argument
-        /// forms use default_text_search_config (english): 0A000.
+        /// forms (`integer` 1) read default_text_search_config when they
+        /// run (STABLE).
         fn typeTextSearchFunction(context: *const Context, n: *ast.Node, count: usize) Error!void {
-            if (count == 1) return error.UnsupportedStatement;
+            if (count == 1) {
+                try bindSignature(context, n, &[_]ast.Type{.text}, if (n.func == .to_tsvector) .tsvector else .tsquery, true);
+                n.integer = 1;
+                n.constant = false;
+                return;
+            }
             if (count != 2) return error.UndefinedFunction;
             const config_node = context.node(n.b);
             if (config_node.ty != .unknown) return error.UndefinedFunction;
             if (config_node.kind == .text_literal) _ = try Io.TextSearch.configByName(E.literalText(context.source, config_node.text).slice());
             try bindSignature(context, n, &[_]ast.Type{ .text, .text }, if (n.func == .to_tsvector) .tsvector else .tsquery, true);
+        }
+
+        /// The regular-expression functions (pg_proc signatures over text
+        /// and int4; wave 4 text-json lane, regex_eval.sig). A fourth
+        /// regexp_replace argument that is untyped or a string selects the
+        /// flags signature over the start position, as PostgreSQL's
+        /// preference for the string category does.
+        fn typeRegexFunction(context: *const Context, n: *ast.Node, count: usize) Error!void {
+            const T = ast.Type;
+            if (context.dialect != .postgres) return if (n.func == .substring_regex or n.func == .substring_similar) error.UnsupportedStatement else error.UndefinedFunction;
+            const text_array = types.arrayType(.text).?;
+            const texts = [_]T{ .text, .text, .text, .text };
+            switch (n.func) {
+                .regexp_match, .regexp_matches, .regexp_split_to_array, .regexp_split_to_table => {
+                    if (count != 2 and count != 3) return error.UndefinedFunction;
+                    try bindSignature(context, n, texts[0..count], if (n.func == .regexp_split_to_table) .text else text_array, true);
+                },
+                .substring_regex, .substring_similar => try bindSignature(context, n, texts[0..count], .text, true),
+                .regexp_replace => {
+                    const flags_form = count == 4 and (argumentType(context, n, 3) == .unknown or value.stringType(argumentType(context, n, 3)));
+                    const signature: []const T = switch (count) {
+                        3 => &.{ .text, .text, .text },
+                        4 => if (flags_form) &.{ .text, .text, .text, .text } else &.{ .text, .text, .text, .int4 },
+                        5 => &.{ .text, .text, .text, .int4, .int4 },
+                        6 => &.{ .text, .text, .text, .int4, .int4, .text },
+                        else => return error.UndefinedFunction,
+                    };
+                    try bindSignature(context, n, signature, .text, true);
+                },
+                .regexp_count => {
+                    if (count < 2 or count > 4) return error.UndefinedFunction;
+                    try bindSignature(context, n, (&[_]T{ .text, .text, .int4, .text })[0..count], .int4, true);
+                },
+                .regexp_instr => {
+                    if (count < 2 or count > 7) return error.UndefinedFunction;
+                    try bindSignature(context, n, (&[_]T{ .text, .text, .int4, .int4, .int4, .text, .int4 })[0..count], .int4, true);
+                },
+                .regexp_substr => {
+                    if (count < 2 or count > 6) return error.UndefinedFunction;
+                    try bindSignature(context, n, (&[_]T{ .text, .text, .int4, .int4, .text, .int4 })[0..count], .text, true);
+                },
+                else => return error.UndefinedFunction,
+            }
+            if (ast.setFunction(n.func)) n.constant = false;
+        }
+
+        /// The set-returning call of a select-list target reachable through
+        /// expressions PostgreSQL evaluates unconditionally (not CASE,
+        /// COALESCE, aggregates, window calls or subqueries), or none.
+        fn setCallIn(context: *const Context, id: u16) u16 {
+            if (id == none) return none;
+            const n = context.node(id);
+            switch (n.kind) {
+                .function => {
+                    if (ast.setFunction(n.func)) return id;
+                    if (n.window != none) return none;
+                    var item = n.b;
+                    while (item != none) : (item = context.node(item).next) {
+                        const found = setCallIn(context, item);
+                        if (found != none) return found;
+                    }
+                    return none;
+                },
+                .cast, .unary, .not_op, .test_op => return setCallIn(context, n.a),
+                .binary, .and_op, .or_op, .nullif, .at_zone, .like, .between => {
+                    for ([_]u16{ n.a, n.b, n.c }) |child| {
+                        const found = setCallIn(context, child);
+                        if (found != none) return found;
+                    }
+                    return none;
+                },
+                else => return none,
+            }
+        }
+
+        /// The tsvector / tsquery utilities (pg_proc signatures; wave 4
+        /// text-json). ts_delete's second argument is text or text[].
+        fn typeTextSearchUtility(context: *const Context, n: *ast.Node, count: usize) Error!void {
+            if (context.dialect != .postgres) return error.UndefinedFunction;
+            const T = ast.Type;
+            const text_array = types.arrayType(.text).?;
+            switch (n.func) {
+                .tsvector_length => try bindSignature(context, n, &[_]T{.tsvector}, .int4, true),
+                .ts_strip => try bindSignature(context, n, &[_]T{.tsvector}, .tsvector, true),
+                .ts_setweight => switch (count) {
+                    2 => try bindSignature(context, n, &[_]T{ .tsvector, .pg_internal_char }, .tsvector, true),
+                    3 => try bindSignature(context, n, &[_]T{ .tsvector, .pg_internal_char, text_array }, .tsvector, true),
+                    else => return error.UndefinedFunction,
+                },
+                .tsvector_to_array => try bindSignature(context, n, &[_]T{.tsvector}, text_array, true),
+                .array_to_tsvector => try bindSignature(context, n, &[_]T{text_array}, .tsvector, true),
+                .ts_delete => {
+                    if (count != 2) return error.UndefinedFunction;
+                    const second = argumentType(context, n, 1);
+                    const array = second != .unknown and types.isArray(second);
+                    try bindSignature(context, n, &[_]T{ .tsvector, if (array) text_array else .text }, .tsvector, true);
+                },
+                .ts_filter => try bindSignature(context, n, &[_]T{ .tsvector, types.arrayType(.pg_internal_char) orelse return error.UndefinedFunction }, .tsvector, true),
+                .ts_numnode => try bindSignature(context, n, &[_]T{.tsquery}, .int4, true),
+                else => return error.UndefinedFunction,
+            }
         }
 
         /// int2/int4/int8 & | # (common integer type) and << >> (int4 count).
@@ -1271,8 +1457,11 @@ pub fn Binder(comptime config: types.Config) type {
                     n.planned_null = knownNull(context, n.b);
                     if (n.planned_null) context.pool.planned_nulls = true;
                 },
-                .jsonb_path_exists, .jsonb_path_match, .jsonb_path_query_array, .jsonb_path_query_first => {
+                .jsonb_path_exists, .jsonb_path_match, .jsonb_path_query_array, .jsonb_path_query_first, .jsonb_path_query => {
                     const result: T = if (n.func == .jsonb_path_exists or n.func == .jsonb_path_match) .boolean else .jsonb;
+                    defer if (n.func == .jsonb_path_query) {
+                        n.constant = false;
+                    };
                     switch (count) {
                         2 => try bindSignature(context, n, &[_]T{ .jsonb, .jsonpath }, result, true),
                         3 => try bindSignature(context, n, &[_]T{ .jsonb, .jsonpath, .jsonb }, result, true),
@@ -1396,6 +1585,12 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "array_append", .func = .array_append }, .{ .name = "array_prepend", .func = .array_prepend },
                 .{ .name = "array_remove", .func = .array_remove },
                 .{ .name = "array_cat", .func = .array_cat },       .{ .name = "array_to_string", .func = .array_to_string },
+                .{ .name = "array_position", .func = .array_position }, .{ .name = "array_positions", .func = .array_positions },
+                .{ .name = "array_replace", .func = .array_replace }, .{ .name = "trim_array", .func = .trim_array },
+                .{ .name = "array_fill", .func = .array_fill },     .{ .name = "array_reverse", .func = .array_reverse },
+                .{ .name = "array_sort", .func = .array_sort },     .{ .name = "array_sample", .func = .array_sample },
+                .{ .name = "array_shuffle", .func = .array_shuffle }, .{ .name = "string_to_array", .func = .string_to_array },
+                .{ .name = "width_bucket", .func = .array_width_bucket },
                 // Range constructors and functions (B11 advanced types).
                 .{ .name = "int4range", .func = .range_constructor }, .{ .name = "int8range", .func = .range_constructor },
                 .{ .name = "numrange", .func = .range_constructor }, .{ .name = "daterange", .func = .range_constructor },
@@ -1407,6 +1602,34 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "host", .func = .inet_host },            .{ .name = "masklen", .func = .masklen },
                 .{ .name = "family", .func = .inet_family },        .{ .name = "network", .func = .inet_network },
                 .{ .name = "broadcast", .func = .broadcast },       .{ .name = "netmask", .func = .netmask },
+                // Network and macaddr8 functions (B11 wave 4).
+                .{ .name = "abbrev", .func = .inet_abbrev },        .{ .name = "set_masklen", .func = .set_masklen },
+                .{ .name = "hostmask", .func = .hostmask },         .{ .name = "inet_merge", .func = .inet_merge },
+                .{ .name = "inet_same_family", .func = .inet_same_family }, .{ .name = "macaddr8_set7bit", .func = .macaddr8_set7bit },
+                .{ .name = "macaddr8", .func = .to_macaddr8 },      .{ .name = "macaddr", .func = .to_macaddr },
+                // Geometric functions over lseg/line/path/polygon/circle (B11 wave 4).
+                .{ .name = "npoints", .func = .geo_call },          .{ .name = "radius", .func = .geo_call },
+                .{ .name = "diameter", .func = .geo_call },         .{ .name = "isclosed", .func = .geo_call },
+                .{ .name = "isopen", .func = .geo_call },           .{ .name = "pclose", .func = .geo_call },
+                .{ .name = "popen", .func = .geo_call },            .{ .name = "slope", .func = .geo_call },
+                .{ .name = "diagonal", .func = .geo_call },         .{ .name = "bound_box", .func = .geo_call },
+                .{ .name = "circle", .func = .geo_call },           .{ .name = "line", .func = .geo_call },
+                .{ .name = "lseg", .func = .geo_call },             .{ .name = "path", .func = .geo_call },
+                .{ .name = "polygon", .func = .geo_call },          .{ .name = "ishorizontal", .func = .geo_call },
+                .{ .name = "isvertical", .func = .geo_call },       .{ .name = "isparallel", .func = .geo_call },
+                .{ .name = "isperp", .func = .geo_call },           .{ .name = "pt_contained_circle", .func = .geo_call },
+                .{ .name = "pt_contained_poly", .func = .geo_call },
+                // Multiranges (B11 wave 4).
+                .{ .name = "int4multirange", .func = .multirange_constructor },
+                .{ .name = "int8multirange", .func = .multirange_constructor },
+                .{ .name = "nummultirange", .func = .multirange_constructor },
+                .{ .name = "datemultirange", .func = .multirange_constructor },
+                .{ .name = "tsmultirange", .func = .multirange_constructor },
+                .{ .name = "tstzmultirange", .func = .multirange_constructor },
+                .{ .name = "multirange", .func = .multirange_of },   .{ .name = "range_merge", .func = .range_merge },
+                // SQL/XML publishing called by name (B11 wave 4).
+                .{ .name = "xmlconcat", .func = .xmlconcat },       .{ .name = "xmlcomment", .func = .xmlcomment },
+                .{ .name = "xmltext", .func = .xmlcomment },
                 // Geometric functions (B11 advanced types).
                 .{ .name = "point", .func = .point_constructor },   .{ .name = "box", .func = .box_constructor },
                 .{ .name = "area", .func = .area },                 .{ .name = "center", .func = .center },
@@ -1426,6 +1649,13 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "pg_advisory_unlock_shared", .func = .pg_advisory_unlock_shared },
                 .{ .name = "pg_backend_pid", .func = .pg_backend_pid },
                 .{ .name = "pg_is_in_recovery", .func = .pg_is_in_recovery },
+                // void-returning session functions (B11 wave-4 types-ext).
+                .{ .name = "pg_notify", .func = .pg_notify },
+                .{ .name = "pg_advisory_lock", .func = .pg_advisory_lock },
+                .{ .name = "pg_advisory_lock_shared", .func = .pg_advisory_lock_shared },
+                .{ .name = "pg_advisory_xact_lock", .func = .pg_advisory_xact_lock },
+                .{ .name = "pg_advisory_xact_lock_shared", .func = .pg_advisory_xact_lock_shared },
+                .{ .name = "pg_advisory_unlock_all", .func = .pg_advisory_unlock_all },
                 // JSONB and SQL/JSON path functions (B11 json-agg lane).
                 .{ .name = "jsonb_set", .func = .jsonb_set },       .{ .name = "jsonb_set_lax", .func = .jsonb_set_lax },
                 .{ .name = "jsonb_insert", .func = .jsonb_insert }, .{ .name = "jsonb_delete_path", .func = .jsonb_delete_path },
@@ -1433,6 +1663,10 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "to_json", .func = .to_json },           .{ .name = "to_jsonb", .func = .to_jsonb },
                 .{ .name = "jsonb_path_exists", .func = .jsonb_path_exists }, .{ .name = "jsonb_path_match", .func = .jsonb_path_match },
                 .{ .name = "jsonb_path_query_array", .func = .jsonb_path_query_array }, .{ .name = "jsonb_path_query_first", .func = .jsonb_path_query_first },
+                // The *_tz variants differ only in datetime comparisons (wave 4).
+                .{ .name = "jsonb_path_query", .func = .jsonb_path_query },       .{ .name = "jsonb_path_query_tz", .func = .jsonb_path_query },
+                .{ .name = "jsonb_path_exists_tz", .func = .jsonb_path_exists },  .{ .name = "jsonb_path_match_tz", .func = .jsonb_path_match },
+                .{ .name = "jsonb_path_query_array_tz", .func = .jsonb_path_query_array }, .{ .name = "jsonb_path_query_first_tz", .func = .jsonb_path_query_first },
                 .{ .name = "jsonb_exists_any", .func = .jsonb_exists_any }, .{ .name = "jsonb_exists_all", .func = .jsonb_exists_all },
                 // Comments (B11 wave 3).
                 .{ .name = "obj_description", .func = .obj_description },
@@ -1444,13 +1678,26 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "pg_get_function_result", .func = .pg_get_function_result },
                 .{ .name = "pg_get_function_sqlbody", .func = .pg_get_function_sqlbody },
                 .{ .name = "pg_tablespace_location", .func = .pg_tablespace_location },
-                // Regular expressions (B11 text lane).
+                // Regular expressions (B11 text lane; positional functions:
+                // wave 4 text-json lane).
                 .{ .name = "regexp_like", .func = .regexp_like },
+                .{ .name = "regexp_match", .func = .regexp_match },
+                .{ .name = "regexp_matches", .func = .regexp_matches },
+                .{ .name = "regexp_replace", .func = .regexp_replace },
+                .{ .name = "regexp_split_to_array", .func = .regexp_split_to_array },
+                .{ .name = "regexp_split_to_table", .func = .regexp_split_to_table },
+                .{ .name = "regexp_count", .func = .regexp_count },
+                .{ .name = "regexp_instr", .func = .regexp_instr },
+                .{ .name = "regexp_substr", .func = .regexp_substr },
                 // Full text search (B11 text lane).
                 .{ .name = "to_tsvector", .func = .to_tsvector },
                 .{ .name = "to_tsquery", .func = .to_tsquery },
                 .{ .name = "plainto_tsquery", .func = .plainto_tsquery },
                 .{ .name = "phraseto_tsquery", .func = .phraseto_tsquery },
+                .{ .name = "strip", .func = .ts_strip },           .{ .name = "setweight", .func = .ts_setweight },
+                .{ .name = "tsvector_to_array", .func = .tsvector_to_array }, .{ .name = "array_to_tsvector", .func = .array_to_tsvector },
+                .{ .name = "ts_delete", .func = .ts_delete },       .{ .name = "ts_filter", .func = .ts_filter },
+                .{ .name = "numnode", .func = .ts_numnode },
                 .{ .name = "similar_to_escape", .func = .similar_to_escape },
                 // Discovery functions (B11 text lane).
                 .{ .name = "pg_typeof", .func = .pg_typeof },
@@ -1462,8 +1709,29 @@ pub fn Binder(comptime config: types.Config) type {
             return .none;
         }
 
+        fn jsonAggregate(kind: ast.Agg) bool {
+            return kind == .json_agg or kind == .jsonb_agg or kind == .json_object_agg or kind == .jsonb_object_agg;
+        }
+
+        /// The strict / unique variant bits of a JSON aggregate call by name
+        /// (json_agg_strict, json_object_agg_unique_strict, ...), or the
+        /// flags JSON_ARRAYAGG / JSON_OBJECTAGG were parsed with.
+        fn jsonAggregateVariant(context: *const Context, n: *const ast.Node) u8 {
+            const name = toName(context, n.name).slice();
+            if (types.same(name, "json_arrayagg") or types.same(name, "json_objectagg")) return @intCast(n.integer & 3);
+            var variant: u8 = 0;
+            if (name.len > 7 and types.same(name[name.len - 7 ..], "_strict")) variant |= 1;
+            if (std.mem.indexOf(u8, name, "_unique") != null) variant |= 2;
+            return variant;
+        }
+
         fn aggregateKind(context: *const Context, n: *const ast.Node) ast.Agg {
             const name = toName(context, n.name);
+            if (context.dialect == .postgres) {
+                const jsonb_result = n.integer & 4 != 0;
+                if (types.same(name.slice(), "json_arrayagg")) return if (jsonb_result) .jsonb_agg else .json_agg;
+                if (types.same(name.slice(), "json_objectagg")) return if (jsonb_result) .jsonb_object_agg else .json_object_agg;
+            }
             const table = [_]struct { name: []const u8, agg: ast.Agg }{
                 .{ .name = "count", .agg = .count },
                 .{ .name = "sum", .agg = .sum },
@@ -1487,8 +1755,15 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "bit_xor", .agg = .bit_xor },
                 // B11 json-agg lane: collection, JSON and ordered-set aggregates.
                 .{ .name = "array_agg", .agg = .array_agg },        .{ .name = "string_agg", .agg = .string_agg },
+                .{ .name = "range_agg", .agg = .range_agg },        .{ .name = "range_intersect_agg", .agg = .range_intersect_agg },
+                .{ .name = "xmlagg", .agg = .xmlagg },
                 .{ .name = "json_agg", .agg = .json_agg },          .{ .name = "jsonb_agg", .agg = .jsonb_agg },
                 .{ .name = "json_object_agg", .agg = .json_object_agg }, .{ .name = "jsonb_object_agg", .agg = .jsonb_object_agg },
+                // The strict and unique variants (wave 4 text-json).
+                .{ .name = "json_agg_strict", .agg = .json_agg },   .{ .name = "jsonb_agg_strict", .agg = .jsonb_agg },
+                .{ .name = "json_object_agg_strict", .agg = .json_object_agg }, .{ .name = "jsonb_object_agg_strict", .agg = .jsonb_object_agg },
+                .{ .name = "json_object_agg_unique", .agg = .json_object_agg }, .{ .name = "jsonb_object_agg_unique", .agg = .jsonb_object_agg },
+                .{ .name = "json_object_agg_unique_strict", .agg = .json_object_agg }, .{ .name = "jsonb_object_agg_unique_strict", .agg = .jsonb_object_agg },
                 .{ .name = "percentile_cont", .agg = .percentile_cont }, .{ .name = "percentile_disc", .agg = .percentile_disc },
                 .{ .name = "mode", .agg = .mode },
             };
@@ -1524,6 +1799,19 @@ pub fn Binder(comptime config: types.Config) type {
                     if (first == .unknown) return error.TypeMismatch;
                     if (types.isArray(first)) return first;
                     return types.arrayType(first) orelse error.UndefinedFunction;
+                },
+                // range_agg(anyrange | anymultirange) -> anymultirange;
+                // range_intersect_agg keeps its input type (B11 wave 4).
+                .xmlagg => {
+                    if (first == .unknown) try coerce(context, args[0], .xml);
+                    if (context.node(args[0]).ty != .xml) return error.UndefinedFunction;
+                    return .xml;
+                },
+                .range_agg, .range_intersect_agg => {
+                    if (first == .unknown) return error.TypeMismatch;
+                    if (multirange_module.isMultirange(first)) return first;
+                    if (!types.isRange(first)) return error.UndefinedFunction;
+                    return if (kind == .range_agg) multirangeOfType(first).? else first;
                 },
                 .json_agg, .jsonb_agg => {
                     if (first == .unknown) return error.TypeMismatch;
@@ -1733,7 +2021,9 @@ pub fn Binder(comptime config: types.Config) type {
             // WITHIN GROUP is required for an ordered-set aggregate (42809).
             if (ast.orderedSetAggregate(kind)) return error.WrongObjectType;
             if (ast.collectingAggregate(kind)) {
+                const variant: i64 = if (jsonAggregate(kind)) jsonAggregateVariant(context, n) else 0;
                 const result = try typeCollectAggregate(context, &inner, n, kind);
+                n.integer = variant;
                 try aggregateInput(context, &inner, n, if (kind == .string_agg or kind == .json_object_agg or kind == .jsonb_object_agg) 2 else 1);
                 if (n.c != none) {
                     inner.window_error = error.WindowingError;
@@ -1858,7 +2148,7 @@ pub fn Binder(comptime config: types.Config) type {
                 // Collection / ordered-set aggregates type elsewhere; as
                 // window functions they are not provided (0A000).
                 .array_agg, .string_agg, .json_agg, .jsonb_agg, .json_object_agg, .jsonb_object_agg,
-                .percentile_cont, .percentile_disc, .mode, .hypothetical_rank, .hypothetical_dense_rank, .hypothetical_percent_rank, .hypothetical_cume_dist => return error.UnsupportedStatement,
+                .percentile_cont, .percentile_disc, .mode, .hypothetical_rank, .hypothetical_dense_rank, .hypothetical_percent_rank, .hypothetical_cume_dist, .range_agg, .range_intersect_agg, .xmlagg => return error.UnsupportedStatement,
                 .none => unreachable,
             };
         }
@@ -2092,6 +2382,19 @@ pub fn Binder(comptime config: types.Config) type {
             } else {
                 var kind=aggregateKind(context,n);
                 if(kind==.none) return error.UndefinedFunction;
+                if(kind==.array_agg or kind==.string_agg) {
+                    // B11 wave 4: collecting window aggregates (no ORDER BY
+                    // inside, as PostgreSQL: 0A000).
+                    if(n.order!=none) return error.UnsupportedStatement;
+                    n.ty=try typeCollectAggregate(context,&inner,n,kind);n.agg=kind;
+                    if(n.c!=none) {
+                        var filter_scope=inner;filter_scope.aggregates=false;
+                        try typeExpr(context,&filter_scope,n.c);try booleanArgument(context,n.c);
+                    }
+                    try typeWindowSpec(context,scope,spec);
+                    n.func=.window_call;n.constant=false;
+                    return;
+                }
                 if(n.star) {if(kind!=.count) return error.Syntax;kind=.count_star;}
                 else if(n.b==none or context.node(n.b).next!=none) return error.UndefinedFunction;
                 if(n.b!=none) try typeExpr(context,&inner,n.b);
@@ -2112,6 +2415,22 @@ pub fn Binder(comptime config: types.Config) type {
         }
 
         fn typeFunction(context: *const Context, scope: *const Scope, n: *ast.Node) Error!void {
+            // SQL/XML publishing parts (B11 wave 4): names, not calls.
+            if (n.func == .xml_name) {
+                n.ty = .text;
+                n.constant = true;
+                return;
+            }
+            if (n.func == .xml_attribute) {
+                try typeExpr(context, scope, n.b);
+                n.ty = context.node(n.b).ty;
+                if (n.ty == .unknown) {
+                    try coerce(context, n.b, .text);
+                    n.ty = .text;
+                }
+                n.constant = isConstant(context, n.b);
+                return;
+            }
             // An explicitly named schema never falls back to a built-in.
             // Resolve ordinary routines before name-based aggregate/window
             // classification (public.count, public.row_number, etc.).
@@ -2129,6 +2448,32 @@ pub fn Binder(comptime config: types.Config) type {
             }
             // Built by linkAggregateInput with typed members (B11).
             if (n.func == .aggregate_input) return;
+            if (n.func == .json_query_function) return bindJsonQueryFunction(context, scope, n);
+            if (n.func == .json_constructor) return bindJsonConstructor(context, scope, n);
+            if (n.func == .is_json) {
+                // IS JSON over a string or JSON value (42804 otherwise).
+                try typeExpr(context, scope, n.b);
+                if (context.node(n.b).ty == .unknown) try coerce(context, n.b, .text);
+                switch (context.node(n.b).ty) {
+                    .text, .varchar, .bpchar, .name, .json, .jsonb => {},
+                    else => return error.TypeMismatch,
+                }
+                n.ty = .boolean;
+                n.constant = isConstant(context, n.b);
+                return;
+            }
+            // Named notation and VARIADIC reach user routines only (B11
+            // wave 4; built-in functions have no parameter names here).
+            if (n.func == .none and n.window == none and !n.within_group and n.order == none and namedArguments(context, n)) {
+                if (n.distinct or n.c != none or n.star) return error.UndefinedFunction;
+                var count: usize = 0;
+                var item = n.b;
+                while (item != none) : (item = context.node(item).next) {
+                    try typeExpr(context, scope, item);
+                    count += 1;
+                }
+                return bindRoutineCall(context, n, count);
+            }
             if (n.within_group) return typeOrderedSet(context, scope, n);
             if (n.order != none) {
                 // Aggregate ORDER BY is not implemented for window functions;
@@ -2174,6 +2519,7 @@ pub fn Binder(comptime config: types.Config) type {
             }
             // lower(anyrange) / upper(anyrange) beside the string functions.
             if ((n.func == .lower or n.func == .upper) and count == 1 and types.isRange(context.node(n.b).ty)) n.func = if (n.func == .lower) .range_lower else .range_upper;
+            extFunctionOverload(context, n, count);
             switch (n.func) {
                 .grouping => {
                     if(!scope.aggregates) return error.GroupingError;
@@ -2421,6 +2767,14 @@ pub fn Binder(comptime config: types.Config) type {
                 .to_timestamp => try bindSignature(context, n, if (count == 1) &[_]ast.Type{.float8} else &[_]ast.Type{ .text, .text }, .timestamptz, true),
                 .array_constructor, .array_subscript, .array_any, .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper,
                 .array_append, .array_prepend, .array_cat, .array_to_string, .array_remove => try typeArrayFunction(context, n, count),
+                .array_position, .array_positions, .array_replace, .trim_array, .array_fill, .array_reverse, .array_sort, .array_sample, .array_shuffle,
+                .string_to_array, .array_width_bucket, .array_set => try typeArrayFunction(context, n, count),
+                .ext_op => return,
+                .inet_abbrev, .set_masklen, .hostmask, .inet_merge, .inet_same_family, .macaddr8_set7bit, .to_macaddr8, .to_macaddr, .mac_trunc => try typeExtFunction(context, n, count),
+                .geo_call => try typeGeometryFunction(context, n, count),
+                .multirange_constructor, .multirange_of, .range_merge, .mr_call => try typeMultirangeFunction(context, n, count),
+                .xmlelement, .xmlforest, .xmlconcat, .xmlcomment, .xmlpi, .xmlroot => try typeXmlFunction(context, n),
+                .xml_name, .xml_attribute => unreachable,
                 .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => try typeRangeFunction(context, n, count),
                 .xmlparse => {
                     n.b = try convert(context, n.b, .text, -1, .implicit);
@@ -2448,6 +2802,20 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 .pg_try_advisory_lock, .pg_try_advisory_lock_shared, .pg_try_advisory_xact_lock, .pg_try_advisory_xact_lock_shared, .pg_advisory_unlock, .pg_advisory_unlock_shared => {
                     if (count == 2) try bindSignature(context, n, &[_]ast.Type{ .int4, .int4 }, .boolean, true) else try bindSignature(context, n, &[_]ast.Type{.int8}, .boolean, true);
+                    n.constant = false;
+                },
+                // Blocking advisory locks (strict) and pg_notify (not strict:
+                // a NULL channel is 22023, a NULL payload empty) return void.
+                .pg_advisory_lock, .pg_advisory_lock_shared, .pg_advisory_xact_lock, .pg_advisory_xact_lock_shared => {
+                    if (count == 2) try bindSignature(context, n, &[_]ast.Type{ .int4, .int4 }, .void, true) else try bindSignature(context, n, &[_]ast.Type{.int8}, .void, true);
+                    n.constant = false;
+                },
+                .pg_advisory_unlock_all => {
+                    try bindSignature(context, n, &[_]ast.Type{}, .void, true);
+                    n.constant = false;
+                },
+                .pg_notify => {
+                    try bindSignature(context, n, &[_]ast.Type{ .text, .text }, .void, false);
                     n.constant = false;
                 },
                 .pg_is_in_recovery => {
@@ -2517,6 +2885,22 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 .to_tsvector, .to_tsquery, .plainto_tsquery, .phraseto_tsquery => try typeTextSearchFunction(context, n, count),
                 .regexp_like => try bindSignature(context, n, if (count == 2) &[_]ast.Type{ .text, .text } else &[_]ast.Type{ .text, .text, .text }, .boolean, true),
+                .regexp_match, .regexp_matches, .regexp_replace, .regexp_split_to_array, .regexp_split_to_table, .regexp_count, .regexp_instr, .regexp_substr => {
+                    if (ast.setFunction(n.func)) {
+                        // Only inside a select-list target (exec expands it).
+                        const seen = scope.set_calls orelse return error.UnsupportedStatement;
+                        seen.* +|= 1;
+                    }
+                    try typeRegexFunction(context, n, count);
+                },
+                .substring_regex, .substring_similar => try typeRegexFunction(context, n, count),
+                .tsvector_length, .ts_strip, .ts_setweight, .tsvector_to_array, .array_to_tsvector, .ts_delete, .ts_filter, .ts_numnode => try typeTextSearchUtility(context, n, count),
+                .json_query_function, .is_json, .json_constructor => return error.UnsupportedStatement, // bound before the arguments
+                .jsonb_path_query => {
+                    const seen = scope.set_calls orelse return error.UnsupportedStatement;
+                    seen.* +|= 1;
+                    try typeJsonFunction(context, n, count);
+                },
                 .similar_to_escape => try bindSignature(context, n, if (count == 1) &[_]ast.Type{.text} else &[_]ast.Type{ .text, .text }, .text, true),
                 .point_constructor => try bindSignature(context, n, &[_]ast.Type{ .float8, .float8 }, .point, true),
                 .box_constructor => try bindSignature(context, n, &[_]ast.Type{ .point, .point }, .box, true),
@@ -2567,6 +2951,461 @@ pub fn Binder(comptime config: types.Config) type {
 
         fn networkType(ty: ast.Type) bool {
             return ty == .inet or ty == .cidr;
+        }
+
+        // ---- types-ext lane (B11 wave 4) -----------------------------------------
+
+        /// Overloads chosen by argument type: trunc(macaddr[8]).
+        fn extFunctionOverload(context: *const Context, n: *ast.Node, count: usize) void {
+            if (count == 0) return;
+            const first = context.node(n.b).ty;
+            if (n.func == .trunc and count == 1 and (first == .macaddr or first == .macaddr8)) n.func = .mac_trunc;
+            // The range accessors over a multirange.
+            if (count == 1 and multirange_module.isMultirange(first)) {
+                const which: ?ast.MultirangeFn = switch (n.func) {
+                    .lower, .range_lower => .lower,
+                    .upper, .range_upper => .upper,
+                    .isempty => .isempty,
+                    .lower_inc => .lower_inc,
+                    .upper_inc => .upper_inc,
+                    .lower_inf => .lower_inf,
+                    .upper_inf => .upper_inf,
+                    else => null,
+                };
+                if (which) |code| {
+                    n.func = .mr_call;
+                    n.integer = @intFromEnum(code);
+                }
+            }
+            // area/center/length/point/box over the other geometric types.
+            const geometric_argument = first == .lseg or first == .line or first == .path or first == .polygon or first == .circle;
+            switch (n.func) {
+                .area, .center, .char_length => if (geometric_argument) {
+                    n.func = .geo_call;
+                },
+                .point_constructor => if (count == 1) {
+                    n.func = .geo_call;
+                },
+                .box_constructor => if (count == 1) {
+                    n.func = .geo_call;
+                },
+                else => {},
+            }
+        }
+
+        fn extArgument(context: *const Context, id: u16, wanted: ast.Type) Error!u16 {
+            const ty = context.node(id).ty;
+            if (ty == .unknown) {
+                try coerce(context, id, wanted);
+                return id;
+            }
+            if (ty != wanted and !value.castable(ty, wanted, .implicit)) return error.UndefinedFunction;
+            return convert(context, id, wanted, -1, .implicit);
+        }
+
+        /// The network and macaddr8 functions of the types-ext lane.
+        fn typeExtFunction(context: *const Context, n: *ast.Node, count: usize) Error!void {
+            const T = ast.Type;
+            switch (n.func) {
+                .inet_abbrev => {
+                    // abbrev(inet) and abbrev(cidr): a cidr keeps its type.
+                    if (count != 1) return error.UndefinedFunction;
+                    if (context.node(n.b).ty != .cidr) n.b = try extArgument(context, n.b, .inet);
+                    n.ty = .text;
+                },
+                .set_masklen => {
+                    if (count != 2) return error.UndefinedFunction;
+                    const second = context.node(n.b).next;
+                    context.node(n.b).next = none;
+                    if (context.node(n.b).ty != .cidr) n.b = try extArgument(context, n.b, .inet);
+                    context.node(n.b).next = try extArgument(context, second, .int4);
+                    n.ty = context.node(n.b).ty;
+                },
+                .hostmask => try bindSignature(context, n, &[_]T{.inet}, .inet, true),
+                .inet_merge => try bindSignature(context, n, &[_]T{ .inet, .inet }, .cidr, true),
+                .inet_same_family => try bindSignature(context, n, &[_]T{ .inet, .inet }, .boolean, true),
+                .macaddr8_set7bit => try bindSignature(context, n, &[_]T{.macaddr8}, .macaddr8, true),
+                .to_macaddr8 => try bindSignature(context, n, &[_]T{.macaddr}, .macaddr8, true),
+                .to_macaddr => try bindSignature(context, n, &[_]T{.macaddr8}, .macaddr, true),
+                .mac_trunc => {
+                    const ty = context.node(n.b).ty;
+                    try bindSignature(context, n, &[_]T{ty}, ty, true);
+                },
+                else => unreachable,
+            }
+            n.constant = listConstant(context, n.b);
+        }
+
+        /// geo_call: the GeoFn from the call's name, typed per overload.
+        fn typeGeometryFunction(context: *const Context, n: *ast.Node, count: usize) Error!void {
+            const T = ast.Type;
+            const name = toName(context, n.name);
+            const which = std.meta.stringToEnum(ast.GeoFn, name.slice()) orelse
+                (if (types.same(name.slice(), "char_length") or types.same(name.slice(), "character_length")) ast.GeoFn.length else return error.UndefinedFunction);
+            n.integer = @intFromEnum(which);
+            const first: T = if (count >= 1) context.node(n.b).ty else .unknown;
+            const second: T = if (count >= 2) context.node(context.node(n.b).next).ty else .unknown;
+            const one = count == 1;
+            switch (which) {
+                .area => if (one and (first == .circle or first == .path)) try bindSignature(context, n, &[_]T{first}, .float8, true) else return error.UndefinedFunction,
+                .center => if (one and first == .circle) try bindSignature(context, n, &[_]T{.circle}, .point, true) else return error.UndefinedFunction,
+                .length => if (one and (first == .lseg or first == .path)) try bindSignature(context, n, &[_]T{first}, .float8, true) else return error.UndefinedFunction,
+                .npoints => if (one and (first == .path or first == .polygon)) try bindSignature(context, n, &[_]T{first}, .int4, true) else return error.UndefinedFunction,
+                .radius, .diameter => try bindSignature(context, n, &[_]T{.circle}, .float8, true),
+                .isclosed, .isopen => try bindSignature(context, n, &[_]T{.path}, .boolean, true),
+                .pclose, .popen => try bindSignature(context, n, &[_]T{.path}, .path, true),
+                .slope => try bindSignature(context, n, &[_]T{ .point, .point }, .float8, true),
+                .diagonal => try bindSignature(context, n, &[_]T{.box}, .lseg, true),
+                .bound_box => try bindSignature(context, n, &[_]T{ .box, .box }, .box, true),
+                .box => if (one and (first == .point or first == .circle or first == .polygon)) try bindSignature(context, n, &[_]T{first}, .box, true) else return error.UndefinedFunction,
+                .circle => if (count == 2) try bindSignature(context, n, &[_]T{ .point, .float8 }, .circle, true) else if (one and (first == .box or first == .polygon)) try bindSignature(context, n, &[_]T{first}, .circle, true) else return error.UndefinedFunction,
+                .line => try bindSignature(context, n, &[_]T{ .point, .point }, .line, true),
+                .lseg => if (count == 2) try bindSignature(context, n, &[_]T{ .point, .point }, .lseg, true) else try bindSignature(context, n, &[_]T{.box}, .lseg, true),
+                .path => try bindSignature(context, n, &[_]T{.polygon}, .path, true),
+                .polygon => if (count == 2) try bindSignature(context, n, &[_]T{ .int4, .circle }, .polygon, true) else if (one and (first == .box or first == .circle or first == .path)) try bindSignature(context, n, &[_]T{first}, .polygon, true) else return error.UndefinedFunction,
+                .point => if (one and (first == .box or first == .circle or first == .lseg or first == .polygon)) try bindSignature(context, n, &[_]T{first}, .point, true) else return error.UndefinedFunction,
+                .ishorizontal, .isvertical => if (count == 2) try bindSignature(context, n, &[_]T{ .point, .point }, .boolean, true) else if (one and (first == .lseg or first == .line)) try bindSignature(context, n, &[_]T{first}, .boolean, true) else return error.UndefinedFunction,
+                .isparallel, .isperp => {
+                    const kind: T = if (first == .line or second == .line) .line else .lseg;
+                    try bindSignature(context, n, &[_]T{ kind, kind }, .boolean, true);
+                },
+                .pt_contained_circle => try bindSignature(context, n, &[_]T{ .point, .circle }, .boolean, true),
+                .pt_contained_poly => try bindSignature(context, n, &[_]T{ .point, .polygon }, .boolean, true),
+            }
+        }
+
+        /// SQL/XML publishing: XMLCONCAT arguments are xml (untyped ones
+        /// read as xml; others 42804), XMLCOMMENT text, XMLPI content text,
+        /// XMLROOT (xml, text); attribute names of one element are unique
+        /// (42601). Every result is xml.
+        fn typeXmlFunction(context: *const Context, n: *ast.Node) Error!void {
+            switch (n.func) {
+                .xmlconcat => {
+                    if (n.b == none) return error.Syntax;
+                    var item = n.b;
+                    while (item != none) : (item = context.node(item).next) {
+                        if (context.node(item).ty == .unknown) try coerce(context, item, .xml);
+                        if (context.node(item).ty != .xml) return error.TypeMismatch;
+                    }
+                },
+                .xmlcomment => try bindSignature(context, n, &[_]ast.Type{.text}, .xml, true),
+                .xmlpi => {
+                    const content = context.node(n.b).next;
+                    if (content != none) {
+                        context.node(n.b).next = try convert(context, content, .text, -1, .implicit);
+                        if (context.node(context.node(n.b).next).ty != .text) return error.UndefinedFunction;
+                    }
+                },
+                .xmlroot => {
+                    if (context.node(n.b).ty == .unknown) try coerce(context, n.b, .xml);
+                    if (context.node(n.b).ty != .xml) return error.TypeMismatch;
+                    const version = context.node(n.b).next;
+                    if (version != none) {
+                        const converted = try convert(context, version, .text, -1, .implicit);
+                        context.node(n.b).next = converted;
+                        if (context.node(converted).ty != .text) return error.UndefinedFunction;
+                    }
+                },
+                .xmlelement, .xmlforest => {
+                    // Unique attribute names (XMLELEMENT only).
+                    const attributes: usize = if (n.func == .xmlelement) @intCast(n.integer) else 0;
+                    var outer = if (n.func == .xmlelement) context.node(n.b).next else none;
+                    for (0..attributes) |index| {
+                        var inner = context.node(outer).next;
+                        for (index + 1..attributes) |_| {
+                            if (types.same(toName(context, context.node(outer).name).slice(), toName(context, context.node(inner).name).slice())) return error.Syntax;
+                            inner = context.node(inner).next;
+                        }
+                        outer = context.node(outer).next;
+                    }
+                },
+                else => unreachable,
+            }
+            n.ty = .xml;
+            n.constant = false;
+        }
+
+        fn multirangeOfType(ty: ast.Type) ?ast.Type {
+            const data = multirange_module.ofRange(types.dataTypeOf(ty)) orelse return null;
+            return types.typeOfData(data);
+        }
+
+        fn rangeOfMultirange(ty: ast.Type) ast.Type {
+            return types.typeOfData(multirange_module.rangeOf(types.dataTypeOf(ty)).?);
+        }
+
+        /// Multirange constructors and functions.
+        fn typeMultirangeFunction(context: *const Context, n: *ast.Node, count: usize) Error!void {
+            switch (n.func) {
+                .multirange_constructor => {
+                    const name = toName(context, n.name);
+                    const data = types.typeByCatalogName(name.slice()) orelse return error.UndefinedFunction;
+                    const result = types.typeOfData(data);
+                    const range = rangeOfMultirange(result);
+                    var item = n.b;
+                    var previous: u16 = none;
+                    while (item != none) {
+                        const next = context.node(item).next;
+                        context.node(item).next = none;
+                        const ty = context.node(item).ty;
+                        if (ty != .unknown and ty != range) return error.UndefinedFunction;
+                        const converted = try convert(context, item, range, -1, .implicit);
+                        if (previous == none) n.b = converted else context.node(previous).next = converted;
+                        context.node(converted).next = next;
+                        previous = converted;
+                        item = next;
+                    }
+                    n.ty = result;
+                    n.integer = @intCast(count);
+                },
+                .multirange_of => {
+                    if (count != 1) return error.UndefinedFunction;
+                    const ty = context.node(n.b).ty;
+                    if (ty == .unknown) return error.TypeMismatch;
+                    n.ty = multirangeOfType(ty) orelse return error.UndefinedFunction;
+                },
+                .range_merge => {
+                    const ty = context.node(n.b).ty;
+                    if (count == 1) {
+                        if (!multirange_module.isMultirange(ty)) return error.UndefinedFunction;
+                        n.ty = rangeOfMultirange(ty);
+                    } else if (count == 2) {
+                        const other = context.node(context.node(n.b).next).ty;
+                        const range = if (ty != .unknown) ty else other;
+                        if (!types.isRange(range)) return error.UndefinedFunction;
+                        try bindSignature(context, n, &[_]ast.Type{ range, range }, range, true);
+                    } else return error.UndefinedFunction;
+                },
+                .mr_call => {
+                    const which: ast.MultirangeFn = @enumFromInt(n.integer);
+                    const ty = context.node(n.b).ty;
+                    n.ty = switch (which) {
+                        .lower, .upper => types.rangeSubtype(rangeOfMultirange(ty)).?,
+                        else => .boolean,
+                    };
+                },
+                else => unreachable,
+            }
+            n.constant = listConstant(context, n.b);
+        }
+
+        /// Multirange operators: @> <@ && << >> &< &> -|- with a multirange
+        /// on either side (a range or, for containment, an element on the
+        /// other) and + - * between multiranges of one type.
+        fn multirangeOperator(context: *const Context, n: *ast.Node) Error!bool {
+            var left = context.node(n.a).ty;
+            var right = context.node(n.b).ty;
+            const left_mr = multirange_module.isMultirange(left);
+            const right_mr = multirange_module.isMultirange(right);
+            if (!left_mr and !right_mr) return false;
+            const set = if (left_mr) left else right;
+            const range = rangeOfMultirange(set);
+            const subtype = types.rangeSubtype(range).?;
+            switch (n.op) {
+                .contains, .contained, .overlap, .shift_left, .shift_right, .over_left, .over_right, .adjacent, .add, .sub, .mul => {},
+                else => return false,
+            }
+            if (left == .unknown) {
+                try coerce(context, n.a, set);
+                left = set;
+            }
+            if (right == .unknown) {
+                try coerce(context, n.b, set);
+                right = set;
+            }
+            for ([_]ast.Type{ left, right }, [_]bool{ true, false }) |ty, is_left| {
+                if (ty == set or ty == range) continue;
+                // An element: @> on the right, <@ on the left.
+                const element_side = (n.op == .contains and !is_left) or (n.op == .contained and is_left);
+                if (element_side and (ty == subtype or value.castable(ty, subtype, .implicit))) continue;
+                return error.UndefinedFunction;
+            }
+            if ((n.op == .add or n.op == .sub or n.op == .mul) and (left != set or right != set)) return error.UndefinedFunction;
+            if (left != set and left != range) n.a = try convert(context, n.a, subtype, -1, .implicit);
+            if (right != set and right != range) n.b = try convert(context, n.b, subtype, -1, .implicit);
+            extOperatorCall(context, n, n.a, n.b, if (n.op == .add or n.op == .sub or n.op == .mul) set else .boolean);
+            return true;
+        }
+
+        fn newGeometry(ty: ast.Type) bool {
+            return ty == .lseg or ty == .line or ty == .path or ty == .polygon or ty == .circle;
+        }
+
+        /// One geometric operator signature: left, op, right -> result.
+        const GeoOperator = struct { left: ast.Type, op: ast.Op, right: ast.Type, result: ast.Type };
+        const geo_operators = blk: {
+            const T = ast.Type;
+            var list: []const GeoOperator = &.{};
+            for ([_]ast.Op{ .add, .sub, .mul, .div }) |op| {
+                list = list ++ [_]GeoOperator{
+                    .{ .left = T.point, .op = op, .right = T.point, .result = T.point },
+                    .{ .left = T.box, .op = op, .right = T.point, .result = T.box },
+                    .{ .left = T.circle, .op = op, .right = T.point, .result = T.circle },
+                    .{ .left = T.path, .op = op, .right = T.point, .result = T.path },
+                };
+            }
+            list = list ++ [_]GeoOperator{.{ .left = T.path, .op = .add, .right = T.path, .result = T.path }};
+            for ([_]ast.Op{ .eq, .lt, .gt, .le, .ge }) |op| {
+                list = list ++ [_]GeoOperator{
+                    .{ .left = T.box, .op = op, .right = T.box, .result = T.boolean },
+                    .{ .left = T.circle, .op = op, .right = T.circle, .result = T.boolean },
+                    .{ .left = T.lseg, .op = op, .right = T.lseg, .result = T.boolean },
+                    .{ .left = T.path, .op = op, .right = T.path, .result = T.boolean },
+                };
+            }
+            list = list ++ [_]GeoOperator{
+                .{ .left = T.circle, .op = .ne, .right = T.circle, .result = T.boolean },
+                .{ .left = T.lseg, .op = .ne, .right = T.lseg, .result = T.boolean },
+                .{ .left = T.point, .op = .ne, .right = T.point, .result = T.boolean },
+                .{ .left = T.line, .op = .eq, .right = T.line, .result = T.boolean },
+                .{ .left = T.circle, .op = .same, .right = T.circle, .result = T.boolean },
+                .{ .left = T.polygon, .op = .same, .right = T.polygon, .result = T.boolean },
+            };
+            const distances = [_][2]T{
+                .{ T.point, T.circle }, .{ T.circle, T.point }, .{ T.circle, T.circle }, .{ T.point, T.lseg }, .{ T.lseg, T.point },
+                .{ T.point, T.line },   .{ T.line, T.point },   .{ T.point, T.box },     .{ T.box, T.point },   .{ T.line, T.line },
+                .{ T.point, T.path },   .{ T.path, T.point },   .{ T.point, T.polygon }, .{ T.polygon, T.point },
+            };
+            for (distances) |pair| list = list ++ [_]GeoOperator{.{ .left = pair[0], .op = .distance, .right = pair[1], .result = T.float8 }};
+            list = list ++ [_]GeoOperator{
+                .{ .left = T.circle, .op = .contains, .right = T.point, .result = T.boolean },
+                .{ .left = T.circle, .op = .contains, .right = T.circle, .result = T.boolean },
+                .{ .left = T.polygon, .op = .contains, .right = T.point, .result = T.boolean },
+                .{ .left = T.path, .op = .contains, .right = T.point, .result = T.boolean },
+                .{ .left = T.box, .op = .contains, .right = T.box, .result = T.boolean },
+                .{ .left = T.point, .op = .contained, .right = T.circle, .result = T.boolean },
+                .{ .left = T.circle, .op = .contained, .right = T.circle, .result = T.boolean },
+                .{ .left = T.point, .op = .contained, .right = T.polygon, .result = T.boolean },
+                .{ .left = T.point, .op = .contained, .right = T.path, .result = T.boolean },
+                .{ .left = T.point, .op = .contained, .right = T.lseg, .result = T.boolean },
+                .{ .left = T.point, .op = .contained, .right = T.line, .result = T.boolean },
+                .{ .left = T.box, .op = .contained, .right = T.box, .result = T.boolean },
+                .{ .left = T.circle, .op = .overlap, .right = T.circle, .result = T.boolean },
+            };
+            for ([_]ast.Op{ .shift_left, .shift_right, .over_left, .over_right }) |op| {
+                list = list ++ [_]GeoOperator{
+                    .{ .left = T.circle, .op = op, .right = T.circle, .result = T.boolean },
+                    .{ .left = T.box, .op = op, .right = T.box, .result = T.boolean },
+                };
+            }
+            const array: [list.len]GeoOperator = list[0..list.len].*;
+            break :blk array;
+        };
+
+        /// Geometric operators of geo_ops.c beyond point/box's original set;
+        /// an untyped operand takes the other's type when that signature
+        /// exists, else the single signature's.
+        fn geometryOperator(context: *const Context, n: *ast.Node) Error!bool {
+            const left = context.node(n.a).ty;
+            const right = context.node(n.b).ty;
+            if (!value.geometryType(left) and !value.geometryType(right)) return false;
+            if (!newGeometry(left) and !newGeometry(right)) {
+                // point/box: only the operators the original lane lacked.
+                const original = switch (n.op) {
+                    .distance => left != .box and right != .box,
+                    .same, .overlap => true,
+                    .contains => left == .box and right != .box,
+                    .contained => left != .box and right == .box,
+                    else => false,
+                };
+                if (original) return false;
+                if (n.op == .eq or n.op == .lt or n.op == .gt or n.op == .le or n.op == .ge or n.op == .ne) {
+                    if (!(left == .box or right == .box or ((left == .point or right == .point) and n.op == .ne))) return false;
+                }
+            }
+            var match: ?GeoOperator = null;
+            var candidates: usize = 0;
+            for (geo_operators) |signature| {
+                if (signature.op != n.op) continue;
+                if (left != .unknown and signature.left != left) continue;
+                if (right != .unknown and signature.right != right) continue;
+                if (left == .unknown and right != .unknown and signature.left == right) {
+                    match = signature;
+                    candidates = 1;
+                    break;
+                }
+                if (right == .unknown and left != .unknown and signature.right == left) {
+                    match = signature;
+                    candidates = 1;
+                    break;
+                }
+                match = signature;
+                candidates += 1;
+            }
+            const found = match orelse return error.UndefinedFunction;
+            if (candidates > 1) return error.AmbiguousFunction;
+            if (left == .unknown) try coerce(context, n.a, found.left);
+            if (right == .unknown) try coerce(context, n.b, found.right);
+            extOperatorCall(context, n, n.a, n.b, found.result);
+            return true;
+        }
+
+        fn macType(ty: ast.Type) bool {
+            return ty == .macaddr or ty == .macaddr8;
+        }
+
+        /// Rewrites a bound operator node into an ext_op call over `left`
+        /// (and `right`), named ?column?.
+        fn extOperatorCall(context: *const Context, n: *ast.Node, left: u16, right: u16, result: ast.Type) void {
+            context.node(left).next = right;
+            if (right != none) context.node(right).next = none;
+            n.integer = @intFromEnum(n.op);
+            n.kind = .function;
+            n.func = .ext_op;
+            n.a = none;
+            n.b = left;
+            n.name = .{};
+            n.ty = result;
+            n.constant = isConstant(context, left) and (right == none or isConstant(context, right));
+        }
+
+        /// Binary operators over the types-ext types: inet + int8, int8 +
+        /// inet, inet - int8, inet - inet, & and | over inet / macaddr /
+        /// macaddr8. Returns false for every other operand type.
+        fn extOperator(context: *const Context, n: *ast.Node) Error!bool {
+            const T = ast.Type;
+            const left = context.node(n.a).ty;
+            const right = context.node(n.b).ty;
+            switch (n.op) {
+                .add, .sub => {
+                    if (!networkType(left) and !(n.op == .add and networkType(right))) return false;
+                    if (networkType(left)) {
+                        const a = try convert(context, n.a, .inet, -1, .implicit);
+                        // inet - unknown is inet - inet; otherwise an integer.
+                        const other: T = if (n.op == .sub and (right == .unknown or networkType(right))) .inet else .int8;
+                        if (right != .unknown and other == .int8 and !value.integral(right)) return error.UndefinedFunction;
+                        const b = try extArgument(context, n.b, other);
+                        extOperatorCall(context, n, a, b, if (other == .inet) .int8 else .inet);
+                        return true;
+                    }
+                    if (left != .unknown and !value.integral(left)) return error.UndefinedFunction;
+                    const a = try extArgument(context, n.a, .int8);
+                    const b = try convert(context, n.b, .inet, -1, .implicit);
+                    extOperatorCall(context, n, a, b, .inet);
+                    return true;
+                },
+                .bit_and, .bit_or => {
+                    const known = if (left != .unknown) left else right;
+                    if (!networkType(known) and !macType(known)) return false;
+                    const target: T = if (networkType(known)) .inet else known;
+                    for ([_]T{ left, right }) |ty| if (ty != .unknown and ty != target and !(target == .inet and networkType(ty))) return error.UndefinedFunction;
+                    const a = try extArgument(context, n.a, target);
+                    const b = try extArgument(context, n.b, target);
+                    extOperatorCall(context, n, a, b, target);
+                    return true;
+                },
+                else => return false,
+            }
+        }
+
+        /// ~inet, ~macaddr, ~macaddr8.
+        fn extUnary(context: *const Context, n: *ast.Node) Error!bool {
+            if (n.op != .bit_not) return false;
+            const ty = context.node(n.a).ty;
+            if (!networkType(ty) and !macType(ty)) return false;
+            const operand = if (networkType(ty)) try convert(context, n.a, .inet, -1, .implicit) else n.a;
+            extOperatorCall(context, n, operand, none, if (networkType(ty)) .inet else ty);
+            return true;
         }
 
         /// inet << <<= >> >>= && inet (cidr converts implicitly; an untyped
@@ -2756,7 +3595,14 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 .array_subscript => {
                     const base_ty = context.node(n.b).ty;
-                    const element = if (base_ty == .name) .pg_internal_char else types.elementType(base_ty) orelse return error.TypeMismatch;
+                    const element: ast.Type = switch (base_ty) {
+                        .name => .pg_internal_char,
+                        // Fixed-length geometric "arrays" (B11 wave 4).
+                        .point, .line => .float8,
+                        .box, .lseg => .point,
+                        else => types.elementType(base_ty) orelse return error.TypeMismatch,
+                    };
+                    if (value.geometryType(base_ty) and array_module.Subscripts.decode(n.integer).slice()) return error.UnsupportedStatement;
                     // Subscripts are int4 by assignment (array subscript
                     // must have type integer: 42804).
                     try convertTail(context, n.b, .int4, .assignment);
@@ -2814,6 +3660,110 @@ pub fn Binder(comptime config: types.Config) type {
                     context.node(second).next = none;
                     n.b = first;
                     n.constant = isConstant(context, first) and isConstant(context, second);
+                },
+                .array_position, .array_positions, .array_width_bucket => {
+                    // array_position(anycompatiblearray, anycompatible [, int4]),
+                    // width_bucket(anycompatible, anycompatiblearray).
+                    if (count != 2 and !(n.func == .array_position and count == 3)) return error.UndefinedFunction;
+                    var first = n.b;
+                    var second = context.node(first).next;
+                    const third = context.node(second).next;
+                    context.node(second).next = none;
+                    if (n.func == .array_width_bucket) {
+                        const array_ty = try arrayConcatTypes(context, &second, &first, .append);
+                        const element = types.elementType(array_ty).?;
+                        try sortableType(element);
+                    } else _ = try arrayConcatTypes(context, &first, &second, .append);
+                    context.node(first).next = second;
+                    if (third != none) context.node(second).next = try convert(context, third, .int4, -1, .implicit);
+                    n.b = first;
+                    n.ty = if (n.func == .array_positions) types.arrayType(.int4).? else .int4;
+                    n.constant = listConstant(context, n.b);
+                },
+                .array_replace => {
+                    // anycompatiblearray, anycompatible, anycompatible.
+                    if (count != 3) return error.UndefinedFunction;
+                    const first = n.b;
+                    const second = context.node(first).next;
+                    const third = context.node(second).next;
+                    const array_ty = context.node(first).ty;
+                    if (array_ty != .unknown and !types.isArray(array_ty)) return error.UndefinedFunction;
+                    var element: ast.Type = if (array_ty == .unknown) .unknown else types.elementType(array_ty).?;
+                    for ([_]u16{ second, third }) |id| {
+                        if (types.isArray(context.node(id).ty)) return error.UndefinedFunction;
+                        unifyInto(&element, context.node(id).ty) catch return error.UndefinedFunction;
+                    }
+                    if (element == .unknown) return error.TypeMismatch;
+                    const result = types.arrayType(element) orelse return error.UndefinedFunction;
+                    context.node(second).next = none;
+                    context.node(third).next = none;
+                    const a = try convert(context, first, result, -1, .implicit);
+                    const b = try convert(context, second, element, -1, .implicit);
+                    const c = try convert(context, third, element, -1, .implicit);
+                    context.node(a).next = b;
+                    context.node(b).next = c;
+                    n.b = a;
+                    n.ty = result;
+                    n.constant = listConstant(context, n.b);
+                },
+                .trim_array, .array_sample => {
+                    if (count != 2) return error.UndefinedFunction;
+                    try arrayArgument(context, n.b);
+                    try convertTail(context, n.b, .int4, .implicit);
+                    n.ty = context.node(n.b).ty;
+                    n.constant = n.func == .trim_array and listConstant(context, n.b);
+                },
+                .array_reverse, .array_shuffle => {
+                    if (count != 1) return error.UndefinedFunction;
+                    try arrayArgument(context, n.b);
+                    n.ty = context.node(n.b).ty;
+                    n.constant = n.func == .array_reverse and isConstant(context, n.b);
+                },
+                .array_sort => {
+                    // array_sort(anyarray [, descending [, nulls_first]]): the
+                    // element type needs an ordering operator (0A000).
+                    if (count < 1 or count > 3) return error.UndefinedFunction;
+                    try arrayArgument(context, n.b);
+                    const element = types.elementType(context.node(n.b).ty).?;
+                    // Comparing two elements needs the ordering operator.
+                    n.integer = if (sortableType(element)) |_| 0 else |_| 1;
+                    try convertTail(context, n.b, .boolean, .implicit);
+                    n.ty = context.node(n.b).ty;
+                    n.constant = listConstant(context, n.b);
+                },
+                .array_fill => {
+                    // array_fill(anyelement, int4[] [, int4[]]).
+                    if (count != 2 and count != 3) return error.UndefinedFunction;
+                    const element = context.node(n.b).ty;
+                    if (element == .unknown) return error.TypeMismatch;
+                    if (types.isArray(element)) return error.UndefinedObject;
+                    try convertTail(context, n.b, types.arrayType(.int4).?, .implicit);
+                    n.ty = types.arrayType(element) orelse return error.UndefinedObject;
+                    n.constant = listConstant(context, n.b);
+                },
+                .string_to_array => {
+                    if (count != 2 and count != 3) return error.UndefinedFunction;
+                    try bindSignature(context, n, if (count == 2) &[_]ast.Type{ .text, .text } else &[_]ast.Type{ .text, .text, .text }, types.arrayType(.text).?, false);
+                },
+                .array_set => {
+                    // UPDATE SET a[...] = v: the base column's array type; an
+                    // element is assigned in its element type, a slice as an
+                    // array (both by assignment); subscripts are int4.
+                    const base = n.b;
+                    const base_ty = context.node(base).ty;
+                    const element = types.elementType(base_ty) orelse return error.TypeMismatch;
+                    const layout = array_module.Subscripts.decode(n.integer);
+                    const assigned = context.node(base).next;
+                    const rest = context.node(assigned).next;
+                    context.node(assigned).next = none;
+                    const typmod = outputTypmod(context, base);
+                    const converted = try convert(context, assigned, if (layout.slice()) base_ty else element, typmod, .assignment);
+                    context.node(base).next = converted;
+                    context.node(converted).next = rest;
+                    try convertTail(context, converted, .int4, .assignment);
+                    n.ty = base_ty;
+                    n.typmod = typmod;
+                    n.constant = false;
                 },
                 .array_to_string => {
                     if (count != 2 and count != 3) return error.UndefinedFunction;
@@ -3115,7 +4065,14 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 // octet_length(bpchar) counts CHAR(n) padding; the others read
                 // CHAR(n) through text, which drops trailing spaces.
-                .char_length, .octet_length, .bit_length, .ascii => try bindSignature(context, n, &[_]T{if (n.func == .octet_length and count == 1 and argumentType(context, n, 0) == .bpchar) .bpchar else .text}, .int4, true),
+                .char_length, .octet_length, .bit_length, .ascii => {
+                    // length(tsvector) (wave 4 text-json).
+                    if (n.func == .char_length and count == 1 and argumentType(context, n, 0) == .tsvector and types.same(toName(context, n.name).slice(), "length")) {
+                        n.func = .tsvector_length;
+                        return typeTextSearchUtility(context, n, count);
+                    }
+                    try bindSignature(context, n, &[_]T{if (n.func == .octet_length and count == 1 and argumentType(context, n, 0) == .bpchar) .bpchar else .text}, .int4, true);
+                },
                 .substring => {
                     // Unknown or text arguments after the first select the
                     // regular-expression overloads substring(text,text[,text]),
@@ -3130,7 +4087,10 @@ pub fn Binder(comptime config: types.Config) type {
                             if (ty != .unknown and !value.stringType(ty)) regex = false;
                             if (!knownNull(context, item)) concrete = true;
                         }
-                        if (regex and concrete) return error.UnsupportedStatement;
+                        if (regex and concrete) {
+                            n.func = if (count == 2) .substring_regex else .substring_similar;
+                            return typeRegexFunction(context, n, count);
+                        }
                     }
                     try bindSignature(context, n, if (count == 2) &[_]T{ .text, .int4 } else &[_]T{ .text, .int4, .int4 }, .text, true);
                 },
@@ -3535,7 +4495,7 @@ pub fn Binder(comptime config: types.Config) type {
         /// Every CHECK constraint of the table, by constraint index.
         fn bindChecks(context: *const Context, index: usize, entry: *const S.Table, checks: *[config.table_constraints]u16) Error!void {
             for (entry.constraints[0..entry.constraint_count], 0..) |*constraint, position| {
-                if (constraint.kind == .check) checks[position] = try bindCheckText(context, constraint.expression.slice(), index);
+                if (constraint.kind == .check and !constraint.not_enforced) checks[position] = try bindCheckText(context, constraint.expression.slice(), index);
             }
         }
 
@@ -3543,7 +4503,7 @@ pub fn Binder(comptime config: types.Config) type {
         pub fn bindFlaggedChecks(context: *const Context, index: usize, flags: *const [config.table_constraints]bool, checks: *[config.table_constraints]u16) Error!void {
             const entry = &context.tables[index];
             for (entry.constraints[0..entry.constraint_count], 0..) |*constraint, position| {
-                if (constraint.kind == .check and flags[position]) checks[position] = try bindCheckText(context, constraint.expression.slice(), index);
+                if (constraint.kind == .check and flags[position] and !constraint.not_enforced) checks[position] = try bindCheckText(context, constraint.expression.slice(), index);
             }
         }
 
@@ -4033,6 +4993,15 @@ pub fn Binder(comptime config: types.Config) type {
                 .row_constructor => return error.UnsupportedStatement,
                 // Internal comparison lists have already bound every field.
                 .row_compare, .row_in => { n.ty = .boolean; n.constant = isConstant(context, n.a) and listConstant(context, n.b); },
+                // A named or VARIADIC call argument: typed through its value;
+                // bindRoutineCall unwraps it (B11 wave 4).
+                .named_argument => {
+                    try typeExpr(context, scope, n.a);
+                    const inner = context.node(n.a);
+                    n.ty = inner.ty;
+                    n.typmod = inner.typmod;
+                    n.constant = false;
+                },
                 .function => try typeFunction(context, scope, n),
                 .when_arm => unreachable,
                 .column => {
@@ -4057,6 +5026,7 @@ pub fn Binder(comptime config: types.Config) type {
                         return;
                     }
                     if (ty == .unknown) return error.AmbiguousFunction;
+                    if (try extUnary(context, n)) return;
                     if (!value.numericCategory(ty) and ty != .interval) return error.UndefinedFunction;
                     if (n.op == .bit_not and !value.integral(ty)) return error.UndefinedFunction;
                     n.ty = ty;
@@ -4067,6 +5037,9 @@ pub fn Binder(comptime config: types.Config) type {
                     try typeExpr(context, scope, n.a);
                     try typeExpr(context, scope, n.b);
                     n.constant = isConstant(context, n.a) and isConstant(context, n.b);
+                    if (try extOperator(context, n)) return;
+                    if (try geometryOperator(context, n)) return;
+                    if (try multirangeOperator(context, n)) return;
                     switch (n.op) {
                         .eq, .ne, .lt, .le, .gt, .ge, .is_distinct, .is_not_distinct => {
                             try comparable(context, &n.a, &n.b);
@@ -4078,13 +5051,22 @@ pub fn Binder(comptime config: types.Config) type {
                         .exists_all => try jsonOperatorCall(context, n, .jsonb_exists_all_op),
                         .path_exists => try jsonOperatorCall(context, n, .jsonb_path_exists_op),
                         // @@ is also tsvector @@ tsquery (either order).
-                        .path_match => if (textSearchType(context.node(n.a).ty) or textSearchType(context.node(n.b).ty)) {
+                        .path_match => if (textSearchType(context.node(n.a).ty) or textSearchType(context.node(n.b).ty) or
+                            (textOrUnknown(context.node(n.a).ty) and textOrUnknown(context.node(n.b).ty)))
+                        {
                             n.op = .text_match;
                             try textMatchOperator(context, n);
                         } else try jsonOperatorCall(context, n, .jsonb_path_match_op),
                         .concat => {
                             const left_ty = context.node(n.a).ty;
                             const right_ty = context.node(n.b).ty;
+                            // tsvector || tsvector (wave 4 text-json).
+                            if ((left_ty == .tsvector and (right_ty == .tsvector or right_ty == .unknown)) or (right_ty == .tsvector and left_ty == .unknown)) {
+                                try coerce(context, n.a, .tsvector);
+                                try coerce(context, n.b, .tsvector);
+                                n.ty = .tsvector;
+                                return;
+                            }
                             if (types.isArray(left_ty) or types.isArray(right_ty)) {
                                 n.ty = try arrayConcatTypes(context, &n.a, &n.b, .operator);
                                 return;
@@ -4496,7 +5478,17 @@ pub fn Binder(comptime config: types.Config) type {
                         .array_constructor => break :blk .{ .name = "array", .strength = 2 },
                         .array_subscript => break :blk figure(context, n.b, buffer),
                         .array_any => break :blk .{ .name = "?column?", .strength = 0 },
-                        .jsonb_minus_op, .jsonb_delete_path_op, .jsonb_exists_any_op, .jsonb_exists_all_op, .jsonb_path_exists_op, .jsonb_path_match_op => break :blk .{ .name = "?column?", .strength = 0 },
+                        .jsonb_minus_op, .jsonb_delete_path_op, .jsonb_exists_any_op, .jsonb_exists_all_op, .jsonb_path_exists_op, .jsonb_path_match_op, .is_json => break :blk .{ .name = "?column?", .strength = 0 },
+                        .ext_op => break :blk .{ .name = "?column?", .strength = 0 },
+                        .xmlelement, .xmlforest, .xmlpi, .xmlroot => break :blk .{ .name = @tagName(n.func), .strength = 2 },
+                        .inet_abbrev => break :blk .{ .name = "abbrev", .strength = 2 },
+                        .to_macaddr8 => break :blk .{ .name = "macaddr8", .strength = 2 },
+                        .to_macaddr => break :blk .{ .name = "macaddr", .strength = 2 },
+                        .mac_trunc => break :blk .{ .name = "trunc", .strength = 2 },
+                        .json_constructor => {
+                            buffer.* = toName(context, n.name);
+                            break :blk .{ .name = buffer.slice(), .strength = 2 };
+                        },
                         else => {},
                     }
                     buffer.* = toName(context, n.name);
@@ -4571,8 +5563,32 @@ pub fn Binder(comptime config: types.Config) type {
         }
 
         fn specifiedNamespace(context: *const Context, schema: ?ast.Ident) Error!u32 {
-            const qualifier = schema orelse return if (context.session.public_schema_on_path) catalog.public_namespace else error.UndefinedSchema;
+            const qualifier = schema orelse {
+                // An unqualified CREATE: the search path's first existing
+                // schema (ddl-dml, wave 4; 3F000 with none).
+                if (context.routine_path_known) return if (context.routine_path.len != 0) context.routine_path[0] else error.UndefinedSchema;
+                return if (context.session.public_schema_on_path) catalog.public_namespace else error.UndefinedSchema;
+            };
             return namespaceOf(context, toName(context, qualifier).slice());
+        }
+
+        /// The schema an unqualified name of an existing relation resolves
+        /// to: the search path's first schema holding it (ddl-dml, wave 4);
+        /// names in stored view texts keep public. With no holder, the
+        /// creation schema (so the caller's lookup reports it missing).
+        fn relationPathNamespace(context: *const Context, schema: ?ast.Ident, name: ast.Ident) Error!u32 {
+            if (schema != null or !context.routine_path_known or
+                (context.stored_source_start != 0 and name.span.start >= context.stored_source_start)) return qualifierNamespace(context, schema);
+            const wanted = toName(context, name);
+            for (context.routine_path) |namespace| {
+                if (context.catalog.findIn(namespace, wanted.slice(), context.snapshot) == null) continue;
+                if (context.namespace_usage) |usage| usage.check(usage.ptr, context.session.role, namespace, context.snapshot) catch |err| {
+                    if (err == error.InsufficientPrivilege) continue;
+                    return err;
+                };
+                return namespace;
+            }
+            return if (context.routine_path.len != 0) context.routine_path[0] else error.TableNotFound;
         }
 
         fn qualifierNamespace(context: *const Context, schema: ?ast.Ident) Error!u32 {
@@ -4585,6 +5601,15 @@ pub fn Binder(comptime config: types.Config) type {
             return namespace;
         }
 
+        /// DROP INDEX name: the search path's first schema with an index of
+        /// that name (ddl-dml, wave 4).
+        fn indexPathNamespace(context: *const Context, schema: ?ast.Ident, name: ast.Ident) Error!u32 {
+            if (schema != null or !context.routine_path_known) return qualifierNamespace(context, schema);
+            const wanted = toName(context, name);
+            for (context.routine_path) |namespace| if (indexNameTaken(context, namespace, wanted.slice())) return namespace;
+            return if (context.routine_path.len != 0) context.routine_path[0] else error.UndefinedSchema;
+        }
+
         fn publicLookup(context: *const Context, ident: ast.Ident) bool {
             return context.session.public_schema_on_path or
                 (context.stored_source_start != 0 and ident.span.start >= context.stored_source_start);
@@ -4594,7 +5619,11 @@ pub fn Binder(comptime config: types.Config) type {
             // PostgreSQL reports a relation in a missing schema as 42P01.
             const namespace = if (schema != null) qualifierNamespace(context, schema) catch |err| {
                 return if (err == error.UndefinedSchema) error.TableNotFound else err;
-            } else if (publicLookup(context, name)) catalog.public_namespace else return error.TableNotFound;
+            } else if (context.stored_source_start != 0 and name.span.start >= context.stored_source_start)
+                catalog.public_namespace
+            else if (context.routine_path_known)
+                try relationPathNamespace(context, null, name)
+            else if (publicLookup(context, name)) catalog.public_namespace else return error.TableNotFound;
             const wanted = toName(context, name);
             return context.catalog.findIn(namespace, wanted.slice(), context.snapshot) orelse return error.TableNotFound;
         }
@@ -4626,6 +5655,7 @@ pub fn Binder(comptime config: types.Config) type {
                 'r' => {},
                 'p' => if (!routed) return error.UnsupportedStatement,
                 'm' => return error.WrongObjectType,
+                'v' => if (!context.view_target) return error.UnsupportedStatement,
                 else => return error.UnsupportedStatement,
             }
             return index;
@@ -4811,7 +5841,7 @@ pub fn Binder(comptime config: types.Config) type {
         }
 
         fn bindDropIndex(context: *const Context, drop: *const Ast.Drop) Error!Bound {
-            const namespace = qualifierNamespace(context, drop.schema) catch |err| {
+            const namespace = indexPathNamespace(context, drop.schema, drop.name) catch |err| {
                 if (err == error.UndefinedSchema and drop.if_exists) return .{ .noop = .drop_index };
                 return err;
             };
@@ -4861,7 +5891,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .column, .aggregate => n.typmod,
                 .cast => if (n.typmod == ast.mysql_integer_cast_typmod) -1 else n.typmod,
                 // A subscript keeps the array's typmod (reftypmod).
-                .function => if (n.func == .array_subscript or n.func == .xmlserialize or n.func == .mysql_date_add) n.typmod else -1,
+                .function => if (n.func == .array_subscript or n.func == .xmlserialize or n.func == .mysql_date_add or n.func == .json_query_function) n.typmod else -1,
                 else => -1,
             };
         }
@@ -5021,8 +6051,17 @@ pub fn Binder(comptime config: types.Config) type {
             if (n.kind != .cast or n.cast_type != .unknown) return null;
             if (context.dialect != .postgres) return error.UnsupportedStatement;
             const user_types = context.user_type_catalog orelse return error.UnsupportedStatement;
-            const namespace = try qualifierNamespace(context, if (n.qualifier.len == 0) null else n.qualifier);
             const name = toName(context, n.name);
+            // An unqualified type name: the search path's first schema with
+            // a user type of that name (ddl-dml, wave 4).
+            const namespace = if (n.qualifier.len == 0 and context.routine_path_known) blk: {
+                for (context.routine_path) |candidate| {
+                    if (user_types.byName(.domain, candidate, name.slice(), context.snapshot) != null or
+                        user_types.byName(.enum_type, candidate, name.slice(), context.snapshot) != null or
+                        user_types.byName(.composite_type, candidate, name.slice(), context.snapshot) != null) break :blk candidate;
+                }
+                break :blk catalog.public_namespace;
+            } else try qualifierNamespace(context, if (n.qualifier.len == 0) null else n.qualifier);
             if (user_types.byName(.domain, namespace, name.slice(), context.snapshot)) |index| {
                 const info = user_types.items[index].domain;
                 n.cast_type = info.base;
@@ -5310,48 +6349,62 @@ pub fn Binder(comptime config: types.Config) type {
         /// Arguments are converted to the parameter types; the routine hook
         /// evaluates the body when the call runs.
         fn bindRoutineCall(context: *const Context, n: *ast.Node, count: usize) Error!void {
-            if (n.qualifier.len != 0) {
-                if (try qualifierNamespace(context, n.qualifier) != catalog.public_namespace) return error.UndefinedFunction;
-            } else if (!publicLookup(context, n.name)) return error.UndefinedFunction;
+            var single: [1]u32 = .{catalog.public_namespace};
+            const path: []const u32 = if (n.qualifier.len != 0) blk: {
+                single[0] = try qualifierNamespace(context, n.qualifier);
+                break :blk &single;
+            } else if (context.stored_source_start != 0 and n.name.span.start >= context.stored_source_start)
+                &single
+            else if (context.routine_path_known)
+                context.routine_path
+            else if (publicLookup(context, n.name)) &single else &.{};
+            if (path.len == 0) return error.UndefinedFunction;
             const set = context.routines orelse return error.UndefinedFunction;
             const name = toName(context, n.name);
-            var best: ?usize = null;
-            var best_exact: usize = 0;
-            var ambiguous = false;
-            for (&set.routines, 0..) |*routine, index| {
-                if (!routine.live or routine.namespace != catalog.public_namespace or !routine.stamp.visible(context.snapshot)) continue;
-                if (!types.same(routine.name.slice(), name.slice()) or routine.arg_count != count) continue;
-                var exact: usize = 0;
-                var accepted = true;
-                var item = n.b;
-                var position: usize = 0;
-                while (item != none) : ({
-                    item = context.node(item).next;
-                    position += 1;
-                }) {
-                    const from = context.node(item).ty;
-                    const data = types.typeFromOid(routine.arg_oids[position]) orelse {
-                        accepted = false;
-                        break;
-                    };
-                    const to = types.typeOfData(data);
-                    // An exact type counts most; an untyped literal prefers
-                    // the string category's preferred type (text).
-                    if (from == to) {
-                        exact += 2;
-                    } else if (from == .unknown) {
-                        if (to == .text) exact += 1;
-                    } else if (!value.castable(from, to, .implicit)) {
-                        accepted = false;
-                        break;
+            // The supplied arguments (B11 wave 4: named notation, VARIADIC).
+            if (count > config.routine_args) return error.UndefinedFunction;
+            var supplied: [config.routine_args]RC.Supplied = undefined;
+            var values: [config.routine_args]u16 = undefined;
+            var variadic_call = false;
+            var item = n.b;
+            var position: usize = 0;
+            while (item != none) : ({
+                item = context.node(item).next;
+                position += 1;
+            }) {
+                const arg = context.node(item);
+                var value_id = item;
+                supplied[position] = .{};
+                if (arg.kind == .named_argument) {
+                    value_id = arg.a;
+                    if (arg.name.len != 0) {
+                        supplied[position].name = toName(context, arg.name);
+                        // `name => a, name => b` (42601).
+                        for (supplied[0..position]) |earlier| if (earlier.name.len != 0 and types.same(earlier.name.slice(), supplied[position].name.slice())) return error.Syntax;
                     }
+                    if (arg.integer == 1) variadic_call = true;
                 }
-                if (!accepted) continue;
-                if (best == null or exact > best_exact) {
+                values[position] = value_id;
+                const value_node = context.node(value_id);
+                supplied[position].ty = value_node.ty;
+                supplied[position].unknown = value_node.ty == .unknown;
+            }
+            var best: ?usize = null;
+            var best_match: RC.Match = .{};
+            var ambiguous = false;
+            var params: [config.routine_args]RC.Param = undefined;
+            var candidate: RC.Match = undefined;
+            for (&set.routines, 0..) |*routine, index| {
+                if (!routine.live or !routine.stamp.visible(context.snapshot)) continue;
+                if (!types.same(routine.name.slice(), name.slice())) continue;
+                if (routineHidden(set, index, path, context.snapshot)) continue;
+                const param_count = RC.callParams(routine, false, &params);
+                if (!RC.matchCall(params[0..param_count], supplied[0..count], variadic_call, &candidate)) continue;
+                if (best == null or RC.betterMatch(&candidate, &best_match)) {
                     best = index;
-                    best_exact = exact;
+                    best_match = candidate;
                     ambiguous = false;
-                } else if (exact == best_exact) ambiguous = true;
+                } else if (!RC.betterMatch(&best_match, &candidate)) ambiguous = true;
             }
             const chosen = best orelse return error.UndefinedFunction;
             if (ambiguous) return error.AmbiguousFunction;
@@ -5359,19 +6412,39 @@ pub fn Binder(comptime config: types.Config) type {
             // A procedure is CALLed (42809); trigger functions only fire (0A000).
             if (routine.kind == 'p') return error.WrongObjectType;
             if (routine.return_oid == routine_catalog.trigger_oid) return error.UnsupportedStatement;
-            const result = types.typeFromOid(routine.return_oid) orelse return error.UnsupportedStatement;
+            const node_id: u16 = @intCast((@intFromPtr(n) - @intFromPtr(&context.pool.nodes[0])) / @sizeOf(ast.Node));
+            const from = context.table_function == node_id;
+            // A record (several OUT parameters) or a set has no scalar
+            // value here; FROM binds them as table functions (0A000).
+            if (!from and (routine.retset or routine.return_oid == routine_catalog.record_oid)) return error.UnsupportedStatement;
+            const result: types.DataType = if (routine.return_oid == routine_catalog.record_oid) .text else types.typeFromOid(routine.return_oid) orelse return error.UnsupportedStatement;
+            // void routines stay outside expressions (the void type, B11 wave 4).
+            if (result == .void) return error.UnsupportedStatement;
+            // One bound argument per input, in parameter order: converted
+            // values, a DEFAULT placeholder, or ARRAY[...] of the variadic
+            // elements.
             var head: u16 = none;
             var tail: u16 = none;
-            var item = n.b;
-            var position: usize = 0;
-            while (item != none) : (position += 1) {
-                const next = context.node(item).next;
-                const to = types.typeOfData(types.typeFromOid(routine.arg_oids[position]) orelse return error.UndefinedFunction);
-                const converted = try convert(context, item, to, -1, .implicit);
-                context.node(converted).next = none;
-                if (tail == none) head = converted else context.node(tail).next = converted;
-                tail = converted;
-                item = next;
+            for (0..routine.arg_count) |input| {
+                const to = types.typeOfData(types.typeFromOid(routine.arg_oids[input]) orelse return error.UndefinedFunction);
+                const slot = best_match.slots[input];
+                const bound: u16 = if (slot == RC.default_slot)
+                    try context.pool.add(.{ .kind = .default_value, .ty = to, .constant = false })
+                else if (slot == RC.expanded_slot) blk: {
+                    const element = types.elementType(to) orelse return error.UndefinedFunction;
+                    const array = try context.pool.add(.{ .kind = .function, .func = .array_constructor, .name = n.name, .ty = to, .constant = false });
+                    var element_tail: u16 = none;
+                    for (values[best_match.expand_from..count]) |value_id| {
+                        const converted = try convert(context, value_id, element, -1, .implicit);
+                        context.node(converted).next = none;
+                        if (element_tail == none) context.node(array).b = converted else context.node(element_tail).next = converted;
+                        element_tail = converted;
+                    }
+                    break :blk array;
+                } else try convert(context, values[slot], to, -1, .implicit);
+                context.node(bound).next = none;
+                if (tail == none) head = bound else context.node(tail).next = bound;
+                tail = bound;
             }
             n.b = head;
             n.func = .routine;
@@ -5379,6 +6452,76 @@ pub fn Binder(comptime config: types.Config) type {
             n.ty = types.typeOfData(result);
             n.typmod = routine.return_typmod;
             n.constant = false;
+            n.boolean = routine.retset;
+            n.c = none;
+            for (context.inline_calls) |entry| {
+                if (entry.node == node_id and entry.routine == chosen) {
+                    n.c = try bindInlineBody(context, routine, entry, from);
+                    break;
+                }
+            }
+        }
+
+        /// Binds an appended SQL body for call inlining: its parameters are
+        /// frame variables, it sees no FROM item of the caller, its columns
+        /// convert to the result columns and it is re-run per call (a
+        /// correlated plan); a scalar call takes its first row. Returns a
+        /// scalar_subquery node over the plan.
+        fn bindInlineBody(context: *const Context, routine: *const RC.Routine, entry: InlineCall, from: bool) Error!u16 {
+            var variables: RoutineVariables = .{};
+            for (0..routine.arg_count) |input| {
+                if (variables.count == variables.items.len) return error.ColumnCapacity;
+                variables.items[variables.count] = .{ .name = routine.arg_names[input], .ty = types.typeOfData(types.typeFromOid(routine.arg_oids[input]) orelse return error.UndefinedFunction), .typmod = routine.arg_typmods[input] };
+                variables.count += 1;
+            }
+            variables.parameters = variables.count;
+            variables.routine_name = routine.name;
+            variables.node_low = entry.low;
+            variables.node_high = entry.high;
+            var inner = context.*;
+            inner.variables = &variables;
+            inner.table_function = none;
+            const scope: Scope = .{};
+            const plan_id = try bindPlan(&inner, entry.query, &scope, null, false);
+            const plans = plansOf(context);
+            const plan = &plans.items[plan_id];
+            plan.correlated = true;
+            // The result columns: OUT / TABLE parameters, else the return type.
+            const wanted: usize = if (routine.out_count != 0) routine.out_count else 1;
+            if (plan.count != wanted) return error.InvalidFunctionDefinition;
+            for (0..wanted) |column| {
+                const oid = if (routine.out_count != 0) routine.out_oids[column] else routine.return_oid;
+                const target = types.typeOfData(types.typeFromOid(oid) orelse return error.UnsupportedStatement);
+                const ty = plan.tys[column];
+                if (ty != target and ty != .unknown and !value.castable(ty, target, .assignment) and !(value.integral(ty) and value.integral(target))) return error.InvalidFunctionDefinition;
+                if (ty != target and ty != .unknown and !(value.integral(ty) and value.integral(target))) {
+                    plan.targets[column] = try convert(context, plan.targets[column], target, -1, .assignment);
+                    plan.tys[column] = target;
+                } else try castColumn(context, plan_id, column, target);
+            }
+            if (!from) plan.limit = @min(plan.limit, 1);
+            return context.pool.add(.{ .kind = .scalar_subquery, .integer = plan_id, .ty = plan.tys[0], .typmod = plan.typmods[0], .constant = false });
+        }
+
+        fn namedArguments(context: *const Context, n: *const ast.Node) bool {
+            var item = n.b;
+            while (item != none) : (item = context.node(item).next) {
+                if (context.node(item).kind == .named_argument) return true;
+            }
+            return false;
+        }
+
+        /// A routine found through `path` is hidden by one with the same
+        /// input types in an earlier namespace (or is outside the path).
+        fn routineHidden(set: *const RC.Set, index: usize, path: []const u32, snap: storage.Snapshot) bool {
+            const routine = &set.routines[index];
+            const rank = std.mem.indexOfScalar(u32, path, routine.namespace) orelse return true;
+            for (&set.routines) |*other| {
+                if (!other.live or !other.stamp.visible(snap) or !types.same(other.name.slice(), routine.name.slice())) continue;
+                if (std.mem.indexOfScalar(u32, path[0..rank], other.namespace) == null) continue;
+                if (RC.sameArgs(other.args(), routine.args())) return true;
+            }
+            return false;
         }
 
         /// A column reference that names a routine variable: `name` (a
@@ -6134,6 +7277,7 @@ pub fn Binder(comptime config: types.Config) type {
             // No btree or hash operator classes (could not identify an
             // ordering/equality operator: 42883).
             if (ty == .point or ty == .box or ty == .xml or ty == .jsonpath or ty == .tsvector or ty == .tsquery) return error.UndefinedFunction;
+            if (types.unorderable(ty)) return error.UndefinedFunction;
         }
 
         fn bindSetOp(context: *const Context, q: *const Ast.Select, parent: ?*const Scope, env: ?*const CteEnv) Error!u16 {
@@ -6347,11 +7491,12 @@ pub fn Binder(comptime config: types.Config) type {
 
         fn registerAgg(context: *const Context, p: *Plan, id: u16) Error!usize {
             const n = context.node(id);
+            const variant: u8 = if (jsonAggregate(n.agg)) @intCast(n.integer & 3) else 0;
             for (p.aggs[0..p.agg_count], 0..) |*agg, index| {
-                if (agg.kind == n.agg and agg.distinct == n.distinct and sameExpr(context, agg.arg, n.a) and sameExpr(context, agg.filter, n.c)) return index;
+                if (agg.kind == n.agg and agg.variant == variant and agg.distinct == n.distinct and sameExpr(context, agg.arg, n.a) and sameExpr(context, agg.filter, n.c)) return index;
             }
             if (p.agg_count == config.columns) return error.StatementTooComplex;
-            p.aggs[p.agg_count] = .{ .kind = n.agg, .arg = n.a, .filter = n.c, .distinct = n.distinct, .arg_ty = if (n.a == none) .unknown else context.node(n.a).ty, .ty = n.ty };
+            p.aggs[p.agg_count] = .{ .kind = n.agg, .arg = n.a, .filter = n.c, .distinct = n.distinct, .arg_ty = if (n.a == none) .unknown else context.node(n.a).ty, .ty = n.ty, .variant = variant };
             p.agg_count += 1;
             return p.agg_count - 1;
         }
@@ -6741,7 +7886,7 @@ pub fn Binder(comptime config: types.Config) type {
             switch (context.node(table.a).ty) {
                 .jsonb => {},
                 .unknown, .json, .text, .varchar, .bpchar, .name => table.a = try convert(context, table.a, .jsonb, -1, .explicit),
-                else => return error.TypeMismatch,
+                else => return error.CannotCoerce,
             }
             try typeExpr(context, &inner, table.c);
             try coerce(context, table.c, .jsonpath);
@@ -6804,6 +7949,81 @@ pub fn Binder(comptime config: types.Config) type {
             return id;
         }
 
+        /// JSON_OBJECT / JSON_ARRAY / JSON_SCALAR / JSON_SERIALIZE (wave 4
+        /// text-json): untyped arguments are text; the result is the
+        /// RETURNING type (json, jsonb or a string type; json by default,
+        /// text for JSON_SERIALIZE).
+        fn bindJsonConstructor(context: *const Context, scope: *const Scope, n: *ast.Node) Error!void {
+            if (context.dialect != .postgres) return error.UndefinedFunction;
+            var item = n.b;
+            while (item != none) : (item = context.node(item).next) {
+                try typeExpr(context, scope, item);
+                if (context.node(item).ty == .unknown) try coerce(context, item, .text);
+            }
+            switch (n.cast_type) {
+                .json, .jsonb, .text, .varchar, .bpchar => {},
+                else => return error.CannotCoerce,
+            }
+            if (n.integer & 3 == 3) switch (context.node(n.b).ty) {
+                .json, .jsonb, .text, .varchar, .bpchar => {},
+                else => return error.TypeMismatch,
+            };
+            n.ty = n.cast_type;
+            n.typmod = n.typmod;
+            n.constant = false;
+        }
+
+        /// JSON_EXISTS / JSON_VALUE / JSON_QUERY (wave 4 text-json): the
+        /// context item becomes jsonb (an untyped or string item is parsed,
+        /// json converts), the path jsonpath, PASSING values keep their
+        /// types, DEFAULT expressions convert to the result type. The
+        /// clauses follow the JSON_TABLE column rules.
+        fn bindJsonQueryFunction(context: *const Context, scope: *const Scope, n: *ast.Node) Error!void {
+            if (context.dialect != .postgres) return error.UndefinedFunction;
+            try typeExpr(context, scope, n.a);
+            switch (context.node(n.a).ty) {
+                .jsonb => {},
+                .unknown, .json, .text, .varchar, .bpchar, .name => n.a = try convert(context, n.a, .jsonb, -1, .explicit),
+                else => return error.CannotCoerce,
+            }
+            var entry = n.b;
+            while (entry != none) : (entry = context.node(entry).next) {
+                const passing = context.node(entry);
+                try typeExpr(context, scope, passing.b);
+                if (context.node(passing.b).ty == .unknown) try coerce(context, passing.b, .text);
+                passing.ty = context.node(passing.b).ty;
+            }
+            const column = context.node(n.c);
+            try typeExpr(context, scope, column.a);
+            try coerce(context, column.a, .jsonpath);
+            if (context.node(column.a).ty != .jsonpath and !value.stringType(context.node(column.a).ty)) return error.UndefinedFunction;
+            const spec = ast.JsonTableColumn.decode(column.integer);
+            const B = ast.JsonTableColumn.Behavior;
+            if (spec.kind == .exists) {
+                if (spec.on_empty != .unspecified) return error.Syntax;
+                switch (spec.on_error) {
+                    .unspecified, .error_value, .true_value, .false_value, .unknown => {},
+                    else => return error.Syntax,
+                }
+            } else {
+                for ([_]B{ spec.on_empty, spec.on_error }) |behavior| switch (behavior) {
+                    .unspecified, .null_value, .error_value, .default_value => {},
+                    .empty_array, .empty_object => if (n.integer != 2) return error.Syntax,
+                    else => return error.Syntax,
+                };
+                if (spec.wrapper != .unspecified and spec.wrapper != .without and spec.quotes == .omit) return error.Syntax;
+            }
+            const ty = column.cast_type;
+            const typmod = column.typmod;
+            for ([_]*u16{ &column.b, &column.c }) |slot| if (slot.* != none) {
+                try typeExpr(context, scope, slot.*);
+                slot.* = try convert(context, slot.*, ty, typmod, .assignment);
+            };
+            n.ty = ty;
+            n.typmod = typmod;
+            n.constant = false;
+        }
+
         fn partitionAncestorsName(context: *const Context, name: ast.Ident, schema: ?ast.Ident) bool {
             if (context.dialect != .postgres or !types.same(toName(context, name).slice(), "pg_partition_ancestors")) return false;
             return if (schema) |namespace| types.same(toName(context, namespace).slice(), "pg_catalog") else true;
@@ -6832,7 +8052,52 @@ pub fn Binder(comptime config: types.Config) type {
             try typeExpr(context, scope, call.b);
             const argument = context.node(call.b).ty;
             if (argument == .unknown) return error.AmbiguousFunction;
+            if (multirange_module.isMultirange(argument)) return rangeOfMultirange(argument);
             return types.elementType(argument) orelse error.UndefinedFunction;
+        }
+
+        /// unnest(anyarray, anyarray [, ...]) in FROM (B11 wave 4): one
+        /// element type per argument into `out`; returns the count.
+        fn bindUnnestArguments(context: *const Context, scope: *const Scope, call: *ast.Node, out: []ast.Type) Error!usize {
+            if (call.star or call.distinct or call.c != none or call.order != none or call.b == none) return error.UndefinedFunction;
+            var count: usize = 0;
+            var arg = call.b;
+            while (arg != none) : (arg = context.node(arg).next) {
+                if (count == out.len) return error.ColumnCapacity;
+                try typeExpr(context, scope, arg);
+                const argument = context.node(arg).ty;
+                if (argument == .unknown) return error.AmbiguousFunction;
+                out[count] = if (multirange_module.isMultirange(argument)) rangeOfMultirange(argument) else types.elementType(argument) orelse return error.UndefinedFunction;
+                count += 1;
+            }
+            return count;
+        }
+
+        fn subscriptsName(context: *const Context, name: ast.Ident, schema: ?ast.Ident) bool {
+            if (context.dialect != .postgres or !types.same(toName(context, name).slice(), "generate_subscripts")) return false;
+            return if (schema) |namespace| types.same(toName(context, namespace).slice(), "pg_catalog") else true;
+        }
+
+        /// generate_subscripts(anyarray, int4 [, bool]) -> setof int4.
+        fn bindSubscriptsArguments(context: *const Context, scope: *const Scope, call: *ast.Node) Error!void {
+            if (call.star or call.distinct or call.c != none or call.order != none or call.b == none) return error.UndefinedFunction;
+            var count: usize = 0;
+            var arg = call.b;
+            while (arg != none) : (arg = context.node(arg).next) {
+                try typeExpr(context, scope, arg);
+                count += 1;
+            }
+            if (count != 2 and count != 3) return error.UndefinedFunction;
+            const array_ty = context.node(call.b).ty;
+            if (array_ty == .unknown) return error.TypeMismatch;
+            if (!types.isArray(array_ty)) return error.UndefinedFunction;
+            const dimension = context.node(call.b).next;
+            const reverse = context.node(dimension).next;
+            context.node(dimension).next = none;
+            const converted = try convert(context, dimension, .int4, -1, .implicit);
+            context.node(call.b).next = converted;
+            if (reverse != none) context.node(converted).next = try convert(context, reverse, .boolean, -1, .implicit);
+            call.ty = .int4;
         }
 
         fn replacePartitionAncestorTarget(context: *const Context, expression: u16, function: u16, column: u16) Error!u16 {
@@ -6859,6 +8124,8 @@ pub fn Binder(comptime config: types.Config) type {
             const name = toName(context, item.name);
             var series: Series = .none;
             var ty: ast.Type = .unknown;
+            var unnest_types: [config.columns]ast.Type = undefined;
+            var unnest_count: usize = 1;
             if (!call.name.quoted and types.same(name.slice(), "generate_series")) {
                 if (call.star or call.distinct or call.c != none) return error.UndefinedFunction;
                 var args: [3]u16 = undefined;
@@ -6928,12 +8195,36 @@ pub fn Binder(comptime config: types.Config) type {
                 series = .options_to_table;
                 ty = .text;
             } else if (unnestName(context, item.name, item.schema)) {
-                ty = try bindUnnestArgument(context, &inner, call);
+                unnest_count = try bindUnnestArguments(context, &inner, call, &unnest_types);
+                ty = unnest_types[0];
                 series = .unnest;
+            } else if (subscriptsName(context, item.name, item.schema)) {
+                try bindSubscriptsArguments(context, &inner, call);
+                ty = .int4;
+                series = .subscripts;
+            } else if (item.schema == null and context.dialect == .postgres and ast.setFunction(functionName(context, call))) {
+                // regexp_matches / regexp_split_to_table (wave 4 text-json).
+                if (call.star or call.distinct or call.c != none or call.order != none) return error.UndefinedFunction;
+                call.func = functionName(context, call);
+                var count: usize = 0;
+                var arg = call.b;
+                while (arg != none) : (arg = context.node(arg).next) {
+                    try typeExpr(context, &inner, arg);
+                    count += 1;
+                }
+                if (call.func == .jsonb_path_query) try typeJsonFunction(context, call, count) else try typeRegexFunction(context, call, count);
+                ty = call.ty;
+                series = .set_function;
             } else {
-                try typeExpr(context, &inner, item.function);
+                var from_context = context.*;
+                from_context.table_function = item.function;
+                try typeExpr(&from_context, &inner, item.function);
                 ty = context.node(item.function).ty;
                 if (ty == .unknown) ty = .text;
+                if (call.func == .routine) {
+                    const routine = &context.routines.?.routines[@intCast(call.integer)];
+                    if (routine.retset or routine.out_count != 0 or call.c != none) return bindRoutineFrom(context, id, item, routine, name);
+                }
             }
             const p = &plans.items[id];
             p.function = item.function;
@@ -6946,6 +8237,18 @@ pub fn Binder(comptime config: types.Config) type {
             p.tys[0] = ty;
             p.typmods[0] = -1;
             p.count = 1;
+            if (series == .unnest and unnest_count > 1) {
+                // Several arrays: every column is named unnest.
+                if (unnest_count > p.names.len) return error.ColumnCapacity;
+                p.names[0] = literalName("unnest");
+                for (1..unnest_count) |column| {
+                    p.targets[column] = try context.pool.add(.{ .kind = .null_literal, .ty = unnest_types[column], .constant = true });
+                    p.names[column] = literalName("unnest");
+                    p.tys[column] = unnest_types[column];
+                    p.typmods[column] = -1;
+                }
+                p.count = unnest_count;
+            }
             if (series == .options_to_table) {
                 if (comptime p.names.len < 2) return error.ColumnCapacity;
                 p.names[0] = literalName("option_name");
@@ -6962,6 +8265,38 @@ pub fn Binder(comptime config: types.Config) type {
                 p.names[column] = literalName("ordinality");
                 p.tys[column] = .int8;
                 p.typmods[column] = -1;
+                p.count += 1;
+            }
+            p.width = p.count;
+            return id;
+        }
+
+        /// A user routine's FROM plan (B11 wave 4): its result columns are
+        /// the OUT / TABLE parameters (named after them), else one column
+        /// named after the function (or the table alias); ORDINALITY adds
+        /// a bigint column.
+        fn bindRoutineFrom(context: *const Context, id: u16, item: *const Ast.FromItem, routine: *const RC.Routine, name: V.Name) Error!u16 {
+            const p = &plansOf(context).items[id];
+            p.function = item.function;
+            p.series = .routine;
+            p.ordinality = item.ordinality;
+            const columns: usize = if (routine.out_count != 0) routine.out_count else 1;
+            if (columns + @intFromBool(item.ordinality) > p.names.len) return error.ColumnCapacity;
+            for (0..columns) |column| {
+                const oid = if (routine.out_count != 0) routine.out_oids[column] else routine.return_oid;
+                const ty = types.typeOfData(types.typeFromOid(oid) orelse return error.UnsupportedStatement);
+                p.targets[column] = try context.pool.add(.{ .kind = .null_literal, .ty = ty, .constant = true });
+                p.tys[column] = ty;
+                p.typmods[column] = if (routine.out_count != 0) routine.out_typmods[column] else routine.return_typmod;
+                // One column takes the alias's name, else its parameter's or the function's.
+                p.names[column] = if (columns == 1 and item.alias != null) toName(context, item.alias.?) else if (routine.out_count != 0 and routine.out_names[column].len != 0) routine.out_names[column] else if (columns == 1) name else literalName("column");
+            }
+            p.count = columns;
+            if (item.ordinality) {
+                p.targets[columns] = try context.pool.add(.{ .kind = .null_literal, .ty = .int8, .constant = true });
+                p.names[columns] = literalName("ordinality");
+                p.tys[columns] = .int8;
+                p.typmods[columns] = -1;
                 p.count += 1;
             }
             p.width = p.count;
@@ -7225,14 +8560,35 @@ pub fn Binder(comptime config: types.Config) type {
                     continue;
                 }
                 const call = context.node(target.expr);
-                if (call.kind == .function and unnestName(context, call.name, functionSchema(call))) {
-                    if (p.unnest_column != none or q.lock.strength != .none) return error.UnsupportedStatement;
+                if (call.kind == .function and (unnestName(context, call.name, functionSchema(call)) or subscriptsName(context, call.name, functionSchema(call)))) {
+                    if (q.lock.strength != .none) return error.UnsupportedStatement;
                     scope.windows = false;
-                    const element = try bindUnnestArgument(context, &scope, call);
+                    if (unnestName(context, call.name, functionSchema(call))) {
+                        call.ty = try bindUnnestArgument(context, &scope, call);
+                        call.integer = 0;
+                    } else {
+                        // `integer` 1 marks generate_subscripts for Exec.
+                        try bindSubscriptsArguments(context, &scope, call);
+                        call.integer = 1;
+                    }
                     scope.windows = true;
-                    call.ty = element;
-                    p.unnest_column = @intCast(p.count);
-                } else if (branch) try typeExpr(context, &scope, target.expr) else try valueExpr(context, &scope, target.expr);
+                    if (p.set_call != none) return error.UnsupportedStatement;
+                    if (p.unnest_column == none) p.unnest_column = @intCast(p.count);
+                    p.srf_set.set(p.count);
+                } else {
+                    // One set-returning built-in may sit inside one target
+                    // (wave 4 text-json): exec evaluates the target per value.
+                    var set_calls: u8 = 0;
+                    scope.set_calls = &set_calls;
+                    if (branch) try typeExpr(context, &scope, target.expr) else try valueExpr(context, &scope, target.expr);
+                    scope.set_calls = null;
+                    if (set_calls != 0) {
+                        const found = setCallIn(context, target.expr);
+                        if (set_calls > 1 or found == none or p.unnest_column != none or q.lock.strength != .none) return error.UnsupportedStatement;
+                        p.unnest_column = @intCast(p.count);
+                        p.set_call = found;
+                    }
+                }
                 const name = if (target.alias) |alias| toName(context, alias) else targetName(context, target.expr);
                 try addTarget(context, p, target.expr, name);
             }
@@ -7486,6 +8842,20 @@ pub fn Binder(comptime config: types.Config) type {
                     }
                     win.deferred_arg=try cloneTree(context,n.b);
                     try lowerWindowTree(context,p,input,win.deferred_arg);
+                } else if(win.kind==.aggregate and (n.agg==.array_agg or n.agg==.string_agg)) {
+                    // B11 wave 4: array_agg / string_agg over the frame rows,
+                    // evaluated lazily; every frame uses the bounded resolver.
+                    win.offset_repeatable=repeatableWindowInput(context,n.b) and repeatableWindowInput(context,context.node(n.b).next) and repeatableWindowInput(context,n.c) and repeatableFrameInput(context,spec.start.offset) and repeatableFrameInput(context,spec.end.offset);
+                    win.deferred_arg=try cloneTree(context,n.b);try lowerWindowTree(context,p,input,win.deferred_arg);
+                    if(n.agg==.string_agg) {win.second_arg=try cloneTree(context,context.node(n.b).next);try lowerWindowTree(context,p,input,win.second_arg);}
+                    win.aggregate=.{.kind=n.agg,.arg=none,.filter=none,.distinct=false,.arg_ty=context.node(n.b).ty,.ty=n.ty};
+                    if(n.c!=none) {win.deferred_filter=try cloneTree(context,n.c);try lowerWindowTree(context,p,input,win.deferred_filter);}
+                    switch(win.frame) {
+                        .full=>{win.frame=.rows;win.start=.{.kind=.unbounded_preceding};win.end=.{.kind=.unbounded_following};},
+                        .rows_prefix=>{win.frame=.rows;win.start=.{.kind=.unbounded_preceding};win.end=.{.kind=.current_row};},
+                        .default=>{if(spec.order_count==0){win.frame=.rows;win.end=.{.kind=.unbounded_following};}else win.frame=.range;},
+                        else=>{},
+                    }
                 } else if(win.kind==.aggregate) {
                     win.offset_repeatable=repeatableWindowInput(context,n.b) and repeatableWindowInput(context,n.c) and repeatableFrameInput(context,spec.start.offset) and repeatableFrameInput(context,spec.end.offset);
                     // For a full unsorted partition, input projection evaluates
@@ -7981,7 +9351,7 @@ pub fn Binder(comptime config: types.Config) type {
                     const create = &statement.create_table;
                     const table_name = toName(context, create.name);
                     const postgres_acl = context.dialect == .postgres and context.namespace_create != null;
-                    const namespace = if (postgres_acl)
+                    const namespace = if (postgres_acl or create.schema == null)
                         try specifiedNamespace(context, create.schema)
                     else
                         try qualifierNamespace(context, create.schema);
@@ -8069,13 +9439,28 @@ pub fn Binder(comptime config: types.Config) type {
                     if (create.like) |*like| try bindLike(context, like, &out);
                     if (create.inherits) |parent| {
                         // INHERITS: the parent's columns first (NOT NULL, DEFAULT,
-                        // generation) and its CHECK constraints; a column
-                        // named like a parent column is 42701 (no merging).
+                        // generation) and its CHECK constraints. A column
+                        // named like a parent column merges into it
+                        // (PostgreSQL MergeAttributes, ddl-dml wave 4).
                         const parent_index = try resolveQualified(context, parent.schema, parent.name);
-                        if (context.tables[parent_index].relkind != 'r') return error.WrongObjectType;
+                        const parent_entry = &context.tables[parent_index];
+                        // Not a partitioned table or a partition (42809).
+                        if (parent_entry.relkind != 'r' or parent_entry.partition.bound != .none) return error.WrongObjectType;
+                        var merged: [config.columns]?V.Column = @splat(null);
+                        try mergeInherited(parent_entry, &out, &merged);
                         const like: Ast.Like = .{ .table = parent, .position = 0, .defaults = true, .constraints = true, .generated = true };
                         try bindLike(context, &like, &out);
-                        out.extras.parent = context.tables[parent_index].oid;
+                        for (merged[0..parent_entry.column_count], out.columns[0..parent_entry.column_count]) |local, *column| {
+                            const own = local orelse continue;
+                            column.not_null = column.not_null or own.not_null;
+                            column.primary_key = own.primary_key;
+                            // A local DEFAULT replaces the inherited one.
+                            if (own.default_kind == .default) {
+                                column.default_kind = .default;
+                                column.expression = own.expression;
+                            }
+                        }
+                        out.extras.parent = parent_entry.oid;
                     }
                     try bindTableConstraints(context, create.constraints[0..create.constraint_count], &out, false);
                     for (out.sequences[0..out.sequence_count]) |seq| {
@@ -8084,12 +9469,22 @@ pub fn Binder(comptime config: types.Config) type {
                             return error.InvalidTableDefinition;
                     }
                     if (create.partition_by != .none) {
-                        // Rows live in the partitions: keys and references
-                        // on the partitioned table are outside the subset.
-                        for (out.columns[0..out.count]) |*column| if (column.primary_key) return error.UnsupportedStatement;
-                        for (out.constraints[0..out.constraint_count]) |*constraint| if (constraint.kind != .check) return error.UnsupportedStatement;
                         const wanted = toName(context, create.partition_key);
                         const key = definitionColumn(out.columns[0..out.count], wanted.slice()) orelse return error.ColumnNotFound;
+                        // Rows live in the partitions. A PRIMARY KEY or UNIQUE
+                        // constraint must include the partition key (0A000),
+                        // so each partition's own key enforces it (ddl-dml,
+                        // wave 4); references and exclusions stay outside.
+                        for (out.columns[0..out.count], 0..) |*column, position| if (column.primary_key and position != key) return error.UnsupportedStatement;
+                        for (out.constraints[0..out.constraint_count]) |*constraint| switch (constraint.kind) {
+                            .check => {},
+                            .primary, .unique => {
+                                var covers = false;
+                                for (constraint.keyColumns()) |column| covers = covers or column == key;
+                                if (!covers) return error.UnsupportedStatement;
+                            },
+                            .foreign, .exclusion => return error.UnsupportedStatement,
+                        };
                         switch (out.columns[key].data_type) {
                             .json, .jsonb => return error.UndefinedFunction,
                             else => {},
@@ -8103,8 +9498,8 @@ pub fn Binder(comptime config: types.Config) type {
                 .drop_table => {
                     const drop = statement.drop_table;
                     const wanted = toName(context, drop.name);
-                    const namespace = qualifierNamespace(context, drop.schema) catch |err| {
-                        if (err == error.UndefinedSchema and drop.if_exists) return setBound(bound, .noop, .drop_table);
+                    const namespace = relationPathNamespace(context, drop.schema, drop.name) catch |err| {
+                        if ((err == error.UndefinedSchema or err == error.TableNotFound) and drop.if_exists) return setBound(bound, .noop, .drop_table);
                         return err;
                     };
                     const found = context.catalog.findIn(namespace, wanted.slice(), context.snapshot) orelse {
@@ -8172,8 +9567,8 @@ pub fn Binder(comptime config: types.Config) type {
                     try bindDefaults(context, index, entry, &needed, &out.defaults, &out.generated);
                     try bindChecks(context, index, entry, &out.checks);
                     if (insert.conflict) |*conflict| {
-                        // Arbiters of a partitioned table are outside the subset.
-                        if (entry.relkind == 'p') return error.UnsupportedStatement;
+                        // A partitioned table's arbiter maps to the routed
+                        // partition's key (Database.partitionArbiter).
                         try bindConflict(context, index, entry, insert.alias, conflict, &out.conflict);
                     }
                     if (insert.returning.output and insert.conflict != null) return error.UnsupportedStatement;
@@ -8218,12 +9613,16 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 .update => {
                     const update = &statement.update;
-                    const index = try modifyingTable(context, try resolveQualified(context, update.schema, update.table), false);
+                    const family = context.family_target != null;
+                    const index = try modifyingTable(context, context.family_target orelse try resolveQualified(context, update.schema, update.table), family);
                     const entry = &context.tables[index];
                     var scope = tableScope(context, index);
+                    // A family member keeps the name the statement used.
+                    if (family) scope.rels[0].name = toName(context, update.table);
                     if (update.alias) |alias| scope.rels[0].name = toName(context, alias);
-                    // An inheritance parent's UPDATE would reach its children.
-                    if (!update.only and hasChildren(context, entry.oid)) return error.UnsupportedStatement;
+                    // An inheritance parent's UPDATE reaches its children
+                    // through Database.familyMutation, one member at a time.
+                    if (!family and !update.only and hasChildren(context, entry.oid)) return error.UnsupportedStatement;
                     var out: Update = .{ .table = index, .values = @splat(none), .where = none, .key = none };
                     if (update.from != none) try bindSources(context, update.from, &scope, &out.from, &out.offsets);
                     for (update.assignments[0..update.count]) |*item| {
@@ -8247,20 +9646,22 @@ pub fn Binder(comptime config: types.Config) type {
                     try bindDefaults(context, index, entry, &needed, &out.defaults, &out.generated);
                     try bindChecks(context, index, entry, &out.checks);
                     if (update.returning.output and out.from != none) return error.UnsupportedStatement;
-                    out.returning = try bindReturning(context, index, &update.returning, update.alias, .update);
+                    out.returning = try bindReturning(context, index, &update.returning, if (family) update.alias orelse update.table else update.alias, .update);
                     return setBound(bound, .update, out);
                 },
                 .delete => {
                     const delete = &statement.delete;
-                    const index = try modifyingTable(context, try resolveQualified(context, delete.schema, delete.table), false);
+                    const family = context.family_target != null;
+                    const index = try modifyingTable(context, context.family_target orelse try resolveQualified(context, delete.schema, delete.table), family);
                     var scope = tableScope(context, index);
+                    if (family) scope.rels[0].name = toName(context, delete.table);
                     if (delete.alias) |alias| scope.rels[0].name = toName(context, alias);
-                    if (!delete.only and hasChildren(context, context.tables[index].oid)) return error.UnsupportedStatement;
+                    if (!family and !delete.only and hasChildren(context, context.tables[index].oid)) return error.UnsupportedStatement;
                     var out: Delete = .{ .table = index, .where = none, .key = none };
                     if (delete.using != none) try bindSources(context, delete.using, &scope, &out.using, &out.offsets);
                     out.where = try bindWhere(context, &scope, delete.where);
                     if (delete.returning.output and out.using != none) return error.UnsupportedStatement;
-                    out.returning = try bindReturning(context, index, &delete.returning, delete.alias, .delete);
+                    out.returning = try bindReturning(context, index, &delete.returning, if (family) delete.alias orelse delete.table else delete.alias, .delete);
                     if (out.using == none) out.key = primaryKey(context, &context.tables[index], out.where);
                     return setBound(bound, .delete, out);
                 },
@@ -8291,7 +9692,7 @@ pub fn Binder(comptime config: types.Config) type {
                         if (create.if_not_exists) return setBound(bound, .noop, .create_schema);
                         return error.DuplicateSchema;
                     }
-                    return setBound(bound, .create_schema, name);
+                    return setBound(bound, .create_schema, .{ .name = name, .owner = if (create.owner) |ident| toName(context, ident) else null, .owner_special = create.owner_special });
                 },
                 .drop_schema => {
                     const drop = &statement.drop_schema;
@@ -8592,8 +9993,8 @@ pub fn Binder(comptime config: types.Config) type {
 
         fn bindAlter(context: *const Context, alter: *const Ast.AlterTable) Error!Bound {
             const wanted = toName(context, alter.table.name);
-            const namespace = qualifierNamespace(context, alter.table.schema) catch |err| {
-                if (err == error.UndefinedSchema and alter.if_exists) return .{ .noop = .alter_table };
+            const namespace = relationPathNamespace(context, alter.table.schema, alter.table.name) catch |err| {
+                if ((err == error.UndefinedSchema or err == error.TableNotFound) and alter.if_exists) return .{ .noop = .alter_table };
                 return err;
             };
             const found = context.catalog.findIn(namespace, wanted.slice(), context.snapshot) orelse {
@@ -8601,6 +10002,11 @@ pub fn Binder(comptime config: types.Config) type {
                 return error.TableNotFound;
             };
             const index = found.slot;
+            if (alter.count == 1) switch (alter.actions[0]) {
+                .attach_partition => |*attach| return bindAttach(context, index, attach.table, &attach.bound),
+                .detach_partition => |*detach| return bindDetach(context, index, detach.table),
+                else => {},
+            };
             var only_legacy_options = true;
             var sets_defaults = alter.count != 0;
             var has_legacy_options = false;
@@ -8842,7 +10248,13 @@ pub fn Binder(comptime config: types.Config) type {
                     }
                     out.columns = staged.columns;
                     out.constraints = staged.constraints;
-                    out.check_constraint[out.constraint_count] = true;
+                    // NOT VALID: existing rows are not checked (CHECK and
+                    // FOREIGN KEY only, 0A000 otherwise; ddl-dml, wave 4).
+                    if (definition.not_valid) {
+                        if (definition.kind != .check and definition.kind != .foreign) return error.UnsupportedStatement;
+                        out.constraints[out.constraint_count].not_valid = true;
+                    }
+                    out.check_constraint[out.constraint_count] = !definition.not_valid and !definition.not_enforced;
                     out.constraint_count += 1;
                 },
                 .drop_constraint => |*drop| {
@@ -8886,9 +10298,342 @@ pub fn Binder(comptime config: types.Config) type {
                     }
                     out.name = name;
                 },
+                // Parsed alone (bindAttach / bindDetach above).
+                .attach_partition, .detach_partition => return error.Syntax,
+                // ddl-dml (wave 4): identity and generated columns. A column
+                // of another kind is 55000 (IF EXISTS: nothing to do).
+                .set_generated => |*set| {
+                    const position = alterColumn(&out, toName(context, set.column).slice()) orelse return error.ColumnNotFound;
+                    const column = &out.columns[position];
+                    switch (column.default_kind) {
+                        .identity_always, .identity_by_default => column.default_kind = if (set.always) .identity_always else .identity_by_default,
+                        else => return error.ObjectNotInPrerequisiteState,
+                    }
+                },
+                .drop_identity => |*drop| {
+                    const position = alterColumn(&out, toName(context, drop.column).slice()) orelse return error.ColumnNotFound;
+                    const column = &out.columns[position];
+                    switch (column.default_kind) {
+                        .identity_always, .identity_by_default => {},
+                        else => if (drop.if_exists) continue else return error.ObjectNotInPrerequisiteState,
+                    }
+                    if (out.drop_identity != null or entry.parent != 0 or hasChildren(context, entry.oid)) return error.UnsupportedStatement;
+                    column.default_kind = .none;
+                    out.drop_identity = @intCast(position);
+                },
+                .drop_expression => |*drop| {
+                    const position = alterColumn(&out, toName(context, drop.column).slice()) orelse return error.ColumnNotFound;
+                    const column = &out.columns[position];
+                    if (column.default_kind != .generated) {
+                        if (drop.if_exists) continue;
+                        return error.ObjectNotInPrerequisiteState;
+                    }
+                    // A virtual column has no stored values to keep.
+                    if (column.virtual or entry.parent != 0 or hasChildren(context, entry.oid)) return error.UnsupportedStatement;
+                    column.default_kind = .none;
+                    column.expression = .{};
+                },
+                .restart_identity => |*restart| {
+                    const position = alterColumn(&out, toName(context, restart.column).slice()) orelse return error.ColumnNotFound;
+                    switch (out.columns[position].default_kind) {
+                        .identity_always, .identity_by_default => {},
+                        else => return error.ObjectNotInPrerequisiteState,
+                    }
+                    if (out.restart_identity != null) return error.UnsupportedStatement;
+                    out.restart_identity = @intCast(position);
+                    out.restart_value = restart.value;
+                },
+                .validate_constraint => |ident| {
+                    // ddl-dml (wave 4): 42704 when missing, 42809 for a kind
+                    // other than CHECK / FOREIGN KEY; a validated constraint
+                    // is left alone. A parent's CHECK validates through its
+                    // children in PostgreSQL (outside the subset, 0A000).
+                    const name = toName(context, ident);
+                    var named = false;
+                    for (out.constraints[0..out.constraint_count], 0..) |*constraint, at| {
+                        if (!types.same(constraint.name.slice(), name.slice())) continue;
+                        named = true;
+                        if (constraint.kind != .check and constraint.kind != .foreign) return error.WrongObjectType;
+                        // A NOT ENFORCED constraint cannot be validated (55000).
+                        if (constraint.not_enforced) return error.ObjectNotInPrerequisiteState;
+                        if (!constraint.not_valid) break;
+                        if (constraint.kind == .check and hasChildren(context, entry.oid)) return error.UnsupportedStatement;
+                        constraint.not_valid = false;
+                        out.check_constraint[at] = true;
+                        break;
+                    }
+                    if (!named) {
+                        const pkey = objectName(out.name.slice(), "", "pkey");
+                        if (entry.primary_column != null and types.same(pkey.slice(), name.slice())) return error.WrongObjectType;
+                        return error.UndefinedObject;
+                    }
+                },
+                .alter_enforced => |*alter_enforced| {
+                    // PostgreSQL 18 alters the enforceability of foreign
+                    // keys only (42809); ENFORCED checks the rows (ddl-dml).
+                    const name = toName(context, alter_enforced.name);
+                    var named = false;
+                    for (out.constraints[0..out.constraint_count], 0..) |*constraint, at| {
+                        if (!types.same(constraint.name.slice(), name.slice())) continue;
+                        named = true;
+                        if (constraint.kind != .foreign) return error.WrongObjectType;
+                        if (constraint.not_enforced == !alter_enforced.enforced) break;
+                        constraint.not_enforced = !alter_enforced.enforced;
+                        if (alter_enforced.enforced) {
+                            constraint.not_valid = false;
+                            out.check_constraint[at] = true;
+                        }
+                        break;
+                    }
+                    if (!named) return error.UndefinedObject;
+                },
+                .rename_constraint => |*rename| {
+                    // ddl-dml (wave 4): 42704 when missing, 42710 when the
+                    // table has the new name, 42P07 when an index-backed
+                    // constraint's new name is a relation. Inherited CHECK
+                    // constraints rename through the family in PostgreSQL;
+                    // a parent or child table is outside the subset (0A000).
+                    if (entry.parent != 0 or hasChildren(context, entry.oid)) return error.UnsupportedStatement;
+                    const from = toName(context, rename.from);
+                    const to = toName(context, rename.to);
+                    // The implicit single-column primary key `<table>_pkey`.
+                    var position: ?usize = null;
+                    for (out.constraints[0..out.constraint_count], 0..) |*constraint, at| {
+                        if (types.same(constraint.name.slice(), from.slice())) position = at;
+                    }
+                    if (position == null) {
+                        var primary_column: ?usize = null;
+                        for (out.columns[0..out.count], 0..) |*column, at| if (column.primary_key) {
+                            primary_column = at;
+                        };
+                        const pkey = objectName(out.name.slice(), "", "pkey");
+                        if (primary_column != null and S.primaryConstraint(entry) == null and types.same(pkey.slice(), from.slice())) {
+                            if (out.constraint_count == config.table_constraints) return error.ColumnCapacity;
+                            var constraint: S.Constraint = .{ .kind = .primary, .name = pkey, .column_count = 1 };
+                            constraint.columns[0] = @intCast(primary_column.?);
+                            out.constraints[out.constraint_count] = constraint;
+                            position = out.constraint_count;
+                            out.constraint_count += 1;
+                        }
+                    }
+                    const at = position orelse return error.UndefinedObject;
+                    for (out.constraints[0..out.constraint_count]) |*constraint| {
+                        if (types.same(constraint.name.slice(), to.slice())) return error.DuplicateObject;
+                    }
+                    switch (out.constraints[at].kind) {
+                        .unique, .primary, .exclusion => if (relationNameTaken(context, entry.namespace, to.slice())) return error.TableExists,
+                        else => {},
+                    }
+                    out.constraints[at].name = to;
+                },
             };
             if (has_legacy_options) try checkLegacyAttributeColumns(context, alter, out.columns[0..out.count]);
             return .{ .alter_table = out };
+        }
+
+        /// CREATE TABLE ... INHERITS: local columns named like a parent
+        /// column leave `out` and are returned by the parent position for
+        /// the merge after the parent's columns are laid out. The types
+        /// (and typmods) must match (42804); merging identity or generated
+        /// columns is outside the subset (0A000).
+        fn mergeInherited(parent: *const S.Table, out: *Create, merged: *[config.columns]?V.Column) Error!void {
+            var kept: usize = 0;
+            for (0..out.count) |index| {
+                const column = out.columns[index];
+                if (findColumnIndex(parent, column.name.slice())) |at| {
+                    const inherited = &parent.columns[at];
+                    if (inherited.data_type != column.data_type or inherited.typmod != column.typmod) return error.TypeMismatch;
+                    switch (column.default_kind) {
+                        .none, .default => {},
+                        else => return error.UnsupportedStatement,
+                    }
+                    switch (inherited.default_kind) {
+                        .none, .default => {},
+                        else => return error.UnsupportedStatement,
+                    }
+                    for (out.sequences[0..out.sequence_count]) |seq| if (seq.column == index) return error.UnsupportedStatement;
+                    merged[at] = column;
+                    continue;
+                }
+                for (out.sequences[0..out.sequence_count]) |*seq| if (seq.column == index) {
+                    seq.column = @intCast(kept);
+                };
+                out.columns[kept] = column;
+                kept += 1;
+            }
+            out.count = kept;
+        }
+
+        // ---- ATTACH / DETACH PARTITION (ddl-dml, wave 4) ------------------
+
+        /// ALTER TABLE parent ATTACH PARTITION table bound: `table` becomes
+        /// a partition of `parent` (PostgreSQL ATExecAttachPartition). It
+        /// must be a plain table or a partitioned one, neither inheriting
+        /// nor inherited (42809), with exactly the parent's columns (42804:
+        /// missing or extra columns, another type or typmod, a parent NOT
+        /// NULL column that is nullable, a generated column that is not) in
+        /// the parent's order (0A000 otherwise: rows route by position) and
+        /// every parent CHECK constraint by name and text (42804). The bound
+        /// must not overlap a sibling's (42P17). Rows are checked when the
+        /// statement runs (23514).
+        fn bindAttach(context: *const Context, parent_index: usize, reference: Ast.TableRef, spec: *const Ast.PartitionBound) Error!Bound {
+            const parent = &context.tables[parent_index];
+            if (parent.relkind != 'p') return error.WrongObjectType;
+            const index = try resolveQualified(context, reference.schema, reference.name);
+            const entry = &context.tables[index];
+            if (entry.relkind != 'r' and entry.relkind != 'p') return error.WrongObjectType;
+            // Already a partition, an inheritance child or parent (42809).
+            if (entry.parent != 0 or (entry.relkind == 'r' and hasChildren(context, entry.oid))) return error.WrongObjectType;
+            // A table cannot be its own (or its ancestor's) partition.
+            var ancestor: u32 = parent.oid;
+            for (0..config.tables) |_| {
+                if (ancestor == 0) break;
+                if (ancestor == entry.oid) return error.InvalidObjectDefinition;
+                const above = findTableOid(context, ancestor) orelse break;
+                ancestor = context.tables[above].parent;
+            }
+            for (entry.columns[0..entry.column_count]) |*column| {
+                if (findColumnIndex(parent, column.name.slice()) == null) return error.TypeMismatch;
+            }
+            for (parent.columns[0..parent.column_count], 0..) |*column, position| {
+                const at = findColumnIndex(entry, column.name.slice()) orelse return error.TypeMismatch;
+                const own = &entry.columns[at];
+                if (own.data_type != column.data_type or own.typmod != column.typmod) return error.TypeMismatch;
+                if (column.not_null and !own.not_null) return error.TypeMismatch;
+                if ((column.default_kind == .generated) != (own.default_kind == .generated) or column.virtual != own.virtual) return error.TypeMismatch;
+                if (at != position) return error.UnsupportedStatement;
+            }
+            for (parent.constraints[0..parent.constraint_count]) |*constraint| {
+                if (constraint.kind != .check) continue;
+                var matched = false;
+                for (entry.constraints[0..entry.constraint_count]) |*own| {
+                    if (own.kind == .check and types.same(own.name.slice(), constraint.name.slice()) and
+                        std_eql(own.expression.slice(), constraint.expression.slice())) matched = true;
+                }
+                if (!matched) return error.TypeMismatch;
+            }
+            const bound = try partitionSpec(context, parent, spec);
+            var default_sibling: ?usize = null;
+            var slots: [K.relation_rows]usize = undefined;
+            const count = visibleTables(context, &slots);
+            for (slots[0..count]) |slot| {
+                const sibling = &context.tables[slot];
+                if (sibling.parent != parent.oid) continue;
+                if (S.partitionsOverlap(&sibling.partition, &bound)) return error.InvalidObjectDefinition;
+                if (sibling.partition.bound == .default) default_sibling = slot;
+            }
+            var out = alterOf(context, index, .alter_table);
+            // The parent's PRIMARY KEY / UNIQUE constraints: the partition
+            // keeps an equivalent one or gets a copy checked over its rows.
+            var keys: [config.table_constraints + 1]S.Constraint = undefined;
+            var key_count: usize = 0;
+            for (parent.constraints[0..parent.constraint_count]) |*constraint| {
+                if (constraint.kind != .primary and constraint.kind != .unique) continue;
+                keys[key_count] = constraint.*;
+                key_count += 1;
+            }
+            // A single-column primary key without a constraint entry.
+            if (parent.primary_column) |column| if (S.primaryConstraint(parent) == null) {
+                keys[key_count] = .{ .kind = .primary, .column_count = 1 };
+                keys[key_count].columns[0] = @intCast(column);
+                key_count += 1;
+            };
+            for (keys[0..key_count]) |*constraint| {
+                var present = constraint.column_count == 1 and out.columns[constraint.columns[0]].primary_key;
+                for (out.constraints[0..out.constraint_count]) |*own| {
+                    if ((own.kind == .primary or own.kind == .unique) and own.nulls_not_distinct == constraint.nulls_not_distinct and
+                        std_eql(own.keyColumns(), constraint.keyColumns())) present = true;
+                }
+                if (present) continue;
+                if (out.constraint_count == config.table_constraints) return error.ColumnCapacity;
+                if (constraint.kind == .primary) for (out.constraints[0..out.constraint_count]) |*own| if (own.kind == .primary) return error.InvalidTableDefinition;
+                var copy = constraint.*;
+                copy.oid = 0;
+                if (constraint.kind == .primary) {
+                    copy.name = objectName(out.name.slice(), "", "pkey");
+                    if (copy.column_count == 1) {
+                        for (out.columns[0..out.count]) |*column| if (column.primary_key) return error.InvalidTableDefinition;
+                        out.columns[copy.columns[0]].primary_key = true;
+                    }
+                } else {
+                    var name2: [256]u8 = undefined;
+                    var name2_len: usize = 0;
+                    for (copy.keyColumns(), 0..) |column, position| {
+                        if (position != 0) {
+                            name2[name2_len] = '_';
+                            name2_len += 1;
+                        }
+                        const part = out.columns[column].name.slice();
+                        const take = @min(part.len, name2.len - name2_len);
+                        @memcpy(name2[name2_len..][0..take], part[0..take]);
+                        name2_len += take;
+                    }
+                    copy.name = chooseName(context, entry.namespace, out.name.slice(), name2[0..name2_len], "key", out.constraints[0..out.constraint_count], true);
+                }
+                out.constraints[out.constraint_count] = copy;
+                out.check_constraint[out.constraint_count] = true;
+                out.constraint_count += 1;
+            }
+            // A primary key added to a keyless table is added alone (the
+            // late primary-key rewrite), outside the subset otherwise.
+            if (!S.keyed(entry)) {
+                var added_primary = false;
+                var added: usize = 0;
+                for (out.check_constraint[0..out.constraint_count], out.constraints[0..out.constraint_count]) |flag, *constraint| if (flag) {
+                    added += 1;
+                    added_primary = added_primary or constraint.kind == .primary;
+                };
+                if (added_primary and added != 1) return error.UnsupportedStatement;
+            }
+            out.extras.parent = parent.oid;
+            out.extras.partition.bound = bound.bound;
+            out.extras.partition.count = bound.count;
+            out.extras.partition.unbounded = bound.unbounded;
+            out.extras.partition.values = bound.values;
+            out.partition_parent = parent_index;
+            out.attach = true;
+            out.partition_default = default_sibling;
+            return .{ .alter_table = out };
+        }
+
+        /// ALTER TABLE parent DETACH PARTITION table: the partition becomes
+        /// a standalone table keeping its rows and constraints (42P01 when
+        /// it is not a partition of `parent`).
+        fn bindDetach(context: *const Context, parent_index: usize, reference: Ast.TableRef) Error!Bound {
+            const parent = &context.tables[parent_index];
+            if (parent.relkind != 'p') return error.WrongObjectType;
+            const index = try resolveQualified(context, reference.schema, reference.name);
+            const entry = &context.tables[index];
+            if (entry.parent != parent.oid or entry.partition.bound == .none) return error.TableNotFound;
+            var out = alterOf(context, index, .alter_table);
+            out.extras.parent = 0;
+            out.extras.partition.bound = .none;
+            out.extras.partition.count = 0;
+            out.extras.partition.unbounded = 0;
+            out.extras.partition.values = @splat(.null_value);
+            out.partition_parent = parent_index;
+            return .{ .alter_table = out };
+        }
+
+        fn std_eql(a: []const u8, b: []const u8) bool {
+            if (a.len != b.len) return false;
+            for (a, b) |x, y| if (x != y) return false;
+            return true;
+        }
+
+        fn findColumnIndex(entry: *const S.Table, name: []const u8) ?usize {
+            for (entry.columns[0..entry.column_count], 0..) |*column, position| {
+                if (types.same(column.name.slice(), name)) return position;
+            }
+            return null;
+        }
+
+        /// The visible table slot with `oid`.
+        fn findTableOid(context: *const Context, oid: u32) ?usize {
+            var slots: [K.relation_rows]usize = undefined;
+            const count = visibleTables(context, &slots);
+            for (slots[0..count]) |slot| if (context.tables[slot].oid == oid) return slot;
+            return null;
         }
 
         // ---- table constraints (CREATE TABLE / ALTER TABLE ADD) ----------
@@ -9006,7 +10751,7 @@ pub fn Binder(comptime config: types.Config) type {
                 named_count += 1;
             };
             for (definitions) |*definition| {
-                var entry: S.Constraint = .{ .nulls_not_distinct = definition.nulls_not_distinct, .deferrable = definition.deferrable, .initially_deferred = definition.initially_deferred, .kind = switch (definition.kind) {
+                var entry: S.Constraint = .{ .nulls_not_distinct = definition.nulls_not_distinct, .deferrable = definition.deferrable, .initially_deferred = definition.initially_deferred, .not_enforced = definition.not_enforced, .kind = switch (definition.kind) {
                     .check => .check,
                     .unique => .unique,
                     .primary => .primary,
@@ -9112,7 +10857,8 @@ pub fn Binder(comptime config: types.Config) type {
             entry.on_delete = @enumFromInt(@intFromEnum(definition.on_delete));
             entry.on_update = @enumFromInt(@intFromEnum(definition.on_update));
             const referenced_name = toName(context, definition.ref_table.name);
-            const namespace = try qualifierNamespace(context, definition.ref_table.schema);
+            const namespace = if (definition.ref_table.schema == null and types.same(referenced_name.slice(), out.name.slice()) and
+                context.catalog.findIn(out.namespace, referenced_name.slice(), context.snapshot) == null) out.namespace else try relationPathNamespace(context, definition.ref_table.schema, definition.ref_table.name);
             const self_reference = namespace == out.namespace and types.same(referenced_name.slice(), out.name.slice());
             var parent_columns: []const V.Column = columns;
             var parent: ?*const S.Table = null;
@@ -9183,7 +10929,9 @@ pub fn Binder(comptime config: types.Config) type {
                 const a = types.typeOfData(columns[child].data_type);
                 const b = types.typeOfData(parent_columns[key].data_type);
                 const integral = (a == .int2 or a == .int4 or a == .int8) and (b == .int2 or b == .int4 or b == .int8);
-                if (a != b and !integral) return error.TypeMismatch;
+                // text and varchar share text equality (T201, ddl-dml).
+                const textual = (a == .text or a == .varchar) and (b == .text or b == .varchar);
+                if (a != b and !integral and !textual) return error.TypeMismatch;
             }
         }
 
@@ -9215,7 +10963,7 @@ pub fn Binder(comptime config: types.Config) type {
         /// statement expanded, added by the caller).
         fn bindCreateView(context: *const Context, create: *const Ast.CreateView) Error!Bound {
             const name = toName(context, create.name.name);
-            const namespace = try qualifierNamespace(context, create.name.schema);
+            const namespace = if (create.name.schema == null) try specifiedNamespace(context, null) else try qualifierNamespace(context, create.name.schema);
             if (namespace == catalog.catalog_namespace or namespace == catalog.information_namespace or namespace == catalog.toast_namespace) return error.UnsupportedStatement;
             const tag: types.CommandTag = if (create.materialized) .create_materialized_view else .create_view;
             const existing_view = context.catalog.findIn(namespace, name.slice(), context.snapshot);
@@ -9296,8 +11044,8 @@ pub fn Binder(comptime config: types.Config) type {
         /// DROP VIEW / DROP MATERIALIZED VIEW (42809 for another kind).
         fn bindDropView(context: *const Context, drop: *const Ast.Drop, materialized: bool) Error!Bound {
             const tag: types.CommandTag = if (materialized) .drop_materialized_view else .drop_view;
-            const namespace = qualifierNamespace(context, drop.schema) catch |err| {
-                if (err == error.UndefinedSchema and drop.if_exists) return .{ .noop = tag };
+            const namespace = relationPathNamespace(context, drop.schema, drop.name) catch |err| {
+                if ((err == error.UndefinedSchema or err == error.TableNotFound) and drop.if_exists) return .{ .noop = tag };
                 return err;
             };
             const wanted = toName(context, drop.name);
@@ -9553,21 +11301,38 @@ pub fn Binder(comptime config: types.Config) type {
             const entry = &context.tables[parent_index];
             if (entry.relkind != 'p') return error.WrongObjectType;
             var out: Create = .{ .name = name, .columns = @splat(.{}), .count = 0, .namespace = namespace };
-            const like: Ast.Like = .{ .table = parent, .position = 0, .defaults = true, .constraints = true, .generated = true };
+            // The partition's own PRIMARY KEY / UNIQUE constraints enforce
+            // the partitioned table's (ddl-dml, wave 4).
+            const like: Ast.Like = .{ .table = parent, .position = 0, .defaults = true, .constraints = true, .generated = true, .indexes = true };
             try bindLike(context, &like, &out);
             out.extras.parent = entry.oid;
+            const bound = try partitionSpec(context, entry, &create.bound);
+            var slots: [K.relation_rows]usize = undefined;
+            const count = visibleTables(context, &slots);
+            for (slots[0..count]) |slot| {
+                const sibling = &context.tables[slot];
+                if (sibling.parent != entry.oid) continue;
+                if (S.partitionsOverlap(&sibling.partition, &bound)) return error.InvalidObjectDefinition;
+            }
+            out.extras.partition = bound;
+            return .{ .create_table = out };
+        }
+
+        /// FOR VALUES ... / DEFAULT of a partition of `entry` (CREATE TABLE
+        /// ... PARTITION OF and ATTACH PARTITION).
+        fn partitionSpec(context: *const Context, entry: *const S.Table, spec: *const Ast.PartitionBound) Error!S.Partition {
             const strategy = entry.partition.strategy;
             const key_column = &entry.columns[entry.partition.key];
             var bound: S.Partition = .{};
             const empty: Scope = .{};
-            switch (create.bound.kind) {
+            switch (spec.kind) {
                 .none => return error.Syntax,
                 .default => bound.bound = .default,
                 .range => {
                     if (strategy != .range) return error.InvalidTableDefinition;
                     bound.bound = .range;
                     bound.count = 2;
-                    for (create.bound.values[0..2], 0..) |id, position| {
+                    for (spec.values[0..2], 0..) |id, position| {
                         if (id == none) {
                             bound.unbounded |= @as(u8, 1) << @intCast(position);
                             continue;
@@ -9579,21 +11344,13 @@ pub fn Binder(comptime config: types.Config) type {
                 .list => {
                     if (strategy != .list) return error.InvalidTableDefinition;
                     bound.bound = .list;
-                    for (create.bound.values[0..create.bound.count]) |id| {
+                    for (spec.values[0..spec.count]) |id| {
                         bound.values[bound.count] = try boundValue(context, &empty, id, key_column);
                         bound.count += 1;
                     }
                 },
             }
-            var slots: [K.relation_rows]usize = undefined;
-            const count = visibleTables(context, &slots);
-            for (slots[0..count]) |slot| {
-                const sibling = &context.tables[slot];
-                if (sibling.parent != entry.oid) continue;
-                if (S.partitionsOverlap(&sibling.partition, &bound)) return error.InvalidObjectDefinition;
-            }
-            out.extras.partition = bound;
-            return .{ .create_table = out };
+            return bound;
         }
 
         fn boundValue(context: *const Context, scope: *const Scope, id: u16, column: *const V.Column) Error!V.Cell {
@@ -9633,6 +11390,12 @@ pub fn Binder(comptime config: types.Config) type {
                 return slot;
             }
             const wanted = toName(context, reference.name);
+            if (context.routine_path_known) {
+                const namespace = try relationPathNamespace(context, null, reference.name);
+                const found = context.catalog.findIn(namespace, wanted.slice(), context.snapshot) orelse return error.TableNotFound;
+                if (found.kind != 'r' and found.kind != 'p') return error.WrongObjectType;
+                return found.slot;
+            }
             if (!publicLookup(context, reference.name)) return error.TableNotFound;
             const found = context.catalog.find(wanted.slice(), context.snapshot) orelse return error.TableNotFound;
             if (found.kind != 'r' and found.kind != 'p') return error.WrongObjectType;
@@ -9643,27 +11406,62 @@ pub fn Binder(comptime config: types.Config) type {
         /// listed table (ONLY is not distinguished).
         fn bindTruncate(context: *const Context, truncate: *const Ast.Truncate) Error!Truncate {
             var out: Truncate = .{ .restart_identity = truncate.restart_identity };
-            for (truncate.tables[0..truncate.count]) |reference| {
+            // ONLY names keep their children unless another item names them.
+            var only: [config.tables]bool = @splat(false);
+            for (truncate.tables[0..truncate.count], truncate.only[0..truncate.count]) |reference, only_item| {
                 const index: u8 = @intCast(try resolveRelationTable(context, reference));
-                for (out.tables[0..out.count]) |previous| {
-                    if (previous == index) break;
+                // A partitioned table holds no rows: ONLY is 42809.
+                if (only_item and context.tables[index].relkind == 'p') return error.WrongObjectType;
+                for (out.tables[0..out.count], 0..) |previous, position| {
+                    if (previous == index) {
+                        only[position] = only[position] and only_item;
+                        break;
+                    }
                 } else {
                     out.tables[out.count] = index;
+                    only[out.count] = only_item;
                     out.count += 1;
                 }
             }
             var slots: [K.relation_rows]usize = undefined;
             const count = visibleTables(context, &slots);
             var position: usize = 0;
-            while (position < out.count) : (position += 1) {
+            while (position < out.count) {
+                var next = position + 1;
+                defer position = next;
                 const oid = context.tables[out.tables[position]].oid;
-                for (slots[0..count]) |slot| {
-                    if (context.tables[slot].parent != oid) continue;
+                // CASCADE: every table with a foreign key to a truncated
+                // table (itself, not its children, as PostgreSQL).
+                if (truncate.cascade) for (slots[0..count]) |slot| {
+                    const other = &context.tables[slot];
+                    var references = false;
+                    for (other.constraints[0..other.constraint_count]) |*constraint| references = references or (constraint.kind == .foreign and constraint.ref_oid == oid);
+                    if (!references) continue;
                     for (out.tables[0..out.count]) |previous| {
                         if (previous == slot) break;
                     } else {
                         if (out.count == out.tables.len) return error.TableCapacity;
                         out.tables[out.count] = @intCast(slot);
+                        only[out.count] = true;
+                        out.count += 1;
+                    }
+                };
+                if (only[position]) continue;
+                for (slots[0..count]) |slot| {
+                    if (context.tables[slot].parent != oid) continue;
+                    for (out.tables[0..out.count], 0..) |previous, listed| {
+                        if (previous != slot) continue;
+                        // A child named with ONLY is still reached through
+                        // its parent, with its own children (rescan).
+                        if (only[listed]) {
+                            only[listed] = false;
+                            next = @min(next, listed);
+                        }
+                        break;
+                    } else {
+                        if (out.count == out.tables.len) return error.TableCapacity;
+                        out.tables[out.count] = @intCast(slot);
+                        only[out.count] = false;
                         out.count += 1;
                     }
                 }

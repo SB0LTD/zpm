@@ -33,6 +33,7 @@ const jsonb = @import("jsonb.sig");
 const value_module = @import("value.sig");
 const float_text = @import("float_text.sig");
 const expr_module = @import("expr.sig");
+const regex = @import("regex.sig");
 const Error = types.Error;
 
 pub const none: u16 = 0xffff;
@@ -1203,6 +1204,13 @@ pub fn Engine(comptime config: types.Config) type {
             stopped: bool = false,
             control: ?*types.ExecutionControl = null,
             session: *const value_module.Session,
+            /// keyvalue() ids: the base object (its bytes, container and
+            /// id: 0 the context item, 1 the vars object, then one per
+            /// generated key-value object) and the next generated id.
+            base_bytes: []const u8 = &.{},
+            base_at: usize = 0,
+            base_id: i64 = 0,
+            next_object_id: i64 = 1,
         };
 
         /// Parses and prints `text` (jsonpath_in + jsonpath_out).
@@ -1224,14 +1232,18 @@ pub fn Engine(comptime config: types.Config) type {
         /// Starts an evaluation of `path` over `document` (the jsonb
         /// bytes); `vars` must be a JSONB object (22023).
         pub fn init(ctx: *Context, path: *const P, document: []const u8, vars: ?[]const u8, control: ?*types.ExecutionControl, session: *const value_module.Session) Error!void {
-            return initItem(ctx, path, .{ .bytes = document, .at = 0 }, vars, control, session);
+            try initItem(ctx, path, .{ .bytes = document, .at = 0 }, vars, control, session);
+            // The jsonb_path_* functions' vars are one base object (their
+            // default is '{}').
+            ctx.next_object_id = 2;
         }
 
         /// As init, with an item of another evaluation as `$` (JSON_TABLE
         /// column paths over a row item).
         pub fn initItem(ctx: *Context, path: *const P, root: Item, vars: ?[]const u8, control: ?*types.ExecutionControl, session: *const value_module.Session) Error!void {
             if (vars) |object| if (object[0] != @intFromEnum(Tag.object)) return error.InvalidParameterValue;
-            ctx.* = .{ .path = path, .root = root, .current = root, .vars = vars, .lax = path.lax, .ignore_structural = path.lax, .control = control, .session = session };
+            ctx.* = .{ .path = path, .root = root, .current = root, .vars = vars, .lax = path.lax, .ignore_structural = path.lax, .control = control, .session = session,
+                .base_bytes = root.bytes, .base_at = root.at, .next_object_id = 1 + @as(i64, @intCast(if (vars) |object| jsonb.countAt(object, 0) else 0)) };
         }
 
         /// Runs the whole path; every result item goes to `sink`.
@@ -1314,9 +1326,32 @@ pub fn Engine(comptime config: types.Config) type {
             defer ctx.depth -= 1;
             const node = &ctx.path.nodes[id];
             switch (node.kind) {
-                .root => return next(ctx, node, ctx.root, sink),
+                .root => {
+                    const saved = .{ ctx.base_bytes, ctx.base_at, ctx.base_id };
+                    ctx.base_bytes = ctx.root.bytes;
+                    ctx.base_at = ctx.root.at;
+                    ctx.base_id = 0;
+                    defer {
+                        ctx.base_bytes = saved[0];
+                        ctx.base_at = saved[1];
+                        ctx.base_id = saved[2];
+                    }
+                    return next(ctx, node, ctx.root, sink);
+                },
                 .current => return next(ctx, node, ctx.current, sink),
-                .variable => return next(ctx, node, try variable(ctx, node), sink),
+                .variable => {
+                    const found = try variable(ctx, node);
+                    const saved = .{ ctx.base_bytes, ctx.base_at, ctx.base_id };
+                    ctx.base_bytes = ctx.vars.?;
+                    ctx.base_at = 0;
+                    ctx.base_id = 1;
+                    defer {
+                        ctx.base_bytes = saved[0];
+                        ctx.base_at = saved[1];
+                        ctx.base_id = saved[2];
+                    }
+                    return next(ctx, node, found, sink);
+                },
                 .null_value, .true_value, .false_value, .number, .string, .last => {
                     const at = ctx.scratch.len;
                     defer ctx.scratch.len = at;
@@ -1661,7 +1696,8 @@ pub fn Engine(comptime config: types.Config) type {
                     const value = N.fromInt(size);
                     return next(ctx, node, try numberItem(ctx, &value), sink);
                 },
-                .keyvalue, .datetime, .date, .time, .time_tz, .timestamp, .timestamp_tz => return error.UnsupportedStatement,
+                .datetime, .date, .time, .time_tz, .timestamp, .timestamp_tz => return error.UnsupportedStatement,
+                .keyvalue => if (!(unwrap and tag == .array)) return keyValue(ctx, node, item, sink),
                 else => {},
             }
             if (unwrap and tag == .array) {
@@ -1772,6 +1808,134 @@ pub fn Engine(comptime config: types.Config) type {
             return next(ctx, node, result, sink);
         }
 
+        /// executeKeyValueMethod: one {"id", "key", "value"} object per
+        /// member, in key order; the id is the object's offset in
+        /// PostgreSQL's binary JSONB layout of its base object plus the
+        /// base object's id times 10^10. Each generated object is a new
+        /// base object.
+        fn keyValue(ctx: *Context, node: *const Node, item: Item, sink: *const Sink) Error!bool {
+            if (tagOf(item) != .object) return error.SqlJsonObjectNotFound;
+            if (jsonb.countAt(item.bytes, item.at) == 0) return false;
+            var offset: i64 = 0;
+            if (item.bytes.ptr == ctx.base_bytes.ptr) offset = layoutOffset(item.bytes, ctx.base_at, item.at) orelse 0;
+            const id = offset + ctx.base_id * 10000000000;
+            var found = false;
+            var members = jsonb.Members.init(item.bytes, item.at);
+            while (members.next()) |member| {
+                if (ctx.stopped) break;
+                found = true;
+                const at = ctx.scratch.len;
+                defer ctx.scratch.len = at;
+                const header = try J.beginContainer(&ctx.scratch, true);
+                try J.writeKey(&ctx.scratch, "id");
+                const id_value = N.fromInt(id);
+                try J.writeNumber(&ctx.scratch, &id_value);
+                try J.writeKey(&ctx.scratch, "key");
+                try J.writeString(&ctx.scratch, member.key);
+                try J.writeKey(&ctx.scratch, "value");
+                try ctx.scratch.append(item.bytes[member.value..][0..jsonb.sizeAt(item.bytes, member.value)]);
+                try J.endContainer(&ctx.scratch, header, 3);
+                const generated = scratchItem(ctx, header);
+                const saved = .{ ctx.base_bytes, ctx.base_at, ctx.base_id };
+                ctx.base_bytes = generated.bytes;
+                ctx.base_at = header;
+                ctx.base_id = ctx.next_object_id;
+                ctx.next_object_id += 1;
+                defer {
+                    ctx.base_bytes = saved[0];
+                    ctx.base_at = saved[1];
+                    ctx.base_id = saved[2];
+                }
+                _ = try next(ctx, node, generated, sink);
+            }
+            return found;
+        }
+
+        fn align4(position: usize) usize {
+            return (position + 3) & ~@as(usize, 3);
+        }
+
+        /// The size of a numeric datum in PostgreSQL's JSONB (make_result:
+        /// base-10000 digits without leading or trailing zero digits, the
+        /// short header when dscale and weight allow it).
+        fn numericSize(value: *const numeric.Numeric) usize {
+            var buffer: [numeric.format_bytes]u8 = undefined;
+            const text = N.format(value, &buffer);
+            var start: usize = 0;
+            if (start < text.len and text[start] == '-') start += 1;
+            var point = start;
+            while (point < text.len and text[point] != '.') point += 1;
+            var integer = text[start..point];
+            const fraction = if (point < text.len) text[point + 1 ..] else text[0..0];
+            while (integer.len > 0 and integer[0] == '0') integer = integer[1..];
+            const integer_chunks = (integer.len + 3) / 4;
+            const fraction_chunks = (fraction.len + 3) / 4;
+            // Chunk k (0-based from the left) of the integer part, left-padded.
+            var digits: usize = 0;
+            var first: ?usize = null;
+            var last: usize = 0;
+            for (0..integer_chunks + fraction_chunks) |k| {
+                var zero = true;
+                for (0..4) |d| {
+                    const byte: u8 = if (k < integer_chunks) blk: {
+                        const pad = integer_chunks * 4 - integer.len;
+                        const index = k * 4 + d;
+                        break :blk if (index < pad) '0' else integer[index - pad];
+                    } else blk: {
+                        const index = (k - integer_chunks) * 4 + d;
+                        break :blk if (index < fraction.len) fraction[index] else '0';
+                    };
+                    if (byte != '0') zero = false;
+                }
+                if (!zero) {
+                    if (first == null) first = k;
+                    last = k;
+                }
+            }
+            var weight: i64 = 0;
+            if (first) |leading| {
+                digits = last - leading + 1;
+                weight = @as(i64, @intCast(integer_chunks)) - 1 - @as(i64, @intCast(leading));
+            }
+            const short = fraction.len <= 63 and weight <= 63 and weight >= -64;
+            return (if (short) @as(usize, 6) else 8) + 2 * digits;
+        }
+
+        /// PostgreSQL's binary JSONB layout (convertJsonbValue) of the
+        /// container at `root`: the offset of the container at `target`
+        /// from it, or null.
+        fn layoutOffset(bytes: []const u8, root: usize, target: usize) ?i64 {
+            var position: usize = 4;
+            return layoutWalk(bytes, root, target, &position, align4(4));
+        }
+
+        fn layoutWalk(bytes: []const u8, at: usize, target: usize, position: *usize, base: usize) ?i64 {
+            switch (@as(Tag, @enumFromInt(bytes[at]))) {
+                .object, .array => |tag| {
+                    position.* = align4(position.*);
+                    if (at == target) return @intCast(position.* - base);
+                    const count = jsonb.countAt(bytes, at);
+                    position.* += 4 + 4 * (if (tag == .object) 2 * count else count);
+                    if (tag == .object) {
+                        var keys = jsonb.Members.init(bytes, at);
+                        while (keys.next()) |member| position.* += member.key.len;
+                    }
+                    var members = jsonb.Members.init(bytes, at);
+                    while (members.next()) |member| {
+                        if (layoutWalk(bytes, member.value, target, position, base)) |found| return found;
+                    }
+                },
+                .string => position.* += jsonb.stringAt(bytes, at).len,
+                .number => {
+                    position.* = align4(position.*);
+                    const number = jsonb.numberAt(bytes, at);
+                    position.* += numericSize(&number);
+                },
+                else => {},
+            }
+            return null;
+        }
+
         // ---- predicates -----------------------------------------------------
 
         fn boolean(ctx: *Context, id: u16, item: Item) Error!Tri {
@@ -1798,7 +1962,7 @@ pub fn Engine(comptime config: types.Config) type {
                 },
                 .is_unknown => return if ((try boolean(ctx, node.a, item)) == .unknown) .true_value else .false_value,
                 .eq, .ne, .lt, .le, .gt, .ge, .starts_with => return predicate(ctx, node, item),
-                .like_regex => return error.UnsupportedStatement,
+                .like_regex => return likeRegex(ctx, node, item),
                 .exists => {
                     const at = mark(ctx);
                     defer release(ctx, at);
@@ -1842,6 +2006,47 @@ pub fn Engine(comptime config: types.Config) type {
                         },
                         .false_value => {},
                     }
+                }
+            }
+            if (found) return .true_value;
+            if (failed) return .unknown;
+            return .false_value;
+        }
+
+        /// executeLikeRegex over every left item (lax: the first match is
+        /// true; strict: every item must be a string). Flags as
+        /// jspConvertRegexFlags maps them: i case-insensitive, q literal,
+        /// otherwise `.` stops at newlines unless s, m anchors at them, and
+        /// x is 0A000.
+        fn likeRegex(ctx: *Context, node: *const Node, item: Item) Error!Tri {
+            var flags: regex.Flags = .{ .icase = node.flags & 1 != 0 };
+            if (node.flags & 16 != 0) {
+                flags.quote = true;
+                flags.ere = true;
+                flags.bre = true;
+            } else {
+                if (node.flags & 8 != 0) return error.UnsupportedStatement;
+                flags.nlstop = node.flags & 2 == 0;
+                flags.nlanch = node.flags & 4 != 0;
+            }
+            var matcher: regex.Matcher(config.regex_states, config.text_bytes) = .{};
+            try matcher.compile(ctx.path.bytes(node), flags, config.expr_depth);
+            const at = mark(ctx);
+            defer release(ctx, at);
+            const left = collect(ctx, node.a, item, true) catch |err| return if (suppressible(err)) .unknown else err;
+            var found = false;
+            var failed = false;
+            for (left.start..left.end) |l| {
+                if (ctx.control) |control| try control.checkpoint();
+                const candidate = ctx.items[l];
+                if (tagOf(candidate) != .string) {
+                    if (!ctx.lax) return .unknown;
+                    failed = true;
+                    continue;
+                }
+                if (try matcher.search(stringOf(candidate), ctx.control)) {
+                    if (ctx.lax) return .true_value;
+                    found = true;
                 }
             }
             if (found) return .true_value;

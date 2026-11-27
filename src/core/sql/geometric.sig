@@ -167,9 +167,20 @@ pub fn sameBox(a: Box, b: Box) bool {
     return samePoint(a.high, b.high) and samePoint(a.low, b.low);
 }
 
-/// point_distance (<->).
+/// point_distance (<->): point_dt, pg_hypot's form (B11 wave 4: exact
+/// PostgreSQL digits).
 pub fn distance(a: Point, b: Point) f64 {
-    return @sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y));
+    var x = @abs(a.x - b.x);
+    var y = @abs(a.y - b.y);
+    if (x != x or y != y) return if ((x - x) != (x - x) and x == x) x else if ((y - y) != (y - y) and y == y) y else x + y;
+    if (x < y) {
+        const t = x;
+        x = y;
+        y = t;
+    }
+    if (y == 0.0) return x;
+    const yx = y / x;
+    return x * @sqrt(1.0 + yx * yx);
 }
 
 /// box_contain_pt (@>) / on_pb (<@).
