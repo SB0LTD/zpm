@@ -3763,7 +3763,7 @@ pub fn Parser(comptime config: types.Config) type {
                 // A function call in FROM (B11), implicitly LATERAL, with
                 // optional WITH ORDINALITY.
                 if (self.mode == .standard and !item.only and self.isSymbol(.lparen)) {
-                    item.function = if (item.schema == null and !item.name.quoted and types.keyword(item.name.span.slice(self.source), "json_table")) try self.jsonTable(item.name) else try self.functionCall(item.name);
+                    item.function = if (item.schema == null and !item.name.quoted and types.keyword(item.name.span.slice(self.source), "json_table")) try self.jsonTable(item.name) else if (item.schema == null and !item.name.quoted and types.keyword(item.name.span.slice(self.source), "xmltable")) try self.xmlTable(item.name) else try self.functionCall(item.name);
                     self.pool.complex = true;
                     if (self.isWord("WITH") and wordIs(self.source, try self.peek(), "ordinality")) {
                         try self.advance();
@@ -4202,6 +4202,17 @@ pub fn Parser(comptime config: types.Config) type {
                 }
                 if (self.mode == .standard and (self.rawWord("normalized") or self.rawWord("nfc") or self.rawWord("nfd") or self.rawWord("nfkc") or self.rawWord("nfkd"))) {
                     left = try self.normalizedTail(left, negated);
+                    continue;
+                }
+                if (self.mode == .standard and self.tokens.dialect == .postgres and try self.takeRaw("document")) {
+                    // IS [NOT] DOCUMENT (B11 wave 5 xml lane).
+                    const test_node = try self.pool.add(.{ .kind = .function, .func = .xml_call, .b = left, .integer = @intFromEnum(ast.XmlFn.is_document) });
+                    try self.pool.raise(test_node, left);
+                    left = test_node;
+                    if (negated) {
+                        left = try self.pool.add(.{ .kind = .not_op, .a = test_node });
+                        try self.pool.raise(left, test_node);
+                    }
                     continue;
                 }
                 if (self.mode == .standard and self.tokens.dialect == .postgres and try self.takeRaw("json")) {
@@ -4662,7 +4673,7 @@ pub fn Parser(comptime config: types.Config) type {
                 "array_agg", "string_agg", "json_agg", "jsonb_agg", "json_object_agg", "jsonb_object_agg",
                 "json_agg_strict", "jsonb_agg_strict", "json_object_agg_strict", "jsonb_object_agg_strict", "json_object_agg_unique",
                 "jsonb_object_agg_unique", "json_object_agg_unique_strict", "jsonb_object_agg_unique_strict",
-                "percentile_cont", "percentile_disc", "mode" }) |word| {
+                "percentile_cont", "percentile_disc", "mode", "xmlagg" }) |word| {
                 if (types.keyword(raw, word)) return true;
             }
             return false;
@@ -4873,6 +4884,105 @@ pub fn Parser(comptime config: types.Config) type {
             var item = list.head;
             while (item != none) : (item = self.pool.nodes[item].next) try self.pool.raise(node, item);
             return node;
+        }
+
+        /// [BY {REF | VALUE}] around a PASSING argument (B11 wave 5 xml).
+        fn xmlPassingMechanism(self: *Self) Error!void {
+            if (!try self.takeWord("BY")) return;
+            if (!(try self.takeRaw("ref")) and !(try self.takeRaw("value"))) return error.Syntax;
+        }
+
+        /// XMLTABLE([XMLNAMESPACES(uri AS name | DEFAULT uri, ...),] row
+        /// PASSING [BY ...] document [BY ...] COLUMNS column, ...) in FROM
+        /// (B11 wave 5 xml lane). The row expression and document are
+        /// c_expr (primary); PATH, DEFAULT and namespace URIs b_expr.
+        fn xmlTable(self: *Self, name: ast.Ident) Error!u16 {
+            try self.expectSymbol(.lparen);
+            try self.enter();
+            defer self.leave();
+            var list: ArgList = .{};
+            if (self.rawWord("xmlnamespaces") and lparenNext(try self.peek())) {
+                try self.advance();
+                try self.expectSymbol(.lparen);
+                while (true) {
+                    var entry: ast.Node = .{ .kind = .function, .func = .xmltable_namespace };
+                    if (try self.takeWord("DEFAULT")) {
+                        entry.integer = 1;
+                        entry.b = try self.comparison();
+                    } else {
+                        entry.b = try self.comparison();
+                        try self.expectWord("AS");
+                        entry.name = try self.label();
+                    }
+                    list.push(self.pool, try self.pool.add(entry));
+                    if (!try self.takeSymbol(.comma)) break;
+                }
+                try self.expectSymbol(.rparen);
+                try self.expectSymbol(.comma);
+            }
+            const row = try self.primary();
+            if (!try self.takeRaw("passing")) return error.Syntax;
+            try self.xmlPassingMechanism();
+            const document = try self.primary();
+            try self.xmlPassingMechanism();
+            if (!try self.takeRaw("columns")) return error.Syntax;
+            while (true) {
+                list.push(self.pool, try self.xmlTableColumn());
+                if (!try self.takeSymbol(.comma)) break;
+            }
+            try self.expectSymbol(.rparen);
+            const node = try self.pool.add(.{ .kind = .function, .func = .xmltable, .name = name, .a = document, .c = row, .b = list.head });
+            try self.pool.raise(node, row);
+            try self.pool.raise(node, document);
+            var item = list.head;
+            while (item != none) : (item = self.pool.nodes[item].next) try self.pool.raise(node, item);
+            return node;
+        }
+
+        /// name FOR ORDINALITY | name type [PATH b_expr] [DEFAULT b_expr]
+        /// [NOT NULL | NULL] (any order; a repeated option is 42601).
+        fn xmlTableColumn(self: *Self) Error!u16 {
+            var column: ast.Node = .{ .kind = .function, .func = .xmltable_column, .name = try self.identifier() };
+            var spec: ast.XmlTableColumn = .{};
+            if (try self.takeWord("FOR")) {
+                if (!try self.takeRaw("ordinality")) return error.Syntax;
+                spec.ordinality = true;
+                column.cast_type = .int4;
+                column.integer = spec.encode();
+                return self.pool.add(column);
+            }
+            const type_spec = try self.typeName();
+            column.cast_type = type_spec.ty;
+            column.typmod = type_spec.typmod;
+            var has_path = false;
+            var has_default = false;
+            while (true) {
+                if (try self.takeWord("DEFAULT")) {
+                    if (has_default) return error.Syntax;
+                    has_default = true;
+                    column.b = try self.comparison();
+                } else if (try self.takeWord("NOT")) {
+                    try self.expectWord("NULL");
+                    if (spec.nullability) return error.Syntax;
+                    spec.nullability = true;
+                    spec.not_null = true;
+                } else if (try self.takeWord("NULL")) {
+                    if (spec.nullability) return error.Syntax;
+                    spec.nullability = true;
+                } else if (try self.takeRaw("path")) {
+                    if (has_path) return error.Syntax;
+                    has_path = true;
+                    column.a = try self.comparison();
+                } else if (self.current.kind == .word) {
+                    // An unrecognized column option (42601).
+                    return error.Syntax;
+                } else break;
+            }
+            column.integer = spec.encode();
+            const id = try self.pool.add(column);
+            if (column.a != none) try self.pool.raise(id, column.a);
+            if (column.b != none) try self.pool.raise(id, column.b);
+            return id;
         }
 
         fn jsonPathLiteral(self: *Self) Error!u16 {
@@ -5632,6 +5742,25 @@ pub fn Parser(comptime config: types.Config) type {
                         return self.pool.add(.{ .kind = .cast, .cast_type = target.ty, .typmod = target.typmod, .a = inner });
                     }
                 }
+                // XMLEXISTS(path PASSING [BY {REF|VALUE}] document [BY {REF|VALUE}])
+                // (B11 wave 5 xml lane): xml_call xmlexists(path, document).
+                if (self.mode == .standard and wordIs(self.source, token, "xmlexists") and lparenNext(try self.peek())) {
+                    const name = try self.identifier();
+                    try self.expectSymbol(.lparen);
+                    try self.enter();
+                    defer self.leave();
+                    const path = try self.primary();
+                    if (!try self.takeRaw("passing")) return error.Syntax;
+                    try self.xmlPassingMechanism();
+                    const document = try self.primary();
+                    try self.xmlPassingMechanism();
+                    try self.expectSymbol(.rparen);
+                    self.pool.nodes[path].next = document;
+                    const call = try self.pool.add(.{ .kind = .function, .func = .xml_call, .name = name, .b = path, .integer = @intFromEnum(ast.XmlFn.xmlexists) });
+                    try self.pool.raise(call, path);
+                    try self.pool.raise(call, document);
+                    return call;
+                }
                 // XMLPARSE({DOCUMENT|CONTENT} expr [{PRESERVE|STRIP} WHITESPACE])
                 // and XMLSERIALIZE({DOCUMENT|CONTENT} expr AS type).
                 if (self.mode == .standard and (wordIs(self.source, token, "xmlparse") or wordIs(self.source, token, "xmlserialize")) and lparenNext(try self.peek())) {
@@ -5649,7 +5778,12 @@ pub fn Parser(comptime config: types.Config) type {
                         const target = try self.typeName();
                         call.cast_type = target.ty;
                         call.typmod = target.typmod;
-                        if ((try self.takeRaw("indent")) or (try self.takeRaw("no"))) return error.UnsupportedStatement;
+                        // [NO] INDENT (B11 wave 5 xml lane).
+                        if (try self.takeRaw("indent")) {
+                            call.integer |= 2;
+                        } else if (try self.takeRaw("no")) {
+                            if (!try self.takeRaw("indent")) return error.Syntax;
+                        }
                     } else if ((try self.takeRaw("preserve")) or (try self.takeRaw("strip"))) {
                         if (!try self.takeRaw("whitespace")) return error.Syntax;
                     }

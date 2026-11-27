@@ -133,8 +133,24 @@ pub fn TypesExt(comptime config: types.Config, comptime E: type) type {
                 .boolean => |flag| try out.add(if (flag) "true" else "false"),
                 .bytea => |*bytes| {
                     const data = bytes.slice();
+                    // xmlbinary (B11 wave 5 xml lane): hex, or base64 with
+                    // libxml2's CRLF after every 72 characters.
+                    if (session.xml_binary_hex) {
+                        const digits = "0123456789ABCDEF";
+                        for (data) |byte| {
+                            try out.byte(digits[byte >> 4]);
+                            try out.byte(digits[byte & 15]);
+                        }
+                        return;
+                    }
                     var index: usize = 0;
+                    var line: usize = 0;
                     while (index < data.len) : (index += 3) {
+                        if (line >= 72) {
+                            try out.add(&.{ 13, 10 });
+                            line = 0;
+                        }
+                        line += 4;
                         const rest = data.len - index;
                         const word: u32 = @as(u32, data[index]) << 16 | (if (rest > 1) @as(u32, data[index + 1]) << 8 else 0) | (if (rest > 2) @as(u32, data[index + 2]) else 0);
                         try out.byte(base64_alphabet[word >> 18]);

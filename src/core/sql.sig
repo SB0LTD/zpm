@@ -121,6 +121,7 @@ const ssi_module = @import("sql/ssi.sig");
 const routine_catalog = @import("sql/routine_catalog.sig");
 const routine_module = @import("sql/routine.sig");
 const nested_module = @import("sql/nested.sig");
+const xml_eval_module = @import("sql/xml_eval.sig");
 const CO = @import("sql/catalog_objects.sig");
 const operator_catalog = @import("sql/operator_catalog.sig");
 const index_operator_catalog = @import("sql/index_operator_catalog.sig");
@@ -2132,6 +2133,12 @@ pub fn Database(comptime config: Config) type {
         /// A RETURN QUERY / set-returning SQL body asks the next routine
         /// statement to keep all its rows (consumed by that statement).
         row_staging: ?*RowStaging = null,
+        /// SQL/XML scratch storage (B11 wave 5 xml lane, sql/xml_eval.sig):
+        /// XML trees, XPath expressions and node sets, serialized results
+        /// and table-mapping output, used in stack order within a
+        /// statement (Session.xml_scratch points at xml_region).
+        xml_backing: [xml_eval_module.scratchBytes(config)]u8 align(8) = undefined,
+        xml_region: types.ValueBytes = .{},
         /// Relations whose rule actions are running ((oid << 8) | event):
         /// an action reaching one again is PostgreSQL's infinite recursion
         /// in rules (42P17).
@@ -2611,6 +2618,7 @@ pub fn Database(comptime config: Config) type {
             self.nested_tables = @splat(0);
             self.scan_tables = @splat(0);
             self.row_staging = null;
+            self.xml_region = .{};
             self.routine_definer = null;
             self.routine_configured = 0;
             self.call_returned = .{};
@@ -11387,8 +11395,11 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn statementHooks(self: *Self, slot: u16, snap: Snapshot) void {
-            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .large_object = &largeObjectCall, .large_object_data = &largeObjectDataCall, .large_object_truncate = &truncateLargeObject, .large_object_file = .{ .authorize = &authorizeLargeObjectFile, .call = &largeObjectFileCall }, .relation_name = &relationName, .relation_display_name = &relationDisplayName, .catalog_text = &catalogText, .schema_path = &catalogSchemaPath, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .view_definition = &postgresViewDefinition, .trigger_definition = &postgresTriggerDefinition, .rule_definition = &postgresRuleDefinition, .statistics_columns = &postgresStatisticsColumns, .relation_publishable = &relationPublishable, .partition_key_definition = &postgresPartitionKey, .partition_ancestors = &postgresPartitionAncestors, .namespace_lookup = &postgresNamespaceLookup, .namespace_name = &postgresNamespaceName, .routine_lookup = &postgresRoutineLookup, .routine_name = &postgresRoutineName };
+            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .large_object = &largeObjectCall, .large_object_data = &largeObjectDataCall, .large_object_truncate = &truncateLargeObject, .large_object_file = .{ .authorize = &authorizeLargeObjectFile, .call = &largeObjectFileCall }, .relation_name = &relationName, .relation_display_name = &relationDisplayName, .catalog_text = &catalogText, .schema_path = &catalogSchemaPath, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .view_definition = &postgresViewDefinition, .trigger_definition = &postgresTriggerDefinition, .rule_definition = &postgresRuleDefinition, .statistics_columns = &postgresStatisticsColumns, .relation_publishable = &relationPublishable, .partition_key_definition = &postgresPartitionKey, .partition_ancestors = &postgresPartitionAncestors, .namespace_lookup = &postgresNamespaceLookup, .namespace_name = &postgresNamespaceName, .routine_lookup = &postgresRoutineLookup, .routine_name = &postgresRoutineName, .xml_query = &xmlQuery };
             self.session.sequences = &self.seq_hook;
+            // A statement starts with the whole XML scratch region free.
+            self.xml_region = .{ .bytes = &self.xml_backing };
+            self.session.xml_scratch = &self.xml_region;
             self.seq_slot = slot;
             self.seq_snap = snap;
             self.workspace.query.views = .{ .ptr = self, .rows = &viewRows, .sequence_rows = &sequenceRows };
@@ -12249,7 +12260,7 @@ pub fn Database(comptime config: Config) type {
 
         /// Settings PostgreSQL has that the caller (Store) implements.
         fn callerSetting(name: []const u8) bool {
-            for ([_][]const u8{ "timezone", "datestyle", "intervalstyle", "xmloption", "application_name", "client_encoding", "client_min_messages", "statement_timeout", "lock_timeout", "idle_in_transaction_session_timeout", "transaction_timeout", "deadlock_timeout", "standard_conforming_strings", "server_version", "server_encoding", "integer_datetimes", "extra_float_digits", "default_table_access_method", "default_tablespace" }) |known| {
+            for ([_][]const u8{ "timezone", "datestyle", "intervalstyle", "xmloption", "application_name", "client_encoding", "client_min_messages", "statement_timeout", "lock_timeout", "idle_in_transaction_session_timeout", "transaction_timeout", "deadlock_timeout", "standard_conforming_strings", "server_version", "server_encoding", "integer_datetimes", "extra_float_digits", "default_table_access_method", "default_tablespace", "xmlbinary" }) |known| {
                 if (Sess.sameInsensitive(name, known)) return true;
             }
             return false;
@@ -16575,6 +16586,63 @@ pub fn Database(comptime config: Config) type {
                 }
             }
             try sink.call(sink.ptr, &row);
+        }
+
+        // ---- SQL/XML table mapping queries (B11 wave 5 xml lane) -------------
+
+        /// Session hook xml_query: `text` runs as a nested statement of the
+        /// running one, read-only under its snapshot (SPI_execute with
+        /// read_only, as xml.c's mapping functions use it). A statement
+        /// that is not a query is 22000 (PostgreSQL's "invalid query");
+        /// row locks and data-modifying WITH are 0A000. The sink gets the
+        /// result columns, then every row while its cells are valid.
+        fn xmlQuery(ptr: *anyopaque, text: []const u8, sink: *const value_module.XmlQuerySink) Error!void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            const slot = self.routine_slot;
+            const snap = self.routine_snap;
+            const mark = try self.nestedEnter(slot);
+            defer self.nestedLeave(slot, mark);
+            var parsed = try P.parse(text, &self.workspace.nodes, .standard);
+            switch (parsed) {
+                .select => {
+                    const top = parsed.select;
+                    parsed = .{ .query = top };
+                    self.workspace.nodes.complex = true;
+                },
+                .query => {},
+                else => return error.DataException,
+            }
+            for (self.workspace.nodes.queries[0..self.workspace.nodes.query_len]) |*block| {
+                if (block.lock.strength != .none) return error.UnsupportedStatement;
+            }
+            self.workspace.query.read_stats = .{};
+            try self.session.checkpoint();
+            const source = try expandRelations(self, &self.workspace, text, snap, &parsed, self.session.role, &self.session);
+            var context = self.bindContext(source, .standard, snap);
+            context.stored_source_start = text.len;
+            var bound: B.Bound = undefined;
+            try B.bindInto(&context, &parsed, &bound);
+            const root = switch (bound) {
+                .query => |root| root,
+                else => return error.DataException,
+            };
+            const plans = &self.workspace.plans;
+            if (plans.dml_len != 0) return error.UnsupportedStatement;
+            for (plans.items[0..plans.len]) |*plan| {
+                for (plan.sources[0..plan.source_count]) |*item| if (item.table) |table| try self.lockTable(slot, table, .access_share);
+            }
+            defer {
+                self.workspace.query.pinned_cells = 0;
+                self.workspace.query.pinned_refs = 0;
+            }
+            const work = &self.workspace.query;
+            const list = try X.queryRows(&self.tables, source, &self.workspace.nodes, plans, root, snap, &self.session, work);
+            const plan = &plans.items[root];
+            try sink.columns(sink.context, plan.count, @ptrCast(&plan.names), &plan.tys, &plan.typmods);
+            for (0..list.count) |index| {
+                try self.session.checkpoint();
+                try sink.row(sink.context, @ptrCast(X.rowAt(work, list, index)));
+            }
         }
 
         // ---- nested statements (B11 wave 4, sql/nested.sig) -----------------

@@ -24,6 +24,7 @@ const range_eval = @import("range_eval.sig");
 const network = @import("network.sig");
 const geometric = @import("geometric.sig");
 const xml_module = @import("xml.sig");
+const xml_eval = @import("xml_eval.sig");
 const json_eval = @import("json_eval.sig");
 const regex_eval = @import("regex_eval.sig");
 const regex = @import("regex.sig");
@@ -1721,6 +1722,9 @@ pub fn Eval(comptime config: types.Config) type {
                 .multirange_constructor, .multirange_of, .range_merge, .mr_call => return types_ext_eval.TypesExt(config, @This()).call(ctx, n),
                 .xmlelement, .xmlforest, .xmlconcat, .xmlcomment, .xmlpi, .xmlroot => return types_ext_eval.TypesExt(config, @This()).xmlCall(ctx, n),
                 .xml_name, .xml_attribute => return error.UnsupportedStatement,
+                // SQL/XML XPath, IS DOCUMENT and table mapping (B11 wave 5).
+                .xml_call => return xml_eval.XmlEval(config, @This()).call(ctx, n),
+                .xmltable, .xmltable_namespace, .xmltable_column => return error.UnsupportedStatement,
                 .jsonb_set, .jsonb_set_lax, .jsonb_insert, .jsonb_delete_path, .jsonb_strip_nulls, .jsonb_pretty, .to_json, .to_jsonb, .jsonb_path_exists, .jsonb_path_match, .jsonb_path_query_array, .jsonb_path_query_first, .jsonb_exists_any, .jsonb_exists_all, .jsonb_minus_op, .jsonb_delete_path_op, .jsonb_exists_any_op, .jsonb_exists_all_op, .jsonb_path_exists_op, .jsonb_path_match_op => return json_eval.JsonEval(config, @This()).call(ctx, n),
                 .regexp_match, .regexp_replace, .regexp_split_to_array, .regexp_count, .regexp_instr, .regexp_substr, .substring_regex, .substring_similar => return regex_eval.RegexEval(config, @This()).call(ctx, n),
                 // A set-returning call reads the value exec is expanding.
@@ -1762,7 +1766,8 @@ pub fn Eval(comptime config: types.Config) type {
                 .xmlparse, .xmlserialize, .xml_is_well_formed, .xml_is_well_formed_document, .xml_is_well_formed_content => {
                     const argument = try eval(ctx, n.b);
                     if (argument == .null_value) return .null_value;
-                    const document = n.integer == 1;
+                    // Bit 0: DOCUMENT; bit 1: XMLSERIALIZE ... INDENT.
+                    const document = n.integer & 1 != 0;
                     switch (n.func) {
                         .xmlparse => {
                             const bytes = argument.text.slice();
@@ -1772,9 +1777,12 @@ pub fn Eval(comptime config: types.Config) type {
                         },
                         .xmlserialize => {
                             if (document and !xml_module.validDocument(argument.xml.slice())) return error.NotAnXmlDocument;
+                            if (n.integer & 2 != 0) return cast(try xml_eval.XmlEval(config, @This()).indent(ctx, argument.xml.slice(), document), .text, n.cast_type, n.typmod, ctx.session);
                             return cast(.{ .text = argument.xml }, .text, n.cast_type, n.typmod, ctx.session);
                         },
-                        .xml_is_well_formed, .xml_is_well_formed_content => return .{ .boolean = xml_module.validContent(argument.text.slice()) },
+                        // xml_is_well_formed follows xmloption (B11 wave 5).
+                        .xml_is_well_formed => return .{ .boolean = if (ctx.session.xml_document) xml_module.validDocument(argument.text.slice()) else xml_module.validContent(argument.text.slice()) },
+                        .xml_is_well_formed_content => return .{ .boolean = xml_module.validContent(argument.text.slice()) },
                         else => return .{ .boolean = xml_module.validDocument(argument.text.slice()) },
                     }
                 },
