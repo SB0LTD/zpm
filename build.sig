@@ -261,6 +261,12 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     try wire(ctx, audio_dsp, "sig_mem", "src/core/sig_mem.sig");
     try wire(ctx, audio_dsp, "sig_testing", "src/core/sig_testing.sig");
     const vector_memory = try ctx.addModule("vector_memory", "src/core/vector_memory.sig");
+    const context_projection = try ctx.addModule("context_projection", "src/core/context_projection.sig");
+    try wire(ctx, context_projection, "sig_mem", "src/core/sig_mem.sig");
+    try wire(ctx, context_projection, "sig_testing", "src/core/sig_testing.sig");
+    const context_history = try ctx.addModule("context_history", "src/core/context_history.sig");
+    try wire(ctx, context_history, "context_projection", "src/core/context_projection.sig");
+    try wire(ctx, context_history, "sig_testing", "src/core/sig_testing.sig");
     try wire(ctx, vector_memory, "sig_math", "src/core/sig_math.sig");
     try wire(ctx, vector_memory, "sig_mem", "src/core/sig_mem.sig");
     try wire(ctx, vector_memory, "sig_testing", "src/core/sig_testing.sig");
@@ -303,6 +309,8 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     try wire(ctx, core, "transformer_ops", "src/core/transformer_ops.sig");
     try wire(ctx, core, "audio_dsp", "src/core/audio_dsp.sig");
     try wire(ctx, core, "vector_memory", "src/core/vector_memory.sig");
+    try wire(ctx, core, "context_projection", "src/core/context_projection.sig");
+    try wire(ctx, core, "context_history", "src/core/context_history.sig");
     try wire(ctx, core, "moment_activation", "src/core/moment_activation.sig");
     try wire(ctx, core, "agent_runtime", "src/core/agent_runtime.sig");
     try wire(ctx, core, "cognitive_receipt", "src/core/cognitive_receipt.sig");
@@ -334,6 +342,15 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("math", "src/core/math.sig"),
         importEntry("sig_math", "src/core/sig_math.sig"),
         importEntry("english_phonemes", "src/core/english_phonemes.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-context-projection", "src/core/context_projection.sig", &.{
+        importEntry("sig_mem", "src/core/sig_mem.sig"),
+        importEntry("sig_testing", "src/core/sig_testing.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-context-history", "src/core/context_history.sig", &.{
+        importEntry("context_projection", "src/core/context_projection.sig"),
+        importEntry("sig_mem", "src/core/sig_mem.sig"),
+        importEntry("sig_testing", "src/core/sig_testing.sig"),
     });
     _ = try addTest(ctx, test_all, "test-vector-memory", "src/core/vector_memory.sig", &.{
         importEntry("sig_mem", "src/core/sig_mem.sig"),
