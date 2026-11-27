@@ -741,12 +741,16 @@ fn routineDefaultCheckpoint() !void {
     try routine_default_copy.execute("CREATE TRIGGER image_before BEFORE INSERT ON image_rows FOR EACH ROW EXECUTE FUNCTION image_trigger()", &result);
     try routine_default_copy.execute("CREATE RULE image_keep AS ON DELETE TO image_rows DO INSTEAD NOTHING", &result);
     try routine_default_copy.execute("CREATE PROCEDURE image_proc() LANGUAGE SQL AS 'INSERT INTO image_rows VALUES (1,2)'", &result);
+    try routine_default_copy.execute("CREATE FUNCTION owned_image() RETURNS INT LANGUAGE SQL AS 'SELECT 42'", &result);
+    try routine_default_copy.execute("ALTER FUNCTION owned_image() OWNER TO default_recipient", &result);
     try routine_default_copy.execute("INSERT INTO image_rows VALUES (2,5)", &result);
     var live_image: ImageBuffer = .{};
     try DB.BaseSnapshot.write(&routine_default_copy, &live_image, &wal);
     try expect(std.mem.eql(u8, live_image.bytes[0..8], "RSBASE10"));
     try routine_image_arena.bind(&routine_image_copy);
     try DB.BaseSnapshot.restore(&routine_image_copy, &live_image, routine_default_copy.csn, &wal, &replay_scratch);
+    try routine_image_copy.execute("SELECT pg_get_userbyid(proowner)='default_recipient' FROM pg_proc WHERE proname='owned_image'", &result);
+    try expect(result.rows[0].cells[0].boolean);
     // The selected image is followed by normal routine DDL/ACL WAL. Its
     // preserved OIDs and grant graph must accept replacement and revocation.
     const replacement = try executeWAL(&routine_default_copy, "CREATE OR REPLACE FUNCTION restored_default() RETURNS INT LANGUAGE SQL AS 'SELECT 9'", &wal);

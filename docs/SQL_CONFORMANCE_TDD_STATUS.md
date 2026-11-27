@@ -17,6 +17,28 @@ Orphan-trigger validation, Debug/ReleaseSafe and 4 MiB stack CI, live generation
 publication and stock PG16/18 archives are pending. Unsupported non-routine
 catalog classes still fail before output; this is not full catalog image parity.
 
+The first PG18 run passed live routine checkpoint publication/reopen but exposed
+stock archive failures on ALTER FUNCTION OWNER and pg_get_ruledef. The candidate
+now implements function/procedure owner changes with preserved OIDs and remapped
+grant graphs, typed trigger enable flags, public-qualified trigger callback parsing,
+search-path-aware callback rendering and caller-owned wide definition output.
+Contracts cover owner transfer, delegation/revocation, rollback, read-only rejection,
+long definitions, byte-budget exhaustion and replay. Windows Debug passed 1,075
+routine assertions / 328 records, 2,521 wide-cell assertions and 158 base-image
+assertions on the corrected candidate.
+
+Linux Debug on a 4 MiB stack additionally exposed routine parameter evaluation
+entering the scalar dispatcher's unrelated wide-cell frame. Thin common-value,
+arithmetic and parameter/call dispatch now passes a Windows Debug diagnostic with
+a 4 MiB PE stack reservation (only the diagnostic copy's header was changed).
+Debug PDB frame sizes fell from 416,728 to 24,872 bytes for eval; arithmetic uses
+an 8,392-byte dispatcher and 82,840-byte handler instead of the old 441,552-byte
+binary dispatcher. Routine reads also bypass the 974,792-byte scalar frame.
+Evaluation order, NULL handling and checkpoints are unchanged. Linux CI and final
+ReleaseSafe qualification remain pending with the unchanged 4 MiB gate. The failed native
+and stack evidence remains recorded in RAMSQL CI 46008582900 and ZPM CI
+46008997236. None of this candidate is marked qualified or merged yet.
+
 ## Per-schema routine default privileges — qualified, 27 November 2026
 
 IN SCHEMA now resolves bounded, deduplicated schema lists and stores the namespace

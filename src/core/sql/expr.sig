@@ -380,6 +380,22 @@ pub fn Eval(comptime config: types.Config) type {
             return .{ .text = text };
         }
 
+        /// Definitions usually fit inline. Wider definitions use only the
+        /// caller's value region and retain its ordinary exhaustion semantics.
+        pub fn renderCatalogDefinition(ptr: *anyopaque, definition: *const fn (*anyopaque, u32, bool, []u8) Error!?usize, oid: u32, pretty: bool, values: ?*types.ValueBytes) Error!V.Cell {
+            var buffer: [config.text_bytes]u8 = undefined;
+            const length = (definition(ptr, oid, pretty, &buffer) catch |err| {
+                if (err != error.TextCapacity) return err;
+                const region = values orelse return err;
+                const available = region.available();
+                const used = (definition(ptr, oid, pretty, available) catch |wide_err|
+                    return if (wide_err == error.TextCapacity) error.WorkspaceCapacity else wide_err) orelse return .null_value;
+                region.used += used;
+                return .{ .text = V.Text.fromValueBytes(available[0..used]) };
+            }) orelse return .null_value;
+            return textCell(buffer[0..length]);
+        }
+
         fn digitsCell(value: i64) Error!V.Cell {
             var buffer: [24]u8 = undefined;
             var index: usize = buffer.len;
@@ -652,19 +668,18 @@ pub fn Eval(comptime config: types.Config) type {
                     const length = try definition(hook.ptr, @intCast(first.integer), column, pretty, &buffer) orelse return .null_value;
                     return textCell(buffer[0..length]);
                 },
-                .pg_get_constraintdef, .pg_get_triggerdef, .pg_get_viewdef => {
+                .pg_get_constraintdef, .pg_get_triggerdef, .pg_get_ruledef, .pg_get_viewdef => {
                     const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
                     const definition = (switch (n.func) {
                         .pg_get_triggerdef => hook.trigger_definition,
+                        .pg_get_ruledef => hook.rule_definition,
                         .pg_get_viewdef => hook.view_definition,
                         else => hook.constraint_definition,
                     }) orelse return error.UnsupportedStatement;
                     const second = node(ctx, n.b).next;
                     const pretty = if (second == none) V.Cell{ .boolean = false } else try eval(ctx, second);
                     if (pretty == .null_value) return .null_value;
-                    var buffer: [config.text_bytes]u8 = undefined;
-                    const length = try definition(hook.ptr, @intCast(first.integer), pretty.boolean, &buffer) orelse return .null_value;
-                    return textCell(buffer[0..length]);
+                    return renderCatalogDefinition(hook.ptr, definition, @intCast(first.integer), pretty.boolean, ctx.session.value_bytes);
                 },
                 .pg_get_statisticsobjdef_columns, .pg_get_partkeydef => {
                     const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
@@ -1181,6 +1196,33 @@ pub fn Eval(comptime config: types.Config) type {
 
         // Keep the wide operator and function temporaries out of scalar reads.
         fn evalBinary(ctx: *const Context, n: *const ast.Node, id: u16) Error!V.Cell {
+            return switch (n.op) {
+                .add, .sub, .mul, .div, .mod => evalArithmetic(ctx, n),
+                else => evalBinaryGeneral(ctx, n, id),
+            };
+        }
+
+        fn evalArithmetic(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
+                    // Preserve left-to-right evaluation, including a right
+                    // expression when the left is NULL. Borrow stable row
+                    // columns instead of copying the full tagged payload.
+                    var left_value: V.Cell = undefined;
+                    var right_value: V.Cell = undefined;
+                    const left = try evalRef(ctx, n.a, &left_value);
+                    const right = try evalRef(ctx, n.b, &right_value);
+                    if (left.* == .null_value or right.* == .null_value) return .null_value;
+                    if (left.* == .integer and right.* == .integer and value_module.integral(n.ty))
+                        return .{ .integer = try arithmetic(n.op, n.ty, left.integer, right.integer) };
+                    if (n.ty == .interval and (n.op == .mul or n.op == .div)) {
+                        const span = if (left.* == .interval) left.interval else right.interval;
+                        const factor = if (left.* == .interval) right.float8 else left.float8;
+                        return .{ .interval = if (n.op == .mul) try stats.intervalMultiply(span, factor) else try stats.intervalDivide(span, factor) };
+                    }
+                    return Io.arithmetic(n.op, left, right, n.ty, ctx.session);
+
+        }
+
+        fn evalBinaryGeneral(ctx: *const Context, n: *const ast.Node, id: u16) Error!V.Cell {
             switch (n.op) {
                 .eq, .ne, .lt, .le, .gt, .ge, .is_distinct, .is_not_distinct, .contains, .contained, .exists, .overlap, .over_left, .over_right, .adjacent, .within_eq, .contains_eq, .same, .regex_match, .text_match => return boolCell(try truth(ctx, id)),
                 .distance => {
@@ -1227,24 +1269,7 @@ pub fn Eval(comptime config: types.Config) type {
                     if (left == .null_value or right == .null_value) return .null_value;
                     return .{ .integer = bitwise(n.op, n.ty, left.integer, right.integer) };
                 },
-                .add, .sub, .mul, .div, .mod => {
-                    // Preserve left-to-right evaluation, including a right
-                    // expression when the left is NULL. Borrow stable row
-                    // columns instead of copying the full tagged payload.
-                    var left_value: V.Cell = undefined;
-                    var right_value: V.Cell = undefined;
-                    const left = try evalRef(ctx, n.a, &left_value);
-                    const right = try evalRef(ctx, n.b, &right_value);
-                    if (left.* == .null_value or right.* == .null_value) return .null_value;
-                    if (left.* == .integer and right.* == .integer and value_module.integral(n.ty))
-                        return .{ .integer = try arithmetic(n.op, n.ty, left.integer, right.integer) };
-                    if (n.ty == .interval and (n.op == .mul or n.op == .div)) {
-                        const span = if (left.* == .interval) left.interval else right.interval;
-                        const factor = if (left.* == .interval) right.float8 else left.float8;
-                        return .{ .interval = if (n.op == .mul) try stats.intervalMultiply(span, factor) else try stats.intervalDivide(span, factor) };
-                    }
-                    return Io.arithmetic(n.op, left, right, n.ty, ctx.session);
-                },
+                .add, .sub, .mul, .div, .mod => unreachable,
                 .arrow, .arrow_text => {
                     const left = try eval(ctx, n.a);
                     const right = try eval(ctx, n.b);
@@ -1444,7 +1469,7 @@ pub fn Eval(comptime config: types.Config) type {
                 .lo_truncate, .lo_truncate64, .lo_from_bytea, .lo_get, .lo_create, .lo_creat, .lo_unlink, .lo_import, .lo_export => unreachable,
                 .current_database, .current_schema, .current_schemas, .pg_encoding_to_char, .to_regtype, .to_regclass, .to_regproc, .format_type, .pg_get_expr, .regclass_in, .regtype_in, .regclass_out, .regtype_out,
                 .to_regnamespace, .regnamespace_in, .regnamespace_out,
-                .acldefault, .pg_get_userbyid, .pg_tablespace_location, .pg_table_is_visible, .pg_get_indexdef, .pg_get_constraintdef, .pg_get_triggerdef, .pg_get_viewdef, .pg_get_statisticsobjdef_columns, .pg_relation_is_publishable, .pg_get_partkeydef => return catalogValue(ctx, n),
+                .acldefault, .pg_get_userbyid, .pg_tablespace_location, .pg_table_is_visible, .pg_get_indexdef, .pg_get_constraintdef, .pg_get_triggerdef, .pg_get_ruledef, .pg_get_viewdef, .pg_get_statisticsobjdef_columns, .pg_relation_is_publishable, .pg_get_partkeydef => return catalogValue(ctx, n),
                 .pg_get_function_arguments, .pg_get_function_identity_arguments, .pg_get_function_result, .pg_get_function_sqlbody => return functionCatalogValue(ctx, n),
                 .pg_partition_ancestors, .array_subquery => return error.UnsupportedStatement,
                 .obj_description, .col_description, .shobj_description, .current_user, .session_user => return objectText(ctx, n),
@@ -1616,21 +1641,46 @@ pub fn Eval(comptime config: types.Config) type {
                         return .{ .text = pair };
                     }
                 },
-                .routine => return routineCall(ctx, n),
-                .routine_param => return routineValue(ctx, n),
+                .routine, .routine_param => unreachable,
                 // Exec.collectAggregate / jsonTableRows read their members (B11).
                 .aggregate_input, .json_table, .json_table_passing, .json_table_column => return error.UnsupportedStatement,
                 .none, .mysql_ifnull => unreachable,
             }
         }
 
+        // Thin dispatch keeps common values, arithmetic and routine calls
+        // out of unrelated wide-cell branches, including in Debug builds.
         pub fn eval(ctx: *const Context, id: u16) Error!V.Cell {
             try ctx.session.checkpoint();
             const n = node(ctx, id);
+            return switch (n.kind) {
+                .null_literal => .null_value,
+                .bool_literal => .{ .boolean = n.boolean },
+                .int_literal => .{ .integer = n.integer },
+                .column => columnRef(ctx, n).*,
+                .binary => evalBinary(ctx, n, id),
+                .function => evalCallable(ctx, n),
+                else => evalCompound(ctx, n, id),
+            };
+        }
+
+        fn evalCallable(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
+            switch (n.func) {
+                    // Routine frames already own their parameters/records.
+                    // Keep these reads and calls out of the scalar dispatcher's
+                    // unrelated wide-cell temporaries on a bounded stack.
+                    .routine => return routineCall(ctx, n),
+                    .routine_param => return routineValue(ctx, n),
+                    .lo_import, .lo_export => return evalLargeObjectFile(ctx, n),
+                    .lo_truncate, .lo_truncate64, .lo_from_bytea, .lo_get, .lo_create, .lo_creat, .lo_unlink => return evalLargeObject(ctx, n),
+                    else => return evalFunction(ctx, n),
+
+            }
+        }
+
+        fn evalCompound(ctx: *const Context, n: *const ast.Node, id: u16) Error!V.Cell {
             switch (n.kind) {
-                .null_literal => return .null_value,
-                .bool_literal => return .{ .boolean = n.boolean },
-                .int_literal => return .{ .integer = n.integer },
+                .null_literal, .bool_literal, .int_literal => unreachable,
                 .text_literal => {
                     if(n.ty==.date and n.date_bound) return .{.date=@intCast(n.integer)};
                     const text = literalText(ctx.source, n.text);
@@ -1645,7 +1695,7 @@ pub fn Eval(comptime config: types.Config) type {
                     const number = try Io.parse(.numeric, -1, n.name.span.slice(ctx.source), ctx.session);
                     return if (n.ty == .numeric or n.ty == .unknown) number else Io.cast(number, .numeric, n.ty, -1, ctx.session);
                 },
-                .column => return columnRef(ctx, n).*,
+                .column => unreachable,
                 .catalog_tableoid => return if (columnOwner(ctx, n).tuple[n.relation] != null) .{ .integer = n.integer } else .null_value,
                 .scalar_subquery, .exists_subquery, .in_subquery => {
                     const hook = ctx.hook orelse return error.UnsupportedStatement;
@@ -1663,7 +1713,7 @@ pub fn Eval(comptime config: types.Config) type {
                     if (n.op == .bit_not) return .{ .integer = try checkRange(~value.integer, n.ty) };
                     return Io.negate(&value, n.ty);
                 },
-                .binary => return evalBinary(ctx, n, id),
+                .binary => unreachable,
                 .case_expr => {
                     var operand: V.Cell = .null_value;
                     if (n.a != none) operand = try eval(ctx, n.a);
@@ -1739,11 +1789,7 @@ pub fn Eval(comptime config: types.Config) type {
                     if (value == .null_value or zone == .null_value) return .null_value;
                     return Io.atZone(&value, zone.text.slice(), ctx.session);
                 },
-                .function => switch (n.func) {
-                    .lo_import, .lo_export => return evalLargeObjectFile(ctx, n),
-                    .lo_truncate, .lo_truncate64, .lo_from_bytea, .lo_get, .lo_create, .lo_creat, .lo_unlink => return evalLargeObject(ctx, n),
-                    else => return evalFunction(ctx, n),
-                },
+                .function => unreachable,
                 // $n of an EXECUTEd SQL prepared statement (tx-session lane).
                 .param => {
                     const raw = ctx.session.params orelse return error.UndefinedParameter;

@@ -1157,7 +1157,7 @@ pub const CommandTag = enum { none, select, insert, update, delete, create_table
     create_role, alter_role, drop_role, grant, revoke, grant_role, revoke_role, create_policy, alter_policy, drop_policy, comment,
     alter_default_privileges,
     create_foreign_data_wrapper, drop_foreign_data_wrapper, create_server, drop_server, create_publication, drop_publication, create_extension, explain, create_domain, drop_domain, vacuum, analyze, create_type, drop_type, create_statistics, alter_statistics, drop_statistics, alter_schema, alter_large_object,
-    prepare_transaction, commit_prepared, rollback_prepared };
+    prepare_transaction, commit_prepared, rollback_prepared, alter_function, alter_procedure };
 
 pub fn lower(byte: u8) u8 {
     return if (byte >= 'A' and byte <= 'Z') byte + ('a' - 'A') else byte;
