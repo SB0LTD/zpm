@@ -435,6 +435,8 @@ pub const Stats = struct {
     /// Constants loaded into uniform registers (Ctx.uniformConsts), less
     /// those the allocation had no uniform register for.
     uconsts: u32 = 0,
+    /// Copies whose reads read their source instead (copies).
+    copies: u32 = 0,
 };
 
 /// How `compile` compiles.
@@ -610,6 +612,10 @@ fn compileTextOnce(k: *const kir.Kernel, caps: device.Caps, st: anytype, opts: O
     c.uniformConsts();
     if (opts.schedule) c.schedule();
     c.webs();
+    // (a web whose writes reach no read: dead once split, as a whole
+    // register it was not)
+    c.dce();
+    c.copies();
     try c.liveness();
     c.stageLive();
     try c.allocate();
@@ -3294,6 +3300,88 @@ fn CtxOf(comptime St: type) type {
             }
         }
 
+        /// Copies, once webs split the registers: an unguarded `MOV u, s`
+        /// with u written there alone and read only further down the same
+        /// straight line, and s written at most once and before it, has
+        /// its reads read s and is dead (nothing on that line writes s
+        /// again, and control does not leave it: no earlier s comes round
+        /// a loop). Fewer registers live, never more.
+        fn copies(c: *Ctx) void {
+            const w = c.w;
+            const nv = w.nv;
+            const defs = w.def_count[0..nv];
+            const def_pos = w.def_at[0..nv];
+            @memset(defs, 0);
+            for (w.mi[0..w.n_mi], 0..) |*m, i| {
+                if (m.kind != .inst) continue;
+                for (m.o[0..m.nd]) |o| {
+                    if (o != .reg or o.reg.v == NOV) continue;
+                    const l = w.lead[o.reg.v];
+                    defs[l] +|= 1;
+                    def_pos[l] = @intCast(i);
+                }
+            }
+            var n_copies: u32 = 0;
+            for (0..w.n_mi) |i| {
+                const m = &w.mi[i];
+                if (m.kind != .inst or m.n != 2 or m.nd != 1 or m.guard != .none or !eq(m.op, "MOV")) continue;
+                const d = m.o[0];
+                const s = m.o[1];
+                if (d != .reg or s != .reg or d.reg.v == NOV or s.reg.v == NOV) continue;
+                if (s.reg.neg or s.reg.abs or s.reg.half != 0 or d.reg.half != 0) continue;
+                const u = d.reg.v;
+                if (w.lead[u] != u or w.size[u] != 1 or w.cls[u] != .r or defs[u] != 1) continue;
+                const sl = w.lead[s.reg.v];
+                if (sl == u or w.cls[sl] != .r or defs[sl] > 1) continue;
+                if (defs[sl] == 1 and def_pos[sl] >= i) continue;
+                const out = for (w.outv) |v| {
+                    if (v != NOV and w.lead[v] == u) break true;
+                } else false;
+                if (out or w.uses[u] == 0) continue;
+                // every read of u down the line, none as an address
+                var seen: u32 = 0;
+                var bad = false;
+                var j = i + 1;
+                while (j < w.n_mi and seen < w.uses[u]) : (j += 1) {
+                    const x = &w.mi[j];
+                    if (x.kind == .label) break;
+                    if (x.kind != .inst) continue;
+                    for (x.o[x.nd..x.n]) |o| {
+                        switch (o) {
+                            .reg => |r| if (r.v == u) {
+                                seen += 1;
+                            },
+                            .mem => |mm| if (mm.base == u or (mm.base != NOV and mm.base + 1 == u)) {
+                                bad = true;
+                            },
+                            else => {},
+                        }
+                    }
+                    if (bad or webControl(x)) break;
+                }
+                if (bad or seen != w.uses[u]) continue;
+                const reads = seen;
+                j = i + 1;
+                seen = 0;
+                while (seen < reads) : (j += 1) {
+                    const x = &w.mi[j];
+                    if (x.kind != .inst) continue;
+                    for (x.o[x.nd..x.n]) |*o| {
+                        if (o.* == .reg and o.reg.v == u) {
+                            o.reg.v = s.reg.v;
+                            seen += 1;
+                        }
+                    }
+                }
+                w.uses[s.reg.v] +|= @intCast(reads);
+                w.uses[s.reg.v] -|= 1;
+                w.uses[u] = 0;
+                m.kind = .dead;
+                n_copies += 1;
+            }
+            w.stats.copies = n_copies;
+        }
+
         /// A size-1 general register written 2..WEB_DEFS times, not a pixel
         /// program's output (those stay put to EXIT).
         fn webCandidate(c: *const Ctx, u: u16, defs: u16) bool {
@@ -3765,13 +3853,35 @@ fn CtxOf(comptime St: type) type {
                     } else i += 1;
                 }
                 const sz: u8 = if (w.cls[u] == .p) 1 else w.size[u];
-                const r = findRun(&used, sz) orelse return error.TooManyRegs;
+                // (a copy of a value ending where it starts: its register,
+                // and the MOV is gone)
+                const hint = if (sz == 1) c.copyHint(u) else null;
+                const r = if (hint != null and !bitSet(&used, hint.?)) hint.? else findRun(&used, sz) orelse return error.TooManyRegs;
                 w.phys[u] = r;
                 for (0..sz) |j| setBit(&used, r + @as(u8, @intCast(j)));
                 if (n_active == active.len) return error.TooManyRegs;
                 active[n_active] = u;
                 n_active += 1;
             }
+        }
+
+        /// The register of the value unit `u` starts as a plain copy of (an
+        /// unguarded MOV), when that value is already placed, or null.
+        fn copyHint(c: *const Ctx, u: u16) ?u8 {
+            const w = c.w;
+            const pos = w.first[u];
+            if (pos >= w.n_mi) return null;
+            const m = &w.mi[pos];
+            if (m.kind != .inst or m.n != 2 or m.nd != 1 or m.guard != .none) return null;
+            if (!std.mem.eql(u8, m.op, "MOV")) return null;
+            const d = m.o[0];
+            const s = m.o[1];
+            if (d != .reg or s != .reg or d.reg.v == NOV or s.reg.v == NOV) return null;
+            if (w.lead[d.reg.v] != u or s.reg.neg or s.reg.abs or s.reg.half != 0 or d.reg.half != 0) return null;
+            const sl = w.lead[s.reg.v];
+            if (sl == u or w.cls[sl] != .r or w.spilled[sl]) return null;
+            if (w.first[sl] >= pos) return null;
+            return c.physOf(s.reg.v);
         }
 
         /// The most scratch predicates an instruction needs: its distinct

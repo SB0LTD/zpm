@@ -59,7 +59,7 @@ const D_FMT = 3;
 const D_SWZ = 4;
 const D_MODE = 5;
 const D_LAST = 6;
-const D_LOD = 7; // base level (0..3), last level (4..7), mipmaps (8..9: none, nearest, linear), min LINEAR (10), λ matters (11)
+const D_LOD = 7; // base level (0..3), last level (4..7), mipmaps (8..9: none, nearest, linear), min LINEAR (10), λ matters (11), the base's read (16..20) and λ 0's (24..28): fixedLevel
 const D_MIN_LOD = 8; // f32
 const D_MAX_LOD = 9; // f32
 const D_C = 10; // f32: a λ at or below it magnifies
@@ -181,10 +181,68 @@ pub fn descriptor(s: State, out: *[DESC_WORDS]u32) void {
     out[D_MAX_LOD] = @bitCast(s.max_lod);
     // (GL: 0.5 when magnifying LINEAR and minifying NEAREST_MIPMAP_*)
     out[D_C] = @bitCast(@as(f32, if (s.linear and s.mip != .none and !s.min_linear) 0.5 else 0));
+    out[D_LOD] |= fixedLevel(out, LAM_BASE) << FIX_BASE | fixedLevel(out, 0) << FIX_ZERO;
     for (0..img.levels) |l| out[D_AT + l] = img.level_at[l];
     out[D_LAYERS] = s.layers;
     out[D_IMAGE_LEVELS] = img.levels;
     for (s.border, at) |w, c| out[D_BORDER + @as(u32, c)] = w;
+}
+
+/// λ of a read with no level (the base level's: a vertex shader's).
+const LAM_BASE: f32 = -1e30;
+/// D_LOD's bits of the reads whose λ the program fixes (fixedLevel's):
+/// the base's, and 0's (sample_c_lz, SampleLevel(.., 0)).
+const FIX_BASE = 16;
+const FIX_ZERO = 24;
+
+/// The level a read at λ `lam` takes (bits 0..3) and its filter (bit 4:
+/// LINEAR), as sampleArray works them out from descriptor `d`'s words,
+/// the same operations in f32: once a draw on the CPU for the λ a
+/// program fixes, not in every read of the program.
+fn fixedLevel(d: *const [DESC_WORDS]u32, lam: f32) u32 {
+    const lw = d[D_LOD];
+    const base = lw & 15;
+    const last = (lw >> 4) & 15;
+    const mip = (lw >> 8) & 3;
+    const min_lod: f32 = @bitCast(d[D_MIN_LOD]);
+    const max_lod: f32 = @bitCast(d[D_MAX_LOD]);
+    const c: f32 = @bitCast(d[D_C]);
+    const lam_c = @max(@min(lam, max_lod), min_lod);
+    const mag = lam_c <= c;
+    const linear = if (mag) d[D_MODE] & M_LINEAR != 0 else lw & L_MIN_LINEAR != 0;
+    const nomip = mag or mip == 0;
+    const lam_f = @min(@max(lam_c, 0), 15);
+    const up = @ceil(lam_f + 0.5) - 1;
+    const near_rel: f32 = if (lam_f <= 0.5) 0 else up;
+    const fl = @floor(lam_f);
+    const at = struct {
+        fn f_(b: u32, rel: f32, l: u32) u32 {
+            return @min(b + @as(u32, @intFromFloat(rel)), l);
+        }
+    }.f_;
+    const level = if (nomip) base else if (mip == 2) at(base, fl, last) else at(base, near_rel, last);
+    return level | (if (linear) @as(u32, 16) else 0);
+}
+
+test "fixedLevel: the level and filter sampleArray works out" {
+    var d: [DESC_WORDS]u32 = @splat(0);
+    // (no texture: the base, nearest)
+    try std.testing.expectEqual(@as(u32, 0), fixedLevel(&d, 0));
+    d[D_LOD] = 2 | 9 << 4 | 2 << 8 | L_MIN_LINEAR;
+    d[D_MODE] = M_LINEAR;
+    d[D_MIN_LOD] = @bitCast(@as(f32, -1000));
+    d[D_MAX_LOD] = @bitCast(@as(f32, 1000));
+    // magnified: the base, the magnification filter
+    try std.testing.expectEqual(@as(u32, 2 | 16), fixedLevel(&d, 0));
+    try std.testing.expectEqual(@as(u32, 2 | 16), fixedLevel(&d, LAM_BASE));
+    // a MinLOD of 2.25 (trilinear): minified from level base + 2
+    d[D_MIN_LOD] = @bitCast(@as(f32, 2.25));
+    d[D_MODE] = 0;
+    try std.testing.expectEqual(@as(u32, 4 | 16), fixedLevel(&d, 0));
+    // the nearest level of 2.75 is base + 3, never past the last
+    d[D_LOD] = 2 | 4 << 4 | 1 << 8;
+    d[D_MIN_LOD] = @bitCast(@as(f32, 2.75));
+    try std.testing.expectEqual(@as(u32, 4), fixedLevel(&d, 0));
 }
 
 /// What a sampler returns: floats, or int or uint bits.
@@ -631,6 +689,13 @@ pub fn sampleArray(k: *kir.Kernel, slot: Slot, s: Arg, t: Arg, layer: ?Arg, kind
         const raw = sampleLayerLevel(k, slot, d, base, slice, s, t, k.mov(.pred, u(0)), kind, off);
         return finish(k, d, raw, kind);
     }
+    if (fixedBits(lod)) |sh| {
+        // (λ the program fixes at 0, or the base's: the level and filter
+        // the draw worked out, fixedLevel's)
+        const lv1 = k.op3(.bfe, .u32, r(lw), u(@as(u32, sh)), u(4));
+        const lin1 = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(lw), u(@as(u32, 16) << sh))), u(0));
+        return fixedRead(k, slot, d, lv1, slice, s, t, lin1, kind, off);
+    }
     const last = k.op3(.bfe, .u32, r(lw), u(4), u(4));
     const mip = k.op3(.bfe, .u32, r(lw), u(8), u(2));
     // λ, clamped to the LOD range
@@ -696,15 +761,7 @@ pub fn sampleArray(k: *kir.Kernel, slot: Slot, s: Arg, t: Arg, layer: ?Arg, kind
     // point; then the nearer level below alone is read, not two blended.
     // One read in straight-line code, no loop: a pixel shader's taps (a
     // shadow map's 36) are then issued together, not one round trip each)
-    if (fixedLow(lod)) {
-        const cv = sampleLayerLevel(k, slot, d, level1, slice, s, t, linear, kind, off);
-        if (slot.shadow != null) {
-            const valid = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(d.fmt), u(F_VALID))), u(0));
-            return .{ r(k.sel(.f32, r(valid), cv[0], f(0))), f(0), f(0), f(1) };
-        }
-        if (hwOf(slot, kind) != null or hwCubeOf(slot, kind) != null) return cv;
-        return finish(k, d, cv, kind);
-    }
+    if (fixedLow(lod)) return fixedRead(k, slot, d, level1, slice, s, t, linear, kind, off);
     const lvl = k.reg(.u32);
     k.set(lvl, .mov, r(level1), no, no);
     const wgt = k.reg(.f32);
@@ -741,6 +798,30 @@ pub fn sampleArray(k: *kir.Kernel, slot: Slot, s: Arg, t: Arg, layer: ?Arg, kind
     // an unbound texture's header (0, 0, 0, 1))
     if (hwOf(slot, kind) != null or hwCubeOf(slot, kind) != null) return out;
     return finish(k, d, out, kind);
+}
+
+/// One level's read in straight-line code (a λ the program fixes).
+fn fixedRead(k: *kir.Kernel, slot: Slot, d: D, level: V, slice: ?Arg, s: Arg, t: Arg, linear: V, kind: Kind, off: [2]i32) [4]Arg {
+    const cv = sampleLayerLevel(k, slot, d, level, slice, s, t, linear, kind, off);
+    if (slot.shadow != null) {
+        const valid = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(d.fmt), u(F_VALID))), u(0));
+        return .{ r(k.sel(.f32, r(valid), cv[0], f(0))), f(0), f(0), f(1) };
+    }
+    if (hwOf(slot, kind) != null or hwCubeOf(slot, kind) != null) return cv;
+    return finish(k, d, cv, kind);
+}
+
+/// D_LOD's first bit of the read fixedLevel worked out for `lod`: the
+/// base level's, or a level the program gives as the constant 0.
+fn fixedBits(lod: Lod) ?u5 {
+    return switch (lod) {
+        .base => FIX_BASE,
+        .level => |x| switch (x) {
+            .imm => |bits| if (bits == 0 or bits == 0x8000_0000) FIX_ZERO else null,
+            .reg => null,
+        },
+        .grad => null,
+    };
 }
 
 /// λ known when the program is built, at 0 or below (the base level, or
