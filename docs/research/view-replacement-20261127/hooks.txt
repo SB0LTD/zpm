@@ -1,0 +1,17 @@
+BEGIN
+CREATE SCHEMA
+SET
+CREATE TABLE
+INSERT 0 1
+CREATE VIEW
+CREATE FUNCTION
+CREATE TRIGGER
+CREATE VIEW
+UPDATE 1
+DO
+CREATE RULE
+CREATE VIEW
+DELETE 0
+DO
+{"oracle" : "PostgreSQL 18.3 on x86_64-windows, compiled by msvc-19.44.35222, 64-bit", "base" : 99, "view" : 198, "triggers" : 1, "rules" : 2}
+ROLLBACK

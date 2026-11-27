@@ -19,6 +19,13 @@ the full release matrix, publishing a 29-asset preview (run 46046582945). Those
 results remain evidence for that revision, not qualification of this combined
 candidate. Fresh source/4 MiB and PG16/18 CI is required before merging it.
 
+Native privilege verification found a missing namespace CREATE check: the
+candidate accepted replacement by a public-view owner without schema CREATE.
+The new red regression reproduces it. Replacement now uses the existing namespace
+authorization hook, with a positive owned-private-schema case and unchanged data
+after denial. General schema privilege GRANT/REVOKE remains open; this does not
+claim full namespace ACL support.
+
 ## View replacement — candidate, 27 November 2026
 
 The red contract reproduces 0A000 for CREATE OR REPLACE VIEW. The candidate uses

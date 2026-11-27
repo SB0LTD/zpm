@@ -1534,11 +1534,19 @@ fn viewReplacement() !void {
     try run("RESET ROLE");
     try run("CREATE ROLE view_owner");
     try run("GRANT SELECT ON view_source TO view_owner");
-    try run("ALTER TABLE replace_me OWNER TO view_owner");
+    try run("CREATE SCHEMA \"Owner Views\" AUTHORIZATION view_owner");
+    try run("CREATE VIEW \"Owner Views\".owned AS SELECT id,v FROM public.view_source");
+    try run("ALTER TABLE \"Owner Views\".owned OWNER TO view_owner");
     try run("SET ROLE view_owner");
-    try run("CREATE OR REPLACE VIEW replace_me AS SELECT id,v*2 AS v FROM view_source WHERE v>0");
+    try run("CREATE OR REPLACE VIEW \"Owner Views\".owned AS SELECT id,v*2 AS v FROM public.view_source WHERE v>0");
     try run("RESET ROLE");
-    try expect("SELECT pg_get_userbyid(relowner) FROM pg_class WHERE relname='replace_me'", "view_owner");
+    try expect("SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid='\"Owner Views\".owned'::regclass", "view_owner");
+    try run("CREATE VIEW public_owned AS SELECT id,v FROM view_source");
+    try run("ALTER TABLE public_owned OWNER TO view_owner");
+    try run("SET ROLE view_owner");
+    try rejects("CREATE OR REPLACE VIEW public_owned AS SELECT id,v+20 AS v FROM view_source", error.InsufficientPrivilege, "SELECT id,v FROM public_owned ORDER BY id", "1|7;2|-3");
+    try run("RESET ROLE");
+    try run("DROP VIEW public_owned");
     try run("SET ROLE view_reader");
     try expect("SELECT id,v FROM replace_me", "1|14");
     try run("RESET ROLE");
@@ -1553,6 +1561,7 @@ fn viewReplacement() !void {
     try expect("SELECT \"Quoted ID\",\"Value\" FROM \"View Space\".\"Replacement View\" ORDER BY \"Quoted ID\"", "1|17;2|7");
     try sameState(&.{
         "SELECT 'replace_me'::regclass::oid",
+        "SELECT id,v FROM \"Owner Views\".owned",
         "SELECT id,v FROM replace_child",
         "SELECT \"Quoted ID\",\"Value\" FROM \"View Space\".\"Replacement View\" ORDER BY \"Quoted ID\"",
         "SELECT pg_get_ruledef(oid) FROM pg_rewrite WHERE ev_class='replace_me'::regclass",

@@ -16,6 +16,11 @@ visible to other snapshots until publication. Rollback discards the replacement;
 WAL restores the new definition without a format change. The owner check and
 access-exclusive lock are the same checks used by other definition changes. New
 query dependencies take access-share locks before publication.
+Replacement also checks namespace CREATE authority. Native PostgreSQL rejects a
+view owner who lacks that right. The supported authorization model permits an
+owned private schema and rejects unauthorized public/other schemas; granular
+schema privilege GRANT/REVOKE remains open. The regression retains the old SELECT
+after rejection and checks successful replacement in the owner's private schema.
 Expanded view reads now also retain access-share locks on the view definition;
 locking only their underlying tables previously let replacement bypass readers.
 The expanded-view list is deduplicated before applying its caller-owned budget.

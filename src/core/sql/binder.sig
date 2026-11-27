@@ -10970,6 +10970,10 @@ pub fn Binder(comptime config: types.Config) type {
             if (relationNameTaken(context, namespace, name.slice())) {
                 if (create.if_not_exists) return .{ .noop = tag };
                 if (!create.replace) return error.TableExists;
+                // PostgreSQL also requires CREATE in the target namespace;
+                // owning the existing view alone does not authorize replacement.
+                if (context.dialect == .postgres) if (context.namespace_create) |privilege|
+                    try privilege.check(privilege.ptr, context.session.role, namespace, context.snapshot, true);
                 if (existing_view == null or existing_view.?.kind != 'v') return error.WrongObjectType;
             }
             const plans = context.plans orelse return error.UnsupportedStatement;
