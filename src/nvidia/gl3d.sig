@@ -620,6 +620,23 @@ pub fn ztFormat(sm: gr.Sm, z: Depth) u32 {
         (if (z.stencil_va != null) ZT_S8Z24 | ZT_STENCIL_IS_SEPARATE else ZT_X8Z24);
 }
 
+/// BLACKWELL_B's report in the pipeline (clce97.h, Hopper's methods on):
+/// the payload (lower, upper), the address (lower, upper), then
+/// REPORT_SEMAPHORE_EXECUTE: OPERATION (1:0) RELEASE, PIPELINE_LOCATION
+/// (5:2) ALL, STRUCTURE_SIZE (14:13) four words: the payload and the GPU's
+/// timestamp at +8, written once every draw before it is done, the draws
+/// after it going on meanwhile (no wait for idle: a timestamp query's).
+/// TURING_A has its SET_REPORT_SEMAPHORE_A..D instead.
+pub const REPORT_SEMAPHORE_PAYLOAD_LOWER: u32 = 0x0158;
+pub const REPORT_SEMAPHORE_EXECUTE: u32 = 0x0168;
+pub const REPORT_PIPELINE_ALL: u32 = 0xf << 2;
+pub const REPORT_STRUCTURE_SHIFT = 13;
+
+/// Each draw before it done, `payload` and the time at `va` (16 bytes).
+pub fn stamp(p: *Push, va: u64, payload: u32) void {
+    many(p, REPORT_SEMAPHORE_PAYLOAD_LOWER, &.{ payload, 0, @truncate(va), @truncate(va >> 32), REPORT_PIPELINE_ALL });
+}
+
 fn one(p: *Push, m: u32, v: u32) void {
     p.immediate(SUBCH, m, v);
 }

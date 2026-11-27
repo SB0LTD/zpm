@@ -397,7 +397,7 @@ pub const EmuDevice = struct {
             // (a draw runs its programs in the emulator: a kernel's is
             // loaded again at its next launch)
             e.loaded = null;
-            return g.method(.{ .mem = e.memory(), .work = e.work }, m, v);
+            return g.method(.{ .mem = e.memory(), .work = e.work, .clock_ns = &e.clock_ns }, m, v);
         }
         if (e.subch[subch] != push.computeClass(e.sm) or m / 4 >= METHODS) return error.BadStream;
         e.methods[m / 4] = v;
