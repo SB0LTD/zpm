@@ -15,7 +15,7 @@
 const std = @import("std");
 const sql = @import("sql");
 
-const DB = sql.Database(.{ .tables = 16, .columns = 8, .rows_per_table = 32, .name_bytes = 32, .text_bytes = 96, .nulls_first_ascending = false, .integer_bits = 32, .transactions = 4, .sequences = 4, .expr_nodes = 512, .routines = 24, .triggers = 12, .rules = 8, .routine_depth = 32, .nested_statements = 8, .work_rows = 256, .schemas = 6 });
+const DB = sql.Database(.{ .tables = 16, .columns = 8, .rows_per_table = 32, .name_bytes = 32, .text_bytes = 256, .nulls_first_ascending = false, .integer_bits = 32, .transactions = 4, .sequences = 4, .expr_nodes = 512, .routines = 40, .triggers = 12, .rules = 8, .routine_depth = 32, .nested_statements = 8, .work_rows = 256, .schemas = 6 });
 
 var assertions: usize = 0;
 var db: DB = .{};
@@ -345,9 +345,120 @@ fn assignmentConversion() !void {
     try idle();
 }
 
+// ---- routine context: PG_CONTEXT, PG_EXCEPTION_CONTEXT, PG_ROUTINE_OID ----------
+
+/// PostgreSQL's error-context lines: one per PL/pgSQL body (line N at the
+/// statement), SQL statement run through SPI, query-evaluated or constant
+/// expression, and statement of a SQL function; PG_EXCEPTION_CONTEXT is
+/// the context the caught error had where it was raised.
+fn routineContext() !void {
+    reset();
+    try run("CREATE FUNCTION ctx() RETURNS TEXT LANGUAGE plpgsql AS $$DECLARE c TEXT; BEGIN GET DIAGNOSTICS c = PG_CONTEXT; RETURN c; END$$");
+    try returns("SELECT ctx()", "PL/pgSQL function ctx() line 1 at GET DIAGNOSTICS");
+    try run("CREATE FUNCTION o1() RETURNS TEXT LANGUAGE plpgsql AS $$BEGIN RETURN ctx(); END$$");
+    try returns("SELECT o1()", "PL/pgSQL function ctx() line 1 at GET DIAGNOSTICS\nPL/pgSQL function o1() line 1 at RETURN");
+    try run("CREATE FUNCTION o3() RETURNS TEXT LANGUAGE plpgsql AS $$DECLARE x TEXT; BEGIN SELECT ctx() INTO x; RETURN x; END$$");
+    try returns("SELECT o3()", "PL/pgSQL function ctx() line 1 at GET DIAGNOSTICS\nSQL statement \"SELECT ctx()\"\nPL/pgSQL function o3() line 1 at SQL statement");
+    try run("CREATE FUNCTION o4(a INT, b TEXT) RETURNS TEXT LANGUAGE plpgsql AS $$DECLARE x TEXT;\nBEGIN\n  IF a > 0 THEN\n    x := ctx();\n  END IF;\n  RETURN x;\nEND$$");
+    try returns("SELECT o4(1, 'x')", "PL/pgSQL function ctx() line 1 at GET DIAGNOSTICS\nPL/pgSQL function o4(integer,text) line 4 at assignment");
+    try run("CREATE FUNCTION s2() RETURNS TEXT LANGUAGE SQL AS $$SELECT 1; SELECT ctx()$$");
+    try returns("SELECT s2()", "PL/pgSQL function ctx() line 1 at GET DIAGNOSTICS\nSQL function \"s2\" statement 2");
+    try run("CREATE FUNCTION o5() RETURNS TEXT LANGUAGE plpgsql AS $$DECLARE x TEXT; BEGIN EXECUTE 'SELECT ctx()' INTO x; RETURN x; END$$");
+    try returns("SELECT o5()", "PL/pgSQL function ctx() line 1 at GET DIAGNOSTICS\nSQL statement \"SELECT ctx()\"\nPL/pgSQL function o5() line 1 at EXECUTE");
+    try run("CREATE FUNCTION o6() RETURNS TEXT LANGUAGE plpgsql AS $$DECLARE x TEXT; BEGIN x := (SELECT ctx()); RETURN x; END$$");
+    try returns("SELECT o6()", "PL/pgSQL function ctx() line 1 at GET DIAGNOSTICS\nPL/pgSQL assignment \"x := (SELECT ctx())\"\nPL/pgSQL function o6() line 1 at assignment");
+    try run("CREATE SCHEMA sx");
+    try run("CREATE FUNCTION sx.ctx2(n INT) RETURNS TEXT LANGUAGE plpgsql AS $$DECLARE c TEXT; BEGIN GET DIAGNOSTICS c = PG_CONTEXT; RETURN c; END$$");
+    try returns("SELECT sx.ctx2(1)", "PL/pgSQL function sx.ctx2(integer) line 1 at GET DIAGNOSTICS");
+    // Triggers, DO and procedures.
+    try run("CREATE TABLE t(a INT)");
+    try run("CREATE TABLE log(c TEXT)");
+    try run("CREATE FUNCTION trg() RETURNS TRIGGER LANGUAGE plpgsql AS $$DECLARE c TEXT; BEGIN GET DIAGNOSTICS c = PG_CONTEXT; INSERT INTO log VALUES (c); RETURN NEW; END$$");
+    try run("CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION trg()");
+    try run("INSERT INTO t VALUES (1)");
+    try run("DO $$DECLARE c TEXT; BEGIN GET DIAGNOSTICS c = PG_CONTEXT; INSERT INTO log VALUES (c); END$$");
+    try run("CREATE PROCEDURE p() LANGUAGE plpgsql AS $$DECLARE c TEXT; BEGIN GET DIAGNOSTICS c = PG_CONTEXT; INSERT INTO log VALUES (c); END$$");
+    try completes("CALL p()", .call, 0);
+    try expect("SELECT c FROM log ORDER BY c", "PL/pgSQL function inline_code_block line 1 at GET DIAGNOSTICS;PL/pgSQL function p() line 1 at GET DIAGNOSTICS;PL/pgSQL function trg() line 1 at GET DIAGNOSTICS");
+    try run("DROP TRIGGER tr ON t");
+    // PG_EXCEPTION_CONTEXT: where the caught error was raised.
+    try run("CREATE FUNCTION e1() RETURNS TEXT LANGUAGE plpgsql AS $$DECLARE c TEXT; BEGIN PERFORM 1/0; RETURN 'no'; EXCEPTION WHEN OTHERS THEN GET STACKED DIAGNOSTICS c = PG_EXCEPTION_CONTEXT; RETURN c; END$$");
+    try returns("SELECT e1()", "SQL statement \"SELECT 1/0\"\nPL/pgSQL function e1() line 1 at PERFORM");
+    try run("CREATE FUNCTION e2() RETURNS TEXT LANGUAGE plpgsql AS $$DECLARE c TEXT; x INT; BEGIN x := 1/0; RETURN 'no'; EXCEPTION WHEN OTHERS THEN GET STACKED DIAGNOSTICS c = PG_EXCEPTION_CONTEXT; RETURN c; END$$");
+    try returns("SELECT e2()", "PL/pgSQL assignment \"x := 1/0\"\nPL/pgSQL function e2() line 1 at assignment");
+    try run("CREATE FUNCTION e3() RETURNS TEXT LANGUAGE plpgsql AS $$DECLARE c TEXT; BEGIN RAISE EXCEPTION 'boom'; EXCEPTION WHEN OTHERS THEN GET STACKED DIAGNOSTICS c = PG_EXCEPTION_CONTEXT; RETURN c; END$$");
+    try returns("SELECT e3()", "PL/pgSQL function e3() line 1 at RAISE");
+    try run("CREATE FUNCTION thrower() RETURNS INT LANGUAGE plpgsql AS $$BEGIN RETURN 1/0; END$$");
+    try run("CREATE FUNCTION e4() RETURNS TEXT LANGUAGE plpgsql AS $$DECLARE c TEXT; x INT; BEGIN x := thrower(); RETURN 'no'; EXCEPTION WHEN OTHERS THEN GET STACKED DIAGNOSTICS c = PG_EXCEPTION_CONTEXT; RETURN c; END$$");
+    try returns("SELECT e4()", "PL/pgSQL expression \"1/0\"\nPL/pgSQL function thrower() line 1 at RETURN\nPL/pgSQL function e4() line 1 at assignment");
+    try run("CREATE FUNCTION e6() RETURNS TEXT LANGUAGE plpgsql AS $$DECLARE c TEXT; BEGIN INSERT INTO t VALUES (1/0); RETURN 'no'; EXCEPTION WHEN OTHERS THEN GET STACKED DIAGNOSTICS c = PG_EXCEPTION_CONTEXT; RETURN c; END$$");
+    try returns("SELECT e6()", "SQL statement \"INSERT INTO t VALUES (1/0)\"\nPL/pgSQL function e6() line 1 at SQL statement");
+    try run("CREATE FUNCTION e9() RETURNS TEXT LANGUAGE plpgsql AS $$DECLARE c TEXT;\nBEGIN\n  IF 1/0 = 1 THEN\n    RETURN 'x';\n  END IF;\n  RETURN 'no';\nEXCEPTION WHEN OTHERS THEN\n  GET STACKED DIAGNOSTICS c = PG_EXCEPTION_CONTEXT;\n  RETURN c;\nEND$$");
+    try returns("SELECT e9()", "PL/pgSQL expression \"1/0 = 1\"\nPL/pgSQL function e9() line 3 at IF");
+    try run("CREATE FUNCTION e10(d INT) RETURNS TEXT LANGUAGE plpgsql AS $$DECLARE c TEXT; x INT := 10 / d; BEGIN RETURN 'no'; END$$");
+    try run("CREATE FUNCTION e11() RETURNS TEXT LANGUAGE plpgsql AS $$DECLARE c TEXT; BEGIN PERFORM e10(0); RETURN 'no'; EXCEPTION WHEN OTHERS THEN GET STACKED DIAGNOSTICS c = PG_EXCEPTION_CONTEXT; RETURN c; END$$");
+    try returns("SELECT e11()", "PL/pgSQL function e10(integer) line 1 during statement block local variable initialization\nSQL statement \"SELECT e10(0)\"\nPL/pgSQL function e11() line 1 at PERFORM");
+    try run("CREATE FUNCTION sq(d INT) RETURNS INT LANGUAGE SQL AS $$SELECT 1; SELECT 1/d$$");
+    try run("CREATE FUNCTION e13() RETURNS TEXT LANGUAGE plpgsql AS $$DECLARE c TEXT; x INT; BEGIN x := sq(0); RETURN 'no'; EXCEPTION WHEN OTHERS THEN GET STACKED DIAGNOSTICS c = PG_EXCEPTION_CONTEXT; RETURN c; END$$");
+    try returns("SELECT e13()", "SQL function \"sq\" statement 2\nPL/pgSQL function e13() line 1 at assignment");
+    try run("CREATE PROCEDURE pr(d INT) LANGUAGE SQL AS $$SELECT 1; SELECT 1/d$$");
+    try run("CREATE FUNCTION e18() RETURNS TEXT LANGUAGE plpgsql AS $$DECLARE c TEXT; BEGIN CALL pr(0); RETURN 'no'; EXCEPTION WHEN OTHERS THEN GET STACKED DIAGNOSTICS c = PG_EXCEPTION_CONTEXT; RETURN c; END$$");
+    try returns("SELECT e18()", "SQL function \"pr\" statement 2\nSQL statement \"CALL pr(0)\"\nPL/pgSQL function e18() line 1 at CALL");
+    try run("CREATE FUNCTION trg2() RETURNS TRIGGER LANGUAGE plpgsql AS $$BEGIN NEW.a := NEW.a / 0; RETURN NEW; END$$");
+    try run("CREATE TRIGGER tr2 BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION trg2()");
+    try run("CREATE FUNCTION e14() RETURNS TEXT LANGUAGE plpgsql AS $$DECLARE c TEXT; BEGIN INSERT INTO t VALUES (5); RETURN 'no'; EXCEPTION WHEN OTHERS THEN GET STACKED DIAGNOSTICS c = PG_EXCEPTION_CONTEXT; RETURN c; END$$");
+    try returns("SELECT e14()", "PL/pgSQL function trg2() line 1 at assignment\nSQL statement \"INSERT INTO t VALUES (5)\"\nPL/pgSQL function e14() line 1 at SQL statement");
+    try run("CREATE FUNCTION e16() RETURNS TEXT LANGUAGE plpgsql AS $$DECLARE c TEXT; BEGIN GET STACKED DIAGNOSTICS c = PG_EXCEPTION_CONTEXT; RETURN c; END$$");
+    try fails("SELECT e16()", error.StackedDiagnosticsAccessedWithoutActiveHandler);
+    // A context longer than a text value is 54000 (no truncation).
+    try run("CREATE FUNCTION o7() RETURNS TEXT LANGUAGE plpgsql AS $$DECLARE x TEXT; BEGIN x := (SELECT ctx() WHERE 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' <> ''); RETURN x; END$$");
+    try fails("SELECT o7()", error.TextCapacity);
+    // PG_ROUTINE_OID: the routine's OID, 0 in a DO block.
+    try run("CREATE FUNCTION oid1() RETURNS TEXT LANGUAGE plpgsql AS $$DECLARE o OID; BEGIN GET DIAGNOSTICS o = PG_ROUTINE_OID; RETURN o::regproc::text || ':' || (o = 'oid1'::regproc::oid); END$$");
+    try returns("SELECT oid1()", "oid1:true");
+    try run("DO $$DECLARE o OID; BEGIN GET DIAGNOSTICS o = PG_ROUTINE_OID; INSERT INTO log VALUES (o::text); END$$");
+    try expect("SELECT c FROM log WHERE c = '0'", "0");
+    try sameState(&.{"SELECT c FROM log ORDER BY c"});
+    try idle();
+}
+
+/// pg_proc.proconfig and the SET clauses it lists: custom settings,
+/// FROM CURRENT (the value at CREATE), flattened as PostgreSQL stores them.
+fn routineConfig() !void {
+    reset();
+    try run("CREATE FUNCTION f1() RETURNS INT LANGUAGE SQL SET search_path = public, pg_temp AS $$SELECT 1$$");
+    try run("CREATE FUNCTION f2() RETURNS INT LANGUAGE SQL SET search_path TO \"Odd Schema\",public SET quote_all_identifiers = on AS $$SELECT 1$$");
+    try run("CREATE FUNCTION f3() RETURNS TEXT LANGUAGE SQL SET my.var = 'hello world' SET row_security TO off AS $$SELECT current_setting('my.var')$$");
+    try run("CREATE FUNCTION f4() RETURNS INT LANGUAGE SQL SET default_text_search_config = 'pg_catalog.english' SET check_function_bodies = false AS $$SELECT 1$$");
+    try run("CREATE FUNCTION f6() RETURNS INT LANGUAGE SQL SET QUOTE_ALL_IDENTIFIERS = 1 SET my.n = 5 AS $$SELECT 1$$");
+    try run("CREATE FUNCTION f7() RETURNS INT LANGUAGE SQL SET search_path = '' AS $$SELECT 1$$");
+    try run("CREATE FUNCTION f8() RETURNS INT LANGUAGE SQL SET search_path = 'a b', \"c\"\"d\" AS $$SELECT 1$$");
+    try run("CREATE FUNCTION f9() RETURNS INT LANGUAGE SQL AS $$SELECT 1$$");
+    const probe = "SELECT proname, proconfig FROM pg_proc WHERE oid >= 16384 ORDER BY 1";
+    try expect(probe, "f1|{\"search_path=public, pg_temp\"};f2|{\"search_path=\\\"Odd Schema\\\", public\",quote_all_identifiers=on};f3|{\"my.var=hello world\",row_security=off};f4|{default_text_search_config=pg_catalog.english,check_function_bodies=false};f6|{quote_all_identifiers=1,my.n=5};f7|{\"search_path=\\\"\\\"\"};f8|{\"search_path=\\\"a b\\\", \\\"c\\\"\\\"d\\\"\"};f9|NULL");
+    try returns("SELECT f3()", "hello world");
+    // FROM CURRENT keeps the value the session had at CREATE.
+    try run("CREATE SCHEMA s1");
+    try run("SET search_path = s1, public");
+    try run("CREATE FUNCTION f5() RETURNS TEXT LANGUAGE SQL SET search_path FROM CURRENT AS $$SELECT current_setting('search_path')$$");
+    try run("SET search_path = public");
+    try returns("SELECT s1.f5()", "s1, public");
+    try fails("CREATE FUNCTION fx() RETURNS INT LANGUAGE SQL SET my.x FROM CURRENT AS $$SELECT 1$$", error.UndefinedSetting);
+    try run("SET my.x = 'abc''d'");
+    try run("CREATE FUNCTION f10() RETURNS TEXT LANGUAGE SQL SET my.x FROM CURRENT AS $$SELECT current_setting('my.x')$$");
+    try run("SET my.x = 'other'");
+    try returns("SELECT f10()", "abc'd");
+    try expect("SELECT proconfig FROM pg_proc WHERE oid >= 16384 AND proname = 'f10'", "{my.x=abc'd}");
+    try expect("SELECT proconfig FROM pg_proc WHERE oid >= 16384 AND proname = 'f5'", "{\"search_path=s1, public\"}");
+    try sameState(&.{ probe, "SELECT s1.f5()" });
+    try idle();
+}
+
 pub fn main() !void {
     try schemaStatements();
     try dynamicStatements();
     try assignmentConversion();
+    try routineContext();
+    try routineConfig();
     std.debug.print("routines-trig: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });
 }

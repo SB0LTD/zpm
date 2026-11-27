@@ -2135,6 +2135,17 @@ pub fn Database(comptime config: Config) type {
         /// CheckTableNotInUse.
         use_tables: [(config.tables + 63) / 64]u64 = @splat(0),
         nested_use: [(config.tables + 63) / 64]u64 = @splat(0),
+        /// The routine error context (B11 wave 5): one item per PL/pgSQL
+        /// body, SPI statement, query-evaluated expression and SQL function
+        /// statement running now, and the context the last error had where
+        /// it was raised (PG_EXCEPTION_CONTEXT).
+        context_items: [context_capacity]R.ContextItem = undefined,
+        context_len: usize = 0,
+        context_captured: bool = false,
+        context_error: Error = error.RaiseException,
+        context_overflow: bool = false,
+        context_bytes: [config.text_bytes]u8 = undefined,
+        context_bytes_len: usize = 0,
         routine_volatility: u8 = 0,
         /// PostgreSQL's errdetail of the last view error (lastErrorDetail).
         error_detail: []const u8 = "",
@@ -2627,6 +2638,8 @@ pub fn Database(comptime config: Config) type {
             self.scan_tables = @splat(0);
             self.use_tables = @splat(0);
             self.nested_use = @splat(0);
+            self.context_len = 0;
+            self.context_captured = false;
             self.row_staging = null;
             self.xml_region = .{};
             self.routine_definer = null;
@@ -11438,6 +11451,8 @@ pub fn Database(comptime config: Config) type {
             self.scan_tables = @splat(0);
             self.use_tables = @splat(0);
             self.nested_use = @splat(0);
+            self.context_len = 0;
+            self.context_captured = false;
             self.installRole();
         }
 
@@ -13430,7 +13445,16 @@ pub fn Database(comptime config: Config) type {
             @memcpy(buffer[0..prefix.len], prefix);
             @memcpy(buffer[prefix.len..][0..expression.len], expression);
             var capture: R.Capture = .{};
-            _ = try self.routineStatement(frame, buffer[0 .. prefix.len + expression.len], &capture);
+            {
+                // 'PL/pgSQL expression "..."' (or assignment) in the context.
+                const plpgsql = self.contextBody();
+                if (plpgsql) |item| try self.routineContextEnter(.{ .kind = .expression, .current = item.current, .source = item.source });
+                defer if (plpgsql != null) self.routineContextLeave();
+                _ = self.routineStatement(frame, buffer[0 .. prefix.len + expression.len], &capture) catch |err| {
+                    if (plpgsql != null) self.routineContextCapture(err);
+                    return err;
+                };
+            }
             if (capture.count != 1) return error.Syntax;
             var cell: V.Cell = if (capture.rows == 0) .null_value else capture.cells[0];
             if (ty) |out| out.* = capture.tys[0];
@@ -13458,7 +13482,17 @@ pub fn Database(comptime config: Config) type {
             if (ty) |out| out.* = self.workspace.nodes.nodes[bound].ty;
             var ctx = self.evalContext(source);
             ctx.frame = frame.evalFrame();
-            return E.eval(&ctx, bound);
+            // PostgreSQL folds a constant expression while planning it, so
+            // its error reports the expression (B11 wave 5); inside a SQL
+            // statement (PERFORM) the statement is reported instead.
+            const direct = self.context_len != 0 and self.context_items[self.context_len - 1].kind == .plpgsql;
+            const plpgsql = if (direct and self.workspace.nodes.nodes[bound].constant) self.contextBody() else null;
+            if (plpgsql) |item| try self.routineContextEnter(.{ .kind = .expression, .current = item.current, .source = item.source });
+            defer if (plpgsql != null) self.routineContextLeave();
+            return E.eval(&ctx, bound) catch |err| {
+                if (plpgsql != null) self.routineContextCapture(err);
+                return err;
+            };
         }
 
         /// `(left) = (right)` (simple CASE statement arms).
@@ -13591,6 +13625,17 @@ pub fn Database(comptime config: Config) type {
                 out.* = self.routine_diag;
             } else R.Diagnostics.describe(err, out);
             self.routine_diag.active = false;
+            // The context the error had where it was raised.
+            out.context = .{};
+            out.context_overflow = false;
+            if (self.context_captured and self.context_error == err) {
+                out.context_overflow = self.context_overflow;
+                const length = @min(self.context_bytes_len, config.text_bytes);
+                @memcpy(out.context.bytes[0..length], self.context_bytes[0..length]);
+                out.context.len = length;
+                if (self.context_bytes_len > config.text_bytes) out.context_overflow = true;
+            }
+            self.context_captured = false;
         }
 
         /// COMMIT / ROLLBACK inside a procedure or DO block (B11 wave 4).
@@ -14001,6 +14046,7 @@ pub fn Database(comptime config: Config) type {
             const namespace = try self.routineCreateNamespace(definition.has_schema, definition.schema, snap);
             var built: RC.Routine = .{};
             try routineFromDefinition(source, definition, &built);
+            try self.settingsFromCurrent(slot, &built);
             const args = built.args();
             const name = definition.name.slice();
             if (self.objects.routineWriter(namespace, name, args, snap)) |other| return self.waitObject(slot, other);
@@ -14147,6 +14193,95 @@ pub fn Database(comptime config: Config) type {
                 }
                 try assignSetting(into, which, name, kind, value.slice());
             }
+        }
+
+        /// `SET name FROM CURRENT` takes the session's value at CREATE, kept
+        /// as SQL text (a search path as its list, others as a string).
+        fn settingsFromCurrent(self: *Self, slot: u16, routine: *RC.Routine) Error!void {
+            var any = false;
+            for (0..routine.setting_count) |index| {
+                const entry = routine.setting(index);
+                any = any or std.mem.endsWith(u8, entry, "=" ++ R.from_current);
+            }
+            if (!any) return;
+            var rebuilt: [RC.arg_bytes]u8 = undefined;
+            var at: usize = 0;
+            for (0..routine.setting_count) |index| {
+                const entry = routine.setting(index);
+                const eq = std.mem.indexOfScalar(u8, entry, '=') orelse return error.InvalidChangeRecord;
+                var value_text: Text = .{};
+                var piece: []const u8 = entry;
+                var quoted: [2 * config.text_bytes + 2]u8 = undefined;
+                if (std.mem.eql(u8, entry[eq + 1 ..], R.from_current)) {
+                    value_text.len = try self.settingText(slot, entry[0..eq], &value_text.bytes);
+                    var writer: CatalogTextWriter = .{ .out = &quoted };
+                    if (Sess.sameInsensitive(entry[0..eq], "search_path")) writer.add(value_text.slice()) else writer.literal(value_text.slice());
+                    if (writer.shortened) return error.TextCapacity;
+                    piece = writer.slice();
+                    if (eq + 1 + piece.len + 1 > rebuilt.len - at) return error.TextCapacity;
+                    @memcpy(rebuilt[at..][0 .. eq + 1], entry[0 .. eq + 1]);
+                    @memcpy(rebuilt[at + eq + 1 ..][0..piece.len], piece);
+                    at += eq + 1 + piece.len;
+                } else {
+                    if (entry.len + 1 > rebuilt.len - at) return error.TextCapacity;
+                    @memcpy(rebuilt[at..][0..entry.len], entry);
+                    at += entry.len;
+                }
+                rebuilt[at] = 0;
+                at += 1;
+            }
+            @memcpy(routine.settings[0..at], rebuilt[0..at]);
+            routine.settings_len = at;
+        }
+
+        /// pg_proc.proconfig: `name=value` per SET clause, the value
+        /// flattened as PostgreSQL's flatten_set_variable_args does (a
+        /// string's content, a search path's items as quoted identifiers
+        /// joined by ", ").
+        fn routineConfig(routine: *const RC.Routine) Error!V.Cell {
+            if (routine.setting_count == 0) return .null_value;
+            var out: Text = .{};
+            var shape: array_module.Shape = .{ .element = .text, .ndim = 1 };
+            shape.dims[0] = @intCast(routine.setting_count);
+            var writer = try V.Arrays.Writer.begin(&out, &shape);
+            for (0..routine.setting_count) |index| {
+                const entry = routine.setting(index);
+                const eq = std.mem.indexOfScalar(u8, entry, '=') orelse return error.InvalidChangeRecord;
+                var cell: V.Cell = .{ .text = .{} };
+                var text: CatalogTextWriter = .{ .out = &cell.text.bytes };
+                for (entry[0..eq]) |byte| text.add(&.{types.lower(byte)});
+                text.add("=");
+                const list = Sess.sameInsensitive(entry[0..eq], "search_path");
+                var cursor = R.Cursor.init(entry, eq + 1) catch return error.InvalidChangeRecord;
+                var first = true;
+                while (!cursor.atEnd()) {
+                    if (!first) text.add(", ");
+                    first = false;
+                    const negative = cursor.takeSymbol(.minus) catch return error.InvalidChangeRecord;
+                    var item: Text = .{};
+                    switch (cursor.current.kind) {
+                        .string => item.len = cursor.string(&item.bytes) catch return error.InvalidChangeRecord,
+                        .word, .quoted_word => {
+                            const ident = cursor.anyIdentifier() catch return error.InvalidChangeRecord;
+                            @memcpy(item.bytes[0..ident.len], ident.slice());
+                            item.len = ident.len;
+                        },
+                        else => {
+                            const raw = entry[cursor.start()..cursor.after()];
+                            @memcpy(item.bytes[0..raw.len], raw);
+                            item.len = raw.len;
+                            cursor.advance() catch return error.InvalidChangeRecord;
+                        },
+                    }
+                    if (negative) text.add("-");
+                    if (list) text.ident(item.slice()) else text.add(item.slice());
+                    if (!(cursor.takeSymbol(.comma) catch return error.InvalidChangeRecord)) break;
+                }
+                if (text.shortened) return error.TextCapacity;
+                cell.text.len = text.len;
+                try writer.append(&cell);
+            }
+            return .{ .array = out };
         }
 
         fn validateSettings(self: *Self, routine: *const RC.Routine) Error!void {
@@ -14755,18 +14890,20 @@ pub fn Database(comptime config: Config) type {
             try self.enterScope(routine, &scope);
             const text_body = routine.body.slice();
             if (routine.language == 1) {
-                var interpreter: Interp = .{ .host = self, .source = text_body, .frame = &frame, .purpose = .procedure, .void_result = true };
+                var interpreter: Interp = .{ .host = self, .source = text_body, .frame = &frame, .purpose = .procedure, .void_result = true, .routine_index = chosen, .routine_oid = routine.oid };
                 try interpreter.execute(.run);
             } else {
                 var statements: R.Statements = .{ .source = text_body };
                 var capture: R.Capture = .{};
+                var number: usize = 0;
                 while (try statements.next()) |span| {
                     try self.session.checkpoint();
                     var ahead = statements;
                     const last = (try ahead.next()) == null;
                     // A SQL procedure's outputs come from its final query.
                     const wanted = last and routine.out_count != 0;
-                    _ = try self.routineStatement(&frame, text_body[span.start..span.end], if (wanted) &capture else null);
+                    number += 1;
+                    _ = try self.sqlFunctionStatement(&frame, text_body[span.start..span.end], if (wanted) &capture else null, chosen, number);
                     if (wanted) for (0..routine.out_count) |output| {
                         const value: V.Cell = if (capture.rows == 0 or output >= capture.count) .null_value else capture.cells[output];
                         frame.cells[outputVariable(routine, output)] = try self.castCell(value, if (output < capture.count) capture.tys[output] else .unknown, routine.out_oids[output], routine.out_typmods[output]);
@@ -14887,7 +15024,7 @@ pub fn Database(comptime config: Config) type {
             const result_column = columnOfOid(routine.return_oid, routine.return_typmod);
             const text_body = routine.body.slice();
             if (routine.language == 1) {
-                var interpreter: Interp = .{ .host = self, .source = text_body, .frame = &frame, .purpose = .function, .return_column = result_column, .void_result = routine.out_count != 0 or routine.retset or routine.return_oid == tg.void_oid, .retset = routine.retset, .rows = .{ .ptr = sink, .call = emit } };
+                var interpreter: Interp = .{ .host = self, .source = text_body, .frame = &frame, .purpose = .function, .return_column = result_column, .void_result = routine.out_count != 0 or routine.retset or routine.return_oid == tg.void_oid, .retset = routine.retset, .rows = .{ .ptr = sink, .call = emit }, .routine_index = index, .routine_oid = routine.oid };
                 for (0..routine.out_count) |output| interpreter.outputs[output] = @intCast(outputVariable(routine, output));
                 interpreter.output_count = routine.out_count;
                 try interpreter.execute(.run);
@@ -14899,7 +15036,7 @@ pub fn Database(comptime config: Config) type {
             }
             // A void SQL function runs its statements and gives NULL.
             if (routine.return_oid == tg.void_oid and !routine.retset) {
-                _ = try self.sqlFunctionBody(&frame, text_body, &result_column, true);
+                _ = try self.sqlFunctionBody(&frame, text_body, &result_column, true, index);
                 return emit(sink, &row);
             }
             // SQL: one `SELECT expression, ...`; other bodies that are not
@@ -14928,7 +15065,7 @@ pub fn Database(comptime config: Config) type {
                 var result_columns: [config.columns]V.Column = undefined;
                 if (columns > config.columns) return error.ColumnCapacity;
                 for (0..columns) |column| result_columns[column] = if (routine.out_count != 0) columnOfOid(routine.out_oids[column], routine.out_typmods[column]) else result_column;
-                return self.sqlFunctionRows(&frame, text_body, result_columns[0..columns], routine.retset, .{ .ptr = sink, .call = emit });
+                return self.sqlFunctionRows(&frame, text_body, result_columns[0..columns], routine.retset, .{ .ptr = sink, .call = emit }, index);
             };
             for (0..columns) |column| {
                 if (q.targets[column].star) return error.UnsupportedStatement;
@@ -14981,7 +15118,7 @@ pub fn Database(comptime config: Config) type {
             if (routine.language == 1) {
                 // A function with OUT parameters returns their final values.
                 const outputs = routine.out_count != 0;
-                var interpreter: Interp = .{ .host = self, .source = text_body, .frame = &frame, .purpose = .function, .return_column = result_column, .void_result = outputs or routine.return_oid == tg.void_oid };
+                var interpreter: Interp = .{ .host = self, .source = text_body, .frame = &frame, .purpose = .function, .return_column = result_column, .void_result = outputs or routine.return_oid == tg.void_oid, .routine_index = index, .routine_oid = routine.oid };
                 try interpreter.execute(.run);
                 // PL/pgSQL returns void as an empty, non-NULL value.
                 out.* = if (outputs) frame.cells[outputVariable(routine, 0)] else if (routine.return_oid == tg.void_oid) V.Cell{ .text = .{} } else interpreter.result;
@@ -14991,7 +15128,7 @@ pub fn Database(comptime config: Config) type {
                 out.* = value;
                 return;
             };
-            out.* = try self.sqlFunctionBody(&frame, text_body, &result_column, routine.return_oid == tg.void_oid);
+            out.* = try self.sqlFunctionBody(&frame, text_body, &result_column, routine.return_oid == tg.void_oid, index);
         }
 
         /// A SQL body that is one SELECT of one expression without FROM is
@@ -15025,13 +15162,15 @@ pub fn Database(comptime config: Config) type {
         /// function returns void. This is the entry point for SQL function
         /// bodies beyond one expression: DML bodies, and set-returning bodies
         /// once they collect every row of the final statement.
-        pub fn sqlFunctionBody(self: *Self, frame: *R.Frame, text_body: []const u8, result_column: *const V.Column, void_result: bool) Error!V.Cell {
+        pub fn sqlFunctionBody(self: *Self, frame: *R.Frame, text_body: []const u8, result_column: *const V.Column, void_result: bool, routine: ?usize) Error!V.Cell {
             var statements: R.Statements = .{ .source = text_body };
             var last: R.Capture = .{};
+            var number: usize = 0;
             while (try statements.next()) |span| {
                 try self.session.checkpoint();
                 last = .{};
-                _ = try self.routineStatement(frame, text_body[span.start..span.end], &last);
+                number += 1;
+                _ = try self.sqlFunctionStatement(frame, text_body[span.start..span.end], &last, routine, number);
             }
             if (void_result or last.rows == 0 or last.count == 0) return .null_value;
             var cell = last.cells[0];
@@ -15041,6 +15180,155 @@ pub fn Database(comptime config: Config) type {
                 if (from != to) cell = try E.cast(cell, if (from == .unknown) .text else from, to, result_column.typmod, &self.session);
             }
             return D.store(result_column, cell, &self.session);
+        }
+
+        /// Statement `number` of SQL routine `routine` ('SQL function "f"
+        /// statement N' in the error context).
+        fn sqlFunctionStatement(self: *Self, frame: *R.Frame, text: []const u8, capture: ?*R.Capture, routine: ?usize, number: usize) Error!usize {
+            try self.routineContextEnter(.{ .kind = .sql_function, .routine = routine, .number = number });
+            defer self.routineContextLeave();
+            return self.routineStatement(frame, text, capture) catch |err| {
+                self.routineContextCapture(err);
+                return err;
+            };
+        }
+
+        // ---- routine error context (B11 wave 5) ------------------------------
+
+        pub const context_capacity = 3 * config.routine_depth + config.nested_statements + 4;
+
+        pub fn routineContextEnter(self: *Self, item: R.ContextItem) Error!void {
+            if (self.context_len == context_capacity) return error.StackDepthExceeded;
+            self.context_items[self.context_len] = item;
+            self.context_len += 1;
+        }
+
+        pub fn routineContextLeave(self: *Self) void {
+            self.context_len -= 1;
+        }
+
+        /// The innermost frame of an error records the context it had
+        /// (PG_EXCEPTION_CONTEXT); a handler takes it.
+        pub fn routineContextCapture(self: *Self, err: Error) void {
+            if (self.context_captured) return;
+            self.context_captured = true;
+            self.context_error = err;
+            self.context_overflow = false;
+            self.context_bytes_len = self.renderContext(&self.context_bytes) orelse blk: {
+                self.context_overflow = true;
+                break :blk 0;
+            };
+        }
+
+        /// PG_CONTEXT: the context now.
+        pub fn routineContextText(self: *Self, out: *V.Text) Error!void {
+            const length = self.renderContext(&out.bytes) orelse return error.TextCapacity;
+            out.len = length;
+        }
+
+        /// The context lines, innermost first, as PostgreSQL's error context
+        /// callbacks write them; null when they do not fit `out`.
+        fn renderContext(self: *const Self, out: []u8) ?usize {
+            var writer: ContextWriter = .{ .out = out };
+            var index = self.context_len;
+            while (index != 0) {
+                index -= 1;
+                const item = &self.context_items[index];
+                if (writer.len != 0) writer.add("\n");
+                switch (item.kind) {
+                    .plpgsql => {
+                        writer.add("PL/pgSQL function ");
+                        if (item.routine) |routine| self.writeRoutineSignature(&writer, routine) else writer.add("inline_code_block");
+                        const current = item.current.?;
+                        writer.add(" line ");
+                        var line: usize = 1;
+                        for (item.source[0..@min(current.start, item.source.len)]) |byte| line += @intFromBool(byte == '\n');
+                        writer.number(line);
+                        if (current.during) {
+                            writer.add(" during statement block local variable initialization");
+                        } else {
+                            writer.add(" at ");
+                            writer.add(current.kind);
+                        }
+                    },
+                    .statement => {
+                        writer.add("SQL statement \"");
+                        writer.add(item.source);
+                        writer.add("\"");
+                    },
+                    .expression => {
+                        const current = item.current.?;
+                        writer.add(if (current.assignment) "PL/pgSQL assignment \"" else "PL/pgSQL expression \"");
+                        const end = @min(current.expr_end, item.source.len);
+                        writer.add(std.mem.trim(u8, item.source[@min(current.expr_start, end)..end], " \t\r\n"));
+                        writer.add("\"");
+                    },
+                    .sql_function => {
+                        writer.add("SQL function \"");
+                        if (item.routine) |routine| writer.add(self.objects.routines[routine].name.slice());
+                        writer.add("\" statement ");
+                        writer.number(item.number);
+                    },
+                }
+            }
+            return if (writer.overflow) null else writer.len;
+        }
+
+        /// format_procedure: name(argument types), schema-qualified when
+        /// the search path does not find it.
+        fn writeRoutineSignature(self: *const Self, writer: *ContextWriter, index: usize) void {
+            const routine = &self.objects.routines[index];
+            var path: [routine_path_capacity]u32 = undefined;
+            const count = self.routinePath(self.seq_snap, &path);
+            if (std.mem.indexOfScalar(u32, path[0..count], routine.namespace) == null or self.routineHidden(index, path[0..count], self.seq_snap)) {
+                writer.add(self.namespaceName(routine.namespace));
+                writer.add(".");
+            }
+            writer.add(routine.name.slice());
+            writer.add("(");
+            for (routine.args(), 0..) |oid, position| {
+                if (position != 0) writer.add(",");
+                writer.add(functionTypeName(oid) catch "?");
+            }
+            writer.add(")");
+        }
+
+        const ContextWriter = struct {
+            out: []u8,
+            len: usize = 0,
+            overflow: bool = false,
+
+            fn add(self: *ContextWriter, bytes: []const u8) void {
+                if (bytes.len > self.out.len - self.len) {
+                    self.overflow = true;
+                    return;
+                }
+                @memcpy(self.out[self.len..][0..bytes.len], bytes);
+                self.len += bytes.len;
+            }
+
+            fn number(self: *ContextWriter, value: usize) void {
+                var digits: [24]u8 = undefined;
+                var at = digits.len;
+                var rest = value;
+                while (true) {
+                    at -= 1;
+                    digits[at] = @intCast('0' + rest % 10);
+                    rest /= 10;
+                    if (rest == 0) break;
+                }
+                self.add(digits[at..]);
+            }
+        };
+
+        /// The innermost PL/pgSQL body on the context stack.
+        fn contextBody(self: *const Self) ?R.ContextItem {
+            var index = self.context_len;
+            while (index != 0) {
+                index -= 1;
+                if (self.context_items[index].kind == .plpgsql) return self.context_items[index];
+            }
+            return null;
         }
 
         // ---- triggers -------------------------------------------------------
@@ -15207,7 +15495,7 @@ pub fn Database(comptime config: Config) type {
             frame.cells[first + 7] = textValue(self.namespaceName(table.namespace));
             frame.cells[first + 8] = .{ .integer = @intCast(trigger.nargs) };
             frame.cells[first + 9] = try self.triggerArguments(trigger);
-            var interpreter: Interp = .{ .host = self, .source = routine.body.slice(), .frame = &frame, .purpose = .trigger };
+            var interpreter: Interp = .{ .host = self, .source = routine.body.slice(), .frame = &frame, .purpose = .trigger, .routine_index = function, .routine_oid = routine.oid };
             try interpreter.execute(.run);
             return interpreter.record;
         }
@@ -16587,24 +16875,35 @@ pub fn Database(comptime config: Config) type {
         /// runs nested; a set-returning body emits every row of its final
         /// statement (a query or a RETURNING), another one the first row
         /// (a row of NULLs without one).
-        fn sqlFunctionRows(self: *Self, frame: *R.Frame, text_body: []const u8, columns: []const V.Column, retset: bool, sink: R.Emit) Error!void {
+        fn sqlFunctionRows(self: *Self, frame: *R.Frame, text_body: []const u8, columns: []const V.Column, retset: bool, sink: R.Emit, routine: usize) Error!void {
             var statements: R.Statements = .{ .source = text_body };
             var pending: ?R.Span = null;
+            var number: usize = 0;
             while (try statements.next()) |span| {
                 if (pending) |earlier| {
                     try self.session.checkpoint();
-                    _ = try self.routineStatement(frame, text_body[earlier.start..earlier.end], null);
+                    number += 1;
+                    _ = try self.sqlFunctionStatement(frame, text_body[earlier.start..earlier.end], null, routine, number);
                 }
                 pending = span;
             }
             const last = pending orelse return error.InvalidFunctionDefinition;
             const text = text_body[last.start..last.end];
+            number += 1;
+            try self.routineContextEnter(.{ .kind = .sql_function, .routine = routine, .number = number });
+            defer self.routineContextLeave();
             if (retset) {
-                _ = try self.routineReturnQuery(frame, text, sink, columns);
+                _ = self.routineReturnQuery(frame, text, sink, columns) catch |err| {
+                    self.routineContextCapture(err);
+                    return err;
+                };
                 return;
             }
             var capture: R.Capture = .{};
-            _ = try self.routineStatement(frame, text, &capture);
+            _ = self.routineStatement(frame, text, &capture) catch |err| {
+                self.routineContextCapture(err);
+                return err;
+            };
             var row: [config.columns]V.Cell = @splat(.null_value);
             if (capture.rows != 0) {
                 if (capture.count != columns.len) return error.TypeMismatch;
@@ -17011,18 +17310,18 @@ pub fn Database(comptime config: Config) type {
 
         /// pg_proc, pg_trigger, pg_rewrite and pg_rules rows.
         fn procRow(sink: *X.RowSink, base: *const [13]Cell) Error!void {
-            return procRowWith(sink, base, false, false);
+            return procRowWith(sink, base, false, false, .null_value);
         }
 
         /// A user routine's row also reports RETURNS SETOF (proretset,
-        /// prorows 1000) and SECURITY DEFINER (B11 wave 4); proconfig
-        /// stays NULL.
-        fn procRowWith(sink: *X.RowSink, base: *const [13]Cell, retset: bool, definer: bool) Error!void {
+        /// prorows 1000), SECURITY DEFINER (B11 wave 4) and its SET clauses
+        /// (proconfig, wave 5).
+        fn procRowWith(sink: *X.RowSink, base: *const [13]Cell, retset: bool, definer: bool, settings: Cell) Error!void {
             var cells: [23]Cell = undefined;
             @memcpy(cells[0..13], base);
             // Built-in routines return one value, run as invoker, have no
             // per-routine settings, transforms or planner support callback.
-            cells[13..].* = .{ boolCell(retset), .null_value, boolCell(definer), .null_value,
+            cells[13..].* = .{ boolCell(retset), .null_value, boolCell(definer), settings,
                 .{ .float4 = if (base[4].integer == operator_catalog.internal_language_oid) 1 else 100 },
                 .{ .float4 = if (retset) 1000 else 0 }, boolCell(false), .null_value, .{ .pg_internal_char = 'u' }, .{ .regproc = 0 } };
             try sink.add(&cells);
@@ -17095,7 +17394,7 @@ pub fn Database(comptime config: Config) type {
                         }
                         const language = if (routine.language == 0) catalog_module.sql_language_oid else catalog_module.plpgsql_language_oid;
                         const acl = if (sink.referencesColumn(12)) try self.routineAcl(routine, snapshot, sink.valueBytes()) else .null_value;
-                        try procRowWith(sink, &.{ intCell(routine.oid), nameCell(routine.name.slice()), intCell(routine.namespace), .{ .pg_internal_char = routine.kind }, intCell(language), .{ .pg_internal_char = routine.volatility }, boolCell(routine.strict), intCell(@intCast(routine.arg_count)), intCell(routine.return_oid), nameCell(argtypes[0..at]), nameCell(routine.body.slice()), intCell(routine.owner), acl }, routine.retset, routine.security_definer);
+                        try procRowWith(sink, &.{ intCell(routine.oid), nameCell(routine.name.slice()), intCell(routine.namespace), .{ .pg_internal_char = routine.kind }, intCell(language), .{ .pg_internal_char = routine.volatility }, boolCell(routine.strict), intCell(@intCast(routine.arg_count)), intCell(routine.return_oid), nameCell(argtypes[0..at]), nameCell(routine.body.slice()), intCell(routine.owner), acl }, routine.retset, routine.security_definer, if (sink.referencesColumn(16)) try routineConfig(routine) else .null_value);
                     }
                 },
                 .pg_trigger => for (&self.objects.triggers) |*trigger| {
