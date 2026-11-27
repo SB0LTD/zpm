@@ -19,6 +19,7 @@ a replica that must answer like the primary.
 | Indexes | CREATE / DROP INDEX CONCURRENTLY, outside transaction blocks only (25001); they build under the plain form's stronger lock | ordered (btree) secondary indexes, below |
 | Locks | An UPDATE that keeps every key column takes FOR NO KEY UPDATE strength: FOR KEY SHARE and foreign key checks (now FOR KEY SHARE) do not wait for it; a key change waits for key sharers. LOCK TABLE on a view locks the relations its query reads, recursively (42809 for a materialized view) | |
 | Row security | Policies of an inheritance parent or partitioned table filter every member's rows read or written through it; new rows a statement returns (or an UPDATE reads) must also pass the SELECT policies; WITH CHECK runs after stored generated columns and before NOT NULL and CHECK constraints | subqueries in policy expressions (0A000: policy texts are bound and deparsed like CHECK constraints) |
+| search_path | SET search_path / SET SCHEMA 'name' with any schema names. One resolver (`Config.search_path_schemas`, default 8 existing schemas; missing schemas and ones without USAGE are skipped, `"$user"` is the current role's schema) drives unqualified tables, views and sequences (FROM items, DML targets, ALTER / DROP / TRUNCATE / LOCK / COMMENT, triggers and rules), regclass and nextval('name'), user types and the routines lane's routine lookup; an unqualified CREATE uses the path's first existing schema (3F000 with none); current_schema() / current_schemas() list the path | pg_catalog placement: built-in relations and functions still resolve before user schemas even when pg_catalog is listed later; pg_temp (no temporary schemas); CREATE VIEW / MATERIALIZED VIEW naming an unqualified relation outside public is 0A000 (stored view texts resolve through public); detached store reads run only with a path of `"$user"`, public, pg_catalog and pg_temp |
 | Schemas and grammar | CREATE SCHEMA [name] AUTHORIZATION role / CURRENT_USER / CURRENT_ROLE / SESSION_USER (42704); FROM ONLY (name); two PRIMARY KEY columns 42P16; a word that starts no statement 42601; wire tags DROP VIEW / DROP MATERIALIZED VIEW / DROP INDEX, START TRANSACTION, CLOSE CURSOR ALL | CREATE SCHEMA with schema elements |
 
 SET SESSION AUTHORIZATION was already implemented on main when this lane
@@ -70,8 +71,7 @@ insert, so ordered indexes are not implemented. They need:
 ## Not done in this lane
 
 TEMP tables with session lifetime (pg_temp, ON COMMIT DELETE ROWS / DROP),
-`search_path` resolution for user schemas (the shared resolver routines-sig
-would use), SHOW ALL, SET TRANSACTION SNAPSHOT / pg_export_snapshot, lazy
+pg_catalog placement in the search path, SHOW ALL, SET TRANSACTION SNAPSHOT / pg_export_snapshot, lazy
 cursors, COMMENT ON INDEX / FUNCTION / TYPE / CONSTRAINT, column, sequence
 and schema-usage privileges beyond what main has, ALTER COLUMN TYPE,
 identifiers longer than 63 bytes (truncation) and varchar(3) yes/no
