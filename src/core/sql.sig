@@ -120,6 +120,7 @@ const session_module = @import("sql/session.sig");
 const ssi_module = @import("sql/ssi.sig");
 const routine_catalog = @import("sql/routine_catalog.sig");
 const routine_module = @import("sql/routine.sig");
+const nested_module = @import("sql/nested.sig");
 const CO = @import("sql/catalog_objects.sig");
 const operator_catalog = @import("sql/operator_catalog.sig");
 const index_operator_catalog = @import("sql/index_operator_catalog.sig");
@@ -996,6 +997,9 @@ pub fn Database(comptime config: Config) type {
             security_start: usize = 0,
             security_len: usize = 0,
             security_table: usize = 0,
+            /// Bytes of `expansion` the running statement uses (a nested
+            /// statement saves and restores them, B11 wave 4).
+            expansion_used: usize = 0,
         };
 
         /// A decoded identifier (quoted names keep case, others fold).
@@ -1254,6 +1258,7 @@ pub fn Database(comptime config: Config) type {
                     }
                 }
             }
+            workspace.expansion_used = length;
             if (length == 0) return source;
             if (bound_statement.* == .select) {
                 const top = bound_statement.select;
@@ -1310,6 +1315,12 @@ pub fn Database(comptime config: Config) type {
         /// the routine hook) unless the routine returns a set or a record.
         fn inlineBody(routine: *const RC.Routine) ?[]const u8 {
             if (routine.language != 0 or routine.security_definer or routine.setting_count != 0 or routine.kind != 'f') return null;
+            // A volatile body runs as nested statements (B11 wave 4): each
+            // takes a new snapshot and command id, which an inlined plan
+            // under the caller's snapshot would not (PostgreSQL inlines
+            // neither volatile set-returning functions nor scalar bodies
+            // that read tables).
+            if (routine.volatility == 'v') return null;
             const text = routine.body.slice();
             var statements: R.Statements = .{ .source = text };
             const span = (statements.next() catch return null) orelse return null;
@@ -2059,6 +2070,29 @@ pub fn Database(comptime config: Config) type {
         /// Write-set index where the running statement's writes begin (its
         /// AFTER ROW triggers read them); kept across a park.
         statement_start: usize = 0,
+        /// Nested statements (B11 wave 4, sql/nested.sig): how many run
+        /// inside an executing statement now (54001 beyond
+        /// Config.nested_statements); whether one ran in the current
+        /// top-level statement (a park then restarts the whole statement);
+        /// the volatility of the routine body running now ('v', 's', 'i',
+        /// or 0 for a statement).
+        nested_depth: usize = 0,
+        nested_ran: bool = false,
+        /// Tables the suspended statements scan (no row-slot compaction
+        /// under them) and the tables the running statement scans.
+        nested_tables: [(config.tables + 63) / 64]u64 = @splat(0),
+        scan_tables: [(config.tables + 63) / 64]u64 = @splat(0),
+        routine_volatility: u8 = 0,
+        /// PostgreSQL's errdetail of the last view error (lastErrorDetail).
+        error_detail: []const u8 = "",
+        /// A RETURN QUERY / set-returning SQL body asks the next routine
+        /// statement to keep all its rows (consumed by that statement).
+        row_staging: ?*RowStaging = null,
+        /// Relations whose rule actions are running ((oid << 8) | event):
+        /// an action reaching one again is PostgreSQL's infinite recursion
+        /// in rules (42P17).
+        rule_active: [8]u64 = @splat(0),
+        rule_active_len: usize = 0,
 
         /// Borrow the embedding's cluster catalogue while serving statements.
         /// The embedding keeps the provider and its rows consistent for the
@@ -2509,6 +2543,9 @@ pub fn Database(comptime config: Config) type {
             self.routine_frame = null;
             self.routine_depth = 0;
             self.routine_nested = 0;
+            self.nested_depth = 0;
+            self.nested_ran = false;
+            self.routine_volatility = 0;
             // A logical copy has fresh session/execution state. In particular,
             // never copy caller-owned interrupt or sequence-hook pointers.
             self.sequence_session = null;
@@ -3194,7 +3231,7 @@ pub fn Database(comptime config: Config) type {
                 // fresh snapshot, as PostgreSQL locks before snapshotting
                 // (the transaction snapshot too, when this statement took it).
                 if (tx.fresh) {
-                    if (tx.snapshot_csn != null and tx.snapshot_cid == tx.cid) {
+                    if (tx.snapshot_csn != null and tx.snapshot_cid == pinned.cid) {
                         tx.snapshot_csn = self.csn;
                         if (tx.ssi) |index| self.ssi.records[index].snapshot = self.csn;
                     }
@@ -3234,6 +3271,9 @@ pub fn Database(comptime config: Config) type {
             const ran = if (routine) self.routineBody(slot, source, snap, result) else self.body(slot, source, parsed, snap, result, .{ .mode = options.mode, .explain = top.explain });
             ran catch |err| {
                 if (err == error.WouldBlock) {
+                    // A nested statement ran (trigger or function SQL): the
+                    // resumed statement starts over, so no effect repeats.
+                    if (self.nested_ran) self.restartStatement(slot);
                     tx.pin = snap;
                     return err;
                 }
@@ -3307,8 +3347,32 @@ pub fn Database(comptime config: Config) type {
                 return self.catalogObject(slot, original, &parsed.catalog_object, snap);
             }
             var statement_copy = parsed.*;
-            const expanded = try expandRelations(self, &self.workspace, original, snap, &statement_copy, self.session.role, &self.session);
-            const source = try self.secureTarget(&statement_copy, expanded, original, snap);
+            // INSERT / UPDATE / DELETE on a view (B11 wave 4): its INSTEAD
+            // OF triggers, or the same statement on its base relation.
+            var text = original;
+            var view_owner: ?u32 = null;
+            const work_bounds = viewBounds(&self.workspace.query);
+            defer restoreBounds(&self.workspace.query, work_bounds);
+            if (self.dmlView(original, parsed, snap)) |view| {
+                if (explain != null) return error.UnsupportedStatement;
+                const event = eventOf(parsed);
+                if (self.insteadTriggers(view, event, snap) or self.anyRuleFor(view, event, snap)) return self.viewModify(slot, original, parsed, snap, mode, view);
+                text = try self.rewriteViewTarget(slot, original, &statement_copy, view, snap);
+                view_owner = self.catalog_objects.owner(self.tables[view].oid, snap);
+            }
+            const expanded = try expandRelations(self, &self.workspace, text, snap, &statement_copy, self.session.role, &self.session);
+            const source = try self.secureTarget(&statement_copy, expanded, text, snap);
+            // A user function in a single-table SELECT runs once per row in
+            // the query engine (B11 wave 4): the simple path evaluates
+            // projections twice (validation, then publication) and keeps
+            // its scan state outside the workspace a nested statement uses.
+            if (statement_copy == .select and self.callsUserRoutine(source, snap)) {
+                const top = statement_copy.select;
+                if (self.workspace.nodes.queries[top].lock.strength == .none) {
+                    statement_copy = .{ .query = top };
+                    self.workspace.nodes.complex = true;
+                }
+            }
             var context = self.bindContext(source, mode, snap);
             context.stored_source_start = original.len;
             if (explain) |options| context.describe_only = !options.analyze;
@@ -3316,7 +3380,14 @@ pub fn Database(comptime config: Config) type {
             var bound: B.Bound = undefined;
             try B.bindInto(&context, &statement_copy, &bound);
             if (self.txs[slot].read_only and (explain == null or explain.?.analyze)) try readOnlyCheck(&bound, &self.workspace.plans);
-            try self.checkPrivileges(&bound, snap);
+            if (view_owner) |owner| {
+                // The view's owner needs the privileges on the base relation.
+                const role = self.session.role;
+                defer self.session.role = role;
+                self.session.role = owner;
+                try self.checkPrivileges(&bound, snap);
+            } else try self.checkPrivileges(&bound, snap);
+            self.noteScans(&bound);
             try self.secureNewRows(&bound, source, snap);
             if (explain) |options| return self.runExplain(slot, source, &bound, snap, result, options);
             switch (bound) {
@@ -3385,13 +3456,19 @@ pub fn Database(comptime config: Config) type {
                     try self.lockSources(slot);
                     // Rules and triggers (B11 wave 3).
                     const upsert = insert.conflict.action == .update;
-                    if (insert.conflict.action != .none and (self.ruleKind(insert.table, '3', snap) != .none or self.ruleKind(insert.table, '2', snap) != .none)) return error.UnsupportedStatement;
-                    if (try self.insteadNothing(insert.table, '3', insert.returning.count != 0, snap)) break :blk 0;
+                    if (insert.conflict.action != .none and (self.anyRule(insert.table, snap))) return error.UnsupportedStatement;
+                    // Rule actions run after the original (B11 wave 4).
+                    const actions = try self.ruleEnter(insert.table, '3', snap);
+                    defer if (actions) self.ruleLeave();
+                    if (try self.insteadNothing(insert.table, '3', insert.returning.count != 0, snap)) {
+                        break :blk if (actions) try self.insertRuleActions(source, insert, snap) else 0;
+                    }
                     const events: []const u8 = if (upsert) &.{ routine_catalog.tg_insert, routine_catalog.tg_update } else &.{routine_catalog.tg_insert};
                     try self.statementTriggers(insert.table, routine_catalog.tg_before, events, snap);
                     const affected = try self.insertRows(slot, source, insert, snap);
                     try self.afterTriggers(slot, self.statement_start, if (upsert) &insert.conflict.update.values else null, snap);
                     try self.statementTriggers(insert.table, 0, events, snap);
+                    if (actions) _ = try self.insertRuleActions(source, insert, snap);
                     break :blk affected;
                 },
                 .update => |*update| blk: {
@@ -3401,7 +3478,11 @@ pub fn Database(comptime config: Config) type {
                     if (update.returning.output) try self.validateTsqlOutput(update.table, .update, snap);
                     try self.ssiRead(slot, update.table);
                     try self.lockSources(slot);
-                    if (try self.insteadNothing(update.table, '2', update.returning.count != 0, snap)) break :blk 0;
+                    // Rule actions run before the original (B11 wave 4).
+                    const actions = try self.ruleEnter(update.table, '2', snap);
+                    defer if (actions) self.ruleLeave();
+                    const instead_affected = if (actions) try self.changeRuleActions(source, update.table, '2', update.where, update.from, &update.offsets, &update.values, update, snap) else 0;
+                    if (try self.insteadNothing(update.table, '2', update.returning.count != 0, snap)) break :blk instead_affected;
                     try self.statementTriggers(update.table, routine_catalog.tg_before, &.{routine_catalog.tg_update}, snap);
                     const affected = try self.updateRows(slot, source, update, snap);
                     try self.afterTriggers(slot, self.statement_start, &update.values, snap);
@@ -3413,7 +3494,10 @@ pub fn Database(comptime config: Config) type {
                     if (delete.returning.output) try self.validateTsqlOutput(delete.table, .delete, snap);
                     try self.ssiRead(slot, delete.table);
                     try self.lockSources(slot);
-                    if (try self.insteadNothing(delete.table, '4', delete.returning.count != 0, snap)) break :blk 0;
+                    const actions = try self.ruleEnter(delete.table, '4', snap);
+                    defer if (actions) self.ruleLeave();
+                    const instead_affected = if (actions) try self.changeRuleActions(source, delete.table, '4', delete.where, delete.using, &delete.offsets, null, null, snap) else 0;
+                    if (try self.insteadNothing(delete.table, '4', delete.returning.count != 0, snap)) break :blk instead_affected;
                     try self.statementTriggers(delete.table, routine_catalog.tg_before, &.{routine_catalog.tg_delete}, snap);
                     const affected = try self.deleteRows(slot, source, delete, snap);
                     try self.afterTriggers(slot, self.statement_start, null, snap);
@@ -3477,9 +3561,9 @@ pub fn Database(comptime config: Config) type {
                 self.outcome.mysql_insert_id = if (tx.mysql_first_generated != 0) tx.mysql_first_generated else tx.mysql_explicit_insert_id;
             }
             switch (bound.*) {
-                .insert => |*insert| if (insert.returning.count != 0) try self.returnRows(slot, source, &insert.returning, insert.table, insert.plan == ast.none, result.rows.len),
-                .update => |*update| if (update.returning.count != 0) try self.returnRows(slot, source, &update.returning, update.table, true, result.rows.len),
-                .delete => |*delete| if (delete.returning.count != 0) try self.returnRows(slot, source, &delete.returning, delete.table, true, result.rows.len),
+                .insert => |*insert| if (insert.returning.count != 0) try self.returnRows(slot, source, &insert.returning, insert.table, insert.plan == ast.none, result.rows.len, snap.cid),
+                .update => |*update| if (update.returning.count != 0) try self.returnRows(slot, source, &update.returning, update.table, true, result.rows.len, snap.cid),
+                .delete => |*delete| if (delete.returning.count != 0) try self.returnRows(slot, source, &delete.returning, delete.table, true, result.rows.len, snap.cid),
                 else => {},
             }
         }
@@ -3634,7 +3718,7 @@ pub fn Database(comptime config: Config) type {
                 state.progress[k] = tx.progress;
                 state.affected[k] = tx.progress_affected;
                 const last = if (k + 1 < plans.dml_len and state.started[k + 1]) state.start[k + 1] else tx.write_len;
-                work.dml_rows[k] = try self.captureReturning(source, returning, table_index, state.start[k], last, slot);
+                work.dml_rows[k] = try self.captureReturning(source, returning, table_index, state.start[k], last, slot, snap.cid);
             }
             tx.progress = 0;
             tx.progress_affected = 0;
@@ -3659,11 +3743,11 @@ pub fn Database(comptime config: Config) type {
 
         /// RETURNING of the rows `table_index` got from writes first..last,
         /// in write order, into the pinned top of the query workspace.
-        fn captureReturning(self: *Self, source: []const u8, list: *const B.Returning, table_index: usize, first: usize, last: usize, slot: u16) Error!X.List {
+        fn captureReturning(self: *Self, source: []const u8, list: *const B.Returning, table_index: usize, first: usize, last: usize, slot: u16, cid: u32) Error!X.List {
             const tx = &self.txs[slot];
             const writes = tx.writes[first..last];
             var count: usize = 0;
-            for (writes) |entry| if (rowWrite(entry.kind) and entry.table == table_index) {
+            for (writes) |entry| if (rowWrite(entry.kind) and entry.table == table_index and self.writeCid(entry) == cid) {
                 count += 1;
             };
             const work = &self.workspace.query;
@@ -3677,7 +3761,7 @@ pub fn Database(comptime config: Config) type {
             const table = &self.tables[table_index];
             var row: usize = 0;
             for (writes) |entry| {
-                if (!rowWrite(entry.kind) or entry.table != table_index) continue;
+                if (!rowWrite(entry.kind) or entry.table != table_index or self.writeCid(entry) != cid) continue;
                 try self.session.checkpoint();
                 ctx.row = S.borrowVersionRow(table, if (entry.kind == .delete) entry.old else entry.new, &row_scratch);
                 const at = work.cell_high + row * width;
@@ -3685,8 +3769,8 @@ pub fn Database(comptime config: Config) type {
                 work.refs[out.start + row] = @intCast(at);
                 row += 1;
             }
-            work.pinned_cells = work.cells.len - work.cell_high;
-            work.pinned_refs = work.refs.len - work.ref_high;
+            work.pinned_cells = work.cells.len - work.top_cells - work.cell_high;
+            work.pinned_refs = work.refs.len - work.top_refs - work.ref_high;
             return out;
         }
 
@@ -3695,14 +3779,14 @@ pub fn Database(comptime config: Config) type {
         /// The statement's write slice survives a park, so a resumed
         /// statement emits every row exactly once. Every value is computed
         /// into the workspace first; a failure leaves the result untouched.
-        fn returnRows(self: *Self, slot: u16, source: []const u8, list: *const B.Returning, table_index: usize, fresh: bool, result_capacity: usize) Error!void {
+        fn returnRows(self: *Self, slot: u16, source: []const u8, list: *const B.Returning, table_index: usize, fresh: bool, result_capacity: usize, cid: u32) Error!void {
             const tx = &self.txs[slot];
             // The statement's own writes (a routine's statement starts
             // inside the CALL / DO statement's subtransaction).
             const start = self.statement_start;
             const writes = tx.writes[start..tx.write_len];
             var count: usize = 0;
-            for (writes) |entry| if (rowWrite(entry.kind) and (entry.table == table_index or self.descends(entry.table, table_index))) {
+            for (writes) |entry| if (rowWrite(entry.kind) and (entry.table == table_index or self.descends(entry.table, table_index)) and self.writeCid(entry) == cid) {
                 count += 1;
             };
             if (list.output and count != self.outcome.affected) return error.UnsupportedStatement;
@@ -3717,6 +3801,7 @@ pub fn Database(comptime config: Config) type {
             var row: usize = 0;
             for (writes) |entry| {
                 if (!rowWrite(entry.kind) or (entry.table != table_index and !self.descends(entry.table, table_index))) continue;
+                if (self.writeCid(entry) != cid) continue;
                 const table = &self.tables[entry.table];
                 if (list.output) {
                     try self.session.checkpoint();
@@ -6339,6 +6424,7 @@ pub fn Database(comptime config: Config) type {
                 try text.add(" AND ");
                 try self.catalog_objects.securityText(role, table.oid, .select, false, snap, &self.workspace.expansion, &length);
             }
+            self.workspace.expansion_used = length;
             const id = try P.parseExpressionAt(self.workspace.expansion[0..length], start, length, &self.workspace.nodes);
             goal.where.* = if (goal.where.* == ast.none) id else try self.workspace.nodes.add(.{ .kind = .and_op, .a = id, .b = goal.where.* });
             return self.workspace.expansion[0..length];
@@ -6379,6 +6465,7 @@ pub fn Database(comptime config: Config) type {
             try self.securedSource(source, source, &length);
             const start = length;
             try self.catalog_objects.securityText(role, oid, goal.command, true, snap, &self.workspace.expansion, &length);
+            self.workspace.expansion_used = @max(self.workspace.expansion_used, length);
             const text = self.workspace.expansion[start..length];
             const context = self.bindContext(text, .standard, snap);
             self.workspace.security_check = try B.bindPolicyText(&context, text, goal.table);
@@ -8590,7 +8677,25 @@ pub fn Database(comptime config: Config) type {
                 text.add(rule.where.slice());
                 text.add(")");
             }
-            text.add(if (rule.instead) " DO INSTEAD NOTHING;" else " DO NOTHING;");
+            if (rule.action.len == 0) {
+                text.add(if (rule.instead) " DO INSTEAD NOTHING;" else " DO NOTHING;");
+            } else {
+                // Actions as written (PostgreSQL deparses them).
+                text.add(if (rule.instead) " DO INSTEAD " else " DO ");
+                if (rule.multiple) {
+                    text.add("( ");
+                    var statements: R.Statements = .{ .source = rule.action.slice() };
+                    while (try statements.next()) |span| {
+                        text.add(rule.action.slice()[span.start..span.end]);
+                        text.add(";\n ");
+                    }
+                    text.add(");");
+                } else {
+                    text.add(" ");
+                    text.add(rule.action.slice());
+                    text.add(";");
+                }
+            }
             if (text.shortened) return error.TextCapacity;
             return text.len;
         }
@@ -8989,7 +9094,13 @@ pub fn Database(comptime config: Config) type {
                         continue;
                     }
                     const deletion = entry.pendingDeletion().?;
-                    if (snap.own(deletion.tx)) return if (deletion.cid == snap.cid) .authored else .skip;
+                    if (snap.own(deletion.tx)) {
+                        // Changed by a statement this one's triggers or
+                        // functions ran (PostgreSQL TM_SelfModified with a
+                        // later command id): 27000 for UPDATE / DELETE.
+                        if (deletion.cid > snap.cid and mode == .write and self.nested_ran) return error.TriggeredDataChangeViolation;
+                        return if (deletion.cid == snap.cid) .authored else .skip;
+                    }
                     waits.add(deletion.tx.slot);
                 }
                 self.locks.rowHolders(table_index, table.rows[entry.rowSlot()].rowid, slot, mode, waits);
@@ -10339,6 +10450,9 @@ pub fn Database(comptime config: Config) type {
             try self.reserveWrites(slot, 1);
             const at = self.horizon();
             try S.ensureVersions(table, 1, at);
+            // A statement suspended under a nested one may be scanning this
+            // table: its row slots must not move (B11 wave 4).
+            if (self.nested_depth != 0 and table.row_high >= table.rows.len and self.suspendedTable(table_index)) return error.RowCapacity;
             try S.ensureRowSlot(table, at);
             const row = S.allocRow(table, rowid);
             table.next_rowid = @max(table.next_rowid, rowid + 1);
@@ -10645,6 +10759,13 @@ pub fn Database(comptime config: Config) type {
             self.routine_diag.active = false;
             self.routine_definer = null;
             self.routine_configured = 0;
+            self.nested_depth = 0;
+            self.nested_ran = false;
+            self.routine_volatility = 0;
+            self.error_detail = "";
+            self.rule_active_len = 0;
+            self.nested_tables = @splat(0);
+            self.scan_tables = @splat(0);
             self.installRole();
         }
 
@@ -12443,12 +12564,13 @@ pub fn Database(comptime config: Config) type {
         }
 
         /// Syntax of a statement inside a routine body.
+        /// Only CREATE FUNCTION and DO check bodies; a DO inside a running
+        /// statement is itself a nested statement with its own workspace.
         pub fn routineCheckStatement(self: *Self, text: []const u8) Error!void {
             if (R.classify(text) != null) {
                 var routine: R.Statement = undefined;
                 return R.parse(text, &self.workspace.nodes, &routine);
             }
-            if (self.routine_nested != 0) return error.UnsupportedStatement;
             _ = try P.parse(text, &self.workspace.nodes, .standard);
         }
 
@@ -12459,10 +12581,48 @@ pub fn Database(comptime config: Config) type {
             const mark = poolMark(pool);
             defer poolRestore(pool, mark);
             const id = try P.parseExpressionAt(source, start, end, pool);
+            // An expression that reads tables runs as `SELECT expr`, like
+            // PL/pgSQL's exec_eval_expr (B11 wave 4).
+            for (pool.nodes[mark.len..pool.len]) |*n| {
+                const reads = switch (n.kind) {
+                    .scalar_subquery, .exists_subquery, .in_subquery => true,
+                    .function => n.func == .array_subquery,
+                    else => false,
+                };
+                if (!reads) continue;
+                poolRestore(pool, mark);
+                return self.routineQueryValue(frame, source[start..end], goal);
+            }
             return self.routineValue(frame, source, id, mark.len, goal);
         }
 
+        /// `SELECT expr` as a statement of the routine: its one value,
+        /// converted like an assignment to `goal`.
+        fn routineQueryValue(self: *Self, frame: *R.Frame, expression: []const u8, goal: ?*const V.Column) Error!V.Cell {
+            const prefix = "SELECT ";
+            var buffer: [config.routine_bytes + prefix.len]u8 = undefined;
+            if (expression.len > config.routine_bytes) return error.TextCapacity;
+            @memcpy(buffer[0..prefix.len], prefix);
+            @memcpy(buffer[prefix.len..][0..expression.len], expression);
+            var capture: R.Capture = .{};
+            _ = try self.routineStatement(frame, buffer[0 .. prefix.len + expression.len], &capture);
+            if (capture.count != 1) return error.Syntax;
+            var cell: V.Cell = if (capture.rows == 0) .null_value else capture.cells[0];
+            const column = goal orelse return cell;
+            const from = capture.tys[0];
+            const to = types.typeOfData(column.data_type);
+            if (to == .boolean and from != .boolean and from != .unknown) return error.TypeMismatch;
+            if (cell != .null_value and from != to) cell = try E.cast(cell, if (from == .unknown) .text else from, to, column.typmod, &self.session);
+            return D.store(column, cell, &self.session);
+        }
+
         fn routineValue(self: *Self, frame: *R.Frame, source: []const u8, id: u16, low: usize, goal: ?*const V.Column) Error!V.Cell {
+            // A volatile routine's expression sees every earlier change of
+            // its transaction (PostgreSQL: CommandCounterIncrement and a new
+            // snapshot per evaluation); STABLE / IMMUTABLE keep the caller's.
+            const saved_snap = self.routine_snap;
+            defer self.routine_snap = saved_snap;
+            if (self.routine_volatility == 'v') self.routine_snap = self.routineSnapshot(self.routine_slot, false);
             frame.variables.node_low = low;
             frame.variables.node_high = self.workspace.nodes.len;
             var context = self.bindContext(source, .standard, self.routine_snap);
@@ -12597,69 +12757,135 @@ pub fn Database(comptime config: Config) type {
             self.routine_depth += 1;
         }
 
-        /// A statement of a procedure or DO block: a new command id and
-        /// snapshot (READ COMMITTED), its variables bound through `frame`.
-        /// Only routines started by CALL / DO run statements: inside an
-        /// expression or a trigger they are 0A000. Returns the rows it
+        /// A statement of a routine body, its variables bound through
+        /// `frame`. In a procedure or DO block it runs as the next statement
+        /// of the CALL / DO; inside an executing statement (a trigger
+        /// function, a function called from an expression) it runs nested
+        /// (B11 wave 4): the suspended statement's workspace is saved and
+        /// restored around it. A volatile routine's statement takes a new
+        /// command id and snapshot (CommandCounterIncrement; the latest
+        /// committed data under READ COMMITTED, the transaction snapshot
+        /// otherwise); a STABLE or IMMUTABLE one runs under its caller's
+        /// snapshot and cannot modify data (0A000). Returns the rows it
         /// processed; `capture` takes its first row (INTO).
         pub fn routineStatement(self: *Self, frame: *R.Frame, text: []const u8, capture: ?*R.Capture) Error!usize {
-            if (self.routine_nested != 0) return error.UnsupportedStatement;
             const slot = self.routine_slot;
             const tx = &self.txs[slot];
-            tx.cid +%= 1;
+            const nested = self.routine_nested != 0;
+            const read_only = self.routine_volatility == 's' or self.routine_volatility == 'i';
+            const kind = R.classify(text);
+            // A row request belongs to this statement, not to statements
+            // nested deeper inside it.
+            const staging = self.row_staging;
+            self.row_staging = null;
+            // Inside a running statement only queries, data changes, CALL
+            // and DO run (DDL there is outside the subset).
+            if (nested) if (kind) |which| if (which != .call and which != .do_block) return error.UnsupportedStatement;
+            if (read_only and kind != null) return error.UnsupportedStatement;
+            var mark: usize = 0;
+            if (nested) mark = try self.nestedEnter(slot);
+            defer if (nested) self.nestedLeave(slot, mark);
+            const snap: Snapshot = if (read_only) self.routine_snap else self.routineSnapshot(slot, true);
             tx.progress = 0;
             tx.progress_affected = 0;
             self.modifying[slot] = .{};
-            const snap: Snapshot = .{ .csn = self.csn, .slot = slot, .epoch = tx.epoch, .cid = tx.cid };
             const start = tx.write_len;
             const saved_snap = self.routine_snap;
             const saved_frame = self.routine_frame;
             const saved_shared = self.session.routine_frame;
             const saved_start = self.statement_start;
             const saved_sequences = self.seq_snap;
+            const saved_volatility = self.routine_volatility;
+            const saved_params = self.active_params;
+            const saved_session_params = self.session.params;
             defer {
                 self.routine_snap = saved_snap;
                 self.routine_frame = saved_frame;
                 self.session.routine_frame = saved_shared;
                 self.statement_start = saved_start;
                 self.seq_snap = saved_sequences;
+                self.routine_volatility = saved_volatility;
+                self.active_params = saved_params;
+                self.session.params = saved_session_params;
             }
             self.routine_snap = snap;
             self.seq_snap = snap;
             self.routine_frame = frame;
             self.session.routine_frame = frame.evalFrame();
             self.statement_start = start;
-            if (R.classify(text) != null) {
+            self.routine_volatility = 0;
+            // The routine's own parameters, not the caller's bind values.
+            self.active_params = null;
+            self.session.params = null;
+            if (kind != null) {
                 try self.routineBody(slot, text, snap, self.routine_result orelse return error.UnsupportedStatement);
                 return 0;
             }
             var parsed = try P.parse(text, &self.workspace.nodes, .standard);
             // Transaction control inside a routine statement (0A000).
             if (parsed == .control) return error.UnsupportedStatement;
+            if (read_only) switch (parsed) {
+                .select, .query => {},
+                else => return error.UnsupportedStatement,
+            };
             frame.variables.node_low = 0;
             frame.variables.node_high = self.workspace.nodes.len;
-            const rows = try self.subStatement(slot, text, &parsed, snap, capture);
+            const rows = try self.subStatement(slot, text, &parsed, snap, capture, read_only, staging);
             try self.deferredCheck(slot, start, true);
             return rows;
         }
 
-        fn subStatement(self: *Self, slot: u16, text: []const u8, parsed: *A.Statement, snap: Snapshot, capture: ?*R.Capture) Error!usize {
+        /// PostgreSQL's CommandCounterIncrement + GetTransactionSnapshot for
+        /// a volatile routine: the latest committed data under READ
+        /// COMMITTED (the transaction snapshot otherwise, taken now if no
+        /// statement took it yet) and every earlier command of its own
+        /// transaction. `claim` takes the next command id for a statement;
+        /// an expression reads at it without taking it.
+        fn routineSnapshot(self: *Self, slot: u16, claim: bool) Snapshot {
+            const tx = &self.txs[slot];
+            if (claim) tx.cid +%= 1;
+            const cid = if (claim) tx.cid else tx.cid +% 1;
+            var csn = self.csn;
+            if (transactionSnapshot(tx.isolation)) {
+                if (tx.snapshot_csn == null) {
+                    tx.snapshot_csn = self.csn;
+                    tx.snapshot_cid = cid;
+                }
+                csn = tx.snapshot_csn.?;
+            }
+            return .{ .csn = csn, .slot = slot, .epoch = tx.epoch, .cid = cid };
+        }
+
+        fn subStatement(self: *Self, slot: u16, text: []const u8, parsed: *A.Statement, snap: Snapshot, capture: ?*R.Capture, read_only: bool, staging: ?*RowStaging) Error!usize {
             if (parsed.* == .select) {
                 const top = parsed.select;
                 parsed.* = .{ .query = top };
                 self.workspace.nodes.complex = true;
             }
+            // A non-volatile function neither locks rows nor writes
+            // (PostgreSQL: "SELECT FOR UPDATE / INSERT is not allowed in a
+            // non-volatile function", 0A000).
+            if (read_only) for (self.workspace.nodes.queries[0..self.workspace.nodes.query_len]) |*block| {
+                if (block.lock.strength != .none) return error.UnsupportedStatement;
+            };
             if (parsed.* != .query) {
                 const result = self.routine_result orelse return error.UnsupportedStatement;
                 try self.body(slot, text, parsed, snap, result, .{ .mode = .standard });
                 const outcome = self.outcome;
+                if (staging) |out| {
+                    const returned = &outcome.returning;
+                    if (returned.count == 0) return error.UnsupportedStatement;
+                    var tys: [config.columns]types.Type = undefined;
+                    for (0..returned.count) |column| tys[column] = types.typeOfData(returned.types[column]);
+                    try self.stageRows(.{ .returned = .{ .base = returned.base, .rows = returned.rows } }, returned.count, tys[0..returned.count], out);
+                }
                 if (capture) |out| {
                     const returned = &outcome.returning;
                     out.rows = if (returned.count != 0) returned.rows else 0;
                     out.count = returned.count;
-                    if (returned.count != 0 and returned.rows != 0) {
+                    if (returned.count != 0 and returned.rows != 0 and !out.rows_only) {
                         for (0..returned.count) |column| {
-                            out.cells[column] = self.workspace.query.cells[returned.base + column];
+                            out.cells[column] = try ownCell(self.workspace.query.cells[returned.base + column]);
                             out.tys[column] = types.typeOfData(returned.types[column]);
                         }
                     }
@@ -12687,20 +12913,22 @@ pub fn Database(comptime config: Config) type {
                 self.workspace.query.pinned_refs = 0;
             }
             if (plans.dml_len != 0) {
+                if (read_only) return error.UnsupportedStatement;
                 try self.secureNewRows(&bound, source, snap);
                 try self.modifyingCtes(slot, source, snap);
                 try self.afterTriggers(slot, self.statement_start, null, snap);
             }
             const work = &self.workspace.query;
             const list = try X.queryRows(&self.tables, source, &self.workspace.nodes, plans, root, snap, &self.session, work);
+            if (staging) |out| try self.stageRows(.{ .list = list }, plans.items[root].count, plans.items[root].tys[0..plans.items[root].count], out);
             if (capture) |out| {
                 const plan = &plans.items[root];
                 out.rows = list.count;
                 out.count = plan.count;
-                if (list.count != 0) {
+                if (list.count != 0 and !out.rows_only) {
                     const row = X.rowAt(work, list, 0);
                     for (0..plan.count) |column| {
-                        out.cells[column] = row[column];
+                        out.cells[column] = try ownCell(row[column]);
                         out.tys[column] = plan.tys[column];
                     }
                 }
@@ -13638,6 +13866,9 @@ pub fn Database(comptime config: Config) type {
             };
             try self.enterRoutine();
             defer self.routine_depth -= 1;
+            const saved_volatility = self.routine_volatility;
+            defer self.routine_volatility = saved_volatility;
+            self.routine_volatility = 'v';
             var frame: R.Frame = .{};
             try routineFrame(&frame, routine);
             // Arguments (and DEFAULTs) are evaluated as the caller.
@@ -13728,6 +13959,9 @@ pub fn Database(comptime config: Config) type {
         fn doBlock(self: *Self, block: *const R.DoBlock) Error!void {
             try self.enterRoutine();
             defer self.routine_depth -= 1;
+            const saved_volatility = self.routine_volatility;
+            defer self.routine_volatility = saved_volatility;
+            self.routine_volatility = 'v';
             var frame: R.Frame = .{};
             try routineParameters(&frame, &.{}, &.{}, &.{}, .{}, true);
             var checker: Interp = .{ .host = self, .source = block.body.slice(), .frame = &frame, .purpose = .do_block, .void_result = true };
@@ -13782,6 +14016,9 @@ pub fn Database(comptime config: Config) type {
             var scope: RoutineScope = .{};
             try self.enterScope(routine, &scope);
             defer self.leaveScope(&scope);
+            const saved_volatility = self.routine_volatility;
+            defer self.routine_volatility = saved_volatility;
+            self.routine_volatility = routine.volatility;
             var frame: R.Frame = .{};
             try routineFrame(&frame, routine);
             for (args[0..count], 0..) |cell, position| frame.cells[position] = cell;
@@ -13798,19 +14035,34 @@ pub fn Database(comptime config: Config) type {
                 } else row[0] = interpreter.result;
                 return emit(sink, &row);
             }
-            // SQL: one `SELECT expression, ...` (other bodies are inlined).
+            // SQL: one `SELECT expression, ...`; other bodies that are not
+            // inlined run their statements nested (B11 wave 4).
+            const columns: usize = if (routine.out_count != 0) routine.out_count else 1;
             var statements: R.Statements = .{ .source = text_body };
-            const span = (try statements.next()) orelse return error.UnsupportedStatement;
-            if ((try statements.next()) != null) return error.UnsupportedStatement;
             const pool = &self.workspace.nodes;
             const mark = poolMark(pool);
             defer poolRestore(pool, mark);
-            const query_index = P.parseQueryAt(text_body, span.start, span.end, pool) catch return error.UnsupportedStatement;
-            const q = &pool.queries[query_index];
-            const columns: usize = if (routine.out_count != 0) routine.out_count else 1;
-            if (q.count != columns or q.item_count != 0 or q.from != null or q.where != ast.none or q.group_count != 0 or
-                q.having != ast.none or q.order_count != 0 or q.limit_present or q.offset_present or q.set_op != .none or q.cte_count != 0 or
-                q.distinct or q.values != ast.none or q.window_defs != ast.none or q.grouping_sets != ast.none) return error.UnsupportedStatement;
+            const simple = simple: {
+                const span = (try statements.next()) orelse break :simple null;
+                if ((try statements.next()) != null) break :simple null;
+                const query_index = P.parseQueryAt(text_body, span.start, span.end, pool) catch break :simple null;
+                const q = &pool.queries[query_index];
+                if (routine.retset or q.count != columns or q.item_count != 0 or q.from != null or q.where != ast.none or q.group_count != 0 or
+                    q.having != ast.none or q.order_count != 0 or q.limit_present or q.offset_present or q.set_op != .none or q.cte_count != 0 or
+                    q.distinct or q.values != ast.none or q.window_defs != ast.none or q.grouping_sets != ast.none) break :simple null;
+                for (pool.nodes[mark.len..pool.len]) |*n| switch (n.kind) {
+                    .scalar_subquery, .exists_subquery, .in_subquery => break :simple null,
+                    else => {},
+                };
+                break :simple q;
+            };
+            const q = simple orelse {
+                poolRestore(pool, mark);
+                var result_columns: [config.columns]V.Column = undefined;
+                if (columns > config.columns) return error.ColumnCapacity;
+                for (0..columns) |column| result_columns[column] = if (routine.out_count != 0) columnOfOid(routine.out_oids[column], routine.out_typmods[column]) else result_column;
+                return self.sqlFunctionRows(&frame, text_body, result_columns[0..columns], routine.retset, .{ .ptr = sink, .call = emit });
+            };
             for (0..columns) |column| {
                 if (q.targets[column].star) return error.UnsupportedStatement;
                 const target_column = if (routine.out_count != 0) columnOfOid(routine.out_oids[column], routine.out_typmods[column]) else result_column;
@@ -13851,6 +14103,9 @@ pub fn Database(comptime config: Config) type {
             var scope: RoutineScope = .{};
             try self.enterScope(routine, &scope);
             defer self.leaveScope(&scope);
+            const saved_volatility = self.routine_volatility;
+            defer self.routine_volatility = saved_volatility;
+            self.routine_volatility = routine.volatility;
             var frame: R.Frame = .{};
             try routineFrame(&frame, routine);
             for (args[0..count], 0..) |cell, position| frame.cells[position] = cell;
@@ -13859,24 +14114,65 @@ pub fn Database(comptime config: Config) type {
             if (routine.language == 1) {
                 // A function with OUT parameters returns their final values.
                 const outputs = routine.out_count != 0;
-                var interpreter: Interp = .{ .host = self, .source = text_body, .frame = &frame, .purpose = .function, .return_column = result_column, .void_result = outputs };
+                var interpreter: Interp = .{ .host = self, .source = text_body, .frame = &frame, .purpose = .function, .return_column = result_column, .void_result = outputs or routine.return_oid == tg.void_oid };
                 try interpreter.execute(.run);
                 out.* = if (outputs) frame.cells[outputVariable(routine, 0)] else interpreter.result;
                 return;
             }
+            if (try self.sqlFunctionExpression(&frame, text_body, &result_column)) |value| {
+                out.* = value;
+                return;
+            }
+            out.* = try self.sqlFunctionBody(&frame, text_body, &result_column, routine.return_oid == tg.void_oid);
+        }
+
+        /// A SQL body that is one SELECT of one expression without FROM is
+        /// evaluated in place (no statement); null for any other body.
+        fn sqlFunctionExpression(self: *Self, frame: *R.Frame, text_body: []const u8, result_column: *const V.Column) Error!?V.Cell {
             var statements: R.Statements = .{ .source = text_body };
-            const span = (try statements.next()) orelse return error.UnsupportedStatement;
-            if ((try statements.next()) != null) return error.UnsupportedStatement;
+            const span = (try statements.next()) orelse return null;
+            if ((try statements.next()) != null) return null;
             const pool = &self.workspace.nodes;
             const mark = poolMark(pool);
             defer poolRestore(pool, mark);
-            const query_index = P.parseQueryAt(text_body, span.start, span.end, pool) catch return error.UnsupportedStatement;
+            const query_index = P.parseQueryAt(text_body, span.start, span.end, pool) catch return null;
             const q = &pool.queries[query_index];
             if (q.count != 1 or q.targets[0].star or q.item_count != 0 or q.from != null or q.where != ast.none or q.group_count != 0 or
                 q.having != ast.none or q.order_count != 0 or q.limit_present or q.offset_present or q.set_op != .none or q.cte_count != 0 or
-                q.distinct or q.values != ast.none or q.window_defs != ast.none or q.grouping_sets != ast.none) return error.UnsupportedStatement;
-            const value = try self.routineValue(&frame, text_body, q.targets[0].expr, mark.len, &result_column);
-            out.* = try D.store(&result_column, value, &self.session);
+                q.distinct or q.values != ast.none or q.window_defs != ast.none or q.grouping_sets != ast.none) return null;
+            // A subquery in the expression reads tables: run it as a statement.
+            for (pool.nodes[mark.len..pool.len]) |*n| switch (n.kind) {
+                .scalar_subquery, .exists_subquery, .in_subquery => return null,
+                else => {},
+            };
+            const value = try self.routineValue(frame, text_body, q.targets[0].expr, mark.len, result_column);
+            return try D.store(result_column, value, &self.session);
+        }
+
+        /// The statements of a SQL-language function called from an
+        /// expression, each run as a nested statement (B11 wave 4) under the
+        /// function's volatility (a volatile body's statements see the
+        /// earlier ones); the result is the first column of the final
+        /// statement's first row, NULL when it returns no row or the
+        /// function returns void. This is the entry point for SQL function
+        /// bodies beyond one expression: DML bodies, and set-returning bodies
+        /// once they collect every row of the final statement.
+        pub fn sqlFunctionBody(self: *Self, frame: *R.Frame, text_body: []const u8, result_column: *const V.Column, void_result: bool) Error!V.Cell {
+            var statements: R.Statements = .{ .source = text_body };
+            var last: R.Capture = .{};
+            while (try statements.next()) |span| {
+                try self.session.checkpoint();
+                last = .{};
+                _ = try self.routineStatement(frame, text_body[span.start..span.end], &last);
+            }
+            if (void_result or last.rows == 0 or last.count == 0) return .null_value;
+            var cell = last.cells[0];
+            if (cell != .null_value) {
+                const from = last.tys[0];
+                const to = types.typeOfData(result_column.data_type);
+                if (from != to) cell = try E.cast(cell, if (from == .unknown) .text else from, to, result_column.typmod, &self.session);
+            }
+            return D.store(result_column, cell, &self.session);
         }
 
         // ---- triggers -------------------------------------------------------
@@ -13884,9 +14180,53 @@ pub fn Database(comptime config: Config) type {
         const tg_names = [_][]const u8{ "tg_name", "tg_when", "tg_level", "tg_op", "tg_relid", "tg_relname", "tg_table_name", "tg_table_schema", "tg_nargs" };
         const tg_types = [_]types.Type{ .name, .text, .text, .text, .oid, .name, .name, .name, .int4 };
 
-        /// FOUND is declared already; the TG_* variables follow it.
+        /// FOUND is declared already; the TG_* variables follow it, then
+        /// TG_ARGV (B11 wave 4).
         fn triggerVariableNames(frame: *R.Frame) Error!void {
             for (tg_names, tg_types) |name, ty| _ = try frame.declare(name, ty, -1);
+            _ = try frame.declare("tg_argv", types.arrayType(.text).?, -1);
+        }
+
+        /// TG_ARGV: the trigger's arguments as a text array indexed from 0
+        /// (`[0:n-1]={...}`), NULL without arguments, as in PostgreSQL.
+        fn triggerArguments(self: *Self, trigger: *const RC.Trigger) Error!V.Cell {
+            if (trigger.nargs == 0) return .null_value;
+            var text: [2 * RC.arg_bytes + 32]u8 = undefined;
+            var at: usize = 0;
+            const header_prefix = "[0:";
+            @memcpy(text[at..][0..header_prefix.len], header_prefix);
+            at += header_prefix.len;
+            var digits: [20]u8 = undefined;
+            const last = formatUnsigned(trigger.nargs - 1, &digits);
+            @memcpy(text[at..][0..last.len], last);
+            at += last.len;
+            const header_suffix = "]={";
+            @memcpy(text[at..][0..header_suffix.len], header_suffix);
+            at += header_suffix.len;
+            for (0..trigger.nargs) |index| {
+                const argument = trigger.argument(index);
+                if (at + 2 * argument.len + 4 > text.len) return error.TextCapacity;
+                if (index != 0) {
+                    text[at] = ',';
+                    at += 1;
+                }
+                text[at] = '"';
+                at += 1;
+                for (argument) |byte| {
+                    if (byte == '"' or byte == '\\') {
+                        text[at] = '\\';
+                        at += 1;
+                    }
+                    text[at] = byte;
+                    at += 1;
+                }
+                text[at] = '"';
+                at += 1;
+            }
+            text[at] = '}';
+            at += 1;
+            if (at > config.text_bytes) return error.TextCapacity;
+            return E.cast(textValue(text[0..at]), .text, types.arrayType(.text).?, -1, &self.session);
         }
 
         fn textValue(bytes: []const u8) V.Cell {
@@ -13958,8 +14298,9 @@ pub fn Database(comptime config: Config) type {
             return cell == .boolean and cell.boolean;
         }
 
-        /// Runs a trigger's function (PL/pgSQL, no statements of its own)
-        /// with NEW / OLD and the TG_* variables; returns what it RETURNed.
+        /// Runs a trigger's function (PL/pgSQL; its SQL statements run as
+        /// nested statements, B11 wave 4) with NEW / OLD and the TG_*
+        /// variables; returns what it RETURNed.
         fn callTrigger(self: *Self, trigger: *const RC.Trigger, table_index: usize, timing: u8, row: bool, event: u8, new: ?*E.Row, old: ?*E.Row, snap: Snapshot) Error!R.Record {
             const function = self.objects.routineByOid(trigger.function_oid, snap) orelse return error.UndefinedFunction;
             const routine = &self.objects.routines[function];
@@ -13972,6 +14313,9 @@ pub fn Database(comptime config: Config) type {
             var scope: RoutineScope = .{};
             try self.enterScope(routine, &scope);
             defer self.leaveScope(&scope);
+            const saved_volatility = self.routine_volatility;
+            defer self.routine_volatility = saved_volatility;
+            self.routine_volatility = routine.volatility;
             var frame: R.Frame = .{};
             try routineParameters(&frame, &.{}, &.{}, &.{}, routine.name, true);
             try triggerVariableNames(&frame);
@@ -13994,6 +14338,7 @@ pub fn Database(comptime config: Config) type {
             frame.cells[first + 6] = textValue(table.name.slice());
             frame.cells[first + 7] = textValue(self.namespaceName(table.namespace));
             frame.cells[first + 8] = .{ .integer = @intCast(trigger.nargs) };
+            frame.cells[first + 9] = try self.triggerArguments(trigger);
             var interpreter: Interp = .{ .host = self, .source = routine.body.slice(), .frame = &frame, .purpose = .trigger };
             try interpreter.execute(.run);
             return interpreter.record;
@@ -14051,8 +14396,12 @@ pub fn Database(comptime config: Config) type {
         fn afterTriggers(self: *Self, slot: u16, start: usize, assigned: ?*const [config.columns]u16, snap: Snapshot) Error!void {
             if (!self.anyTrigger(0, true, tg.tg_insert, snap) and !self.anyTrigger(0, true, tg.tg_update, snap) and !self.anyTrigger(0, true, tg.tg_delete, snap)) return;
             const tx = &self.txs[slot];
+            // Statements the triggers run append after `end` and fire their
+            // own AFTER triggers; writes of nested statements in between
+            // (BEFORE triggers, functions) carry later command ids.
+            const end = tx.write_len;
             var index = start;
-            while (index < tx.write_len) : (index += 1) {
+            while (index < @min(end, tx.write_len)) : (index += 1) {
                 const entry = tx.writes[index];
                 const event: u8 = switch (entry.kind) {
                     .insert => tg.tg_insert,
@@ -14060,6 +14409,7 @@ pub fn Database(comptime config: Config) type {
                     .delete => tg.tg_delete,
                     else => continue,
                 };
+                if (self.writeCid(entry) != snap.cid) continue;
                 var list: [config.triggers]u8 = undefined;
                 const count = self.rowTriggerList(entry.table, snap, &list);
                 if (count == 0) continue;
@@ -14102,10 +14452,14 @@ pub fn Database(comptime config: Config) type {
             const table = &self.tables[table_index];
             const kind = definition.tgtype;
             const row = kind & tg.tg_row != 0;
-            // INSTEAD OF triggers (views) are outside the subset.
-            if (kind & tg.tg_instead != 0) return error.UnsupportedStatement;
             if (table.relkind == 'm' or table.relkind == 'S') return error.WrongObjectType;
-            if (table.relkind == 'v' and row) return error.WrongObjectType;
+            // INSTEAD OF triggers are row triggers of views without column
+            // lists or WHEN (B11 wave 4); views have no BEFORE / AFTER row
+            // triggers (42809, 0A000 as PostgreSQL).
+            if (kind & tg.tg_instead != 0) {
+                if (table.relkind != 'v') return error.WrongObjectType;
+                if (!row or definition.column_count != 0 or definition.when.end != definition.when.start) return error.UnsupportedStatement;
+            } else if (table.relkind == 'v' and row) return error.WrongObjectType;
             if (kind & tg.tg_truncate != 0 and row) return error.UnsupportedStatement;
             var columns: [config.columns]u8 = undefined;
             for (definition.columns[0..definition.column_count], 0..) |*column_name, position| {
@@ -14266,11 +14620,15 @@ pub fn Database(comptime config: Config) type {
             const table_index = try self.namedTable(&definition.table, snap);
             try self.lockTable(slot, table_index, .access_exclusive);
             const table = &self.tables[table_index];
-            // Rules on views and materialized views are outside the subset.
-            if (table.relkind != 'r' and table.relkind != 'p') return error.UnsupportedStatement;
+            // Rules on tables and views (B11 wave 4); materialized views
+            // are outside the subset.
+            if (table.relkind != 'r' and table.relkind != 'p' and table.relkind != 'v') return error.UnsupportedStatement;
             const where = source[definition.where.start..definition.where.end];
             if (where.len > config.routine_bytes) return error.TextCapacity;
             if (where.len != 0) try self.validateRecordCondition(table_index, where, definition.event, true, false);
+            const action = source[definition.action.start..definition.action.end];
+            if (action.len > config.routine_bytes) return error.TextCapacity;
+            if (action.len != 0) try self.validateRuleAction(action, definition.event);
             if (self.objects.ruleWriter(table.oid, definition.name.slice(), snap)) |other| return self.waitObject(slot, other);
             const existing = self.objects.findRule(table.oid, definition.name.slice(), snap);
             if (existing != null and !definition.replace) return error.DuplicateObject;
@@ -14279,8 +14637,9 @@ pub fn Database(comptime config: Config) type {
             const oid = if (existing) |old| self.objects.rules[old].oid else try self.takeOid();
             if (existing) |old| try self.dropObject(slot, .rule, old, snap);
             const item = &self.objects.rules[index];
-            item.* = .{ .oid = oid, .name = definition.name, .table_oid = table.oid, .event = definition.event, .instead = definition.instead };
+            item.* = .{ .oid = oid, .name = definition.name, .table_oid = table.oid, .event = definition.event, .instead = definition.instead, .multiple = definition.multiple };
             try item.where.set(where);
+            try item.action.set(action);
             self.createdObject(slot, .rule, index, snap);
         }
 
@@ -14299,6 +14658,188 @@ pub fn Database(comptime config: Config) type {
             try self.dropObject(slot, .rule, index, snap);
         }
 
+        // ---- rule actions (B11 wave 4) ---------------------------------------
+
+        /// PostgreSQL rejects OLD in ON INSERT rules and NEW in ON DELETE
+        /// rules (42P17); every action must parse.
+        fn validateRuleAction(self: *Self, action: []const u8, event: u8) Error!void {
+            var statements: R.Statements = .{ .source = action };
+            while (try statements.next()) |span| {
+                const text = action[span.start..span.end];
+                _ = try P.parse(text, &self.workspace.nodes, .standard);
+                const pool = &self.workspace.nodes;
+                for (pool.nodes[0..pool.len]) |*n| {
+                    if (n.kind != .column or n.qualifier.len == 0) continue;
+                    const qualifier = identName(text, n.qualifier);
+                    if (event == '3' and types.same(qualifier.slice(), "old")) return error.InvalidObjectDefinition;
+                    if (event == '4' and types.same(qualifier.slice(), "new")) return error.InvalidObjectDefinition;
+                }
+            }
+        }
+
+        /// The rules with actions of a relation for an event, in name order.
+        fn ruleActionList(self: *const Self, table_index: usize, event: u8, snap: Snapshot, out: *[config.rules]u8) usize {
+            var list: [config.rules]u8 = undefined;
+            const count = self.objects.tableRules(self.tables[table_index].oid, event, snap, &list);
+            var used: usize = 0;
+            for (list[0..count]) |position| {
+                if (self.objects.rules[position].action.len == 0) continue;
+                out[used] = position;
+                used += 1;
+            }
+            return used;
+        }
+
+        /// Marks a relation's rule actions as running; true when it has any.
+        /// Reaching a relation whose actions run already is 42P17.
+        fn ruleEnter(self: *Self, table_index: usize, event: u8, snap: Snapshot) Error!bool {
+            var list: [config.rules]u8 = undefined;
+            if (self.ruleActionList(table_index, event, snap, &list) == 0) return false;
+            const key = (@as(u64, self.tables[table_index].oid) << 8) | event;
+            for (self.rule_active[0..self.rule_active_len]) |running| if (running == key) return error.InvalidObjectDefinition;
+            if (self.rule_active_len == self.rule_active.len) return error.StackDepthExceeded;
+            self.rule_active[self.rule_active_len] = key;
+            self.rule_active_len += 1;
+            return true;
+        }
+
+        fn ruleLeave(self: *Self) void {
+            self.rule_active_len -= 1;
+        }
+
+        /// Affected rows the command tag reports for an unconditional
+        /// INSTEAD rule: the last INSTEAD action of the original's kind.
+        const RuleCount = struct { last: ?usize = null, total: usize = 0, kind_rule: usize = 0, kind_statement: usize = 0 };
+
+        /// One action statement with NEW / OLD of a row of `table_index`,
+        /// run as a nested statement under a volatile snapshot.
+        fn ruleStatement(self: *Self, table_index: usize, new: ?*E.Row, old: ?*E.Row, text: []const u8) Error!usize {
+            try self.enterRoutine();
+            defer self.routine_depth -= 1;
+            self.routine_nested += 1;
+            defer self.routine_nested -= 1;
+            const saved_volatility = self.routine_volatility;
+            defer self.routine_volatility = saved_volatility;
+            self.routine_volatility = 'v';
+            var frame: R.Frame = .{};
+            frame.variables.record_table = &self.tables[table_index];
+            frame.new = new;
+            frame.old = old;
+            return self.routineStatement(&frame, text, null);
+        }
+
+        /// The rule actions of one row: each rule whose qualification holds
+        /// runs its statements in order. `count` collects the rows of the
+        /// last INSTEAD action of `kind` ('3' INSERT, '2' UPDATE, '4' DELETE).
+        fn applyRuleActions(self: *Self, table_index: usize, event: u8, new: ?*E.Row, old: ?*E.Row, kind: u8, count: *RuleCount, snap: Snapshot) Error!void {
+            var list: [config.rules]u8 = undefined;
+            const rules = self.ruleActionList(table_index, event, snap, &list);
+            for (list[0..rules]) |position| {
+                const rule = &self.objects.rules[position];
+                if (rule.where.len != 0) {
+                    var frame: R.Frame = .{};
+                    var old_copy: E.Row = undefined;
+                    if (old) |row| old_copy = row.*;
+                    frame.variables.record_table = &self.tables[table_index];
+                    frame.new = new;
+                    frame.old = if (old != null) &old_copy else null;
+                    const column: V.Column = .{ .data_type = .boolean };
+                    const where = rule.where.slice();
+                    const cell = try self.routineEvaluate(&frame, where, 0, where.len, &column);
+                    if (cell != .boolean or !cell.boolean) continue;
+                }
+                var text_copy: RC.Text = rule.action;
+                const action = text_copy.slice();
+                var statements: R.Statements = .{ .source = action };
+                var index: usize = 0;
+                while (try statements.next()) |span| : (index += 1) {
+                    try self.session.checkpoint();
+                    const text = action[span.start..span.end];
+                    const rows = try self.ruleStatement(table_index, new, old, text);
+                    if (!rule.instead) continue;
+                    const word = R.firstWordOf(text);
+                    const same_kind = switch (kind) {
+                        '3' => types.keyword(word, "insert"),
+                        '2' => types.keyword(word, "update"),
+                        else => types.keyword(word, "delete"),
+                    };
+                    if (!same_kind) continue;
+                    // A later rule or statement replaces the counted one.
+                    if (count.last == null or position != count.kind_rule or index != count.kind_statement) {
+                        if (count.last != null and (position != count.kind_rule or index != count.kind_statement)) count.total = 0;
+                        count.kind_rule = position;
+                        count.kind_statement = index;
+                    }
+                    count.last = 0;
+                    count.total += rows;
+                }
+            }
+        }
+
+        /// INSERT rule actions: the statement's rows are computed again
+        /// (PostgreSQL copies the INSERT's expressions into each action),
+        /// NEW with the column defaults.
+        fn insertRuleActions(self: *Self, source: []const u8, insert: *const B.Insert, snap: Snapshot) Error!usize {
+            const table = &self.tables[insert.table];
+            var ctx = self.evalContext(source);
+            const derived: D.Derived = .{ .defaults = &insert.defaults, .generated = &insert.generated, .checks = &insert.checks };
+            var count: RuleCount = .{};
+            if (insert.plan != ast.none) {
+                const work = &self.workspace.query;
+                const rows = try X.queryRows(&self.tables, source, &self.workspace.nodes, &self.workspace.plans, insert.plan, snap, &self.session, work);
+                for (0..rows.count) |index| {
+                    try self.session.checkpoint();
+                    ctx.tuple[1] = X.rowAt(work, rows, index);
+                    var cells = try D.insertedRowDeferred(&ctx, table, &insert.values, derived);
+                    try self.applyRuleActions(insert.table, '3', &cells, null, '3', &count, snap);
+                }
+            } else if (insert.rows == ast.none) {
+                var cells = try D.insertedRowDeferred(&ctx, table, &insert.values, derived);
+                try self.applyRuleActions(insert.table, '3', &cells, null, '3', &count, snap);
+            } else {
+                const nodes = &self.workspace.nodes.nodes;
+                var row = insert.rows;
+                while (row != ast.none) : (row = nodes[row].next) {
+                    try self.session.checkpoint();
+                    var values: [config.columns]u16 = @splat(ast.none);
+                    var item = nodes[row].b;
+                    var item_index: usize = 0;
+                    while (item != ast.none) : (item = nodes[item].next) {
+                        values[insert.mapping[item_index]] = item;
+                        item_index += 1;
+                    }
+                    var cells = try D.insertedRowDeferred(&ctx, table, &values, derived);
+                    try self.applyRuleActions(insert.table, '3', &cells, null, '3', &count, snap);
+                }
+            }
+            return count.total;
+        }
+
+        /// UPDATE / DELETE rule actions, before the original statement:
+        /// every row of the table its WHERE keeps (with NEW for UPDATE).
+        fn changeRuleActions(self: *Self, source: []const u8, table_index: usize, event: u8, where: u16, from: u16, offsets: *const [config.relations]u16, values: ?*const [config.columns]u16, update: ?*const B.Update, snap: Snapshot) Error!usize {
+            const table = &self.tables[table_index];
+            var ctx = self.evalContext(source);
+            const joined = try self.joinedRows(source, from, offsets, snap);
+            var count: RuleCount = .{};
+            const high = table.row_high;
+            for (0..high) |row| {
+                try self.session.checkpoint();
+                if (table.rows[row].newest == 0) continue;
+                const version = S.visibleAt(table, row, snap) orelse continue;
+                var old: E.Row = undefined;
+                S.copyVersionRow(table, version, &old);
+                if (!try self.keepJoined(&ctx, where, joined, &old)) continue;
+                if (values) |assigned| {
+                    const bound = update.?;
+                    const derived: D.Derived = .{ .defaults = &bound.defaults, .generated = &bound.generated, .checks = &bound.checks };
+                    var new = try D.updatedRowDeferred(&ctx, table, assigned, derived, &old);
+                    try self.applyRuleActions(table_index, event, &new, &old, event, &count, snap);
+                } else try self.applyRuleActions(table_index, event, null, &old, event, &count, snap);
+            }
+            return count.total;
+        }
+
         /// DROP TABLE takes the table's triggers and rules along (their
         /// drops are encoded before the table's).
         fn dropTableObjects(self: *Self, slot: u16, oid: u32, snap: Snapshot) Error!void {
@@ -14312,6 +14853,1020 @@ pub fn Database(comptime config: Config) type {
                 if (rule.stamp.deleterOther(snap)) |other| return self.waitObject(slot, other);
                 try self.dropObject(slot, .rule, index, snap);
             }
+        }
+
+        // ---- views as INSERT / UPDATE / DELETE targets (B11 wave 4) ---------
+
+        /// The view an INSERT / UPDATE / DELETE names, if it names one
+        /// (other targets, and names that do not resolve, bind as usual).
+        fn dmlView(self: *Self, original: []const u8, parsed: *const A.Statement, snap: Snapshot) ?usize {
+            const schema: ?ast.Ident, const name: ast.Ident = switch (parsed.*) {
+                .insert => |*insert| .{ insert.schema, insert.table },
+                .update => |*update| .{ update.schema, update.table },
+                .delete => |*delete| .{ delete.schema, delete.table },
+                else => return null,
+            };
+            if (schema == null and !self.session.public_schema_on_path) return null;
+            const schema_name = if (schema) |qualifier| identName(original, qualifier) else Name{};
+            const namespace = (self.namespaceForUsage(self.session.role, if (schema != null) schema_name.slice() else null, snap) catch return null) orelse return null;
+            const found = self.catalog.findIn(namespace, identName(original, name).slice(), snap) orelse return null;
+            return if (found.kind == 'v') found.slot else null;
+        }
+
+        fn eventOf(parsed: *const A.Statement) u8 {
+            return switch (parsed.*) {
+                .insert => tg.tg_insert,
+                .update => tg.tg_update,
+                else => tg.tg_delete,
+            };
+        }
+
+        fn insteadTriggers(self: *const Self, view: usize, event: u8, snap: Snapshot) bool {
+            var list: [config.triggers]u8 = undefined;
+            const count = self.objects.tableTriggers(self.tables[view].oid, snap, &list);
+            for (list[0..count]) |position| {
+                if (triggerMatches(&self.objects.triggers[position], tg.tg_instead, true, event)) return true;
+            }
+            return false;
+        }
+
+        /// The workspace bounds a view statement changes (restored after it).
+        const ViewBounds = struct { floor_cells: usize, top_cells: usize, floor_refs: usize, top_refs: usize, floor_values: usize, pinned_cells: usize, pinned_refs: usize };
+
+        fn viewBounds(work: *const X.Work) ViewBounds {
+            return .{ .floor_cells = work.floor_cells, .top_cells = work.top_cells, .floor_refs = work.floor_refs, .top_refs = work.top_refs,
+                .floor_values = work.floor_values, .pinned_cells = work.pinned_cells, .pinned_refs = work.pinned_refs };
+        }
+
+        fn restoreBounds(work: *X.Work, bounds: ViewBounds) void {
+            work.floor_cells = bounds.floor_cells;
+            work.top_cells = bounds.top_cells;
+            work.floor_refs = bounds.floor_refs;
+            work.top_refs = bounds.top_refs;
+            work.floor_values = bounds.floor_values;
+            work.pinned_cells = bounds.pinned_cells;
+            work.pinned_refs = bounds.pinned_refs;
+        }
+
+        /// INSERT / UPDATE / DELETE on a view: its INSTEAD OF row triggers
+        /// run for every new row (INSERT) or every view row the WHERE keeps
+        /// (UPDATE / DELETE), with NEW / OLD shaped like the view. A NULL
+        /// result skips the row; RETURNING reads the row a trigger returned
+        /// (OLD for DELETE). Statement triggers of the view fire around it.
+        /// A view without a trigger for the event is not updatable here
+        /// (55000).
+        fn viewModify(self: *Self, slot: u16, original: []const u8, parsed: *const A.Statement, snap: Snapshot, mode: ParseMode, view: usize) Error!void {
+            const event = eventOf(parsed);
+            try self.lockTable(slot, view, .row_exclusive);
+            const rule_event: u8 = switch (event) {
+                tg.tg_insert => '3',
+                tg.tg_update => '2',
+                else => '4',
+            };
+            // Rules of the view (B11 wave 4): an unconditional INSTEAD rule
+            // replaces the statement; other rules need INSTEAD OF triggers
+            // for the rest (rules beside automatic updating are outside the
+            // subset).
+            const plan: ViewPlan = .{ .triggers = self.insteadTriggers(view, event, snap), .rules = self.ruleKind(view, rule_event, snap), .rule_event = rule_event };
+            if (!plan.triggers and plan.rules != .everything) return if (self.anyRuleFor(view, event, snap)) error.UnsupportedStatement else error.ObjectNotInPrerequisiteState;
+            const returning_count: usize = switch (parsed.*) {
+                .insert => |*insert| insert.returning.count,
+                .update => |*update| update.returning.count,
+                .delete => |*delete| delete.returning.count,
+                else => 0,
+            };
+            _ = try self.insteadNothing(view, rule_event, returning_count != 0, snap);
+            const actions = try self.ruleEnter(view, rule_event, snap);
+            defer if (actions) self.ruleLeave();
+            try self.statementTriggers(view, tg.tg_before, &.{event}, snap);
+            const work = &self.workspace.query;
+            const bounds = viewBounds(work);
+            defer restoreBounds(work, bounds);
+            var rows: X.List = .{ .start = 0, .count = 0 };
+            if (event != tg.tg_insert) rows = try self.viewRowList(slot, view, snap);
+            // The statement itself binds over the view's columns.
+            const top = try P.parseTopWithOptions(original, &self.workspace.nodes, .{ .mode = mode, .dialect = self.dialect });
+            var statement_copy = top.command;
+            const source = try expandRelations(self, &self.workspace, original, snap, &statement_copy, self.session.role, &self.session);
+            var context = self.bindContext(source, mode, snap);
+            context.stored_source_start = original.len;
+            context.view_target = true;
+            var bound: B.Bound = undefined;
+            try B.bindInto(&context, &statement_copy, &bound);
+            if (self.txs[slot].read_only) try readOnlyCheck(&bound, &self.workspace.plans);
+            try self.checkPrivileges(&bound, snap);
+            try self.lockSources(slot);
+            var staged: ViewStaging = .{};
+            var count: RuleCount = .{};
+            var affected: usize = switch (bound) {
+                .insert => |*insert| try self.viewInsert(slot, source, insert, view, snap, &staged, plan, &count),
+                .update => |*update| try self.viewUpdate(source, update, view, rows, snap, &staged, plan, &count),
+                .delete => |*delete| try self.viewDelete(source, delete, view, rows, snap, &staged, plan, &count),
+                else => return error.UnsupportedStatement,
+            };
+            if (plan.rules == .everything) affected = count.total;
+            try self.statementTriggers(view, 0, &.{event}, snap);
+            self.outcome = .{ .affected = affected, .command = B.command(&bound) };
+            const returning: ?*const B.Returning = switch (bound) {
+                .insert => |*insert| &insert.returning,
+                .update => |*update| &update.returning,
+                .delete => |*delete| &delete.returning,
+                else => null,
+            };
+            if (returning) |list| if (list.count != 0) {
+                if (list.output) return error.UnsupportedStatement;
+                var returned: Returned = .{ .count = list.count, .rows = staged.rows, .base = staged.base, .non_null_columns = list.non_null_columns };
+                @memcpy(returned.names[0..list.count], list.names[0..list.count]);
+                @memcpy(returned.types[0..list.count], list.types[0..list.count]);
+                @memcpy(returned.typmods[0..list.count], list.typmods[0..list.count]);
+                self.outcome.returning = returned;
+            };
+        }
+
+        /// Every row of a view under the statement snapshot, materialized in
+        /// the query workspace and kept below its floors while the
+        /// statement runs (the caller restores them).
+        fn viewRowList(self: *Self, slot: u16, view: usize, snap: Snapshot) Error!X.List {
+            const table = &self.tables[view];
+            var text: [2 * 2 * config.name_bytes + 32]u8 = undefined;
+            var used: usize = 0;
+            try appendText(&text, &used, "SELECT * FROM ");
+            try appendQuoted(&text, &used, self.namespaceName(table.namespace));
+            try appendText(&text, &used, ".");
+            try appendQuoted(&text, &used, table.name.slice());
+            const query_text = text[0..used];
+            var parsed = try P.parse(query_text, &self.workspace.nodes, .standard);
+            const source = try expandRelations(self, &self.workspace, query_text, snap, &parsed, self.session.role, &self.session);
+            if (parsed == .select) {
+                const top_query = parsed.select;
+                parsed = .{ .query = top_query };
+                self.workspace.nodes.complex = true;
+            }
+            var context = self.bindContext(source, .standard, snap);
+            context.stored_source_start = query_text.len;
+            var bound: B.Bound = undefined;
+            try B.bindInto(&context, &parsed, &bound);
+            const root = switch (bound) {
+                .query => |root| root,
+                else => return error.UnsupportedStatement,
+            };
+            try self.lockSources(slot);
+            const work = &self.workspace.query;
+            const list = try X.queryRows(&self.tables, source, &self.workspace.nodes, &self.workspace.plans, root, snap, &self.session, work);
+            if (self.workspace.plans.items[root].count != table.column_count) return error.UnsupportedStatement;
+            work.floor_values = nested_module.valueFloor(work);
+            work.floor_cells = work.cell_low;
+            work.floor_refs = work.ref_low;
+            work.top_cells = work.cells.len - work.cell_high;
+            work.top_refs = work.refs.len - work.ref_high;
+            work.pinned_cells = 0;
+            work.pinned_refs = 0;
+            return list;
+        }
+
+        /// RETURNING rows of a view statement, staged in the workspace in
+        /// row order.
+        const ViewStaging = struct { base: usize = 0, rows: usize = 0 };
+
+        fn stageReturning(self: *Self, source: []const u8, list: *const B.Returning, row: *const E.Row, staged: *ViewStaging, capacity: usize) Error!void {
+            if (list.count == 0) return;
+            if (staged.rows >= capacity) return error.RowCapacity;
+            const work = &self.workspace.query;
+            const at = try X.stageCells(work, list.count);
+            if (staged.rows == 0) staged.base = at else if (at != staged.base + staged.rows * list.count) return error.WorkspaceCapacity;
+            var ctx = self.evalContext(source);
+            ctx.row = row;
+            for (list.targets[0..list.count], 0..) |id, column| work.cells[at + column] = try E.eval(&ctx, id);
+            staged.rows += 1;
+        }
+
+        /// How a view statement runs: INSTEAD OF triggers, rules, or both.
+        const ViewPlan = struct { triggers: bool, rules: RuleKind, rule_event: u8 };
+
+        fn anyRuleFor(self: *const Self, view: usize, event: u8, snap: Snapshot) bool {
+            const rule_event: u8 = switch (event) {
+                tg.tg_insert => '3',
+                tg.tg_update => '2',
+                else => '4',
+            };
+            var list: [config.rules]u8 = undefined;
+            return self.objects.tableRules(self.tables[view].oid, rule_event, snap, &list) != 0;
+        }
+
+        /// One row of a view statement: rule actions (after the row for
+        /// INSERT, before it for UPDATE / DELETE, as PostgreSQL orders the
+        /// action queries) and the INSTEAD OF triggers unless a rule
+        /// replaces the row. True when a trigger processed the row.
+        fn viewRow(self: *Self, view: usize, event: u8, new: ?*E.Row, old: ?*E.Row, plan: ViewPlan, count: *RuleCount, snap: Snapshot) Error!bool {
+            if (event != tg.tg_insert) try self.applyRuleActions(view, plan.rule_event, new, old, plan.rule_event, count, snap);
+            var processed = false;
+            if (plan.triggers and plan.rules != .everything) {
+                const replaced = plan.rules == .conditional and try self.ruleSkips(view, plan.rule_event, new, old, snap);
+                if (!replaced) processed = try self.insteadRow(view, event, new, old, snap);
+            }
+            if (event == tg.tg_insert) try self.applyRuleActions(view, plan.rule_event, new, old, plan.rule_event, count, snap);
+            return processed;
+        }
+
+        /// INSTEAD OF row triggers of `view` in name order: each receives
+        /// the row the previous one returned; false when one returned NULL.
+        fn insteadRow(self: *Self, view: usize, event: u8, new: ?*E.Row, old: ?*E.Row, snap: Snapshot) Error!bool {
+            var list: [config.triggers]u8 = undefined;
+            const count = self.objects.tableTriggers(self.tables[view].oid, snap, &list);
+            for (list[0..count]) |position| {
+                const trigger = &self.objects.triggers[position];
+                if (!triggerMatches(trigger, tg.tg_instead, true, event)) continue;
+                switch (try self.callTrigger(trigger, view, tg.tg_instead, true, event, new, old, snap)) {
+                    .new => if (new == null) return false,
+                    .old => {
+                        const row = old orelse return false;
+                        if (new) |target_row| target_row.* = row.*;
+                    },
+                    .null_row, .none => return false,
+                }
+            }
+            return true;
+        }
+
+        fn viewInsert(self: *Self, slot: u16, source: []const u8, insert: *const B.Insert, view: usize, snap: Snapshot, staged: *ViewStaging, plan: ViewPlan, count: *RuleCount) Error!usize {
+            _ = slot;
+            if (insert.conflict.action != .none or insert.replace) return error.UnsupportedStatement;
+            const table = &self.tables[view];
+            var ctx = self.evalContext(source);
+            const derived: D.Derived = .{ .defaults = &insert.defaults, .generated = &insert.generated, .checks = &insert.checks };
+            const capacity = self.routine_result.?.rows.len;
+            var affected: usize = 0;
+            if (insert.plan != ast.none) {
+                const work = &self.workspace.query;
+                const rows = try X.queryRows(&self.tables, source, &self.workspace.nodes, &self.workspace.plans, insert.plan, snap, &self.session, work);
+                for (0..rows.count) |index| {
+                    try self.session.checkpoint();
+                    ctx.tuple[1] = X.rowAt(work, rows, index);
+                    var cells = try D.insertedRow(&ctx, table, &insert.values, derived);
+                    if (!try self.viewRow(view, tg.tg_insert, &cells, null, plan, count, snap)) continue;
+                    affected += 1;
+                    try self.stageReturning(source, &insert.returning, &cells, staged, capacity);
+                }
+            } else if (insert.rows == ast.none) {
+                var cells = try D.insertedRow(&ctx, table, &insert.values, derived);
+                if (try self.viewRow(view, tg.tg_insert, &cells, null, plan, count, snap)) {
+                    affected += 1;
+                    try self.stageReturning(source, &insert.returning, &cells, staged, capacity);
+                }
+            } else {
+                const nodes = &self.workspace.nodes.nodes;
+                var row = insert.rows;
+                while (row != ast.none) : (row = nodes[row].next) {
+                    try self.session.checkpoint();
+                    var values: [config.columns]u16 = @splat(ast.none);
+                    var item = nodes[row].b;
+                    var item_index: usize = 0;
+                    while (item != ast.none) : (item = nodes[item].next) {
+                        values[insert.mapping[item_index]] = item;
+                        item_index += 1;
+                    }
+                    var cells = try D.insertedRow(&ctx, table, &values, derived);
+                    if (!try self.viewRow(view, tg.tg_insert, &cells, null, plan, count, snap)) continue;
+                    affected += 1;
+                    try self.stageReturning(source, &insert.returning, &cells, staged, capacity);
+                }
+            }
+            return affected;
+        }
+
+        fn viewUpdate(self: *Self, source: []const u8, update: *const B.Update, view: usize, rows: X.List, snap: Snapshot, staged: *ViewStaging, plan: ViewPlan, count: *RuleCount) Error!usize {
+            const table = &self.tables[view];
+            var ctx = self.evalContext(source);
+            const derived: D.Derived = .{ .defaults = &update.defaults, .generated = &update.generated, .checks = &update.checks };
+            const joined = try self.joinedRows(source, update.from, &update.offsets, snap);
+            const capacity = self.routine_result.?.rows.len;
+            var affected: usize = 0;
+            for (0..rows.count) |index| {
+                try self.session.checkpoint();
+                var old: E.Row = @splat(.null_value);
+                const row = X.rowAt(&self.workspace.query, rows, index);
+                for (0..table.column_count) |column| old[column] = row[column];
+                if (!try self.keepJoined(&ctx, update.where, joined, &old)) continue;
+                var new = try D.updatedRow(&ctx, table, &update.values, derived, &old);
+                if (!try self.viewRow(view, tg.tg_update, &new, &old, plan, count, snap)) continue;
+                affected += 1;
+                try self.stageReturning(source, &update.returning, &new, staged, capacity);
+            }
+            return affected;
+        }
+
+        fn viewDelete(self: *Self, source: []const u8, delete: *const B.Delete, view: usize, rows: X.List, snap: Snapshot, staged: *ViewStaging, plan: ViewPlan, count: *RuleCount) Error!usize {
+            const table = &self.tables[view];
+            var ctx = self.evalContext(source);
+            const joined = try self.joinedRows(source, delete.using, &delete.offsets, snap);
+            const capacity = self.routine_result.?.rows.len;
+            var affected: usize = 0;
+            for (0..rows.count) |index| {
+                try self.session.checkpoint();
+                var old: E.Row = @splat(.null_value);
+                const row = X.rowAt(&self.workspace.query, rows, index);
+                for (0..table.column_count) |column| old[column] = row[column];
+                if (!try self.keepJoined(&ctx, delete.where, joined, &old)) continue;
+                var kept = old;
+                if (!try self.viewRow(view, tg.tg_delete, null, &kept, plan, count, snap)) continue;
+                affected += 1;
+                try self.stageReturning(source, &delete.returning, &old, staged, capacity);
+            }
+            return affected;
+        }
+
+        /// PostgreSQL's errdetail for a view that is not automatically
+        /// updatable (SQLSTATE 55000), kept for the caller after the error.
+        pub const view_details = struct {
+            pub const distinct = "Views containing DISTINCT are not automatically updatable.";
+            pub const group = "Views containing GROUP BY are not automatically updatable.";
+            pub const having = "Views containing HAVING are not automatically updatable.";
+            pub const set_operation = "Views containing UNION, INTERSECT, or EXCEPT are not automatically updatable.";
+            pub const with = "Views containing WITH are not automatically updatable.";
+            pub const limit = "Views containing LIMIT or OFFSET are not automatically updatable.";
+            pub const aggregate = "Views that return aggregate functions are not automatically updatable.";
+            pub const window = "Views that return window functions are not automatically updatable.";
+            pub const single = "Views that do not select from a single table or view are not automatically updatable.";
+            pub const no_columns = "Views that have no updatable columns are not automatically updatable.";
+            pub const column = "View columns that are not columns of their base relation are not updatable.";
+        };
+
+        /// The detail of the last view updatability error (empty: none).
+        pub fn lastErrorDetail(self: *const Self) []const u8 {
+            return self.error_detail;
+        }
+
+        fn viewError(self: *Self, detail: []const u8) Error {
+            self.error_detail = detail;
+            return error.ObjectNotInPrerequisiteState;
+        }
+
+        fn columnError(self: *Self) Error {
+            self.error_detail = view_details.column;
+            return error.UnsupportedStatement;
+        }
+
+        /// Text of a rewritten view statement: the user's statement and the
+        /// stored view definitions it reaches, in the top of the query
+        /// workspace (kept until the statement ends).
+        const RewriteText = struct {
+            bytes: []u8,
+            len: usize,
+
+            fn add(self: *RewriteText, text: []const u8) Error!usize {
+                if (text.len > self.bytes.len - self.len) return error.TextCapacity;
+                const start = self.len;
+                @memcpy(self.bytes[start..][0..text.len], text);
+                self.len += text.len;
+                return start;
+            }
+
+            /// A quoted identifier for `name` (a view column name).
+            fn ident(self: *RewriteText, name: []const u8) Error!ast.Ident {
+                _ = try self.add(" \"");
+                const start = self.len;
+                for (name) |byte| {
+                    if (byte == '"') _ = try self.add("\"\"") else _ = try self.add(&[_]u8{byte});
+                }
+                const span_len = self.len - start;
+                _ = try self.add("\"");
+                return .{ .span = .{ .start = start, .len = span_len }, .quoted = true, .len = name.len };
+            }
+        };
+
+        /// One auto-updatable view: its parsed definition, the base relation
+        /// it selects from and the expression of each view column.
+        const ViewShape = struct {
+            query: u16 = ast.none,
+            item: A.FromItem = .{},
+            columns: [config.columns]u16 = @splat(ast.none),
+            plain: [config.columns]bool = @splat(false),
+            count: usize = 0,
+            where: u16 = ast.none,
+        };
+
+        /// PostgreSQL's view_query_is_auto_updatable over the stored
+        /// definition, parsed into the pool from `text`.
+        fn viewShape(self: *Self, view: usize, text: *RewriteText, for_columns: bool) Error!ViewShape {
+            const table = &self.tables[view];
+            _ = try text.add(" ");
+            const start = try text.add(table.query.slice());
+            const pool = &self.workspace.nodes;
+            const query = try P.parseQueryAt(text.bytes[0..text.len], start, text.len, pool);
+            const q = &pool.queries[query];
+            if (q.distinct or q.distinct_on_count != 0) return self.viewError(view_details.distinct);
+            if (q.group_count != 0 or q.grouping_sets != ast.none or q.rollup) return self.viewError(view_details.group);
+            if (q.having != ast.none) return self.viewError(view_details.having);
+            if (q.set_op != .none) return self.viewError(view_details.set_operation);
+            if (q.cte_count != 0) return self.viewError(view_details.with);
+            if (q.limit_present or q.offset_present) return self.viewError(view_details.limit);
+            var shape: ViewShape = .{ .query = query, .where = q.where };
+            // Targets: `*` (the base columns) or one expression per column.
+            var star = false;
+            for (q.targets[0..q.count]) |item_target| {
+                if (item_target.star) {
+                    star = true;
+                    continue;
+                }
+                if (containsKind(pool, item_target.expr, .aggregate)) return self.viewError(view_details.aggregate);
+                if (containsWindow(pool, item_target.expr)) return self.viewError(view_details.window);
+            }
+            if (q.item_count != 1 or q.from == null and q.item_count == 0) return self.viewError(view_details.single);
+            const item = q.items[0];
+            if (item.query != ast.none or item.function != ast.none or item.join != .first or item.sample_method != 0 or item.column_aliases != ast.none)
+                return self.viewError(view_details.single);
+            shape.item = item;
+            const base = try self.viewBase(text.bytes[0..text.len], &item);
+            const base_table = &self.tables[base];
+            if (base_table.relkind != 'r' and base_table.relkind != 'p' and base_table.relkind != 'v') return self.viewError(view_details.single);
+            // View columns in order.
+            var count: usize = 0;
+            for (q.targets[0..q.count]) |item_target| {
+                if (item_target.star) {
+                    for (base_table.columns[0..base_table.column_count]) |*column| {
+                        if (count == config.columns) return error.ColumnCapacity;
+                        const name = try text.ident(column.name.slice());
+                        shape.columns[count] = try pool.add(.{ .kind = .column, .name = name, .qualifier = if (item.alias) |alias| alias else item.name });
+                        shape.plain[count] = true;
+                        count += 1;
+                    }
+                    continue;
+                }
+                if (count == config.columns) return error.ColumnCapacity;
+                const n = &pool.nodes[item_target.expr];
+                shape.columns[count] = item_target.expr;
+                shape.plain[count] = n.kind == .column and !n.star and (n.qualifier.len == 0 or sameIdent(text.bytes[0..text.len], n.qualifier, if (item.alias) |alias| alias else item.name));
+                count += 1;
+            }
+            if (star and count == 0) return self.viewError(view_details.single);
+            if (count != table.column_count) return error.UnsupportedStatement;
+            shape.count = count;
+            if (for_columns) {
+                var any = false;
+                for (shape.plain[0..count]) |plain| any = any or plain;
+                if (!any) return self.viewError(view_details.no_columns);
+            }
+            // The definition's FROM item is not expanded with the statement.
+            q.item_count = 0;
+            return shape;
+        }
+
+        fn viewBase(self: *Self, text: []const u8, item: *const A.FromItem) Error!usize {
+            const snap = self.routine_snap;
+            const schema_name = if (item.schema) |qualifier| identName(text, qualifier) else Name{};
+            const namespace = (try self.namespaceForUsage(self.session.role, if (item.schema != null) schema_name.slice() else null, snap)) orelse return error.TableNotFound;
+            const found = self.catalog.findIn(namespace, identName(text, item.name).slice(), snap) orelse return error.TableNotFound;
+            if (found.kind == 'S') return self.viewError(view_details.single);
+            return found.slot;
+        }
+
+        fn sameIdent(text: []const u8, a: ast.Ident, b: ast.Ident) bool {
+            return types.same(identName(text, a).slice(), identName(text, b).slice());
+        }
+
+        fn containsKind(pool: *const A.Pool, id: u16, kind: ast.NodeKind) bool {
+            if (id == ast.none) return false;
+            const n = &pool.nodes[id];
+            if (n.kind == kind) return true;
+            for ([_]u16{ n.a, n.b, n.c }) |child| {
+                var item = child;
+                while (item != ast.none) : (item = pool.nodes[item].next) if (containsKind(pool, item, kind)) return true;
+            }
+            return false;
+        }
+
+        fn containsWindow(pool: *const A.Pool, id: u16) bool {
+            if (id == ast.none) return false;
+            const n = &pool.nodes[id];
+            if (n.window != ast.none) return true;
+            for ([_]u16{ n.a, n.b, n.c }) |child| {
+                var item = child;
+                while (item != ast.none) : (item = pool.nodes[item].next) if (containsWindow(pool, item)) return true;
+            }
+            return false;
+        }
+
+        /// A copy of an expression tree in the pool (a view column read
+        /// through the view); subqueries are outside the subset.
+        fn copyTree(pool: *A.Pool, id: u16) Error!u16 {
+            if (id == ast.none) return ast.none;
+            var n = pool.nodes[id];
+            switch (n.kind) {
+                .scalar_subquery, .exists_subquery, .in_subquery, .aggregate => return error.UnsupportedStatement,
+                else => {},
+            }
+            if (n.window != ast.none or n.order != ast.none) return error.UnsupportedStatement;
+            n.a = try copyChain(pool, n.a);
+            n.b = try copyChain(pool, n.b);
+            n.c = try copyChain(pool, n.c);
+            n.next = ast.none;
+            return pool.add(n);
+        }
+
+        fn copyChain(pool: *A.Pool, head: u16) Error!u16 {
+            var first: u16 = ast.none;
+            var last: u16 = ast.none;
+            var item = head;
+            while (item != ast.none) : (item = pool.nodes[item].next) {
+                const copy = try copyTree(pool, item);
+                if (last == ast.none) first = copy else pool.nodes[last].next = copy;
+                last = copy;
+            }
+            return first;
+        }
+
+        /// The view column a statement's column node names, if it names one:
+        /// unqualified, or qualified by the view's name or alias.
+        fn viewColumnOf(self: *const Self, text: []const u8, view: usize, n: *const ast.Node, names: []const ast.Ident) Error!?usize {
+            if (n.kind != .column or n.star) return null;
+            if (n.qualifier.len != 0) {
+                var mine = false;
+                for (names) |name| mine = mine or sameIdent(text, n.qualifier, name);
+                if (!mine) return null;
+            }
+            const wanted = identName(text, n.name);
+            const table = &self.tables[view];
+            for (table.columns[0..table.column_count], 0..) |*column, index| {
+                if (types.same(column.name.slice(), wanted.slice())) return index;
+            }
+            return error.ColumnNotFound;
+        }
+
+        /// Rewrites the view's column references under `id` (not inside
+        /// subqueries) to the base relation's columns or expressions.
+        fn substituteView(self: *Self, text: []const u8, view: usize, shape: *const ViewShape, names: []const ast.Ident, id: u16) Error!void {
+            if (id == ast.none) return;
+            const pool = &self.workspace.nodes;
+            const n = &pool.nodes[id];
+            if (try self.viewColumnOf(text, view, n, names)) |column| {
+                const keep_next = n.next;
+                const source_node = shape.columns[column];
+                if (shape.plain[column]) {
+                    const base = pool.nodes[source_node];
+                    n.name = base.name;
+                    n.qualifier = base.qualifier;
+                } else {
+                    const copy = try copyTree(pool, source_node);
+                    pool.nodes[id] = pool.nodes[copy];
+                }
+                pool.nodes[id].next = keep_next;
+                return;
+            }
+            for ([_]u16{ n.a, n.b, n.c }) |child| {
+                var item = child;
+                while (item != ast.none) : (item = pool.nodes[item].next) try self.substituteView(text, view, shape, names, item);
+            }
+        }
+
+        /// A RETURNING list over the view: `*` becomes the view's columns,
+        /// every reference reads the base relation.
+        fn rewriteReturning(self: *Self, text: *RewriteText, view: usize, shape: *const ViewShape, names: []const ast.Ident, list: *A.Returning) Error!void {
+            if (list.count == 0) return;
+            if (list.output) return error.UnsupportedStatement;
+            var out: [config.columns]A.Target = undefined;
+            var count: usize = 0;
+            const table = &self.tables[view];
+            for (list.targets[0..list.count]) |item_target| {
+                if (item_target.star) {
+                    if (item_target.expr != ast.none) {
+                        const n = &self.workspace.nodes.nodes[item_target.expr];
+                        if (n.qualifier.len != 0) {
+                            var mine = false;
+                            for (names) |name| mine = mine or sameIdent(text.bytes[0..text.len], n.qualifier, name);
+                            if (!mine) return error.UnsupportedStatement;
+                        }
+                    }
+                    for (0..shape.count) |column| {
+                        if (count == config.columns) return error.ColumnCapacity;
+                        const expr = if (shape.plain[column]) try self.workspace.nodes.add(self.workspace.nodes.nodes[shape.columns[column]]) else try copyTree(&self.workspace.nodes, shape.columns[column]);
+                        self.workspace.nodes.nodes[expr].next = ast.none;
+                        out[count] = .{ .expr = expr, .alias = try text.ident(table.columns[column].name.slice()) };
+                        count += 1;
+                    }
+                    continue;
+                }
+                if (count == config.columns) return error.ColumnCapacity;
+                var copy = item_target;
+                // An unaliased column keeps the view column's name.
+                if (copy.alias == null and item_target.expr != ast.none) {
+                    if (try self.viewColumnOf(text.bytes[0..text.len], view, &self.workspace.nodes.nodes[item_target.expr], names)) |column| copy.alias = try text.ident(table.columns[column].name.slice());
+                }
+                try self.substituteView(text.bytes[0..text.len], view, shape, names, copy.expr);
+                out[count] = copy;
+                count += 1;
+            }
+            @memcpy(list.targets[0..count], out[0..count]);
+            list.count = count;
+        }
+
+        /// The base column a view column assignment or INSERT target names
+        /// (0A000 for a column that is not a base column).
+        fn viewTargetColumn(self: *Self, text: []const u8, view: usize, shape: *const ViewShape, ident: ast.Ident) Error!ast.Ident {
+            const wanted = identName(text, ident);
+            const table = &self.tables[view];
+            for (table.columns[0..table.column_count], 0..) |*column, index| {
+                if (!types.same(column.name.slice(), wanted.slice())) continue;
+                if (!shape.plain[index]) return self.columnError();
+                return self.workspace.nodes.nodes[shape.columns[index]].name;
+            }
+            return error.ColumnNotFound;
+        }
+
+        /// An INSERT / UPDATE / DELETE on an automatically updatable view
+        /// becomes the same statement on its base relation (PostgreSQL's
+        /// rewriteTargetView): column names map to the base columns, reads
+        /// of view columns to their expressions, and UPDATE / DELETE keep
+        /// only rows of the view (its WHERE). Views over views repeat it.
+        /// Returns the statement text the rewritten statement reads.
+        fn rewriteViewTarget(self: *Self, slot: u16, original: []const u8, rewritten: *A.Statement, first_view: usize, snap: Snapshot) Error![]const u8 {
+            const work = &self.workspace.query;
+            const limit = @min(config.expansion_bytes, (work.cells.len - work.top_cells - work.pinned_cells - work.floor_cells) * @sizeOf(Cell) / 2);
+            const need = nested_module.cellsFor(Cell, limit);
+            if (limit < original.len or work.cells.len - work.top_cells - work.pinned_cells < work.floor_cells + need) return error.WorkspaceCapacity;
+            const at = work.cells.len - work.top_cells - work.pinned_cells - need;
+            work.top_cells = work.cells.len - at - work.pinned_cells;
+            if (work.cell_high > at) work.cell_high = at;
+            const bytes: [*]u8 = @ptrCast(&work.cells[at]);
+            var text: RewriteText = .{ .bytes = bytes[0..limit], .len = 0 };
+            _ = try text.add(original);
+            const event: u8 = switch (rewritten.*) {
+                .insert => tg.tg_insert,
+                .update => tg.tg_update,
+                else => tg.tg_delete,
+            };
+            var view = first_view;
+            var depth: usize = 0;
+            while (true) : (depth += 1) {
+                if (depth == config.tables) return error.StackDepthExceeded;
+                // Privileges on the view itself belong to the user.
+                if (!self.privilegedRole(snap)) try self.needTable(view, switch (event) {
+                    tg.tg_insert => CO.priv_insert,
+                    tg.tg_update => CO.priv_update,
+                    else => CO.priv_delete,
+                }, snap);
+                if (depth != 0) try self.lockTable(slot, view, .row_exclusive);
+                const shape = try self.viewShape(view, &text, event != tg.tg_delete);
+                const current = text.bytes[0..text.len];
+                var names: [2]ast.Ident = undefined;
+                var name_count: usize = 0;
+                switch (rewritten.*) {
+                    .insert => |*insert| {
+                        if (insert.conflict != null) return error.UnsupportedStatement;
+                        names[0] = insert.table;
+                        name_count = 1;
+                        if (insert.alias) |alias| {
+                            names[0] = alias;
+                        }
+                        var columns: [config.columns]ast.Ident = undefined;
+                        var count: usize = 0;
+                        if (insert.explicit_columns) {
+                            for (insert.columns[0..insert.column_count]) |ident| {
+                                columns[count] = try self.viewTargetColumn(current, view, &shape, ident);
+                                count += 1;
+                            }
+                        } else {
+                            count = shape.count;
+                            if (insert.source == .values and insert.rows != ast.none) {
+                                const first = self.workspace.nodes.nodes[insert.rows].integer;
+                                if (first >= 1 and first < @as(i64, @intCast(count))) count = @intCast(first);
+                            } else if (insert.source == .default_values) count = 0;
+                            for (0..count) |column| {
+                                if (!shape.plain[column]) return self.columnError();
+                                columns[column] = self.workspace.nodes.nodes[shape.columns[column]].name;
+                            }
+                        }
+                        @memcpy(insert.columns[0..count], columns[0..count]);
+                        insert.column_count = count;
+                        insert.explicit_columns = count != 0;
+                        insert.schema = shape.item.schema;
+                        insert.table = shape.item.name;
+                        insert.alias = shape.item.alias;
+                        try self.rewriteReturning(&text, view, &shape, names[0..name_count], &insert.returning);
+                    },
+                    .update => |*update| {
+                        names[0] = update.alias orelse update.table;
+                        name_count = 1;
+                        for (update.assignments[0..update.count]) |*item| {
+                            item.column = try self.viewTargetColumn(current, view, &shape, item.column);
+                            try self.substituteView(current, view, &shape, names[0..name_count], item.value);
+                        }
+                        try self.substituteView(current, view, &shape, names[0..name_count], update.where);
+                        update.where = try self.andWhere(shape.where, update.where);
+                        try self.rewriteReturning(&text, view, &shape, names[0..name_count], &update.returning);
+                        update.schema = shape.item.schema;
+                        update.table = shape.item.name;
+                        update.alias = shape.item.alias;
+                        update.only = update.only or shape.item.only;
+                    },
+                    .delete => |*delete| {
+                        names[0] = delete.alias orelse delete.table;
+                        name_count = 1;
+                        try self.substituteView(current, view, &shape, names[0..name_count], delete.where);
+                        delete.where = try self.andWhere(shape.where, delete.where);
+                        try self.rewriteReturning(&text, view, &shape, names[0..name_count], &delete.returning);
+                        delete.schema = shape.item.schema;
+                        delete.table = shape.item.name;
+                        delete.alias = shape.item.alias;
+                        delete.only = delete.only or shape.item.only;
+                    },
+                    else => return error.UnsupportedStatement,
+                }
+                const base = try self.viewBase(text.bytes[0..text.len], &shape.item);
+                if (self.tables[base].relkind != 'v') break;
+                // A view under an INSTEAD OF trigger view is outside the subset.
+                if (self.insteadTriggers(base, event, snap)) return error.UnsupportedStatement;
+                view = base;
+            }
+            return text.bytes[0..text.len];
+        }
+
+        fn andWhere(self: *Self, view_where: u16, where: u16) Error!u16 {
+            if (view_where == ast.none) return where;
+            if (where == ast.none) return view_where;
+            return self.workspace.nodes.add(.{ .kind = .and_op, .a = view_where, .b = where });
+        }
+
+        // ---- rows of a routine statement (RETURN QUERY, SQL set bodies) ------
+
+        /// The rows a routine statement kept for its caller: `rows` rows of
+        /// `width` cells at `start` in the query workspace's free region,
+        /// right below the saved state of the statement that called it.
+        pub const RowStaging = struct {
+            done: bool = false,
+            start: usize = 0,
+            rows: usize = 0,
+            width: usize = 0,
+            tys: [config.columns]types.Type = @splat(.unknown),
+        };
+
+        const StagedSource = union(enum) { list: X.List, returned: struct { base: usize, rows: usize } };
+
+        /// A value leaving a nested statement (INTO captures, kept rows)
+        /// must own its bytes. Values up to Config.text_bytes are inline and
+        /// copy with the cell into the routine frame or the kept rows; a
+        /// larger one points into the nested statement's value region, which
+        /// the next statement reuses, and does not fit that bounded storage:
+        /// 54000 (TextCapacity) instead of a value that could change later.
+        fn ownCell(cell: V.Cell) Error!V.Cell {
+            switch (cell) {
+                inline else => |payload| if (@TypeOf(payload) == V.Text) {
+                    if (payload.indirect()) return error.TextCapacity;
+                },
+            }
+            return cell;
+        }
+
+        /// Copies a statement's result rows to the top of its free query
+        /// workspace (through the free bottom, so no source is overwritten):
+        /// the suspended statement's free region after nestedLeave.
+        fn stageRows(self: *Self, rows: StagedSource, width: usize, tys: []const types.Type, out: *RowStaging) Error!void {
+            const work = &self.workspace.query;
+            const count: usize = switch (rows) {
+                .list => |list| list.count,
+                .returned => |returned| returned.rows,
+            };
+            if (width > config.columns) return error.ColumnCapacity;
+            const total = count * width;
+            const top = work.cells.len - work.top_cells - work.pinned_cells;
+            if (work.cell_high < work.cell_low or work.cell_high - work.cell_low < total or top < work.cell_low + total) return error.WorkspaceCapacity;
+            const low = work.cell_low;
+            for (0..count) |index| {
+                try self.session.checkpoint();
+                for (0..width) |column| {
+                    work.cells[low + index * width + column] = try ownCell(switch (rows) {
+                        .list => |list| X.rowAt(work, list, index)[column],
+                        .returned => |returned| work.cells[returned.base + index * width + column],
+                    });
+                }
+            }
+            const start = top - total;
+            var at = total;
+            while (at > 0) {
+                at -= 1;
+                work.cells[start + at] = work.cells[low + at];
+            }
+            out.* = .{ .done = true, .start = start, .rows = count, .width = width };
+            @memcpy(out.tys[0..width], tys);
+        }
+
+        /// RETURN QUERY (and the final statement of a set-returning SQL
+        /// body): the statement runs nested, its rows are kept, then emitted
+        /// one by one as rows of the function, each column of the result
+        /// type (PostgreSQL: 42804 when the query's structure differs).
+        pub fn routineReturnQuery(self: *Self, frame: *R.Frame, text: []const u8, sink: R.Emit, columns: []const V.Column) Error!usize {
+            var staged: RowStaging = .{};
+            const saved = self.row_staging;
+            defer self.row_staging = saved;
+            self.row_staging = &staged;
+            _ = try self.routineStatement(frame, text, null);
+            if (!staged.done) return error.UnsupportedStatement;
+            if (staged.width != columns.len) return error.TypeMismatch;
+            for (columns, staged.tys[0..staged.width]) |column, from| {
+                if (from != .unknown and from != types.typeOfData(column.data_type)) return error.TypeMismatch;
+            }
+            return self.emitStaged(&staged, sink, columns);
+        }
+
+        /// Emits kept rows through a function's row sink. The rows move to
+        /// the top of the free region first, which stays reserved while the
+        /// sink appends below it.
+        fn emitStaged(self: *Self, staged: *const RowStaging, sink: R.Emit, columns: []const V.Column) Error!usize {
+            const work = &self.workspace.query;
+            const width = staged.width;
+            const total = staged.rows * width;
+            if (staged.rows == 0) return 0;
+            if (work.cell_high < staged.start + total or work.cell_high - total < work.cell_low) return error.WorkspaceCapacity;
+            const start = work.cell_high - total;
+            var at = total;
+            while (at > 0) {
+                at -= 1;
+                work.cells[start + at] = work.cells[staged.start + at];
+            }
+            const saved_high = work.cell_high;
+            defer work.cell_high = saved_high;
+            work.cell_high = start;
+            var row: [config.columns]V.Cell = undefined;
+            for (0..staged.rows) |index| {
+                try self.session.checkpoint();
+                for (columns, 0..) |*column, position| {
+                    var cell = work.cells[start + index * width + position];
+                    if (cell != .null_value and staged.tys[position] == .unknown) cell = try E.cast(cell, .text, types.typeOfData(column.data_type), column.typmod, &self.session);
+                    row[position] = try D.store(column, cell, &self.session);
+                }
+                try sink.call(sink.ptr, &row);
+            }
+            return staged.rows;
+        }
+
+        /// A SQL body that is not inlined, called in FROM: every statement
+        /// runs nested; a set-returning body emits every row of its final
+        /// statement (a query or a RETURNING), another one the first row
+        /// (a row of NULLs without one).
+        fn sqlFunctionRows(self: *Self, frame: *R.Frame, text_body: []const u8, columns: []const V.Column, retset: bool, sink: R.Emit) Error!void {
+            var statements: R.Statements = .{ .source = text_body };
+            var pending: ?R.Span = null;
+            while (try statements.next()) |span| {
+                if (pending) |earlier| {
+                    try self.session.checkpoint();
+                    _ = try self.routineStatement(frame, text_body[earlier.start..earlier.end], null);
+                }
+                pending = span;
+            }
+            const last = pending orelse return error.InvalidFunctionDefinition;
+            const text = text_body[last.start..last.end];
+            if (retset) {
+                _ = try self.routineReturnQuery(frame, text, sink, columns);
+                return;
+            }
+            var capture: R.Capture = .{};
+            _ = try self.routineStatement(frame, text, &capture);
+            var row: [config.columns]V.Cell = @splat(.null_value);
+            if (capture.rows != 0) {
+                if (capture.count != columns.len) return error.TypeMismatch;
+                for (columns, 0..) |*column, position| {
+                    var cell = capture.cells[position];
+                    const from = capture.tys[position];
+                    const to = types.typeOfData(column.data_type);
+                    if (cell != .null_value and from != to) cell = try E.cast(cell, if (from == .unknown) .text else from, to, column.typmod, &self.session);
+                    row[position] = try D.store(column, cell, &self.session);
+                }
+            }
+            try sink.call(sink.ptr, &row);
+        }
+
+        // ---- nested statements (B11 wave 4, sql/nested.sig) -----------------
+
+        /// The suspended statement's state that a nested statement
+        /// replaces: its workspace (sql/nested.sig) and its statement-scoped
+        /// Database fields.
+        fn nestedTransfer(self: *Self, stream: *nested_module.Stream, slot: u16) void {
+            const tx = &self.txs[slot];
+            nested_module.workspace(stream, &self.workspace);
+            stream.value(&self.outcome);
+            stream.value(&self.modifying[slot]);
+            stream.value(&tx.progress);
+            stream.value(&tx.progress_affected);
+            stream.value(&tx.mysql_insert_value);
+            stream.value(&self.statement_start);
+            stream.value(&self.routine_snap);
+            stream.value(&self.seq_snap);
+            stream.value(&self.routine_frame);
+            stream.value(&self.session.routine_frame);
+            stream.value(&self.session.params);
+            stream.value(&self.active_params);
+            stream.value(&self.routine_result);
+            stream.value(&self.routine_volatility);
+            stream.value(&self.nested_tables);
+            stream.value(&self.scan_tables);
+        }
+
+        /// The tables a bound statement scans while it runs (UPDATE / DELETE
+        /// / MERGE targets and query sources).
+        fn noteScans(self: *Self, bound: *const B.Bound) void {
+            self.scan_tables = @splat(0);
+            const scanned: ?usize = switch (bound.*) {
+                .update => |*update| update.table,
+                .delete => |*delete| delete.table,
+                .merge => |*merge| merge.table,
+                .select => |*select| select.table,
+                else => null,
+            };
+            if (scanned) |index| self.markScan(index);
+            const plans = &self.workspace.plans;
+            for (plans.items[0..plans.len]) |*plan| {
+                for (plan.sources[0..plan.source_count]) |*item| if (item.table) |table| self.markScan(table);
+            }
+        }
+
+        fn markScan(self: *Self, index: usize) void {
+            if (index >= config.tables) return;
+            self.scan_tables[index / 64] |= @as(u64, 1) << @intCast(index % 64);
+        }
+
+        /// Suspends the running statement for a nested one: saves its state
+        /// at the top of the free query workspace and gives the nested
+        /// statement the free middle (floors and tops). Returns the cell
+        /// where the state was saved.
+        fn nestedEnter(self: *Self, slot: u16) Error!usize {
+            if (self.nested_depth >= config.nested_statements) return error.StackDepthExceeded;
+            try self.session.checkpoint();
+            var measure: nested_module.Stream = .{ .mode = .measure };
+            self.nestedTransfer(&measure, slot);
+            const work = &self.workspace.query;
+            const need = nested_module.cellsFor(Cell, measure.at);
+            if (work.cell_high < work.cell_low or work.cell_high - work.cell_low < need) return error.WorkspaceCapacity;
+            const at = work.cell_high - need;
+            var save: nested_module.Stream = .{ .mode = .save, .bytes = @ptrCast(&work.cells[at]) };
+            self.nestedTransfer(&save, slot);
+            work.floor_values = nested_module.valueFloor(work);
+            work.floor_cells = work.cell_low;
+            work.top_cells = work.cells.len - at;
+            work.floor_refs = work.ref_low;
+            work.top_refs = work.refs.len - work.ref_high;
+            work.pinned_cells = 0;
+            work.pinned_refs = 0;
+            X.resetWork(work);
+            for (&self.nested_tables, self.scan_tables) |*suspended, scanned| suspended.* |= scanned;
+            self.scan_tables = @splat(0);
+            self.nested_depth += 1;
+            self.nested_ran = true;
+            return at;
+        }
+
+        /// Resumes the suspended statement exactly as nestedEnter found it.
+        fn nestedLeave(self: *Self, slot: u16, at: usize) void {
+            const work = &self.workspace.query;
+            var restore: nested_module.Stream = .{ .mode = .restore, .bytes = @ptrCast(&work.cells[at]) };
+            self.nestedTransfer(&restore, slot);
+            self.nested_depth -= 1;
+        }
+
+        /// A statement in which a nested statement ran must wait: undo all
+        /// of it, so the re-delivered statement runs again from its start
+        /// (with a fresh snapshot, as after a wait before any data access)
+        /// and no trigger or function effect happens twice.
+        fn restartStatement(self: *Self, slot: u16) void {
+            const tx = &self.txs[slot];
+            if (tx.sub_len == 0 or !tx.subs[tx.sub_len - 1].statement) return;
+            const sub = tx.subs[tx.sub_len - 1];
+            M.abortSlice(self, slot, sub.write_start, sub.lock_start);
+            tx.progress = 0;
+            tx.progress_affected = 0;
+            tx.mysql_insert_value = null;
+            self.modifying[slot] = .{};
+            tx.fresh = true;
+            self.wake_epoch +%= 1;
+        }
+
+        /// A parsed function call names a visible user function (bound
+        /// later; built-in names a user function shadows count too).
+        fn callsUserRoutine(self: *const Self, source: []const u8, snap: Snapshot) bool {
+            var any = false;
+            for (&self.objects.routines) |*routine| any = any or (routine.live and routine.kind == 'f');
+            if (!any) return false;
+            const pool = &self.workspace.nodes;
+            for (pool.nodes[0..pool.len]) |*n| {
+                if (n.kind != .function or n.name.span.len == 0 or n.name.span.start + n.name.span.len > source.len) continue;
+                const name = identName(source, n.name);
+                for (&self.objects.routines) |*routine| {
+                    if (routine.live and routine.kind == 'f' and routine.stamp.visible(snap) and types.same(routine.name.slice(), name.slice())) return true;
+                }
+            }
+            return false;
+        }
+
+        fn suspendedTable(self: *const Self, table_index: usize) bool {
+            return self.nested_tables[table_index / 64] & (@as(u64, 1) << @intCast(table_index % 64)) != 0;
+        }
+
+        /// The command id that made a row write (row versions carry it).
+        fn writeCid(self: *const Self, entry: M.Write) u32 {
+            const table = &self.tables[entry.table];
+            return switch (entry.kind) {
+                .insert, .update => table.versions[entry.new].xmin_cid,
+                .delete => table.versions[entry.old].xmax_cid,
+                else => 0,
+            };
         }
 
         // ---- durability -------------------------------------------------------
@@ -14329,15 +15884,16 @@ pub fn Database(comptime config: Config) type {
                 return C.encodeObject(writer, tag, buffer[0..payload.used]);
             }
             const extended = class == .routine and self.objects.routines[index].extended();
+            const action = class == .rule and self.objects.rules[index].action.len != 0;
             const tag: change_log.Op = switch (class) {
                 .routine => if (extended) .create_routine_extended else .create_routine,
                 .trigger => .create_trigger,
-                .rule => .create_rule,
+                .rule => if (action) .create_rule_action else .create_rule,
             };
             switch (class) {
                 .routine => if (extended) try RC.encodeRoutineExtended(&payload, &self.objects.routines[index]) else try RC.encodeRoutine(&payload, &self.objects.routines[index]),
                 .trigger => try RC.encodeTrigger(&payload, &self.objects.triggers[index]),
-                .rule => try RC.encodeRule(&payload, &self.objects.rules[index]),
+                .rule => if (action) try RC.encodeRuleAction(&payload, &self.objects.rules[index]) else try RC.encodeRule(&payload, &self.objects.rules[index]),
             }
             return C.encodeObject(writer, tag, buffer[0..payload.used]);
         }
@@ -14391,10 +15947,10 @@ pub fn Database(comptime config: Config) type {
                     item.stamp = stamp;
                     oid = item.oid;
                 },
-                @intFromEnum(change_log.Op.create_rule) => {
+                @intFromEnum(change_log.Op.create_rule), @intFromEnum(change_log.Op.create_rule_action) => {
                     const index = try self.replaySlot(.rule);
                     const item = &self.objects.rules[index];
-                    try RC.decodeRule(payload, item);
+                    if (tag == @intFromEnum(change_log.Op.create_rule)) try RC.decodeRule(payload, item) else try RC.decodeRuleAction(payload, item);
                     item.live = true;
                     item.stamp = stamp;
                     oid = item.oid;

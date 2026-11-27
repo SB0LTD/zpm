@@ -378,7 +378,7 @@ fn sqlFunctions() !void {
     try fails("CREATE OR REPLACE FUNCTION add1(y INT) RETURNS INT LANGUAGE SQL AS 'SELECT y'", error.InvalidFunctionDefinition);
     try fails("CREATE OR REPLACE PROCEDURE add1(x INT) LANGUAGE SQL AS 'SELECT 1'", error.WrongObjectType);
     // A query body is inlined (B11 wave 4); writes and several statements
-    // stay 0A000 from an expression (tests/test_sql_routines_sig.sig).
+    // run as nested statements (tests/test_sql_nested_stmts.sig).
     try run("CREATE FUNCTION counted() RETURNS BIGINT LANGUAGE SQL AS 'SELECT count(*) FROM tdd_a'");
     try expect("SELECT counted() = (SELECT count(*) FROM tdd_a)", "t");
     // Procedures are CALLed; functions are not.
@@ -486,9 +486,13 @@ fn plpgsqlFunctions() !void {
     try run("CREATE FUNCTION depth(n INT) RETURNS INT LANGUAGE plpgsql AS $$BEGIN IF n <= 0 THEN RETURN 0; END IF; RETURN depth(n - 1) + 1; END$$");
     try expect("SELECT depth(10)", "10");
     try fails("SELECT depth(100)", error.StackDepthExceeded);
-    // Statements are not run inside an expression (0A000), atomically.
+    // Statements run nested inside an expression (B11 wave 4); a failing
+    // one undoes the whole statement.
     try run("CREATE FUNCTION writes() RETURNS INT LANGUAGE plpgsql AS $$BEGIN INSERT INTO tdd_b VALUES (9, 9); RETURN 1; END$$");
-    try rejects("SELECT writes()", error.UnsupportedStatement, "SELECT count(*) FROM tdd_b", "3");
+    var wrote = try replicate("SELECT writes()");
+    try same(try render(&wrote), "1");
+    try rejects("SELECT writes()", error.PrimaryKeyViolation, "SELECT count(*) FROM tdd_b", "4");
+    try run("DELETE FROM tdd_b WHERE id = 9");
     // Compile errors at CREATE (42601, 22005, 22004, 42704).
     try fails("CREATE FUNCTION e1() RETURNS INT LANGUAGE plpgsql AS $$BEGIN x := ; RETURN 1; END$$", error.Syntax);
     try fails("CREATE FUNCTION e2() RETURNS INT LANGUAGE plpgsql AS $$BEGIN y := 1; RETURN 1; END$$", error.Syntax);
@@ -615,7 +619,8 @@ fn triggers() !void {
     try fails("CREATE TRIGGER x BEFORE TRUNCATE ON a FOR EACH ROW EXECUTE FUNCTION guard()", error.UnsupportedStatement);
     try fails("CREATE TRIGGER x AFTER UPDATE OF nosuch ON a FOR EACH ROW EXECUTE FUNCTION guard()", error.ColumnNotFound);
     try fails("CREATE TRIGGER x AFTER INSERT ON nosuch FOR EACH ROW EXECUTE FUNCTION guard()", error.TableNotFound);
-    try fails("CREATE TRIGGER x INSTEAD OF INSERT ON a FOR EACH ROW EXECUTE FUNCTION guard()", error.UnsupportedStatement);
+    // Tables have no INSTEAD OF triggers (42809).
+    try fails("CREATE TRIGGER x INSTEAD OF INSERT ON a FOR EACH ROW EXECUTE FUNCTION guard()", error.WrongObjectType);
     try fails("DROP TRIGGER nosuch ON a", error.UndefinedObject);
     try completes("DROP TRIGGER IF EXISTS nosuch ON a", .drop_trigger, 0);
     // A function used by a trigger needs CASCADE; DROP TABLE takes its triggers.
@@ -655,7 +660,9 @@ fn rules() !void {
     try completes("INSERT INTO r VALUES (10, 5), (11, 500)", .insert, 1);
     try fails("CREATE RULE x AS ON INSERT TO r WHERE OLD.id > 1 DO INSTEAD NOTHING", error.InvalidObjectDefinition);
     try fails("CREATE RULE x AS ON DELETE TO r WHERE NEW.id > 1 DO INSTEAD NOTHING", error.InvalidObjectDefinition);
-    try fails("CREATE RULE x AS ON DELETE TO r DO INSTEAD DELETE FROM r", error.UnsupportedStatement);
+    // INSERT / UPDATE / DELETE actions run (B11 wave 4, contract-sql-nested-stmts);
+    // SELECT actions are outside the subset (0A000).
+    try fails("CREATE RULE x AS ON DELETE TO r DO INSTEAD SELECT 1", error.UnsupportedStatement);
     try fails("CREATE RULE x AS ON SELECT TO r DO INSTEAD NOTHING", error.UnsupportedStatement);
     try fails("MERGE INTO r USING (SELECT 1 AS id) s ON r.id = s.id WHEN MATCHED THEN DELETE", error.UnsupportedStatement);
     try fails("INSERT INTO r VALUES (1, 1) ON CONFLICT DO NOTHING", error.UnsupportedStatement);

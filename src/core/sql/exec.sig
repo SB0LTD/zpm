@@ -146,19 +146,27 @@ pub fn Exec(comptime config: types.Config) type {
             dml_rows: [config.ctes]List = undefined,
             value_backing: [types.catalogValueBytes(config)]u8 = undefined,
             values: types.ValueBytes = .{},
+            /// Nested statements (B11 wave 4): the cells, refs and value
+            /// bytes below the floors and the cells and refs above the tops
+            /// belong to the statements suspended under the running one.
+            floor_cells: usize = 0,
+            top_cells: usize = 0,
+            floor_refs: usize = 0,
+            top_refs: usize = 0,
+            floor_values: usize = 0,
 
             fn setupValues(self: *Work, session: *const value_module.Session) value_module.Session {
-                self.values = .{ .bytes = &self.value_backing };
+                self.values = .{ .bytes = self.value_backing[self.floor_values..] };
                 var active = session.*;
                 active.value_bytes = &self.values;
                 return active;
             }
 
             fn reset(self: *Work) void {
-                self.cell_low = 0;
-                self.cell_high = self.cells.len - self.pinned_cells;
-                self.ref_low = 0;
-                self.ref_high = self.refs.len - self.pinned_refs;
+                self.cell_low = self.floor_cells;
+                self.cell_high = self.cells.len - self.top_cells - self.pinned_cells;
+                self.ref_low = self.floor_refs;
+                self.ref_high = self.refs.len - self.top_refs - self.pinned_refs;
                 self.stream_stats = .{};
                 self.read_stats = .{};
                 for (&self.ctes) |*cte| cte.* = .{};

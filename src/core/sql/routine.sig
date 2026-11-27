@@ -183,6 +183,10 @@ pub fn Routines(comptime config: types.Config) type {
             table: TableName = .{},
             where: Span = .{},
             instead: bool = false,
+            /// The action statements (B11 wave 4): empty for NOTHING; the
+            /// text inside the parentheses of `( a; b )` (`multiple`).
+            action: Span = .{},
+            multiple: bool = false,
         };
 
         pub const Statement = union(Kind) {
@@ -1074,9 +1078,45 @@ pub fn Routines(comptime config: types.Config) type {
             if (try cursor.take("instead")) {
                 out.instead = true;
             } else _ = try cursor.take("also");
-            // Actions other than NOTHING (query rewriting) are outside the subset.
-            if (!try cursor.take("nothing")) return error.UnsupportedStatement;
+            if (try cursor.take("nothing")) return finish(cursor);
+            // INSERT / UPDATE / DELETE actions (B11 wave 4), one or several
+            // in parentheses; SELECT and NOTIFY actions are outside it.
+            if (cursor.symbol(.lparen)) {
+                out.action = try parenthesized(cursor);
+                out.multiple = true;
+            } else {
+                const begin = cursor.start();
+                var end = begin;
+                var depth: usize = 0;
+                while (!cursor.atEnd()) {
+                    if (cursor.symbol(.lparen)) depth += 1;
+                    if (cursor.symbol(.rparen) and depth > 0) depth -= 1;
+                    if (depth == 0 and cursor.symbol(.semicolon)) break;
+                    end = cursor.after();
+                    try cursor.advance();
+                }
+                if (end == begin) return error.Syntax;
+                out.action = .{ .start = begin, .end = end };
+            }
             try finish(cursor);
+            if (out.action.end == out.action.start) return error.Syntax;
+            var statements: Statements = .{ .source = cursor.source[0..out.action.end], .position = out.action.start };
+            var count: usize = 0;
+            while (try statements.next()) |span| {
+                const word = firstWordOf(cursor.source[span.start..span.end]);
+                const known = types.keyword(word, "insert") or types.keyword(word, "update") or types.keyword(word, "delete");
+                if (!known) return if (types.keyword(word, "select") or types.keyword(word, "notify") or types.keyword(word, "with") or types.keyword(word, "values")) error.UnsupportedStatement else error.Syntax;
+                count += 1;
+            }
+            if (count == 0) return error.Syntax;
+        }
+
+        pub fn firstWordOf(text: []const u8) []const u8 {
+            var at: usize = 0;
+            while (at < text.len and !types.letter(text[at])) at += 1;
+            var end = at;
+            while (end < text.len and (types.letter(text[end]) or types.digit(text[end]))) end += 1;
+            return text[at..end];
         }
 
         /// Parses a routine statement (`classify` returned its kind).
@@ -1222,6 +1262,8 @@ pub fn Routines(comptime config: types.Config) type {
             tys: [config.columns]types.Type = @splat(.unknown),
             count: usize = 0,
             rows: usize = 0,
+            /// Only the row count is wanted (PERFORM): no value is kept.
+            rows_only: bool = false,
         };
 
         pub const Mode = enum { check, run, skip };
@@ -2226,9 +2268,8 @@ pub fn Routines(comptime config: types.Config) type {
                     return .normal;
                 }
 
-                /// RETURN QUERY runs a query inside the running statement:
-                /// checked at CREATE, 0A000 when run (nested statement
-                /// execution is not available to functions here).
+                /// RETURN QUERY runs a query inside the running statement as a
+                /// nested statement and adds its rows (B11 wave 4).
                 noinline fn returnQuery(self: *Self, mode: Mode) Error!Signal {
                     const c = &self.cursor;
                     try c.expect("query");
@@ -2247,7 +2288,23 @@ pub fn Routines(comptime config: types.Config) type {
                     try c.expectSymbol(.semicolon);
                     switch (mode) {
                         .check => try self.host.routineCheckStatement(self.source[begin..end]),
-                        .run => return error.UnsupportedStatement,
+                        .run => {
+                            // The query runs as a nested statement (B11
+                            // wave 4); its rows become rows of the function.
+                            const sink = self.rows orelse return error.UnsupportedStatement;
+                            var columns: [config.routine_args]V.Column = undefined;
+                            var count: usize = 1;
+                            if (self.output_count != 0) {
+                                count = self.output_count;
+                                for (self.outputs[0..count], 0..) |variable, column| {
+                                    const item = &self.frame.variables.items[variable];
+                                    columns[column] = columnOf(item.ty, item.typmod);
+                                }
+                            } else columns[0] = self.return_column;
+                            const rows = try self.host.routineReturnQuery(self.frame, self.source[begin..end], sink, columns[0..count]);
+                            self.frame.row_count = rows;
+                            self.frame.cells[self.frame.found] = .{ .boolean = rows != 0 };
+                        },
                         .skip => {},
                     }
                     return .normal;
@@ -2422,7 +2479,7 @@ pub fn Routines(comptime config: types.Config) type {
                             try self.host.routineCheckStatement(buffer[0 .. 7 + text.len]);
                             return .normal;
                         }
-                        var capture: Capture = .{};
+                        var capture: Capture = .{ .rows_only = true };
                         const rows = try self.host.routineStatement(self.frame, buffer[0 .. 7 + text.len], &capture);
                         self.frame.cells[self.frame.found] = .{ .boolean = rows != 0 };
                         self.frame.row_count = rows;
