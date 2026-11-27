@@ -1,0 +1,63 @@
+{
+  "target": "PostgreSQL 18.3",
+  "matrix_queries": 204,
+  "extra_probes": 76,
+  "failures": [
+    {
+      "sql": "SELECT trunc(NULL)",
+      "oid": 701,
+      "text": null,
+      "sqlstate": null,
+      "actual": {
+        "columns": [],
+        "rows": [],
+        "command": null,
+        "error": {
+          "sqlstate": "42725",
+          "message": "function trunc(unknown) is not unique"
+        },
+        "transaction": "E"
+      }
+    },
+    {
+      "sql": "SELECT currval('nf_seq')",
+      "oid": 20,
+      "text": "2",
+      "sqlstate": null,
+      "actual": {
+        "columns": [
+          [
+            "currval",
+            20,
+            8,
+            -1,
+            0
+          ]
+        ],
+        "rows": [
+          [
+            "1"
+          ]
+        ],
+        "command": "SELECT 1",
+        "error": null,
+        "transaction": "T"
+      }
+    }
+  ],
+  "excluded_dimensions": [
+    "numeric results outside configured coefficient/display capacity",
+    "other mathematical functions and overloads",
+    "extended-wire parameter lifecycle",
+    "WAL replay and execution budgets (Sig-only tests)"
+  ],
+  "oracle_version": [
+    [
+      "PostgreSQL 18.3 on x86_64-windows, compiled by msvc-19.44.35222, 64-bit"
+    ]
+  ],
+  "matrix_sha256": "0286a767fe3ff07f21d3bae14c54f5c1310f8d3758c9df4b3e2445e851d576b7",
+  "hash_encoding": "UTF-8 with LF newlines",
+  "contract_sha256": "237ffb26e5305ec15660c5c9f3b381aff05078d24386a09a4050a094bd2f5c40",
+  "oracle_script_sha256": "1dde7cd398268021b9b98467545656a16b6059b86834c8e0693e0ca2ca729a74"
+}
