@@ -94,6 +94,8 @@ const GENERIC_END = GENERIC + 4 * sph.GENERICS;
 pub const Host = struct {
     mem: emu.Memory,
     work: *emu.Work,
+    /// The device's clock (ns): a draw moves it on, a report reads it.
+    clock_ns: ?*u64 = null,
 };
 
 const Bound = struct { valid: bool = false, va: u64 = 0, size: u32 = 0 };
@@ -255,6 +257,20 @@ pub const Engine = struct {
             g.host = host;
             return g.draw(g.reg(gl3d.DRAW_INDEX_BUFFER_BEGIN_END_A), v, true);
         }
+        if (m == gl3d.REPORT_SEMAPHORE_EXECUTE) return g.report(host, v);
+    }
+
+    /// REPORT_SEMAPHORE_EXECUTE (gl3d.stamp's): a release of four words,
+    /// the payload and the device's time (every draw before it is done:
+    /// the model draws in order); anything else refused.
+    fn report(g: *Engine, host: Host, v: u32) error{BadStream}!void {
+        if (v & 3 != 0 or (v >> gl3d.REPORT_STRUCTURE_SHIFT) & 3 != 0 or (v >> 7) & 0x1f != 0)
+            return g.refuse("a report other than a four-word release");
+        const pl = gl3d.REPORT_SEMAPHORE_PAYLOAD_LOWER;
+        const va = @as(u64, g.reg(pl + 12) & 0x1ff_ffff) << 32 | g.reg(pl + 8);
+        const b = host.mem.find(va, 16) orelse return g.refuse("a report's memory is not mapped");
+        std.mem.writeInt(u64, b[0..8], g.reg(pl), .little);
+        std.mem.writeInt(u64, b[8..16], if (host.clock_ns) |c| c.* else 0, .little);
     }
 
     /// BIND_GROUP_CONSTANT_BUFFER: the selector's buffer latched in the
@@ -584,6 +600,7 @@ pub const Engine = struct {
     /// strip, a fan), as many instances as SET_DRAW_CONTROL_B says.
     fn draw(g: *Engine, first: u32, count: u32, indexed: bool) anyerror!void {
         g.why = "";
+        const pixels0 = g.pixels;
         try g.validate();
         const topo = g.reg(gr.SET_PRIMITIVE_TOPOLOGY);
         const instances = g.reg(gr.SET_DRAW_CONTROL_A + 4);
@@ -654,6 +671,8 @@ pub const Engine = struct {
             }
         }
         g.draws += 1;
+        // (the device's time on: a microsecond, and a nanosecond a pixel)
+        if (g.host.clock_ns) |c| c.* += 1000 + g.pixels - pixels0;
     }
 
     /// One run of primitives (a draw's, or a restarted strip's or fan's):

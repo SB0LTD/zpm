@@ -423,6 +423,8 @@ pub const Stats = struct {
     /// SHFL/VOTE in divergent code, and those in a loop out of step.
     div_collectives: u32 = 0,
     nobar_collectives: u32 = 0,
+    /// Units split off a temporary's first web (Ctx.webs).
+    webs: u32 = 0,
 };
 
 /// How `compile` compiles.
@@ -596,6 +598,7 @@ fn compileTextOnce(k: *const kir.Kernel, caps: device.Caps, st: anytype, opts: O
     try c.lower();
     c.dce();
     if (opts.schedule) c.schedule();
+    c.webs();
     try c.liveness();
     c.stageLive();
     try c.allocate();
@@ -3056,6 +3059,270 @@ fn CtxOf(comptime St: type) type {
             @memcpy(blk, w.sched_tmp[0..n]);
         }
 
+        // ── 4c. Webs ────────────────────────────────────────────────────────
+        //
+        // The allocation gives each unit one interval, its first access to
+        // its last. A temporary the source writes in many places (a Direct3D
+        // shader's r3.x, reused for unrelated values from top to bottom:
+        // rename splits it only inside a straight-line stretch) so holds a
+        // register through the whole program: Superposition's lighting pass
+        // had 128 such units, 144 of its 176 registers, live at its peak.
+        // Each is split into its webs: the writes a read can see (the
+        // reaching definitions over the program's labels and branches)
+        // joined, with the reads they reach, each web a unit of its own. A
+        // guarded write, or one of half a register, keeps the old value
+        // where it does not write: it joins the writes that reach it.
+
+        /// A unit split into webs is written this many times at most (a bit
+        /// each in a word; bit 63 the program's entry, for reads that no
+        /// write reaches).
+        const WEB_DEFS = 63;
+        const WEB_ENTRY: u6 = 63;
+        const WebMode = enum { reach, join, rename };
+
+        fn webs(c: *Ctx) void {
+            const w = c.w;
+            const nv0 = w.nv;
+            // (the labels' reaching writes, the control points and each
+            // unit's touches live in the assembler's words, unused until
+            // emitText; the touch lists' starts and lengths in first and
+            // last, which liveness sets anew)
+            const n_lab: usize = @as(usize, c.labels) + 1;
+            if (n_lab >= w.words.len) return;
+            const ctl_at = n_lab;
+            var n_ctl: usize = 0;
+            for (w.mi[0..w.n_mi], 0..) |*m, i| {
+                if (!webControl(m)) continue;
+                if (ctl_at + n_ctl >= w.words.len) return;
+                w.words[ctl_at + n_ctl] = i;
+                n_ctl += 1;
+            }
+            const touches = w.def_at[0..nv0];
+            const defs = w.def_count[0..nv0];
+            @memset(touches, 0);
+            @memset(defs, 0);
+            for (w.mi[0..w.n_mi]) |*m| {
+                if (m.kind != .inst) continue;
+                for (m.o[0..m.n], 0..) |o, k| {
+                    const v = webOperand(o) orelse continue;
+                    if (k < m.nd and o == .reg) defs[v] +|= 1;
+                    touches[v] +|= 1;
+                }
+            }
+            var total: usize = 0;
+            for (0..nv0) |vi| {
+                if (!c.webCandidate(@intCast(vi), defs[vi])) touches[vi] = 0;
+                w.first[vi] = @intCast(total);
+                total += touches[vi];
+            }
+            const tch_at = ctl_at + n_ctl;
+            if (total == 0 or tch_at + total > w.words.len) return;
+            @memset(w.last[0..nv0], 0);
+            for (w.mi[0..w.n_mi], 0..) |*m, i| {
+                if (m.kind != .inst) continue;
+                for (m.o[0..m.n]) |o| {
+                    const v = webOperand(o) orelse continue;
+                    if (touches[v] == 0) continue;
+                    const list = tch_at + w.first[v];
+                    const k = w.last[v];
+                    if (k > 0 and w.words[list + k - 1] == i) continue;
+                    w.words[list + k] = i;
+                    w.last[v] = k + 1;
+                }
+            }
+            for (0..nv0) |vi| {
+                if (touches[vi] == 0) continue;
+                const t = w.words[tch_at + w.first[vi] ..][0..w.last[vi]];
+                c.splitWebs(@intCast(vi), defs[vi], w.words[0..n_lab], w.words[ctl_at..][0..n_ctl], t);
+            }
+        }
+
+        /// A size-1 general register written 2..WEB_DEFS times, not a pixel
+        /// program's output (those stay put to EXIT).
+        fn webCandidate(c: *const Ctx, u: u16, defs: u16) bool {
+            const w = c.w;
+            if (defs < 2 or defs > WEB_DEFS) return false;
+            if (w.lead[u] != u or w.size[u] != 1 or w.cls[u] != .r) return false;
+            for (w.outv) |v| {
+                if (v != NOV and w.lead[v] == u) return false;
+            }
+            return true;
+        }
+
+        /// The register an operand reads or writes (a memory operand's base
+        /// is read), or null.
+        fn webOperand(o: Opd) ?u16 {
+            return switch (o) {
+                .reg => |r| if (r.v != NOV) r.v else null,
+                .mem => |x| if (x.base != NOV) x.base else null,
+                else => null,
+            };
+        }
+
+        /// Where control may leave the straight line: a label, a branch, an
+        /// end (EXIT, and a pixel's KILL).
+        fn webControl(m: *const MI) bool {
+            if (m.kind == .label) return true;
+            if (m.kind != .inst) return false;
+            return eq(m.op, "BRA") or eq(m.op, "EXIT") or eq(m.op, "KILL");
+        }
+
+        fn webRoot(parent: *[64]u8, x: u6) u6 {
+            var r = x;
+            while (parent[r] != r) r = @intCast(parent[r]);
+            var y = x;
+            while (parent[y] != r) {
+                const next: u6 = @intCast(parent[y]);
+                parent[y] = r;
+                y = next;
+            }
+            return r;
+        }
+
+        /// The writes in `bits` one web.
+        fn webJoin(parent: *[64]u8, bits: u64) void {
+            if (bits == 0) return;
+            const first = webRoot(parent, @intCast(@ctz(bits)));
+            var b = bits;
+            while (b != 0) : (b &= b - 1) {
+                const r = webRoot(parent, @intCast(@ctz(b)));
+                if (r != first) parent[r] = first;
+            }
+        }
+
+        /// Unit u's webs (u keeps the first write's; each other a new unit),
+        /// if there are two or more and the units have room.
+        fn splitWebs(c: *Ctx, u: u16, ndefs: u16, lin: []u64, ctl: []const u64, t: []const u64) void {
+            const w = c.w;
+            var parent: [64]u8 = undefined;
+            for (&parent, 0..) |*p, i| p.* = @intCast(i);
+            var map: [64]u16 = @splat(u);
+            @memset(lin, 0);
+            // the writes reaching each label, to a fixed point (each back
+            // edge may need a round more)
+            var rounds: usize = 0;
+            while (c.webWalk(u, lin, ctl, t, &parent, &map, .reach)) {
+                rounds += 1;
+                if (rounds > 2 * WEB_DEFS) return;
+            }
+            // (true: a read no write reaches on some path)
+            const entry_read = c.webWalk(u, lin, ctl, t, &parent, &map, .join);
+            // a unit for each web: u for the first write's
+            const keep = webRoot(&parent, 0);
+            var want: [64]bool = @splat(false);
+            var fresh: usize = 0;
+            for (0..ndefs) |d| {
+                const r = webRoot(&parent, @intCast(d));
+                if (r != keep and !want[r]) {
+                    want[r] = true;
+                    fresh += 1;
+                }
+            }
+            const er = webRoot(&parent, WEB_ENTRY);
+            if (entry_read and er != keep and !want[er]) {
+                want[er] = true;
+                fresh += 1;
+            }
+            if (fresh == 0) return;
+            if (w.nv + fresh > w.cls.len or w.nv + fresh >= NOV) return;
+            for (&map, 0..) |*m, i| {
+                if (!want[i]) continue;
+                const n: u16 = @intCast(w.nv);
+                w.nv += 1;
+                w.cls[n] = .r;
+                w.size[n] = 1;
+                w.lead[n] = n;
+                w.off[n] = 0;
+                w.tys[n] = w.tys[u];
+                w.uniform[n] = w.uniform[u];
+                m.* = n;
+            }
+            _ = c.webWalk(u, lin, ctl, t, &parent, &map, .rename);
+            w.stats.webs += @intCast(fresh);
+        }
+
+        /// One walk over unit u's touches and the control points in program
+        /// order. `reach`: the writes reaching each label into `lin` (true
+        /// if any grew); `join`: each read's reaching writes, and each
+        /// merging write with those, one web (true if a read sees the
+        /// entry's); `rename`: each operand of u its web's unit (`map`, by
+        /// root; the entry's web, never written, keeps u).
+        fn webWalk(c: *Ctx, u: u16, lin: []u64, ctl: []const u64, t: []const u64, parent: *[64]u8, map: *const [64]u16, mode: WebMode) bool {
+            const w = c.w;
+            const END = std.math.maxInt(u64);
+            const entry_bit = @as(u64, 1) << WEB_ENTRY;
+            var changed = false;
+            var cur: u64 = entry_bit;
+            var live = true;
+            var d: u8 = 0;
+            var a: usize = 0;
+            var b: usize = 0;
+            while (a < ctl.len or b < t.len) {
+                const pc = if (a < ctl.len) ctl[a] else END;
+                const pt = if (b < t.len) t[b] else END;
+                const pos = @min(pc, pt);
+                const m = &w.mi[pos];
+                if (m.kind == .label) {
+                    const l = m.o[0].label;
+                    cur = if (live) cur | lin[l] else lin[l];
+                    live = true;
+                    a += 1;
+                    continue;
+                }
+                if (pt == pos) {
+                    // (reads first: an instruction reads before it writes)
+                    for (m.o[0..m.n], 0..) |*o, k| {
+                        if (k < m.nd and o.* != .mem) continue;
+                        if (webOperand(o.*) != u) continue;
+                        switch (mode) {
+                            .reach => {},
+                            .join => {
+                                webJoin(parent, cur);
+                                if (cur & entry_bit != 0) changed = true;
+                            },
+                            .rename => {
+                                const r = if (cur == 0) webRoot(parent, WEB_ENTRY) else webRoot(parent, @intCast(@ctz(cur)));
+                                switch (o.*) {
+                                    .reg => o.reg.v = map[r],
+                                    .mem => o.mem.base = map[r],
+                                    else => {},
+                                }
+                            },
+                        }
+                    }
+                    for (m.o[0..m.nd]) |*o| {
+                        if (o.* != .reg or o.reg.v != u) continue;
+                        // (u has WEB_DEFS writes at most: bits 0..62)
+                        const bit = @as(u64, 1) << @intCast(d);
+                        const merge = m.guard != .none or o.reg.half != 0;
+                        switch (mode) {
+                            .reach => {},
+                            .join => if (merge) {
+                                webJoin(parent, cur | bit);
+                                if (cur & entry_bit != 0) changed = true;
+                            },
+                            .rename => o.reg.v = map[webRoot(parent, @intCast(d))],
+                        }
+                        if (live) cur = if (merge) cur | bit else bit;
+                        d += 1;
+                    }
+                    b += 1;
+                }
+                if (pc == pos) {
+                    if (eq(m.op, "BRA")) {
+                        const l = m.o[0].label;
+                        if (live and lin[l] | cur != lin[l]) {
+                            lin[l] |= cur;
+                            changed = true;
+                        }
+                    }
+                    if (m.guard == .none) live = false;
+                    a += 1;
+                }
+            }
+            return changed;
+        }
+
         // ── 5. Liveness and allocation ──────────────────────────────────────
 
         fn liveness(c: *Ctx) Error!void {
@@ -3453,6 +3720,10 @@ fn CtxOf(comptime St: type) type {
                     },
                     .inst => {},
                 }
+                // (a copy the allocation gave its source's register: nothing
+                // to do, guarded or not. Superposition's lighting pass had
+                // 123 of its 1,252 MOVs so)
+                if (c.selfMove(m)) continue;
                 // predicates in registers: read through P6 (and P5), written
                 // through P6
                 var scratch: u8 = SCRATCH_P;
@@ -3524,6 +3795,16 @@ fn CtxOf(comptime St: type) type {
             }
             if (t.full) return tooBig("a table full");
             return w.text[0..t.len];
+        }
+
+        /// MOV Rd, Rs with both in one register (no sign, no half).
+        fn selfMove(c: *const Ctx, m: *const MI) bool {
+            if (m.n != 2 or !std.mem.eql(u8, m.op, "MOV")) return false;
+            const d = m.o[0];
+            const s = m.o[1];
+            if (d != .reg or s != .reg or d.reg.v == NOV or s.reg.v == NOV) return false;
+            if (s.reg.neg or s.reg.abs or s.reg.half != 0 or d.reg.half != 0) return false;
+            return c.physOf(d.reg.v) == c.physOf(s.reg.v);
         }
 
         fn spillRead(c: *Ctx, t: *Text, v: u16, p: u8, map: *[8]Scratch, n_map: *usize) Error!void {

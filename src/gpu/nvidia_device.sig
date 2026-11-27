@@ -682,13 +682,21 @@ pub const Adapter = struct {
                 // (the 3D engine's whole state at the run's first draw; a
                 // later one's own state alone, but each whole with serial_draws)
                 if (graphics == 1 or a.serial_draws) gl3d.emit(&p, &draw) else gl3d.emitNext(&p, &draw);
-                // (a profiled run: the draw alone, done, its end stamped as
-                // a dispatch's is; the next draw starts on an idle engine)
-                if (s.profiled) {
+                // (a profiled run: each draw's end stamped in the pipeline,
+                // the draws after it going on, so the differences are what
+                // each adds to the run as it runs unprofiled. Turing's: the
+                // draw alone, done, stamped as a dispatch is; the next on
+                // an idle engine. Waiting at each draw made cheap draws look
+                // many times their cost: the engine filled and drained for
+                // each)
+                if (s.profiled and a.sm() == .sm_75) {
                     p.method(gl3dSubch(), WAIT_FOR_IDLE, &.{0});
                     p.reportTimestamp(s.ends.va + i * 16, @intCast(i));
                     a.barriers += 1;
-                } else drawn.add(d, g);
+                } else {
+                    if (s.profiled) gl3d.stamp(&p, s.ends.va + i * 16, @intCast(i));
+                    drawn.add(d, g);
+                }
                 after_draw = true;
                 hz = .{};
                 a.draws += 1;
@@ -1546,6 +1554,21 @@ fn graphicsRun() !void {
     d.fromDevice(target, 0, W * H * 4);
     try testing.expectEqualSlices(u8, &want, target.cpu[0 .. W * H * 4]);
     T.dev.adapter.serial_draws = false;
+    // profiled: each draw stamped in the pipeline (Blackwell's), no wait
+    // between them, the same pixels; the stamps in the draws' order
+    if (d.caps.target != .sm_75) {
+        try testing.expect(d.profile(true));
+        defer _ = d.profile(false);
+        @memset(target.cpu[0 .. W * H * 4], 0x11);
+        d.toDevice(target, 0, W * H * 4);
+        try runWait(d, &.{ a1, a2, a3 });
+        try testing.expectEqual(@as(u32, 2), T.dev.adapter.barriers);
+        d.fromDevice(target, 0, W * H * 4);
+        try testing.expectEqualSlices(u8, &want, target.cpu[0 .. W * H * 4]);
+        var ends: [4]u64 = undefined;
+        try testing.expectEqual(@as(usize, 3), d.dispatchNs(&ends));
+        try testing.expect(ends[0] > 0 and ends[0] < ends[1] and ends[1] < ends[2]);
+    }
     d.free(target);
     d.free(vb);
     d.free(vb2);
@@ -2876,6 +2899,47 @@ test "a register reused in a stretch (kir_sm120.rename) and the same computation
         k.store(.u32, m, r(ob), r(v));
     }
     try same(caps, &k, .{ 2, 1, 1 }, &.{}, 4 * NT, null);
+}
+
+test "temporaries written again past branches (kir_sm120.webs): each web a unit of its own, two sets used in turn in one set's registers, the same bits" {
+    const caps = caseCaps(false);
+    fillInts(0x3eb);
+    var k = newKernel("webs", .{ 64, 1, 1 });
+    const A = k.binding();
+    _ = k.binding();
+    _ = k.binding();
+    const O = k.binding();
+    const t = lin(&k);
+    const seed = k.load(.u32, kir.global(A, 32), r(k.op2(.shl, .u32, r(t), u(2))));
+    const odd = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(t), u(1))), u(0));
+    // two sets of temporaries as a shader's r0..r5: set a written and read,
+    // then b, then a again, then b, each written behind a branch (rename
+    // splits a register only inside a straight-line stretch)
+    const N = 12;
+    var a: [N]kir.V = undefined;
+    var b: [N]kir.V = undefined;
+    for (&a) |*x| x.* = k.reg(.u32);
+    for (&b) |*x| x.* = k.reg(.u32);
+    const acc = k.reg(.u32);
+    k.set(acc, .mov, u(0), no, no);
+    for (0..4) |pass| {
+        const set = if (pass % 2 == 0) &a else &b;
+        k.ifp(r(odd));
+        for (set, 0..) |x, j| k.set(x, .imad, r(t), u(@intCast(j * 3 + pass + 1)), r(seed));
+        k.els();
+        for (set, 0..) |x, j| k.set(x, .iadd, r(t), u(@intCast(j * 7 + pass)), no);
+        k.endif();
+        // (the whole set live at once: each times the next)
+        for (set, 0..) |x, j| k.set(acc, .imad, r(x), r(set[(j + 1) % N]), r(acc));
+    }
+    k.store(.u32, kir.global(O, 32), r(k.op2(.shl, .u32, r(t), u(2))), r(acc));
+    try same(caps, &k, .{ 2, 1, 1 }, &.{}, 2 * 64, null);
+    const bin = try kir_sm120.compileIn(&k, caps, &T.st, &T.code, .{});
+    // (a pass's webs: each set twice, one unit each time)
+    try testing.expect(T.st.stats.webs >= 2 * N);
+    // (one set, the sum, the lane's values; both sets held through the
+    // whole program took 2N and more)
+    try testing.expect(bin.regs < 2 * N);
 }
 
 test "ids, parameters and predicates past the six registers" {
