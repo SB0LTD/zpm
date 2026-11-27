@@ -1345,6 +1345,16 @@ pub fn Parser(comptime config: types.Config) type {
             return .{ .prepared_transaction = .{ .action = action, .gid = gid } };
         }
 
+        /// `AND [NO] CHAIN` after COMMIT / END / ROLLBACK / ABORT (T261,
+        /// B11 wave 5); true for AND CHAIN. The statement must end there.
+        fn chainClause(self: *Self) Error!bool {
+            if (self.mode != .standard or !try self.takeWord("AND")) return false;
+            const chain = !try self.takeWord("NO");
+            if (!try self.takeRaw("chain")) return error.Syntax;
+            try self.finish();
+            return chain;
+        }
+
         fn controlStatement(self: *Self) Error!ast.Control {
             if (self.mode == .standard and (self.rawWord("vacuum") or self.rawWord("analyze") or self.rawWord("analyse"))) {
                 const vacuum = self.rawWord("vacuum");
@@ -1373,11 +1383,13 @@ pub fn Parser(comptime config: types.Config) type {
                 try self.advance();
                 if (commit and self.tokens.dialect == .postgres and self.rawWord("prepared")) return self.preparedTransaction(.commit);
                 _ = (try self.takeWord("WORK")) or (try self.takeWord("TRANSACTION"));
+                if (try self.chainClause()) return .commit_chain;
                 self.finish() catch return error.UnsupportedStatement;
                 return .commit;
             }
             if (try self.takeWord("ABORT")) {
                 _ = (try self.takeWord("WORK")) or (try self.takeWord("TRANSACTION"));
+                if (try self.chainClause()) return .rollback_chain;
                 try self.finish();
                 return .rollback;
             }
@@ -1390,6 +1402,7 @@ pub fn Parser(comptime config: types.Config) type {
                     try self.finish();
                     return .{ .rollback_to = name };
                 }
+                if (try self.chainClause()) return .rollback_chain;
                 self.finish() catch return error.UnsupportedStatement;
                 return .rollback;
             }
@@ -1432,7 +1445,9 @@ pub fn Parser(comptime config: types.Config) type {
                 if (try self.takeWord("TIME")) {
                     try self.expectWord("ZONE");
                     var value: ast.SettingValue = .{};
-                    if (!try self.takeWord("LOCAL")) value = try self.settingValue();
+                    if (self.mode == .standard and self.rawWord("interval")) {
+                        value = try self.zoneInterval();
+                    } else if (!try self.takeWord("LOCAL")) value = try self.settingValue();
                     try self.finish();
                     return .{ .set = .{ .local = local, .name = .{ .special = .time_zone }, .value = value } };
                 }
@@ -1529,6 +1544,35 @@ pub fn Parser(comptime config: types.Config) type {
                 if (out.len > config.name_bytes) return error.NameCapacity;
             }
             return out;
+        }
+
+        /// `INTERVAL 'text' [field [TO field]]` as a time zone (F761, B11
+        /// wave 5, gram.y zone_value): the string and the qualifier's last
+        /// field; the engine reads the offset.
+        fn zoneInterval(self: *Self) Error!ast.SettingValue {
+            try self.advance();
+            if (self.current.kind != .string) return error.Syntax;
+            var value: ast.SettingValue = .{ .kind = .interval, .quoted = self.current.quoted() };
+            try self.advance();
+            const first = try self.intervalField();
+            var last = first;
+            if (first != .none and try self.takeWord("TO")) {
+                last = try self.intervalField();
+                if (@intFromEnum(last) <= @intFromEnum(first)) return error.Syntax;
+            }
+            // PostgreSQL: only HOUR, MINUTE or HOUR TO MINUTE (42601).
+            if (first != .none and first != .hour and first != .minute) return error.Syntax;
+            if (last != .hour and last != .minute and last != .none) return error.Syntax;
+            value.interval_field = last;
+            return value;
+        }
+
+        fn intervalField(self: *Self) Error!ast.IntervalField {
+            const fields = [_]struct { []const u8, ast.IntervalField }{ .{ "year", .year }, .{ "month", .month }, .{ "day", .day }, .{ "hour", .hour }, .{ "minute", .minute }, .{ "second", .second } };
+            inline for (fields) |entry| {
+                if (try self.takeRaw(entry[0])) return entry[1];
+            }
+            return .none;
         }
 
         fn settingValue(self: *Self) Error!ast.SettingValue {

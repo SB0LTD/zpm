@@ -775,8 +775,8 @@ pub fn Binder(comptime config: types.Config) type {
                 .control => |control| switch (control) {
                     .maintenance => |spec| if (spec.operation == .vacuum) .vacuum else .analyze,
                     .begin, .set_transaction => .begin,
-                    .commit => .commit,
-                    .rollback, .rollback_to => .rollback,
+                    .commit, .commit_chain => .commit,
+                    .rollback, .rollback_to, .rollback_chain => .rollback,
                     .prepared_transaction => |prepared| switch (prepared.action) {
                         .prepare => .prepare_transaction,
                         .commit => .commit_prepared,

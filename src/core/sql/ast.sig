@@ -1256,6 +1256,9 @@ pub const Isolation = enum { default, read_uncommitted, read_committed, repeatab
 
 /// Transaction modes of BEGIN / START TRANSACTION / SET TRANSACTION / SET
 /// SESSION CHARACTERISTICS AS TRANSACTION (null: not given).
+/// Interval qualifier fields, coarsest first.
+pub const IntervalField = enum(u8) { none, year, month, day, hour, minute, second };
+
 pub const Characteristics = struct {
     isolation: Isolation = .default,
     read_only: ?bool = null,
@@ -1272,7 +1275,10 @@ pub const SettingName = struct {
 /// SET value: DEFAULT, LOCAL (TIME ZONE LOCAL), a word, a string literal or
 /// a (signed) number. `span` is the raw word/number; `quoted` the string.
 pub const SettingValue = struct {
-    kind: enum { default, word, string, number } = .default,
+    kind: enum { default, word, string, number, interval } = .default,
+    /// SET TIME ZONE INTERVAL 'text' [fields] (F761, B11 wave 5): the
+    /// qualifier's last field (IntervalField; none without one).
+    interval_field: IntervalField = .none,
     span: Span = .{},
     // Sign of a numeric token, separate from whitespace or comments.
     number_sign: u8 = 0,
@@ -1303,6 +1309,10 @@ pub const Control = union(enum) {
     /// null = RESET ALL.
     reset: ?SettingName,
     set_session_characteristics: Characteristics,
+    /// COMMIT / ROLLBACK AND CHAIN (T261, B11 wave 5): the next
+    /// transaction starts at once with the same characteristics.
+    commit_chain: void,
+    rollback_chain: void,
 };
 
 /// LOCK TABLE modes (PostgreSQL's eight, weakest first).

@@ -214,6 +214,9 @@ pub const Control = union(enum) {
     reset: ?ControlText,
     /// SET SESSION CHARACTERISTICS AS TRANSACTION (default_transaction_*).
     set_session_characteristics: Characteristics,
+    /// COMMIT / ROLLBACK AND CHAIN (T261, B11 wave 5).
+    commit_chain: void,
+    rollback_chain: void,
 };
 
 pub const StatementOptions = struct {
@@ -12614,6 +12617,24 @@ pub fn Database(comptime config: Config) type {
             return self.applyModes(slot, modes, false);
         }
 
+        /// The characteristics COMMIT / ROLLBACK AND CHAIN carries into the
+        /// next transaction (T261): the ending transaction's isolation level,
+        /// READ ONLY and DEFERRABLE. A transaction that failed outside any
+        /// savepoint has had its transaction settings undone, as
+        /// PostgreSQL's abort does: the next one takes the session defaults
+        /// (null).
+        pub fn chainCharacteristics(self: *const Self, slot: u16, failed: bool) ?ast.Characteristics {
+            const tx = &self.txs[slot];
+            if (failed and tx.userSavepoints() == 0) return null;
+            const isolation: ast.Isolation = switch (tx.isolation) {
+                .read_committed => .read_committed,
+                .repeatable_read => .repeatable_read,
+                .serializable => .serializable,
+                .read_uncommitted => .read_uncommitted,
+            };
+            return .{ .isolation = isolation, .read_only = tx.read_only, .deferrable = tx.deferrable };
+        }
+
         /// SET SESSION CHARACTERISTICS AS TRANSACTION (default_transaction_*).
         pub fn sessionCharacteristics(self: *Self, slot: ?u16, modes: ast.Characteristics) Error!void {
             return self.setCharacteristics(slot, modes);
@@ -12695,7 +12716,7 @@ pub fn Database(comptime config: Config) type {
                     if (self.statement_implicit) return error.UnsupportedStatement;
                     self.outcome = .{ .command = .begin };
                 },
-                .commit, .rollback, .prepared_transaction, .savepoint, .release, .rollback_to => return error.UnsupportedStatement,
+                .commit, .rollback, .prepared_transaction, .savepoint, .release, .rollback_to, .commit_chain, .rollback_chain => return error.UnsupportedStatement,
                 .set => |set| {
                     var name: ControlText = .{};
                     try settingName(source, set.name, &name);
@@ -16857,13 +16878,51 @@ pub fn Database(comptime config: Config) type {
                     lexer.decodeQuoted(source, value.quoted, &out.bytes);
                     out.len = value.quoted.len;
                 },
+                .interval => try zoneIntervalHours(source, value, out),
             }
             return switch (value.kind) {
                 .default => .default,
                 .word => .word,
                 .string => .string,
-                .number => .number,
+                .number, .interval => .number,
             };
+        }
+
+        /// SET TIME ZONE INTERVAL 'text' [fields] (F761, B11 wave 5): the
+        /// offset in hours east as decimal text, the form the numeric zone
+        /// setting reads. A bare number counts in the qualifier's last
+        /// field; finer fields are dropped. Months or days are 22023, as in
+        /// PostgreSQL (invalid interval value for time zone).
+        fn zoneIntervalHours(source: []const u8, value: ast.SettingValue, out: *ControlText) Error!void {
+            var text: [64]u8 = undefined;
+            if (value.quoted.len > text.len) return error.InvalidParameterValue;
+            lexer.decodeQuoted(source, value.quoted, &text);
+            const raw = std.mem.trim(u8, text[0..value.quoted.len], " \t");
+            const unit_us: i64 = switch (value.interval_field) {
+                .none, .second => 1_000_000,
+                .minute => 60_000_000,
+                .hour => 3_600_000_000,
+                .day, .month, .year => return error.InvalidParameterValue,
+            };
+            var us: i64 = 0;
+            const bare = raw.len != 0 and for (raw, 0..) |byte, index| {
+                if (!(types.digit(byte) or ((byte == '+' or byte == '-') and index == 0))) break false;
+            } else true;
+            if (bare) {
+                const number = std.fmt.parseInt(i64, raw, 10) catch return error.InvalidParameterValue;
+                us = std.math.mul(i64, number, unit_us) catch return error.InvalidParameterValue;
+            } else {
+                const interval = try temporal_module.parseInterval(raw);
+                if (interval.months != 0 or interval.days != 0) return error.InvalidParameterValue;
+                us = interval.us;
+                // The qualifier drops fields below its last one.
+                if (value.interval_field == .minute or value.interval_field == .hour) us -= @rem(us, unit_us);
+            }
+            const seconds = @divTrunc(us, 1_000_000);
+            const negative = seconds < 0;
+            const magnitude: u64 = @abs(seconds);
+            const written = std.fmt.bufPrint(&out.bytes, "{s}{d}.{d:0>6}", .{ if (negative) "-" else "", magnitude / 3600, (magnitude % 3600) * 1_000_000 / 3600 }) catch return error.InvalidParameterValue;
+            out.len = written.len;
         }
 
         /// Lexer-based scheduling hint, including nested comments/whitespace.
@@ -16903,6 +16962,8 @@ pub fn Database(comptime config: Config) type {
                 .begin => |modes| out = .{ .begin = modes },
                 .commit => out = .commit,
                 .rollback => out = .rollback,
+                .commit_chain => out = .commit_chain,
+                .rollback_chain => out = .rollback_chain,
                 .prepared_transaction => |prepared| {
                     var gid: ?two_phase.Gid = null;
                     if (prepared.gid.len <= 199) {
