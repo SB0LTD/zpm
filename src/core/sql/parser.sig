@@ -4366,7 +4366,8 @@ pub fn Parser(comptime config: types.Config) type {
             }
             if (!name.quoted and (types.keyword(raw_name, "nextval") or types.keyword(raw_name, "setval"))) self.pool.complex = true;
             // Set-returning built-ins expand on the general engine (wave 4).
-            if (!name.quoted and (types.keyword(raw_name, "regexp_matches") or types.keyword(raw_name, "regexp_split_to_table"))) self.pool.complex = true;
+            if (!name.quoted and (types.keyword(raw_name, "regexp_matches") or types.keyword(raw_name, "regexp_split_to_table") or
+                types.keyword(raw_name, "jsonb_path_query") or types.keyword(raw_name, "jsonb_path_query_tz"))) self.pool.complex = true;
             var call: ast.Node = .{ .kind = .function, .name = name };
             if (self.tokens.dialect == .tds and !name.quoted and types.keyword(raw_name, "isnull")) {
                 self.last_native_syntax = name.span.start;

@@ -237,10 +237,16 @@ pub fn JsonEval(comptime config: types.Config, comptime E: type) type {
             } };
             if (state.mode == .array) header = try J.beginContainer(&out, false);
             const sink: JP.Sink = .{ .context = &state, .emit = collectEmit };
-            _ = JP.run(&context, &sink) catch |err| {
-                if (silent and jsonpath.suppressible(err)) return .null_value;
-                return err;
+            // A silent error ends the evaluation: exists and match give
+            // NULL, the array and first forms what was found before it.
+            const failed = run: {
+                _ = JP.run(&context, &sink) catch |err| {
+                    if (silent and jsonpath.suppressible(err)) break :run true;
+                    return err;
+                };
+                break :run false;
             };
+            if (failed and (state.mode == .exists or state.mode == .match)) return .null_value;
             switch (state.mode) {
                 .exists => return .{ .boolean = state.count != 0 },
                 .match => {
@@ -264,6 +270,43 @@ pub fn JsonEval(comptime config: types.Config, comptime E: type) type {
                     return jsonbCell(&out);
                 },
             }
+        }
+
+        const RowState = struct {
+            context: *anyopaque,
+            row: *const fn (*anyopaque, *const V.Cell) Error!bool,
+            stopped: bool = false,
+        };
+
+        fn rowItemEmit(raw: ?*anyopaque, item: JP.Item) Error!bool {
+            const state: *RowState = @ptrCast(@alignCast(raw.?));
+            var out: J.Buffer = .{};
+            try out.append(item.bytes[item.at..][0..jsonb.sizeAt(item.bytes, item.at)]);
+            const cell = try jsonbCell(&out);
+            if (!try state.row(state.context, &cell)) state.stopped = true;
+            return state.stopped;
+        }
+
+        /// The rows of jsonb_path_query (wave 4 text-json): every item the
+        /// path yields, in order; NULL arguments give none, and a silent
+        /// call ends quietly at a suppressible error.
+        pub fn pathRows(ctx: *const E.Context, n: *const ast.Node, context: *anyopaque, row: *const fn (*anyopaque, *const V.Cell) Error!bool) Error!void {
+            var args: Args = .{};
+            try arguments(ctx, n, &args);
+            if (args.any_null) return;
+            const session = ctx.session;
+            const silent = args.count > 3 and args.cells[3].boolean;
+            const vars: ?[]const u8 = if (args.count > 2) args.cells[2].jsonb.slice() else null;
+            var path: JP.P = undefined;
+            try path.parse(args.cells[1].text.slice(), session.control);
+            var evaluation: JP.Context = undefined;
+            try JP.init(&evaluation, &path, args.cells[0].jsonb.slice(), vars, session.control, session);
+            var state: RowState = .{ .context = context, .row = row };
+            const sink: JP.Sink = .{ .context = &state, .emit = rowItemEmit };
+            _ = JP.run(&evaluation, &sink) catch |err| {
+                if (silent and jsonpath.suppressible(err)) return;
+                return err;
+            };
         }
 
         // ---- JSON_TABLE (B11 json-agg lane) ---------------------------------

@@ -596,6 +596,7 @@ pub fn Exec(comptime config: types.Config) type {
                 const n = &ctx.pool.nodes[call];
                 return switch (n.func) {
                     .regexp_matches, .regexp_split_to_table => regex_eval.RegexEval(config, E).rows(ctx, n, sink),
+                    .jsonb_path_query => json_eval.JsonEval(config, E).pathRows(ctx, n, sink.context, sink.row),
                     else => error.UnsupportedStatement,
                 };
             }

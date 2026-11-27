@@ -1406,8 +1406,11 @@ pub fn Binder(comptime config: types.Config) type {
                     n.planned_null = knownNull(context, n.b);
                     if (n.planned_null) context.pool.planned_nulls = true;
                 },
-                .jsonb_path_exists, .jsonb_path_match, .jsonb_path_query_array, .jsonb_path_query_first => {
+                .jsonb_path_exists, .jsonb_path_match, .jsonb_path_query_array, .jsonb_path_query_first, .jsonb_path_query => {
                     const result: T = if (n.func == .jsonb_path_exists or n.func == .jsonb_path_match) .boolean else .jsonb;
+                    defer if (n.func == .jsonb_path_query) {
+                        n.constant = false;
+                    };
                     switch (count) {
                         2 => try bindSignature(context, n, &[_]T{ .jsonb, .jsonpath }, result, true),
                         3 => try bindSignature(context, n, &[_]T{ .jsonb, .jsonpath, .jsonb }, result, true),
@@ -1609,6 +1612,10 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "to_json", .func = .to_json },           .{ .name = "to_jsonb", .func = .to_jsonb },
                 .{ .name = "jsonb_path_exists", .func = .jsonb_path_exists }, .{ .name = "jsonb_path_match", .func = .jsonb_path_match },
                 .{ .name = "jsonb_path_query_array", .func = .jsonb_path_query_array }, .{ .name = "jsonb_path_query_first", .func = .jsonb_path_query_first },
+                // The *_tz variants differ only in datetime comparisons (wave 4).
+                .{ .name = "jsonb_path_query", .func = .jsonb_path_query },       .{ .name = "jsonb_path_query_tz", .func = .jsonb_path_query },
+                .{ .name = "jsonb_path_exists_tz", .func = .jsonb_path_exists },  .{ .name = "jsonb_path_match_tz", .func = .jsonb_path_match },
+                .{ .name = "jsonb_path_query_array_tz", .func = .jsonb_path_query_array }, .{ .name = "jsonb_path_query_first_tz", .func = .jsonb_path_query_first },
                 .{ .name = "jsonb_exists_any", .func = .jsonb_exists_any }, .{ .name = "jsonb_exists_all", .func = .jsonb_exists_all },
                 // Comments (B11 wave 3).
                 .{ .name = "obj_description", .func = .obj_description },
@@ -2790,6 +2797,11 @@ pub fn Binder(comptime config: types.Config) type {
                     try typeRegexFunction(context, n, count);
                 },
                 .substring_regex, .substring_similar => try typeRegexFunction(context, n, count),
+                .jsonb_path_query => {
+                    const seen = scope.set_calls orelse return error.UnsupportedStatement;
+                    seen.* +|= 1;
+                    try typeJsonFunction(context, n, count);
+                },
                 .similar_to_escape => try bindSignature(context, n, if (count == 1) &[_]ast.Type{.text} else &[_]ast.Type{ .text, .text }, .text, true),
                 .point_constructor => try bindSignature(context, n, &[_]ast.Type{ .float8, .float8 }, .point, true),
                 .box_constructor => try bindSignature(context, n, &[_]ast.Type{ .point, .point }, .box, true),
@@ -7961,7 +7973,7 @@ pub fn Binder(comptime config: types.Config) type {
                     try typeExpr(context, &inner, arg);
                     count += 1;
                 }
-                try typeRegexFunction(context, call, count);
+                if (call.func == .jsonb_path_query) try typeJsonFunction(context, call, count) else try typeRegexFunction(context, call, count);
                 ty = call.ty;
                 series = .set_function;
             } else {

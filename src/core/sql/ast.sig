@@ -171,7 +171,10 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     // substring(text, text, text) (SIMILAR ... ESCAPE). regexp_matches and
     // regexp_split_to_table return sets (FROM items or one target).
     regexp_match, regexp_matches, regexp_replace, regexp_split_to_array, regexp_split_to_table, regexp_count, regexp_instr, regexp_substr,
-    substring_regex, substring_similar };
+    substring_regex, substring_similar,
+    // jsonb_path_query (and jsonb_path_query_tz): the items of a path as a
+    // set (wave 4 text-json; json_eval.sig rows).
+    jsonb_path_query };
 
 
 /// mr_call variants: the range accessors applied to a multirange's span.
@@ -309,7 +312,7 @@ pub fn strictFunction(func: Func) bool {
 /// Set-returning built-ins (wave 4 text-json): bound only as a FROM item
 /// or inside one target of a select list.
 pub fn setFunction(func: Func) bool {
-    return func == .regexp_matches or func == .regexp_split_to_table;
+    return func == .regexp_matches or func == .regexp_split_to_table or func == .jsonb_path_query;
 }
 
 /// Cast typmods marking `::regclass` / `::regtype` (OID-valued casts).
