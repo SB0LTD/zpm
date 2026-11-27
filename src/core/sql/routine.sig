@@ -183,6 +183,10 @@ pub fn Routines(comptime config: types.Config) type {
             table: TableName = .{},
             where: Span = .{},
             instead: bool = false,
+            /// The action statements (B11 wave 4): empty for NOTHING; the
+            /// text inside the parentheses of `( a; b )` (`multiple`).
+            action: Span = .{},
+            multiple: bool = false,
         };
 
         pub const Statement = union(Kind) {
@@ -1074,9 +1078,45 @@ pub fn Routines(comptime config: types.Config) type {
             if (try cursor.take("instead")) {
                 out.instead = true;
             } else _ = try cursor.take("also");
-            // Actions other than NOTHING (query rewriting) are outside the subset.
-            if (!try cursor.take("nothing")) return error.UnsupportedStatement;
+            if (try cursor.take("nothing")) return finish(cursor);
+            // INSERT / UPDATE / DELETE actions (B11 wave 4), one or several
+            // in parentheses; SELECT and NOTIFY actions are outside it.
+            if (cursor.symbol(.lparen)) {
+                out.action = try parenthesized(cursor);
+                out.multiple = true;
+            } else {
+                const begin = cursor.start();
+                var end = begin;
+                var depth: usize = 0;
+                while (!cursor.atEnd()) {
+                    if (cursor.symbol(.lparen)) depth += 1;
+                    if (cursor.symbol(.rparen) and depth > 0) depth -= 1;
+                    if (depth == 0 and cursor.symbol(.semicolon)) break;
+                    end = cursor.after();
+                    try cursor.advance();
+                }
+                if (end == begin) return error.Syntax;
+                out.action = .{ .start = begin, .end = end };
+            }
             try finish(cursor);
+            if (out.action.end == out.action.start) return error.Syntax;
+            var statements: Statements = .{ .source = cursor.source[0..out.action.end], .position = out.action.start };
+            var count: usize = 0;
+            while (try statements.next()) |span| {
+                const word = firstWordOf(cursor.source[span.start..span.end]);
+                const known = types.keyword(word, "insert") or types.keyword(word, "update") or types.keyword(word, "delete");
+                if (!known) return if (types.keyword(word, "select") or types.keyword(word, "notify") or types.keyword(word, "with") or types.keyword(word, "values")) error.UnsupportedStatement else error.Syntax;
+                count += 1;
+            }
+            if (count == 0) return error.Syntax;
+        }
+
+        pub fn firstWordOf(text: []const u8) []const u8 {
+            var at: usize = 0;
+            while (at < text.len and !types.letter(text[at])) at += 1;
+            var end = at;
+            while (end < text.len and (types.letter(text[end]) or types.digit(text[end]))) end += 1;
+            return text[at..end];
         }
 
         /// Parses a routine statement (`classify` returned its kind).

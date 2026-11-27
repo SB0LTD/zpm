@@ -660,7 +660,9 @@ fn rules() !void {
     try completes("INSERT INTO r VALUES (10, 5), (11, 500)", .insert, 1);
     try fails("CREATE RULE x AS ON INSERT TO r WHERE OLD.id > 1 DO INSTEAD NOTHING", error.InvalidObjectDefinition);
     try fails("CREATE RULE x AS ON DELETE TO r WHERE NEW.id > 1 DO INSTEAD NOTHING", error.InvalidObjectDefinition);
-    try fails("CREATE RULE x AS ON DELETE TO r DO INSTEAD DELETE FROM r", error.UnsupportedStatement);
+    // INSERT / UPDATE / DELETE actions run (B11 wave 4, contract-sql-nested-stmts);
+    // SELECT actions are outside the subset (0A000).
+    try fails("CREATE RULE x AS ON DELETE TO r DO INSTEAD SELECT 1", error.UnsupportedStatement);
     try fails("CREATE RULE x AS ON SELECT TO r DO INSTEAD NOTHING", error.UnsupportedStatement);
     try fails("MERGE INTO r USING (SELECT 1 AS id) s ON r.id = s.id WHEN MATCHED THEN DELETE", error.UnsupportedStatement);
     try fails("INSERT INTO r VALUES (1, 1) ON CONFLICT DO NOTHING", error.UnsupportedStatement);

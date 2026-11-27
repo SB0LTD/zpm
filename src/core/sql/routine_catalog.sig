@@ -74,7 +74,7 @@ pub const tg_instead: u8 = 64;
 /// Object class of a write-set entry (Mvcc.Write.new) and of an overlay slot.
 pub const Class = enum(u8) { routine = 0, trigger = 1, rule = 2 };
 
-pub const Op = enum(u8) { create_routine = 60, drop_routine = 61, create_trigger = 62, drop_trigger = 63, create_rule = 64, drop_rule = 65 };
+pub const Op = enum(u8) { create_routine = 60, drop_routine = 61, create_trigger = 62, drop_trigger = 63, create_rule = 64, drop_rule = 65, create_rule_action = 85 };
 
 /// The MVCC stamps of one object version (the storage.Version rules).
 pub const Stamp = struct {
@@ -409,9 +409,12 @@ pub fn Catalog(comptime config: types.Config) type {
             /// pg_rewrite.ev_type: '2' UPDATE, '3' INSERT, '4' DELETE.
             event: u8 = '4',
             instead: bool = true,
-            /// WHERE qualification text (empty: unconditional). The action
-            /// is always NOTHING in this subset.
+            /// WHERE qualification text (empty: unconditional).
             where: Text = .{},
+            /// Action statements (B11 wave 4, op 85): empty for NOTHING;
+            /// `multiple` when written in parentheses.
+            action: Text = .{},
+            multiple: bool = false,
         };
 
         /// Every object slot of a database.
@@ -815,7 +818,23 @@ pub fn Catalog(comptime config: types.Config) type {
             try out.text(item.args[0..item.args_len]);
         }
 
+        /// Op 64 carries DO NOTHING rules only; a rule with actions is op 85
+        /// (catalog images do not carry rule actions: they refuse them).
         pub fn encodeRule(out: *Payload, item: *const Rule) Error!void {
+            if (item.action.len != 0) return error.UnsupportedStatement;
+            try encodeRuleFields(out, item);
+        }
+
+        /// Op 85 (B11 wave 4): the op 64 payload, flags u8 (1 multiple),
+        /// then the action text (u16 + bytes, at least one byte).
+        pub fn encodeRuleAction(out: *Payload, item: *const Rule) Error!void {
+            if (item.action.len == 0) return error.UnsupportedStatement;
+            try encodeRuleFields(out, item);
+            try out.int(u8, @intFromBool(item.multiple));
+            try out.text(item.action.slice());
+        }
+
+        fn encodeRuleFields(out: *Payload, item: *const Rule) Error!void {
             try out.int(u32, item.oid);
             try out.name(item.name.slice());
             try out.int(u32, item.table_oid);
@@ -1013,16 +1032,32 @@ pub fn Catalog(comptime config: types.Config) type {
 
         pub fn decodeRule(payload: []const u8, out: *Rule) Error!void {
             var reader = Reader{ .bytes = payload };
+            try decodeRuleFields(&reader, out);
+            if (!reader.finished()) return error.InvalidChangeRecord;
+        }
+
+        pub fn decodeRuleAction(payload: []const u8, out: *Rule) Error!void {
+            var reader = Reader{ .bytes = payload };
+            try decodeRuleFields(&reader, out);
+            const flags = try reader.int(u8);
+            if (flags > 1) return error.InvalidChangeRecord;
+            out.multiple = flags == 1;
+            out.action.len = try readText(&reader, &out.action.bytes);
+            if (out.action.len == 0) return error.InvalidChangeRecord;
+            for (out.action.slice()) |byte| if (byte == 0) return error.InvalidChangeRecord;
+            if (!reader.finished()) return error.InvalidChangeRecord;
+        }
+
+        fn decodeRuleFields(reader: *Reader, out: *Rule) Error!void {
             out.* = .{};
             out.oid = try reader.int(u32);
-            try readName(&reader, &out.name);
+            try readName(reader, &out.name);
             out.table_oid = try reader.int(u32);
             out.event = try reader.int(u8);
             const instead = try reader.int(u8);
             if (out.event < '2' or out.event > '4' or instead > 1) return error.InvalidChangeRecord;
             out.instead = instead == 1;
-            out.where.len = try readText(&reader, &out.where.bytes);
-            if (!reader.finished()) return error.InvalidChangeRecord;
+            out.where.len = try readText(reader, &out.where.bytes);
         }
 
         pub fn decodeOid(payload: []const u8) Error!u32 {
@@ -1152,9 +1187,9 @@ pub fn Catalog(comptime config: types.Config) type {
                     try overlayAdd(overlay, .{ .live = true, .class = .trigger, .oid = item.oid, .table_oid = item.table_oid, .function_oid = item.function_oid, .name = item.name });
                     return item.oid;
                 },
-                @intFromEnum(Op.create_rule) => {
+                @intFromEnum(Op.create_rule), @intFromEnum(Op.create_rule_action) => {
                     var item: Rule = undefined;
-                    try decodeRule(payload, &item);
+                    if (tag == @intFromEnum(Op.create_rule)) try decodeRule(payload, &item) else try decodeRuleAction(payload, &item);
                     if (item.oid < 16384 or item.oid == 0xffffffff or overlayHas(overlay, item.oid) or context.oidTaken(item.oid)) return error.ChangeRecordConflict;
                     if (!context.tableLive(item.table_oid)) return error.ChangeRecordConflict;
                     for (&overlay.objects) |*object| {

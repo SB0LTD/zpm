@@ -16,7 +16,7 @@
 const std = @import("std");
 const sql = @import("sql");
 
-const DB = sql.Database(.{ .tables = 16, .columns = 8, .rows_per_table = 32, .name_bytes = 32, .text_bytes = 64, .nulls_first_ascending = false, .integer_bits = 32, .transactions = 4, .sequences = 4, .expr_nodes = 512, .routines = 16, .triggers = 12, .rules = 8, .routine_depth = 32, .nested_statements = 8, .work_rows = 256 });
+const DB = sql.Database(.{ .tables = 16, .columns = 8, .rows_per_table = 32, .name_bytes = 32, .text_bytes = 64, .nulls_first_ascending = false, .integer_bits = 32, .transactions = 4, .sequences = 4, .expr_nodes = 512, .routines = 16, .triggers = 12, .rules = 16, .routine_depth = 32, .nested_statements = 8, .work_rows = 256 });
 /// A small workspace: the saved statements do not fit (54000).
 const Small = sql.Database(.{ .tables = 4, .columns = 4, .rows_per_table = 8, .name_bytes = 32, .text_bytes = 32, .nulls_first_ascending = false, .integer_bits = 32, .expr_nodes = 256, .routines = 4, .triggers = 2, .rules = 1, .nested_statements = 8 });
 
@@ -26,6 +26,7 @@ var replica: DB = .{};
 var small: Small = .{};
 var scratch: DB.ReplayScratch = .{};
 var record: [65536]u8 = undefined;
+var crafted: [65536]u8 = undefined;
 var records_applied: usize = 0;
 
 fn check(ok: bool) !void {
@@ -672,6 +673,121 @@ fn updatableViews() !void {
     try idle();
 }
 
+// ---- rule actions ---------------------------------------------------------------
+
+const rule_probe = "SELECT r.rulename, r.ev_type, r.is_instead, p.definition FROM pg_rewrite r JOIN pg_rules p ON p.rulename = r.rulename ORDER BY r.rulename";
+
+/// DO [ALSO | INSTEAD] INSERT / UPDATE / DELETE actions with NEW / OLD and
+/// WHERE, on tables and views: INSERT actions after the original, UPDATE
+/// and DELETE actions before it, an unconditional INSTEAD rule replaces
+/// it (the tag counts its last action of the same kind), a conditional
+/// one keeps the original for the other rows. Rules with actions replay
+/// as op 85.
+fn ruleActions() !void {
+    reset();
+    try run("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)");
+    try run("CREATE TABLE log (what TEXT)");
+    try completes("CREATE RULE ri AS ON INSERT TO t DO ALSO INSERT INTO log VALUES ('ins:' || new.id || ':' || new.v)", .create_rule, 0);
+    try completes("INSERT INTO t VALUES (1, 'a'), (2, 'b')", .insert, 2);
+    try run("CREATE RULE ru AS ON UPDATE TO t DO ALSO INSERT INTO log VALUES ('upd:' || old.v || '->' || new.v)");
+    try completes("UPDATE t SET v = v || '!' WHERE id = 1", .update, 1);
+    try run("CREATE RULE rd AS ON DELETE TO t WHERE old.id = 2 DO ALSO INSERT INTO log VALUES ('del:' || old.id)");
+    try completes("DELETE FROM t WHERE id >= 1", .delete, 2);
+    try expect("SELECT * FROM t ORDER BY id", "");
+    try expect("SELECT * FROM log", "ins:1:a;ins:2:b;upd:a->a!;del:2");
+    // Conditional and unconditional INSTEAD rules.
+    try run("CREATE TABLE u (id INT, v TEXT)");
+    try run("CREATE RULE ui AS ON INSERT TO u WHERE new.id < 0 DO INSTEAD INSERT INTO log VALUES ('neg:' || new.id)");
+    try completes("INSERT INTO u VALUES (1, 'x'), (-1, 'y')", .insert, 1);
+    try expect("SELECT * FROM u", "1|x");
+    try run("CREATE RULE ui2 AS ON INSERT TO u DO INSTEAD (INSERT INTO log VALUES ('i1:' || new.id); INSERT INTO log VALUES ('i2:' || new.id))");
+    try completes("INSERT INTO u VALUES (5, 'z')", .insert, 1);
+    try expect("SELECT * FROM u", "1|x");
+    try expect("SELECT * FROM log WHERE what LIKE 'i%' OR what LIKE 'neg%' ORDER BY what", "i1:5;i2:5;ins:1:a;ins:2:b;neg:-1");
+    // Rules on a view replace its statements.
+    try run("CREATE VIEW vw AS SELECT * FROM t");
+    try run("CREATE RULE vi AS ON INSERT TO vw DO INSTEAD INSERT INTO t VALUES (new.id, new.v)");
+    try run("CREATE RULE vu AS ON UPDATE TO vw DO INSTEAD UPDATE t SET v = new.v WHERE id = old.id");
+    try run("CREATE RULE vd AS ON DELETE TO vw DO INSTEAD DELETE FROM t WHERE id = old.id");
+    try completes("INSERT INTO vw VALUES (7, 'g'), (8, 'h')", .insert, 2);
+    try completes("UPDATE vw SET v = 'G' WHERE id = 7", .update, 1);
+    try completes("DELETE FROM vw WHERE id = 8", .delete, 1);
+    try expect("SELECT * FROM t ORDER BY id", "7|G");
+    // RETURNING needs a rule with RETURNING (0A000).
+    try rejects("INSERT INTO vw VALUES (9, 'i') RETURNING *", error.UnsupportedStatement, "SELECT count(*) FROM t", "1");
+    // UPDATE actions run before the original; defaults are evaluated again.
+    try run("CREATE TABLE s (id SERIAL PRIMARY KEY, v TEXT)");
+    try run("CREATE TABLE sl (n INT)");
+    try run("CREATE RULE sr AS ON INSERT TO s DO ALSO INSERT INTO sl VALUES (new.id)");
+    try completes("INSERT INTO s (v) VALUES ('a'), ('b')", .insert, 2);
+    try expect("SELECT id FROM s ORDER BY id", "1;2");
+    try expect("SELECT n FROM sl ORDER BY n", "3;4");
+    // Definition errors and recursion (42P17), SELECT / NOTIFY actions (0A000).
+    try fails("CREATE RULE bad AS ON INSERT TO t DO ALSO INSERT INTO log VALUES (old.v)", error.InvalidObjectDefinition);
+    try fails("CREATE RULE bad2 AS ON DELETE TO t DO ALSO INSERT INTO log VALUES (new.v)", error.InvalidObjectDefinition);
+    try fails("CREATE RULE s1 AS ON INSERT TO t DO ALSO SELECT 1", error.UnsupportedStatement);
+    try fails("CREATE RULE n1 AS ON INSERT TO t DO ALSO NOTIFY ch", error.UnsupportedStatement);
+    try run("CREATE RULE rec AS ON INSERT TO log DO ALSO INSERT INTO log VALUES ('again')");
+    try rejects("INSERT INTO log VALUES ('x')", error.InvalidObjectDefinition, "SELECT count(*) FROM log", "10");
+    try run("DROP RULE rec ON log");
+    // A failing action undoes the whole statement.
+    try run("CREATE RULE bad_action AS ON INSERT TO sl DO ALSO INSERT INTO t VALUES (new.n, 'dup')");
+    try rejects("INSERT INTO sl VALUES (7)", error.PrimaryKeyViolation, "SELECT count(*) FROM sl", "2");
+    try expect(rule_probe, "bad_action|3|f|CREATE RULE bad_action AS\n    ON INSERT TO public.sl DO  INSERT INTO t VALUES (new.n, 'dup');;" ++
+        "rd|4|f|CREATE RULE rd AS\n    ON DELETE TO public.t\n   WHERE (old.id = 2) DO  INSERT INTO log VALUES ('del:' || old.id);;" ++
+        "ri|3|f|CREATE RULE ri AS\n    ON INSERT TO public.t DO  INSERT INTO log VALUES ('ins:' || new.id || ':' || new.v);;" ++
+        "ru|2|f|CREATE RULE ru AS\n    ON UPDATE TO public.t DO  INSERT INTO log VALUES ('upd:' || old.v || '->' || new.v);;" ++
+        "sr|3|f|CREATE RULE sr AS\n    ON INSERT TO public.s DO  INSERT INTO sl VALUES (new.id);;" ++
+        "ui|3|t|CREATE RULE ui AS\n    ON INSERT TO public.u\n   WHERE (new.id < 0) DO INSTEAD  INSERT INTO log VALUES ('neg:' || new.id);;" ++
+        "ui2|3|t|CREATE RULE ui2 AS\n    ON INSERT TO public.u DO INSTEAD ( INSERT INTO log VALUES ('i1:' || new.id);\n INSERT INTO log VALUES ('i2:' || new.id);\n );;" ++
+        "vd|4|t|CREATE RULE vd AS\n    ON DELETE TO public.vw DO INSTEAD  DELETE FROM t WHERE id = old.id;;" ++
+        "vi|3|t|CREATE RULE vi AS\n    ON INSERT TO public.vw DO INSTEAD  INSERT INTO t VALUES (new.id, new.v);;" ++
+        "vu|2|t|CREATE RULE vu AS\n    ON UPDATE TO public.vw DO INSTEAD  UPDATE t SET v = new.v WHERE id = old.id;");
+    // The replica replays op 85 and its rules act alike.
+    try sameState(&.{ rule_probe, "SELECT * FROM t ORDER BY id", "SELECT * FROM log ORDER BY what", "SELECT * FROM u ORDER BY id", "SELECT n FROM sl ORDER BY n" });
+    try run("INSERT INTO vw VALUES (20, 'r')");
+    try run("INSERT INTO u VALUES (-2, 'q')");
+    try sameState(&.{ "SELECT * FROM t ORDER BY id", "SELECT * FROM log ORDER BY what" });
+    var left: DB.Result = .{};
+    var right: DB.Result = .{};
+    try db.execute("INSERT INTO u VALUES (-3, 'p')", &left);
+    try replica.execute("INSERT INTO u VALUES (-3, 'p')", &right);
+    try check(left.affected_rows == right.affected_rows);
+    try sameState(&.{"SELECT * FROM log ORDER BY what"});
+    try run("DROP RULE vi ON vw");
+    try expect("SELECT count(*) FROM pg_rules WHERE rulename = 'vi'", "0");
+    try sameState(&.{rule_probe});
+    try idle();
+}
+
+/// Malformed op 85 records are rejected before anything changes; the
+/// well-formed one replays.
+fn ruleRecords() !void {
+    reset();
+    try run("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)");
+    try run("CREATE TABLE log (what TEXT)");
+    const result = &other_slot;
+    result.* = .{};
+    var used: usize = 0;
+    try db.executeChanges("CREATE RULE ri AS ON INSERT TO t DO ALSO INSERT INTO log VALUES (new.v)", result, &record, &used, null, null);
+    const action = "INSERT INTO log VALUES (new.v)";
+    const at = std.mem.indexOf(u8, record[0..used], action) orelse return error.MissingRuleAction;
+    @memcpy(crafted[0..used], record[0..used]);
+    crafted[at - 3] = 7;
+    if (replica.applyChangeRecord(crafted[0..used], &scratch)) |_| return error.InvalidRecordAccepted else |err| try check(err == error.InvalidChangeRecord);
+    @memcpy(crafted[0..used], record[0..used]);
+    crafted[at] = 0;
+    if (replica.applyChangeRecord(crafted[0..used], &scratch)) |_| return error.InvalidRecordAccepted else |err| try check(err == error.InvalidChangeRecord);
+    try expect("SELECT count(*) FROM pg_rules", "1");
+    try same(try query(&replica, "SELECT count(*) FROM pg_rules"), "0");
+    try replica.applyChangeRecord(record[0..used], &scratch);
+    records_applied += 1;
+    try sameState(&.{rule_probe});
+    try run("INSERT INTO t VALUES (1, 'a')");
+    try sameState(&.{ "SELECT * FROM log", rule_probe });
+    try idle();
+}
+
 pub fn main() !void {
     try triggerStatements();
     try functionStatements();
@@ -682,5 +798,7 @@ pub fn main() !void {
     try triggerArguments();
     try insteadOfTriggers();
     try updatableViews();
+    try ruleActions();
+    try ruleRecords();
     std.debug.print("nested statements: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });
 }
