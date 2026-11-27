@@ -1201,7 +1201,7 @@ pub fn Eval(comptime config: types.Config) type {
         /// Compiles `pattern` (an ARE under `flags`) and searches `subject`;
         /// every text position of the simulation is a checkpoint.
         fn regexMatch(ctx: *const Context, subject: []const u8, pattern: []const u8, flags: regex.Flags) Error!bool {
-            var program: regex.Regex(config.regex_states) = .{};
+            var program: regex.Matcher(config.regex_states, config.text_bytes) = .{};
             try program.compile(pattern, flags, config.expr_depth);
             return program.search(subject, ctx.session.control);
         }

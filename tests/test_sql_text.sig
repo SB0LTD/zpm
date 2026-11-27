@@ -835,17 +835,17 @@ fn regularExpressions() !void {
     for (0..3) |index| try meta(index, "?column?", 16, -1);
     for (regex_battery) |case| try single(case[0], case[1]);
 
-    // Not supported here (0A000), where PostgreSQL matches: back
-    // references, BREs (embedded `b`; regexp_like options `b` and `e`,
-    // which parse_re_flags turns into BREs) and lookarounds nested more
-    // than three deep.
-    for ([_][]const u8{
-        "SELECT 'aa' ~ '(a)\\1'",              "SELECT 'aa' ~ '(a)(b)\\2'",
-        "SELECT 'aa' ~ '(a)\\1*'",             "SELECT 'a' ~ '(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)(k)(l)\\12'",
-        "SELECT 'a' ~ '(?b)a'",                "SELECT regexp_like('Abc','^a','b')",
-        "SELECT regexp_like('a','a{1}?','e')", "SELECT regexp_like('a.','a.','qe')",
-        "SELECT 'ab' ~ 'a(?=(?=(?=(?=b))))'",
-    }) |source| try rejects(source, error.UnsupportedStatement);
+    // Back references, BREs (embedded `b`; regexp_like options `b` and
+    // `e`, which parse_re_flags turns into BREs) and lookarounds nested
+    // more than three deep (wave 4 text-json; checked against native
+    // PostgreSQL 18.7).
+    for ([_][2][]const u8{
+        .{ "SELECT 'aa' ~ '(a)\\1'", "t" },                                          .{ "SELECT 'aa' ~ '(a)(b)\\2'", "f" },
+        .{ "SELECT 'aa' ~ '(a)\\1*'", "t" },                                         .{ "SELECT 'a' ~ '(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)(k)(l)\\12'", "f" },
+        .{ "SELECT 'a' ~ '(?b)a'", "t" },                                            .{ "SELECT regexp_like('Abc','^a','b')", "f" },
+        .{ "SELECT regexp_like('a','a{1}?','e')", "f" },                             .{ "SELECT regexp_like('a.','a.','qe')", "t" },
+        .{ "SELECT 'ab' ~ 'a(?=(?=(?=(?=b))))'", "t" },
+    }) |case| try single(case[0], case[1]);
     // A program beyond Config.regex_states instructions is 54000 (the
     // first one PostgreSQL also refuses, as too complex: 2201B).
     try rejects("SELECT 'aaa' ~ '(a{255}){255}'", error.ProgramLimitExceeded);
