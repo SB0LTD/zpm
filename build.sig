@@ -268,6 +268,12 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("postgres", "src/db/postgres.sig"), importEntry("scram", "src/db/scram.sig"),
     });
     _ = try addContract(ctx, test_sql, "contract-sql-composite-catalog", "tests/test_sql_composite_catalog.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    // Generated SQL-standard feature probes (tests/sql_conformance/generate_feature_contract.py):
+    // fails only when a probe the committed scoreboard records as passing regresses.
+    _ = try addContract(ctx, test_sql, "contract-sql-features", "tests/test_sql_features.sig", &.{
+        importEntry("sql", "src/core/sql.sig"),       importEntry("db_store", "src/db/store.sig"),
+        importEntry("postgres", "src/db/postgres.sig"), importEntry("scram", "src/db/scram.sig"),
+    });
     _ = try ctx.addModule("resource_observation", "src/core/resource_observation.sig");
     const machine_resources=try ctx.addModule("machine_resources", "src/platform/machine_resources.sig");
     try wire(ctx,machine_resources,"resource_observation","src/core/resource_observation.sig");

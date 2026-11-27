@@ -5,7 +5,8 @@ import json
 from pathlib import Path
 import struct
 import unittest
-from audit import Pg, equivalent
+from audit import FIRST_USER_OID, Pg, equivalent
+import feature_probes
 from generate_contracts import literal
 from verify_quantified_oracle import matrix
 from verify_row_oracle import matrix as row_matrix
@@ -271,6 +272,62 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(literal(None), 'null')
         self.assertEqual(literal('"\\\n'), '"\\x22\\x5c\\x0a"')
         self.assertEqual(literal('א'), '"\\xd7\\x90"')
+
+    def test_type_identity_oracle_covers_every_allocated_column(self):
+        root = Path(__file__).parent
+        oracle = json.loads((root / 'postgres18_oracle.json').read_text(encoding='utf8'))
+        recorded = json.loads((root / 'type_identity_oracle.json').read_text(encoding='utf8'))
+        manifest = json.loads((root / 'cases.json').read_text(encoding='utf8'))
+        self.assertEqual(recorded['manifest_sha256'], oracle['manifest_sha256'])
+        self.assertNotIn('failures', recorded)
+        scopes = {case['id']: case['scope'] for case in manifest['cases']}
+        wanted = {}
+        for case in oracle['cases']:
+            if case.get('status') != 'oracle_valid' or scopes[case['id']] != 'transaction':
+                continue
+            for index, statement in enumerate(case['oracle'][1:]):
+                for position, column in enumerate(statement['columns']):
+                    if column[1] >= FIRST_USER_OID:
+                        wanted.setdefault(case['id'], set()).add((str(index), str(position)))
+        found = {case: {(index, position) for index, columns in statements.items() for position in columns}
+                 for case, statements in recorded['cases'].items()}
+        self.assertEqual(wanted, found)
+        for statements in recorded['cases'].values():
+            for columns in statements.values():
+                for namespace, name, kind in columns.values():
+                    self.assertTrue(namespace and name)
+                    self.assertIn(kind, ('b', 'c', 'd', 'e', 'm', 'p', 'r'))
+
+    def test_feature_probe_oracle_scoreboard_and_contract_agree(self):
+        probes = feature_probes.load_probes()
+        digest = feature_probes.probes_digest(probes)
+        oracle = json.loads(feature_probes.ORACLE.read_text(encoding='utf8'))
+        self.assertEqual(oracle['probes_sha256'], digest)
+        self.assertEqual([p['id'] for p in oracle['probes']], [p['id'] for p in probes])
+        self.assertTrue(all(p['stable'] and len(p['statements']) for p in oracle['probes']))
+        contract = (feature_probes.ROOT.parent / 'test_sql_features.sig').read_text(encoding='utf8')
+        self.assertIn('Probes sha256: ' + digest, contract)
+        status = json.loads(feature_probes.STATUS.read_text(encoding='utf8'))
+        results = status['probe_results']
+        self.assertEqual(sorted(results['pass'] + results['fail']), sorted(p['id'] for p in probes))
+        features = feature_probes.load_features()
+        self.assertEqual(list(status['features']), [f['id'] for f in features])
+        for feature in features:
+            entry = status['features'][feature['id']]
+            if entry['applicability'] == 'in_scope':
+                self.assertTrue(feature['postgres_supported'])
+                self.assertIn(entry['status'], ('closed', 'partial', 'open'))
+                self.assertTrue(entry['evidence'], feature['id'])
+                passed = [p for p in entry['evidence'] if p in results['pass']]
+                expected = 'closed' if len(passed) == len(entry['evidence']) else 'partial' if passed else 'open'
+                self.assertEqual(entry['status'], expected, feature['id'])
+            else:
+                self.assertEqual(entry['status'], 'not_applicable')
+
+    def test_feature_canonical_escaping(self):
+        self.assertEqual(feature_probes.esc(b'a|b,c/d;e#f\\g\n\x7f'),
+                         b'a\\|b\\,c\\/d\\;e\\#f\\\\g\\x0a\\x7f')
+        self.assertEqual(feature_probes.esc('é'.encode()), 'é'.encode())
 
 
 if __name__ == '__main__':
