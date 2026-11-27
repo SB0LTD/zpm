@@ -348,6 +348,11 @@ pub fn Sessions(comptime config: types.Config) type {
             /// Cursors.rowids), or null.
             table: ?usize = null,
             table_oid: u32 = 0,
+            /// pg_cursors (E121-08): the DECLARE text, kept in the cursor's
+            /// value bytes at this offset from value_base, and its time.
+            statement_offset: usize = 0,
+            statement_len: usize = 0,
+            created_us: ?i64 = null,
         };
 
         pub const Cursors = struct {

@@ -56,7 +56,9 @@ pub const View = enum(u8) { pg_type, pg_namespace, pg_class, pg_attribute, pg_in
     pg_roles, pg_authid, pg_auth_members, pg_policy, pg_policies, pg_description, pg_shdescription, pg_foreign_data_wrapper, pg_foreign_server, pg_publication, pg_extension, pg_tables, table_privileges, pg_enum, pg_database, pg_am, pg_collation, pg_constraint, pg_statistic_ext,
     pg_publication_rel, pg_publication_namespace, pg_settings, pg_depend, pg_tablespace, pg_foreign_table,
     pg_init_privs, pg_cast, pg_transform, pg_language, pg_operator, pg_opclass, pg_opfamily, pg_ts_parser, pg_ts_template, pg_ts_dict, pg_ts_config, pg_default_acl, pg_conversion, pg_range, pg_event_trigger, pg_partitioned_table, pg_subscription,
-    pg_seclabel, pg_shseclabel, pg_seclabels, pg_db_role_setting, pg_amop, pg_amproc, pg_largeobject, pg_largeobject_metadata, sequence_state, pg_parameter_acl };
+    pg_seclabel, pg_shseclabel, pg_seclabels, pg_db_role_setting, pg_amop, pg_amproc, pg_largeobject, pg_largeobject_metadata, sequence_state, pg_parameter_acl,
+    // The session's open cursors (E121-08, B11 wave 5).
+    pg_cursors };
 
 pub const sql_language_oid: u32 = 14;
 pub const plpgsql_language_oid: u32 = 13002;
@@ -472,6 +474,8 @@ const pg_extension_columns = [_]ViewColumn{ col("oid", .oid), col("extname", .na
 const pg_tables_columns = [_]ViewColumn{ col("schemaname", .name), col("tablename", .name), col("tableowner", .name), col("tablespace", .name), col("hasindexes", .boolean), col("hasrules", .boolean), col("hastriggers", .boolean), col("rowsecurity", .boolean) };
 const table_privileges_columns = [_]ViewColumn{ col("grantor", .name), col("grantee", .name), col("table_catalog", .name), col("table_schema", .name), col("table_name", .name), col("privilege_type", .text), col("is_grantable", .text), col("with_hierarchy", .text) };
 
+const pg_cursors_columns = [_]ViewColumn{ col("name", .text), col("statement", .text), col("is_holdable", .boolean), col("is_binary", .boolean), col("is_scrollable", .boolean), col("creation_time", .timestamptz) };
+
 const pg_settings_columns = [_]ViewColumn{
     col("name", .text), col("setting", .text), col("unit", .text), col("category", .text), col("short_desc", .text),
     col("extra_desc", .text), col("context", .text), col("vartype", .text), col("source", .text), col("min_val", .text),
@@ -491,6 +495,7 @@ pub fn viewColumns(view: View) []const ViewColumn {
         .pg_tablespace => &pg_tablespace_columns,
         .pg_foreign_table => &pg_foreign_table_columns,
         .pg_settings => &pg_settings_columns,
+        .pg_cursors => &pg_cursors_columns,
         .pg_attribute => &pg_attribute_columns,
         .pg_index => &pg_index_columns,
         .pg_constraint => &pg_constraint_columns,
@@ -562,7 +567,8 @@ pub fn findView(schema: ?[]const u8, name: []const u8) ?View {
     const catalog_views = [_]View{ .pg_type, .pg_enum, .pg_namespace, .pg_am, .pg_collation, .pg_class, .pg_settings, .pg_attribute, .pg_index, .pg_constraint, .pg_depend, .pg_statistic_ext, .pg_attrdef, .pg_sequence, .pg_indexes, .pg_views, .pg_matviews, .pg_inherits, .pg_proc, .pg_trigger, .pg_rewrite, .pg_rules,
         .pg_tablespace, .pg_foreign_table, .pg_roles, .pg_authid, .pg_auth_members, .pg_policy, .pg_policies, .pg_description, .pg_shdescription, .pg_foreign_data_wrapper, .pg_foreign_server, .pg_publication, .pg_publication_rel, .pg_publication_namespace, .pg_extension, .pg_tables,
         .pg_init_privs, .pg_cast, .pg_transform, .pg_language, .pg_operator, .pg_opclass, .pg_opfamily, .pg_ts_parser, .pg_ts_template, .pg_ts_dict, .pg_ts_config, .pg_default_acl, .pg_conversion, .pg_range, .pg_event_trigger, .pg_partitioned_table, .pg_subscription,
-        .pg_seclabel, .pg_shseclabel, .pg_seclabels, .pg_db_role_setting, .pg_amop, .pg_amproc, .pg_largeobject, .pg_largeobject_metadata, .pg_parameter_acl };
+        .pg_seclabel, .pg_shseclabel, .pg_seclabels, .pg_db_role_setting, .pg_amop, .pg_amproc, .pg_largeobject, .pg_largeobject_metadata, .pg_parameter_acl,
+        .pg_cursors };
     const information_views = [_]View{ .schemata, .tables, .columns, .table_constraints, .key_column_usage, .table_privileges };
     const qualified = schema orelse {
         for (catalog_views) |view| if (types.same(@tagName(view), name)) return view;

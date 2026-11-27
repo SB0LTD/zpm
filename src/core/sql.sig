@@ -1550,7 +1550,7 @@ pub fn Database(comptime config: Config) type {
                 // Describe only needs the static relation schema.
                 if (!describe_only) for (self.workspace.plans.items[0..self.workspace.plans.len]) |*block| {
                     for (block.sources[0..block.source_count]) |*item| {
-                        if (item.view == .pg_settings or item.sequence != null) return error.UnsupportedStatement;
+                        if (item.view == .pg_settings or item.view == .pg_cursors or item.sequence != null) return error.UnsupportedStatement;
                     }
                 };
                 // Metadata-only Describe does not call evaluation hooks.
@@ -8026,6 +8026,7 @@ pub fn Database(comptime config: Config) type {
         fn viewRows(ptr: *anyopaque, view: catalog_module.View, sink: *X.RowSink) Error!void {
             const self: *Self = @ptrCast(@alignCast(ptr));
             if (view == .pg_settings) return settingRows(self.sessionState(), sink);
+            if (view == .pg_cursors) return self.cursorRows(sink);
             return self.fillViewRows(&self.session,self.seq_snap,&self.workspace.nodes,view,sink);
         }
 
@@ -8311,7 +8312,7 @@ pub fn Database(comptime config: Config) type {
 
         fn fillSchemaViewRows(self: *const Self, session_values: *const value_module.Session, snapshot: Snapshot, pool: *A.Pool, view: catalog_module.View, sink: *X.RowSink) Error!void {
             const include_class_acl = view == .pg_class and sink.referencesColumn(catalog_module.pg_class_acl_column);
-            if (view == .pg_settings) return error.UnsupportedStatement;
+            if (view == .pg_settings or view == .pg_cursors) return error.UnsupportedStatement;
             if (view == .sequence_state) return error.UnsupportedStatement;
             // Parameter grants have no persisted objects. Stock tools still
             // discover the typed catalog before exporting global roles.
@@ -12158,6 +12159,18 @@ pub fn Database(comptime config: Config) type {
             return .{ .array = out };
         }
 
+        /// pg_cursors (E121-08, B11 wave 5): this session's open cursors.
+        /// is_scrollable follows the declaration (NO SCROLL is false).
+        fn cursorRows(self: *Self, sink: *X.RowSink) Error!void {
+            const state = self.sessionState();
+            for (&self.cursors.slots) |*cursor| {
+                if (!cursor.used or cursor.session != state.id) continue;
+                const declared = self.cursors.value_backing[cursor.value_base + cursor.statement_offset ..][0..cursor.statement_len];
+                try sink.add(&.{ try objectTextCell(cursor.name.slice()), try definitionCell(declared, sink), boolCell(cursor.hold), boolCell(false),
+                    boolCell(cursor.scroll), if (cursor.created_us) |us| Cell{ .timestamptz = us } else .null_value });
+            }
+        }
+
         fn settingRows(state: *const Sess.State, sink: *X.RowSink) Error!void {
             const boot: Sess.Values = .{};
             // A projection can run set_config. The scan exposes a consistent
@@ -13014,6 +13027,9 @@ pub fn Database(comptime config: Config) type {
                     }
                 }
             }
+            // pg_cursors' statement text (E121-08) shares the value bytes.
+            const statement_offset = values.used - value_base;
+            _ = values.copy(source) catch return error.SessionCapacity;
             const cursor = &self.cursors.slots[index];
             cursor.* = .{ .used = true, .session = state.id, .hold = declare.hold, .scroll = declare.scroll orelse true, .epoch = tx.epoch, .slot = slot, .depth = tx.userSavepoints(), .column_count = columns, .base = self.cursors.used_rows, .count = rows, .value_base = value_base, .value_len = values.used - value_base };
             @memcpy(cursor.name.bytes[0..name.len], name.slice());
@@ -13027,6 +13043,9 @@ pub fn Database(comptime config: Config) type {
                 cursor.table = table;
                 cursor.table_oid = self.tables[table].oid;
             }
+            cursor.statement_offset = statement_offset;
+            cursor.statement_len = source.len;
+            cursor.created_us = self.session.statement_us orelse if (self.session.clock) |clock| clock() else null;
             self.cursors.used_rows += rows;
             self.cursors.value_used = values.used;
             result.clear(0);
