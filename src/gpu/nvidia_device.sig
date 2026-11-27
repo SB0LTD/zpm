@@ -2910,6 +2910,7 @@ test "temporaries written again past branches (kir_sm120.webs): each web a unit 
     _ = k.binding();
     const O = k.binding();
     const t = lin(&k);
+    const seed = k.load(.u32, kir.global(A, 32), r(k.op2(.shl, .u32, r(t), u(2))));
     const odd = k.cmp(.u32, .ne, r(k.op2(.@"and", .u32, r(t), u(1))), u(0));
     // two sets of temporaries as a shader's r0..r5: set a written and read,
     // then b, then a again, then b, each written behind a branch (rename
@@ -2924,10 +2925,7 @@ test "temporaries written again past branches (kir_sm120.webs): each web a unit 
     for (0..4) |pass| {
         const set = if (pass % 2 == 0) &a else &b;
         k.ifp(r(odd));
-        for (set, 0..) |x, j| {
-            const at = k.op2(.shl, .u32, r(k.op2(.@"and", .u32, r(k.op2(.iadd, .u32, r(t), u(@intCast(j + pass * N)))), u(63))), u(2));
-            k.set(x, .mov, r(k.load(.u32, kir.global(A, 32), r(at))), no, no);
-        }
+        for (set, 0..) |x, j| k.set(x, .imad, r(t), u(@intCast(j * 3 + pass + 1)), r(seed));
         k.els();
         for (set, 0..) |x, j| k.set(x, .iadd, r(t), u(@intCast(j * 7 + pass)), no);
         k.endif();
@@ -2939,7 +2937,7 @@ test "temporaries written again past branches (kir_sm120.webs): each web a unit 
     const bin = try kir_sm120.compileIn(&k, caps, &T.st, &T.code, .{});
     // (a pass's webs: each set twice, one unit each time)
     try testing.expect(T.st.stats.webs >= 2 * N);
-    // (one set, the sum and the addresses; both sets held through the
+    // (one set, the sum, the lane's values; both sets held through the
     // whole program took 2N and more)
     try testing.expect(bin.regs < 2 * N);
 }
