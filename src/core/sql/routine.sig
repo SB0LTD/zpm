@@ -45,7 +45,7 @@ pub fn Routines(comptime config: types.Config) type {
         pub const Text = RC.Text;
         pub const Name = V.Name;
 
-        pub const Kind = enum { create_function, create_procedure, drop_function, drop_procedure, call, do_block, create_trigger, drop_trigger, create_rule, drop_rule, grant_execute, revoke_execute };
+        pub const Kind = enum { create_function, create_procedure, drop_function, drop_procedure, call, do_block, create_trigger, drop_trigger, create_rule, drop_rule, grant_execute, revoke_execute, alter_function, alter_procedure };
 
         /// A byte range of the statement source.
         pub const Span = struct { start: usize = 0, end: usize = 0 };
@@ -93,6 +93,8 @@ pub fn Routines(comptime config: types.Config) type {
             arg_count: usize = 0,
         };
 
+        pub const AlterOwner = struct { routine: DropRoutine = .{}, owner: catalog_objects.Grantee = .{} };
+
         pub const ExecuteTarget = struct {
             routine: DropRoutine = .{},
             schema: Name = .{},
@@ -114,6 +116,7 @@ pub fn Routines(comptime config: types.Config) type {
 
         pub const CreateTrigger = struct {
             replace: bool = false,
+            has_function_schema: bool = false,
             name: Name = .{},
             tgtype: u8 = 0,
             columns: [config.columns]Name = @splat(.{}),
@@ -151,6 +154,8 @@ pub fn Routines(comptime config: types.Config) type {
             drop_rule: DropObject,
             grant_execute: ExecuteGrant,
             revoke_execute: ExecuteGrant,
+            alter_function: AlterOwner,
+            alter_procedure: AlterOwner,
         };
 
         // ---- tokens -------------------------------------------------------
@@ -265,6 +270,12 @@ pub fn Routines(comptime config: types.Config) type {
         pub fn classify(source: []const u8) ?Kind {
             var cursor = Cursor.init(source, 0) catch return null;
             if (cursor.is("call")) return .call;
+            if (cursor.is("alter")) {
+                cursor.advance() catch return null;
+                if (cursor.is("function")) return .alter_function;
+                if (cursor.is("procedure")) return .alter_procedure;
+                return null;
+            }
             if (cursor.is("grant") or cursor.is("revoke")) {
                 const grant = cursor.is("grant");
                 cursor.advance() catch return null;
@@ -466,6 +477,19 @@ pub fn Routines(comptime config: types.Config) type {
             try routineSignature(cursor, pool, out);
             if (cursor.symbol(.comma)) return error.UnsupportedStatement;
             if (try cursor.take("cascade")) out.cascade = true else _ = try cursor.take("restrict");
+            try finish(cursor);
+        }
+
+        fn alterOwner(cursor: *Cursor, pool: anytype, out: *AlterOwner) Error!void {
+            out.* = .{};
+            try cursor.expect("alter");
+            out.routine.procedure = try cursor.take("procedure");
+            if (!out.routine.procedure) try cursor.expect("function");
+            out.routine.name = try publicName(cursor, &out.routine.has_schema);
+            try routineSignature(cursor, pool, &out.routine);
+            if (!try cursor.take("owner")) return error.UnsupportedStatement;
+            try cursor.expect("to");
+            out.owner = try executeRole(cursor);
             try finish(cursor);
         }
 
@@ -701,7 +725,7 @@ pub fn Routines(comptime config: types.Config) type {
             if (try cursor.take("when")) out.when = try parenthesized(cursor);
             try cursor.expect("execute");
             if (!try cursor.take("function")) try cursor.expect("procedure");
-            out.function = try cursor.identifier();
+            out.function = try publicName(cursor, &out.has_function_schema);
             if (cursor.symbol(.dot)) return error.UnsupportedStatement;
             try cursor.expectSymbol(.lparen);
             if (!try cursor.takeSymbol(.rparen)) while (true) {
@@ -797,6 +821,10 @@ pub fn Routines(comptime config: types.Config) type {
                     out.* = if (kind == .drop_function) .{ .drop_function = .{} } else .{ .drop_procedure = .{} };
                     try dropRoutine(&cursor, pool, if (kind == .drop_function) &out.drop_function else &out.drop_procedure);
                 },
+                .alter_function, .alter_procedure => {
+                    out.* = if (kind == .alter_function) .{ .alter_function = .{} } else .{ .alter_procedure = .{} };
+                    try alterOwner(&cursor, pool, if (kind == .alter_function) &out.alter_function else &out.alter_procedure);
+                },
                 .call => {
                     out.* = .{ .call = .{} };
                     try call(&cursor, &out.call);
@@ -838,6 +866,8 @@ pub fn Routines(comptime config: types.Config) type {
                 .create_procedure => .create_procedure,
                 .drop_function => .drop_function,
                 .drop_procedure => .drop_procedure,
+                .alter_function => .alter_function,
+                .alter_procedure => .alter_procedure,
                 .call => .call,
                 .do_block => .do_block,
                 .create_trigger => .create_trigger,

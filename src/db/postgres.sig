@@ -2529,6 +2529,8 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                 .drop_function => "DROP FUNCTION",
                 .create_procedure => "CREATE PROCEDURE",
                 .drop_procedure => "DROP PROCEDURE",
+                .alter_function => "ALTER FUNCTION",
+                .alter_procedure => "ALTER PROCEDURE",
                 .call => "CALL",
                 .do_block => "DO",
                 .create_trigger => "CREATE TRIGGER",

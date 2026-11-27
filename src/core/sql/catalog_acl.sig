@@ -56,8 +56,13 @@ pub fn Acl(comptime V: type) type {
         };
 
         pub fn catalogOwner(owner: []const u8, privileges: []const u8, values: ?*types.ValueBytes) types.Error!V.Cell {
+            return catalogDefaults(owner, privileges, null, values);
+        }
+
+        pub fn catalogDefaults(owner: []const u8, privileges: []const u8, public: ?[]const u8, values: ?*types.ValueBytes) types.Error!V.Cell {
             var inline_buffer: [V.Text.inline_capacity]u8 = undefined;
-            var writer = try CatalogWriter.start(&inline_buffer, values, 1);
+            var writer = try CatalogWriter.start(&inline_buffer, values, if (public == null) 1 else 2);
+            if (public) |rights| try writer.add("", rights, owner);
             try writer.add(owner, privileges, owner);
             return writer.finish();
         }

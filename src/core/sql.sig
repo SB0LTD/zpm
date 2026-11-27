@@ -8438,6 +8438,39 @@ pub fn Database(comptime config: Config) type {
             return text.len;
         }
 
+        fn ruleDefinition(self: *const Self, rule: *const RC.Rule, snapshot: Snapshot, pretty: bool, out: []u8) Error!?usize {
+            const slot = self.visibleTableSlot(rule.table_oid, snapshot) orelse return null;
+            const table = &self.tables[slot];
+            var text: CatalogTextWriter = .{ .out = out, .quote_all = self.session.quote_all_identifiers };
+            text.add("CREATE RULE ");
+            text.ident(rule.name.slice());
+            text.add(" AS\n    ON ");
+            text.add(switch (rule.event) { '2' => "UPDATE", '3' => "INSERT", else => "DELETE" });
+            text.add(" TO ");
+            if (!pretty or !self.inRelationSearchPath(table.namespace, table.name.slice())) {
+                text.ident(self.namespaceName(table.namespace));
+                text.add(".");
+            }
+            text.ident(table.name.slice());
+            if (rule.where.len != 0) {
+                text.add("\n   WHERE (");
+                text.add(rule.where.slice());
+                text.add(")");
+            }
+            text.add(if (rule.instead) " DO INSTEAD NOTHING;" else " DO NOTHING;");
+            if (text.shortened) return error.TextCapacity;
+            return text.len;
+        }
+
+        fn postgresRuleDefinition(ptr: *anyopaque, oid: u32, pretty: bool, out: []u8) Error!?usize {
+            const self: *const Self = @ptrCast(@alignCast(ptr));
+            for (&self.objects.rules) |*rule| {
+                if (rule.live and rule.oid == oid and rule.stamp.visible(self.seq_snap))
+                    return self.ruleDefinition(rule, self.seq_snap, pretty, out);
+            }
+            return null;
+        }
+
         fn postgresTriggerDefinition(ptr: *anyopaque, oid: u32, pretty: bool, out: []u8) Error!?usize {
             const self: *const Self = @ptrCast(@alignCast(ptr));
             const snapshot = self.seq_snap;
@@ -8480,6 +8513,10 @@ pub fn Database(comptime config: Config) type {
                     text.add(") ");
                 }
                 text.add("EXECUTE FUNCTION ");
+                if (!self.session.public_schema_on_path) {
+                    text.ident(self.namespaceName(routine.namespace));
+                    text.add(".");
+                }
                 text.ident(routine.name.slice());
                 text.add("(");
                 for (0..trigger.nargs) |index| {
@@ -10437,7 +10474,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn statementHooks(self: *Self, slot: u16, snap: Snapshot) void {
-            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .large_object = &largeObjectCall, .large_object_data = &largeObjectDataCall, .large_object_truncate = &truncateLargeObject, .large_object_file = .{ .authorize = &authorizeLargeObjectFile, .call = &largeObjectFileCall }, .relation_name = &relationName, .relation_display_name = &relationDisplayName, .catalog_text = &catalogText, .schema_path = &catalogSchemaPath, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .view_definition = &postgresViewDefinition, .trigger_definition = &postgresTriggerDefinition, .statistics_columns = &postgresStatisticsColumns, .relation_publishable = &relationPublishable, .partition_key_definition = &postgresPartitionKey, .partition_ancestors = &postgresPartitionAncestors, .namespace_lookup = &postgresNamespaceLookup, .namespace_name = &postgresNamespaceName, .routine_lookup = &postgresRoutineLookup, .routine_name = &postgresRoutineName };
+            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .large_object = &largeObjectCall, .large_object_data = &largeObjectDataCall, .large_object_truncate = &truncateLargeObject, .large_object_file = .{ .authorize = &authorizeLargeObjectFile, .call = &largeObjectFileCall }, .relation_name = &relationName, .relation_display_name = &relationDisplayName, .catalog_text = &catalogText, .schema_path = &catalogSchemaPath, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .view_definition = &postgresViewDefinition, .trigger_definition = &postgresTriggerDefinition, .rule_definition = &postgresRuleDefinition, .statistics_columns = &postgresStatisticsColumns, .relation_publishable = &relationPublishable, .partition_key_definition = &postgresPartitionKey, .partition_ancestors = &postgresPartitionAncestors, .namespace_lookup = &postgresNamespaceLookup, .namespace_name = &postgresNamespaceName, .routine_lookup = &postgresRoutineLookup, .routine_name = &postgresRoutineName };
             self.session.sequences = &self.seq_hook;
             self.seq_slot = slot;
             self.seq_snap = snap;
@@ -12389,6 +12426,7 @@ pub fn Database(comptime config: Config) type {
             switch (statement_value) {
                 .create_function, .create_procedure => |*definition| try self.createRoutine(slot, definition, snap),
                 .drop_function, .drop_procedure => |*drop| try self.dropRoutine(slot, drop, snap),
+                .alter_function, .alter_procedure => |*change| try self.alterRoutineOwner(slot, source, change, snap),
                 .grant_execute, .revoke_execute => |*grant| try self.grantRoutine(slot, source, grant, kind == .grant_execute, snap),
                 .call => |*call| try self.restartable(slot, snap, call, source),
                 .do_block => |*block| try self.restartable(slot, snap, block, source),
@@ -12957,6 +12995,38 @@ pub fn Database(comptime config: Config) type {
             };
         }
 
+        fn alterRoutineOwner(self: *Self, slot: u16, source: []const u8, change: *const R.AlterOwner, snap: Snapshot) Error!void {
+            const index = (try self.findRoutineTarget(slot, &change.routine, snap)) orelse return error.UndefinedFunction;
+            const old = &self.objects.routines[index];
+            var latest = snap;
+            latest.csn = self.csn;
+            if (!old.stamp.visible(latest)) return error.SerializationFailure;
+            if (!self.ownsRoutine(old, latest)) return error.InsufficientPrivilege;
+            const owner = try self.objectRole(source, change.owner, snap);
+            if (owner == CO.public_role) return error.UndefinedObject;
+            try self.checkLargeAclRole(slot, owner, snap);
+            if (owner == old.owner) return;
+            if (!self.privilegedRole(latest)) {
+                if (!self.catalog_objects.membershipPath(self.session.role, owner, .set, latest)) return error.InsufficientPrivilege;
+                try bindNamespaceCreate(self, owner, old.namespace, latest, true);
+            }
+            var acl = old.acl;
+            if (acl.explicit) {
+                var edges: [@as(usize, config.routine_acl_entries) + 3]LoAcl.Edge = undefined;
+                var graph = acl.graph(old.owner, &edges);
+                const root = graph.changeOwner(owner);
+                if (root.flags != 0) graph.add(.{ .grantor = owner, .grantee = owner, .flags = root.flags, .options = root.options });
+                try acl.assignGraph(graph);
+            }
+            try self.reserveWrites(slot, 2);
+            const next = try self.objectSlot(.routine);
+            try self.dropObject(slot, .routine, index, snap);
+            self.objects.routines[next] = old.*;
+            self.objects.routines[next].owner = owner;
+            self.objects.routines[next].acl = acl;
+            self.createdObject(slot, .routine, next, snap);
+        }
+
         fn dropRoutine(self: *Self, slot: u16, drop: *const R.DropRoutine, snap: Snapshot) Error!void {
             const index = (try self.findRoutineTarget(slot, drop, snap)) orelse {
                 if (drop.if_exists) return;
@@ -13361,6 +13431,7 @@ pub fn Database(comptime config: Config) type {
                 if (!routine.live or !routine.stamp.visible(snap) or routine.arg_count != 0 or routine.namespace != catalog_module.public_namespace) continue;
                 if (types.same(routine.name.slice(), definition.function.slice())) function = index;
             }
+            if (!definition.has_function_schema and !self.session.public_schema_on_path) return error.UndefinedFunction;
             const routine_index = function orelse return error.UndefinedFunction;
             const routine = &self.objects.routines[routine_index];
             if (routine.return_oid != tg.trigger_oid or routine.kind != 'f') return error.InvalidObjectDefinition;
@@ -13768,7 +13839,7 @@ pub fn Database(comptime config: Config) type {
                 },
                 .pg_trigger => for (&self.objects.triggers) |*trigger| {
                     if (!trigger.live or !trigger.stamp.visible(snapshot)) continue;
-                    try sink.add(&.{ intCell(trigger.oid), intCell(trigger.table_oid), nameCell(trigger.name.slice()), intCell(trigger.function_oid), intCell(trigger.tgtype), nameCell("O"), boolCell(false), intCell(@intCast(trigger.nargs)), intCell(0) });
+                    try sink.add(&.{ intCell(trigger.oid), intCell(trigger.table_oid), nameCell(trigger.name.slice()), intCell(trigger.function_oid), intCell(trigger.tgtype), .{ .pg_internal_char = 'O' }, boolCell(false), intCell(@intCast(trigger.nargs)), intCell(0) });
                 },
                 .pg_rewrite => {
                     for (&self.objects.rules) |*rule| {
@@ -13790,27 +13861,18 @@ pub fn Database(comptime config: Config) type {
                     const table_index = self.visibleTableSlot(rule.table_oid, snapshot) orelse continue;
                     const table = &self.tables[table_index];
                     const schema_name = self.namespaceName(table.namespace);
-                    var text: [512]u8 = undefined;
-                    var definition: CatalogTextWriter = .{ .out = &text };
-                    definition.add("CREATE RULE ");
-                    definition.add(rule.name.slice());
-                    definition.add(" AS\n    ON ");
-                    definition.add(switch (rule.event) {
-                        '2' => "UPDATE",
-                        '3' => "INSERT",
-                        else => "DELETE",
-                    });
-                    definition.add(" TO ");
-                    definition.add(schema_name);
-                    definition.add(".");
-                    definition.add(table.name.slice());
-                    if (rule.where.len != 0) {
-                        definition.add("\n   WHERE (");
-                        definition.add(rule.where.slice());
-                        definition.add(")");
-                    }
-                    definition.add(if (rule.instead) " DO INSTEAD NOTHING;" else " DO NOTHING;");
-                    try sink.add(&.{ nameCell(schema_name), nameCell(table.name.slice()), nameCell(rule.name.slice()), nameCell(definition.slice()) });
+                    const RuleText = struct {
+                        db: *const Self,
+                        rule: *const RC.Rule,
+                        snapshot: Snapshot,
+                        fn render(ptr: *anyopaque, _: u32, pretty: bool, out: []u8) Error!?usize {
+                            const context: *const @This() = @ptrCast(@alignCast(ptr));
+                            return context.db.ruleDefinition(context.rule, context.snapshot, pretty, out);
+                        }
+                    };
+                    var context: RuleText = .{ .db = self, .rule = rule, .snapshot = snapshot };
+                    const definition = try E.renderCatalogDefinition(&context, &RuleText.render, rule.oid, false, sink.valueBytes());
+                    try sink.add(&.{ nameCell(schema_name), nameCell(table.name.slice()), nameCell(rule.name.slice()), definition });
                 },
                 else => {},
             }

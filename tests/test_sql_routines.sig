@@ -1093,7 +1093,7 @@ fn routineGrantCapacity() !void {
 }
 
 fn routineDefaultCapacity() !void {
-    const Defaults = sql.Database(.{ .tables = 1, .columns = 2, .rows_per_table = 1, .work_rows = 8, .result_rows = 1, .expr_nodes = 128, .catalog_objects = 16, .routines = 1, .routine_acl_entries = 1 });
+    const Defaults = sql.Database(.{ .tables = 1, .columns = 2, .rows_per_table = 1, .work_rows = 8, .result_rows = 1, .expr_nodes = 128, .catalog_objects = 16, .routines = 1, .routine_acl_entries = 1, .name_bytes = 63, .text_bytes = 128 });
     var limited_defaults: Defaults = .{};
     var result: Defaults.Result = .{};
     try limited_defaults.execute("CREATE ROLE default_a", &result);
@@ -1115,6 +1115,15 @@ fn routineDefaultCapacity() !void {
     const merged_before = limited_defaults.oid_counter;
     if (limited_defaults.execute("CREATE FUNCTION merged_overflow() RETURNS INT LANGUAGE SQL AS 'SELECT 1'", &result)) |_| return error.MergedDefaultCapacityIgnored else |err| try check(err == error.ProgramLimitExceeded);
     try check(limited_defaults.oid_counter == merged_before and limited_defaults.usage().transactions == 0);
+    const owner = "default_owner_" ++ ("a" ** 49);
+    try limited_defaults.execute("CREATE ROLE " ++ owner, &result);
+    var values: [Defaults.Result.value_bytes]u8 = undefined;
+    result.bindValueMemory(&values);
+    try limited_defaults.execute("SELECT acldefault('f',oid) FROM pg_roles WHERE rolname='" ++ owner ++ "'", &result);
+    try check(result.rows[0].cells[0].array.indirect());
+    var formatted: [512]u8 = undefined;
+    const shown = try Defaults.Io.format(&result.rows[0].cells[0], false, Defaults.Result.default_session, &formatted);
+    try same(shown, "{=X/" ++ owner ++ "," ++ owner ++ "=X/" ++ owner ++ "}");
 }
 
 fn routineReadOnly() !void {
@@ -1356,6 +1365,80 @@ fn routineSchemaDefaults() !void {
     try sameState(&.{"SELECT defaclnamespace,defaclacl::text FROM pg_default_acl ORDER BY defaclnamespace", "SELECT proname,proacl::text FROM pg_proc WHERE pronamespace=2200 ORDER BY proname"});
 }
 
+fn routineOwnership() !void {
+    reset();
+    try run("CREATE ROLE routine_owner SUPERUSER");
+    try run("CREATE ROLE routine_reader");
+    try run("CREATE ROLE routine_leaf");
+    try run("CREATE FUNCTION owned_fn(x INT) RETURNS INT LANGUAGE SQL AS 'SELECT x+1'");
+    try run("CREATE PROCEDURE owned_proc() LANGUAGE SQL AS 'SELECT 1'");
+    try run("REVOKE EXECUTE ON ROUTINE owned_fn(INT),owned_proc() FROM PUBLIC");
+    try run("GRANT EXECUTE ON ROUTINE owned_fn(INT),owned_proc() TO routine_reader WITH GRANT OPTION");
+    try run("SET ROLE routine_reader");
+    try run("GRANT EXECUTE ON ROUTINE owned_fn(INT),owned_proc() TO routine_leaf");
+    try run("RESET ROLE");
+    const before = db.oid_counter;
+    try completes("ALTER FUNCTION public.owned_fn(x INT) OWNER TO routine_owner", .alter_function, 0);
+    try completes("ALTER PROCEDURE public.owned_proc() OWNER TO routine_owner", .alter_procedure, 0);
+    try check(db.oid_counter == before);
+    try expect("SELECT pg_get_userbyid(proowner) FROM pg_proc WHERE proname='owned_fn'", "routine_owner");
+    try run("SET ROLE routine_leaf");
+    try expect("SELECT owned_fn(4)", "5");
+    try run("CALL owned_proc()");
+    try fails("ALTER FUNCTION owned_fn(INT) OWNER TO CURRENT_USER", error.InsufficientPrivilege);
+    try run("RESET ROLE");
+    try fails("ALTER FUNCTION owned_proc() OWNER TO ramsql", error.WrongObjectType);
+    try fails("ALTER FUNCTION owned_fn(INT) OWNER TO PUBLIC", error.UndefinedObject);
+    try fails("ALTER FUNCTION owned_fn(INT) OWNER TO missing_routine_owner", error.UndefinedObject);
+    const transaction = try db.begin();
+    try statement(transaction, "ALTER FUNCTION owned_fn(INT) OWNER TO ramsql");
+    db.abort(transaction);
+    try expect("SELECT pg_get_userbyid(proowner) FROM pg_proc WHERE proname='owned_fn'", "routine_owner");
+    const reader = try db.begin();
+    try db.beginModes(reader, .{ .read_only = true });
+    try statementFails(reader, "ALTER FUNCTION owned_fn(INT) OWNER TO ramsql", error.ReadOnlyTransaction);
+    db.abort(reader);
+    try run("SET ROLE routine_owner");
+    try run("REVOKE EXECUTE ON FUNCTION owned_fn(INT) FROM routine_reader CASCADE");
+    try run("RESET ROLE");
+    try run("SET ROLE routine_leaf");
+    try fails("SELECT owned_fn(4)", error.InsufficientPrivilege);
+    try run("CALL owned_proc()");
+    try run("RESET ROLE");
+    try sameState(&.{"SELECT proname,pg_get_userbyid(proowner),proacl::text FROM pg_proc WHERE pronamespace=2200 ORDER BY proname"});
+}
+
+fn ruleAndTriggerDiscovery() !void {
+    reset();
+    const owner = "acl_owner_aaaaaaaaaaaaaaaaaaaaaa";
+    try run("CREATE ROLE " ++ owner);
+    try expect("SELECT pg_typeof(acldefault('f',oid))::text,acldefault('f',oid)::text FROM pg_roles WHERE rolname='" ++ owner ++ "'", "aclitem[]|{=X/" ++ owner ++ "," ++ owner ++ "=X/" ++ owner ++ "}");
+    try expect("SELECT pg_get_ruledef(0::oid),pg_get_ruledef(NULL::oid)", "NULL|NULL");
+    try run("CREATE TABLE metadata_table_aaaaaaaaaaaaaaaa(id INT,v INT)");
+    try run("CREATE RULE metadata_rule_bbbbbbbbbbbbbbbbb AS ON DELETE TO metadata_table_aaaaaaaaaaaaaaaa WHERE (OLD.id>0) DO INSTEAD NOTHING");
+    try expect("SELECT length(pg_get_ruledef(oid))>128 FROM pg_rewrite WHERE rulename='metadata_rule_bbbbbbbbbbbbbbbbb'", "t");
+    try expect("SELECT definition=pg_get_ruledef(r.oid) FROM pg_rules q JOIN pg_rewrite r ON q.rulename=r.rulename", "t");
+    var short_result: DB.Result = .{};
+    var short_values: [8]u8 = undefined;
+    short_result.bindValueMemory(&short_values);
+    const csn = db.csn;
+    if (db.execute("SELECT pg_get_ruledef(oid) FROM pg_rewrite", &short_result)) |_| return error.DefinitionValueBudgetIgnored else |err| try check(err == error.WorkspaceCapacity);
+    try check(db.csn == csn and db.usage().transactions == 0);
+    try run("CREATE FUNCTION trigger_function_aaaaaaaaaaaaaaa() RETURNS TRIGGER LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END'");
+    try run("SET search_path=''");
+    try fails("CREATE TRIGGER missing_path BEFORE INSERT ON public.metadata_table_aaaaaaaaaaaaaaaa FOR EACH ROW EXECUTE FUNCTION trigger_function_aaaaaaaaaaaaaaa()", error.UndefinedFunction);
+    try run("CREATE TRIGGER trigger_name_bbbbbbbbbbbbbbbbbbb BEFORE INSERT ON public.metadata_table_aaaaaaaaaaaaaaaa FOR EACH ROW EXECUTE FUNCTION public.trigger_function_aaaaaaaaaaaaaaa()");
+    try expect("SELECT length(pg_catalog.pg_get_triggerdef(oid,false))>128 FROM pg_catalog.pg_trigger WHERE tgname='trigger_name_bbbbbbbbbbbbbbbbbbb'", "t");
+    try expectColumn("SELECT tgenabled FROM pg_catalog.pg_trigger", "tgenabled", 18, "O");
+    const definition = try query(&db, "SELECT pg_catalog.pg_get_triggerdef(oid,false) FROM pg_catalog.pg_trigger");
+    var copied: [4096]u8 = undefined;
+    @memcpy(copied[0..definition.len], definition);
+    try run("DROP TRIGGER trigger_name_bbbbbbbbbbbbbbbbbbb ON public.metadata_table_aaaaaaaaaaaaaaaa");
+    try run(copied[0..definition.len]);
+    try run("RESET search_path");
+    try sameState(&.{"SELECT pg_get_ruledef(oid) FROM pg_rewrite", "SELECT pg_get_triggerdef(oid),tgenabled FROM pg_trigger"});
+}
+
 fn routineDefaultWalValidation() !void {
     reset();
     try run("CREATE ROLE wal_default");
@@ -1413,6 +1496,8 @@ pub fn main() !void {
     try routineSchemaDefaults();
     try routineDefaultCapacity();
     try routineDefaultWalValidation();
+    try routineOwnership();
+    try ruleAndTriggerDiscovery();
     try bodyValidationSetting();
     try oraclePrograms();
     try sqlFunctions();

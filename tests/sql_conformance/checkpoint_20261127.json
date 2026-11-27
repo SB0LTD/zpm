@@ -3,20 +3,20 @@
   "date": "2026-11-27",
   "qualification": "incomplete",
   "scope": "postgresql_smoke_only",
-  "zpm_runtime_revision": "1f4c33df6684196a8ceee03059a118ee2479695f",
-  "ramsql_revision": "12690c301ba5d99effd171d558d1d0d23259abe2",
+  "zpm_runtime_revision": "a3735e76c90d8fa291a45915a24c13702e1db612",
+  "ramsql_revision": "b7780b75c3e75f23be5f585443f34545a02f32a6",
   "oracle": "PostgreSQL 18.3",
   "oracle_image": "postgres:18.3-bookworm@sha256:80630f83606d8db77d30b3851b16a9f78be2d0d4dda6f7b82a1fdca5ebe3acba",
   "manifest_sha256": "1feee91259a68605cd6d50c3a1863b79f3882e0d5c424126912ba3036520f47c",
   "audit_sha256": "6fb343fb3c088985501fe5512eb678d6c5b3589eb965d0688fcf1482fc8d5b7b",
-  "inventory_binary_sha256": "540199eef79175ee771feb9b9f6cf4dcac0a34b10c28c336fe777d50e341387b",
+  "inventory_binary_sha256": "7995a165bcba86333f890db649367308eb28ebfd7151a4a3285cf5244c5f83d2",
   "stock_binary_sha256": {
-    "pg16": "48669a0923c93c99df452bebedc1dfbf1868adcc2ae07989949da3f1a806f4e8",
-    "pg18": "9e1df3f0b583611a02ac494483f60c4da3b7c882af762ed3f140e19a4a98ec5c"
+    "pg16": "2e9c8f73d22fc555e246711ee66da6aa311e51942a7275d263b0f7324c032274",
+    "pg18": "264c8de2ad9308e53b1a5904d121fdd33f45e4d5f6f00c383a03f3350301b220"
   },
-  "inventory_evidence": "https://github.com/SB0LTD/ramsql/actions/runs/46005925696",
-  "stock_tooling_evidence": "https://github.com/SB0LTD/ramsql/actions/runs/46005923853",
-  "contract_evidence": "https://github.com/SB0LTD/zpm/actions/runs/46005857387",
+  "inventory_evidence": "https://github.com/SB0LTD/ramsql/actions/runs/46014847242",
+  "stock_tooling_evidence": "https://github.com/SB0LTD/ramsql/actions/runs/46014842554",
+  "contract_evidence": "https://github.com/SB0LTD/zpm/actions/runs/46014717587",
   "counts": {
     "postgresql_smoke_pass": 106,
     "postgresql_fail": 0
@@ -38,7 +38,14 @@
       "ReleaseSafe"
     ],
     "wide_cell_stack_mib": 4,
-    "status": "passed"
+    "status": "passed",
+    "routines": 1078,
+    "routine_records_replayed": 329,
+    "wide_cell_checkpoint": 2521,
+    "base_images": 158,
+    "catalog_security": 1761,
+    "security_records_replayed": 432,
+    "full_zpm_workflow": "passed"
   },
   "separate_native_lanes_required": {
     "mysql": 6,
@@ -54,16 +61,15 @@
     "Reviewed applicability and full semantic closure of the upstream inventory",
     "Current native MySQL and T-SQL inventory lanes",
     "Other default-privilege object classes, schema-wide grants and non-public namespaces",
+    "Other catalog image classes/layouts, synthetic view rule deparsing and broader rule actions",
     "Broader routine execution, signatures, SECURITY DEFINER and volatile-window demand",
     "Upstream/application regressions and production qualification beyond finite smoke coverage"
   ],
   "local_contracts": {
-    "optimizations": [
-      "Debug",
-      "ReleaseSafe"
-    ],
-    "routines": 1021,
-    "routine_records_replayed": 301,
-    "wide_cell_checkpoint": 2512
+    "debug_routines": 1078,
+    "routine_records_replayed": 329,
+    "debug_wide_cell_checkpoint": 2521,
+    "base_images": 158,
+    "windows_debug_diagnostic_stack_mib": 4
   }
 }

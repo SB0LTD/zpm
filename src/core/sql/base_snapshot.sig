@@ -8,6 +8,7 @@ const catalog = @import("catalog.sig");
 const objects = @import("catalog_objects.sig");
 const change_log = @import("change_log.sig");
 const large = @import("large_object_pages.sig");
+const routine_catalog = @import("routine_catalog.sig");
 
 const single_magic = "RSBASE01";
 const multi_magic = "RSBASE02";
@@ -19,6 +20,7 @@ const pages_magic = "RSBASE06";
 const large_defaults_magic = "RSBASE07";
 const builtin_acl_magic = "RSBASE08";
 const routine_defaults_magic = "RSBASE09";
+const routine_objects_magic = "RSBASE10";
 const header_size = 24;
 const table_header_size = 8;
 const part_size = 5;
@@ -58,14 +60,21 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
     const S = storage.Storage(config);
     const O = objects.Objects(config);
     const C = change_log.ChangeLog(config);
+    const RC = routine_catalog.Catalog(config);
 
     return struct {
         const CatalogImage = struct {
             counts: [catalog_kinds.len]u32 = @splat(0),
+            routines: [3]u32 = @splat(0),
             pages: usize = 0,
 
             fn hasObjects(self: CatalogImage) bool {
                 for (self.counts) |count| if (count != 0) return true;
+                return self.hasRoutines();
+            }
+
+            fn hasRoutines(self: CatalogImage) bool {
+                for (self.routines) |count| if (count != 0) return true;
                 return false;
             }
 
@@ -83,6 +92,33 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
         };
 
         const catalog_kinds = [_]objects.Kind{ .role, .large_object, .large_object_acl, .comment, .large_object_default_acl, .builtin_routine_acl, .routine_default_acl };
+        const routine_classes = .{
+            .{ .field = "routines", .op = change_log.Op.create_routine },
+            .{ .field = "triggers", .op = change_log.Op.create_trigger },
+            .{ .field = "rules", .op = change_log.Op.create_rule },
+        };
+
+        fn writeRoutineObjects(db: *const Database, sink: anytype, scratch: []u8) !void {
+            const snap: storage.Snapshot = .{ .csn = db.csn };
+            // Roles, schemas and tables precede all routines. Functions
+            // precede triggers so every dependency can be validated normally.
+            inline for (routine_classes) |class| {
+                for (&@field(db.objects, class.field)) |*item| {
+                    if (!item.live or !item.stamp.visible(snap)) continue;
+                    var bytes: [RC.payload_bytes]u8 = undefined;
+                    var payload: RC.Payload = .{ .buffer = &bytes };
+                    switch (class.op) {
+                        .create_routine => try RC.encodeRoutine(&payload, item),
+                        .create_trigger => try RC.encodeTrigger(&payload, item),
+                        .create_rule => try RC.encodeRule(&payload, item),
+                        else => unreachable,
+                    }
+                    var writer = try change_log.Writer.init(scratch, 0);
+                    try C.encodeObject(&writer, class.op, bytes[0..payload.used]);
+                    try appendPart(sink, class.op, scratch[0..try writer.finish()]);
+                }
+            }
+        }
 
         fn writeCatalog(db: *const Database, sink: anytype, scratch: []u8, kind: objects.Kind) !void {
             const snap: storage.Snapshot = .{ .csn = db.csn };
@@ -165,10 +201,11 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
                 const position = std.mem.indexOfScalar(objects.Kind, &catalog_kinds, object.kind) orelse return error.SnapshotUnsupportedState;
                 image.counts[position] += 1;
             }
-            for (&db.objects.routines) |*item| if (item.live and item.stamp.visible(snap)) return error.SnapshotUnsupportedState;
-            for (&db.objects.triggers) |*item| if (item.live and item.stamp.visible(snap)) return error.SnapshotUnsupportedState;
-            for (&db.objects.rules) |*item| if (item.live and item.stamp.visible(snap)) return error.SnapshotUnsupportedState;
-            if (image.hasObjects() and image.counts[1] == 0 and !image.hasLargeDefaults() and !image.hasBuiltinAcls() and !image.hasRoutineDefaults()) return error.SnapshotUnsupportedState;
+            inline for (routine_classes, 0..) |class, index| {
+                for (&@field(db.objects, class.field)) |*item|
+                    if (item.live and item.stamp.visible(snap)) { image.routines[index] += 1; };
+            }
+            if (image.hasObjects() and image.counts[1] == 0 and !image.hasLargeDefaults() and !image.hasBuiltinAcls() and !image.hasRoutineDefaults() and !image.hasRoutines()) return error.SnapshotUnsupportedState;
             return image;
         }
 
@@ -276,16 +313,20 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
                 try sink.appendAll(&header);
                 try writeTable(table, sink, scratch);
             } else {
-                @memcpy(header[0..8], if (catalog_image.hasRoutineDefaults()) routine_defaults_magic else if (catalog_image.hasBuiltinAcls()) builtin_acl_magic else if (catalog_image.hasLargeDefaults()) large_defaults_magic else if (with_pages) pages_magic else if (schema_count != 0) schemas_magic else if (with_defaults) defaults_magic else if (sequence_count == 0) multi_magic else sequence_magic);
+                @memcpy(header[0..8], if (catalog_image.hasRoutines()) routine_objects_magic else if (catalog_image.hasRoutineDefaults()) routine_defaults_magic else if (catalog_image.hasBuiltinAcls()) builtin_acl_magic else if (catalog_image.hasLargeDefaults()) large_defaults_magic else if (with_pages) pages_magic else if (schema_count != 0) schemas_magic else if (with_defaults) defaults_magic else if (sequence_count == 0) multi_magic else sequence_magic);
                 std.mem.writeInt(u32, header[16..20], @intCast(selected.count), .little);
                 std.mem.writeInt(u32, header[20..24], @intCast(sequence_count), .little);
                 try sink.appendAll(&header);
                 if (with_pages) {
-                    var counts: [32]u8 = undefined;
-                    const groups: usize = if (catalog_image.hasRoutineDefaults()) 7 else if (catalog_image.hasBuiltinAcls()) 6 else if (catalog_image.hasLargeDefaults()) 5 else 4;
+                    var counts: [44]u8 = undefined;
+                    const groups: usize = if (catalog_image.hasRoutines() or catalog_image.hasRoutineDefaults()) 7 else if (catalog_image.hasBuiltinAcls()) 6 else if (catalog_image.hasLargeDefaults()) 5 else 4;
                     for (catalog_image.counts[0..groups], 0..) |count, index| std.mem.writeInt(u32, counts[index * 4 ..][0..4], count, .little);
                     std.mem.writeInt(u32, counts[groups * 4 ..][0..4], @intCast(catalog_image.pages), .little);
-                    try sink.appendAll(counts[0..(groups + 1) * 4]);
+                    if (catalog_image.hasRoutines()) for (catalog_image.routines, 0..) |count, index| {
+                        std.mem.writeInt(u32, counts[(groups + 1 + index) * 4 ..][0..4], count, .little);
+                    };
+                    const count_len = (groups + 1 + @as(usize, if (catalog_image.hasRoutines()) 3 else 0)) * 4;
+                    try sink.appendAll(counts[0..count_len]);
                     try writeCatalog(db, sink, scratch, .role);
                 }
                 if (with_pages or schema_count != 0) {
@@ -325,6 +366,7 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
             if (with_pages) {
                 for (catalog_kinds[1..]) |kind| try writeCatalog(db, sink, scratch, kind);
                 try writePages(db, sink);
+                if (catalog_image.hasRoutines()) try writeRoutineObjects(db, sink, scratch);
             }
             var counters = try change_log.Writer.init(scratch, 0);
             try C.encodeCounters(&counters, change_log.first_oid + db.oid_counter, db.next_constraint_oid, db.next_default_oid, &db.tables);
@@ -399,17 +441,19 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
 
             var offset: u64 = header_size;
             var sequence_count: u32 = 0;
-            const with_routine_defaults = std.mem.eql(u8, header[0..8], routine_defaults_magic);
+            const with_routines = std.mem.eql(u8, header[0..8], routine_objects_magic);
+            const with_routine_defaults = with_routines or std.mem.eql(u8, header[0..8], routine_defaults_magic);
             const with_builtin_acls = with_routine_defaults or std.mem.eql(u8, header[0..8], builtin_acl_magic);
             const with_large_defaults = with_builtin_acls or std.mem.eql(u8, header[0..8], large_defaults_magic);
             const with_pages = with_large_defaults or std.mem.eql(u8, header[0..8], pages_magic);
             const with_schemas = with_pages or std.mem.eql(u8, header[0..8], schemas_magic);
             const groups: usize = if (with_routine_defaults) 7 else if (with_builtin_acls) 6 else if (with_large_defaults) 5 else 4;
             var counts: [catalog_kinds.len]u32 = @splat(0);
+            var routine_counts: [3]u32 = @splat(0);
             var page_count: u32 = 0;
             if (with_pages) {
-                var encoded: [32]u8 = undefined;
-                const encoded_len = (groups + 1) * 4;
+                var encoded: [44]u8 = undefined;
+                const encoded_len = (groups + 1 + @as(usize, if (with_routines) 3 else 0)) * 4;
                 try readExact(file, offset, encoded[0..encoded_len], length);
                 offset += encoded_len;
                 var objects_total: u64 = 0;
@@ -418,8 +462,16 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
                     objects_total += count.*;
                 }
                 page_count = std.mem.readInt(u32, encoded[groups * 4 ..][0..4], .little);
-                if (objects_total == 0 or objects_total > db.catalog_objects.items.len or
-                    (with_routine_defaults and counts[6] == 0) or
+                var routines_total: u64 = 0;
+                if (with_routines) inline for (routine_classes, 0..) |class, index| {
+                    const count = std.mem.readInt(u32, encoded[(groups + 1 + index) * 4 ..][0..4], .little);
+                    if (count > @field(db.objects, class.field).len) return error.InvalidSnapshotImage;
+                    routine_counts[index] = count;
+                    routines_total += count;
+                };
+                if ((objects_total == 0 and routines_total == 0) or objects_total > db.catalog_objects.items.len or
+                    (with_routines and routines_total == 0) or
+                    (!with_routines and with_routine_defaults and counts[6] == 0) or
                     (!with_routine_defaults and with_builtin_acls and counts[5] == 0) or
                     (!with_builtin_acls and with_large_defaults and counts[4] == 0) or
                     (page_count != 0 and (db.large_pages == null or page_count > db.large_pages.?.capacity())))
@@ -476,6 +528,12 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
                     try replay.object_overlay.verifyLargeObjectGrants();
                 }
                 try restorePages(db, file, length, &offset, scratch, csn, page_count);
+                if (with_routines) inline for (routine_classes, 0..) |class, index| {
+                    for (0..routine_counts[index]) |_| {
+                        const frame = try readPart(file, &offset, length, scratch, class.op);
+                        try C.applyBaseImageRecord(db, frame, replay, .{ .csn = csn, .op = class.op, .with_routines = true });
+                    }
+                };
             }
             const counters = try readPart(file, &offset, length, scratch, .catalog_counters);
             if (offset != length or try file.length() != length) return error.InvalidSnapshotImage;

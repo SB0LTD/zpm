@@ -701,6 +701,8 @@ var routine_default_db: DB = .{};
 var routine_default_copy: DB = .{};
 var routine_default_arena: Arena = .{};
 var routine_default_copy_arena: Arena = .{};
+var routine_image_copy: DB = .{};
+var routine_image_arena: Arena = .{};
 
 fn routineDefaultCheckpoint() !void {
     try routine_default_arena.bind(&routine_default_db);
@@ -732,9 +734,52 @@ fn routineDefaultCheckpoint() !void {
     try routine_default_copy.execute("SELECT restored_default()", &result);
     try expect(result.rows[0].cells[0].integer == 7);
     try routine_default_copy.execute("RESET ROLE", &result);
-    // The existing compact format still rejects live routines explicitly.
+    // Live routines, their delegated ACLs and their dependents must survive
+    // a second compact checkpoint, not force retention of the whole WAL.
+    try routine_default_copy.execute("CREATE TABLE image_rows(id INT PRIMARY KEY,v INT)", &result);
+    try routine_default_copy.execute("CREATE FUNCTION image_trigger() RETURNS TRIGGER LANGUAGE plpgsql AS 'BEGIN NEW.v := NEW.v + 10; RETURN NEW; END'", &result);
+    try routine_default_copy.execute("CREATE TRIGGER image_before BEFORE INSERT ON image_rows FOR EACH ROW EXECUTE FUNCTION image_trigger()", &result);
+    try routine_default_copy.execute("CREATE RULE image_keep AS ON DELETE TO image_rows DO INSTEAD NOTHING", &result);
+    try routine_default_copy.execute("CREATE PROCEDURE image_proc() LANGUAGE SQL AS 'INSERT INTO image_rows VALUES (1,2)'", &result);
+    try routine_default_copy.execute("CREATE FUNCTION owned_image() RETURNS INT LANGUAGE SQL AS 'SELECT 42'", &result);
+    try routine_default_copy.execute("ALTER FUNCTION owned_image() OWNER TO default_recipient", &result);
+    try routine_default_copy.execute("INSERT INTO image_rows VALUES (2,5)", &result);
+    var live_image: ImageBuffer = .{};
+    try DB.BaseSnapshot.write(&routine_default_copy, &live_image, &wal);
+    try expect(std.mem.eql(u8, live_image.bytes[0..8], "RSBASE10"));
+    try routine_image_arena.bind(&routine_image_copy);
+    try DB.BaseSnapshot.restore(&routine_image_copy, &live_image, routine_default_copy.csn, &wal, &replay_scratch);
+    try routine_image_copy.execute("SELECT pg_get_userbyid(proowner)='default_recipient' FROM pg_proc WHERE proname='owned_image'", &result);
+    try expect(result.rows[0].cells[0].boolean);
+    // The selected image is followed by normal routine DDL/ACL WAL. Its
+    // preserved OIDs and grant graph must accept replacement and revocation.
+    const replacement = try executeWAL(&routine_default_copy, "CREATE OR REPLACE FUNCTION restored_default() RETURNS INT LANGUAGE SQL AS 'SELECT 9'", &wal);
+    try routine_image_copy.applyChangeRecord(replacement, &replay_scratch);
+    try routine_image_copy.execute("SET ROLE default_recipient", &result);
+    try routine_image_copy.execute("SELECT restored_default()", &result);
+    try expect(result.rows[0].cells[0].integer == 9);
+    try routine_image_copy.execute("RESET ROLE", &result);
+    const revocation = try executeWAL(&routine_default_copy, "REVOKE EXECUTE ON FUNCTION restored_default() FROM default_member CASCADE", &wal);
+    try routine_image_copy.applyChangeRecord(revocation, &replay_scratch);
+    try routine_image_copy.execute("SET ROLE default_recipient", &result);
+    if (routine_image_copy.execute("SELECT restored_default()", &result)) |_| return error.RestoredRoutineRevokeLost else |err| try expect(err == error.InsufficientPrivilege);
+    try routine_image_copy.execute("RESET ROLE", &result);
+    try routine_image_copy.execute("SELECT v FROM image_rows WHERE id=2", &result);
+    try expect(result.rows[0].cells[0].integer == 15); // Restore does not refire the INSERT trigger.
+    try routine_image_copy.execute("CALL image_proc()", &result);
+    try routine_image_copy.execute("DELETE FROM image_rows", &result);
+    try routine_image_copy.execute("SELECT v FROM image_rows WHERE id=1", &result);
+    try expect(result.rows[0].cells[0].integer == 12);
+    try routine_image_copy.execute("CREATE FUNCTION after_image() RETURNS INT LANGUAGE SQL AS 'SELECT 8'", &result);
+    try routine_image_copy.execute("SET ROLE default_member", &result);
+    try routine_image_copy.execute("SELECT after_image()", &result);
+    try expect(result.rows[0].cells[0].integer == 8);
+    try routine_image_copy.execute("RESET ROLE", &result);
+    // Unsupported non-routine catalog classes still fail before emitting.
+    try routine_image_copy.execute("CREATE ROLE image_group", &result);
+    try routine_image_copy.execute("GRANT image_group TO default_recipient", &result);
     var unsupported: ImageBuffer = .{};
-    if (DB.BaseSnapshot.write(&routine_default_copy, &unsupported, &wal)) |_| return error.RoutineImageSilentlyDropped else |err| try expect(err == error.SnapshotUnsupportedState);
+    if (DB.BaseSnapshot.write(&routine_image_copy, &unsupported, &wal)) |_| return error.UnsupportedCatalogSilentlyDropped else |err| try expect(err == error.SnapshotUnsupportedState);
     try expect(unsupported.used == 0);
 }
 
