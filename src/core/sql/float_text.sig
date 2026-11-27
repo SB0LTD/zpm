@@ -136,6 +136,15 @@ pub fn format(comptime T: type, value: T, extra_digits: i8, out: []u8) []const u
 }
 
 const Significant = struct { digits: [16]u8 = undefined, len: usize = 0, exponent: i32 = 0 };
+
+/// `value` (finite, non-zero) rounded once to `precision` (at most 16)
+/// significant digits, trailing zeros removed, into `out`; returns their
+/// count and the decimal exponent (XPath number formatting, B11 wave 5).
+pub fn roundedDigits(value: f64, precision: usize, out: *[16]u8) struct { len: usize, exponent: i32 } {
+    const rounded = roundedSignificant(value, precision);
+    @memcpy(out[0..rounded.len], rounded.digits[0..rounded.len]);
+    return .{ .len = rounded.len, .exponent = rounded.exponent };
+}
 const decimal_limb_base = 1000000000;
 
 /// Round the exact binary value once. Rounding the shortest decimal first
