@@ -2496,6 +2496,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                 .drop_view => "DROP VIEW",
                 .drop_materialized_view => "DROP MATERIALIZED VIEW",
                 .drop_table => "drop",
+                .drop_index => "DROP INDEX",
                 .create_sequence => "create_sequence",
                 .drop_sequence => "drop_sequence",
                 .truncate => "truncate",
@@ -2558,7 +2559,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                 try w.append("MOVE ");
                 try w.number(@intCast(affected));
             } else if (equal(completed_command, "close_cursor")) {
-                try w.append("CLOSE CURSOR");
+                try w.append(if (deallocateAll(source)) "CLOSE CURSOR ALL" else "CLOSE CURSOR");
             } else if (equal(completed_command, "prepare")) {
                 try w.append("PREPARE");
             } else if (equal(completed_command, "deallocate")) {
@@ -2603,7 +2604,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             } else if (equal(completed_command, "merge")) {
                 try w.append("MERGE ");
                 try w.number(@intCast(affected));
-            } else if (isCommand(completed_command, source, "create")) try w.append("CREATE TABLE") else if (isCommand(completed_command, source, "drop")) try w.append("DROP TABLE") else if (equal(completed_command, "savepoint")) try w.append("SAVEPOINT") else if (equal(completed_command, "release")) try w.append("RELEASE") else if (equal(completed_command, "show")) try w.append("SHOW") else if (equal(completed_command, "reset")) try w.append("RESET") else if (equal(completed_command, "set")) try w.append("SET") else if (equal(completed_command, "begin")) try w.append("BEGIN") else if (equal(completed_command, "commit")) try w.append(if (rolled_back) "ROLLBACK" else "COMMIT") else if (equal(completed_command, "rollback")) try w.append("ROLLBACK") else if (word(source, "begin") or word(source, "start")) try w.append("BEGIN") else if (word(source, "commit") or word(source, "end")) try w.append(if (rolled_back) "ROLLBACK" else "COMMIT") else if (word(source, "rollback") or word(source, "abort")) try w.append("ROLLBACK") else if (word(source, "set")) try w.append("SET") else if (word(source, "deallocate")) try w.append("DEALLOCATE") else try w.append("OK");
+            } else if (isCommand(completed_command, source, "create")) try w.append("CREATE TABLE") else if (isCommand(completed_command, source, "drop")) try w.append("DROP TABLE") else if (equal(completed_command, "savepoint")) try w.append("SAVEPOINT") else if (equal(completed_command, "release")) try w.append("RELEASE") else if (equal(completed_command, "show")) try w.append("SHOW") else if (equal(completed_command, "reset")) try w.append("RESET") else if (equal(completed_command, "set")) try w.append("SET") else if (equal(completed_command, "begin")) try w.append(if (word(source, "start")) "START TRANSACTION" else "BEGIN") else if (equal(completed_command, "commit")) try w.append(if (rolled_back) "ROLLBACK" else "COMMIT") else if (equal(completed_command, "rollback")) try w.append("ROLLBACK") else if (word(source, "begin")) try w.append("BEGIN") else if (word(source, "start")) try w.append("START TRANSACTION") else if (word(source, "commit") or word(source, "end")) try w.append(if (rolled_back) "ROLLBACK" else "COMMIT") else if (word(source, "rollback") or word(source, "abort")) try w.append("ROLLBACK") else if (word(source, "set")) try w.append("SET") else if (word(source, "deallocate")) try w.append("DEALLOCATE") else try w.append("OK");
             try w.byte(0);
             w.end(p);
         }
@@ -2760,6 +2761,7 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "NotNullViolation")) return "23502";
     if (equal(name, "CheckViolation")) return "23514";
     if (equal(name, "ForeignKeyViolation")) return "23503";
+    if (equal(name, "RestrictViolation")) return "23001";
     if (equal(name, "ExclusionViolation")) return "23P01";
     if (equal(name, "IndexCapacity")) return "54000";
     if (equal(name, "InvalidForeignKey")) return "42830";

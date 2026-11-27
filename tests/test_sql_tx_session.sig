@@ -458,8 +458,11 @@ fn settings() !void {
     try expect(tx, "SHOW search_path", "\"$user\", public, pg_catalog");
     try expect(tx, "SET search_path = 'public'", "");
     try expect(tx, "SHOW search_path", "public");
-    // Other schemas would change name resolution here (0A000).
-    try fails(tx, "SET search_path TO tdd_schema, public", error.UnsupportedStatement);
+    // Any schema names resolve through the path (ddl-dml, wave 4:
+    // contract-sql-ddl-dml covers the resolution).
+    try expect(tx, "SET search_path TO tdd_schema, public", "");
+    try expect(tx, "SHOW search_path", "tdd_schema, public");
+    try expect(tx, "SET search_path = 'public'", "");
     try expect(tx, "SHOW search_path", "public");
     // Placeholders, current_setting and set_config.
     try expect(tx, "SET tdd.mode = 'fast'", "");
@@ -713,7 +716,8 @@ fn locking() !void {
     // Errors.
     const t8 = try db.begin();
     try fails(t8, "LOCK TABLE missing", error.TableNotFound);
-    try fails(t8, "LOCK TABLE tdd_v", error.UnsupportedStatement);
+    // A view locks its base relations (ddl-dml, wave 4: contract-sql-ddl-dml).
+    try expect(t8, "LOCK TABLE tdd_v", "");
     try fails(t8, "LOCK TABLE nosuch.tdd_a", error.UndefinedSchema);
     try fails(t8, "LOCK TABLE tdd_a IN SHARE", error.Syntax);
     if (db.statement(t8, "LOCK TABLE tdd_a", &result, .{ .implicit = true })) |_| return error.InvalidStatementAccepted else |err| try check(err == error.NoActiveTransaction);

@@ -179,6 +179,9 @@ pub const Config = struct {
     /// Savepoint levels of one transaction that can change engine
     /// settings (each keeps the level's starting values).
     setting_snapshots: usize = 4,
+    /// Schemas the search path resolves (ddl-dml, wave 4): existing schemas
+    /// of search_path beyond this many are not searched.
+    search_path_schemas: usize = 8,
     /// LISTEN channels per session (also its pending LISTEN/UNLISTEN
     /// actions), listening sessions, committed notifications not yet read
     /// by every listener, uncommitted NOTIFY entries of all transactions
@@ -555,6 +558,9 @@ pub const Error = error{
     /// SQLSTATE 44000: a new row of an auto-updatable view violates its
     /// WITH CHECK OPTION (B11 wave 4).
     WithCheckOptionViolation,
+    /// SQLSTATE 23001: a key an ON DELETE / ON UPDATE RESTRICT foreign key
+    /// still references when the statement ends (ddl-dml, wave 4).
+    RestrictViolation,
     /// SQLSTATE 22030: a duplicate key where JSON object keys must be
     /// unique (wave 4 text-json).
     DuplicateJsonObjectKeyValue,

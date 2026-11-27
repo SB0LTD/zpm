@@ -194,6 +194,21 @@ pub fn Dml(comptime config: types.Config) type {
             return cells;
         }
 
+        /// Row security (ddl-dml, wave 4): PostgreSQL computes stored
+        /// generated columns, checks the WITH CHECK policies, then NOT NULL
+        /// and CHECK constraints (ExecInsert / ExecUpdate). These are the
+        /// halves around the policy check.
+        pub fn generatedRow(ctx: *const E.Context, table: *const S.Table, derived: Derived, cells: *E.Row) Error!void {
+            try computeGenerated(ctx, table, derived, cells);
+        }
+
+        pub fn constrainRow(ctx: *const E.Context, table: *const S.Table, derived: Derived, cells: *const E.Row) Error!void {
+            for (table.columns[0..table.column_count], 0..) |*column, index| {
+                if (cells[index] == .null_value and column.not_null) return error.NotNullViolation;
+            }
+            try checkConstraints(ctx, table, derived, cells);
+        }
+
         /// After the BEFORE ROW triggers: NOT NULL, stored generated
         /// columns, then CHECK constraints (PostgreSQL's order).
         pub fn finishRow(ctx: *const E.Context, table: *const S.Table, derived: Derived, cells: *E.Row) Error!void {

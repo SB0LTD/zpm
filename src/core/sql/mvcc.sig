@@ -115,6 +115,11 @@ pub fn Mvcc(comptime config: types.Config) type {
             /// A deferred constraint skipped a check: COMMIT (or SET
             /// CONSTRAINTS ... IMMEDIATE) re-checks this transaction's rows.
             deferred_checks: bool = false,
+            /// A non-deferrable FOREIGN KEY found its row missing (or a NO
+            /// ACTION key still referenced) mid-statement: the statement's
+            /// end re-checks its rows, as PostgreSQL's AFTER-trigger RI
+            /// checks do (ddl-dml, wave 4).
+            statement_checks: bool = false,
             /// SET CONSTRAINTS ALL mode (null: each constraint's INITIALLY).
             constraints_all: ?bool = null,
             /// SET CONSTRAINTS name modes, newest last.

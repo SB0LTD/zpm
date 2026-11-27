@@ -1174,7 +1174,6 @@ pub fn Database(comptime config: Config) type {
             };
             const tables = &db.tables;
             const catalog = &db.catalog;
-            const public_schema_on_path = session.public_schema_on_path;
             workspace.expanded_count = 0;
             const pool = &workspace.nodes;
             var length: usize = 0;
@@ -1182,7 +1181,7 @@ pub fn Database(comptime config: Config) type {
             if (bound_statement.* == .refresh_view) {
                 const refresh = &bound_statement.refresh_view;
                 const schema_name = if (refresh.name.schema) |qualifier| identName(source, qualifier) else Name{};
-                const namespace_oid = if (refresh.name.schema != null or public_schema_on_path) try db.namespaceForUsage(session.role, if (refresh.name.schema != null) schema_name.slice() else null, snap) else null;
+                const namespace_oid = if (refresh.name.schema != null) try db.namespaceForUsage(session.role, schema_name.slice(), snap) else try db.pathRelation(session.role, identName(source, refresh.name.name).slice(), snap);
                 if (namespace_oid) |namespace| {
                     if (catalog.findIn(namespace, identName(source, refresh.name.name).slice(), snap)) |found| {
                         if (found.kind == 'm') refresh.query = try appendQuery(workspace, &length, source, tables[found.slot].query.slice());
@@ -1215,17 +1214,26 @@ pub fn Database(comptime config: Config) type {
                         if (view == .pg_authid and !privileged) return error.InsufficientPrivilege;
                         continue;
                     }
-                    if (item.schema == null and !public_schema_on_path and direct) continue;
                     const qualified = if (item.schema != null) schema_name.slice() else null;
+                    // Names the statement writes resolve through the search
+                    // path; stored view texts through public (ddl-dml).
+                    // A detached read context resolves like the default path
+                    // (the store runs them only with such paths).
                     const namespace = if (direct)
-                        try db.namespaceForUsage(session.role, qualified, snap)
+                        (if (qualified != null) try db.namespaceForUsage(session.role, qualified, snap) else if (session == &db.session) try db.pathRelation(session.role, name.slice(), snap) else if (session.public_schema_on_path) try db.namespaceForUsage(session.role, null, snap) else null)
                     else
                         namespaceFor(catalog, qualified, snap);
+                    // A stored definition names its relations by text: one
+                    // outside public needs its schema written (ddl-dml).
+                    if (direct and qualified == null and namespace != null and namespace.? != catalog_module.public_namespace) switch (bound_statement.*) {
+                        .create_view => return error.UnsupportedStatement,
+                        else => {},
+                    };
                     const found = catalog.findIn(namespace orelse continue, name.slice(), snap) orelse continue;
                     if (executes_query) try session.restricted_relation_kinds.check(found.kind);
                     // Items the statement names (not view or expansion texts).
                     if (!privileged and direct) {
-                        const secured = try secureItem(db, workspace, &length, source, role, session.row_security, found, snap);
+                        const secured = try secureItem(db, workspace, &length, source, role, session.row_security, found, item.only, snap);
                         if (secured != ast.none) {
                             item.query = secured;
                             item.view = true;
@@ -2094,6 +2102,14 @@ pub fn Database(comptime config: Config) type {
         /// in rules (42P17).
         rule_active: [8]u64 = @splat(0),
         rule_active_len: usize = 0,
+        /// ddl-dml (wave 4): the table an UPDATE / DELETE without ONLY
+        /// named while its family's members run (familyMutation), and which
+        /// written rows its RETURNING reads (an UPDATE that moved a row
+        /// across partitions logs a delete and an insert).
+        family_root: ?usize = null,
+        family_returning: CommandTag = .none,
+        /// ON CONFLICT DO UPDATE of a routed partition row is running.
+        conflict_routed: bool = false,
 
         /// Borrow the embedding's cluster catalogue while serving statements.
         /// The embedding keeps the provider and its rows consistent for the
@@ -2745,6 +2761,7 @@ pub fn Database(comptime config: Config) type {
                 tx.copy_table = null;
                 tx.copy_rows = 0;
                 tx.deferred_checks = false;
+                tx.statement_checks = false;
                 tx.constraints_all = null;
                 tx.constraint_mode_count = 0;
                 tx.isolation = .read_committed;
@@ -3249,6 +3266,7 @@ pub fn Database(comptime config: Config) type {
                 tx.mysql_insert_value = null;
                 tx.mysql_first_generated = 0;
                 tx.mysql_explicit_insert_id = 0;
+                tx.statement_checks = false;
                 self.modifying[slot] = .{};                snap = .{ .csn = self.csn, .slot = slot, .epoch = tx.epoch, .cid = tx.cid };
                 // The first statement that needs a snapshot fixes the
                 // transaction snapshot (REPEATABLE READ / SERIALIZABLE use it).
@@ -3282,12 +3300,14 @@ pub fn Database(comptime config: Config) type {
                 self.wake_epoch +%= 1;
                 return legacy(options.mode, err);
             };
-            // DEFERRABLE constraints in IMMEDIATE mode: end of statement.
-            self.deferredCheck(slot, start, true) catch |err| {
+            // DEFERRABLE constraints in IMMEDIATE mode and the foreign keys
+            // a row could not satisfy yet: end of statement.
+            self.deferredCheck(slot, start, true, true) catch |err| {
                 self.dropStatement(slot);
                 self.wake_epoch +%= 1;
                 return err;
             };
+            tx.statement_checks = false;
             if (!options.writes and tx.write_len > start) {
                 self.dropStatement(slot);
                 return error.ReadOnlyTransaction;
@@ -3347,6 +3367,14 @@ pub fn Database(comptime config: Config) type {
                 if (self.txs[slot].read_only) return error.ReadOnlyTransaction;
                 return self.catalogObject(slot, original, &parsed.catalog_object, snap);
             }
+            // CREATE / DROP INDEX CONCURRENTLY build like the plain forms
+            // (under their stronger lock) and, as PostgreSQL, never run
+            // inside a transaction block (25001).
+            switch (parsed.*) {
+                .create_index => |*create| if (create.concurrently and !self.statement_implicit) return error.ActiveSqlTransaction,
+                .drop_index => |*drop| if (drop.concurrently and !self.statement_implicit) return error.ActiveSqlTransaction,
+                else => {},
+            }
             var statement_copy = parsed.*;
             // INSERT / UPDATE / DELETE on a view (B11 wave 4): its INSTEAD
             // OF triggers, or the same statement on its base relation.
@@ -3365,6 +3393,8 @@ pub fn Database(comptime config: Config) type {
                 text = try self.rewriteViewTarget(slot, original, &statement_copy, view, snap);
                 view_owner = self.catalog_objects.owner(self.tables[view].oid, snap);
             }
+            // UPDATE / DELETE through an inheritance parent or a partitioned table (ddl-dml, wave 4).
+            if (explain == null and view_owner == null) if (try self.familyRoot(&statement_copy, original, mode, snap)) |root| return self.familyMutation(slot, original, root, snap, result, mode);
             const expanded = try expandRelations(self, &self.workspace, text, snap, &statement_copy, self.session.role, &self.session);
             const source = try self.secureTarget(&statement_copy, expanded, text, snap);
             // A user function in a single-table SELECT runs once per row in
@@ -3528,8 +3558,8 @@ pub fn Database(comptime config: Config) type {
                     try self.alterSequence(slot, alter.slot, alter.options, alter.ownership, snap);
                     break :blk 0;
                 },
-                .create_schema => |name| blk: {
-                    try self.createSchema(slot, name, snap);
+                .create_schema => |*create| blk: {
+                    try self.createSchema(slot, create.name, try self.createSchemaOwner(create, snap), snap);
                     break :blk 0;
                 },
                 .drop_schema => |*drop| blk: {
@@ -3571,6 +3601,165 @@ pub fn Database(comptime config: Config) type {
                 .delete => |*delete| if (delete.returning.count != 0) try self.returnRows(slot, source, &delete.returning, delete.table, true, result.rows.len, snap.cid),
                 else => {},
             }
+        }
+
+        // ---- inheritance and partition families (ddl-dml, wave 4) ---------
+
+        /// The table an UPDATE / DELETE without ONLY names, when it is a
+        /// partitioned table or an inheritance parent with children.
+        /// Anything else (including a failed lookup, reported by the normal
+        /// binding) returns null.
+        fn familyRoot(self: *Self, statement_copy: *const A.Statement, original: []const u8, mode: ParseMode, snap: Snapshot) Error!?usize {
+            if (self.dialect != .postgres or mode != .standard) return null;
+            const schema: ?ast.Ident, const name: ast.Ident = switch (statement_copy.*) {
+                .update => |*update| if (update.only) return null else .{ update.schema, update.table },
+                .delete => |*delete| if (delete.only) return null else .{ delete.schema, delete.table },
+                else => return null,
+            };
+            const context = self.bindContext(original, mode, snap);
+            const index = B.resolveQualified(&context, schema, name) catch return null;
+            const table = &self.tables[index];
+            if (table.relkind != 'p' and (table.relkind != 'r' or !self.hasChildren(table.oid, snap))) return null;
+            return index;
+        }
+
+        /// Visible members of `root`'s family, root first, breadth first
+        /// (the order the family's reads expand to).
+        fn familyMembers(self: *const Self, root: usize, snap: Snapshot, out: *[config.tables]usize) usize {
+            out[0] = root;
+            var count: usize = 1;
+            var relations: [K.relation_rows]K.Found = undefined;
+            const relation_count = self.catalog.visibleRelations(snap, &relations);
+            var next: usize = 0;
+            while (next < count) : (next += 1) {
+                const oid = self.tables[out[next]].oid;
+                for (relations[0..relation_count]) |found| {
+                    if (found.kind == 'S' or self.tables[found.slot].parent != oid or count == out.len) continue;
+                    out[count] = found.slot;
+                    count += 1;
+                }
+            }
+            return count;
+        }
+
+        /// Parses and binds `original` again with `member` as its target
+        /// (the statement keeps naming the root). Returns the bound source.
+        noinline fn bindFamily(self: *Self, original: []const u8, mode: ParseMode, member: usize, snap: Snapshot, bound: *B.Bound) Error![]const u8 {
+            const top = try P.parseTopWithOptions(original, &self.workspace.nodes, .{ .mode = mode, .dialect = self.dialect });
+            var statement_copy = top.command;
+            const expanded = try expandRelations(self, &self.workspace, original, snap, &statement_copy, self.session.role, &self.session);
+            const source = try self.secureTarget(&statement_copy, expanded, original, snap);
+            var context = self.bindContext(source, mode, snap);
+            context.stored_source_start = original.len;
+            context.family_target = member;
+            try B.bindInto(&context, &statement_copy, bound);
+            switch (bound.*) {
+                .update, .delete => {},
+                else => return error.UnsupportedStatement,
+            }
+            return source;
+        }
+
+        /// UPDATE / DELETE through an inheritance parent or a partitioned
+        /// table, as PostgreSQL's inherited UPDATE / DELETE: one statement
+        /// over every member (FROM ONLY each; a partitioned table holds no
+        /// rows). Each member is parsed and bound again as the target
+        /// (members share the root's column prefix), privileges, rules and
+        /// statement-level triggers are the root's, row triggers each
+        /// member's, and RETURNING evaluates the root's list over every
+        /// member row the statement wrote. An UPDATE whose new row leaves
+        /// its partition moves it (moveRow).
+        noinline fn familyMutation(self: *Self, slot: u16, original: []const u8, root: usize, snap: Snapshot, result: *Result, mode: ParseMode) Error!void {
+            var members: [config.tables]usize = undefined;
+            const count = self.familyMembers(root, snap, &members);
+            // PostgreSQL applies only the root's rules to the statement.
+            for (members[1..count]) |member| if (self.anyRule(member, snap)) return error.UnsupportedStatement;
+            self.family_root = root;
+            defer self.family_root = null;
+            var bound: B.Bound = undefined;
+            _ = try self.bindFamily(original, mode, root, snap, &bound);
+            const is_update = bound == .update;
+            const returning = if (is_update) bound.update.returning.count else bound.delete.returning.count;
+            if (self.txs[slot].read_only) try readOnlyCheck(&bound, &self.workspace.plans);
+            try self.checkPrivileges(&bound, snap);
+            self.workspace.security_check = ast.none;
+            const event: u8 = if (is_update) routine_catalog.tg_update else routine_catalog.tg_delete;
+            const command: CommandTag = if (is_update) .update else .delete;
+            try self.lockTable(slot, root, .row_exclusive);
+            if (try self.insteadNothing(root, if (is_update) '2' else '4', returning != 0, snap)) {
+                self.outcome = .{ .affected = 0, .command = command };
+                return;
+            }
+            try self.statementTriggers(root, routine_catalog.tg_before, &.{event}, snap);
+            var affected: usize = 0;
+            for (members[0..count]) |member| {
+                if (self.tables[member].relkind == 'p') continue;
+                const source = try self.bindFamily(original, mode, member, snap, &bound);
+                try self.secureNewRows(&bound, source, snap);
+                try self.lockTable(slot, member, .row_exclusive);
+                try self.ssiRead(slot, member);
+                try self.lockSources(slot);
+                affected += switch (bound) {
+                    .update => |*update| try self.updateRows(slot, source, update, snap),
+                    .delete => |*delete| try self.deleteRows(slot, source, delete, snap),
+                    else => return error.UnsupportedStatement,
+                };
+            }
+            try self.afterTriggers(slot, self.statement_start, if (bound == .update) &bound.update.values else null, snap);
+            try self.statementTriggers(root, 0, &.{event}, snap);
+            self.outcome = .{ .affected = affected, .command = command };
+            if (returning == 0) return;
+            const source = try self.bindFamily(original, mode, root, snap, &bound);
+            self.family_returning = command;
+            defer self.family_returning = .none;
+            switch (bound) {
+                .update => |*update| try self.returnRows(slot, source, &update.returning, root, true, result.rows.len, snap.cid),
+                .delete => |*delete| try self.returnRows(slot, source, &delete.returning, root, true, result.rows.len, snap.cid),
+                else => return error.UnsupportedStatement,
+            }
+        }
+
+        /// Row movement (PostgreSQL ExecCrossPartitionUpdate): an UPDATE
+        /// through a partitioned table whose new row leaves its partition
+        /// deletes the old row there and inserts the new one into the
+        /// partition the statement's target routes it to, with that
+        /// partition's constraints. The row must stay inside the target
+        /// (23514). BEFORE ROW triggers or rules on either partition are
+        /// outside the subset (0A000); AFTER ROW triggers fire for the
+        /// delete and the insert, as PostgreSQL's do.
+        noinline fn moveRow(self: *Self, slot: u16, ctx: *E.Context, update: *const B.Update, old: u32, old_cells: *const E.Row, cells: *E.Row, snap: Snapshot) Error!bool {
+            const root = self.family_root orelse return error.CheckViolation;
+            try self.partitionBound(root, cells, snap);
+            const destination = try self.routeRow(slot, root, cells, snap);
+            if (self.rowHooks(update.table, routine_catalog.tg_delete, '4', snap) or self.insertHooks(destination, snap)) return error.UnsupportedStatement;
+            // The destination's NOT NULL and CHECK constraints.
+            const target_table = &self.tables[destination];
+            for (target_table.columns[0..target_table.column_count], 0..) |*column, index| {
+                if (cells[index] == .null_value and column.not_null) return error.NotNullViolation;
+            }
+            var flags: [config.table_constraints]bool = @splat(true);
+            var checks: [config.table_constraints]u16 = @splat(ast.none);
+            const context = self.bindContext(ctx.source, .standard, snap);
+            try B.bindFlaggedChecks(&context, destination, &flags, &checks);
+            try D.checkRow(ctx, target_table, &checks, cells);
+            // The old row leaves its partition (referencing rows see a delete).
+            try self.referencedChange(slot, update.table, old_cells, null, snap);
+            if (self.tables[update.table].versions[old].hasDeletion()) return true;
+            try self.placeDelete(slot, update.table, old, snap);
+            if (target_table.primary_column) |column| switch (S.primaryKeyCheck(target_table, &cells[column], 0xffffffff, snap)) {
+                .free => {},
+                .taken => return error.PrimaryKeyViolation,
+                .wait => |owner| {
+                    var waits: L.Set = .{};
+                    waits.add(owner);
+                    return self.park(slot, waits);
+                },
+            };
+            if (try self.uniqueTaken(slot, destination, cells, 0xffffffff, null, snap)) |_| return error.PrimaryKeyViolation;
+            try self.exclusionTaken(slot, destination, cells, 0xffffffff, null, snap);
+            try self.checkReferences(slot, destination, cells, null, snap);
+            try self.appendRow(slot, destination, cells, snap);
+            return true;
         }
 
         fn lockSelect(self: *Self, slot: u16, select: *const B.Select) Error!void {
@@ -3791,7 +3980,7 @@ pub fn Database(comptime config: Config) type {
             const start = self.statement_start;
             const writes = tx.writes[start..tx.write_len];
             var count: usize = 0;
-            for (writes) |entry| if (rowWrite(entry.kind) and (entry.table == table_index or self.descends(entry.table, table_index)) and self.writeCid(entry) == cid) {
+            for (writes) |entry| if (self.returnedWrite(entry.kind) and (entry.table == table_index or self.descends(entry.table, table_index)) and self.writeCid(entry) == cid) {
                 count += 1;
             };
             if (list.output and count != self.outcome.affected) return error.UnsupportedStatement;
@@ -3805,7 +3994,7 @@ pub fn Database(comptime config: Config) type {
             var cell_scratch: Cell = undefined;
             var row: usize = 0;
             for (writes) |entry| {
-                if (!rowWrite(entry.kind) or (entry.table != table_index and !self.descends(entry.table, table_index))) continue;
+                if (!self.returnedWrite(entry.kind) or (entry.table != table_index and !self.descends(entry.table, table_index))) continue;
                 if (self.writeCid(entry) != cid) continue;
                 const table = &self.tables[entry.table];
                 if (list.output) {
@@ -3830,6 +4019,16 @@ pub fn Database(comptime config: Config) type {
 
         fn rowWrite(kind: anytype) bool {
             return kind == .insert or kind == .update or kind == .delete;
+        }
+
+        /// RETURNING rows: through a family an UPDATE returns its updated
+        /// and moved (inserted) rows, a DELETE its deleted ones.
+        fn returnedWrite(self: *const Self, kind: anytype) bool {
+            return switch (self.family_returning) {
+                .update => kind == .insert or kind == .update,
+                .delete => kind == .delete,
+                else => rowWrite(kind),
+            };
         }
 
         fn validateTsqlOutput(self: *const Self, index: usize, command: CommandTag, snap: Snapshot) Error!void {
@@ -3906,7 +4105,17 @@ pub fn Database(comptime config: Config) type {
         /// CREATE SCHEMA: a schema slot, an OID and a cat_relations row
         /// (relkind 'n'), all transactional. A concurrent creator of the same
         /// name is waited for; the binder already rejected a visible name.
-        fn createSchema(self: *Self, slot: u16, name: Name, snap: Snapshot) Error!void {
+        /// CREATE SCHEMA ... AUTHORIZATION: the owner role (42704 when it
+        /// does not exist, PUBLIC included); else the current role.
+        fn createSchemaOwner(self: *Self, create: *const B.CreateSchema, snap: Snapshot) Error!u32 {
+            return switch (create.owner_special) {
+                1 => self.session.role,
+                2 => self.sessionState().sessionUser(),
+                else => if (create.owner) |name| self.catalog_objects.roleByName(name.slice(), snap) orelse error.UndefinedObject else self.session.role,
+            };
+        }
+
+        fn createSchema(self: *Self, slot: u16, name: Name, owner: u32, snap: Snapshot) Error!void {
             const tx = &self.txs[slot];
             if (self.catalog.creator(name.slice(), snap)) |other| {
                 var waits: L.Set = .{};
@@ -3914,7 +4123,6 @@ pub fn Database(comptime config: Config) type {
                 tx.fresh = tx.write_len == tx.subs[tx.sub_len - 1].write_start;
                 return self.park(slot, waits);
             }
-            const owner = self.session.role;
             if (owner != CO.bootstrap_role) {
                 if (self.catalog_objects.pendingReference(owner, snap)) |other| return self.objectPark(slot, other);
                 var latest = snap;
@@ -4238,9 +4446,8 @@ pub fn Database(comptime config: Config) type {
         /// A table, view or materialized view named by a catalog-object
         /// statement (42P01), locked in `mode`; null with IF EXISTS.
         fn objectTable(self: *Self, slot: u16, source: []const u8, name: CO.Qualified, mode: locks_module.TableMode, snap: Snapshot) Error!usize {
-            if (!name.has_schema and !self.session.public_schema_on_path) return error.TableNotFound;
             const schema_name = if (name.has_schema) objectName(source, name.schema) else Name{};
-            const namespace = (try self.namespaceForUsage(self.session.role, if (name.has_schema) schema_name.slice() else null, snap)) orelse return error.UndefinedSchema;
+            const namespace = (try self.relationNamespace(self.session.role, if (name.has_schema) schema_name.slice() else null, objectName(source, name.name).slice(), snap)) orelse return error.TableNotFound;
             const found = self.catalog.findIn(namespace, objectName(source, name.name).slice(), snap) orelse return error.TableNotFound;
             if (found.kind == 'S') return error.WrongObjectType;
             try self.lockTable(slot, found.slot, mode);
@@ -5233,9 +5440,23 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn typeNamespace(self: *const Self, source: []const u8, name: CO.Qualified, snap: Snapshot) Error!u32 {
-            if (!name.has_schema and !self.session.public_schema_on_path) return error.UndefinedSchema;
-            const schema = if (name.has_schema) objectName(source, name.schema) else Name{};
-            return (try self.namespaceForUsage(self.session.role, if (name.has_schema) schema.slice() else null, snap)) orelse error.UndefinedSchema;
+            if (!name.has_schema) {
+                // The search path's first schema holding a user type of that
+                // name, else its first schema (CREATE; 3F000 with none).
+                var path: [routine_path_capacity]u32 = undefined;
+                const count = self.routinePath(snap, &path);
+                const wanted = objectName(source, name.name);
+                for (path[0..count]) |namespace| {
+                    if (self.catalog_objects.byName(.domain, namespace, wanted.slice(), snap) != null or
+                        self.catalog_objects.byName(.enum_type, namespace, wanted.slice(), snap) != null or
+                        self.catalog_objects.byName(.composite_type, namespace, wanted.slice(), snap) != null) return namespace;
+                }
+                if (count == 0) return error.UndefinedSchema;
+                try self.checkNamespaceUsage(self.session.role, path[0], snap);
+                return path[0];
+            }
+            const schema = objectName(source, name.schema);
+            return (try self.namespaceForUsage(self.session.role, schema.slice(), snap)) orelse error.UndefinedSchema;
         }
 
         fn typeNameOccupied(self: *const Self, namespace: u32, name: []const u8, snap: Snapshot) bool {
@@ -6008,9 +6229,8 @@ pub fn Database(comptime config: Config) type {
                     }
                 },
                 .sequence => {
-                    if (!comment.object.has_schema and !self.session.public_schema_on_path) return error.TableNotFound;
                     const schema_name = if (comment.object.has_schema) objectName(source, comment.object.schema) else Name{};
-                    const namespace = (try self.namespaceForUsage(self.session.role, if (comment.object.has_schema) schema_name.slice() else null, snap)) orelse return error.UndefinedSchema;
+                    const namespace = (try self.relationNamespace(self.session.role, if (comment.object.has_schema) schema_name.slice() else null, objectName(source, comment.object.name).slice(), snap)) orelse return error.TableNotFound;
                     const found = self.catalog.findIn(namespace, objectName(source, comment.object.name).slice(), snap) orelse return error.TableNotFound;
                     if (found.kind != 'S') return error.WrongObjectType;
                     if (!privileged) return error.InsufficientPrivilege;
@@ -6406,19 +6626,20 @@ pub fn Database(comptime config: Config) type {
         fn secureTarget(self: *Self, statement_copy: *A.Statement, source: []const u8, original: []const u8, snap: Snapshot) Error![]const u8 {
             const role = self.session.role;
             if (self.privilegedRole(snap)) return source;
-            const goal: struct { schema: ?ast.Ident, table: ast.Ident, where: *u16, command: CO.Command, reads: bool } = switch (statement_copy.*) {
-                .update => |*update| .{ .schema = update.schema, .table = update.table, .where = &update.where, .command = .update, .reads = update.where != ast.none or update.returning.count != 0 },
-                .delete => |*delete| .{ .schema = delete.schema, .table = delete.table, .where = &delete.where, .command = .delete, .reads = delete.where != ast.none or delete.returning.count != 0 },
+            const goal: struct { schema: ?ast.Ident, table: ast.Ident, where: *u16, command: CO.Command, reads: bool, only: bool } = switch (statement_copy.*) {
+                .update => |*update| .{ .schema = update.schema, .table = update.table, .where = &update.where, .command = .update, .reads = update.where != ast.none or update.returning.count != 0, .only = update.only },
+                .delete => |*delete| .{ .schema = delete.schema, .table = delete.table, .where = &delete.where, .command = .delete, .reads = delete.where != ast.none or delete.returning.count != 0, .only = delete.only },
                 else => return source,
             };
-            if (goal.schema == null and !self.session.public_schema_on_path) return source;
             const schema_name = if (goal.schema) |qualifier| identName(source, qualifier) else Name{};
-            const namespace = (try self.namespaceForUsage(role, if (goal.schema != null) schema_name.slice() else null, snap)) orelse return source;
+            const namespace = (try self.relationNamespace(role, if (goal.schema != null) schema_name.slice() else null, identName(source, goal.table).slice(), snap)) orelse return source;
             const found = self.catalog.findIn(namespace, identName(source, goal.table).slice(), snap) orelse return source;
             if (found.kind != 'r' and found.kind != 'p') return source;
             const table = &self.tables[found.slot];
             if (!try self.checkRowSecurity(role, table.oid, self.session.row_security, snap)) return source;
-            if (table.relkind == 'p' or self.hasChildren(table.oid, snap)) return error.UnsupportedStatement;
+            // A family's UPDATE / DELETE runs per member (familyMutation)
+            // under the named table's policies.
+            if ((table.relkind == 'p' or self.hasChildren(table.oid, snap)) and self.family_root == null and !goal.only) return error.UnsupportedStatement;
             var length: usize = 0;
             try self.securedSource(source, original, &length);
             var text: CO.Appender = .{ .out = &self.workspace.expansion, .len = &length };
@@ -6442,9 +6663,11 @@ pub fn Database(comptime config: Config) type {
             self.workspace.security_check = ast.none;
             const role = self.session.role;
             if (self.privilegedRole(snap)) return;
-            const goal: struct { table: usize, command: CO.Command } = switch (bound.*) {
-                .insert => |*insert| .{ .table = insert.table, .command = .insert },
-                .update => |*update| .{ .table = update.table, .command = .update },
+            // A new row the statement also reads (RETURNING; an UPDATE's
+            // WHERE) must pass the SELECT policies too (ddl-dml, wave 4).
+            const goal: struct { table: usize, command: CO.Command, reads: bool } = switch (bound.*) {
+                .insert => |*insert| .{ .table = insert.table, .command = .insert, .reads = insert.returning.count != 0 },
+                .update => |*update| .{ .table = update.table, .command = .update, .reads = update.where != ast.none or update.returning.count != 0 },
                 .merge => |*merge| {
                     if (try self.checkRowSecurity(role, self.tables[merge.table].oid, self.session.row_security, snap)) return error.UnsupportedStatement;
                     return;
@@ -6463,13 +6686,19 @@ pub fn Database(comptime config: Config) type {
                 },
                 else => return,
             };
-            const oid = self.tables[goal.table].oid;
+            // A family member's new rows meet the named root's policies.
+            const oid = if (self.family_root) |root| self.tables[root].oid else self.tables[goal.table].oid;
             if (!try self.checkRowSecurity(role, oid, self.session.row_security, snap)) return;
             if (bound.* == .insert and bound.insert.conflict.action != .none) return error.UnsupportedStatement;
             var length: usize = 0;
             try self.securedSource(source, source, &length);
             const start = length;
             try self.catalog_objects.securityText(role, oid, goal.command, true, snap, &self.workspace.expansion, &length);
+            if (goal.reads) {
+                var text: CO.Appender = .{ .out = &self.workspace.expansion, .len = &length };
+                try text.add(" AND ");
+                try self.catalog_objects.securityText(role, oid, .select, false, snap, &self.workspace.expansion, &length);
+            }
             self.workspace.expansion_used = @max(self.workspace.expansion_used, length);
             const text = self.workspace.expansion[start..length];
             const context = self.bindContext(text, .standard, snap);
@@ -6477,6 +6706,12 @@ pub fn Database(comptime config: Config) type {
             self.workspace.security_start = start;
             self.workspace.security_len = length - start;
             self.workspace.security_table = goal.table;
+        }
+
+        /// Whether the running statement checks row security on new rows of
+        /// table `table_slot`.
+        fn securedTarget(self: *const Self, table_slot: usize) bool {
+            return self.workspace.security_check != ast.none and self.workspace.security_table == table_slot;
         }
 
         /// The new row of the statement's INSERT / UPDATE target passes its
@@ -6504,7 +6739,7 @@ pub fn Database(comptime config: Config) type {
         /// names (not one a view or an expansion introduced: those run with
         /// the view owner's rights, the bootstrap superuser). Returns the
         /// derived query replacing it under row security, or none.
-        fn secureItem(db: *const Self, workspace: *Workspace, length: *usize, source: []const u8, role: u32, row_security: bool, found: K.Found, snap: Snapshot) Error!u16 {
+        fn secureItem(db: *const Self, workspace: *Workspace, length: *usize, source: []const u8, role: u32, row_security: bool, found: K.Found, only: bool, snap: Snapshot) Error!u16 {
             if (found.kind == 'S') {
                 const seq = &db.seqs[found.slot];
                 const owner = if (seq.owner == 0) CO.bootstrap_role else db.catalog_objects.owner(seq.owner, snap);
@@ -6515,7 +6750,6 @@ pub fn Database(comptime config: Config) type {
             if (!db.catalog_objects.tablePrivileges(role, table.oid, CO.priv_select, snap)) return error.InsufficientPrivilege;
             if (table.relkind != 'r' and table.relkind != 'p') return ast.none;
             if (!try db.checkRowSecurity(role, table.oid, row_security, snap)) return ast.none;
-            if (table.relkind == 'p' or db.hasChildren(table.oid, snap)) return error.UnsupportedStatement;
             if (length.* == 0) {
                 if (source.len > workspace.expansion.len) return error.TextCapacity;
                 @memcpy(workspace.expansion[0..source.len], source);
@@ -6524,7 +6758,10 @@ pub fn Database(comptime config: Config) type {
             var text: CO.Appender = .{ .out = &workspace.expansion, .len = length };
             try text.add(" ");
             const start = length.*;
-            try text.add("SELECT * FROM ONLY ");
+            // A family read through the named table: its policies filter
+            // every member's rows (the expansion reads the members).
+            const family = !only and (table.relkind == 'p' or db.hasChildren(table.oid, snap));
+            try text.add(if (family) "SELECT * FROM " else "SELECT * FROM ONLY ");
             try text.quoted(db.namespaceName(table.namespace));
             try text.add(".");
             try text.quoted(table.name.slice());
@@ -6690,26 +6927,34 @@ pub fn Database(comptime config: Config) type {
             return writer.len;
         }
 
-        fn catalogSchemaPath(ptr: *anyopaque, implicit: bool, names: *[2][]const u8) usize {
+        fn catalogSchemaPath(ptr: *anyopaque, implicit: bool, names: *[value_module.schema_path_names][]const u8) usize {
             const self: *Self = @ptrCast(@alignCast(ptr));
             const path = self.sessionState().values.search_path.slice();
             var items = std.mem.splitSequence(u8, path, ", ");
             var count: usize = 0;
             var catalog_seen = false;
-            var public_seen = false;
-            while (items.next()) |item| {
-                if (types.same(item, "pg_catalog") and !catalog_seen) {
-                    names[count] = "pg_catalog";
-                    count += 1;
-                    catalog_seen = true;
-                } else if (types.same(item, "public") and !public_seen) {
-                    names[count] = "public";
-                    count += 1;
-                    public_seen = true;
-                }
+            // Listed schemas that exist, in order (ddl-dml: user schemas too).
+            while (items.next()) |raw| {
+                var item = raw;
+                if (item.len >= 2 and item[0] == '"' and item[item.len - 1] == '"') item = item[1 .. item.len - 1];
+                if (count == names.len - 1) break;
+                const name: []const u8 = if (types.same(item, "pg_catalog")) "pg_catalog" else if (types.same(item, "public")) "public" else blk: {
+                    if (item.len == 0 or types.same(item, "pg_temp")) continue;
+                    const wanted = if (types.same(item, "$user")) (self.catalog_objects.roleName(self.session.role, self.seq_snap) orelse continue) else item;
+                    const found = self.catalog.findSchema(wanted, self.seq_snap) orelse continue;
+                    for (&self.schemas) |*schema| if (schema.live and schema.oid == found.oid) break :blk schema.name.slice();
+                    continue;
+                };
+                var seen = false;
+                for (names[0..count]) |previous| seen = seen or types.same(previous, name);
+                if (seen) continue;
+                catalog_seen = catalog_seen or types.same(name, "pg_catalog");
+                names[count] = name;
+                count += 1;
             }
             if (implicit and !catalog_seen) {
-                if (count != 0) names[1] = names[0];
+                var position = count;
+                while (position != 0) : (position -= 1) names[position] = names[position - 1];
                 names[0] = "pg_catalog";
                 count += 1;
             }
@@ -7129,8 +7374,10 @@ pub fn Database(comptime config: Config) type {
             }
             const name = namespaceIdentifier(std.mem.trim(u8, text, whitespace)) catch return missing;
             if (self.regclassIn(catalog_module.catalog_namespace, name.slice())) |oid| return oid;
-            if (!self.session.public_schema_on_path) return missing;
-            return if (self.regclassIn(catalog_module.public_namespace, name.slice())) |oid| oid else missing;
+            var path: [routine_path_capacity]u32 = undefined;
+            const count = self.routinePath(self.seq_snap, &path);
+            for (path[0..count]) |namespace| if (self.regclassIn(namespace, name.slice())) |oid| return oid;
+            return missing;
         }
 
         fn regclassIn(self: *const Self, namespace: u32, name: []const u8) ?u32 {
@@ -7379,9 +7626,15 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn inRelationSearchPath(self: *const Self, namespace: u32, name: []const u8) bool {
-            // The supported relation path resolves pg_catalog before public.
-            return namespace == catalog_module.catalog_namespace or
-                (self.session.public_schema_on_path and namespace == catalog_module.public_namespace and self.catalog.findSystemView(null, name) == null);
+            // pg_catalog first, then the search path's first holder.
+            if (namespace == catalog_module.catalog_namespace) return true;
+            if (self.catalog.findSystemView(null, name) != null) return false;
+            var path: [routine_path_capacity]u32 = undefined;
+            const count = self.routinePath(self.seq_snap, &path);
+            for (path[0..count]) |candidate| {
+                if (self.catalog.findIn(candidate, name, self.seq_snap) != null) return candidate == namespace;
+            }
+            return false;
         }
 
         fn relationVisible(ptr: *anyopaque, oid: u32) ?bool {
@@ -8454,11 +8707,13 @@ pub fn Database(comptime config: Config) type {
             const label = switch (kind) { .check => "c", .unique => "u", .primary => "p", .foreign => "f", .exclusion => "x" };
             const deferrable = if (constraint) |item| item.deferrable else false;
             const deferred = if (constraint) |item| item.initially_deferred else false;
+            const validated = if (constraint) |item| !item.not_valid and !item.not_enforced else true;
+            const enforced = if (constraint) |item| !item.not_enforced else true;
             const foreign = if (kind == .foreign) constraint else null;
             const index = if (kind == .primary) S.primaryIndexOid(table) else if (foreign) |item| self.referencedConstraintIndex(item, snapshot) else 0;
             try sink.add(&.{
                 intCell(oid), nameCell(name), intCell(table.namespace), nameCell(label),
-                boolCell(deferrable), boolCell(deferred), boolCell(true), boolCell(true),
+                boolCell(deferrable), boolCell(deferred), boolCell(enforced), boolCell(validated),
                 intCell(table.oid), intCell(0), intCell(index), intCell(0),
                 intCell(if (foreign) |item| item.ref_oid else 0),
                 nameCell(if (foreign) |item| foreignActionCode(item.on_update) else " "),
@@ -8858,6 +9113,7 @@ pub fn Database(comptime config: Config) type {
             if (constraint) |item| {
                 if (item.deferrable) text.add(" DEFERRABLE");
                 if (item.initially_deferred) text.add(" INITIALLY DEFERRED");
+                if (item.not_enforced) text.add(" NOT ENFORCED") else if (item.not_valid) text.add(" NOT VALID");
             }
             if (text.shortened) return error.TextCapacity;
             return text.len;
@@ -9102,16 +9358,58 @@ pub fn Database(comptime config: Config) type {
                     if (snap.own(deletion.tx)) {
                         // Changed by a statement this one's triggers or
                         // functions ran (PostgreSQL TM_SelfModified with a
-                        // later command id): 27000 for UPDATE / DELETE.
-                        if (deletion.cid > snap.cid and mode == .write and self.nested_ran) return error.TriggeredDataChangeViolation;
+                        // later command id): 27000 for UPDATE / DELETE (an
+                        // UPDATE takes FOR NO KEY UPDATE strength, ddl-dml).
+                        if (deletion.cid > snap.cid and (mode == .write or mode == .no_key_update) and self.nested_ran) return error.TriggeredDataChangeViolation;
                         return if (deletion.cid == snap.cid) .authored else .skip;
                     }
-                    waits.add(deletion.tx.slot);
+                    // FOR KEY SHARE does not conflict with an UPDATE that
+                    // keeps every key column (FOR NO KEY UPDATE strength).
+                    if (mode != .key_share or !keysKept(table, current)) waits.add(deletion.tx.slot);
                 }
                 self.locks.rowHolders(table_index, table.rows[entry.rowSlot()].rowid, slot, mode, waits);
                 if (waits.any()) return .wait;
                 return .{ .ready = current };
             }
+        }
+
+        /// Whether `column` is a key column of `table` (PostgreSQL's
+        /// INDEX_ATTR_BITMAP_KEY): in the primary key, a non-deferrable
+        /// UNIQUE constraint or a unique index over plain columns without a
+        /// predicate (ddl-dml, wave 4).
+        fn keyColumn(table: *const S.Table, column: usize) bool {
+            if (table.primary_column == column) return true;
+            for (table.constraints[0..table.constraint_count]) |*constraint| {
+                if ((constraint.kind != .primary and constraint.kind != .unique) or constraint.deferrable) continue;
+                for (constraint.keyColumns()) |key| if (key == column) return true;
+            }
+            for (table.indexes[0..table.index_count]) |*index| {
+                if (!index.unique or index.predicate.len != 0) continue;
+                var plain = true;
+                for (index.keyColumns()) |key| plain = plain and key != S.expression_key;
+                if (!plain) continue;
+                for (index.keyColumns()) |key| if (key == column) return true;
+            }
+            return false;
+        }
+
+        /// Whether two rows of `table` agree on every key column.
+        fn sameKeys(table: *const S.Table, old: *const E.Row, new: *const E.Row) bool {
+            for (0..table.column_count) |column| {
+                if (!keyColumn(table, column)) continue;
+                if (@as(V.CellTag, old[column]) != @as(V.CellTag, new[column]) or V.compare(&old[column], &new[column]) != 0) return false;
+            }
+            return true;
+        }
+
+        /// A version another transaction is updating: whether its new
+        /// version keeps every key column (a NO KEY UPDATE; a DELETE has no
+        /// successor).
+        fn keysKept(table: *const S.Table, version: u32) bool {
+            const next = S.successor(table, version) orelse return false;
+            var old_scratch: S.VersionRowScratch = undefined;
+            var new_scratch: S.VersionRowScratch = undefined;
+            return sameKeys(table, S.borrowVersionRow(table, version, &old_scratch), S.borrowVersionRow(table, next, &new_scratch));
         }
 
         const RowLocker = struct {
@@ -9474,7 +9772,10 @@ pub fn Database(comptime config: Config) type {
             if (!types.same(alter.name.slice(), source.name.slice())) {
                 try self.checkRelationTypeName(slot, source.namespace, alter.name.slice(), snap);
             }
+            // ATTACH / DETACH PARTITION lock the partitioned table first (ddl-dml).
+            if (alter.partition_parent) |parent| try self.lockTable(slot, parent, if (alter.attach) .share_update_exclusive else .access_exclusive);
             try self.lockTable(slot, alter.table, .access_exclusive);
+            if (alter.partition_default) |default| try self.lockTable(slot, default, .access_exclusive);
             const tx = &self.txs[slot];
             try self.reserveWrites(slot, 3 + 2 * config.columns);
             var destination: ?usize = null;
@@ -9506,6 +9807,10 @@ pub fn Database(comptime config: Config) type {
             S.reset(copy, source.oid, alter.name, alter.columns[0..alter.count]);
             copy.namespace = source.namespace;
             S.setConstraints(copy, alter.constraints[0..alter.constraint_count]);
+            // ADD FOREIGN KEY ... REFERENCES the table itself (ddl-dml).
+            for (copy.constraints[0..copy.constraint_count]) |*constraint| {
+                if (constraint.kind == .foreign and constraint.ref_oid == 0) constraint.ref_oid = copy.oid;
+            }
             S.setExtras(copy, &alter.extras);
             if (S.keyed(copy)) copy.primary_index_oid = source.primary_index_oid;
             try self.assignConstraintOids(copy, source);
@@ -9545,6 +9850,24 @@ pub fn Database(comptime config: Config) type {
             try self.remapColumnComments(slot, source.oid, alter.sources[0..alter.count], snap);
             try self.remapStatistics(slot, source.oid, alter.sources[0..alter.count], snap);
             if (alter.identity) |identity| try self.createSequence(slot, copy.namespace, identity.name, identity.spec, copy.oid, identity.column, false, snap);
+            // DROP IDENTITY / RESTART: the column's own sequence (ddl-dml).
+            if (alter.restart_identity) |column| {
+                const position = self.ownedSequence(copy.oid, column, snap) orelse return error.UndefinedObject;
+                try self.alterSequence(slot, position, .{ .restart = true, .restart_value = alter.restart_value }, null, snap);
+            }
+            if (alter.drop_identity) |column| {
+                const position = self.ownedSequence(copy.oid, column, snap) orelse return error.UndefinedObject;
+                try self.dropSequence(slot, position, snap);
+            }
+        }
+
+        /// The live sequence a column of table `oid` owns (identity, SERIAL).
+        fn ownedSequence(self: *const Self, oid: u32, column: u8, snap: Snapshot) ?usize {
+            _ = snap;
+            for (&self.seqs, 0..) |*seq, position| {
+                if (seq.live and seq.dead_csn == 0 and !seq.pending_drop and seq.owner == oid and seq.owner_column == column) return position;
+            }
+            return null;
         }
 
         /// Existing rows against the constraints ALTER TABLE added or
@@ -9566,6 +9889,41 @@ pub fn Database(comptime config: Config) type {
             }
             var ctx = self.evalContext("");
             var row_scratch: S.VersionRowScratch = undefined;
+            // ATTACH PARTITION: the DEFAULT partition gives up the new bound.
+            if (alter.partition_default) |default| attach: {
+                const parent_index = alter.partition_parent orelse break :attach;
+                const key = self.tables[parent_index].partition.key;
+                var members: [config.tables]usize = undefined;
+                const count = self.familyMembers(default, snap, &members);
+                for (members[0..count]) |member| {
+                    const other = &self.tables[member];
+                    for (0..other.row_high) |row| {
+                        if (other.rows[row].newest == 0) continue;
+                        const version = S.visibleAt(other, row, snap) orelse continue;
+                        try self.session.checkpoint();
+                        var temporary: Cell = undefined;
+                        if (S.partitionContains(&table.partition, S.borrowVersionCell(other, version, key, &temporary))) return error.CheckViolation;
+                    }
+                }
+            }
+            // ATTACH PARTITION: every row inside the bound, a partitioned
+            // table's through its partitions (23514).
+            if (alter.attach) attach: {
+                const parent_index = alter.partition_parent orelse break :attach;
+                const key = self.tables[parent_index].partition.key;
+                var members: [config.tables]usize = undefined;
+                const count = self.familyMembers(index, snap, &members);
+                for (members[0..count]) |member| {
+                    const part = &self.tables[member];
+                    for (0..part.row_high) |row| {
+                        if (part.rows[row].newest == 0) continue;
+                        const version = S.visibleAt(part, row, snap) orelse continue;
+                        try self.session.checkpoint();
+                        var temporary: Cell = undefined;
+                        try self.partitionKeyFits(index, S.borrowVersionCell(part, version, key, &temporary), snap);
+                    }
+                }
+            }
             for (0..table.row_high) |row| {
                 if (table.rows[row].newest == 0) continue;
                 const version = S.visibleAt(table, row, snap) orelse continue;
@@ -9738,6 +10096,49 @@ pub fn Database(comptime config: Config) type {
             return @intFromBool(try self.updateOne(slot, ctx, update, row, goal, old, snap));
         }
 
+        /// ON CONFLICT through a partitioned table (ddl-dml, wave 4): the
+        /// arbiter of `root` as the routed partition's equivalent key.
+        fn partitionArbiter(self: *const Self, root: usize, partition: usize, arbiter: B.Arbiter) Error!B.Arbiter {
+            const parent = &self.tables[root];
+            const leaf = &self.tables[partition];
+            switch (arbiter) {
+                .any => return .any,
+                .primary => {
+                    if (leaf.primary_column != null and leaf.primary_column == parent.primary_column) return .primary;
+                    return error.UnsupportedStatement;
+                },
+                .constraint => |position| {
+                    const wanted = &parent.constraints[position];
+                    for (leaf.constraints[0..leaf.constraint_count], 0..) |*candidate, index| {
+                        if (!S.scannedUnique(leaf, candidate) or candidate.nulls_not_distinct != wanted.nulls_not_distinct) continue;
+                        if (candidate.column_count != wanted.column_count) continue;
+                        var same = true;
+                        for (candidate.keyColumns(), wanted.keyColumns()) |a, b| same = same and a == b;
+                        if (same) return .{ .constraint = index };
+                    }
+                    if (wanted.kind == .primary and wanted.column_count == 1 and leaf.primary_column == wanted.columns[0]) return .primary;
+                    return error.UnsupportedStatement;
+                },
+                .index => return error.UnsupportedStatement,
+            }
+        }
+
+        /// DO UPDATE of a row a partitioned table's INSERT routed to a
+        /// partition: the bound SET list over the partition (same column
+        /// layout) with the partition's CHECK constraints. A new row that
+        /// would leave the partition is 0A000, as in PostgreSQL.
+        noinline fn routedConflictUpdate(self: *Self, slot: u16, ctx: *E.Context, table_index: usize, update: *const B.Update, version: u32, proposed: *const E.Row, snap: Snapshot) Error!usize {
+            var routed = update.*;
+            routed.table = table_index;
+            routed.checks = @splat(ast.none);
+            const flags: [config.table_constraints]bool = @splat(true);
+            const context = self.bindContext(ctx.source, .standard, snap);
+            try B.bindFlaggedChecks(&context, table_index, &flags, &routed.checks);
+            self.conflict_routed = true;
+            defer self.conflict_routed = false;
+            return self.conflictUpdate(slot, ctx, table_index, &routed, version, proposed, snap);
+        }
+
         /// A primary-key replacement is one real delete and one insert. More
         /// than one uniqueness key, trigger and foreign-key effects require
         /// their own replacement path before those schemas can be admitted.
@@ -9791,29 +10192,43 @@ pub fn Database(comptime config: Config) type {
             const hooked = self.insertHooks(insert.table, snap);
             const target_table = &self.tables[insert.table];
             const auto = mysqlAutoColumn(target_table);
+            // Row security checks the new row before NOT NULL and CHECK
+            // constraints (ddl-dml, wave 4).
+            const secured_row = self.securedTarget(insert.table);
             var cells = if (auto) |column| blk: {
                 const replacement = try self.mysqlInsertValue(slot, ctx, insert.table, column, values[column]);
                 break :blk try D.insertedRowWithValue(ctx, target_table, values, derived, replacement);
-            } else if (hooked) try D.insertedRowDeferred(ctx, target_table, values, derived) else try D.insertedRow(ctx, target_table, values, derived);
+            } else if (hooked or secured_row) try D.insertedRowDeferred(ctx, target_table, values, derived) else try D.insertedRow(ctx, target_table, values, derived);
             if (hooked and try self.ruleSkips(insert.table, '3', &cells, null, snap)) return 0;
             // A partitioned table routes the row to its partition.
             const table_index = try self.routeRow(slot, insert.table, &cells, snap);
             if (hooked) {
                 if (!try self.beforeRow(table_index, routine_catalog.tg_insert, &cells, null, null, snap)) return 0;
-                try D.finishRow(ctx, &self.tables[insert.table], derived, &cells);
+                if (!secured_row) try D.finishRow(ctx, &self.tables[insert.table], derived, &cells);
                 if (table_index != insert.table) try self.partitionBound(table_index, &cells, snap);
             }
             // Row security checks the row the triggers produced (B11 wave 3).
-            try self.securityCheck(ctx, insert.table, &cells);
+            if (secured_row and auto == null) {
+                try D.generatedRow(ctx, &self.tables[insert.table], derived, &cells);
+                try self.securityCheck(ctx, insert.table, &cells);
+                try D.constrainRow(ctx, &self.tables[insert.table], derived, &cells);
+            } else try self.securityCheck(ctx, insert.table, &cells);
             const table = &self.tables[table_index];
             const replaced = insert.replace and try self.replaceMysqlConflict(slot, table_index, &cells, snap);
             // ON CONFLICT: the arbiter is checked first (PostgreSQL's
             // speculative pre-check); other unique indexes still raise 23505.
             const conflict = &insert.conflict;
-            if (conflict.action != .none) if (try self.arbiterTaken(slot, table_index, conflict.arbiter, &cells, snap)) |version| switch (conflict.action) {
-                .nothing, .none => return 0,
-                .update => return self.conflictUpdate(slot, ctx, table_index, &conflict.update, version, &cells, snap),
-            };
+            if (conflict.action != .none) {
+                // Through a partitioned table the routed partition's key arbitrates.
+                const arbiter = if (table_index == insert.table) conflict.arbiter else try self.partitionArbiter(insert.table, table_index, conflict.arbiter);
+                if (try self.arbiterTaken(slot, table_index, arbiter, &cells, snap)) |version| switch (conflict.action) {
+                    .nothing, .none => return 0,
+                    .update => {
+                        if (table_index == insert.table) return self.conflictUpdate(slot, ctx, table_index, &conflict.update, version, &cells, snap);
+                        return self.routedConflictUpdate(slot, ctx, table_index, &conflict.update, version, &cells, snap);
+                    },
+                };
+            }
             if (table.primary_column) |column| switch (S.primaryKeyCheck(table, &cells[column], 0xffffffff, snap)) {
                 .free => {},
                 .taken => return error.PrimaryKeyViolation,
@@ -9931,6 +10346,9 @@ pub fn Database(comptime config: Config) type {
                 if (!version.hasDeletion()) return .{ .found = @intCast(index) };
                 const deletion = version.pendingDeletion() orelse continue;
                 if (snap.own(deletion.tx)) continue;
+                // An UPDATE in progress that keeps the keys (NO KEY UPDATE)
+                // leaves the row referenced: FOR KEY SHARE does not wait.
+                if (keysKept(table, @intCast(index))) return .{ .found = @intCast(index) };
                 if (waiting == null) waiting = deletion.tx.slot;
             }
             return if (waiting) |slot| .{ .wait = slot } else .missing;
@@ -9944,7 +10362,7 @@ pub fn Database(comptime config: Config) type {
         fn checkReferences(self: *Self, slot: u16, table_index: usize, cells: *const E.Row, old: ?*const E.Row, snap: Snapshot) Error!void {
             const table = &self.tables[table_index];
             for (table.constraints[0..table.constraint_count]) |*constraint| {
-                if (constraint.kind != .foreign) continue;
+                if (constraint.kind != .foreign or constraint.not_enforced) continue;
                 if (old) |previous| if (!S.keyChanged(constraint, previous, cells)) continue;
                 var has_null = false;
                 for (constraint.keyColumns()) |column| has_null = has_null or cells[column] == .null_value;
@@ -9953,7 +10371,12 @@ pub fn Database(comptime config: Config) type {
                     self.txs[slot].deferred_checks = true;
                     continue;
                 }
-                try self.referencedRow(slot, table_index, constraint, cells, snap);
+                // A missing referenced row may still appear before the
+                // statement ends (PostgreSQL's RI check is an AFTER trigger).
+                self.referencedRow(slot, table_index, constraint, cells, snap) catch |err| {
+                    if (err != error.ForeignKeyViolation) return err;
+                    self.txs[slot].statement_checks = true;
+                };
             }
         }
 
@@ -9981,9 +10404,10 @@ pub fn Database(comptime config: Config) type {
                     if (parent.versions[version].creationCsn() == 0) return;
                     const rowid = parent.rows[parent.versions[version].rowSlot()].rowid;
                     var waits: L.Set = .{};
-                    self.locks.rowHolders(parent_index, rowid, slot, .share, &waits);
+                    // FOR KEY SHARE, as PostgreSQL's RI check (ddl-dml).
+                    self.locks.rowHolders(parent_index, rowid, slot, .key_share, &waits);
                     if (waits.any()) return self.park(slot, waits);
-                    if (try self.locks.grantRow(parent_index, rowid, slot, .share)) |granted| try M.recordLock(self, slot, granted);
+                    if (try self.locks.grantRow(parent_index, rowid, slot, .key_share)) |granted| try M.recordLock(self, slot, granted);
                 },
             }
         }
@@ -10004,7 +10428,7 @@ pub fn Database(comptime config: Config) type {
                 const child_index = found.slot;
                 const child = &self.tables[child_index];
                 for (child.constraints[0..child.constraint_count]) |*constraint| {
-                    if (constraint.kind != .foreign or constraint.ref_oid != parent.oid) continue;
+                    if (constraint.kind != .foreign or constraint.ref_oid != parent.oid or constraint.not_enforced) continue;
                     var has_null = false;
                     for (constraint.refColumns()) |column| has_null = has_null or old[column] == .null_value;
                     if (has_null) continue;
@@ -10018,6 +10442,16 @@ pub fn Database(comptime config: Config) type {
                     const action = if (new == null) constraint.on_delete else constraint.on_update;
                     if (action == .no_action and constraint.deferrable) {
                         self.txs[slot].deferred_checks = true;
+                        continue;
+                    }
+                    // NO ACTION and RESTRICT are checked when the statement
+                    // ends: the references may be gone (and for NO ACTION
+                    // the key live again) by then.
+                    if (action == .no_action or action == .restrict) {
+                        self.referencingRows(slot, child_index, constraint, action, old, new, snap) catch |err| {
+                            if (err != error.ForeignKeyViolation) return err;
+                            self.txs[slot].statement_checks = true;
+                        };
                         continue;
                     }
                     try self.referencingRows(slot, child_index, constraint, action, old, new, snap);
@@ -10178,7 +10612,7 @@ pub fn Database(comptime config: Config) type {
                     tx.constraint_mode_count += 1;
                 }
             }
-            if (!set.deferred) try self.deferredCheck(slot, 0, true);
+            if (!set.deferred) try self.deferredCheck(slot, 0, true, false);
         }
 
         /// The deferred checks of a transaction (COMMIT, SET CONSTRAINTS
@@ -10191,15 +10625,20 @@ pub fn Database(comptime config: Config) type {
         pub fn deferredViolation(self: *const Self, slot: u16) Error!void {
             // SERIALIZABLE: a doomed transaction or pivot cannot commit.
             if (self.active(slot)) if (self.txs[slot].ssi) |index| try self.ssi.check(index);
-            return self.deferredCheck(slot, 0, false);
+            return self.deferredCheck(slot, 0, false, false);
         }
 
         /// Writes from `start`; `immediate_only` skips constraints whose
         /// mode is DEFERRED now (statement end, SET CONSTRAINTS IMMEDIATE).
-        fn deferredCheck(self: *const Self, slot: u16, start: usize, immediate_only: bool) Error!void {
+        /// `statement_end`: also the non-deferred foreign key checks a row
+        /// left for the end of its statement (PostgreSQL's RI triggers fire
+        /// then): a missing referenced row, a removed key that NO ACTION
+        /// rows still reference, and one RESTRICT rows reference at all.
+        fn deferredCheck(self: *const Self, slot: u16, start: usize, immediate_only: bool, statement_end: bool) Error!void {
             const tx = &self.txs[slot];
             var row_scratch: S.VersionRowScratch = undefined;
-            if (!tx.active or !tx.deferred_checks) return;
+            var new_scratch: S.VersionRowScratch = undefined;
+            if (!tx.active or !(tx.deferred_checks or (statement_end and tx.statement_checks))) return;
             const snap: Snapshot = .{ .csn = self.csn, .slot = slot, .epoch = tx.epoch, .cid = tx.cid +% 1 };
             for (tx.writes[start..tx.write_len]) |entry| {
                 if (entry.kind != .insert and entry.kind != .update and entry.kind != .delete) continue;
@@ -10207,15 +10646,21 @@ pub fn Database(comptime config: Config) type {
                 if (!table.live or table.pending_drop) continue;
                 if (entry.kind != .delete) {
                     const version = &table.versions[entry.new];
-                    if (version.rowLink() != 0 and !version.hasDeletion()) try self.deferredRow(slot, table, S.borrowVersionRow(table, entry.new, &row_scratch), version.rowSlot(), immediate_only, snap);
+                    if (version.rowLink() != 0 and !version.hasDeletion()) try self.deferredRow(slot, table, S.borrowVersionRow(table, entry.new, &row_scratch), version.rowSlot(), immediate_only, statement_end, snap);
                 }
-                if (entry.kind != .insert) try self.deferredParent(slot, table, S.borrowVersionRow(table, entry.old, &row_scratch), immediate_only, snap);
+                if (entry.kind != .insert) {
+                    const new: ?*const E.Row = if (entry.kind == .update) S.borrowVersionRow(table, entry.new, &new_scratch) else null;
+                    try self.deferredParent(slot, table, S.borrowVersionRow(table, entry.old, &row_scratch), new, immediate_only, statement_end, snap);
+                }
             }
         }
 
-        fn deferredRow(self: *const Self, slot: u16, table: *const S.Table, cells: *const E.Row, row: u32, immediate_only: bool, snap: Snapshot) Error!void {
+        fn deferredRow(self: *const Self, slot: u16, table: *const S.Table, cells: *const E.Row, row: u32, immediate_only: bool, statement_end: bool, snap: Snapshot) Error!void {
             for (table.constraints[0..table.constraint_count], 0..) |*constraint, position| {
-                if (!constraint.deferrable or (immediate_only and self.deferredNow(slot, table, position))) continue;
+                if (constraint.not_enforced) continue;
+                if (constraint.deferrable) {
+                    if (immediate_only and self.deferredNow(slot, table, position)) continue;
+                } else if (constraint.kind != .foreign or !statement_end) continue;
                 switch (constraint.kind) {
                     .unique, .primary => switch (S.uniqueCheck(table, constraint, cells, row, snap)) {
                         .taken => return error.PrimaryKeyViolation,
@@ -10237,23 +10682,41 @@ pub fn Database(comptime config: Config) type {
             }
         }
 
-        /// A key this transaction removed or changed in `table`: unless the
-        /// key is live again, no live row may reference it through a
-        /// deferrable foreign key.
-        fn deferredParent(self: *const Self, slot: u16, table: *const S.Table, old: *const E.Row, immediate_only: bool, snap: Snapshot) Error!void {
+        /// A key this transaction removed or changed in `table` (`new`: the
+        /// row's new version, null for a delete): unless the key is live
+        /// again, no live row may reference it through a deferrable NO
+        /// ACTION foreign key, nor (at statement end) a non-deferrable one;
+        /// a RESTRICT key that changed may not be referenced at all.
+        fn deferredParent(self: *const Self, slot: u16, table: *const S.Table, old: *const E.Row, new: ?*const E.Row, immediate_only: bool, statement_end: bool, snap: Snapshot) Error!void {
             var relations: [K.relation_rows]K.Found = undefined;
             const count = self.catalog.visibleRelations(snap, &relations);
             for (relations[0..count]) |found| {
                 if (found.kind == 'S') continue;
                 const child = &self.tables[found.slot];
                 for (child.constraints[0..child.constraint_count], 0..) |*constraint, position| {
-                    if (constraint.kind != .foreign or !constraint.deferrable or constraint.ref_oid != table.oid) continue;
-                    if (immediate_only and self.deferredNow(slot, child, position)) continue;
+                    if (constraint.kind != .foreign or constraint.ref_oid != table.oid or constraint.not_enforced) continue;
+                    const action = if (new == null) constraint.on_delete else constraint.on_update;
+                    switch (action) {
+                        .cascade, .set_null, .set_default => continue,
+                        .no_action, .restrict => {},
+                    }
+                    if (constraint.deferrable and action == .no_action) {
+                        if (immediate_only and self.deferredNow(slot, child, position)) continue;
+                    } else if (!statement_end) continue;
                     var has_null = false;
                     for (constraint.refColumns()) |column| has_null = has_null or old[column] == .null_value;
                     if (has_null) continue;
-                    if (liveKey(table, constraint.refColumns(), old, constraint.refColumns(), snap) != .missing) continue;
-                    if (liveKey(child, constraint.keyColumns(), old, constraint.refColumns(), snap) != .missing) return error.ForeignKeyViolation;
+                    if (action == .restrict) {
+                        if (new) |cells| {
+                            var changed = false;
+                            for (constraint.refColumns()) |column| {
+                                if (@as(V.CellTag, old[column]) != @as(V.CellTag, cells[column]) or V.compare(&old[column], &cells[column]) != 0) changed = true;
+                            }
+                            if (!changed) continue;
+                        }
+                    } else if (liveKey(table, constraint.refColumns(), old, constraint.refColumns(), snap) != .missing) continue;
+                    if (liveKey(child, constraint.keyColumns(), old, constraint.refColumns(), snap) != .missing)
+                        return if (action == .restrict) error.RestrictViolation else error.ForeignKeyViolation;
                 }
             }
         }
@@ -10304,7 +10767,14 @@ pub fn Database(comptime config: Config) type {
             const table = &self.tables[index];
             if (table.parent == 0 or table.partition.bound == .none) return;
             const parent_slot = self.visibleTableSlot(table.parent, snap) orelse return;
-            const key = &cells[self.tables[parent_slot].partition.key];
+            return self.partitionKeyFits(index, &cells[self.tables[parent_slot].partition.key], snap);
+        }
+
+        /// The partition key value `key` lies inside partition `index`'s
+        /// bound (23514).
+        fn partitionKeyFits(self: *const Self, index: usize, key: *const Cell, snap: Snapshot) Error!void {
+            const table = &self.tables[index];
+            if (table.parent == 0 or table.partition.bound == .none) return;
             if (table.partition.bound != .default) {
                 if (!S.partitionContains(&table.partition, key)) return error.CheckViolation;
                 return;
@@ -11039,7 +11509,9 @@ pub fn Database(comptime config: Config) type {
             if (table.rows[row].newest == 0) return 0;
             const version = S.visibleAt(table, row, snap) orelse return 0;
             var waits: L.Set = .{};
-            const plan = try self.target(slot, update.table, version, snap, .write, &waits);
+            // FOR NO KEY UPDATE strength; updateOne waits for FOR KEY SHARE
+            // holders when the row's keys change.
+            const plan = try self.target(slot, update.table, version, snap, .no_key_update, &waits);
             if (plan == .authored) return 1;
             var old_cells = S.borrowVersionRow(table, version, row_scratch);
             if (!try self.keepJoined(ctx, update.where, joined, old_cells)) return 0;
@@ -11061,14 +11533,45 @@ pub fn Database(comptime config: Config) type {
             const table = &self.tables[update.table];
             const derived: D.Derived = .{ .defaults = &update.defaults, .generated = &update.generated, .checks = &update.checks };
             const hooked = self.rowHooks(update.table, routine_catalog.tg_update, '2', snap);
-            var cells = if (hooked) try D.updatedRowDeferred(ctx, table, &update.values, derived, old_cells) else try D.updatedRow(ctx, table, &update.values, derived, old_cells);
+            // Through a partitioned table the partition decides first: a
+            // moved row meets its destination's CHECKs, not these (ddl-dml).
+            const movable = if (self.family_root) |root| self.tables[root].relkind == 'p' else false;
+            var unchecked = derived;
+            if (movable) unchecked.checks = null;
+            // Row security checks the new row before NOT NULL and CHECK
+            // constraints (ddl-dml, wave 4).
+            const secured_row = self.securedTarget(update.table);
+            var cells = if (hooked or secured_row) try D.updatedRowDeferred(ctx, table, &update.values, unchecked, old_cells) else try D.updatedRow(ctx, table, &update.values, unchecked, old_cells);
             if (hooked) {
                 if (try self.ruleSkips(update.table, '2', &cells, old_cells, snap)) return false;
                 if (!try self.beforeRow(update.table, routine_catalog.tg_update, &cells, old_cells, &update.values, snap)) return false;
-                try D.finishRow(ctx, table, derived, &cells);
+                if (!secured_row) try D.finishRow(ctx, table, unchecked, &cells);
+            }
+            if (secured_row) {
+                try D.generatedRow(ctx, table, unchecked, &cells);
+                try self.securityCheck(ctx, update.table, &cells);
+                try D.constrainRow(ctx, table, unchecked, &cells);
+            }
+            if (movable) {
+                self.partitionBound(update.table, &cells, snap) catch |err| {
+                    if (err != error.CheckViolation) return err;
+                    return self.moveRow(slot, ctx, update, old, old_cells, &cells, snap);
+                };
+                try D.checkRow(ctx, table, &update.checks, &cells);
+            }
+            // A key change is FOR UPDATE strength: FOR KEY SHARE holders
+            // of the row are waited for.
+            if (!sameKeys(table, old_cells, &cells)) {
+                var waits: L.Set = .{};
+                self.locks.rowHolders(update.table, table.rows[row].rowid, slot, .write, &waits);
+                if (waits.any()) return self.park(slot, waits);
             }
             try self.securityCheck(ctx, update.table, &cells);
-            try self.partitionBound(update.table, &cells, snap);
+            self.partitionBound(update.table, &cells, snap) catch |err| {
+                // ON CONFLICT DO UPDATE never moves a row (0A000).
+                if (err == error.CheckViolation and self.conflict_routed) return error.UnsupportedStatement;
+                return err;
+            };
             if (table.primary_column) |column| {
                 if (update.values[column] != ast.none) switch (S.primaryKeyCheck(table, &cells[column], row, snap)) {
                     .free => {},
@@ -11610,14 +12113,13 @@ pub fn Database(comptime config: Config) type {
                 }
                 if (expect and elements != 0) return error.InvalidSettingValue;
             }
-            if (!public) return error.UnsupportedStatement;
             try out.set(buffer[0..used]);
         }
 
         fn pathElement(name: []const u8, buffer: []u8, used: *usize, elements: *usize, public: *bool) Error!void {
-            if (types.same(name, "public")) {
-                public.* = true;
-            } else if (!(types.same(name, "$user") or types.same(name, "pg_catalog") or types.same(name, "pg_temp"))) return error.UnsupportedStatement;
+            // Any schema name: missing ones are skipped when names resolve
+            // (ddl-dml, wave 4).
+            if (types.same(name, "public")) public.* = true;
             if (elements.* != 0) {
                 if (buffer.len - used.* < 2) return error.SessionCapacity;
                 buffer[used.*] = ',';
@@ -12229,19 +12731,34 @@ pub fn Database(comptime config: Config) type {
                 .access_exclusive => .access_exclusive,
             };
             for (lock.tables[0..lock.count], lock.only[0..lock.count]) |reference, only| {
-                if (reference.schema == null and !self.session.public_schema_on_path) return error.TableNotFound;
                 const schema_name = if (reference.schema) |qualifier| identName(source, qualifier) else Name{};
-                const namespace = (try self.namespaceForUsage(self.session.role, if (reference.schema != null) schema_name.slice() else null, snap)) orelse return error.UndefinedSchema;
+                const namespace = (try self.relationNamespace(self.session.role, if (reference.schema != null) schema_name.slice() else null, identName(source, reference.name).slice(), snap)) orelse return error.TableNotFound;
                 const found = self.catalog.findIn(namespace, identName(source, reference.name).slice(), snap) orelse return error.TableNotFound;
                 switch (found.kind) {
-                    'r', 'p' => {},
-                    'v', 'm' => return error.UnsupportedStatement,
+                    'r', 'p', 'v' => {},
                     else => return error.WrongObjectType,
                 }
                 var members: [config.tables]usize = undefined;
                 members[0] = found.slot;
                 var count: usize = 1;
-                if (!only) {
+                // A view locks every relation its query reads, recursively
+                // (and their children), in the same mode (ddl-dml, wave 4).
+                if (found.kind == 'v') {
+                    var next: usize = 0;
+                    while (next < count) : (next += 1) {
+                        const member = &self.tables[members[next]];
+                        if (member.relkind != 'v') continue;
+                        for (member.depends[0..member.depend_count]) |oid| {
+                            const base = self.visibleTableSlot(oid, snap) orelse continue;
+                            var known = false;
+                            for (members[0..count]) |existing| known = known or existing == base;
+                            if (known or count == members.len) continue;
+                            members[count] = base;
+                            count += 1;
+                        }
+                    }
+                }
+                if (!only or found.kind == 'v') {
                     var relations: [K.relation_rows]K.Found = undefined;
                     const relation_count = self.catalog.visibleRelations(snap, &relations);
                     var next: usize = 0;
@@ -12672,7 +13189,9 @@ pub fn Database(comptime config: Config) type {
         /// order: `$user` (a schema named like current_user, when one
         /// exists), public and any other listed schema that exists. The
         /// binder matches pg_catalog's built-ins before user routines.
-        pub const routine_path_capacity = 4;
+        /// The shared search-path resolver (ddl-dml, wave 4): relations,
+        /// sequences, types and routines resolve through it.
+        pub const routine_path_capacity = config.search_path_schemas;
 
         fn routinePath(self: *const Self, snap: Snapshot, out: *[routine_path_capacity]u32) usize {
             const values = if (self.session_state) |state| &state.values else &self.default_session_state.values;
@@ -12693,6 +13212,30 @@ pub fn Database(comptime config: Config) type {
                 count += 1;
             }
             return count;
+        }
+
+        /// The first schema of the search path holding a relation (table,
+        /// view, sequence) named `name` that `role` may use (PostgreSQL
+        /// skips schemas without USAGE); null when none does.
+        fn pathRelation(self: *const Self, role: u32, name: []const u8, snap: Snapshot) Error!?u32 {
+            var path: [routine_path_capacity]u32 = undefined;
+            const count = self.routinePath(snap, &path);
+            for (path[0..count]) |namespace| {
+                if (self.catalog.findIn(namespace, name, snap) == null) continue;
+                self.checkNamespaceUsage(role, namespace, snap) catch |err| {
+                    if (err == error.InsufficientPrivilege) continue;
+                    return err;
+                };
+                return namespace;
+            }
+            return null;
+        }
+
+        /// A relation name: the named schema's (3F000 when missing, 42501
+        /// without USAGE), else the search path's first holder (null).
+        fn relationNamespace(self: *const Self, role: u32, schema: ?[]const u8, name: []const u8, snap: Snapshot) Error!?u32 {
+            if (schema) |named| return (try self.namespaceForUsage(role, named, snap)) orelse error.UndefinedSchema;
+            return self.pathRelation(role, name, snap);
         }
 
         /// The schema a routine is created in: the named one (3F000 when
@@ -12808,6 +13351,9 @@ pub fn Database(comptime config: Config) type {
             const saved_volatility = self.routine_volatility;
             const saved_params = self.active_params;
             const saved_session_params = self.session.params;
+            // A trigger's statements are not part of an outer family
+            // statement or routed ON CONFLICT (ddl-dml, wave 4).
+            const saved_family = .{ self.family_root, self.family_returning, self.conflict_routed };
             defer {
                 self.routine_snap = saved_snap;
                 self.routine_frame = saved_frame;
@@ -12817,7 +13363,11 @@ pub fn Database(comptime config: Config) type {
                 self.routine_volatility = saved_volatility;
                 self.active_params = saved_params;
                 self.session.params = saved_session_params;
+                self.family_root, self.family_returning, self.conflict_routed = saved_family;
             }
+            self.family_root = null;
+            self.family_returning = .none;
+            self.conflict_routed = false;
             self.routine_snap = snap;
             self.seq_snap = snap;
             self.routine_frame = frame;
@@ -12841,7 +13391,7 @@ pub fn Database(comptime config: Config) type {
             frame.variables.node_low = 0;
             frame.variables.node_high = self.workspace.nodes.len;
             const rows = try self.subStatement(slot, text, &parsed, snap, capture, read_only, staging);
-            try self.deferredCheck(slot, start, true);
+            try self.deferredCheck(slot, start, true, true);
             return rows;
         }
 
@@ -14542,8 +15092,7 @@ pub fn Database(comptime config: Config) type {
 
         /// A table or view named by a trigger / rule statement.
         fn namedTable(self: *Self, name: *const R.TableName, snap: Snapshot) Error!usize {
-            if (name.schema.len == 0 and !self.session.public_schema_on_path) return error.TableNotFound;
-            const namespace = (try self.namespaceForUsage(self.session.role, if (name.schema.len != 0) name.schema.slice() else null, snap)) orelse return error.UndefinedSchema;
+            const namespace = (try self.relationNamespace(self.session.role, if (name.schema.len != 0) name.schema.slice() else null, name.name.slice(), snap)) orelse return error.TableNotFound;
             const found = self.catalog.findIn(namespace, name.name.slice(), snap) orelse return error.TableNotFound;
             if (found.kind == 'S') return error.WrongObjectType;
             return found.slot;
@@ -16165,6 +16714,7 @@ pub fn Database(comptime config: Config) type {
                 .xml_option => "xmloption",
                 .session_authorization => "session_authorization",
                 .transaction_isolation => "transaction_isolation",
+                .schema => "search_path",
             };
             out.len = special.len;
             @memcpy(out.bytes[0..special.len], special);

@@ -158,6 +158,11 @@ pub const extensions_format_version: u16 = 3;
 pub const constraint_identity_format_version: u16 = 4;
 pub const primary_index_identity_format_version: u16 = 5;
 pub const default_identity_format_version: u16 = 6;
+/// ddl-dml (wave 4): version 6 plus constraint flag bits 3, NOT VALID (a
+/// CHECK or FOREIGN KEY whose existing rows were not checked), and 4, NOT
+/// ENFORCED (one never checked). Written only when a constraint has either:
+/// older definitions stay byte-identical.
+pub const not_valid_format_version: u16 = 7;
 
 pub const Op = enum(u8) { create_table = 1, drop_table = 2, insert = 3, update = 4, delete = 5, catalog_counters = 6, create_sequence = 7, drop_sequence = 8, sequence = 9, truncate = 11, alter_table = 12, create_sequence_cached = 13, alter_sequence = 14, create_schema = 15, drop_schema = 16, catalog_counters_with_constraints = 17, create_owned_schema = 18, create_private_schema = 19, catalog_counters_with_defaults = 20, create_scoped_identity_sequence = 21, create_scoped_sequence = 22, alter_sequence_ownership = 23, create_scoped_serial_sequence = 24, create_routine = 60, drop_routine = 61, create_trigger = 62, drop_trigger = 63, create_rule = 64, drop_rule = 65, object_create = 70, object_drop = 71, large_object_page = 72, create_routine_extended = 80, create_rule_action = 85 };
 
@@ -506,14 +511,16 @@ pub fn ChangeLog(comptime config: types.Config) type {
         /// Name, format version, columns and (version 2) namespace and
         /// constraints of a table definition.
         pub fn encodeDefinition(writer: *Writer, table: *const S.Table) Error!void {
-            var v6 = false;
+            var v7 = false;
+            for (table.constraints[0..table.constraint_count]) |*constraint| v7 = v7 or constraint.not_valid or constraint.not_enforced;
+            var v6 = v7;
             for (table.columns[0..table.column_count]) |*column| v6 = v6 or column.default_oid != 0;
             const v5 = v6 or table.primary_index_oid != 0;
             const v4 = v5 or table.primary_constraint_oid != 0 or table.constraint_count != 0;
             const v3 = v4 or S.extended(table);
             const extended = v3 or table.namespace != public_namespace or table.constraint_count != 0;
             try writer.name(table.name.slice());
-            try writer.int(u16, if (v6) default_identity_format_version else if (v5) primary_index_identity_format_version else if (v4) constraint_identity_format_version else if (v3) extensions_format_version else if (extended) definition_format_version else expr_format_version);
+            try writer.int(u16, if (v7) not_valid_format_version else if (v6) default_identity_format_version else if (v5) primary_index_identity_format_version else if (v4) constraint_identity_format_version else if (v3) extensions_format_version else if (extended) definition_format_version else expr_format_version);
             try writer.int(u8, @intCast(table.column_count));
             for (table.columns[0..table.column_count]) |*column| {
                 try writer.name(column.name.slice());
@@ -531,7 +538,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
             for (table.constraints[0..table.constraint_count]) |*constraint| {
                 try writer.int(u8, @intFromEnum(constraint.kind));
                 try writer.name(constraint.name.slice());
-                try writer.int(u8, @as(u8, @intFromBool(constraint.nulls_not_distinct)) | (@as(u8, @intFromBool(constraint.deferrable)) << 1) | (@as(u8, @intFromBool(constraint.initially_deferred)) << 2));
+                try writer.int(u8, @as(u8, @intFromBool(constraint.nulls_not_distinct)) | (@as(u8, @intFromBool(constraint.deferrable)) << 1) | (@as(u8, @intFromBool(constraint.initially_deferred)) << 2) | (@as(u8, @intFromBool(constraint.not_valid)) << 3) | (@as(u8, @intFromBool(constraint.not_enforced)) << 4));
                 try writer.int(u8, constraint.column_count);
                 try writer.bytes(constraint.keyColumns());
                 const text = constraint.expression.slice();
@@ -1544,10 +1551,13 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 @memcpy(constraint.name.bytes[0..constraint_name.len], constraint_name);
                 for (out.constraints[0..index]) |*previous| if (types.same(previous.name.slice(), constraint.name.slice())) return error.InvalidChangeRecord;
                 const flags = try reader.int(u8);
-                if (flags > @as(u8, if (v3) 7 else 1)) return error.InvalidChangeRecord;
+                if (flags > @as(u8, if (version >= not_valid_format_version) 31 else if (v3) 7 else 1)) return error.InvalidChangeRecord;
                 constraint.nulls_not_distinct = flags & 1 != 0;
                 constraint.deferrable = flags & 2 != 0;
                 constraint.initially_deferred = flags & 4 != 0;
+                constraint.not_valid = flags & 8 != 0;
+                constraint.not_enforced = flags & 16 != 0;
+                if ((constraint.not_valid or constraint.not_enforced) and constraint.kind != .check and constraint.kind != .foreign) return error.InvalidChangeRecord;
                 if (constraint.initially_deferred and !constraint.deferrable) return error.InvalidChangeRecord;
                 constraint.column_count = try reader.int(u8);
                 if (constraint.column_count > out.count) return error.InvalidChangeRecord;
@@ -1691,7 +1701,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
             out.name.len = table_name.len;
             @memcpy(out.name.bytes[0..table_name.len], table_name);
             const version = try reader.int(u16);
-            if (version < expr_format_version or version > default_identity_format_version) return error.UnsupportedLogVersion;
+            if (version < expr_format_version or version > not_valid_format_version) return error.UnsupportedLogVersion;
             out.count = try reader.int(u8);
             if (out.count == 0) return error.InvalidChangeRecord;
             if (out.count > config.columns) return error.ChangeRecordConflict;
@@ -1846,7 +1856,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
             if (primary != 0 and primary != previous.primary and constraintOidTaken(scratch, primary)) return error.ChangeRecordConflict;
             for (definition.constraints[0..definition.constraint_count]) |*constraint| {
                 if (constraint.kind == .primary) continue;
-                if (constraint.oid != previous.sameConstraint(constraint) and constraintOidTaken(scratch, constraint.oid)) return error.ChangeRecordConflict;
+                // RENAME CONSTRAINT keeps the identity under a new name (ddl-dml).
+                if (constraint.oid != previous.sameConstraint(constraint) and !previous.has(constraint.oid) and constraintOidTaken(scratch, constraint.oid)) return error.ChangeRecordConflict;
             }
         }
 
@@ -2126,7 +2137,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         if (late) {
                             const base = &db.tables[index];
                             if (vt.mutated or !vt.base or definition.primary_index_oid == 0 or
-                                base.relkind != 'r' or base.parent != 0 or definition.extras.parent != 0 or
+                                // ATTACH PARTITION may give a plain table its parent's key (ddl-dml).
+                                base.relkind != 'r' or base.parent != 0 or
                                 definition.constraint_count != base.constraint_count + 1 or definition.extras.index_count != vt.index_count or
                                 definition.count != vt.column_count or !types.same(definition.name.slice(), vt.name.slice()) or
                                 oidTaken(db, scratch, definition.primary_index_oid, 1)) return error.ChangeRecordConflict;
