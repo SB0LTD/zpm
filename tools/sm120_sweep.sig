@@ -100,6 +100,47 @@ test "sweep: lfm3_nv's kernels, every variant, as raw words" {
     std.debug.print("sweep: {d} programs written\n", .{S.count});
 }
 
+/// The ALU instructions kir_sm120's uniformConsts gives a uniform source
+/// (form 6: b uniform; form 7: c uniform), each shape it makes, after an
+/// LDCU of a 32-bit constant.
+pub const UREG_FORMS =
+    \\.params 16
+    \\LDCU UR6, c[0x1][0x10]
+    \\LDCU UR62, c[0x0][0x380]
+    \\FMUL R0, R1, UR6
+    \\FMUL.FTZ R0, -R1, UR6
+    \\FADD R0, R1, UR6
+    \\FADD.FTZ R0, |R1|, -UR6
+    \\FFMA R0, R1, UR6, R2
+    \\FFMA R0, R1, UR6, RZ
+    \\FFMA R0, R1, R2, UR6
+    \\FFMA.FTZ R0, -R1, R2, -UR6
+    \\FMNMX R0, R1, UR6, PT
+    \\FMNMX.FTZ R0, R1, UR6, !PT
+    \\VIMNMX.S32 R0, R1, UR6, PT
+    \\VIMNMX.U32 R0, R1, UR6, !PT
+    \\IMAD R0, R1, UR6, R2
+    \\IMAD R0, R1, R2, UR6
+    \\SHF.R.U32.HI R0, RZ, UR6, R1
+    \\SHF.R.W.U32.HI R0, RZ, R1, UR6
+    \\SHF.L.U32 R0, R1, UR6, RZ
+    \\LOP3.LUT R0, R1, UR6, RZ, 0xc0, !PT
+    \\LOP3.LUT R0, R1, UR6, R2, 0xf8, !PT
+    \\FSETP.GT.AND P0, PT, R1, UR6, PT
+    \\FSETP.GEU.AND P1, PT, |R1|, UR6, PT
+    \\ISETP.GE.AND P0, PT, R1, UR6, PT
+    \\ISETP.NE.U32.AND P0, PT, R1, UR62, PT
+    \\FSEL R0, R1, UR6, P0
+    \\SEL R0, R1, UR6, P0
+    \\EXIT
+    \\
+;
+
+test "sweep: ALU instructions with a uniform source" {
+    if (S.dir == null and !openDir()) return error.SkipZigTest;
+    try dumpText("ureg_forms", UREG_FORMS);
+}
+
 // ── kir_sm120's output: the self-test's kernels, as the emulated RTX loads them ──
 
 const Capture = struct {
