@@ -1,0 +1,23 @@
+{
+ "target": "native PostgreSQL 18.7",
+ "oracle_version": "PostgreSQL 18.7 (Ubuntu 18.7-1.pgdg24.04+5) on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit",
+ "manifest_sha256": "1feee91259a68605cd6d50c3a1863b79f3882e0d5c424126912ba3036520f47c",
+ "oracle_report_sha256": "dcf2ef99e025d694cffc06c3e07f3b164d20e58f5103becef279335afb246120",
+ "note": "Statement indexes count fixture and case statements after the driver-owned BEGIN.",
+ "cases": {
+  "PG.TYPE.ENUM_DOMAIN_COMPOSITE": {
+   "7": {
+    "0": [
+     "public",
+     "tdd_enum",
+     "e"
+    ],
+    "2": [
+     "public",
+     "tdd_composite",
+     "c"
+    ]
+   }
+  }
+ }
+}

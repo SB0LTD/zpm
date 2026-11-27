@@ -202,9 +202,21 @@ the consolidation does not fix those SQLF findings. See the
 and [system gap plan](https://github.com/SB0LTD/ramsql/blob/main/compatibility/GAP_CLOSING_PLAN.md).
 
 Prepared wire operations and selected session/transaction commands have separate
-server tests. The 755 upstream standard records
-still need reviewed applicability and mappings, including overloads beyond these
-118 probes. No full language or dialect closure follows from this inventory.
+server tests.
+
+The 755 upstream standard records now have reviewed applicability and a measured
+status in `postgres18_feature_status.json`, summarized in
+[docs/SQL_FEATURE_STATUS.md](../../docs/SQL_FEATURE_STATUS.md). Each in-scope
+feature has probe programs in `features/*.sql` (format in `feature_probes.py`).
+`verify_feature_oracle.py` records them on native PostgreSQL 18 (fresh database
+per probe, two runs that must agree); `generate_feature_contract.py` turns the
+recording into `tests/test_sql_features.sig` (`contract-sql-features`), which
+runs every probe through ZPM's PostgreSQL wire session in-process and compares
+canonical results: message order, RowDescription, command tags, SQLSTATEs,
+transaction status and row text, with allocated type OIDs compared by catalog
+identity. `feature_status.py` builds the scoreboard from the contract's output.
+The contract fails only when a probe recorded as passing regresses. Probes are
+smoke-depth evidence per feature, not full closure of the standard.
 
 Original dbMeter full/subset correctness is separately 7/7 for all three engines
 in run 41024725859. Its overall advantage gate failed, including stock 200-byte
@@ -278,9 +290,30 @@ fixture and fixed caller-owned test storage (8 tables, 16 columns, 32 rows/table
 64 result/work rows, 512-byte cells, 2048 expression nodes). These are test budgets,
 not production capacity claims. It checks column names, type OIDs, typmods, exact
 formatted scalar values, NULLs and row multiplicity/order after each statement.
+Type OIDs and composite text follow the wire: a nominal user-defined column type
+reports its own OID and record output. Built-in OIDs are compared exactly. An
+allocated OID (16384 or above) in the oracle is a cluster-counter value, so the
+driver compares catalog identities instead, as the wire audit does: it reads the
+candidate's namespace, type name and kind from pg_type inside the fixture
+transaction and compares them with `type_identity_oracle.json`. That file is
+recorded by `verify_type_identity_oracle.py`, which replays each affected case on
+native PostgreSQL 18, requires every statement to reproduce the recorded oracle
+apart from allocated OIDs, and reads the same pg_type identities. The recorded
+`postgres18_oracle.json` is unchanged. A case with an allocated OID but no
+recorded identity is reported as `OracleTypeIdentityMissing`.
+
+`PG.UTILITY.EXPLAIN` runs in the core driver with the wire audit's
+`explain_structure` comparator: one `QUERY PLAN` json cell, a valid plan tree
+(non-empty node types, non-negative numeric actual rows, non-negative integer
+actual loops, optional child arrays) and the root's actual rows for its single
+loop. Physical operators and timing may differ. An allocator-free reader mirrors
+Python's json acceptance for this check, with bounded nesting; row counts above
+2^64 never compare equal. With both changes the core driver passes **102 of 118**
+programs; the 16 others are native-only scopes (session, cluster, COPY protocol,
+MySQL and T-SQL) that remain covered by the wire audit.
 The core driver omits wire message tags, native SQL transaction commands,
-concurrency, crash durability, COPY streaming and EXPLAIN structure. Those
-checks run through the applicable wire and recovery suites.
+concurrency, crash durability and COPY streaming. Those checks run through the
+applicable wire and recovery suites.
 
 The broad generated suite deliberately returns an error while any feature or
 closure dimension is incomplete. Passing first-slice regressions and a red broad
