@@ -2919,6 +2919,16 @@ pub fn Parser(comptime config: types.Config) type {
             }
         }
 
+        /// `WHERE CURRENT OF cursor` of a positioned UPDATE / DELETE (E121-06,
+        /// E121-07, B11 wave 5): the cursor's name, or null for another WHERE.
+        fn currentOf(self: *Self) Error!?ast.Ident {
+            if (self.mode != .standard or !self.isWord("WHERE") or !wordIs(self.source, try self.peek(), "current")) return null;
+            try self.advance();
+            try self.advance();
+            if (!try self.takeRaw("of")) return error.Syntax;
+            return try self.identifier();
+        }
+
         fn where(self: *Self) Error!u16 {
             if (!try self.takeWord("WHERE")) return none;
             return self.expression();
@@ -4044,7 +4054,7 @@ pub fn Parser(comptime config: types.Config) type {
             }
             try self.outputClause(&out.returning);
             if (self.mode == .standard and try self.takeWord("FROM")) out.from = try self.fromBlock();
-            out.where = try self.where();
+            if (try self.currentOf()) |cursor| out.current_of = cursor else out.where = try self.where();
             try self.returningClause(&out.returning);
             try self.finish();
             return out;
@@ -4062,7 +4072,7 @@ pub fn Parser(comptime config: types.Config) type {
             if (self.mode == .standard) out.alias = try self.targetAlias();
             try self.outputClause(&out.returning);
             if (self.mode == .standard and try self.takeWord("USING")) out.using = try self.fromBlock();
-            out.where = try self.where();
+            if (try self.currentOf()) |cursor| out.current_of = cursor else out.where = try self.where();
             try self.returningClause(&out.returning);
             try self.finish();
             return out;

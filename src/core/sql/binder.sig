@@ -151,10 +151,14 @@ pub fn Binder(comptime config: types.Config) type {
         /// UPDATE ... FROM: `from` is the root plan of `SELECT * FROM items`;
         /// FROM item i (relation i + 1 of WHERE/SET) starts at output
         /// column offsets[i + 1] of each joined row.
-        pub const Update = struct { table: usize, values: [config.columns]u16, where: u16, key: u16, returning: Returning = .{}, defaults: [config.columns]u16 = @splat(none), generated: [config.columns]u16 = @splat(none), checks: [config.table_constraints]u16 = @splat(none), from: u16 = none, offsets: [config.relations]u16 = @splat(0) };
+        pub const Update = struct { table: usize, values: [config.columns]u16, where: u16, key: u16, returning: Returning = .{}, defaults: [config.columns]u16 = @splat(none), generated: [config.columns]u16 = @splat(none), checks: [config.table_constraints]u16 = @splat(none), from: u16 = none, offsets: [config.relations]u16 = @splat(0),
+            /// WHERE CURRENT OF cursor (B11 wave 5), resolved when it runs.
+            current_of: ?ast.Ident = null };
 
         /// DELETE ... USING: like Update.from.
-        pub const Delete = struct { table: usize, where: u16, key: u16, returning: Returning = .{}, using: u16 = none, offsets: [config.relations]u16 = @splat(0) };
+        pub const Delete = struct { table: usize, where: u16, key: u16, returning: Returning = .{}, using: u16 = none, offsets: [config.relations]u16 = @splat(0),
+            /// WHERE CURRENT OF cursor (B11 wave 5), resolved when it runs.
+            current_of: ?ast.Ident = null };
 
         /// Binds an UPDATE FROM / DELETE USING list as `SELECT * FROM items`
         /// and adds every item to the statement scope after the target
@@ -9678,6 +9682,7 @@ pub fn Binder(comptime config: types.Config) type {
                         out.values[column] = try assignment(context, item.value, &entry.columns[column]);
                     }
                     out.where = try bindWhere(context, &scope, update.where);
+                    out.current_of = update.current_of;
                     // The key probe reads relation 0 only: no probe with FROM.
                     out.key = if (out.from != none) none else primaryKey(context, entry, out.where);
                     const needed = assignedDefaults(context, &out.values);
@@ -9698,6 +9703,7 @@ pub fn Binder(comptime config: types.Config) type {
                     var out: Delete = .{ .table = index, .where = none, .key = none };
                     if (delete.using != none) try bindSources(context, delete.using, &scope, &out.using, &out.offsets);
                     out.where = try bindWhere(context, &scope, delete.where);
+                    out.current_of = delete.current_of;
                     if (delete.returning.output and out.using != none) return error.UnsupportedStatement;
                     out.returning = try bindReturning(context, index, &delete.returning, if (family) delete.alias orelse delete.table else delete.alias, .delete);
                     if (out.using == none) out.key = primaryKey(context, &context.tables[index], out.where);

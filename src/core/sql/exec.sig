@@ -6045,6 +6045,9 @@ pub fn Exec(comptime config: types.Config) type {
             }
             const rows: usize = if (query.limit < found) @intCast(query.limit) else found;
             if (comptime !observing) if (rows > result.rows.len) return error.WorkspaceCapacity;
+            // A cursor's DECLARE keeps each output row's source row (B11
+            // wave 5, WHERE CURRENT OF).
+            if (comptime @hasDecl(@TypeOf(locker), "capture")) try locker.capture(table_index, indices[0..rows]);
             if (!plain) {
                 // Validation pass: projections may fail; the result is untouched.
                 for (indices[0..rows]) |version| {

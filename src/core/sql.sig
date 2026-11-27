@@ -2138,6 +2138,9 @@ pub fn Database(comptime config: Config) type {
         family_returning: CommandTag = .none,
         /// ON CONFLICT DO UPDATE of a routed partition row is running.
         conflict_routed: bool = false,
+        /// DECLARE CURSOR of a simple single-table query (B11 wave 5): where
+        /// the scan leaves each output row's rowid (WHERE CURRENT OF).
+        cursor_capture: ?*CursorCapture = null,
 
         /// Borrow the embedding's cluster catalogue while serving statements.
         /// The embedding keeps the provider and its rows consistent for the
@@ -2596,6 +2599,7 @@ pub fn Database(comptime config: Config) type {
             self.family_root = null;
             self.family_returning = .none;
             self.conflict_routed = false;
+            self.cursor_capture = null;
             self.rule_active_len = 0;
             self.nested_tables = @splat(0);
             self.scan_tables = @splat(0);
@@ -3839,7 +3843,42 @@ pub fn Database(comptime config: Config) type {
             if (select.table) |table| try self.lockTable(slot, table, if (select.lock.strength == .none) .access_share else .row_share);
         }
 
+        /// Output rows' rowids of a DECLARE CURSOR scan (B11 wave 5).
+        const CursorCapture = struct { rowids: []u64, count: usize = 0, table: ?usize = null };
+
+        /// A row locker that also records the scan's output rows.
+        fn Capturing(comptime Inner: type) type {
+            return struct {
+                inner: Inner,
+                db: *Self,
+                into: *CursorCapture,
+                pub const active = Inner.active;
+                pub fn lock(self: @This(), table_index: usize, version: u32) Error!?u32 {
+                    return self.inner.lock(table_index, version);
+                }
+                pub fn capture(self: @This(), table_index: usize, versions: []const u32) Error!void {
+                    if (versions.len > self.into.rowids.len) return error.SessionCapacity;
+                    const table = &self.db.tables[table_index];
+                    for (versions, 0..) |version, index| self.into.rowids[index] = table.rows[table.versions[version].rowSlot()].rowid;
+                    self.into.count = versions.len;
+                    self.into.table = table_index;
+                }
+            };
+        }
+
         fn runBoundSelect(self: *Self, slot: u16, source: []const u8, select: *const B.Select, snap: Snapshot, output: anytype) Error!void {
+            if (self.cursor_capture) |into| if (comptime @TypeOf(output) == *Result) {
+                self.cursor_capture = null;
+                if (select.lock.strength == .none) return self.executeBoundSelect(slot, source, select, snap, Capturing(X.NoLock){ .inner = .{}, .db = self, .into = into }, output);
+                const capture_mode: locks_module.RowMode = switch (select.lock.strength) {
+                    .update, .none => .update,
+                    .no_key_update => .no_key_update,
+                    .share => .share,
+                    .key_share => .key_share,
+                };
+                const inner: RowLocker = .{ .db = self, .slot = slot, .snap = snap, .mode = capture_mode, .wait = select.lock.wait };
+                return self.executeBoundSelect(slot, source, select, snap, Capturing(RowLocker){ .inner = inner, .db = self, .into = into }, output);
+            };
             if (select.lock.strength == .none) return self.executeBoundSelect(slot, source, select, snap, X.NoLock{}, output);
             const row_mode: locks_module.RowMode = switch (select.lock.strength) {
                 .update, .none => .update,
@@ -11558,6 +11597,23 @@ pub fn Database(comptime config: Config) type {
             return .{ .list = list, .offsets = offsets };
         }
 
+        /// WHERE CURRENT OF (E121-06, E121-07, B11 wave 5): the row slot of
+        /// the named cursor's current row in `table_index` (null when that
+        /// row is gone). PostgreSQL's errors: 34000 for no such cursor;
+        /// 24000 for one held from a previous transaction, one that is not a
+        /// simply updatable scan of the table, or one not on a row.
+        fn currentOfRow(self: *Self, source: []const u8, ident: ast.Ident, table_index: usize) Error!?u32 {
+            const state = self.sessionState();
+            var name: ControlText = .{};
+            try decodeIdent(source, ident, &name);
+            const index = self.cursors.find(state.id, name.slice()) orelse return error.PortalNotFound;
+            const cursor = &self.cursors.slots[index];
+            if (cursor.committed) return error.InvalidCursorState;
+            if (cursor.table == null or cursor.table_oid != self.tables[table_index].oid) return error.InvalidCursorState;
+            if (cursor.position == 0 or cursor.position > cursor.count) return error.InvalidCursorState;
+            return S.findRow(&self.tables[table_index], self.cursors.rowids[cursor.base + cursor.position - 1]);
+        }
+
         /// Subqueries in the statement's own WHERE / SET / VALUES (B11 wave
         /// 5, docs/SQL_DDL_DML.md): installed only when the bound statement
         /// has one. `fresh` starts the query workspace; UPDATE FROM / DELETE
@@ -11597,6 +11653,10 @@ pub fn Database(comptime config: Config) type {
             const joined = try self.joinedRows(source, update.from, &update.offsets, snap);
             var queries: X.StatementQueries = .{};
             self.statementQueries(&queries, source, snap, joined == null, &ctx);
+            if (update.current_of) |cursor| {
+                const row = (try self.currentOfRow(source, cursor, update.table)) orelse return 0;
+                return self.updateSlot(slot, &ctx, &row_scratch, update, row, snap, joined);
+            }
             switch (try X.candidates(&ctx, table, update.key, snap)) {
                 .empty => {},
                 .slot => |hit| affected += try self.updateSlot(slot, &ctx, &row_scratch, update, hit.row, snap, joined),
@@ -11711,6 +11771,10 @@ pub fn Database(comptime config: Config) type {
             const joined = try self.joinedRows(source, delete.using, &delete.offsets, snap);
             var queries: X.StatementQueries = .{};
             self.statementQueries(&queries, source, snap, joined == null, &ctx);
+            if (delete.current_of) |cursor| {
+                const row = (try self.currentOfRow(source, cursor, delete.table)) orelse return 0;
+                return self.deleteSlot(slot, &ctx, &row_scratch, delete, row, snap, joined);
+            }
             switch (try X.candidates(&ctx, table, delete.key, snap)) {
                 .empty => {},
                 .slot => |hit| affected += try self.deleteSlot(slot, &ctx, &row_scratch, delete, hit.row, snap, joined),
@@ -12920,8 +12984,20 @@ pub fn Database(comptime config: Config) type {
             };
             // PostgreSQL: FOR UPDATE/SHARE cursors cannot be SCROLL or WITH HOLD.
             if (locking and ((declare.scroll orelse false) or declare.hold)) return error.UnsupportedStatement;
+            // A simple single-table query keeps its rows' rowids for WHERE
+            // CURRENT OF (B11 wave 5). Without FOR UPDATE / SHARE, as
+            // PostgreSQL's plan search, a sorted scan is not simply
+            // updatable.
+            var capture: CursorCapture = .{ .rowids = self.cursors.rowids[self.cursors.used_rows..] };
+            const updatable = switch (inner) {
+                .select => |query| locking or self.workspace.nodes.queries[query].order_count == 0,
+                else => false,
+            };
+            if (updatable) self.cursor_capture = &capture;
+            defer self.cursor_capture = null;
             try self.body(slot, inner_source, &inner, snap, result, .{ .mode = mode });
             const rows = result.row_count;
+            if (capture.table != null and capture.count != rows) capture.table = null;
             if (rows > Sess.cursor_row_capacity - self.cursors.used_rows) return error.SessionCapacity;
             const columns = result.column_count;
             var values: types.ValueBytes = .{ .bytes = &self.cursors.value_backing, .used = self.cursors.value_used };
@@ -12947,6 +13023,10 @@ pub fn Database(comptime config: Config) type {
             @memcpy(cursor.typmods[0..columns], result.column_typmods[0..columns]);
             cursor.has_nominal_types = result.has_nominal_types;
             if (result.has_nominal_types) @memcpy(cursor.nominal_types[0..columns], result.nominal_types[0..columns]);
+            if (capture.table) |table| {
+                cursor.table = table;
+                cursor.table_oid = self.tables[table].oid;
+            }
             self.cursors.used_rows += rows;
             self.cursors.value_used = values.used;
             result.clear(0);

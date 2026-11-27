@@ -1064,6 +1064,8 @@ pub fn Ast(comptime config: types.Config) type {
             /// UPDATE ... FROM items: a query block (index into Pool.queries)
             /// holding only the FROM list, or none.
             from: u16 = none,
+            /// WHERE CURRENT OF cursor (E121-06, B11 wave 5).
+            current_of: ?Ident = null,
         };
 
         pub const Delete = struct {
@@ -1075,6 +1077,8 @@ pub fn Ast(comptime config: types.Config) type {
             alias: ?Ident = null,
             /// DELETE ... USING items (a FROM-list query block), or none.
             using: u16 = none,
+            /// WHERE CURRENT OF cursor (E121-07, B11 wave 5).
+            current_of: ?Ident = null,
         };
 
         /// COPY t [(columns)] FROM STDIN | COPY t [(columns)] | (query) TO

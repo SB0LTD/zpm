@@ -2823,6 +2823,7 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "ProtocolViolation")) return "08P01";
     if (equal(name, "StatementNotFound")) return "26000";
     if (equal(name, "PortalNotFound")) return "34000";
+    if (equal(name, "InvalidCursorState")) return "24000";
     if (equal(name, "DuplicateStatement")) return "42P05";
     if (equal(name, "DuplicatePortal")) return "42P03";
     if (equal(name, "TransactionFailed")) return "25P02";
