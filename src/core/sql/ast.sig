@@ -151,7 +151,12 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     // Types-ext operators and functions (B11 wave 4, types_ext_eval.sig):
     // ext_op is an operator call (`integer` the Op, the operands in `b`),
     // named ?column?; then the network and macaddr8 functions.
-    ext_op, inet_abbrev, set_masklen, hostmask, inet_merge, inet_same_family, macaddr8_set7bit, to_macaddr8, to_macaddr, mac_trunc };
+    ext_op, inet_abbrev, set_masklen, hostmask, inet_merge, inet_same_family, macaddr8_set7bit, to_macaddr8, to_macaddr, mac_trunc,
+    // Geometric functions over the B11 wave-4 types (`integer` a GeoFn).
+    geo_call };
+
+/// geo_call variants (types_ext_eval.sig), chosen by name and arguments.
+pub const GeoFn = enum(u8) { area, center, length, npoints, radius, diameter, isclosed, isopen, pclose, popen, slope, diagonal, bound_box, box, circle, line, lseg, path, polygon, point, ishorizontal, isvertical, isparallel, isperp, pt_contained_circle, pt_contained_poly };
 
 /// JSON_TABLE column flags (Node.integer of a json_table_column).
 pub const JsonTableColumn = struct {
@@ -229,7 +234,7 @@ pub fn immutableBuiltin(func: Func) bool {
         .array_constructor, .array_subscript, .array_any, .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper,
         .array_append, .array_prepend, .array_cat, .array_remove => true,
         .array_position, .array_positions, .array_replace, .trim_array, .array_fill, .array_reverse, .array_sort, .string_to_array, .array_width_bucket, .array_set => true,
-        .ext_op, .inet_abbrev, .set_masklen, .hostmask, .inet_merge, .inet_same_family, .macaddr8_set7bit, .to_macaddr8, .to_macaddr, .mac_trunc => true,
+        .ext_op, .inet_abbrev, .set_masklen, .hostmask, .inet_merge, .inet_same_family, .macaddr8_set7bit, .to_macaddr8, .to_macaddr, .mac_trunc, .geo_call => true,
         .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => true,
         .inet_host, .masklen, .inet_family, .inet_network, .broadcast, .netmask => true,
         .point_constructor, .box_constructor, .area, .center, .width, .height => true,
@@ -260,7 +265,7 @@ pub fn strictFunction(func: Func) bool {
         .to_date, .to_number, .to_timestamp, .aggregate_pair, .normalize, .is_normalized => true,
         .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper => true,
         .trim_array, .array_reverse, .array_sort, .array_sample, .array_shuffle => true,
-        .ext_op, .inet_abbrev, .set_masklen, .hostmask, .inet_merge, .inet_same_family, .macaddr8_set7bit, .to_macaddr8, .to_macaddr, .mac_trunc => true,
+        .ext_op, .inet_abbrev, .set_masklen, .hostmask, .inet_merge, .inet_same_family, .macaddr8_set7bit, .to_macaddr8, .to_macaddr, .mac_trunc, .geo_call => true,
         .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => true,
         .inet_host, .masklen, .inet_family, .inet_network, .broadcast, .netmask => true,
         .point_constructor, .box_constructor, .area, .center, .width, .height => true,

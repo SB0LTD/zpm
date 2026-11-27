@@ -89,6 +89,39 @@ pub fn Types(comptime Result: type) type {
             return at;
         }
 
+        /// lseg_recv / line_recv / circle_recv / path_recv / poly_recv,
+        /// validated as their input functions validate (B11 wave 4).
+        fn receiveGeometry(bytes: []const u8, data_type: DataType) Error!Cell {
+            const G = Io.Geometry;
+            var text: Io.Text = .{};
+            var writer: G.Writer = .{ .bytes = &text.bytes };
+            switch (data_type) {
+                .lseg, .line, .circle => {
+                    const words: usize = if (data_type == .lseg) 4 else 3;
+                    if (bytes.len != words * 8) return error.ProtocolViolation;
+                    writer.begin(switch (data_type) {
+                        .lseg => .lseg,
+                        .line => .line,
+                        else => .circle,
+                    }) catch return error.BufferTooSmall;
+                    for (0..words) |index| writer.float(@bitCast(getInt(u64, bytes[index * 8 ..][0..8]))) catch return error.BufferTooSmall;
+                },
+                else => {
+                    const path = data_type == .path;
+                    const head: usize = if (path) 5 else 4;
+                    if (bytes.len < head) return error.ProtocolViolation;
+                    if (path and bytes[0] > 1) return error.ProtocolViolation;
+                    const points = getInt(i32, bytes[head - 4 ..][0..4]);
+                    if (points <= 0 or bytes.len != head + @as(usize, @intCast(points)) * 16) return error.ProtocolViolation;
+                    writer.beginPoints(if (path) .path else .polygon, if (path) bytes[0] == 1 else true, @intCast(points)) catch return error.BufferTooSmall;
+                    for (0..@as(usize, @intCast(points)) * 2) |index| writer.float(@bitCast(getInt(u64, bytes[head + index * 8 ..][0..8]))) catch return error.BufferTooSmall;
+                },
+            }
+            if (!G.valid(writer.slice())) return error.ProtocolViolation;
+            text.len = writer.len;
+            return .{ .geo = text };
+        }
+
         pub fn sendBinary(cell: *const Cell, data_type: DataType, session: *const Session, out: []u8) Error!usize {
             var at: usize = 0;
             switch (cell.*) {
@@ -153,6 +186,27 @@ pub fn Types(comptime Result: type) type {
                 },
                 .macaddr => |*value| try put(out, &at, value),
                 .macaddr8 => |*value| try put(out, &at, value),
+                // lseg/line/circle: their float8 words; path: closed byte,
+                // int32 count, points; polygon: int32 count, points.
+                .geo => |*value| {
+                    const bytes = value.slice();
+                    const G = Io.Geometry;
+                    switch (G.kindOf(bytes)) {
+                        .lseg, .line, .circle => {
+                            const words: usize = if (G.kindOf(bytes) == .lseg) 4 else 3;
+                            for (0..words) |index| try putInt(u64, out, &at, @bitCast(G.word(bytes, index)));
+                        },
+                        .path, .polygon => {
+                            if (G.kindOf(bytes) == .path) try put(out, &at, &.{@intFromBool(G.closed(bytes))});
+                            try putInt(i32, out, &at, @intCast(G.count(bytes)));
+                            for (0..G.count(bytes)) |index| {
+                                const p = G.pointAt(bytes, index);
+                                try putInt(u64, out, &at, @bitCast(p.x));
+                                try putInt(u64, out, &at, @bitCast(p.y));
+                            }
+                        },
+                    }
+                },
                 .xml => at += try sendText(cell, session, out),
                 // regtypesend is oidsend.
                 .regtype, .regproc => |value| try putInt(u32, out, &at, value),
@@ -422,6 +476,7 @@ pub fn Types(comptime Result: type) type {
                     if (bytes.len != 6) return error.ProtocolViolation;
                     return .{ .macaddr = bytes[0..6].* };
                 },
+                .lseg, .line, .circle, .path, .polygon => return receiveGeometry(bytes, data_type),
                 // macaddr8_recv also takes the six-byte form.
                 .macaddr8 => {
                     if (bytes.len == 6) return .{ .macaddr8 = .{ bytes[0], bytes[1], bytes[2], 0xff, 0xfe, bytes[3], bytes[4], bytes[5] } };

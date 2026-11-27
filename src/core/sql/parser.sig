@@ -1738,7 +1738,7 @@ pub fn Parser(comptime config: types.Config) type {
                 .integer, .int, .int4, .bigint, .int8, .smallint, .int2, .boolean, .@"bool", .text, .numeric, .decimal, .real, .float4, .float8, .float, .double, .name, .oid, .date, .timestamp, .timestamptz, .interval, .json, .jsonb, .regclass, .regtype, .regnamespace, .regproc => true,
                 .varchar, .character, .char, .bpchar, .uuid, .bytea, .time, .timetz, .bit, .varbit, .money => true,
                 .pg_lsn, .xid8, .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange, .inet, .cidr, .macaddr, .point, .box, .xml, .jsonpath, .tsvector, .tsquery => true,
-                .void, .macaddr8 => true,
+                .void, .macaddr8, .lseg, .line, .path, .polygon, .circle => true,
                 else => false,
             };
         }
@@ -1985,6 +1985,11 @@ pub fn Parser(comptime config: types.Config) type {
                 .tsquery => .{ .ty = .tsquery },
                 .void => .{ .ty = .void },
                 .macaddr8 => .{ .ty = .macaddr8 },
+                .lseg => .{ .ty = .lseg },
+                .line => .{ .ty = .line },
+                .path => .{ .ty = .path },
+                .polygon => .{ .ty = .polygon },
+                .circle => .{ .ty = .circle },
                 .character, .char => blk: {
                     const varying = try self.takeWord("VARYING");
                     break :blk .{ .ty = if (varying) .varchar else .bpchar, .typmod = try self.characterLength(!varying) };

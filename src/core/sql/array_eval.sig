@@ -10,6 +10,7 @@ const types = @import("types.sig");
 const ast = @import("ast.sig");
 const array = @import("array.sig");
 const value = @import("value.sig");
+const geometry = @import("geometry.sig");
 const Error = types.Error;
 const none = ast.none;
 
@@ -704,6 +705,23 @@ pub fn ArrayEval(comptime config: types.Config, comptime E: type) type {
                 }
             }
             if (any_null) return .null_value;
+            if (base == .point or base == .box or base == .geo) {
+                // point[0..1], box/lseg[0..1] (corners), line[0..2]; a
+                // second subscript or one out of range is NULL.
+                if (layout.count != 1) return .null_value;
+                const index = lower[0].?;
+                switch (base) {
+                    .point => |p| return if (index == 0) .{ .float8 = p.x } else if (index == 1) .{ .float8 = p.y } else .null_value,
+                    .box => |b| return if (index == 0) .{ .point = b.high } else if (index == 1) .{ .point = b.low } else .null_value,
+                    else => {
+                        const bytes = base.geo.slice();
+                        const limit: i64 = if (geometry.kindOf(bytes) == .line) 3 else 2;
+                        if (index < 0 or index >= limit) return .null_value;
+                        if (geometry.kindOf(bytes) == .line) return .{ .float8 = geometry.word(bytes, @intCast(index)) };
+                        return .{ .point = .{ .x = geometry.word(bytes, @intCast(index * 2)), .y = geometry.word(bytes, @intCast(index * 2 + 1)) } };
+                    },
+                }
+            }
             if (node(ctx, n.b).ty == .name) {
                 // PostgreSQL treats name as a fixed-length zero-padded byte
                 // array, with a zero-based index and a "char" result.

@@ -413,6 +413,12 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     try writer.int(u8, 24);
                     try writer.bytes(value);
                 },
+                // B11 wave 4 (types-ext): value tag 41, validated on replay.
+                .geo => |*text| {
+                    try writer.int(u8, 41);
+                    try writer.int(u32, @intCast(text.len));
+                    try writer.bytes(text.slice());
+                },
                 // B11 wave 4 (types-ext): value tag 46.
                 .macaddr8 => |*value| {
                     try writer.int(u8, 46);
@@ -1313,6 +1319,14 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 },
                 24 => .{ .macaddr = (try reader.take(6))[0..6].* },
                 46 => .{ .macaddr8 = (try reader.take(8))[0..8].* },
+                41 => blk: {
+                    const len = try reader.int(u32);
+                    if (len > config.text_bytes) return error.ChangeRecordConflict;
+                    var text: V.Text = .{ .len = len };
+                    @memcpy(text.bytes[0..len], try reader.take(len));
+                    if (!@import("geometry.sig").valid(text.slice())) return error.InvalidChangeRecord;
+                    break :blk .{ .geo = text };
+                },
                 30 => .{ .regtype = try reader.int(u32) },
                 31 => .{ .pg_internal_char = try reader.int(u8) },
                 32 => .{ .regproc = try reader.int(u32) },

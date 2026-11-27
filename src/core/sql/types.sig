@@ -601,14 +601,16 @@ pub const Dialect = enum { postgres, mysql, tds };
 pub const DataType = enum(u8) { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, mysql_bigint_unsigned, pg_internal_char, aclitem, xid, regproc,
     // B11 wave-4 types-ext: the void pseudo-type (function results only).
     void,
-    macaddr8, _ };
+    macaddr8,
+    lseg, line, path, polygon, circle, _ };
 
 /// Bound expression type. `unknown` is an untyped string or NULL literal
 /// that has not been resolved by context yet. Unnamed values are array
 /// types, encoded like DataType's (arrayType/elementType).
 pub const Type = enum(u8) { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, mysql_bigint_unsigned, pg_internal_char, aclitem, xid, regproc,
     void,
-    macaddr8, _ };
+    macaddr8,
+    lseg, line, path, polygon, circle, _ };
 
 /// Array types set this bit over the element type's ordinal.
 pub const array_bit: u8 = 0x80;
@@ -657,7 +659,7 @@ pub fn isArray(ty: Type) bool {
 /// operator class: ORDER BY, GROUP BY and DISTINCT over them are 42883.
 pub fn unorderable(ty: Type) bool {
     return switch (ty) {
-        .void => true,
+        .void, .lseg, .line, .path, .polygon, .circle => true,
         else => false,
     };
 }
@@ -745,6 +747,11 @@ pub fn dataTypeOf(ty: Type) DataType {
         .aclitem => .aclitem,
         .void => .void,
         .macaddr8 => .macaddr8,
+        .lseg => .lseg,
+        .line => .line,
+        .path => .path,
+        .polygon => .polygon,
+        .circle => .circle,
         _ => if (elementType(ty)) |element| arrayData(dataTypeOf(element)).? else .text,
     };
 }
@@ -802,6 +809,11 @@ pub fn typeOfData(data_type: DataType) Type {
         .aclitem => .aclitem,
         .void => .void,
         .macaddr8 => .macaddr8,
+        .lseg => .lseg,
+        .line => .line,
+        .path => .path,
+        .polygon => .polygon,
+        .circle => .circle,
         _ => if (elementData(data_type)) |element| arrayType(typeOfData(element)).? else .text,
     };
 }
@@ -915,6 +927,11 @@ fn baseInfo(data_type: DataType) TypeInfo {
         .tsquery => .{ .oid = 3615, .name = "tsquery", .len = -1, .category = 'U', .array = 3645 },
         .void => .{ .oid = 2278, .name = "void", .len = 4, .category = 'P', .array = 0 },
         .macaddr8 => .{ .oid = 774, .name = "macaddr8", .len = 8, .category = 'U', .array = 775 },
+        .lseg => .{ .oid = 601, .name = "lseg", .len = 32, .category = 'G', .array = 1018, .alignment = 'd' },
+        .line => .{ .oid = 628, .name = "line", .len = 24, .category = 'G', .array = 629, .alignment = 'd' },
+        .path => .{ .oid = 602, .name = "path", .len = -1, .category = 'G', .array = 1019, .alignment = 'd' },
+        .polygon => .{ .oid = 604, .name = "polygon", .len = -1, .category = 'G', .array = 1027, .alignment = 'd' },
+        .circle => .{ .oid = 718, .name = "circle", .len = 24, .category = 'G', .array = 719, .alignment = 'd' },
         _ => .{ .oid = 0, .name = "", .len = -1, .category = 'A', .array = 0 },
     };
 }
@@ -1000,6 +1017,11 @@ fn baseSqlName(data_type: DataType) []const u8 {
         .pg_internal_char => "\"char\"",
         .void => "void",
         .macaddr8 => "macaddr8",
+        .lseg => "lseg",
+        .line => "line",
+        .path => "path",
+        .polygon => "polygon",
+        .circle => "circle",
         _ => "",
     };
 }
@@ -1051,6 +1073,11 @@ pub fn typeInputName(data_type: DataType) []const u8 {
         .pg_internal_char => "charin",
         .void => "void_in",
         .macaddr8 => "macaddr8_in",
+        .lseg => "lseg_in",
+        .line => "line_in",
+        .path => "path_in",
+        .polygon => "poly_in",
+        .circle => "circle_in",
         _ => "array_in",
     };
 }
@@ -1324,7 +1351,7 @@ pub fn Values(comptime config: Config) type {
         /// compares/hashes without trailing spaces.
         pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar, uuid, bytea, time, timetz, bits, money, pg_lsn, xid8, array, range, inet, macaddr, point, box, xml, regtype, tsvector, tsquery, pg_internal_char, regproc,
             // B11 wave-4 types-ext.
-            macaddr8 };
+            macaddr8, geo };
 
         pub const Cell = union(CellTag) {
             null_value: void,
@@ -1375,6 +1402,8 @@ pub fn Values(comptime config: Config) type {
             regproc: u32,
             /// macaddr8: eight bytes (network.sig).
             macaddr8: network.Mac8,
+            /// lseg, line, path, polygon and circle (geometry.sig layout).
+            geo: Text,
         };
 
         /// Range values of these cells (range.sig).
@@ -1443,6 +1472,7 @@ pub fn Values(comptime config: Config) type {
                 // void values are the empty text (void_out).
                 .void => .text,
                 .macaddr8 => .macaddr8,
+                .lseg, .line, .path, .polygon, .circle => .geo,
                 _ => .array,
             };
         }
@@ -1483,6 +1513,8 @@ pub fn Values(comptime config: Config) type {
                 .inet => |*value| network.compare(value, &right.inet),
                 .macaddr => |*value| bytesOrder(value, &right.macaddr),
                 .macaddr8 => |*value| bytesOrder(value, &right.macaddr8),
+                // No ordering operators (42883); bytes keep internal equality.
+                .geo => |*value| bytesOrder(value.slice(), right.geo.slice()),
                 .point => |value| geometric.comparePoints(value, right.point),
                 .box => |value| geometric.compareBoxes(value, right.box),
                 .xml => |*value| bytesOrder(value.slice(), right.xml.slice()),
@@ -1570,6 +1602,10 @@ pub fn Values(comptime config: Config) type {
                 .macaddr8 => |*bytes| {
                     mix(&code, tag);
                     for (bytes) |byte| code = (code ^ byte) *% 1099511628211;
+                },
+                .geo => |*bytes| {
+                    mix(&code, tag);
+                    for (bytes.slice()) |byte| code = (code ^ byte) *% 1099511628211;
                 },
                 .point => |point| {
                     mix(&code, tag);

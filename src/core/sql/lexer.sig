@@ -236,6 +236,11 @@ pub const Keyword = enum {
     // B11 wave-4 types-ext.
     void,
     macaddr8,
+    lseg,
+    line,
+    path,
+    polygon,
+    circle,
 };
 
 /// Words that cannot be unquoted identifiers.

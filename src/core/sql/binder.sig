@@ -1445,6 +1445,18 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "hostmask", .func = .hostmask },         .{ .name = "inet_merge", .func = .inet_merge },
                 .{ .name = "inet_same_family", .func = .inet_same_family }, .{ .name = "macaddr8_set7bit", .func = .macaddr8_set7bit },
                 .{ .name = "macaddr8", .func = .to_macaddr8 },      .{ .name = "macaddr", .func = .to_macaddr },
+                // Geometric functions over lseg/line/path/polygon/circle (B11 wave 4).
+                .{ .name = "npoints", .func = .geo_call },          .{ .name = "radius", .func = .geo_call },
+                .{ .name = "diameter", .func = .geo_call },         .{ .name = "isclosed", .func = .geo_call },
+                .{ .name = "isopen", .func = .geo_call },           .{ .name = "pclose", .func = .geo_call },
+                .{ .name = "popen", .func = .geo_call },            .{ .name = "slope", .func = .geo_call },
+                .{ .name = "diagonal", .func = .geo_call },         .{ .name = "bound_box", .func = .geo_call },
+                .{ .name = "circle", .func = .geo_call },           .{ .name = "line", .func = .geo_call },
+                .{ .name = "lseg", .func = .geo_call },             .{ .name = "path", .func = .geo_call },
+                .{ .name = "polygon", .func = .geo_call },          .{ .name = "ishorizontal", .func = .geo_call },
+                .{ .name = "isvertical", .func = .geo_call },       .{ .name = "isparallel", .func = .geo_call },
+                .{ .name = "isperp", .func = .geo_call },           .{ .name = "pt_contained_circle", .func = .geo_call },
+                .{ .name = "pt_contained_poly", .func = .geo_call },
                 // Geometric functions (B11 advanced types).
                 .{ .name = "point", .func = .point_constructor },   .{ .name = "box", .func = .box_constructor },
                 .{ .name = "area", .func = .area },                 .{ .name = "center", .func = .center },
@@ -2496,6 +2508,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .string_to_array, .array_width_bucket, .array_set => try typeArrayFunction(context, n, count),
                 .ext_op => return,
                 .inet_abbrev, .set_masklen, .hostmask, .inet_merge, .inet_same_family, .macaddr8_set7bit, .to_macaddr8, .to_macaddr, .mac_trunc => try typeExtFunction(context, n, count),
+                .geo_call => try typeGeometryFunction(context, n, count),
                 .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => try typeRangeFunction(context, n, count),
                 .xmlparse => {
                     n.b = try convert(context, n.b, .text, -1, .implicit);
@@ -2665,6 +2678,20 @@ pub fn Binder(comptime config: types.Config) type {
             if (count == 0) return;
             const first = context.node(n.b).ty;
             if (n.func == .trunc and count == 1 and (first == .macaddr or first == .macaddr8)) n.func = .mac_trunc;
+            // area/center/length/point/box over the other geometric types.
+            const geometric_argument = first == .lseg or first == .line or first == .path or first == .polygon or first == .circle;
+            switch (n.func) {
+                .area, .center, .char_length => if (geometric_argument) {
+                    n.func = .geo_call;
+                },
+                .point_constructor => if (count == 1) {
+                    n.func = .geo_call;
+                },
+                .box_constructor => if (count == 1) {
+                    n.func = .geo_call;
+                },
+                else => {},
+            }
         }
 
         fn extArgument(context: *const Context, id: u16, wanted: ast.Type) Error!u16 {
@@ -2708,6 +2735,157 @@ pub fn Binder(comptime config: types.Config) type {
                 else => unreachable,
             }
             n.constant = listConstant(context, n.b);
+        }
+
+        /// geo_call: the GeoFn from the call's name, typed per overload.
+        fn typeGeometryFunction(context: *const Context, n: *ast.Node, count: usize) Error!void {
+            const T = ast.Type;
+            const name = toName(context, n.name);
+            const which = std.meta.stringToEnum(ast.GeoFn, name.slice()) orelse
+                (if (types.same(name.slice(), "char_length") or types.same(name.slice(), "character_length")) ast.GeoFn.length else return error.UndefinedFunction);
+            n.integer = @intFromEnum(which);
+            const first: T = if (count >= 1) context.node(n.b).ty else .unknown;
+            const second: T = if (count >= 2) context.node(context.node(n.b).next).ty else .unknown;
+            const one = count == 1;
+            switch (which) {
+                .area => if (one and (first == .circle or first == .path)) try bindSignature(context, n, &[_]T{first}, .float8, true) else return error.UndefinedFunction,
+                .center => if (one and first == .circle) try bindSignature(context, n, &[_]T{.circle}, .point, true) else return error.UndefinedFunction,
+                .length => if (one and (first == .lseg or first == .path)) try bindSignature(context, n, &[_]T{first}, .float8, true) else return error.UndefinedFunction,
+                .npoints => if (one and (first == .path or first == .polygon)) try bindSignature(context, n, &[_]T{first}, .int4, true) else return error.UndefinedFunction,
+                .radius, .diameter => try bindSignature(context, n, &[_]T{.circle}, .float8, true),
+                .isclosed, .isopen => try bindSignature(context, n, &[_]T{.path}, .boolean, true),
+                .pclose, .popen => try bindSignature(context, n, &[_]T{.path}, .path, true),
+                .slope => try bindSignature(context, n, &[_]T{ .point, .point }, .float8, true),
+                .diagonal => try bindSignature(context, n, &[_]T{.box}, .lseg, true),
+                .bound_box => try bindSignature(context, n, &[_]T{ .box, .box }, .box, true),
+                .box => if (one and (first == .point or first == .circle or first == .polygon)) try bindSignature(context, n, &[_]T{first}, .box, true) else return error.UndefinedFunction,
+                .circle => if (count == 2) try bindSignature(context, n, &[_]T{ .point, .float8 }, .circle, true) else if (one and (first == .box or first == .polygon)) try bindSignature(context, n, &[_]T{first}, .circle, true) else return error.UndefinedFunction,
+                .line => try bindSignature(context, n, &[_]T{ .point, .point }, .line, true),
+                .lseg => if (count == 2) try bindSignature(context, n, &[_]T{ .point, .point }, .lseg, true) else try bindSignature(context, n, &[_]T{.box}, .lseg, true),
+                .path => try bindSignature(context, n, &[_]T{.polygon}, .path, true),
+                .polygon => if (count == 2) try bindSignature(context, n, &[_]T{ .int4, .circle }, .polygon, true) else if (one and (first == .box or first == .circle or first == .path)) try bindSignature(context, n, &[_]T{first}, .polygon, true) else return error.UndefinedFunction,
+                .point => if (one and (first == .box or first == .circle or first == .lseg or first == .polygon)) try bindSignature(context, n, &[_]T{first}, .point, true) else return error.UndefinedFunction,
+                .ishorizontal, .isvertical => if (count == 2) try bindSignature(context, n, &[_]T{ .point, .point }, .boolean, true) else if (one and (first == .lseg or first == .line)) try bindSignature(context, n, &[_]T{first}, .boolean, true) else return error.UndefinedFunction,
+                .isparallel, .isperp => {
+                    const kind: T = if (first == .line or second == .line) .line else .lseg;
+                    try bindSignature(context, n, &[_]T{ kind, kind }, .boolean, true);
+                },
+                .pt_contained_circle => try bindSignature(context, n, &[_]T{ .point, .circle }, .boolean, true),
+                .pt_contained_poly => try bindSignature(context, n, &[_]T{ .point, .polygon }, .boolean, true),
+            }
+        }
+
+        fn newGeometry(ty: ast.Type) bool {
+            return ty == .lseg or ty == .line or ty == .path or ty == .polygon or ty == .circle;
+        }
+
+        /// One geometric operator signature: left, op, right -> result.
+        const GeoOperator = struct { left: ast.Type, op: ast.Op, right: ast.Type, result: ast.Type };
+        const geo_operators = blk: {
+            const T = ast.Type;
+            var list: []const GeoOperator = &.{};
+            for ([_]ast.Op{ .add, .sub, .mul, .div }) |op| {
+                list = list ++ [_]GeoOperator{
+                    .{ .left = T.point, .op = op, .right = T.point, .result = T.point },
+                    .{ .left = T.box, .op = op, .right = T.point, .result = T.box },
+                    .{ .left = T.circle, .op = op, .right = T.point, .result = T.circle },
+                    .{ .left = T.path, .op = op, .right = T.point, .result = T.path },
+                };
+            }
+            list = list ++ [_]GeoOperator{.{ .left = T.path, .op = .add, .right = T.path, .result = T.path }};
+            for ([_]ast.Op{ .eq, .lt, .gt, .le, .ge }) |op| {
+                list = list ++ [_]GeoOperator{
+                    .{ .left = T.box, .op = op, .right = T.box, .result = T.boolean },
+                    .{ .left = T.circle, .op = op, .right = T.circle, .result = T.boolean },
+                    .{ .left = T.lseg, .op = op, .right = T.lseg, .result = T.boolean },
+                    .{ .left = T.path, .op = op, .right = T.path, .result = T.boolean },
+                };
+            }
+            list = list ++ [_]GeoOperator{
+                .{ .left = T.circle, .op = .ne, .right = T.circle, .result = T.boolean },
+                .{ .left = T.lseg, .op = .ne, .right = T.lseg, .result = T.boolean },
+                .{ .left = T.point, .op = .ne, .right = T.point, .result = T.boolean },
+                .{ .left = T.line, .op = .eq, .right = T.line, .result = T.boolean },
+                .{ .left = T.circle, .op = .same, .right = T.circle, .result = T.boolean },
+                .{ .left = T.polygon, .op = .same, .right = T.polygon, .result = T.boolean },
+            };
+            const distances = [_][2]T{
+                .{ T.point, T.circle }, .{ T.circle, T.point }, .{ T.circle, T.circle }, .{ T.point, T.lseg }, .{ T.lseg, T.point },
+                .{ T.point, T.line },   .{ T.line, T.point },   .{ T.point, T.box },     .{ T.box, T.point },   .{ T.line, T.line },
+                .{ T.point, T.path },   .{ T.path, T.point },   .{ T.point, T.polygon }, .{ T.polygon, T.point },
+            };
+            for (distances) |pair| list = list ++ [_]GeoOperator{.{ .left = pair[0], .op = .distance, .right = pair[1], .result = T.float8 }};
+            list = list ++ [_]GeoOperator{
+                .{ .left = T.circle, .op = .contains, .right = T.point, .result = T.boolean },
+                .{ .left = T.circle, .op = .contains, .right = T.circle, .result = T.boolean },
+                .{ .left = T.polygon, .op = .contains, .right = T.point, .result = T.boolean },
+                .{ .left = T.path, .op = .contains, .right = T.point, .result = T.boolean },
+                .{ .left = T.box, .op = .contains, .right = T.box, .result = T.boolean },
+                .{ .left = T.point, .op = .contained, .right = T.circle, .result = T.boolean },
+                .{ .left = T.circle, .op = .contained, .right = T.circle, .result = T.boolean },
+                .{ .left = T.point, .op = .contained, .right = T.polygon, .result = T.boolean },
+                .{ .left = T.point, .op = .contained, .right = T.path, .result = T.boolean },
+                .{ .left = T.point, .op = .contained, .right = T.lseg, .result = T.boolean },
+                .{ .left = T.point, .op = .contained, .right = T.line, .result = T.boolean },
+                .{ .left = T.box, .op = .contained, .right = T.box, .result = T.boolean },
+                .{ .left = T.circle, .op = .overlap, .right = T.circle, .result = T.boolean },
+            };
+            for ([_]ast.Op{ .shift_left, .shift_right, .over_left, .over_right }) |op| {
+                list = list ++ [_]GeoOperator{
+                    .{ .left = T.circle, .op = op, .right = T.circle, .result = T.boolean },
+                    .{ .left = T.box, .op = op, .right = T.box, .result = T.boolean },
+                };
+            }
+            const array: [list.len]GeoOperator = list[0..list.len].*;
+            break :blk array;
+        };
+
+        /// Geometric operators of geo_ops.c beyond point/box's original set;
+        /// an untyped operand takes the other's type when that signature
+        /// exists, else the single signature's.
+        fn geometryOperator(context: *const Context, n: *ast.Node) Error!bool {
+            const left = context.node(n.a).ty;
+            const right = context.node(n.b).ty;
+            if (!value.geometryType(left) and !value.geometryType(right)) return false;
+            if (!newGeometry(left) and !newGeometry(right)) {
+                // point/box: only the operators the original lane lacked.
+                const original = switch (n.op) {
+                    .distance => left != .box and right != .box,
+                    .same, .overlap => true,
+                    .contains => left == .box and right != .box,
+                    .contained => left != .box and right == .box,
+                    else => false,
+                };
+                if (original) return false;
+                if (n.op == .eq or n.op == .lt or n.op == .gt or n.op == .le or n.op == .ge or n.op == .ne) {
+                    if (!(left == .box or right == .box or ((left == .point or right == .point) and n.op == .ne))) return false;
+                }
+            }
+            var match: ?GeoOperator = null;
+            var candidates: usize = 0;
+            for (geo_operators) |signature| {
+                if (signature.op != n.op) continue;
+                if (left != .unknown and signature.left != left) continue;
+                if (right != .unknown and signature.right != right) continue;
+                if (left == .unknown and right != .unknown and signature.left == right) {
+                    match = signature;
+                    candidates = 1;
+                    break;
+                }
+                if (right == .unknown and left != .unknown and signature.right == left) {
+                    match = signature;
+                    candidates = 1;
+                    break;
+                }
+                match = signature;
+                candidates += 1;
+            }
+            const found = match orelse return error.UndefinedFunction;
+            if (candidates > 1) return error.AmbiguousFunction;
+            if (left == .unknown) try coerce(context, n.a, found.left);
+            if (right == .unknown) try coerce(context, n.b, found.right);
+            extOperatorCall(context, n, n.a, n.b, found.result);
+            return true;
         }
 
         fn macType(ty: ast.Type) bool {
@@ -2965,7 +3143,14 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 .array_subscript => {
                     const base_ty = context.node(n.b).ty;
-                    const element = if (base_ty == .name) .pg_internal_char else types.elementType(base_ty) orelse return error.TypeMismatch;
+                    const element: ast.Type = switch (base_ty) {
+                        .name => .pg_internal_char,
+                        // Fixed-length geometric "arrays" (B11 wave 4).
+                        .point, .line => .float8,
+                        .box, .lseg => .point,
+                        else => types.elementType(base_ty) orelse return error.TypeMismatch,
+                    };
+                    if (value.geometryType(base_ty) and array_module.Subscripts.decode(n.integer).slice()) return error.UnsupportedStatement;
                     // Subscripts are int4 by assignment (array subscript
                     // must have type integer: 42804).
                     try convertTail(context, n.b, .int4, .assignment);
@@ -4391,6 +4576,7 @@ pub fn Binder(comptime config: types.Config) type {
                     try typeExpr(context, scope, n.b);
                     n.constant = isConstant(context, n.a) and isConstant(context, n.b);
                     if (try extOperator(context, n)) return;
+                    if (try geometryOperator(context, n)) return;
                     switch (n.op) {
                         .eq, .ne, .lt, .le, .gt, .ge, .is_distinct, .is_not_distinct => {
                             try comparable(context, &n.a, &n.b);

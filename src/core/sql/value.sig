@@ -26,6 +26,7 @@ const array_text = @import("array_text.sig");
 const range_text = @import("range_text.sig");
 const network = @import("network.sig");
 const geometric = @import("geometric.sig");
+const geometry = @import("geometry.sig");
 const xml = @import("xml.sig");
 const jsonpath = @import("jsonpath.sig");
 const text_search = @import("text_search.sig");
@@ -205,6 +206,14 @@ const SessionType = Session;
 
 pub const Context = enum { implicit, assignment, explicit };
 
+/// The geometric types (point, box and the B11 wave-4 types).
+pub fn geometryType(ty: Type) bool {
+    return switch (ty) {
+        .point, .box, .lseg, .line, .path, .polygon, .circle => true,
+        else => false,
+    };
+}
+
 pub fn numericCategory(ty: Type) bool {
     return switch (ty) {
         .int2, .int4, .int8, .numeric, .float4, .float8 => true,
@@ -307,6 +316,23 @@ fn extendedCast(from: Type, to: Type, context: Context) ?bool {
         if (from == .oid or to == .oid or (target_alias and integral(from))) return true;
         if (source_alias and (to == .int4 or to == .int8)) return context != .implicit;
         // conversion.
+        if (stringType(to)) return context != .implicit;
+        if (stringType(from)) return context == .explicit;
+        return false;
+    }
+    if (geometryType(from) or geometryType(to)) {
+        // geo_ops casts (B11 wave 4): point -> box, path <-> polygon and
+        // box -> polygon by assignment; the other conversions explicitly;
+        // strings by I/O conversion.
+        if ((from == .point and to == .box) or (from == .path and to == .polygon) or (from == .polygon and to == .path) or (from == .box and to == .polygon)) return context != .implicit;
+        const explicit = switch (from) {
+            .lseg => to == .point,
+            .box => to == .point or to == .lseg or to == .circle,
+            .polygon => to == .point or to == .box or to == .circle,
+            .circle => to == .point or to == .box or to == .polygon,
+            else => false,
+        };
+        if (explicit) return context == .explicit;
         if (stringType(to)) return context != .implicit;
         if (stringType(from)) return context == .explicit;
         return false;
@@ -604,6 +630,7 @@ pub fn Io(comptime config: types.Config) type {
                 .inet => |*value| network.format(value, value.cidr or verbose, buffer),
                 .macaddr => |*value| network.formatMac(value, buffer),
                 .macaddr8 => |*value| network.formatMac8(value, buffer),
+                .geo => |*value| geometry.format(value.slice(), session.extra_float_digits, buffer),
                 .point => |value| geometric.formatPoint(value, session.extra_float_digits, buffer),
                 .box => |value| geometric.formatBox(value, session.extra_float_digits, buffer),
                 .xml => |*value| xml.output(value.slice(), buffer),
@@ -627,6 +654,78 @@ pub fn Io(comptime config: types.Config) type {
                 else
                     copy(buffer, &.{ '\\', '0' + (value >> 6), '0' + ((value >> 3) & 7), '0' + (value & 7) }),
             };
+        }
+
+        /// The lseg/line/path/polygon/circle layout (wire codecs).
+        pub const Geometry = geometry;
+
+        fn geometryKind(ty: Type) geometry.Kind {
+            return switch (ty) {
+                .lseg => .lseg,
+                .line => .line,
+                .path => .path,
+                .polygon => .polygon,
+                else => .circle,
+            };
+        }
+
+        /// The function-based geometric casts (B11 wave 4): point(box |
+        /// lseg | polygon | circle), box(point | polygon | circle),
+        /// lseg(box), circle(box | polygon), polygon(box | circle | path)
+        /// and path(polygon).
+        pub fn geometryCast(cell: *const V.Cell, to: Type) Error!V.Cell {
+            var text: V.Text = .{};
+            var out: geometry.Writer = .{ .bytes = &text.bytes };
+            const bytes: []const u8 = if (cell.* == .geo) cell.geo.slice() else &.{};
+            const kind: ?geometry.Kind = if (cell.* == .geo) geometry.kindOf(bytes) else null;
+            switch (to) {
+                .point => return .{ .point = switch (cell.*) {
+                    .box => |value| geometric.center(value),
+                    .geo => switch (kind.?) {
+                        .lseg => try geometry.lsegCenter(geometry.lseg(bytes)),
+                        .circle => geometry.circle(bytes).center,
+                        .polygon => (try geometry.polygonCircle(bytes)).center,
+                        else => return error.CannotCoerce,
+                    },
+                    else => return error.CannotCoerce,
+                } },
+                .box => return .{ .box = switch (cell.*) {
+                    .point => |value| .{ .high = value, .low = value },
+                    .geo => switch (kind.?) {
+                        .polygon => geometry.boundBox(bytes),
+                        .circle => try geometry.circleBox(geometry.circle(bytes)),
+                        else => return error.CannotCoerce,
+                    },
+                    else => return error.CannotCoerce,
+                } },
+                .lseg => {
+                    if (cell.* != .box) return error.CannotCoerce;
+                    try geometry.writeLseg(&out, .{ .a = cell.box.high, .b = cell.box.low });
+                },
+                .circle => {
+                    if (cell.* == .box) {
+                        try geometry.writeCircle(&out, try geometry.boxCircle(cell.box));
+                    } else if (kind == .polygon) {
+                        try geometry.writeCircle(&out, try geometry.polygonCircle(bytes));
+                    } else return error.CannotCoerce;
+                },
+                .polygon => {
+                    if (cell.* == .box) {
+                        try geometry.boxPolygon(cell.box, &out);
+                    } else if (kind == .circle) {
+                        try geometry.circlePolygon(12, geometry.circle(bytes), &out);
+                    } else if (kind == .path) {
+                        try geometry.repoint(bytes, .polygon, &out);
+                    } else return error.CannotCoerce;
+                },
+                .path => {
+                    if (kind != .polygon) return error.CannotCoerce;
+                    try geometry.repoint(bytes, .path, &out);
+                },
+                else => return error.CannotCoerce,
+            }
+            text.len = out.len;
+            return .{ .geo = text };
         }
 
         /// Range text I/O and constructors (range_text.sig).
@@ -772,6 +871,19 @@ pub fn Io(comptime config: types.Config) type {
                 .inet, .cidr => .{ .inet = try network.parse(input, ty == .cidr) },
                 .macaddr => .{ .macaddr = try network.parseMac(input) },
                 .macaddr8 => .{ .macaddr8 = try network.parseMac8(input) },
+                .lseg, .line, .path, .polygon, .circle => blk: {
+                    var text: V.Text = .{};
+                    var writer: geometry.Writer = .{ .bytes = &text.bytes };
+                    switch (ty) {
+                        .lseg => try geometry.parseLseg(input, &writer),
+                        .line => try geometry.parseLine(input, &writer),
+                        .path => try geometry.parsePath(input, &writer),
+                        .polygon => try geometry.parsePolygon(input, &writer),
+                        else => try geometry.parseCircle(input, &writer),
+                    }
+                    text.len = writer.len;
+                    break :blk .{ .geo = text };
+                },
                 .point => .{ .point = try geometric.parsePoint(input) },
                 .box => .{ .box = try geometric.parseBox(input) },
                 // xml_in: casts and textual input honor the session XML mode.
@@ -1220,6 +1332,12 @@ pub fn Io(comptime config: types.Config) type {
                     .text => |*value| try parse(.cidr, -1, value.slice(), session),
                     else => return error.CannotCoerce,
                 },
+                .lseg, .line, .path, .polygon, .circle => switch (cell) {
+                    .text => |*value| try parse(to, -1, value.slice(), session),
+                    .geo => if (geometryKind(to) == geometry.kindOf(cell.geo.slice())) cell else try geometryCast(&cell, to),
+                    .box => try geometryCast(&cell, to),
+                    else => return error.CannotCoerce,
+                },
                 .macaddr8 => switch (cell) {
                     .macaddr8 => cell,
                     .macaddr => |*value| V.Cell{ .macaddr8 = network.mac8FromMac(value) },
@@ -1255,9 +1373,8 @@ pub fn Io(comptime config: types.Config) type {
                     else => return error.CannotCoerce,
                 },
                 .point, .box => switch (cell) {
-                    .point, .box => cell,
                     .text => |*value| try parse(to, -1, value.slice(), session),
-                    else => return error.CannotCoerce,
+                    else => if (@as(V.CellTag, cell) == V.cellTag(types.dataTypeOf(to))) cell else try geometryCast(&cell, to),
                 },
                 .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange => switch (cell) {
                     .range => cell,
