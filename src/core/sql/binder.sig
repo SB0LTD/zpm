@@ -506,6 +506,9 @@ pub fn Binder(comptime config: types.Config) type {
             window_defs:u16=none,
             saw_aggregate: ?*bool = null,
             ctes: ?*const CteEnv = null,
+            /// Set-returning calls may appear (one select-list target): the
+            /// count of those seen (wave 4 text-json).
+            set_calls: ?*u8 = null,
         };
 
         pub const SortKey = struct { column: u16, descending: bool, nulls_first: bool };
@@ -562,7 +565,10 @@ pub fn Binder(comptime config: types.Config) type {
             // A user routine in FROM (B11 wave 4): Exec.routineRows.
             routine,
             // generate_subscripts(anyarray, int4 [, bool]) (B11 wave 4).
-            subscripts };
+            subscripts,
+            // A set-returning built-in in FROM (wave 4 text-json):
+            // `function` is the call (regexp_matches, regexp_split_to_table).
+            set_function };
 
         /// A bound query block of the general engine (design §4.9). Its
         /// materialized rows are `width` cells: the `count` visible output
@@ -607,6 +613,10 @@ pub fn Binder(comptime config: types.Config) type {
             /// Every top-level set-returning target (unnest, generate_subscripts;
             /// B11 wave 4); `unnest_column` is the first. They run in lockstep.
             srf_set: std.StaticBitSet(types.projectionColumns(config)) = .empty,
+            /// The set-returning call inside target `unnest_column` when it is
+            /// not UNNEST (wave 4 text-json; exec evaluates the target once
+            /// per produced value).
+            set_call: u16 = none,
             count: usize = 0,
             width: usize = 0,
             names: [types.projectionColumns(config)]V.Name = undefined,
@@ -1160,12 +1170,27 @@ pub fn Binder(comptime config: types.Config) type {
             return ty == .tsvector or ty == .tsquery;
         }
 
+        fn textOrUnknown(ty: ast.Type) bool {
+            return ty == .unknown or value.characterType(ty);
+        }
+
         /// @@: tsvector @@ tsquery and tsquery @@ tsvector (an untyped side
-        /// takes the other operand type). text @@ tsquery and text @@ text
-        /// use default_text_search_config (pg_catalog.english): 0A000.
+        /// takes the other operand type), text @@ tsquery (`integer` 1:
+        /// to_tsvector of the text) and text @@ text (`integer` 2, also for
+        /// two untyped operands: to_tsvector @@ plainto_tsquery), both
+        /// under default_text_search_config.
         fn textMatchOperator(context: *const Context, n: *ast.Node) Error!void {
             const left = context.node(n.a).ty;
             const right = context.node(n.b).ty;
+            if (textOrUnknown(left) and (right == .tsquery or textOrUnknown(right))) {
+                n.a = try convert(context, n.a, .text, -1, .implicit);
+                if (right != .tsquery) n.b = try convert(context, n.b, .text, -1, .implicit);
+                if (context.node(n.a).ty != .text or (right != .tsquery and context.node(n.b).ty != .text)) return error.UndefinedFunction;
+                n.integer = if (right == .tsquery) 1 else 2;
+                n.ty = .boolean;
+                n.constant = false;
+                return;
+            }
             if (left == .tsvector or right == .tsquery) {
                 if (left == .unknown) return error.UnsupportedStatement;
                 try coerce(context, n.b, .tsquery);
@@ -1184,14 +1209,93 @@ pub fn Binder(comptime config: types.Config) type {
         /// to_tsvector / to_tsquery / plainto_tsquery / phraseto_tsquery
         /// (regconfig, text). The configuration is an untyped literal
         /// (regconfig input, checked now when constant); the one-argument
-        /// forms use default_text_search_config (english): 0A000.
+        /// forms (`integer` 1) read default_text_search_config when they
+        /// run (STABLE).
         fn typeTextSearchFunction(context: *const Context, n: *ast.Node, count: usize) Error!void {
-            if (count == 1) return error.UnsupportedStatement;
+            if (count == 1) {
+                try bindSignature(context, n, &[_]ast.Type{.text}, if (n.func == .to_tsvector) .tsvector else .tsquery, true);
+                n.integer = 1;
+                n.constant = false;
+                return;
+            }
             if (count != 2) return error.UndefinedFunction;
             const config_node = context.node(n.b);
             if (config_node.ty != .unknown) return error.UndefinedFunction;
             if (config_node.kind == .text_literal) _ = try Io.TextSearch.configByName(E.literalText(context.source, config_node.text).slice());
             try bindSignature(context, n, &[_]ast.Type{ .text, .text }, if (n.func == .to_tsvector) .tsvector else .tsquery, true);
+        }
+
+        /// The regular-expression functions (pg_proc signatures over text
+        /// and int4; wave 4 text-json lane, regex_eval.sig). A fourth
+        /// regexp_replace argument that is untyped or a string selects the
+        /// flags signature over the start position, as PostgreSQL's
+        /// preference for the string category does.
+        fn typeRegexFunction(context: *const Context, n: *ast.Node, count: usize) Error!void {
+            const T = ast.Type;
+            if (context.dialect != .postgres) return if (n.func == .substring_regex or n.func == .substring_similar) error.UnsupportedStatement else error.UndefinedFunction;
+            const text_array = types.arrayType(.text).?;
+            const texts = [_]T{ .text, .text, .text, .text };
+            switch (n.func) {
+                .regexp_match, .regexp_matches, .regexp_split_to_array, .regexp_split_to_table => {
+                    if (count != 2 and count != 3) return error.UndefinedFunction;
+                    try bindSignature(context, n, texts[0..count], if (n.func == .regexp_split_to_table) .text else text_array, true);
+                },
+                .substring_regex, .substring_similar => try bindSignature(context, n, texts[0..count], .text, true),
+                .regexp_replace => {
+                    const flags_form = count == 4 and (argumentType(context, n, 3) == .unknown or value.stringType(argumentType(context, n, 3)));
+                    const signature: []const T = switch (count) {
+                        3 => &.{ .text, .text, .text },
+                        4 => if (flags_form) &.{ .text, .text, .text, .text } else &.{ .text, .text, .text, .int4 },
+                        5 => &.{ .text, .text, .text, .int4, .int4 },
+                        6 => &.{ .text, .text, .text, .int4, .int4, .text },
+                        else => return error.UndefinedFunction,
+                    };
+                    try bindSignature(context, n, signature, .text, true);
+                },
+                .regexp_count => {
+                    if (count < 2 or count > 4) return error.UndefinedFunction;
+                    try bindSignature(context, n, (&[_]T{ .text, .text, .int4, .text })[0..count], .int4, true);
+                },
+                .regexp_instr => {
+                    if (count < 2 or count > 7) return error.UndefinedFunction;
+                    try bindSignature(context, n, (&[_]T{ .text, .text, .int4, .int4, .int4, .text, .int4 })[0..count], .int4, true);
+                },
+                .regexp_substr => {
+                    if (count < 2 or count > 6) return error.UndefinedFunction;
+                    try bindSignature(context, n, (&[_]T{ .text, .text, .int4, .int4, .text, .int4 })[0..count], .text, true);
+                },
+                else => return error.UndefinedFunction,
+            }
+            if (ast.setFunction(n.func)) n.constant = false;
+        }
+
+        /// The set-returning call of a select-list target reachable through
+        /// expressions PostgreSQL evaluates unconditionally (not CASE,
+        /// COALESCE, aggregates, window calls or subqueries), or none.
+        fn setCallIn(context: *const Context, id: u16) u16 {
+            if (id == none) return none;
+            const n = context.node(id);
+            switch (n.kind) {
+                .function => {
+                    if (ast.setFunction(n.func)) return id;
+                    if (n.window != none) return none;
+                    var item = n.b;
+                    while (item != none) : (item = context.node(item).next) {
+                        const found = setCallIn(context, item);
+                        if (found != none) return found;
+                    }
+                    return none;
+                },
+                .cast, .unary, .not_op, .test_op => return setCallIn(context, n.a),
+                .binary, .and_op, .or_op, .nullif, .at_zone, .like, .between => {
+                    for ([_]u16{ n.a, n.b, n.c }) |child| {
+                        const found = setCallIn(context, child);
+                        if (found != none) return found;
+                    }
+                    return none;
+                },
+                else => return none,
+            }
         }
 
         /// int2/int4/int8 & | # (common integer type) and << >> (int4 count).
@@ -1516,8 +1620,17 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "pg_get_function_result", .func = .pg_get_function_result },
                 .{ .name = "pg_get_function_sqlbody", .func = .pg_get_function_sqlbody },
                 .{ .name = "pg_tablespace_location", .func = .pg_tablespace_location },
-                // Regular expressions (B11 text lane).
+                // Regular expressions (B11 text lane; positional functions:
+                // wave 4 text-json lane).
                 .{ .name = "regexp_like", .func = .regexp_like },
+                .{ .name = "regexp_match", .func = .regexp_match },
+                .{ .name = "regexp_matches", .func = .regexp_matches },
+                .{ .name = "regexp_replace", .func = .regexp_replace },
+                .{ .name = "regexp_split_to_array", .func = .regexp_split_to_array },
+                .{ .name = "regexp_split_to_table", .func = .regexp_split_to_table },
+                .{ .name = "regexp_count", .func = .regexp_count },
+                .{ .name = "regexp_instr", .func = .regexp_instr },
+                .{ .name = "regexp_substr", .func = .regexp_substr },
                 // Full text search (B11 text lane).
                 .{ .name = "to_tsvector", .func = .to_tsvector },
                 .{ .name = "to_tsquery", .func = .to_tsquery },
@@ -2668,6 +2781,15 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 .to_tsvector, .to_tsquery, .plainto_tsquery, .phraseto_tsquery => try typeTextSearchFunction(context, n, count),
                 .regexp_like => try bindSignature(context, n, if (count == 2) &[_]ast.Type{ .text, .text } else &[_]ast.Type{ .text, .text, .text }, .boolean, true),
+                .regexp_match, .regexp_matches, .regexp_replace, .regexp_split_to_array, .regexp_split_to_table, .regexp_count, .regexp_instr, .regexp_substr => {
+                    if (ast.setFunction(n.func)) {
+                        // Only inside a select-list target (exec expands it).
+                        const seen = scope.set_calls orelse return error.UnsupportedStatement;
+                        seen.* +|= 1;
+                    }
+                    try typeRegexFunction(context, n, count);
+                },
+                .substring_regex, .substring_similar => try typeRegexFunction(context, n, count),
                 .similar_to_escape => try bindSignature(context, n, if (count == 1) &[_]ast.Type{.text} else &[_]ast.Type{ .text, .text }, .text, true),
                 .point_constructor => try bindSignature(context, n, &[_]ast.Type{ .float8, .float8 }, .point, true),
                 .box_constructor => try bindSignature(context, n, &[_]ast.Type{ .point, .point }, .box, true),
@@ -3847,7 +3969,10 @@ pub fn Binder(comptime config: types.Config) type {
                             if (ty != .unknown and !value.stringType(ty)) regex = false;
                             if (!knownNull(context, item)) concrete = true;
                         }
-                        if (regex and concrete) return error.UnsupportedStatement;
+                        if (regex and concrete) {
+                            n.func = if (count == 2) .substring_regex else .substring_similar;
+                            return typeRegexFunction(context, n, count);
+                        }
                     }
                     try bindSignature(context, n, if (count == 2) &[_]T{ .text, .int4 } else &[_]T{ .text, .int4, .int4 }, .text, true);
                 },
@@ -4808,7 +4933,9 @@ pub fn Binder(comptime config: types.Config) type {
                         .exists_all => try jsonOperatorCall(context, n, .jsonb_exists_all_op),
                         .path_exists => try jsonOperatorCall(context, n, .jsonb_path_exists_op),
                         // @@ is also tsvector @@ tsquery (either order).
-                        .path_match => if (textSearchType(context.node(n.a).ty) or textSearchType(context.node(n.b).ty)) {
+                        .path_match => if (textSearchType(context.node(n.a).ty) or textSearchType(context.node(n.b).ty) or
+                            (textOrUnknown(context.node(n.a).ty) and textOrUnknown(context.node(n.b).ty)))
+                        {
                             n.op = .text_match;
                             try textMatchOperator(context, n);
                         } else try jsonOperatorCall(context, n, .jsonb_path_match_op),
@@ -7824,6 +7951,19 @@ pub fn Binder(comptime config: types.Config) type {
                 try bindSubscriptsArguments(context, &inner, call);
                 ty = .int4;
                 series = .subscripts;
+            } else if (item.schema == null and context.dialect == .postgres and ast.setFunction(functionName(context, call))) {
+                // regexp_matches / regexp_split_to_table (wave 4 text-json).
+                if (call.star or call.distinct or call.c != none or call.order != none) return error.UndefinedFunction;
+                call.func = functionName(context, call);
+                var count: usize = 0;
+                var arg = call.b;
+                while (arg != none) : (arg = context.node(arg).next) {
+                    try typeExpr(context, &inner, arg);
+                    count += 1;
+                }
+                try typeRegexFunction(context, call, count);
+                ty = call.ty;
+                series = .set_function;
             } else {
                 var from_context = context.*;
                 from_context.table_function = item.function;
@@ -8181,9 +8321,23 @@ pub fn Binder(comptime config: types.Config) type {
                         call.integer = 1;
                     }
                     scope.windows = true;
+                    if (p.set_call != none) return error.UnsupportedStatement;
                     if (p.unnest_column == none) p.unnest_column = @intCast(p.count);
                     p.srf_set.set(p.count);
-                } else if (branch) try typeExpr(context, &scope, target.expr) else try valueExpr(context, &scope, target.expr);
+                } else {
+                    // One set-returning built-in may sit inside one target
+                    // (wave 4 text-json): exec evaluates the target per value.
+                    var set_calls: u8 = 0;
+                    scope.set_calls = &set_calls;
+                    if (branch) try typeExpr(context, &scope, target.expr) else try valueExpr(context, &scope, target.expr);
+                    scope.set_calls = null;
+                    if (set_calls != 0) {
+                        const found = setCallIn(context, target.expr);
+                        if (set_calls > 1 or found == none or p.unnest_column != none or q.lock.strength != .none) return error.UnsupportedStatement;
+                        p.unnest_column = @intCast(p.count);
+                        p.set_call = found;
+                    }
+                }
                 const name = if (target.alias) |alias| toName(context, alias) else targetName(context, target.expr);
                 try addTarget(context, p, target.expr, name);
             }

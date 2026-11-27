@@ -25,6 +25,7 @@ const network = @import("network.sig");
 const geometric = @import("geometric.sig");
 const xml_module = @import("xml.sig");
 const json_eval = @import("json_eval.sig");
+const regex_eval = @import("regex_eval.sig");
 const regex = @import("regex.sig");
 const flat_record = @import("flat_record.sig");
 const Error = types.Error;
@@ -309,6 +310,9 @@ pub fn Eval(comptime config: types.Config) type {
             /// Routine frame (B11 wave 3) read by routine_param nodes; the
             /// innermost context with one wins, else Session.routine_frame.
             frame: ?*const Frame = null,
+            /// The current value of the select list's set-returning call
+            /// (wave 4 text-json; Exec.projectSet).
+            set_value: ?*const V.Cell = null,
         };
 
         /// Values of a running routine: parameters / PL/pgSQL variables and
@@ -1087,6 +1091,7 @@ pub fn Eval(comptime config: types.Config) type {
                         const left = try eval(ctx, n.a);
                         const right = try eval(ctx, n.b);
                         if (left == .null_value or right == .null_value) return null;
+                        if (n.integer == 1 or n.integer == 2) return try textMatchText(ctx, &left, &right, n.integer == 2);
                         const vector = if (left == .tsvector) left.tsvector.slice() else right.tsvector.slice();
                         const query = if (left == .tsquery) left.tsquery.slice() else right.tsquery.slice();
                         return try Io.TextSearch.matches(vector, query, ctx.session.control);
@@ -1196,6 +1201,23 @@ pub fn Eval(comptime config: types.Config) type {
                 .boolean => |b| b,
                 else => unreachable,
             };
+        }
+
+        fn defaultTextSearch(ctx: *const Context) Io.TextSearch.Configuration {
+            return if (ctx.session.text_search_config == 0) .simple else .english;
+        }
+
+        /// ts_match_tq / ts_match_tt: to_tsvector(text) @@ query, the query
+        /// plainto_tsquery(text) for text @@ text (default configuration).
+        fn textMatchText(ctx: *const Context, left: *const V.Cell, right: *const V.Cell, plain: bool) Error!bool {
+            const TS = Io.TextSearch;
+            const ts_config = defaultTextSearch(ctx);
+            var vector: TS.Out = .{};
+            try TS.toVector(left.text.slice(), ts_config, &vector, ctx.session.control);
+            if (!plain) return TS.matches(vector.slice(), right.tsquery.slice(), ctx.session.control);
+            var query: TS.Out = .{};
+            try TS.toQuery(right.text.slice(), .plain, ts_config, &query);
+            return TS.matches(vector.slice(), query.slice(), ctx.session.control);
         }
 
         /// Compiles `pattern` (an ARE under `flags`) and searches `subject`;
@@ -1513,21 +1535,23 @@ pub fn Eval(comptime config: types.Config) type {
                 .pg_partition_ancestors, .array_subquery => return error.UnsupportedStatement,
                 .obj_description, .col_description, .shobj_description, .current_user, .session_user => return objectText(ctx, n),
                 .to_tsvector, .to_tsquery, .plainto_tsquery, .phraseto_tsquery => {
-                    const config_cell = try eval(ctx, n.b);
-                    const input = try eval(ctx, ctx.pool.nodes[n.b].next);
-                    if (config_cell == .null_value or input == .null_value) return .null_value;
                     const TS = Io.TextSearch;
-                    _ = try TS.configByName(config_cell.text.slice());
+                    // One argument: default_text_search_config.
+                    const default_config = n.integer == 1;
+                    const config_cell = if (default_config) V.Cell{ .text = .{} } else try eval(ctx, n.b);
+                    const input = try eval(ctx, if (default_config) n.b else ctx.pool.nodes[n.b].next);
+                    if (config_cell == .null_value or input == .null_value) return .null_value;
+                    const ts_config = if (default_config) defaultTextSearch(ctx) else try TS.configByName(config_cell.text.slice());
                     var out: TS.Out = .{};
                     const text = input.text.slice();
                     switch (n.func) {
                         .to_tsvector => {
-                            try TS.toVector(text, &out, ctx.session.control);
+                            try TS.toVector(text, ts_config, &out, ctx.session.control);
                             return .{ .tsvector = (try textCell(out.slice())).text };
                         },
-                        .to_tsquery => try TS.toQuery(text, .to, &out),
-                        .plainto_tsquery => try TS.toQuery(text, .plain, &out),
-                        else => try TS.toQuery(text, .phrase, &out),
+                        .to_tsquery => try TS.toQuery(text, .to, ts_config, &out),
+                        .plainto_tsquery => try TS.toQuery(text, .plain, ts_config, &out),
+                        else => try TS.toQuery(text, .phrase, ts_config, &out),
                     }
                     return .{ .tsquery = (try textCell(out.slice())).text };
                 },
@@ -1608,6 +1632,9 @@ pub fn Eval(comptime config: types.Config) type {
                 .xmlelement, .xmlforest, .xmlconcat, .xmlcomment, .xmlpi, .xmlroot => return types_ext_eval.TypesExt(config, @This()).xmlCall(ctx, n),
                 .xml_name, .xml_attribute => return error.UnsupportedStatement,
                 .jsonb_set, .jsonb_set_lax, .jsonb_insert, .jsonb_delete_path, .jsonb_strip_nulls, .jsonb_pretty, .to_json, .to_jsonb, .jsonb_path_exists, .jsonb_path_match, .jsonb_path_query_array, .jsonb_path_query_first, .jsonb_exists_any, .jsonb_exists_all, .jsonb_minus_op, .jsonb_delete_path_op, .jsonb_exists_any_op, .jsonb_exists_all_op, .jsonb_path_exists_op, .jsonb_path_match_op => return json_eval.JsonEval(config, @This()).call(ctx, n),
+                .regexp_match, .regexp_replace, .regexp_split_to_array, .regexp_count, .regexp_instr, .regexp_substr, .substring_regex, .substring_similar => return regex_eval.RegexEval(config, @This()).call(ctx, n),
+                // A set-returning call reads the value exec is expanding.
+                .regexp_matches, .regexp_split_to_table => return if (ctx.set_value) |current| current.* else error.UnsupportedStatement,
                 .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => return range_eval.RangeEval(config, @This()).call(ctx, n),
                 .current_setting, .set_config, .pg_try_advisory_lock, .pg_try_advisory_lock_shared, .pg_try_advisory_xact_lock, .pg_try_advisory_xact_lock_shared, .pg_advisory_unlock, .pg_advisory_unlock_shared, .pg_backend_pid, .pg_is_in_recovery => return sessionFunction(ctx, n),
                 .pg_notify, .pg_advisory_lock, .pg_advisory_lock_shared, .pg_advisory_xact_lock, .pg_advisory_xact_lock_shared, .pg_advisory_unlock_all => return sessionFunction(ctx, n),

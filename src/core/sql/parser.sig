@@ -4365,6 +4365,8 @@ pub fn Parser(comptime config: types.Config) type {
                     .text = .{ .start = name.span.start, .end = end, .len = end - name.span.start } });
             }
             if (!name.quoted and (types.keyword(raw_name, "nextval") or types.keyword(raw_name, "setval"))) self.pool.complex = true;
+            // Set-returning built-ins expand on the general engine (wave 4).
+            if (!name.quoted and (types.keyword(raw_name, "regexp_matches") or types.keyword(raw_name, "regexp_split_to_table"))) self.pool.complex = true;
             var call: ast.Node = .{ .kind = .function, .name = name };
             if (self.tokens.dialect == .tds and !name.quoted and types.keyword(raw_name, "isnull")) {
                 self.last_native_syntax = name.span.start;
@@ -4886,7 +4888,13 @@ pub fn Parser(comptime config: types.Config) type {
                 },
                 .substring => if (!self.isSymbol(.rparen)) {
                     list.push(self.pool, try self.expression());
-                    if (try self.takeWord("FROM")) {
+                    if (self.mode == .standard and try self.takeRaw("similar")) {
+                        // substring(x SIMILAR pattern ESCAPE escape) is
+                        // substring(x, pattern, escape) (wave 4 text-json).
+                        list.push(self.pool, try self.expression());
+                        if (!try self.takeRaw("escape")) return error.Syntax;
+                        list.push(self.pool, try self.expression());
+                    } else if (try self.takeWord("FROM")) {
                         const start = try self.expression();
                         list.push(self.pool, start);
                         if (try self.takeWord("FOR")) list.push(self.pool, try self.expression());

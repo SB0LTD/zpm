@@ -337,7 +337,8 @@ fn strings() void {
     rejects("SELECT repeat('a',(1/0)::int)",error.DivisionByZero);
     // A strict call with a syntactic NULL still validates constant arguments.
     rejects("SELECT substring('abc',NULL,1/0)",error.DivisionByZero);
-    rejects("SELECT substring('abc','b')",error.UnsupportedStatement);
+    // substring(text, text) is the regular-expression overload (wave 4).
+    value("SELECT substring('abc','b')",25,"b");
     // Input-sized loops honour the statement work budget.
     budgeted("SELECT length(repeat('x',200))",40);
     budgeted("SELECT reverse(repeat('ab',100))",40);
