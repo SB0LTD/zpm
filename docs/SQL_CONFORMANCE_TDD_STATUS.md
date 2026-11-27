@@ -1,5 +1,22 @@
 # SQL conformance TDD checkpoint
 
+## Routine catalog checkpoints — candidate, 27 November 2026
+
+A regression first reproduced compact image export rejecting live routines with
+SnapshotUnsupportedState. RSBASE10 now adds bounded counts and checked frames for
+functions/procedures, triggers and rules. Roles, schemas, tables and default ACLs
+restore before routines; routines precede dependent triggers. Existing WAL codecs
+validate routine owners, ACL grantors/grantees, namespace and trigger/table links.
+RSBASE01–09 remain readable and retain their output encoding when applicable.
+
+Local Debug initially passed 2,517 wide-cell checkpoint assertions and 156 base
+image assertions, including a function-only image without tables/catalog rows,
+delegated ACLs, body replacement via subsequent WAL, procedure/trigger/rule effects,
+invalid counts, unknown namespaces, truncation/trailing data and version mismatch.
+Orphan-trigger validation, Debug/ReleaseSafe and 4 MiB stack CI, live generation
+publication and stock PG16/18 archives are pending. Unsupported non-routine
+catalog classes still fail before output; this is not full catalog image parity.
+
 ## Per-schema routine default privileges — qualified, 27 November 2026
 
 IN SCHEMA now resolves bounded, deduplicated schema lists and stores the namespace

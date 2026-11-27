@@ -65,6 +65,8 @@ jobs:
         run: |
           set -euo pipefail
           for optimize in Debug ReleaseSafe; do
+            "$SIG" build run-contract-sql-base-snapshot -Doptimize="$optimize" -j2 \
+              --Sig-lib-dir "$SIG_LIB_DIR"
             "$SIG" build run-contract-sql-routines run-contract-sql-catalog-security \
               -Doptimize="$optimize" -j2 --Sig-lib-dir "$SIG_LIB_DIR"
           done

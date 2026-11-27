@@ -746,9 +746,13 @@ fn routineDefaultCheckpoint() !void {
     try expect(std.mem.eql(u8, live_image.bytes[0..8], "RSBASE10"));
     try routine_image_arena.bind(&routine_image_copy);
     try DB.BaseSnapshot.restore(&routine_image_copy, &live_image, routine_default_copy.csn, &wal, &replay_scratch);
+    // The selected image is followed by normal routine DDL/ACL WAL. Its
+    // preserved OIDs and grant graph must accept replacement and revocation.
+    const replacement = try executeWAL(&routine_default_copy, "CREATE OR REPLACE FUNCTION restored_default() RETURNS INT LANGUAGE SQL AS 'SELECT 9'", &wal);
+    try routine_image_copy.applyChangeRecord(replacement, &replay_scratch);
     try routine_image_copy.execute("SET ROLE default_recipient", &result);
     try routine_image_copy.execute("SELECT restored_default()", &result);
-    try expect(result.rows[0].cells[0].integer == 7);
+    try expect(result.rows[0].cells[0].integer == 9);
     try routine_image_copy.execute("RESET ROLE", &result);
     try routine_image_copy.execute("CALL image_proc()", &result);
     try routine_image_copy.execute("DELETE FROM image_rows", &result);
@@ -759,6 +763,12 @@ fn routineDefaultCheckpoint() !void {
     try routine_image_copy.execute("SELECT after_image()", &result);
     try expect(result.rows[0].cells[0].integer == 8);
     try routine_image_copy.execute("RESET ROLE", &result);
+    // Unsupported non-routine catalog classes still fail before emitting.
+    try routine_image_copy.execute("CREATE ROLE image_group", &result);
+    try routine_image_copy.execute("GRANT image_group TO default_recipient", &result);
+    var unsupported: ImageBuffer = .{};
+    if (DB.BaseSnapshot.write(&routine_image_copy, &unsupported, &wal)) |_| return error.UnsupportedCatalogSilentlyDropped else |err| try expect(err == error.SnapshotUnsupportedState);
+    try expect(unsupported.used == 0);
 }
 
 pub fn main(init: std.process.Init) !void {

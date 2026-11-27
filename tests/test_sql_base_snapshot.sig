@@ -402,7 +402,53 @@ fn exerciseNamedSchemas() !void {
     try check(result.rows[0].cells[0].integer > 1 and result.rows[0].cells[1].integer > 1);
 }
 
+fn exerciseRoutineOnly() !void {
+    try reset(&live, 0);
+    try live.execute("CREATE FUNCTION image_only(x INT) RETURNS INT IMMUTABLE LANGUAGE SQL AS 'SELECT x+1'", &result);
+    var image: Image = .{};
+    var scratch: [4096]u8 = undefined;
+    try DB.BaseSnapshot.write(&live, &image, &scratch);
+    try check(std.mem.eql(u8, image.bytes[0..8], "RSBASE10"));
+    const csn = live.csn;
+    try reset(&restored, 1);
+    try DB.BaseSnapshot.restore(&restored, &image, csn, &scratch, &replay);
+    try restored.execute("SELECT image_only(9)", &result);
+    try check(result.rows[0].cells[0].integer == 10);
+    // Version 10 has seven catalog counts, the page count, then three
+    // routine-class counts. This image needs no table/schema/catalog row.
+    try check(std.mem.readInt(u32, image.bytes[56..60], .little) == 1);
+    for (0..6) |variant| {
+        var invalid = image;
+        const wanted = if (variant == 2) error.ChangeRecordConflict else error.InvalidSnapshotImage;
+        switch (variant) {
+            0 => std.mem.writeInt(u32, invalid.bytes[56..60], @intCast(live.objects.routines.len + 1), .little),
+            1 => std.mem.writeInt(u32, invalid.bytes[56..60], 0, .little),
+            // part header (5), WAL header (8), tag (1), length (4),
+            // routine OID (4), then namespace. The first part is at 72.
+            2 => std.mem.writeInt(u32, invalid.bytes[94..98], 0x0fffffff, .little),
+            3 => invalid.used -= 1,
+            4 => { invalid.bytes[invalid.used] = 0; invalid.used += 1; },
+            else => @memcpy(invalid.bytes[0..8], "RSBASE09"),
+        }
+        try reset(&restored, 1);
+        if (DB.BaseSnapshot.restore(&restored, &invalid, csn, &scratch, &replay)) |_| return error.InvalidRoutineImageAccepted else |err| try check(err == wanted);
+    }
+    try live.execute("CREATE TABLE image_dependency(id INT)", &result);
+    try live.execute("CREATE FUNCTION image_hook() RETURNS TRIGGER LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END'", &result);
+    try live.execute("CREATE TRIGGER image_edge BEFORE INSERT ON image_dependency FOR EACH ROW EXECUTE FUNCTION image_hook()", &result);
+    image.used = 0;
+    try DB.BaseSnapshot.write(&live, &image, &scratch);
+    const name = "image_edge";
+    try check(std.mem.count(u8, image.bytes[0..image.used], name) == 1);
+    const name_at = std.mem.indexOf(u8, image.bytes[0..image.used], name).?;
+    // Trigger name is followed by its table OID, then function OID.
+    std.mem.writeInt(u32, image.bytes[name_at + name.len + 4 ..][0..4], 0x0fffffff, .little);
+    try reset(&restored, 1);
+    if (DB.BaseSnapshot.restore(&restored, &image, live.csn, &scratch, &replay)) |_| return error.OrphanTriggerImageAccepted else |err| try check(err == error.ChangeRecordConflict);
+}
+
 pub fn main() !void {
+    try exerciseRoutineOnly();
     try exerciseSequences(false);
     try exerciseSequences(true);
     try exerciseOwnedSequences();
