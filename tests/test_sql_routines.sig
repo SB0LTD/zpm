@@ -1220,7 +1220,10 @@ fn routineDefaultPrivileges() !void {
     try expect("SELECT proacl::text FROM pg_proc WHERE proname='owner_default'", "{default_owner=X/default_owner}");
     const pending = try db.begin();
     try statement(pending, "ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC");
+    try statement(pending, "CREATE FUNCTION own_default() RETURNS INT LANGUAGE SQL AS 'SELECT 7'");
+    try same(try rows(pending, "SELECT proacl IS NULL FROM pg_proc WHERE proname='own_default'"), "f");
     db.abort(pending);
+    try expect("SELECT count(*) FROM pg_proc WHERE proname='own_default'", "0");
     try run("CREATE FUNCTION rolled_default() RETURNS INT LANGUAGE SQL AS 'SELECT 66'");
     try expect("SELECT proacl IS NULL FROM pg_proc WHERE proname='rolled_default'", "t");
     try fails("ALTER DEFAULT PRIVILEGES GRANT EXECUTE ON FUNCTIONS TO PUBLIC WITH GRANT OPTION", error.InvalidGrantOperation);
