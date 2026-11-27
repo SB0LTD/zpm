@@ -2563,6 +2563,22 @@ pub fn Database(comptime config: Config) type {
             self.nested_depth = 0;
             self.nested_ran = false;
             self.routine_volatility = 0;
+            // Per-statement state added in wave 4: a copy starts with none
+            // of it, as a fresh database does (Debug leaves undefined bytes).
+            self.family_root = null;
+            self.family_returning = .none;
+            self.conflict_routed = false;
+            self.rule_active_len = 0;
+            self.nested_tables = @splat(0);
+            self.scan_tables = @splat(0);
+            self.row_staging = null;
+            self.routine_definer = null;
+            self.routine_configured = 0;
+            self.call_returned = .{};
+            self.statement_start = 0;
+            self.routine_path_len = 0;
+            self.routine_diag = .{};
+            self.error_detail = "";
             // A logical copy has fresh session/execution state. In particular,
             // never copy caller-owned interrupt or sequence-hook pointers.
             self.sequence_session = null;
@@ -7631,8 +7647,13 @@ pub fn Database(comptime config: Config) type {
             if (self.catalog.findSystemView(null, name) != null) return false;
             var path: [routine_path_capacity]u32 = undefined;
             const count = self.routinePath(self.seq_snap, &path);
+            // PostgreSQL's RelationIsVisible: the relation's own schema is on
+            // the path and no earlier schema holds the same name. Comparing
+            // the namespace first also covers indexes, which the relation
+            // catalog lookup does not hold.
             for (path[0..count]) |candidate| {
-                if (self.catalog.findIn(candidate, name, self.seq_snap) != null) return candidate == namespace;
+                if (candidate == namespace) return true;
+                if (self.catalog.findIn(candidate, name, self.seq_snap) != null) return false;
             }
             return false;
         }
