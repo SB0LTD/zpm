@@ -91,7 +91,18 @@ pub fn restrictedRoutine(oid: u32) bool {
 /// database). PostgreSQL assigns its OID at initdb; ZPM fixes it.
 pub const plpgsql_extension_oid: u32 = 13001;
 
-pub const Kind = enum(u8) { role = 1, member = 2, acl = 3, relation = 4, policy = 5, comment = 6, fdw = 7, server = 8, publication = 9, domain = 10, enum_type = 11, composite_type = 12, statistics = 13, publication_table = 14, publication_schema = 15, schema_acl = 16, schema_acl_state = 17, schema_owner = 18, role_settings = 19, large_object = 20, large_object_acl = 21, large_object_default_acl = 22, builtin_routine_acl = 23, _ };
+pub const Kind = enum(u8) { role = 1, member = 2, acl = 3, relation = 4, policy = 5, comment = 6, fdw = 7, server = 8, publication = 9, domain = 10, enum_type = 11, composite_type = 12, statistics = 13, publication_table = 14, publication_schema = 15, schema_acl = 16, schema_acl_state = 17, schema_owner = 18, role_settings = 19, large_object = 20, large_object_acl = 21, large_object_default_acl = 22, builtin_routine_acl = 23, routine_default_acl = 24, _ };
+
+/// PUBLIC's routine default is stored with the owner marker, not as a role row.
+pub const routine_default_public: u32 = 1 << 31;
+
+pub fn defaultAcl(kind: Kind) bool {
+    return kind == .large_object_default_acl or kind == .routine_default_acl;
+}
+
+pub fn defaultAclFlags(kind: Kind) u32 {
+    return if (kind == .routine_default_acl) priv_execute | routine_default_public else large_object_privileges;
+}
 
 pub fn publicationMembership(kind: Kind) bool {
     return kind == .publication_table or kind == .publication_schema;
@@ -334,6 +345,7 @@ pub const Grant = struct {
     table_count: usize = 0,
     large_objects: [list_capacity]u32 = @splat(0),
     large_object_count: usize = 0,
+    routine_defaults: bool = false,
     granted: [list_capacity]Ident = @splat(.{}),
     granted_count: usize = 0,
     grantees: [list_capacity]Grantee = @splat(.{}),
@@ -1088,6 +1100,7 @@ const Parser = struct {
     }
 
     fn privilegeWord(raw: []const u8) ?u32 {
+        if (types.keyword(raw, "execute")) return priv_execute;
         if (types.keyword(raw, "usage")) return priv_schema_usage;
         if (types.keyword(raw, "create")) return priv_schema_create;
         for (privilege_words, privilege_bits) |spelled, bit| if (types.keyword(raw, spelled)) return bit;
@@ -1130,7 +1143,7 @@ const Parser = struct {
         out.revoke = try self.take("revoke");
         if (!out.revoke) try self.expect("grant");
         out.grant = try self.grant(out.revoke, true, true);
-        if (has_schema) return error.InvalidGrantOperation;
+        if (has_schema) return if (out.grant.routine_defaults) error.UnsupportedStatement else error.InvalidGrantOperation;
         return out;
     }
 
@@ -1176,8 +1189,9 @@ const Parser = struct {
         }
         if (try self.take("on")) {
             out.schema = try self.take("schema");
+            out.routine_defaults = defaults and (try self.take("functions") or try self.take("routines"));
             const large_object = !out.schema and postgres and try self.take("large");
-            if (defaults and !large_object) return error.UnsupportedStatement;
+            if (defaults and !large_object and !out.routine_defaults) return error.UnsupportedStatement;
             if (large_object) try self.expect(if (defaults) "objects" else "object");
             if (!out.schema and !large_object and (self.word("sequence") or self.word("database") or self.word("function") or self.word("procedure") or
                 self.word("routine") or self.word("language") or self.word("type") or self.word("domain") or self.word("foreign") or
@@ -1194,13 +1208,18 @@ const Parser = struct {
                     out.large_object_count += 1;
                     if (!try self.takeSymbol(.comma)) break;
                 }
+            } else if (out.routine_defaults) {
+                if (out.membership) return error.Syntax;
+                if (privileges & ~priv_execute != 0) return error.InvalidGrantOperation;
+                out.privileges = if (all) priv_execute else privileges;
+                out.all_privileges = all;
             } else if (out.schema) {
                 if (all or privileges != priv_schema_usage) return error.UnsupportedStatement;
             } else {
                 if (privileges & ~table_privileges != 0) return error.UnsupportedStatement;
                 _ = try self.take("table");
             }
-            if (!large_object) {
+            if (!large_object and !out.routine_defaults) {
                 out.privileges = if (all) table_privileges else privileges;
                 while (true) {
                     if (out.table_count == list_capacity) return error.ProgramLimitExceeded;
@@ -1567,7 +1586,7 @@ pub fn Objects(comptime config: types.Config) type {
             pub fn oidWidth(self: *const Object) u32 {
                 if (self.kind == .composite_type) return 3;
                 if (userType(self.kind)) return 2 + @as(u32, self.enum_label_count);
-                if (self.kind == .large_object_default_acl) return @intFromBool(self.oid != 0);
+                if (defaultAcl(self.kind)) return @intFromBool(self.oid != 0);
                 return @intFromBool(ownsOid(self.kind));
             }
 
@@ -1642,7 +1661,7 @@ pub fn Objects(comptime config: types.Config) type {
                 .role, .policy, .fdw, .server, .publication, .statistics => a.oid == b.oid,
                 .publication_table, .publication_schema => a.oid == b.oid and a.target == b.target and a.grantee == b.grantee,
                 .domain, .enum_type, .composite_type => a.oid == b.oid and a.target == b.target,
-                .member, .acl, .schema_acl, .large_object_default_acl => a.target == b.target and a.grantee == b.grantee,
+                .member, .acl, .schema_acl, .large_object_default_acl, .routine_default_acl => a.target == b.target and a.grantee == b.grantee,
                 .large_object_acl, .builtin_routine_acl => a.target == b.target and a.grantee == b.grantee and a.sub == b.sub,
                 .relation, .schema_acl_state, .schema_owner, .role_settings, .large_object => a.target == b.target,
                 .comment => a.grantee == b.grantee and a.target == b.target and a.sub == b.sub,
@@ -2039,7 +2058,7 @@ pub fn Objects(comptime config: types.Config) type {
 
         fn decodeKind(cursor: Cursor) Error!Kind {
             const raw = try cursor.int(u8);
-            if (raw < 1 or raw > @intFromEnum(Kind.builtin_routine_acl)) return error.InvalidChangeRecord;
+            if (raw < 1 or raw > @intFromEnum(Kind.routine_default_acl)) return error.InvalidChangeRecord;
             return @enumFromInt(raw);
         }
 
@@ -2068,7 +2087,7 @@ pub fn Objects(comptime config: types.Config) type {
                 // put their grantor OID in that key field, including in drops.
                 .large_object_acl => o.oid == 0 and o.target != 0,
                 .builtin_routine_acl => o.oid == 0 and restrictedRoutine(o.target),
-                .large_object_default_acl => o.target != 0 and o.sub == 0 and
+                .large_object_default_acl, .routine_default_acl => o.target != 0 and o.sub == 0 and
                     ((o.oid != 0) == (o.target == o.grantee)),
                 .relation, .schema_acl_state, .schema_owner, .role_settings, .large_object => o.oid == 0 and o.target != 0 and o.grantee == 0 and o.sub == 0,
                 .comment => o.oid == 0 and o.target != 0 and o.sub >= 0 and switch (o.grantee) {
@@ -2132,6 +2151,11 @@ pub fn Objects(comptime config: types.Config) type {
                     o.text_len == 0 and o.split == 0 and (o.oid != 0 or o.flags != 0) and
                     o.flags & ~large_object_privileges == 0 and o.grant_flags & ~o.flags == 0 and
                     (o.grantee != public_role or o.grant_flags == 0),
+                .routine_default_acl => !has_name and o.owner == o.target and o.role_count == 0 and
+                    o.text_len == 0 and o.split == 0 and o.grantee != public_role and
+                    (o.oid != 0 or o.flags != 0) and
+                    o.flags & ~(priv_execute | (if (o.oid != 0) routine_default_public else @as(u32, 0))) == 0 and
+                    o.grant_flags & ~priv_execute == 0 and o.grant_flags & ~o.flags == 0,
                 .builtin_routine_acl => !has_name and o.owner != 0 and o.role_count == 0 and o.text_len == 0 and o.split == 0 and
                     o.sub == (if (o.owner == bootstrap_role) @as(i32, 0) else @as(i32, @bitCast(o.owner))) and
                     (o.flags != 0 or (o.owner == bootstrap_role and o.grantee == bootstrap_role)) and
@@ -2378,7 +2402,7 @@ pub fn Objects(comptime config: types.Config) type {
                     if (!v.live) continue;
                     const existing = asObject(v);
                     if (!sameKey(&existing, key)) continue;
-                    if (v.kind == .large_object_default_acl and v.oid != key.oid) return error.ChangeRecordConflict;
+                    if (defaultAcl(v.kind) and v.oid != key.oid) return error.ChangeRecordConflict;
                     v.* = .{};
                     return;
                 }
@@ -2432,11 +2456,11 @@ pub fn Objects(comptime config: types.Config) type {
                         if ((v.sub == 0) != (large_owner == v.owner) or
                             (grantee != public_role and !self.roleExists(grantee))) return error.ChangeRecordConflict;
                     },
-                    .large_object_default_acl => {
+                    .large_object_default_acl, .routine_default_acl => {
                         if (grantee != public_role and !self.roleExists(grantee)) return error.ChangeRecordConflict;
                         if (v.oid == 0) {
                             for (&self.items) |*entry| {
-                                if (entry.live and entry.kind == .large_object_default_acl and
+                                if (entry.live and entry.kind == v.kind and
                                     entry.target == target and entry.oid != 0) break;
                             } else return error.ChangeRecordConflict;
                         }

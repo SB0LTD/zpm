@@ -1,5 +1,40 @@
 # SQL conformance TDD checkpoint
 
+## Global routine default privileges — 27 November 2026 candidate
+
+The failing contract reproduced ALTER DEFAULT PRIVILEGES rejecting EXECUTE on
+FUNCTIONS/ROUTINES. Global GRANT/REVOKE now applies to newly created functions
+and procedures for the actual creating role, including FOR ROLE/USER lists,
+PUBLIC and grant options. Existing routines and CREATE OR REPLACE retain their
+ACLs. Restoring the built-in defaults removes the redundant pg_default_acl row.
+Typed `f` default ACLs use caller-owned value storage, including ACLs larger than
+an inline text cell. Role dependencies, read-only rejection, rollback, exhausted
+routine ACL budgets and malformed WAL are covered. A failed CREATE does not
+publish a routine or consume its OID when the default ACL exceeds its budget.
+
+Routine defaults use catalog kind 24; existing kind encodings are unchanged.
+Replay rejects invalid option/flag combinations, absent roles and orphaned
+scope entries before publication. Compact format RSBASE09 adds a checked routine
+default section, retaining readers for RSBASE01–08 and preserving older output
+formats when no routine defaults exist. The checkpoint contract restores defaults
+before creating a new routine and delegating its EXECUTE privilege. Live routines,
+triggers and rules remain explicitly unsupported in compact snapshots; the
+writer fails before emitting bytes rather than discarding them.
+
+Creators read the latest committed defaults plus their own preceding commands.
+They do not wait for an unrelated, uncommitted default-ACL edit. Routine creation
+now checks pending changes to its owner role instead of all objects owned by that
+role. A two-transaction contract and a live native comparison cover this path.
+Local Windows Debug passes 968 routine assertions with 264 records replayed;
+the expanded wide-cell checkpoint contract passed 2,510 assertions. CI must still
+qualify Debug/ReleaseSafe on the 4 MiB stack, all 106 PostgreSQL smoke programs,
+and stock PG16/18 archives in both directions before merge.
+
+Per-schema routine defaults, other default-privilege object classes, other routine
+namespaces, broader role semantics and full routine/catalog snapshot parity remain
+open. This candidate does not close the complete privilege family.
+[PostgreSQL 18 default privileges](https://www.postgresql.org/docs/18/sql-alterdefaultprivileges.html)
+
 ## Qualified routine resolution — 27 November 2026
 
 The failing contract reproduced `public`-qualified expression calls, CALL and

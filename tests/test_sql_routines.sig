@@ -34,6 +34,7 @@ fn check(ok: bool) !void {
 }
 
 var text_buffer: [16384]u8 = undefined;
+var query_values: [DB.Result.value_bytes]u8 = undefined;
 /// Rows as `a|b;c|d`, NULL for null cells (PostgreSQL text output).
 fn render(result: *const DB.Result) ![]const u8 {
     var at: usize = 0;
@@ -64,6 +65,7 @@ fn same(got: []const u8, wanted: []const u8) !void {
 
 fn query(target: *DB, source: []const u8) ![]const u8 {
     var result: DB.Result = .{};
+    result.bindValueMemory(&query_values);
     target.execute(source, &result) catch |err| {
         std.debug.print("{s}: {s}\n", .{ source, @errorName(err) });
         return err;
@@ -1090,6 +1092,20 @@ fn routineGrantCapacity() !void {
     try check(result.rows[0].cells[0].integer == 1);
 }
 
+fn routineDefaultCapacity() !void {
+    const Defaults = sql.Database(.{ .tables = 1, .columns = 2, .rows_per_table = 1, .work_rows = 8, .result_rows = 1, .expr_nodes = 128, .catalog_objects = 8, .routines = 1, .routine_acl_entries = 1 });
+    var limited_defaults: Defaults = .{};
+    var result: Defaults.Result = .{};
+    try limited_defaults.execute("CREATE ROLE default_a", &result);
+    try limited_defaults.execute("CREATE ROLE default_b", &result);
+    try limited_defaults.execute("ALTER DEFAULT PRIVILEGES GRANT EXECUTE ON FUNCTIONS TO default_a,default_b", &result);
+    const before = limited_defaults.oid_counter;
+    if (limited_defaults.execute("CREATE FUNCTION default_overflow() RETURNS INT LANGUAGE SQL AS 'SELECT 1'", &result)) |_| return error.DefaultRoutineAclCapacityIgnored else |err| try check(err == error.ProgramLimitExceeded);
+    try check(limited_defaults.oid_counter == before);
+    try limited_defaults.execute("SELECT count(*) FROM pg_proc WHERE proname='default_overflow'", &result);
+    try check(result.rows[0].cells[0].integer == 0 and limited_defaults.usage().transactions == 0);
+}
+
 fn routineReadOnly() !void {
     reset();
     try run("CREATE ROLE read_guest");
@@ -1166,6 +1182,122 @@ fn routineQualification() !void {
     try sameState(&.{"SELECT count(*) FROM pg_proc WHERE pronamespace=2200"});
 }
 
+fn routineDefaultPrivileges() !void {
+    reset();
+    try run("CREATE ROLE default_reader");
+    try run("CREATE ROLE default_leaf");
+    try run("CREATE ROLE default_owner SUPERUSER");
+    try run("CREATE FUNCTION before_default() RETURNS INT LANGUAGE SQL AS 'SELECT 11'");
+    try run("ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC");
+    try run("ALTER DEFAULT PRIVILEGES GRANT EXECUTE ON ROUTINES TO default_reader WITH GRANT OPTION");
+    try run("CREATE FUNCTION with_default() RETURNS INT LANGUAGE SQL AS 'SELECT 22'");
+    try run("CREATE PROCEDURE proc_default() LANGUAGE SQL AS 'SELECT 1'");
+    const acl = "SELECT proacl::text FROM pg_proc WHERE proname='with_default'";
+    try expect(acl, "{ramsql=X/ramsql,default_reader=X*/ramsql}");
+    try expect("SELECT defaclobjtype::text,defaclnamespace FROM pg_default_acl", "f|0");
+    try run("SET ROLE default_reader");
+    try expect("SELECT before_default(),with_default()", "11|22");
+    try run("CALL proc_default()");
+    try run("GRANT EXECUTE ON FUNCTION with_default() TO default_leaf");
+    try run("RESET ROLE");
+    try run("ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM default_reader");
+    try run("CREATE FUNCTION no_default() RETURNS INT LANGUAGE SQL AS 'SELECT 33'");
+    try run("SET ROLE default_reader");
+    try fails("SELECT no_default()", error.InsufficientPrivilege);
+    try expect("SELECT with_default()", "22");
+    try run("RESET ROLE");
+    try run("SET ROLE default_leaf");
+    try expect("SELECT with_default()", "22");
+    try run("RESET ROLE");
+    try run("ALTER DEFAULT PRIVILEGES GRANT EXECUTE ON ROUTINES TO PUBLIC");
+    try expect("SELECT count(*) FROM pg_default_acl WHERE defaclobjtype='f'", "0");
+    try run("CREATE FUNCTION reset_default() RETURNS INT LANGUAGE SQL AS 'SELECT 44'");
+    try expect("SELECT proacl IS NULL FROM pg_proc WHERE proname='reset_default'", "t");
+    try run("ALTER DEFAULT PRIVILEGES FOR ROLE default_owner REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC");
+    try run("SET ROLE default_owner");
+    try run("CREATE FUNCTION owner_default() RETURNS INT LANGUAGE SQL AS 'SELECT 55'");
+    try run("RESET ROLE");
+    try expect("SELECT proacl::text FROM pg_proc WHERE proname='owner_default'", "{default_owner=X/default_owner}");
+    const pending = try db.begin();
+    try statement(pending, "ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC");
+    db.abort(pending);
+    try run("CREATE FUNCTION rolled_default() RETURNS INT LANGUAGE SQL AS 'SELECT 66'");
+    try expect("SELECT proacl IS NULL FROM pg_proc WHERE proname='rolled_default'", "t");
+    try fails("ALTER DEFAULT PRIVILEGES GRANT EXECUTE ON FUNCTIONS TO PUBLIC WITH GRANT OPTION", error.InvalidGrantOperation);
+    try fails("ALTER DEFAULT PRIVILEGES GRANT SELECT ON FUNCTIONS TO default_reader", error.InvalidGrantOperation);
+    try fails("ALTER DEFAULT PRIVILEGES GRANT EXECUTE ON FUNCTIONS TO missing_default_role", error.UndefinedObject);
+    try run("SET ROLE default_reader");
+    try fails("ALTER DEFAULT PRIVILEGES FOR ROLE default_owner GRANT EXECUTE ON FUNCTIONS TO default_leaf", error.InsufficientPrivilege);
+    try run("RESET ROLE");
+    const reader = try db.begin();
+    try db.beginModes(reader, .{ .read_only = true });
+    try statementFails(reader, "ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC", error.ReadOnlyTransaction);
+    db.abort(reader);
+    const writer = try db.begin();
+    try statement(writer, "ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC");
+    const creator = try db.begin();
+    try statement(creator, "CREATE FUNCTION concurrent_default() RETURNS INT LANGUAGE SQL AS 'SELECT 77'");
+    try commit(creator);
+    db.abort(writer);
+    try expect("SELECT proacl IS NULL FROM pg_proc WHERE proname='concurrent_default'", "t");
+    try run("CREATE ROLE default_only");
+    try run("ALTER DEFAULT PRIVILEGES GRANT EXECUTE ON FUNCTIONS TO default_only");
+    try fails("DROP ROLE default_only", error.DependentObjects);
+    try run("ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM default_only");
+    try run("DROP ROLE default_only");
+    try run("CREATE ROLE default_acl_aaaaaaaaaaaaaaaaaaaa");
+    try run("CREATE ROLE default_acl_bbbbbbbbbbbbbbbbbbbb");
+    try run("CREATE ROLE default_acl_cccccccccccccccccccc");
+    const wide_roles = "default_acl_aaaaaaaaaaaaaaaaaaaa,default_acl_bbbbbbbbbbbbbbbbbbbb,default_acl_cccccccccccccccccccc";
+    try run("ALTER DEFAULT PRIVILEGES GRANT EXECUTE ON FUNCTIONS TO " ++ wide_roles);
+    try expect("SELECT length(defaclacl::text)>128 FROM pg_default_acl WHERE defaclrole=10", "t");
+    try run("CREATE FUNCTION wide_default() RETURNS INT LANGUAGE SQL AS 'SELECT 88'");
+    try expect("SELECT length(proacl::text)>128 FROM pg_proc WHERE proname='wide_default'", "t");
+    try run("ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM " ++ wide_roles);
+    try sameState(&.{acl, "SELECT defaclobjtype::text,defaclacl::text FROM pg_default_acl ORDER BY defaclrole", "SELECT proname,proacl::text FROM pg_proc WHERE pronamespace=2200 ORDER BY proname"});
+}
+
+fn routineDefaultWalValidation() !void {
+    reset();
+    try run("CREATE ROLE wal_default");
+    try run("CREATE ROLE wal_scope");
+    var result: DB.Result = .{};
+    try db.execute("SELECT oid FROM pg_roles WHERE rolname='wal_default'", &result);
+    const grantee: u32 = @intCast(result.rows[0].cells[0].integer);
+    try db.execute("SELECT oid FROM pg_roles WHERE rolname='wal_scope'", &result);
+    const scope: u32 = @intCast(result.rows[0].cells[0].integer);
+    var used: usize = 0;
+    try db.executeChanges("ALTER DEFAULT PRIVILEGES GRANT EXECUTE ON FUNCTIONS TO wal_default WITH GRANT OPTION", &result, &record, &used, null, null);
+    // Object kind, OID, owner-role target, grantee, sub-key, grantor.
+    var key: [21]u8 = @splat(0);
+    key[0] = 24;
+    std.mem.writeInt(u32, key[5..9], 10, .little);
+    std.mem.writeInt(u32, key[9..13], grantee, .little);
+    std.mem.writeInt(u32, key[17..21], 10, .little);
+    try check(std.mem.count(u8, record[0..used], &key) == 1);
+    const at = std.mem.indexOf(u8, record[0..used], &key).?;
+    const before = replica.csn;
+    var bad: [65536]u8 = undefined;
+    for (0..3) |variant| {
+        @memcpy(bad[0..used], record[0..used]);
+        switch (variant) {
+            0 => std.mem.writeInt(u32, bad[at + 21 ..][0..4], (1 << 31) | (1 << 7), .little),
+            1 => std.mem.writeInt(u32, bad[at + 9 ..][0..4], 0x0fffffff, .little),
+            else => {
+                std.mem.writeInt(u32, bad[at + 5 ..][0..4], scope, .little);
+                std.mem.writeInt(u32, bad[at + 17 ..][0..4], scope, .little);
+            },
+        }
+        if (replica.applyChangeRecord(bad[0..used], &scratch)) |_| return error.InvalidRoutineDefaultsAccepted else |err|
+            try check(err == if (variant == 0) error.InvalidChangeRecord else error.ChangeRecordConflict);
+        try check(replica.csn == before);
+        try same(try query(&replica, "SELECT count(*) FROM pg_default_acl"), "0");
+    }
+    try replica.applyChangeRecord(record[0..used], &scratch);
+    records_applied += 1;
+    try sameState(&.{"SELECT defaclacl::text FROM pg_default_acl WHERE defaclobjtype='f'"});
+}
+
 pub fn main() !void {
     try routineDiscovery();
     try executeLists();
@@ -1174,6 +1306,9 @@ pub fn main() !void {
     try routineGrantCapacity();
     try routineReadOnly();
     try routineQualification();
+    try routineDefaultPrivileges();
+    try routineDefaultCapacity();
+    try routineDefaultWalValidation();
     try bodyValidationSetting();
     try oraclePrograms();
     try sqlFunctions();
