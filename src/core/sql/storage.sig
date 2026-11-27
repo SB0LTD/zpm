@@ -1182,16 +1182,15 @@ pub fn Storage(comptime config: types.Config) type {
         }
 
         /// Ordered index admission of a new version (before it is created):
-        /// the entry's key and INCLUDE bytes stay within index_key_bytes and
-        /// every tree can still split along a full path (IndexCapacity, 54000).
+        /// the entry's key and INCLUDE bytes stay within index_key_bytes
+        /// (IndexCapacity, 54000). Nodes need no check: indexRoom keeps the
+        /// entries within the count the arena holds in its worst case, and
+        /// an insert allocates only nodes of the resulting tree.
         pub fn admitVersion(table: *const Table, cells: []const V.Cell) Error!void {
             if (comptime !index_storage) return;
-            for (table.indexes[0..table.index_count], 0..) |*index, which| {
+            for (table.indexes[0..table.index_count]) |*index| {
                 if (index.hash) continue;
                 if (entryBytes(index, cells) > config.index_key_bytes) return error.IndexCapacity;
-                if (!hasIndexHash(table, which)) continue;
-                const run = runConst(table, which);
-                if (freeNodes(run) < nodeConst(run, 0)[meta_height] + 1) return error.IndexCapacity;
             }
         }
 
@@ -1211,6 +1210,34 @@ pub fn Storage(comptime config: types.Config) type {
                 span.cells[span.eq] = cells[column];
                 span.eq += 1;
             }
+        }
+
+        /// A walk of one hash chain of hash index `which` (B11 wave 5:
+        /// equality lookups through USING hash).
+        pub const HashScan = struct { position: usize = 0, mask: usize = 0, live: bool = false };
+
+        pub fn hashScan(table: *const Table, which: usize, cells: *const [config.columns]V.Cell) HashScan {
+            if (comptime !index_storage) return .{};
+            if (!hasIndexHash(table, which) or !table.indexes[which].hash) return .{};
+            const slots = slotsConst(table, which);
+            const mask = slots.len - 1;
+            return .{ .position = secondaryHash(&table.indexes[which], cells, mask), .mask = mask, .live = true };
+        }
+
+        /// The next version on the chain whose plain key columns equal
+        /// `cells` (visible or not), in no particular order.
+        pub fn hashNext(table: *const Table, which: usize, cells: *const [config.columns]V.Cell, scan: *HashScan) ?u32 {
+            var row_scratch: VersionRowScratch = undefined;
+            if (comptime !index_storage) return null;
+            if (!scan.live) return null;
+            const slots = slotsConst(table, which);
+            while (slots[scan.position] != 0) {
+                const entry = slots[scan.position] - 1;
+                scan.position = (scan.position + 1) & scan.mask;
+                if (plainKeyEqual(&table.indexes[which], borrowVersionRow(table, entry, &row_scratch), cells)) return entry;
+            }
+            scan.live = false;
+            return null;
         }
 
         /// Versions visible to `snap` whose plain key columns of index
@@ -1436,15 +1463,6 @@ pub fn Storage(comptime config: types.Config) type {
             n[1] = meta[meta_free];
             meta[meta_free] = node;
             meta[meta_free_count] += 1;
-        }
-
-        /// Nodes a tree can still allocate.
-        fn freeNodes(run: []const u32) usize {
-            const meta = nodeConst(run, 0);
-            const capacity = run.len / node_words;
-            const high = @max(1, meta[meta_high]);
-            if (high > capacity) return 0;
-            return capacity - high + meta[meta_free_count];
         }
 
         fn treeCount(run: []const u32) usize {
@@ -1969,6 +1987,10 @@ pub fn Storage(comptime config: types.Config) type {
                 previous = node;
                 node = n[1];
             }
+            // The arena bound: nodes in use never exceed the worst case
+            // (half-full nodes) of the entry count.
+            const in_use = @max(1, meta[meta_high]) - 1 - meta[meta_free_count];
+            if (in_use > treeNodes(count)) return false;
             return count == table.version_used and count == meta[meta_entries];
         }
 

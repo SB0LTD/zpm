@@ -599,7 +599,190 @@ fn uniqueness() !void {
     try primary("DROP TABLE u");
 }
 
-pub fn main() !void {
+// ---- capacity ----------------------------------------------------------------
+
+fn small(entries: usize, depth: usize, key_bytes: usize) sql.Config {
+    return .{ .tables = 3, .columns = 3, .rows_per_table = 40, .versions_per_table = 96, .name_bytes = 32, .text_bytes = 64, .nulls_first_ascending = false, .integer_bits = 32, .transactions = 2, .index_fanout = 8, .index_entries = entries, .index_depth = depth, .index_key_bytes = key_bytes };
+}
+
+/// Node arena sized for 20 entries per index (index_entries).
+const Entries = sql.Database(small(20, 0, 2704));
+/// Height 2 at fanout 8: at most 2 x 4^2 - 1 = 31 entries.
+const Shallow = sql.Database(small(0, 2, 2704));
+/// Entries of at most 16 bytes of key and INCLUDE values.
+const Narrow = sql.Database(small(0, 0, 16));
+var entries_db: Entries = .{};
+var shallow_db: Shallow = .{};
+var narrow_db: Narrow = .{};
+var craft_db: Entries = .{};
+var craft_replica: Entries = .{};
+var craft_scratch: Entries.ReplayScratch = .{};
+var crafted_record: [1 << 16]u8 = undefined;
+
+fn run(target: anytype, source: []const u8) !void {
+    const T = @TypeOf(target.*);
+    var result: T.Result = .{};
+    statements += 1;
+    target.execute(source, &result) catch |err| {
+        std.debug.print("{s}: {s}\n", .{ source, @errorName(err) });
+        return err;
+    };
+}
+
+fn fill(target: anytype, table: []const u8, first: usize, count: usize) !void {
+    var text: [128]u8 = undefined;
+    for (first..first + count) |id| try run(target, try std.fmt.bufPrint(&text, "INSERT INTO {s} VALUES ({d}, {d})", .{ table, id, id % 7 }));
+}
+
+fn capacity() !void {
+    // Node arena: index_entries entries, then 54000 with nothing changed.
+    try run(&entries_db, "CREATE TABLE n (id INT PRIMARY KEY, a INT)");
+    try run(&entries_db, "CREATE INDEX n_a ON n (a)");
+    try fill(&entries_db, "n", 1, 20);
+    try rejects(&entries_db, "INSERT INTO n VALUES (21, 1)", error.IndexCapacity);
+    try rejects(&entries_db, "UPDATE n SET a = a + 1 WHERE id < 3", error.IndexCapacity);
+    try expect(&entries_db, "SELECT count(*), sum(a) FROM n", "20|63");
+    try valid(&entries_db, "n");
+    try run(&entries_db, "DELETE FROM n WHERE id > 15");
+    _ = entries_db.vacuum();
+    try rejects(&entries_db, "INSERT INTO n VALUES (16, 1), (17, 1), (18, 1), (19, 1), (20, 1), (21, 1)", error.IndexCapacity);
+    try expect(&entries_db, "SELECT count(*) FROM n", "15");
+    try fill(&entries_db, "n", 16, 5);
+    try valid(&entries_db, "n");
+    try run(&entries_db, "CREATE TABLE m (id INT PRIMARY KEY, a INT)");
+    try fill(&entries_db, "m", 1, 21);
+    try rejects(&entries_db, "CREATE INDEX m_a ON m (a)", error.IndexCapacity);
+    try expect(&entries_db, "SELECT count(*) FROM pg_indexes WHERE tablename = 'm'", "1");
+    // Depth: a height-2 tree holds 31 entries.
+    try run(&shallow_db, "CREATE TABLE d (id INT PRIMARY KEY, a INT)");
+    try run(&shallow_db, "CREATE INDEX d_a ON d (a DESC)");
+    try fill(&shallow_db, "d", 1, 31);
+    try valid(&shallow_db, "d");
+    try rejects(&shallow_db, "INSERT INTO d VALUES (32, 0)", error.IndexCapacity);
+    try expect(&shallow_db, "SELECT count(*) FROM d", "31");
+    try expect(&shallow_db, "SELECT id FROM d WHERE a = 6 ORDER BY id", "6;13;20;27");
+    try run(&shallow_db, "CREATE TABLE d2 (id INT PRIMARY KEY, a INT)");
+    try fill(&shallow_db, "d2", 1, 32);
+    try rejects(&shallow_db, "CREATE INDEX d2_a ON d2 (a)", error.IndexCapacity);
+    // Entry bytes: 16 bytes of key and INCLUDE values (PostgreSQL's index
+    // row size limit is 54000 too).
+    try run(&narrow_db, "CREATE TABLE k (id INT PRIMARY KEY, t TEXT, a INT)");
+    try run(&narrow_db, "CREATE INDEX k_t ON k (t)");
+    try run(&narrow_db, "INSERT INTO k VALUES (1, '0123456789abcdef', 1), (2, 'short', 2)");
+    try rejects(&narrow_db, "INSERT INTO k VALUES (3, '0123456789abcdefg', 3)", error.IndexCapacity);
+    try rejects(&narrow_db, "UPDATE k SET t = t || 'x' WHERE id = 1", error.IndexCapacity);
+    try rejects(&narrow_db, "CREATE INDEX k_ta ON k (t, a)", error.IndexCapacity);
+    try rejects(&narrow_db, "CREATE INDEX k_ai ON k (a) INCLUDE (t)", error.IndexCapacity);
+    try expect(&narrow_db, "SELECT count(*) FROM pg_indexes WHERE tablename = 'k'", "2");
+    try run(&narrow_db, "CREATE TABLE kh (id INT PRIMARY KEY, t TEXT)");
+    try run(&narrow_db, "CREATE INDEX kh_t ON kh USING hash (t)");
+    try run(&narrow_db, "INSERT INTO kh VALUES (1, '0123456789abcdefghijklmnop')");
+    try expect(&narrow_db, "SELECT id FROM kh WHERE t = '0123456789abcdefghijklmnop'", "1");
+    try valid(&narrow_db, "k");
+}
+
+/// Index flag 4 (USING hash) round-trips; a crafted flag fails closed; a
+/// definition without the flag (any record logged before access methods
+/// were recorded) replays as an ordered index.
+fn craftedRecords() !void {
+    var result: Entries.Result = .{};
+    var used: usize = 0;
+    try craft_db.executeChanges("CREATE TABLE h (id INT PRIMARY KEY, a INT)", &result, &record, &used, null, null);
+    try craft_replica.applyChangeRecord(record[0..used], &craft_scratch);
+    used = 0;
+    try craft_db.executeChanges("CREATE INDEX crafted_h ON h USING hash (a)", &result, &record, &used, null, null);
+    const valid_record = record[0..used];
+    const at = (std.mem.indexOf(u8, valid_record, "\x09crafted_h") orelse return error.IndexNameNotLogged) + 10;
+    try check(valid_record[at] == 4);
+    for ([_]u8{ 8, 4 | 1, 4 | 8 }) |flags| {
+        @memcpy(crafted_record[0..used], valid_record);
+        crafted_record[at] = flags;
+        try check(craft_replica.applyChangeRecord(crafted_record[0..used], &craft_scratch) == error.InvalidChangeRecord);
+        try expect(&craft_replica, "SELECT count(*) FROM pg_indexes WHERE tablename = 'h'", "1");
+    }
+    @memcpy(crafted_record[0..used], valid_record);
+    crafted_record[at] = 0;
+    try craft_replica.applyChangeRecord(crafted_record[0..used], &craft_scratch);
+    try expect(&craft_replica, "SELECT indexdef FROM pg_indexes WHERE indexname = 'crafted_h'", "CREATE INDEX crafted_h ON public.h USING btree (a)");
+    try expect(&craft_db, "SELECT indexdef FROM pg_indexes WHERE indexname = 'crafted_h'", "CREATE INDEX crafted_h ON public.h USING hash (a)");
+    used = 0;
+    try craft_db.executeChanges("INSERT INTO h VALUES (1, 5), (2, 6), (3, 5)", &result, &record, &used, null, null);
+    try craft_replica.applyChangeRecord(record[0..used], &craft_scratch);
+    try expect(&craft_db, "SELECT id FROM h WHERE a = 5", "1;3");
+    try expect(&craft_replica, "SELECT id FROM h WHERE a = 5", "1;3");
+    try valid(&craft_replica, "h");
+}
+
+// ---- cost at 120k rows -------------------------------------------------------
+
+const Big = sql.Database(.{ .external_storage = true, .compact_integral_scans = true, .tables = 2, .columns = 4, .rows_per_table = 8, .name_bytes = 32, .text_bytes = 16, .nulls_first_ascending = false, .integer_bits = 32, .transactions = 2, .table_indexes = 2, .external_indexes = 2, .tx_writes = 8192, .work_rows = 8192, .result_rows = 256, .expr_nodes = 512 });
+const big_rows: usize = 120_000;
+/// CREATE TABLE lands in slot 0; CREATE INDEX copies the table into slot 1.
+const big_budget: [2]Big.TableBudget = .{ .{ .rows = 8, .versions = 16 }, .{ .rows = big_rows + 8, .versions = 2 * big_rows + 16 } };
+const big_refs: usize = 32768;
+const big_bytes: usize = Big.backingBytesFor(big_budget, big_refs) catch unreachable;
+var big: Big = .{};
+var big_region: [big_bytes]u8 align(64) = undefined;
+
+const Cost = struct { index_ns: u64, scan_ns: u64, entries: usize };
+
+fn elapsed(io: std.Io, start: std.Io.Timestamp) u64 {
+    const now = std.Io.Clock.awake.now(io);
+    return @intCast(now.nanoseconds - start.nanoseconds);
+}
+
+/// Runs the indexed and the scanned form `rounds` times each, checks they
+/// answer alike, and returns the mean time per statement.
+fn cost(io: std.Io, indexed: []const u8, scanned: []const u8, rounds: usize) !Cost {
+    var out: Cost = .{ .index_ns = 0, .scan_ns = 0, .entries = 0 };
+    const left = try query(&big, indexed, &text_buffer);
+    @memcpy(saved_buffer[0..left.len], left);
+    try same(try query(&big, scanned, &text_buffer), saved_buffer[0..left.len]);
+    const before = big.workspace.query.read_stats.index_entries;
+    var start = std.Io.Clock.awake.now(io);
+    for (0..rounds) |_| _ = try query(&big, indexed, &text_buffer);
+    out.index_ns = elapsed(io, start) / rounds;
+    out.entries = (big.workspace.query.read_stats.index_entries -% before);
+    start = std.Io.Clock.awake.now(io);
+    for (0..rounds) |_| _ = try query(&big, scanned, &text_buffer);
+    out.scan_ns = elapsed(io, start) / rounds;
+    return out;
+}
+
+var costs: [5]Cost = undefined;
+
+fn benchmark(io: std.Io) !void {
+    try big.bindMemoryFor(&big_region, big_budget, big_refs);
+    try run(&big, "CREATE TABLE big (id INT PRIMARY KEY, k INT, g INT, u INT)");
+    try run(&big, "CREATE INDEX big_k ON big (k)");
+    var text: [256]u8 = undefined;
+    var first: usize = 1;
+    while (first <= big_rows) : (first += 4000) {
+        try run(&big, try std.fmt.bufPrint(&text, "INSERT INTO big SELECT g, (g * 7919) % 120011, g % 1000, (g * 7919) % 120011 FROM generate_series({d}, {d}) g", .{ first, @min(first + 3999, big_rows) }));
+    }
+    try expect(&big, "SELECT count(*) FROM big", "120000");
+    try valid(&big, "big");
+    // k (indexed) and u (not indexed) hold the same values.
+    costs[0] = try cost(io, "SELECT id FROM big WHERE k = 77777", "SELECT id FROM big WHERE u = 77777", 200);
+    costs[1] = try cost(io, "SELECT id FROM big WHERE k BETWEEN 50000 AND 50099", "SELECT id FROM big WHERE u BETWEEN 50000 AND 50099", 50);
+    costs[2] = try cost(io, "SELECT id, k FROM big ORDER BY k DESC LIMIT 10", "SELECT id, u FROM big ORDER BY u DESC LIMIT 10", 20);
+    costs[3] = try cost(io, "SELECT min(k), max(k) FROM big", "SELECT min(u), max(u) FROM big", 20);
+    costs[4] = try cost(io, "SELECT count(*), sum(g) FROM big WHERE k >= 30000 AND k < 31200", "SELECT count(*), sum(g) FROM big WHERE u >= 30000 AND u < 31200", 10);
+    // An aggregate over more index rows than the workspace holds streams
+    // over a scan instead, with the same answer.
+    const wide = try query(&big, "SELECT count(*), sum(g) FROM big WHERE k >= 0 AND k < 60000", &text_buffer);
+    @memcpy(saved_buffer[0..wide.len], wide);
+    try same(try query(&big, "SELECT count(*), sum(g) FROM big WHERE u >= 0 AND u < 60000", &text_buffer), saved_buffer[0..wide.len]);
+    try same(saved_buffer[0..5], "59996");
+    // An index walk reads the entries of its range (plus one boundary
+    // entry), never the table.
+    try check(costs[0].entries <= 2 * 200 + 2);
+    try check(costs[1].entries <= 101 * 50 + 2);
+    try check(costs[2].entries <= 11 * 20 + 2);
+    try check(costs[0].index_ns < costs[0].scan_ns and costs[1].index_ns < costs[1].scan_ns and costs[2].index_ns < costs[2].scan_ns);
+}
+
+pub fn main(init: std.process.Init) !void {
     try accessMethods();
     try shapes();
     try randomized();
@@ -607,7 +790,17 @@ pub fn main() !void {
     try minMax();
     try joins();
     try uniqueness();
-    var buffer: [512]u8 = undefined;
-    const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-btree\",\"pass\":true,\"assertions\":{d},\"statements\":{d}}}\n", .{ assertions, statements });
+    try capacity();
+    try craftedRecords();
+    try benchmark(init.io);
+    var buffer: [1024]u8 = undefined;
+    const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-btree\",\"pass\":true,\"assertions\":{d},\"statements\":{d},\"rows\":{d}," ++
+        "\"probe_ns\":[{d},{d}],\"range100_ns\":[{d},{d}],\"top10_ns\":[{d},{d}],\"minmax_ns\":[{d},{d}],\"range1200_count_ns\":[{d},{d}]," ++
+        "\"index_bytes_per_version\":{d}}}\n", .{
+        assertions, statements, big_rows,
+        costs[0].index_ns, costs[0].scan_ns, costs[1].index_ns, costs[1].scan_ns, costs[2].index_ns, costs[2].scan_ns,
+        costs[3].index_ns, costs[3].scan_ns, costs[4].index_ns, costs[4].scan_ns,
+        (try Big.indexRunWords(1 << 19, big_budget[1].versions)) * 4 / big_budget[1].versions,
+    });
     std.debug.print("{s}", .{report});
 }

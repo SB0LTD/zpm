@@ -577,6 +577,9 @@ pub fn Binder(comptime config: types.Config) type {
             /// (primary keys) ignore it.
             index_probe: u16 = none,
             probe_index: u8 = no_index,
+            /// The only FROM item of a plan read through an ordered or hash
+            /// index (B11 wave 5): which = no_index scans.
+            index: IndexPath = .{},
             // Query composition (B11).
             /// A LATERAL derived table / table function, re-run per left row.
             lateral: bool = false,
@@ -5576,6 +5579,8 @@ pub fn Binder(comptime config: types.Config) type {
             covering: bool = false,
             /// Equality on every key column of a UNIQUE index.
             unique_lookup: bool = false,
+            /// A USING hash index: one equality (eq[0]), heap order.
+            hash: bool = false,
         };
 
         fn collectConjuncts(context: *const Context, root: u16, out: *[index_conjuncts]u16) usize {
@@ -5902,7 +5907,7 @@ pub fn Binder(comptime config: types.Config) type {
 
         /// The index path of ordered index `which` for these WHERE
         /// conjuncts, or null when it narrows nothing.
-        fn indexPathFor(context: *const Context, table: usize, which: usize, terms: []const u16, out: *const Select) ?IndexPath {
+        fn indexPathFor(context: *const Context, table: usize, which: usize, terms: []const u16, select: ?*const Select) ?IndexPath {
             const entry = &context.tables[table];
             const index = &entry.indexes[which];
             var path: IndexPath = .{ .which = @intCast(which) };
@@ -5958,14 +5963,16 @@ pub fn Binder(comptime config: types.Config) type {
                     } else if (nullTest(context, term, column, .is_not_null)) path.ranged = true;
                 };
             }
+            const narrows = path.eq_count != 0 or path.list != none or path.ranged;
+            path.unique_lookup = index.unique and path.eq_count == index.key_count;
+            // A query plan's FROM item: only the narrowing walk.
+            const out = select orelse return if (narrows) path else null;
             if (orderWalk(context, index, &path, out)) |backward| {
                 path.ordered = true;
                 path.backward = backward;
             }
-            const narrows = path.eq_count != 0 or path.list != none or path.ranged;
             // An ORDER BY alone uses the index for a LIMIT (top-N).
             if (!narrows and !(path.ordered and out.limit != 0xffffffffffffffff)) return null;
-            path.unique_lookup = index.unique and path.eq_count == index.key_count;
             var columns: u64 = 0;
             for (index.keyColumns()) |column| if (column < 64) {
                 columns |= @as(u64, 1) << @intCast(column);
@@ -5978,6 +5985,44 @@ pub fn Binder(comptime config: types.Config) type {
             for (out.order[0..out.order_count]) |*key| covering = covering and columnsWithin(context, key.expr, columns, 0);
             path.covering = covering;
             return path;
+        }
+
+        /// A hash index serves one `column = bound` (PostgreSQL hash
+        /// indexes return no tuples in order and no index-only data).
+        fn hashPathFor(context: *const Context, table: usize, which: usize, terms: []const u16) ?IndexPath {
+            const entry = &context.tables[table];
+            const column = entry.indexes[which].keys[0];
+            if (column == S.expression_key) return null;
+            for (terms) |term| {
+                const bound = equalityBound(context, entry, term, column) orelse continue;
+                var path: IndexPath = .{ .which = @intCast(which), .eq_count = 1, .hash = true };
+                path.eq[0] = bound;
+                return path;
+            }
+            return null;
+        }
+
+        /// The index walk of a query plan's only FROM item (B11 wave 5):
+        /// the item's rows come from the walk in heap order and the plan
+        /// filters them with its WHERE as it filters a scan.
+        fn planIndex(context: *const Context, table: usize, where: u16) IndexPath {
+            const entry = &context.tables[table];
+            if (entry.index_count == 0 or where == none) return .{};
+            var terms: [index_conjuncts]u16 = undefined;
+            const count = collectConjuncts(context, where, &terms);
+            var best: IndexPath = .{};
+            var best_score: usize = 0;
+            for (entry.indexes[0..entry.index_count], 0..) |*index, which| {
+                if (!S.hasIndexHash(entry, which)) continue;
+                const path = (if (index.hash) hashPathFor(context, table, which, terms[0..count]) else indexPathFor(context, table, which, terms[0..count], null)) orelse continue;
+                if (!predicateImplied(context, table, index, terms[0..count])) continue;
+                const score = pathScore(&path);
+                if (score > best_score) {
+                    best = path;
+                    best_score = score;
+                }
+            }
+            return best;
         }
 
         fn pathScore(path: *const IndexPath) usize {
@@ -5997,8 +6042,8 @@ pub fn Binder(comptime config: types.Config) type {
             var best: IndexPath = .{};
             var best_score: usize = 0;
             for (entry.indexes[0..entry.index_count], 0..) |*index, which| {
-                if (!S.hasIndexTree(entry, which)) continue;
-                const path = indexPathFor(context, table, which, terms[0..count], out) orelse continue;
+                if (!S.hasIndexHash(entry, which)) continue;
+                const path = (if (index.hash) hashPathFor(context, table, which, terms[0..count]) else indexPathFor(context, table, which, terms[0..count], out)) orelse continue;
                 if (!predicateImplied(context, table, index, terms[0..count])) continue;
                 const score = pathScore(&path);
                 if (score > best_score) {
@@ -9446,6 +9491,9 @@ pub fn Binder(comptime config: types.Config) type {
             p.source_count = q.item_count;
             try resolveWindows(context,q.window_defs);
             p.where = try bindWhere(context, &scope, q.where);
+            if (p.source_count == 1 and !p.general_join and p.sources[0].sample_method == 0 and !p.sources[0].lateral) if (p.sources[0].table) |table| {
+                p.sources[0].index = planIndex(context, table, p.where);
+            };
             for (q.group[0..q.group_count]) |expr_id| {
                 p.keys[p.key_count] = try groupKey(context, &scope, q, expr_id);
                 p.key_count += 1;
