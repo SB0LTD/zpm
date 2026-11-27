@@ -869,25 +869,38 @@ pub fn Eval(comptime config: types.Config) type {
                     out.len = reply.len;
                     return .{ .text = out };
                 },
+                // void results (B11 wave 4): the empty text of void_out.
+                .pg_notify => {
+                    if (args[0] == .null_value) return error.InvalidParameterValue;
+                    const payload = if (args[1] == .null_value) "" else args[1].text.slice();
+                    _ = try hook.call(hook.ptr, .notify, args[0].text.slice(), payload, 0, 0, 0, &out.bytes);
+                    return .{ .text = .{} };
+                },
+                .pg_advisory_unlock_all => {
+                    _ = try hook.call(hook.ptr, .advisory_unlock_all, "", "", 0, 0, 0, &out.bytes);
+                    return .{ .text = .{} };
+                },
                 else => {},
             }
             for (args[0..count]) |arg| if (arg == .null_value) return .null_value;
             var flags: u8 = 0;
             switch (n.func) {
-                .pg_try_advisory_lock_shared, .pg_try_advisory_xact_lock_shared, .pg_advisory_unlock_shared => flags |= 1,
+                .pg_try_advisory_lock_shared, .pg_try_advisory_xact_lock_shared, .pg_advisory_unlock_shared, .pg_advisory_lock_shared, .pg_advisory_xact_lock_shared => flags |= 1,
                 else => {},
             }
             switch (n.func) {
-                .pg_try_advisory_xact_lock, .pg_try_advisory_xact_lock_shared => flags |= 2,
+                .pg_try_advisory_xact_lock, .pg_try_advisory_xact_lock_shared, .pg_advisory_xact_lock, .pg_advisory_xact_lock_shared => flags |= 2,
                 else => {},
             }
             if (count == 2) flags |= 4;
             const kind: value_module.SessionCall = switch (n.func) {
                 .pg_advisory_unlock, .pg_advisory_unlock_shared => .advisory_unlock,
+                .pg_advisory_lock, .pg_advisory_lock_shared, .pg_advisory_xact_lock, .pg_advisory_xact_lock_shared => .advisory_lock,
                 else => .advisory_try_lock,
             };
             const second: i64 = if (count == 2) args[1].integer else 0;
             const reply = try hook.call(hook.ptr, kind, "", "", args[0].integer, second, flags, &out.bytes);
+            if (kind == .advisory_lock) return .{ .text = .{} };
             return .{ .boolean = reply.integer != 0 };
         }
 
@@ -1584,6 +1597,7 @@ pub fn Eval(comptime config: types.Config) type {
                 .jsonb_set, .jsonb_set_lax, .jsonb_insert, .jsonb_delete_path, .jsonb_strip_nulls, .jsonb_pretty, .to_json, .to_jsonb, .jsonb_path_exists, .jsonb_path_match, .jsonb_path_query_array, .jsonb_path_query_first, .jsonb_exists_any, .jsonb_exists_all, .jsonb_minus_op, .jsonb_delete_path_op, .jsonb_exists_any_op, .jsonb_exists_all_op, .jsonb_path_exists_op, .jsonb_path_match_op => return json_eval.JsonEval(config, @This()).call(ctx, n),
                 .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => return range_eval.RangeEval(config, @This()).call(ctx, n),
                 .current_setting, .set_config, .pg_try_advisory_lock, .pg_try_advisory_lock_shared, .pg_try_advisory_xact_lock, .pg_try_advisory_xact_lock_shared, .pg_advisory_unlock, .pg_advisory_unlock_shared, .pg_backend_pid, .pg_is_in_recovery => return sessionFunction(ctx, n),
+                .pg_notify, .pg_advisory_lock, .pg_advisory_lock_shared, .pg_advisory_xact_lock, .pg_advisory_xact_lock_shared, .pg_advisory_unlock_all => return sessionFunction(ctx, n),
                 .xmlparse, .xmlserialize, .xml_is_well_formed, .xml_is_well_formed_document, .xml_is_well_formed_content => {
                     const argument = try eval(ctx, n.b);
                     if (argument == .null_value) return .null_value;

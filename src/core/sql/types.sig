@@ -598,12 +598,15 @@ pub const Dialect = enum { postgres, mysql, tds };
 /// `integer32` int4 (INTEGER); the others are named after PostgreSQL.
 /// The unnamed values are array types: the element's ordinal with
 /// array_bit set (arrayData/elementData); there are no arrays of arrays.
-pub const DataType = enum(u8) { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, mysql_bigint_unsigned, pg_internal_char, aclitem, xid, regproc, _ };
+pub const DataType = enum(u8) { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, mysql_bigint_unsigned, pg_internal_char, aclitem, xid, regproc,
+    // B11 wave-4 types-ext: the void pseudo-type (function results only).
+    void, _ };
 
 /// Bound expression type. `unknown` is an untyped string or NULL literal
 /// that has not been resolved by context yet. Unnamed values are array
 /// types, encoded like DataType's (arrayType/elementType).
-pub const Type = enum(u8) { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, mysql_bigint_unsigned, pg_internal_char, aclitem, xid, regproc, _ };
+pub const Type = enum(u8) { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, mysql_bigint_unsigned, pg_internal_char, aclitem, xid, regproc,
+    void, _ };
 
 /// Array types set this bit over the element type's ordinal.
 pub const array_bit: u8 = 0x80;
@@ -619,7 +622,7 @@ pub const catalog_anyarray_oid: u32 = 2277;
 /// The array type of a named element type (null for an array).
 pub fn arrayData(element: DataType) ?DataType {
     const raw = @intFromEnum(element);
-    if (element == .mysql_bigint_unsigned or raw >= data_type_count) return null;
+    if (element == .mysql_bigint_unsigned or element == .void or raw >= data_type_count) return null;
     return @enumFromInt(raw | array_bit);
 }
 
@@ -628,12 +631,12 @@ pub fn elementData(data_type: DataType) ?DataType {
     const raw = @intFromEnum(data_type);
     if (raw < array_bit or raw & ~array_bit >= data_type_count) return null;
     const element: DataType = @enumFromInt(raw & ~array_bit);
-    return if (element == .mysql_bigint_unsigned) null else element;
+    return if (element == .mysql_bigint_unsigned or element == .void) null else element;
 }
 
 pub fn arrayType(element: Type) ?Type {
     const raw = @intFromEnum(element);
-    if (element == .unknown or element == .mysql_bigint_unsigned or raw >= type_count) return null;
+    if (element == .unknown or element == .mysql_bigint_unsigned or element == .void or raw >= type_count) return null;
     return @enumFromInt(raw | array_bit);
 }
 
@@ -641,11 +644,20 @@ pub fn elementType(ty: Type) ?Type {
     const raw = @intFromEnum(ty);
     if (raw < array_bit or raw & ~array_bit >= type_count or raw & ~array_bit == 0) return null;
     const element: Type = @enumFromInt(raw & ~array_bit);
-    return if (element == .mysql_bigint_unsigned) null else element;
+    return if (element == .mysql_bigint_unsigned or element == .void) null else element;
 }
 
 pub fn isArray(ty: Type) bool {
     return elementType(ty) != null;
+}
+
+/// Types of the B11 wave-4 types-ext lane without a btree or hash
+/// operator class: ORDER BY, GROUP BY and DISTINCT over them are 42883.
+pub fn unorderable(ty: Type) bool {
+    return switch (ty) {
+        .void => true,
+        else => false,
+    };
 }
 
 /// The subtype of a built-in range type (null otherwise).
@@ -729,6 +741,7 @@ pub fn dataTypeOf(ty: Type) DataType {
         .tsquery => .tsquery,
         .pg_internal_char => .pg_internal_char,
         .aclitem => .aclitem,
+        .void => .void,
         _ => if (elementType(ty)) |element| arrayData(dataTypeOf(element)).? else .text,
     };
 }
@@ -784,6 +797,7 @@ pub fn typeOfData(data_type: DataType) Type {
         .tsquery => .tsquery,
         .pg_internal_char => .pg_internal_char,
         .aclitem => .aclitem,
+        .void => .void,
         _ => if (elementData(data_type)) |element| arrayType(typeOfData(element)).? else .text,
     };
 }
@@ -895,6 +909,7 @@ fn baseInfo(data_type: DataType) TypeInfo {
         .regtype => .{ .oid = 2206, .name = "regtype", .len = 4, .category = 'N', .array = 2211 },
         .tsvector => .{ .oid = 3614, .name = "tsvector", .len = -1, .category = 'U', .array = 3643 },
         .tsquery => .{ .oid = 3615, .name = "tsquery", .len = -1, .category = 'U', .array = 3645 },
+        .void => .{ .oid = 2278, .name = "void", .len = 4, .category = 'P', .array = 0 },
         _ => .{ .oid = 0, .name = "", .len = -1, .category = 'A', .array = 0 },
     };
 }
@@ -978,6 +993,7 @@ fn baseSqlName(data_type: DataType) []const u8 {
         .tsquery => "tsquery",
         .aclitem => "aclitem",
         .pg_internal_char => "\"char\"",
+        .void => "void",
         _ => "",
     };
 }
@@ -1027,6 +1043,7 @@ pub fn typeInputName(data_type: DataType) []const u8 {
         .tsquery => "tsqueryin",
         .aclitem => "aclitemin",
         .pg_internal_char => "charin",
+        .void => "void_in",
         _ => "array_in",
     };
 }
@@ -1412,6 +1429,8 @@ pub fn Values(comptime config: Config) type {
                 .tsvector => .tsvector,
                 .tsquery => .tsquery,
                 .pg_internal_char => .pg_internal_char,
+                // void values are the empty text (void_out).
+                .void => .text,
                 _ => .array,
             };
         }

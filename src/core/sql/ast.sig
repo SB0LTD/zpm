@@ -137,7 +137,10 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     // is the regconfig name.
     to_tsvector, to_tsquery, plainto_tsquery, phraseto_tsquery, mysql_ifnull, mysql_date_add, mysql_last_insert_id, sind, cosd, acldefault, pg_encoding_to_char, current_schemas, array_remove, to_regproc,
     quote_ident, quote_literal, pg_get_userbyid, pg_tablespace_location,
-    pg_get_function_arguments, pg_get_function_identity_arguments, pg_get_function_result, pg_get_function_sqlbody };
+    pg_get_function_arguments, pg_get_function_identity_arguments, pg_get_function_result, pg_get_function_sqlbody,
+    // void-returning session functions (B11 wave-4 types-ext, Database
+    // session hook; volatile).
+    pg_notify, pg_advisory_lock, pg_advisory_lock_shared, pg_advisory_xact_lock, pg_advisory_xact_lock_shared, pg_advisory_unlock_all };
 
 /// JSON_TABLE column flags (Node.integer of a json_table_column).
 pub const JsonTableColumn = struct {
@@ -235,6 +238,7 @@ pub fn strictFunction(func: Func) bool {
         .current_timestamp, .current_date, .current_database, .current_schema, .current_schemas, .pg_encoding_to_char,
         .to_regtype, .to_regclass, .to_regproc, .pg_get_expr, .acldefault, .pg_get_userbyid, .pg_tablespace_location,
         .pg_get_function_arguments, .pg_get_function_identity_arguments, .pg_get_function_result, .pg_get_function_sqlbody,
+        .pg_advisory_lock, .pg_advisory_lock_shared, .pg_advisory_xact_lock, .pg_advisory_xact_lock_shared,
         .regclass_in, .regtype_in, .regclass_out, .regtype_out, .to_regnamespace, .regnamespace_in, .regnamespace_out => true,
         .lower, .upper, .initcap, .char_length, .octet_length, .bit_length, .substring, .btrim, .ltrim, .rtrim, .strpos, .replace,
         .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .overlay, .to_hex => true,

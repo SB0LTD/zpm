@@ -872,6 +872,7 @@ pub fn Binder(comptime config: types.Config) type {
             if (geometricType(left) or geometricType(right) or left == .xml or right == .xml) return error.UndefinedFunction;
             // tsvector / tsquery comparison operators are not provided.
             if (left == .tsvector or right == .tsvector or left == .tsquery or right == .tsquery) return error.UndefinedFunction;
+            if (types.unorderable(left) or types.unorderable(right)) return error.UndefinedFunction;
             if (left == right) return;
             if (value.integral(left) and value.integral(right)) return;
             if (context.legacy) {
@@ -1444,6 +1445,13 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "pg_advisory_unlock_shared", .func = .pg_advisory_unlock_shared },
                 .{ .name = "pg_backend_pid", .func = .pg_backend_pid },
                 .{ .name = "pg_is_in_recovery", .func = .pg_is_in_recovery },
+                // void-returning session functions (B11 wave-4 types-ext).
+                .{ .name = "pg_notify", .func = .pg_notify },
+                .{ .name = "pg_advisory_lock", .func = .pg_advisory_lock },
+                .{ .name = "pg_advisory_lock_shared", .func = .pg_advisory_lock_shared },
+                .{ .name = "pg_advisory_xact_lock", .func = .pg_advisory_xact_lock },
+                .{ .name = "pg_advisory_xact_lock_shared", .func = .pg_advisory_xact_lock_shared },
+                .{ .name = "pg_advisory_unlock_all", .func = .pg_advisory_unlock_all },
                 // JSONB and SQL/JSON path functions (B11 json-agg lane).
                 .{ .name = "jsonb_set", .func = .jsonb_set },       .{ .name = "jsonb_set_lax", .func = .jsonb_set_lax },
                 .{ .name = "jsonb_insert", .func = .jsonb_insert }, .{ .name = "jsonb_delete_path", .func = .jsonb_delete_path },
@@ -2478,6 +2486,20 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 .pg_try_advisory_lock, .pg_try_advisory_lock_shared, .pg_try_advisory_xact_lock, .pg_try_advisory_xact_lock_shared, .pg_advisory_unlock, .pg_advisory_unlock_shared => {
                     if (count == 2) try bindSignature(context, n, &[_]ast.Type{ .int4, .int4 }, .boolean, true) else try bindSignature(context, n, &[_]ast.Type{.int8}, .boolean, true);
+                    n.constant = false;
+                },
+                // Blocking advisory locks (strict) and pg_notify (not strict:
+                // a NULL channel is 22023, a NULL payload empty) return void.
+                .pg_advisory_lock, .pg_advisory_lock_shared, .pg_advisory_xact_lock, .pg_advisory_xact_lock_shared => {
+                    if (count == 2) try bindSignature(context, n, &[_]ast.Type{ .int4, .int4 }, .void, true) else try bindSignature(context, n, &[_]ast.Type{.int8}, .void, true);
+                    n.constant = false;
+                },
+                .pg_advisory_unlock_all => {
+                    try bindSignature(context, n, &[_]ast.Type{}, .void, true);
+                    n.constant = false;
+                },
+                .pg_notify => {
+                    try bindSignature(context, n, &[_]ast.Type{ .text, .text }, .void, false);
                     n.constant = false;
                 },
                 .pg_is_in_recovery => {
@@ -5418,6 +5440,8 @@ pub fn Binder(comptime config: types.Config) type {
             // value here; FROM binds them as table functions (0A000).
             if (!from and (routine.retset or routine.return_oid == routine_catalog.record_oid)) return error.UnsupportedStatement;
             const result: types.DataType = if (routine.return_oid == routine_catalog.record_oid) .text else types.typeFromOid(routine.return_oid) orelse return error.UnsupportedStatement;
+            // void routines stay outside expressions (the void type, B11 wave 4).
+            if (result == .void) return error.UnsupportedStatement;
             // One bound argument per input, in parameter order: converted
             // values, a DEFAULT placeholder, or ARRAY[...] of the variadic
             // elements.
@@ -6275,6 +6299,7 @@ pub fn Binder(comptime config: types.Config) type {
             // No btree or hash operator classes (could not identify an
             // ordering/equality operator: 42883).
             if (ty == .point or ty == .box or ty == .xml or ty == .jsonpath or ty == .tsvector or ty == .tsquery) return error.UndefinedFunction;
+            if (types.unorderable(ty)) return error.UndefinedFunction;
         }
 
         fn bindSetOp(context: *const Context, q: *const Ast.Select, parent: ?*const Scope, env: ?*const CteEnv) Error!u16 {

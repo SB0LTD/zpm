@@ -230,6 +230,12 @@ pub fn bitType(ty: Type) bool {
 
 /// pg_cast entries of the B11 types; null when the pair is not one of them.
 fn extendedCast(from: Type, to: Type, context: Context) ?bool {
+    if (from == .void or to == .void) {
+        // void (B11 wave 4): void_in/void_out only, by I/O conversion.
+        if (stringType(to)) return context != .implicit;
+        if (stringType(from)) return context == .explicit;
+        return false;
+    }
     if (to == .pg_internal_char) return switch (from) {
         .int4, .name => context == .explicit,
         .text, .varchar, .bpchar => context != .implicit,
@@ -421,6 +427,7 @@ pub fn comparisonType(a: Type, b: Type) ?Type {
     // point has no = operator and box compares only by area: neither has
     // ordinary comparison operators here.
     if (a == .point or b == .point or a == .box or b == .box) return null;
+    if (a == .void or b == .void) return null;
     // xml and jsonpath have no comparison operators; tsvector/tsquery have none here.
     if (a == .xml or b == .xml or a == .jsonpath or b == .jsonpath or a == .tsvector or b == .tsvector or a == .tsquery or b == .tsquery) return null;
     if (a != b and (a == .pg_internal_char or b == .pg_internal_char)) {
@@ -771,6 +778,8 @@ pub fn Io(comptime config: types.Config) type {
                 .regtype => .{ .regtype = try types.regtypeInput(input) },
                 .regproc => .{ .regproc = (try routineOid(session, input, true)) orelse return error.UndefinedFunction },
                 .aclitem => return error.UnsupportedStatement,
+                // void_in ignores its input.
+                .void => .{ .text = .{} },
                 .pg_internal_char => .{ .pg_internal_char = parseInternalChar(input) },
                 .tsvector, .tsquery => blk: {
                     var out: TS.Out = .{};
@@ -993,6 +1002,8 @@ pub fn Io(comptime config: types.Config) type {
             }
             const out: V.Cell = switch (to) {
                 .aclitem => return error.UnsupportedStatement,
+                // void_in ignores its input (I/O conversion from a string).
+                .void => V.Cell{ .text = .{} },
                 .pg_internal_char => switch (cell) {
                     .integer => |value| blk: {
                         if (value < -128 or value > 127) return error.NumericValueOutOfRange;

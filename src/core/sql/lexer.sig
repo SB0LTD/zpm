@@ -233,6 +233,8 @@ pub const Keyword = enum {
     jsonpath,
     tsvector,
     tsquery,
+    // B11 wave-4 types-ext.
+    void,
 };
 
 /// Words that cannot be unquoted identifiers.

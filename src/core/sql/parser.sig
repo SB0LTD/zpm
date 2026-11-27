@@ -1738,6 +1738,7 @@ pub fn Parser(comptime config: types.Config) type {
                 .integer, .int, .int4, .bigint, .int8, .smallint, .int2, .boolean, .@"bool", .text, .numeric, .decimal, .real, .float4, .float8, .float, .double, .name, .oid, .date, .timestamp, .timestamptz, .interval, .json, .jsonb, .regclass, .regtype, .regnamespace, .regproc => true,
                 .varchar, .character, .char, .bpchar, .uuid, .bytea, .time, .timetz, .bit, .varbit, .money => true,
                 .pg_lsn, .xid8, .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange, .inet, .cidr, .macaddr, .point, .box, .xml, .jsonpath, .tsvector, .tsquery => true,
+                .void => true,
                 else => false,
             };
         }
@@ -1880,7 +1881,7 @@ pub fn Parser(comptime config: types.Config) type {
             }
             if (array) {
                 if (ast.regKind(spec.typmod) != .none) return error.UnsupportedStatement;
-                if (!types.isArray(spec.ty)) spec.ty = types.arrayType(spec.ty) orelse return error.Syntax;
+                if (!types.isArray(spec.ty)) spec.ty = types.arrayType(spec.ty) orelse return if (spec.ty == .void) error.UndefinedObject else error.Syntax;
             }
             return spec;
         }
@@ -1982,6 +1983,7 @@ pub fn Parser(comptime config: types.Config) type {
                 .jsonpath => .{ .ty = .jsonpath },
                 .tsvector => .{ .ty = .tsvector },
                 .tsquery => .{ .ty = .tsquery },
+                .void => .{ .ty = .void },
                 .character, .char => blk: {
                     const varying = try self.takeWord("VARYING");
                     break :blk .{ .ty = if (varying) .varchar else .bpchar, .typmod = try self.characterLength(!varying) };
@@ -2318,6 +2320,8 @@ pub fn Parser(comptime config: types.Config) type {
                 const spec = try self.typeName();
                 // regclass/regtype columns are outside the subset.
                 if (spec.typmod < -1) return error.UnsupportedStatement;
+                // A column cannot have the void pseudo-type (42P16).
+                if (spec.ty == .void) return error.InvalidTableDefinition;
                 column.type_name = if (mysql_bigint and spec.ty == .int8 and try self.takeRaw("unsigned")) .mysql_bigint_unsigned else spec.ty;
                 column.typmod = spec.typmod;
             }

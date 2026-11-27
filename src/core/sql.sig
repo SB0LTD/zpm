@@ -8017,7 +8017,8 @@ pub fn Database(comptime config: Config) type {
                     }
                     // Reuse the wide row temporary across type entries.
                     for (std.enums.values(DataType)) |data_type| {
-                        if (data_type == .mysql_bigint_unsigned) continue;
+                        // void is a builtin pseudo-type row above.
+                        if (data_type == .mysql_bigint_unsigned or data_type == .void) continue;
                         const info = types.typeInfo(data_type);
                         const category: [1]u8 = .{info.category};
                         const type_collation = intCell(collation.typeCollation(types.typeOfData(data_type)));
@@ -12327,7 +12328,7 @@ pub fn Database(comptime config: Config) type {
                     self.installRole();
                     return .{ .len = try self.settingText(slot, a, out) };
                 },
-                .advisory_try_lock, .advisory_unlock => {
+                .advisory_try_lock, .advisory_unlock, .advisory_lock => {
                     const raw: u64 = if (flags & 4 != 0) (@as(u64, @bitCast(x)) << 32) | (@as(u64, @bitCast(y)) & 0xffffffff) else @bitCast(x);
                     const key: locks_module.AdvisoryKey = .{ .key = @bitCast(raw), .pair = flags & 4 != 0 };
                     const state = self.sessionState();
@@ -12338,15 +12339,48 @@ pub fn Database(comptime config: Config) type {
                         return .{ .integer = if (released) 1 else 0 };
                     }
                     const xact = flags & 2 != 0;
+                    const tx = &self.txs[slot];
+                    const statement_tag = (@as(u64, tx.epoch) << 32) | tx.cid;
                     var waits: L.Set = .{};
                     var conflict = false;
-                    self.locks.advisoryHolders(key, state.id, exclusive, &.{}, &.{}, &waits, &conflict);
-                    if (conflict) return .{ .integer = 0 };
+                    if (kind == .advisory_lock) {
+                        // pg_advisory_lock[_xact][_shared] (B11 wave 4): wait
+                        // for the conflicting holders' transactions; a holder
+                        // outside a transaction wakes it through unlock.
+                        var sessions: [config.transactions]u64 = undefined;
+                        var holders: [config.transactions]?u16 = undefined;
+                        for (&self.txs, 0..) |*other, index| {
+                            sessions[index] = if (other.active) other.session else 0;
+                            holders[index] = if (other.active) @intCast(index) else null;
+                        }
+                        self.locks.advisoryHolders(key, state.id, exclusive, &holders, &sessions, &waits, &conflict);
+                        if (conflict) {
+                            self.locks.undoStatementAdvisory(state.id, statement_tag);
+                            return self.park(slot, waits);
+                        }
+                    } else {
+                        self.locks.advisoryHolders(key, state.id, exclusive, &.{}, &.{}, &waits, &conflict);
+                        if (conflict) return .{ .integer = 0 };
+                    }
                     const index = try self.locks.grantAdvisory(key, state.id, slot, xact, exclusive);
-                    if (xact) try M.recordLock(self, slot, .{ .kind = .advisory, .table = 0, .mode = if (exclusive) 1 else 0, .index = @intCast(index) });
+                    if (xact) {
+                        try M.recordLock(self, slot, .{ .kind = .advisory, .table = 0, .mode = if (exclusive) 1 else 0, .index = @intCast(index) });
+                    } else self.locks.noteStatementAdvisory(index, state.id, exclusive, statement_tag);
                     return .{ .integer = 1 };
                 },
-                else => return error.UnsupportedStatement,
+                .advisory_unlock_all => {
+                    self.locks.releaseAdvisoryAll(self.sessionState().id);
+                    self.wake_epoch +%= 1;
+                    return .{};
+                },
+                .notify => {
+                    // pg_notify(channel, payload): NOTIFY's queue entry, kept
+                    // with the statement (a failed statement drops it).
+                    const tx = &self.txs[slot];
+                    const state = self.sessionState();
+                    try self.notify.enqueue(slot, tx.epoch, tx.userSavepoints(), tx.cid, a, b, state.pid);
+                    return .{};
+                },
             }
         }
 
