@@ -11001,7 +11001,7 @@ pub fn Binder(comptime config: types.Config) type {
             }
             const text = create.text.slice(context.source);
             out.extras.relkind = if (create.materialized) 'm' else 'v';
-            if (text.len > config.text_bytes) {
+            if (text.len > out.extras.query.bytes.len) {
                 out.extras.query.len = try lexer.compactDefinition(text, &out.extras.query.bytes);
             } else {
                 out.extras.query.len = text.len;

@@ -1583,6 +1583,37 @@ fn viewReplacement() !void {
     try expect("SELECT id,v,extra FROM replace_me ORDER BY id", "1|107|8;2|97|-2");
 }
 
+fn longViewDefinitions() !void {
+    reset();
+    try run("CREATE TABLE long_source(id INT,v INT)");
+    try run("INSERT INTO long_source VALUES (1,7),(2,-3)");
+    // This actual SELECT exceeds a default 128-byte data cell, without
+    // relying on removable comments or padding. Its metadata must own it.
+    try run("CREATE VIEW long_definition AS SELECT id,v FROM public.long_source WHERE long_source.id=1 OR long_source.id=2 OR long_source.id=3 OR long_source.id=4 OR long_source.id=5 OR long_source.id=6 OR long_source.id=7 OR long_source.id=8");
+    try expect("SELECT id,v FROM long_definition ORDER BY id", "1|7;2|-3");
+    try expect("SELECT length(pg_get_viewdef('long_definition'::regclass))>128", "t");
+    try expect("SELECT length(definition)>128 FROM pg_views WHERE viewname='long_definition'", "t");
+    var held: DB.Result = .{};
+    var held_values: [4096]u8 = undefined;
+    held.bindValueMemory(&held_values);
+    try db.execute("SELECT definition FROM pg_views WHERE viewname='long_definition'", &held);
+    try run("CREATE OR REPLACE VIEW long_definition AS SELECT id,v+1 AS v FROM public.long_source WHERE long_source.id=1 OR long_source.id=2 OR long_source.id=3 OR long_source.id=4 OR long_source.id=5 OR long_source.id=6 OR long_source.id=7 OR long_source.id=8");
+    try expect("SELECT id,v FROM long_definition ORDER BY id", "1|8;2|-2");
+    try run("CREATE MATERIALIZED VIEW long_materialized AS SELECT id,v*3 AS v FROM public.long_source WHERE long_source.id=1 OR long_source.id=2 OR long_source.id=3 OR long_source.id=4 OR long_source.id=5 OR long_source.id=6 OR long_source.id=7 OR long_source.id=8");
+    try expect("SELECT id,v FROM long_materialized ORDER BY id", "1|21;2|-9");
+    try expect("SELECT length(definition)>128 FROM pg_matviews WHERE matviewname='long_materialized'", "t");
+    try check(std.mem.startsWith(u8, held.rows[0].cells[0].text.slice(), "SELECT id,v FROM"));
+    var count: DB.Result = .{};
+    try db.execute("SELECT count(*) FROM pg_views", &count);
+    try check(count.rows[0].cells[0].integer == 1);
+    try sameState(&.{
+        "SELECT id,v FROM long_definition ORDER BY id",
+        "SELECT pg_get_viewdef('long_definition'::regclass)",
+        "SELECT pg_get_ruledef(oid) FROM pg_rewrite WHERE ev_class='long_definition'::regclass",
+        "SELECT id,v FROM long_materialized ORDER BY id",
+    });
+}
+
 fn viewReplacementWithHooks() !void {
     reset();
     try run("CREATE TABLE hook_source(id INT PRIMARY KEY,v INT)");
@@ -1660,6 +1691,7 @@ pub fn main() !void {
     try routineOwnership();
     try viewReplacement();
     try viewReplacementWithHooks();
+    try longViewDefinitions();
     try viewReturnRuleDiscovery();
     try ruleAndTriggerDiscovery();
     try bodyValidationSetting();

@@ -50,4 +50,16 @@ RamSQL's stock archive fixture exercises replacement and rollback on both native
 PostgreSQL and RamSQL, then checks plain/custom archives in both directions and
 deparsed return-rule actions. PG16 and PG18 CI must pass before merging.
 
+Stored view SQL now uses the query-expansion budget instead of a user cell's
+inline text budget. A real native dump containing a qualified CTE reproduced
+TextCapacity with 128-byte cells. Ordinary and materialized definitions now own
+up to max(text_bytes, expansion_bytes), capped at 65,535 bytes by the existing
+WAL length field; the default is 4,096 bytes. This is an explicit bounded
+metadata budget, not unlimited statement storage. Longer pg_views/pg_matviews
+definition cells use caller-owned result memory, including across replacement;
+unreferenced definition columns do not consume that memory. Contracts cover
+reads, replacement, materialization and WAL replay with genuine SQL over 128 bytes.
+Compact base images still reject view metadata; this change qualifies WAL replay,
+not complete checkpoint support for views.
+
 Reference: [PostgreSQL CREATE VIEW](https://www.postgresql.org/docs/18/sql-createview.html).

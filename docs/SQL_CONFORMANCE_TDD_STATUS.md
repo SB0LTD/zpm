@@ -2,6 +2,14 @@
 
 ## Integrated wave-4 reassessment — qualification pending, 27 November 2026
 
+Stronger local plain/custom stock archive fixtures found stored view SQL tied
+to the 128-byte inline data-cell budget. The candidate separates owned query
+metadata from cells and returns long catalog definitions through caller-owned
+result memory. The regression covers ordinary/materialized views, replacement,
+result lifetime and WAL replay. The existing 16-bit WAL length and configured
+query-expansion budget remain explicit bounds; compact base-image view support
+remains open. PG16/18 qualification is still required for this later candidate.
+
 The current candidate includes main b87c97a6: routine schemas/signatures and
 SECURITY DEFINER, nested SQL/updatable views/rule actions, extended types,
 regex/text-search/SQL-JSON, inheritance/partition DML, constraints, search_path

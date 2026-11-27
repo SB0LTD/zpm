@@ -7849,6 +7849,12 @@ pub fn Database(comptime config: Config) type {
             return .{ .text = text };
         }
 
+        fn definitionCell(bytes: []const u8, sink: *X.RowSink) Error!V.Cell {
+            if (bytes.len <= config.text_bytes) return nameCell(bytes);
+            const values = sink.valueBytes() orelse return error.WorkspaceCapacity;
+            return .{ .text = V.Text.fromValueBytes(try values.copy(bytes)) };
+        }
+
         fn intCell(value: i64) V.Cell {
             return .{ .integer = value };
         }
@@ -8567,10 +8573,12 @@ pub fn Database(comptime config: Config) type {
                             }
                         },
                         .pg_views => if (table.relkind == 'v') {
-                            try sink.add(&.{ nameCell(schema_name), nameCell(name), nameCell("ramsql"), nameCell(table.query.slice()) });
+                            const definition = if (sink.referencesColumn(3)) try definitionCell(table.query.slice(), sink) else V.Cell.null_value;
+                            try sink.add(&.{ nameCell(schema_name), nameCell(name), nameCell("ramsql"), definition });
                         },
                         .pg_matviews => if (table.relkind == 'm') {
-                            try sink.add(&.{ nameCell(schema_name), nameCell(name), nameCell("ramsql"), .null_value, boolCell(table.index_count != 0), boolCell(table.populated), nameCell(table.query.slice()) });
+                            const definition = if (sink.referencesColumn(6)) try definitionCell(table.query.slice(), sink) else V.Cell.null_value;
+                            try sink.add(&.{ nameCell(schema_name), nameCell(name), nameCell("ramsql"), .null_value, boolCell(table.index_count != 0), boolCell(table.populated), definition });
                         },
                         .pg_inherits => if (table.parent != 0) {
                             try sink.add(&.{ intCell(oid), intCell(table.parent), intCell(1), boolCell(false) });
@@ -8911,7 +8919,7 @@ pub fn Database(comptime config: Config) type {
             }
             const root = try P.parseQueryAt(source, 0, source.len, pool);
             const blocks = pool.queries[query_len..pool.query_len];
-            var changes: std.StaticBitSet(config.text_bytes + 1) = .empty;
+            var changes: std.StaticBitSet(S.query_capacity + 1) = .empty;
             for (blocks) |*block| for (block.items[0..block.item_count]) |*item| {
                 if (item.schema != null or item.query != ast.none or item.function != ast.none or item.name.len == 0) continue;
                 const name = identName(source, item.name);
