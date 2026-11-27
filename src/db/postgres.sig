@@ -576,7 +576,10 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             var writer: Writer = .{ .bytes = output };
             try failure(&writer, "54000", "SQL message exceeds the configured packet capacity");
             if (@hasDecl(DB, "failTransaction")) db.failTransaction();
-            if (self.oversize_tag == 'Q') try self.ready(db, &writer) else self.failed = true;
+            if (self.oversize_tag == 'Q') {
+                if (comptime @hasDecl(DB, "abortExtended")) db.abortExtended();
+                try self.ready(db, &writer);
+            } else self.failed = true;
             return .{ .consumed = prefix + consumed, .written = writer.at };
         }
 
@@ -629,7 +632,12 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                         db.finishSimpleQueryBatch(false) catch return error.BufferTooSmall;
                     };
                     if (@hasDecl(DB, "failTransaction")) db.failTransaction();
-                    if (tag == 'Q') try self.ready(db, &w) else self.failed = true;
+                    if (tag == 'Q' or tag == 'S') {
+                        if (comptime @hasDecl(DB, "abortExtended")) db.abortExtended();
+                        self.failed = false;
+                        if (tag == 'S') self.closeIdlePortals(db);
+                        try self.ready(db, &w);
+                    } else self.failed = true;
                     break :blk false;
                 };
             }
@@ -1042,10 +1050,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                         if (@as(anyerror, err) == error.TransactionTimeout) return err;
                         try failure(w, sqlstate(err), @errorName(err));
                     };
-                    if (!@hasDecl(DB, "transactionStatus") or db.transactionStatus() == 'I') {
-                        for (&self.portals) |*p| p.live = false;
-                        self.active_portal = null;
-                    }
+                    self.closeIdlePortals(db);
                     try self.ready(db, w);
                 },
                 'H' => {
@@ -1059,6 +1064,13 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             }
             return false;
         }
+        fn closeIdlePortals(self: *Self, db: *const DB) void {
+            if (!@hasDecl(DB, "transactionStatus") or db.transactionStatus() == 'I') {
+                for (&self.portals) |*p| p.live = false;
+                self.active_portal = null;
+            }
+        }
+
         fn executePortal(self: *Self, db: *DB, portal_value: *const Portal, limit: u32) !void {
             if (comptime has_primary_key) if (limit == 0) {
                 if (portal_value.primary_key) |*key| {
