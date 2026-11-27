@@ -2051,6 +2051,9 @@ pub fn Database(comptime config: Config) type {
         routine_definer: ?u32 = null,
         /// Running routines with SET clauses (transaction control is 2D000).
         routine_configured: usize = 0,
+        /// Settings saved by routines with SET clauses, one per nesting
+        /// level (kept off the stack).
+        routine_saved: [config.routine_depth]Sess.Values = undefined,
         /// Write-set index where the running statement's writes begin (its
         /// AFTER ROW triggers read them); kept across a park.
         statement_start: usize = 0,
@@ -13020,7 +13023,8 @@ pub fn Database(comptime config: Config) type {
             active: bool = false,
             settings: bool = false,
             definer: ?u32 = null,
-            values: Sess.Values = undefined,
+            /// routine_saved index (the routine's nesting level).
+            level: usize = 0,
         };
 
         fn enterScope(self: *Self, routine: *const RC.Routine, scope: *RoutineScope) Error!void {
@@ -13028,10 +13032,13 @@ pub fn Database(comptime config: Config) type {
             const state = self.sessionState();
             scope.definer = self.routine_definer;
             if (routine.setting_count != 0) {
-                scope.values = state.values;
-                var next = state.values;
-                try routineSettingValues(routine, &next);
-                state.values = next;
+                if (self.routine_depth == 0) return error.StackDepthExceeded;
+                scope.level = self.routine_depth - 1;
+                self.routine_saved[scope.level] = state.values;
+                routineSettingValues(routine, &state.values) catch |err| {
+                    state.values = self.routine_saved[scope.level];
+                    return err;
+                };
                 scope.settings = true;
                 self.routine_configured += 1;
             }
@@ -13043,7 +13050,7 @@ pub fn Database(comptime config: Config) type {
         fn leaveScope(self: *Self, scope: *const RoutineScope) void {
             if (!scope.active) return;
             if (scope.settings) {
-                self.sessionState().values = scope.values;
+                self.sessionState().values = self.routine_saved[scope.level];
                 self.routine_configured -= 1;
             }
             self.routine_definer = scope.definer;
