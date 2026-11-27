@@ -1360,6 +1360,8 @@ pub fn Database(comptime config: Config) type {
         /// the routine hook) unless the routine returns a set or a record.
         fn inlineBody(routine: *const RC.Routine) ?[]const u8 {
             if (routine.language != 0 or routine.security_definer or routine.setting_count != 0 or routine.kind != 'f') return null;
+            // A void function's value is NULL whatever its body returns.
+            if (routine.return_oid == tg.void_oid) return null;
             // A volatile body runs as nested statements (B11 wave 4): each
             // takes a new snapshot and command id, which an inlined plan
             // under the caller's snapshot would not (PostgreSQL inlines
@@ -2127,6 +2129,12 @@ pub fn Database(comptime config: Config) type {
         /// under them) and the tables the running statement scans.
         nested_tables: [(config.tables + 63) / 64]u64 = @splat(0),
         scan_tables: [(config.tables + 63) / 64]u64 = @splat(0),
+        /// Tables the running statement uses (sources and targets) and the
+        /// ones the suspended statements use (B11 wave 5): DDL in a nested
+        /// statement on one of them is 55006, PostgreSQL's
+        /// CheckTableNotInUse.
+        use_tables: [(config.tables + 63) / 64]u64 = @splat(0),
+        nested_use: [(config.tables + 63) / 64]u64 = @splat(0),
         routine_volatility: u8 = 0,
         /// PostgreSQL's errdetail of the last view error (lastErrorDetail).
         error_detail: []const u8 = "",
@@ -2617,6 +2625,8 @@ pub fn Database(comptime config: Config) type {
             self.rule_active_len = 0;
             self.nested_tables = @splat(0);
             self.scan_tables = @splat(0);
+            self.use_tables = @splat(0);
+            self.nested_use = @splat(0);
             self.row_staging = null;
             self.xml_region = .{};
             self.routine_definer = null;
@@ -9788,6 +9798,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn dropTable(self: *Self, slot: u16, index: usize, cascade: bool, snap: Snapshot) Error!usize {
+            try self.checkNotInUse(index);
             try checkPendingLatePrimary(&self.tables[index]);
             try self.fenceBankPlacement(slot, false);
             try self.lockTable(slot, index, .access_exclusive);
@@ -9853,6 +9864,7 @@ pub fn Database(comptime config: Config) type {
         /// truncate entry per table covers all latest rows. Commit stamps
         /// those marks, and abort or ROLLBACK TO clears them.
         fn truncateTables(self: *Self, slot: u16, truncate: *const B.Truncate, snap: Snapshot) Error!void {
+            for (truncate.tables[0..truncate.count]) |index| try self.checkNotInUse(index);
             for (truncate.tables[0..truncate.count]) |index| try self.lockTable(slot, index, .access_exclusive);
             var current = snap;
             current.csn = self.csn;
@@ -9912,6 +9924,7 @@ pub fn Database(comptime config: Config) type {
             // ALTER acquires a new bank live and replays in place. Even a
             // dense bank move can change later heterogeneous CREATE choices.
             if (S.anyIntegralBank(&self.tables)) return error.UnsupportedStatement;
+            if (alter.command != .create_view) try self.checkNotInUse(alter.table);
             const source = &self.tables[alter.table];
             try checkPendingLatePrimary(source);
             var primary = false;
@@ -11423,6 +11436,8 @@ pub fn Database(comptime config: Config) type {
             self.rule_active_len = 0;
             self.nested_tables = @splat(0);
             self.scan_tables = @splat(0);
+            self.use_tables = @splat(0);
+            self.nested_use = @splat(0);
             self.installRole();
         }
 
@@ -13381,6 +13396,12 @@ pub fn Database(comptime config: Config) type {
         /// Parses, binds (names read `frame`'s variables) and evaluates an
         /// expression at the top of the statement pool, then restores it.
         pub fn routineEvaluate(self: *Self, frame: *R.Frame, source: []const u8, start: usize, end: usize, goal: ?*const V.Column) Error!V.Cell {
+            return self.routineEvaluateTyped(frame, source, start, end, goal, null);
+        }
+
+        /// routineEvaluate that also reports the expression's type (EXECUTE
+        /// ... USING, B11 wave 5).
+        pub fn routineEvaluateTyped(self: *Self, frame: *R.Frame, source: []const u8, start: usize, end: usize, goal: ?*const V.Column, ty: ?*types.Type) Error!V.Cell {
             const pool = &self.workspace.nodes;
             const mark = poolMark(pool);
             defer poolRestore(pool, mark);
@@ -13395,14 +13416,14 @@ pub fn Database(comptime config: Config) type {
                 };
                 if (!reads) continue;
                 poolRestore(pool, mark);
-                return self.routineQueryValue(frame, source[start..end], goal);
+                return self.routineQueryValue(frame, source[start..end], goal, ty);
             }
-            return self.routineValue(frame, source, id, mark.len, goal);
+            return self.routineValue(frame, source, id, mark.len, goal, ty);
         }
 
         /// `SELECT expr` as a statement of the routine: its one value,
         /// converted like an assignment to `goal`.
-        fn routineQueryValue(self: *Self, frame: *R.Frame, expression: []const u8, goal: ?*const V.Column) Error!V.Cell {
+        fn routineQueryValue(self: *Self, frame: *R.Frame, expression: []const u8, goal: ?*const V.Column, ty: ?*types.Type) Error!V.Cell {
             const prefix = "SELECT ";
             var buffer: [config.routine_bytes + prefix.len]u8 = undefined;
             if (expression.len > config.routine_bytes) return error.TextCapacity;
@@ -13412,6 +13433,7 @@ pub fn Database(comptime config: Config) type {
             _ = try self.routineStatement(frame, buffer[0 .. prefix.len + expression.len], &capture);
             if (capture.count != 1) return error.Syntax;
             var cell: V.Cell = if (capture.rows == 0) .null_value else capture.cells[0];
+            if (ty) |out| out.* = capture.tys[0];
             const column = goal orelse return cell;
             const from = capture.tys[0];
             const to = types.typeOfData(column.data_type);
@@ -13420,7 +13442,7 @@ pub fn Database(comptime config: Config) type {
             return D.store(column, cell, &self.session);
         }
 
-        fn routineValue(self: *Self, frame: *R.Frame, source: []const u8, id: u16, low: usize, goal: ?*const V.Column) Error!V.Cell {
+        fn routineValue(self: *Self, frame: *R.Frame, source: []const u8, id: u16, low: usize, goal: ?*const V.Column, ty: ?*types.Type) Error!V.Cell {
             // A volatile routine's expression sees every earlier change of
             // its transaction (PostgreSQL: CommandCounterIncrement and a new
             // snapshot per evaluation); STABLE / IMMUTABLE keep the caller's.
@@ -13433,6 +13455,7 @@ pub fn Database(comptime config: Config) type {
             context.plans = null;
             context.variables = &frame.variables;
             const bound = try B.bindRoutineExpression(&context, id, goal);
+            if (ty) |out| out.* = self.workspace.nodes.nodes[bound].ty;
             var ctx = self.evalContext(source);
             ctx.frame = frame.evalFrame();
             return E.eval(&ctx, bound);
@@ -13447,7 +13470,7 @@ pub fn Database(comptime config: Config) type {
             const b = try P.parseExpressionAt(source, right.start, right.end, pool);
             const id = try pool.add(.{ .kind = .binary, .op = .eq, .a = a, .b = b });
             const column: V.Column = .{ .data_type = .boolean };
-            const cell = try self.routineValue(frame, source, id, mark.len, &column);
+            const cell = try self.routineValue(frame, source, id, mark.len, &column, null);
             return cell == .boolean and cell.boolean;
         }
 
@@ -13608,9 +13631,8 @@ pub fn Database(comptime config: Config) type {
             // nested deeper inside it.
             const staging = self.row_staging;
             self.row_staging = null;
-            // Inside a running statement only queries, data changes, CALL
-            // and DO run (DDL there is outside the subset).
-            if (nested) if (kind) |which| if (which != .call and which != .do_block) return error.UnsupportedStatement;
+            // Routine DDL (CREATE FUNCTION, TRIGGER, RULE ...) runs nested
+            // too (T651, B11 wave 5); a non-volatile routine runs none.
             if (read_only and kind != null) return error.UnsupportedStatement;
             var mark: usize = 0;
             if (nested) mark = try self.nestedEnter(slot);
@@ -13742,8 +13764,12 @@ pub fn Database(comptime config: Config) type {
                 else => return error.UnsupportedStatement,
             };
             const plans = &self.workspace.plans;
+            self.use_tables = @splat(0);
             for (plans.items[0..plans.len]) |*plan| {
-                for (plan.sources[0..plan.source_count]) |*item| if (item.table) |table| try self.lockTable(slot, table, .access_share);
+                for (plan.sources[0..plan.source_count]) |*item| if (item.table) |table| {
+                    try self.lockTable(slot, table, .access_share);
+                    markTable(&self.use_tables, table);
+                };
             }
             defer {
                 self.workspace.query.pinned_cells = 0;
@@ -14219,11 +14245,14 @@ pub fn Database(comptime config: Config) type {
         }
 
         /// The statements of a SQL routine body (PostgreSQL's
-        /// check_function_bodies): analyzed until a utility statement.
+        /// check_function_bodies): every statement but utility ones is
+        /// analyzed, also after a utility statement (which does not run:
+        /// a later statement naming a table it creates is 42P01, as in
+        /// PostgreSQL 18).
         fn validateSql(self: *Self, definition: *const RC.Routine, frame: *R.Frame, snap: Snapshot) Error!void {
             const text_body = definition.body.slice();
             var statements: R.Statements = .{ .source = text_body };
-            var analyzable = true;
+            const analyzable = true;
             var final_type: ?types.Type = null;
             var final_types: [config.routine_args]types.Type = @splat(.unknown);
             var final_count: usize = 0;
@@ -14238,17 +14267,13 @@ pub fn Database(comptime config: Config) type {
                 if (R.classify(text) != null) {
                     var routine: R.Statement = undefined;
                     try R.parse(text, &self.workspace.nodes, &routine);
-                    analyzable = false;
                     continue;
                 }
                 var parsed = try P.parse(text, &self.workspace.nodes, .standard);
                 switch (parsed) {
                     .control, .copy => return error.UnsupportedStatement,
                     .select, .query, .insert, .update, .delete, .merge => {},
-                    else => {
-                        analyzable = false;
-                        continue;
-                    },
+                    else => continue,
                 }
                 if (!analyzable) continue;
                 if (parsed == .select) {
@@ -14862,14 +14887,19 @@ pub fn Database(comptime config: Config) type {
             const result_column = columnOfOid(routine.return_oid, routine.return_typmod);
             const text_body = routine.body.slice();
             if (routine.language == 1) {
-                var interpreter: Interp = .{ .host = self, .source = text_body, .frame = &frame, .purpose = .function, .return_column = result_column, .void_result = routine.out_count != 0 or routine.retset, .retset = routine.retset, .rows = .{ .ptr = sink, .call = emit } };
+                var interpreter: Interp = .{ .host = self, .source = text_body, .frame = &frame, .purpose = .function, .return_column = result_column, .void_result = routine.out_count != 0 or routine.retset or routine.return_oid == tg.void_oid, .retset = routine.retset, .rows = .{ .ptr = sink, .call = emit } };
                 for (0..routine.out_count) |output| interpreter.outputs[output] = @intCast(outputVariable(routine, output));
                 interpreter.output_count = routine.out_count;
                 try interpreter.execute(.run);
                 if (routine.retset) return;
                 if (routine.out_count != 0) {
                     for (0..routine.out_count) |output| row[output] = frame.cells[outputVariable(routine, output)];
-                } else row[0] = interpreter.result;
+                } else row[0] = if (routine.return_oid == tg.void_oid) V.Cell{ .text = .{} } else interpreter.result;
+                return emit(sink, &row);
+            }
+            // A void SQL function runs its statements and gives NULL.
+            if (routine.return_oid == tg.void_oid and !routine.retset) {
+                _ = try self.sqlFunctionBody(&frame, text_body, &result_column, true);
                 return emit(sink, &row);
             }
             // SQL: one `SELECT expression, ...`; other bodies that are not
@@ -14903,7 +14933,7 @@ pub fn Database(comptime config: Config) type {
             for (0..columns) |column| {
                 if (q.targets[column].star) return error.UnsupportedStatement;
                 const target_column = if (routine.out_count != 0) columnOfOid(routine.out_oids[column], routine.out_typmods[column]) else result_column;
-                const value = try self.routineValue(&frame, text_body, q.targets[column].expr, mark.len, &target_column);
+                const value = try self.routineValue(&frame, text_body, q.targets[column].expr, mark.len, &target_column, null);
                 row[column] = try D.store(&target_column, value, &self.session);
             }
             return emit(sink, &row);
@@ -14953,13 +14983,14 @@ pub fn Database(comptime config: Config) type {
                 const outputs = routine.out_count != 0;
                 var interpreter: Interp = .{ .host = self, .source = text_body, .frame = &frame, .purpose = .function, .return_column = result_column, .void_result = outputs or routine.return_oid == tg.void_oid };
                 try interpreter.execute(.run);
-                out.* = if (outputs) frame.cells[outputVariable(routine, 0)] else interpreter.result;
+                // PL/pgSQL returns void as an empty, non-NULL value.
+                out.* = if (outputs) frame.cells[outputVariable(routine, 0)] else if (routine.return_oid == tg.void_oid) V.Cell{ .text = .{} } else interpreter.result;
                 return;
             }
-            if (try self.sqlFunctionExpression(&frame, text_body, &result_column)) |value| {
+            if (routine.return_oid != tg.void_oid) if (try self.sqlFunctionExpression(&frame, text_body, &result_column)) |value| {
                 out.* = value;
                 return;
-            }
+            };
             out.* = try self.sqlFunctionBody(&frame, text_body, &result_column, routine.return_oid == tg.void_oid);
         }
 
@@ -14982,7 +15013,7 @@ pub fn Database(comptime config: Config) type {
                 .scalar_subquery, .exists_subquery, .in_subquery => return null,
                 else => {},
             };
-            const value = try self.routineValue(frame, text_body, q.targets[0].expr, mark.len, result_column);
+            const value = try self.routineValue(frame, text_body, q.targets[0].expr, mark.len, result_column, null);
             return try D.store(result_column, value, &self.session);
         }
 
@@ -16708,12 +16739,15 @@ pub fn Database(comptime config: Config) type {
             stream.value(&self.routine_volatility);
             stream.value(&self.nested_tables);
             stream.value(&self.scan_tables);
+            stream.value(&self.use_tables);
+            stream.value(&self.nested_use);
         }
 
         /// The tables a bound statement scans while it runs (UPDATE / DELETE
         /// / MERGE targets and query sources).
         fn noteScans(self: *Self, bound: *const B.Bound) void {
             self.scan_tables = @splat(0);
+            self.use_tables = @splat(0);
             const scanned: ?usize = switch (bound.*) {
                 .update => |*update| update.table,
                 .delete => |*delete| delete.table,
@@ -16722,6 +16756,12 @@ pub fn Database(comptime config: Config) type {
                 else => null,
             };
             if (scanned) |index| self.markScan(index);
+            if (bound.* == .insert) markTable(&self.use_tables, bound.insert.table);
+            self.noteUses();
+        }
+
+        /// The query sources of the bound plans, scanned while they run.
+        fn noteUses(self: *Self) void {
             const plans = &self.workspace.plans;
             for (plans.items[0..plans.len]) |*plan| {
                 for (plan.sources[0..plan.source_count]) |*item| if (item.table) |table| self.markScan(table);
@@ -16731,6 +16771,20 @@ pub fn Database(comptime config: Config) type {
         fn markScan(self: *Self, index: usize) void {
             if (index >= config.tables) return;
             self.scan_tables[index / 64] |= @as(u64, 1) << @intCast(index % 64);
+            markTable(&self.use_tables, index);
+        }
+
+        fn markTable(set: *[(config.tables + 63) / 64]u64, index: usize) void {
+            if (index >= config.tables) return;
+            set[index / 64] |= @as(u64, 1) << @intCast(index % 64);
+        }
+
+        /// DDL on a table a suspended statement uses (55006, PostgreSQL's
+        /// "cannot DROP TABLE ... because it is being used by active
+        /// queries in this session").
+        fn checkNotInUse(self: *const Self, index: usize) Error!void {
+            if (self.nested_depth == 0 or index >= config.tables) return;
+            if (self.nested_use[index / 64] & (@as(u64, 1) << @intCast(index % 64)) != 0) return error.ObjectInUse;
         }
 
         /// Suspends the running statement for a nested one: saves its state
@@ -16758,6 +16812,8 @@ pub fn Database(comptime config: Config) type {
             X.resetWork(work);
             for (&self.nested_tables, self.scan_tables) |*suspended, scanned| suspended.* |= scanned;
             self.scan_tables = @splat(0);
+            for (&self.nested_use, self.use_tables) |*suspended, used| suspended.* |= used;
+            self.use_tables = @splat(0);
             self.nested_depth += 1;
             self.nested_ran = true;
             return at;

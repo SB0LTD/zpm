@@ -6465,8 +6465,8 @@ pub fn Binder(comptime config: types.Config) type {
             // value here; FROM binds them as table functions (0A000).
             if (!from and (routine.retset or routine.return_oid == routine_catalog.record_oid)) return error.UnsupportedStatement;
             const result: types.DataType = if (routine.return_oid == routine_catalog.record_oid) .text else types.typeFromOid(routine.return_oid) orelse return error.UnsupportedStatement;
-            // void routines stay outside expressions (the void type, B11 wave 4).
-            if (result == .void) return error.UnsupportedStatement;
+            // A void routine's value is the void type (B11 wave 5): NULL from
+            // a SQL body, an empty value from PL/pgSQL, as in PostgreSQL.
             // One bound argument per input, in parameter order: converted
             // values, a DEFAULT placeholder, or ARRAY[...] of the variadic
             // elements.

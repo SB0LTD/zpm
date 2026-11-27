@@ -1600,6 +1600,7 @@ pub fn Routines(comptime config: types.Config) type {
                         }
                     }
                     if (c.is("commit") or c.is("rollback")) return self.transactionStatement(mode);
+                    if (c.is("execute")) return self.dynamicStatement(mode);
                     if (sqlWord(c)) return self.sqlStatement(mode);
                     return self.assignment(mode);
                 }
@@ -1841,15 +1842,15 @@ pub fn Routines(comptime config: types.Config) type {
                     self.frame.not_null[index] = not_null;
                     if (initial) |span| {
                         if (mode == .run) {
-                            const column = columnOf(typed.spec.ty, typed.spec.typmod);
                             // The default sees the variables declared before it.
                             self.frame.variables.count = index;
-                            const value = self.evaluate(span, mode, &column) catch |err| {
+                            var from: types.Type = .unknown;
+                            const value = self.host.routineEvaluateTyped(self.frame, self.source, span.start, span.end, null, &from) catch |err| {
                                 self.frame.variables.count = index + 1;
                                 return err;
                             };
                             self.frame.variables.count = index + 1;
-                            try self.store(.{ .index = index, .ty = typed.spec.ty, .typmod = typed.spec.typmod }, value, true);
+                            try self.storeCast(.{ .index = index, .ty = typed.spec.ty, .typmod = typed.spec.typmod }, value, from);
                         } else {
                             self.frame.variables.count = index;
                             _ = try self.evaluate(span, mode, null);
@@ -1912,12 +1913,19 @@ pub fn Routines(comptime config: types.Config) type {
                     }
                 }
 
-                /// Converts a value of type `from` to the target (assignment).
+                /// Converts a value of type `from` to the target (assignment;
+                /// without an assignment cast PL/pgSQL converts through the
+                /// types' text forms, as exec_cast_value's I/O coercion).
                 fn storeCast(self: *Self, place: Target, value: V.Cell, from: types.Type) Error!void {
                     var cell = value;
                     if (cell != .null_value and from != place.ty and from != .unknown) {
-                        if (!value_module.castable(from, place.ty, .assignment) and !(value_module.integral(from) and value_module.integral(place.ty))) return error.TypeMismatch;
-                        cell = try E.cast(cell, from, place.ty, place.typmod, self.host.routineSession());
+                        const session = self.host.routineSession();
+                        if (value_module.castable(from, place.ty, .assignment) or (value_module.integral(from) and value_module.integral(place.ty))) {
+                            cell = try E.cast(cell, from, place.ty, place.typmod, session);
+                        } else {
+                            const text = try E.cast(cell, from, .text, -1, session);
+                            cell = try E.cast(text, .text, place.ty, place.typmod, session);
+                        }
                     } else if (cell != .null_value and from == .unknown and cell == .text and place.ty != .text) {
                         cell = try E.cast(cell, .text, place.ty, place.typmod, self.host.routineSession());
                     }
@@ -1933,9 +1941,9 @@ pub fn Routines(comptime config: types.Config) type {
                         _ = try self.evaluate(span, mode, null);
                         return .normal;
                     }
-                    const column = columnOf(place.ty, place.typmod);
-                    const value = try self.evaluate(span, mode, &column);
-                    try self.store(place, value, false);
+                    var from: types.Type = .unknown;
+                    const value = try self.host.routineEvaluateTyped(self.frame, self.source, span.start, span.end, null, &from);
+                    try self.storeCast(place, value, from);
                     return .normal;
                 }
 
@@ -2277,7 +2285,7 @@ pub fn Routines(comptime config: types.Config) type {
                     const c = &self.cursor;
                     try c.expect("query");
                     if (self.purpose != .function or !self.retset) return error.TypeMismatch;
-                    if (c.is("execute")) return error.UnsupportedStatement;
+                    if (c.is("execute")) return self.returnQueryExecute(mode);
                     const begin = c.start();
                     var depth: usize = 0;
                     while (!c.atEnd()) {
@@ -2642,6 +2650,139 @@ pub fn Routines(comptime config: types.Config) type {
                             try self.storeCast(place, value, if (index < capture.count) capture.tys[index] else .unknown);
                         }
                     }
+                    return .normal;
+                }
+
+                /// The parts of EXECUTE: the command expression, INTO targets
+                /// and USING expressions (either clause first, each once).
+                const Dynamic = struct {
+                    command: Span = .{},
+                    into: bool = false,
+                    strict: bool = false,
+                    targets: [config.columns]Target = undefined,
+                    target_count: usize = 0,
+                    using: [config.routine_variables]Span = undefined,
+                    using_count: usize = 0,
+                };
+
+                fn dynamicClauses(self: *Self, mode: Mode, out: *Dynamic, comptime allow_into: bool) Error!void {
+                    const c = &self.cursor;
+                    out.command = try self.expression(.{ .into = allow_into, .using = true });
+                    var has_using = false;
+                    while (!c.symbol(.semicolon)) {
+                        if (allow_into and !out.into and c.is("into")) {
+                            out.into = true;
+                            try c.advance();
+                            out.strict = try c.take("strict");
+                            while (true) {
+                                if (out.target_count == out.targets.len) return error.ColumnCapacity;
+                                out.targets[out.target_count] = try self.target(mode);
+                                out.target_count += 1;
+                                if (!try c.takeSymbol(.comma)) break;
+                            }
+                            continue;
+                        }
+                        if (!has_using and c.is("using")) {
+                            has_using = true;
+                            try c.advance();
+                            while (true) {
+                                if (out.using_count == out.using.len) return error.ColumnCapacity;
+                                out.using[out.using_count] = try self.expression(.{ .comma = true, .into = allow_into });
+                                out.using_count += 1;
+                                if (!try c.takeSymbol(.comma)) break;
+                            }
+                            continue;
+                        }
+                        return error.Syntax;
+                    }
+                    try c.expectSymbol(.semicolon);
+                    if (mode == .check) {
+                        _ = try self.evaluate(out.command, .check, null);
+                        for (out.using[0..out.using_count]) |span| _ = try self.evaluate(span, .check, null);
+                    }
+                }
+
+                /// The command string (22004 when NULL) and a frame holding
+                /// the USING values as $1..$n: dynamic SQL sees no routine
+                /// variables, as in PostgreSQL (an untyped literal is text).
+                fn dynamicPrepare(self: *Self, parts: *const Dynamic, frame: *Frame, string: *V.Cell) Error!void {
+                    const text_column: V.Column = .{ .data_type = .text };
+                    string.* = try self.evaluate(parts.command, .run, &text_column);
+                    if (string.* == .null_value) return error.NullValueNotAllowed;
+                    if (string.* != .text) return error.TypeMismatch;
+                    for (parts.using[0..parts.using_count]) |span| {
+                        var ty: types.Type = .unknown;
+                        const value = try self.host.routineEvaluateTyped(self.frame, self.source, span.start, span.end, null, &ty);
+                        const index = try frame.declare("", if (ty == .unknown) .text else ty, -1);
+                        frame.cells[index] = value;
+                    }
+                    frame.variables.parameters = frame.variables.count;
+                }
+
+                /// EXECUTE command [INTO [STRICT] targets] [USING values]
+                /// (T653, B11 wave 5): every statement of the string runs as
+                /// a statement of the routine (nested inside a running
+                /// statement); the last one's first row fills INTO and its
+                /// row count is ROW_COUNT. FOUND does not change. INTO with a
+                /// command that returns no data is 42601.
+                noinline fn dynamicStatement(self: *Self, mode: Mode) Error!Signal {
+                    try self.cursor.expect("execute");
+                    var parts: Dynamic = .{};
+                    try self.dynamicClauses(mode, &parts, true);
+                    if (mode != .run) return .normal;
+                    var frame: Frame = .{};
+                    var string: V.Cell = .null_value;
+                    try self.dynamicPrepare(&parts, &frame, &string);
+                    const text = string.text.slice();
+                    var statements: Statements = .{ .source = text };
+                    var capture: Capture = .{};
+                    var rows: usize = 0;
+                    var any = false;
+                    while (try statements.next()) |span| {
+                        capture = .{};
+                        any = true;
+                        rows = try self.host.routineStatement(&frame, text[span.start..span.end], if (parts.into) &capture else null);
+                    }
+                    if (!any) return error.Syntax;
+                    self.frame.row_count = rows;
+                    if (parts.into) {
+                        if (capture.count == 0) return error.Syntax;
+                        if (parts.strict and capture.rows == 0) return error.NoDataFound;
+                        if (parts.strict and capture.rows > 1) return error.TooManyRows;
+                        for (parts.targets[0..parts.target_count], 0..) |place, index| {
+                            const value: V.Cell = if (capture.rows == 0 or index >= capture.count) .null_value else capture.cells[index];
+                            try self.storeCast(place, value, if (index < capture.count) capture.tys[index] else .unknown);
+                        }
+                    }
+                    return .normal;
+                }
+
+                /// RETURN QUERY EXECUTE command [USING values].
+                noinline fn returnQueryExecute(self: *Self, mode: Mode) Error!Signal {
+                    try self.cursor.expect("execute");
+                    var parts: Dynamic = .{};
+                    try self.dynamicClauses(mode, &parts, false);
+                    if (mode != .run) return .normal;
+                    var frame: Frame = .{};
+                    var string: V.Cell = .null_value;
+                    try self.dynamicPrepare(&parts, &frame, &string);
+                    const sink = self.rows orelse return error.UnsupportedStatement;
+                    var columns: [config.routine_args]V.Column = undefined;
+                    var count: usize = 1;
+                    if (self.output_count != 0) {
+                        count = self.output_count;
+                        for (self.outputs[0..count], 0..) |variable, column| {
+                            const item = &self.frame.variables.items[variable];
+                            columns[column] = columnOf(item.ty, item.typmod);
+                        }
+                    } else columns[0] = self.return_column;
+                    const text = string.text.slice();
+                    var statements: Statements = .{ .source = text };
+                    const span = (try statements.next()) orelse return error.Syntax;
+                    if ((try statements.next()) != null) return error.Syntax;
+                    const rows = try self.host.routineReturnQuery(&frame, text[span.start..span.end], sink, columns[0..count]);
+                    self.frame.row_count = rows;
+                    self.frame.cells[self.frame.found] = .{ .boolean = rows != 0 };
                     return .normal;
                 }
 
