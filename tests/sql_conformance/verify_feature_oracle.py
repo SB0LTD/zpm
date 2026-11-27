@@ -169,17 +169,22 @@ def run_probe(port, user, probe):
         finally:
             session.close()
     finally:
-        reset(admin)
+        cleanup(admin)
         admin.close()
 
 
-def reset(admin):
+def cleanup(admin):
+    """Drop the probe database and the w4f_* roles a probe created."""
     segments = admin.raw(f'DROP DATABASE IF EXISTS {PROBE_DB} WITH (FORCE)')
     if segments[0][0] == 'E':
         raise RuntimeError('Cannot drop the probe database')
     roles = admin.rows("SELECT rolname FROM pg_catalog.pg_roles WHERE rolname LIKE 'w4f\\_%'")
     for (name,) in roles:
         admin.raw('DROP ROLE ' + name.decode())
+
+
+def reset(admin):
+    cleanup(admin)
     segments = admin.raw(f'CREATE DATABASE {PROBE_DB} TEMPLATE template0')
     if segments[0][0] == 'E':
         raise RuntimeError('Cannot create the probe database')
