@@ -19,6 +19,7 @@
 
 const values = @import("values.sig");
 const std = @import("std");
+const builtin = @import("builtin");
 const objects = @import("objects.sig");
 const compiler = @import("compiler.sig");
 const regexp = @import("regexp.sig");
@@ -47,8 +48,104 @@ extern "kernel32" fn Sleep(u32) void;
 const TimeZoneInformation = extern struct { bias: i32, standard_name: [32]u16, standard_date: SystemTime, standard_bias: i32, daylight_name: [32]u16, daylight_date: SystemTime, daylight_bias: i32 };
 extern "kernel32" fn GetTimeZoneInformation(*TimeZoneInformation) u32;
 fn dbgPrint(msg: []const u8) void {
-    _ = WriteFile(GetStdHandle(@bitCast(@as(i32, -11))), msg.ptr, @intCast(msg.len), null, null);
+    if (builtin.os.tag == .windows) {
+        _ = WriteFile(GetStdHandle(@bitCast(@as(i32, -11))), msg.ptr, @intCast(msg.len), null, null);
+    } else if (builtin.os.tag == .linux) {
+        var offset: usize = 0;
+        while (offset < msg.len) {
+            const rc = std.os.linux.write(1, msg[offset..].ptr, msg.len - offset);
+            switch (std.os.linux.errno(rc)) {
+                .INTR => continue,
+                .SUCCESS => { if (rc == 0) return; offset += rc; },
+                else => return,
+            }
+        }
+    }
 }
+
+fn hostCounter(now: *i64) bool {
+    if (builtin.os.tag == .windows) return QueryPerformanceCounter(now) != 0;
+    if (builtin.os.tag == .linux) {
+        var ts: std.os.linux.timespec = undefined;
+        if (std.os.linux.errno(std.os.linux.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS) return false;
+        now.* = @intCast(@as(i128, ts.sec) * 1_000_000_000 + ts.nsec);
+        return true;
+    }
+    return false;
+}
+fn hostFrequency(frequency_out: *i64) bool {
+    if (builtin.os.tag == .windows) return QueryPerformanceFrequency(frequency_out) != 0;
+    if (builtin.os.tag == .linux) { frequency_out.* = 1_000_000_000; return true; }
+    return false;
+}
+fn hostSleep(ms: u32) void {
+    if (builtin.os.tag == .windows) { Sleep(ms); return; }
+    if (builtin.os.tag == .linux) {
+        var request_time = std.os.linux.timespec{ .sec = @intCast(ms / 1000), .nsec = @intCast(@as(u64, ms % 1000) * 1_000_000) };
+        var remaining: std.os.linux.timespec = undefined;
+        while (true) switch (std.os.linux.errno(std.os.linux.nanosleep(&request_time, &remaining))) {
+            .SUCCESS => return,
+            .INTR => request_time = remaining,
+            else => @panic("JavaScript timer sleep failed"),
+        };
+    }
+    @panic("JavaScript timer host unavailable");
+}
+fn hostRandom(bytes: []u8) bool {
+    if (bytes.len == 0) return true;
+    if (builtin.os.tag == .windows) return BCryptGenRandom(null, bytes.ptr, @intCast(bytes.len), 2) >= 0;
+    if (builtin.os.tag == .linux) {
+        var used: usize = 0;
+        while (used < bytes.len) {
+            const rc = std.os.linux.getrandom(bytes[used..].ptr, @min(bytes.len - used, 256), 0);
+            switch (std.os.linux.errno(rc)) {
+                .INTR => continue,
+                .SUCCESS => { if (rc == 0 or rc > bytes.len - used) break; used += rc; },
+                else => break,
+            }
+        }
+        if (used == bytes.len) return true;
+    }
+    @memset(bytes, 0);
+    return false;
+}
+test "native VM host clocks entropy and calendar work without foreign runtime" {
+    if (builtin.os.tag != .windows and builtin.os.tag != .linux) return error.SkipZigTest;
+    var frequency_out: i64 = 0;
+    var before: i64 = 0;
+    var after: i64 = 0;
+    try std.testing.expect(hostFrequency(&frequency_out) and frequency_out > 0);
+    try std.testing.expect(hostCounter(&before));
+    hostSleep(1);
+    try std.testing.expect(hostCounter(&after) and after >= before);
+    try std.testing.expect(taskClock() > 0);
+    try std.testing.expect(std.math.isFinite(dateNow().toNumber()) and dateNow().toNumber() > 0);
+    var guarded: [66]u8 = @splat(0x5a);
+    try std.testing.expect(hostRandom(guarded[1..65]));
+    try std.testing.expectEqual(@as(u8, 0x5a), guarded[0]);
+    try std.testing.expectEqual(@as(u8, 0x5a), guarded[65]);
+    try std.testing.expect(!std.mem.allEqual(u8, guarded[1..65], 0x5a));
+    var utc: SystemTime = undefined;
+    var local: SystemTime = undefined;
+    try std.testing.expect(dateParts(0, &utc, &local));
+    try std.testing.expectEqual(@as(u16, 1970), utc.year);
+    try std.testing.expectEqual(@as(u16, 1), utc.month);
+    try std.testing.expectEqual(@as(u16, 1), utc.day);
+    try std.testing.expectEqual(@as(u16, 4), utc.weekday);
+    try std.testing.expect(dateParts(-1, &utc, &local));
+    try std.testing.expectEqual(@as(u16, 1969), utc.year);
+    try std.testing.expectEqual(@as(u16, 12), utc.month);
+    try std.testing.expectEqual(@as(u16, 31), utc.day);
+    try std.testing.expectEqual(@as(u16, 999), utc.millis);
+    try std.testing.expect(dateParts(951782400000, &utc, &local));
+    try std.testing.expectEqual(@as(u16, 2000), utc.year);
+    try std.testing.expectEqual(@as(u16, 2), utc.month);
+    try std.testing.expectEqual(@as(u16, 29), utc.day);
+    if (builtin.os.tag == .linux) try std.testing.expectEqual(@as(i64, 0), dateOffset(utc, local));
+    try std.testing.expect(!dateParts(dateNaN(), &utc, &local));
+    try std.testing.expect(!dateParts(std.math.inf(f64), &utc, &local));
+}
+
 fn nConsoleLog(args: []const Value) Value {
     dbgPrint("[JSLOG] ");
     for (args, 0..) |a, i| {
@@ -353,7 +450,12 @@ pub fn taskQueueReset() void {
     for (&tasks) |*task| task.* = .{};
     task_next_id = 1;
 }
-pub fn taskClock() u64 { return GetTickCount64(); }
+pub fn taskClock() u64 {
+    if (builtin.os.tag == .windows) return GetTickCount64();
+    var counter: i64 = 0;
+    if (!hostCounter(&counter) or counter < 0) @panic("JavaScript monotonic clock unavailable");
+    return @intCast(@divTrunc(counter, 1_000_000));
+}
 
 fn enqueueTask(args: []const Value, repeat: bool, microtask: bool) Value {
     if (args.len == 0 or args[0].tag != .function) {
@@ -408,7 +510,7 @@ pub fn takeTask(deadline: u64) ?Task {
     if (!task.microtask) {
         const now = taskClock();
         if (task.due > deadline) return null;
-        if (task.due > now) Sleep(@intCast(@min(task.due - now, 4294967295)));
+        if (task.due > now) hostSleep(@intCast(@min(task.due - now, 4294967295)));
     }
     if (task.interval == 0) tasks[index].active = false else tasks[index].due = taskClock() + task.interval;
     return task;
@@ -3302,6 +3404,12 @@ fn nBtoa(args: []const Value) Value {
 }
 
 fn dateNow() Value {
+    if (builtin.os.tag == .linux) {
+        var ts: std.os.linux.timespec = undefined;
+        if (std.os.linux.errno(std.os.linux.clock_gettime(.REALTIME, &ts)) != .SUCCESS) return Value.number(dateNaN());
+        return Value.number(@as(f64, @floatFromInt(ts.sec)) * 1000 + @as(f64, @floatFromInt(@divTrunc(ts.nsec, 1_000_000))));
+    }
+    if (builtin.os.tag != .windows) return Value.number(dateNaN());
     var ft: FileTime = undefined;
     GetSystemTimeAsFileTime(&ft);
     const ticks = (@as(u64, ft.high) << 32) | ft.low;
@@ -3312,6 +3420,25 @@ fn dateNaN() f64 { return @bitCast(@as(u64, 0x7FF8000000000000)); }
 
 fn dateParts(ms: f64, utc: *SystemTime, local: *SystemTime) bool {
     if (ms != ms or ms < -11644473600000 or ms > 9e14) return false;
+    if (builtin.os.tag == .linux) {
+        // This native Linux VM uses an explicit UTC browser calendar profile,
+        // independent of the host's TZ files. Windows retains its OS local zone.
+        // Shift negative epochs by one Gregorian 400-year cycle for std's
+        // unsigned decomposition, then undo the year shift.
+        const seconds = @divFloor(@as(i64, @intFromFloat(ms)), 1000);
+        const shift: u16 = if (seconds < 0) 400 else 0;
+        const epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(seconds + if (seconds < 0) @as(i64, 12_622_780_800) else 0) };
+        const yd = epoch.getEpochDay().calculateYearDay();
+        const md = yd.calculateMonthDay();
+        const day_time = epoch.getDaySeconds();
+        utc.* = .{ .year = yd.year - shift, .month = md.month.numeric(),
+            .weekday = @intCast(@mod(@divFloor(seconds, 86400) + 4, 7)), .day = @as(u16, md.day_index) + 1,
+            .hour = day_time.getHoursIntoDay(), .minute = day_time.getMinutesIntoHour(), .second = day_time.getSecondsIntoMinute(),
+            .millis = @intCast(@mod(@as(i64, @intFromFloat(ms)), 1000)) };
+        local.* = utc.*;
+        return true;
+    }
+    if (builtin.os.tag != .windows) return false;
     const ticks: u64 = @intFromFloat((ms + 11644473600000) * 10000);
     const ft = FileTime{ .low = @truncate(ticks), .high = @truncate(ticks >> 32) };
     return FileTimeToSystemTime(&ft, utc) != 0 and SystemTimeToTzSpecificLocalTime(null, utc, local) != 0;
@@ -3329,8 +3456,8 @@ fn datePad(buf: []u8, cursor: *usize, value: u32, width: usize) void {
     cursor.* += width;
 }
 
-/// Local Date string from the OS calendar and zone, with no locale/runtime
-/// dependency. Date() and Date.prototype.toString share the same conversion.
+/// Windows uses the OS local zone; the Linux browser profile uses UTC.
+/// Date() and Date.prototype.toString share the same native conversion.
 fn dateString(value: Value) Value {
     if (value.tag != .object or objects.objTypeOf(value.data.obj_idx) != .date) {
         requestNativeThrow("Method Date.prototype.toString called on incompatible receiver");
@@ -3359,8 +3486,9 @@ fn dateStringFromTime(ms: f64) Value {
     buf[n] = if (offset <= 0) '+' else '-'; n += 1;
     const magnitude: u32 = @intCast(if (offset < 0) -offset else offset);
     datePad(&buf, &n, magnitude / 60, 2); datePad(&buf, &n, magnitude % 60, 2);
-    var zone: TimeZoneInformation = undefined;
-    if (GetTimeZoneInformation(&zone) != 0xFFFFFFFF) {
+    if (builtin.os.tag == .windows) {
+        var zone: TimeZoneInformation = undefined;
+        if (GetTimeZoneInformation(&zone) != 0xFFFFFFFF) {
         const zone_name = if (offset == @as(i64, zone.bias) + zone.daylight_bias and zone.daylight_date.month != 0) zone.daylight_name else zone.standard_name;
         if (zone_name[0] != 0) {
             buf[n] = ' '; buf[n+1] = '('; n += 2;
@@ -3372,6 +3500,10 @@ fn dateStringFromTime(ms: f64) Value {
             }
             buf[n] = ')'; n += 1;
         }
+        }
+    } else if (builtin.os.tag == .linux) {
+        const name = " (Coordinated Universal Time)";
+        @memcpy(buf[n..][0..name.len], name); n += name.len;
     }
     return Value.string(values.internString(buf[0..n]));
 }
@@ -3457,7 +3589,7 @@ pub fn constructDate(args: []const Value) Value {
 }
 
 // Milliseconds since environment initialization, measured by the monotonic
-// Windows performance counter. The deterministic clock is an explicit debug
+// host performance counter. The deterministic clock is an explicit debug
 // option; the small increment is also a fallback when the counter is unavailable.
 pub var dbg_deterministic_clock: bool = false;
 var perf_now_ms: f64 = 0;
@@ -3467,7 +3599,7 @@ pub var performance_time_origin: f64 = 0;
 fn perfNow() Value {
     if (!dbg_deterministic_clock and perf_counter_frequency > 0) {
         var now: i64 = 0;
-        if (QueryPerformanceCounter(&now) != 0) {
+        if (hostCounter(&now)) {
             const elapsed = @as(f64, @floatFromInt(now - perf_counter_start)) * 1000 / @as(f64, @floatFromInt(perf_counter_frequency));
             perf_now_ms = @max(perf_now_ms, elapsed);
             return Value.number(perf_now_ms);
@@ -3481,8 +3613,8 @@ pub fn resetPerfNow() void {
     perf_now_ms = 0;
     performance_time_origin = dateNow().toNumber();
     perf_counter_frequency = 0;
-    _ = QueryPerformanceFrequency(&perf_counter_frequency);
-    _ = QueryPerformanceCounter(&perf_counter_start);
+    _ = hostFrequency(&perf_counter_frequency);
+    _ = hostCounter(&perf_counter_start);
 }
 
 fn textEncode(args: []const Value) Value {
@@ -3522,7 +3654,7 @@ fn cryptoRandom(args: []const Value) Value {
     const object = objects.getObject(view.data.obj_idx);
     if (object.byte_length > 65536) { requestNativeThrow("getRandomValues exceeds 65536 bytes"); native_throw_name = "QuotaExceededError"; return Value.UNDEFINED; }
     const bytes = objects.getBufferBytes(object.buffer_id)[object.byte_offset..][0..object.byte_length];
-    if (bytes.len > 0 and BCryptGenRandom(null, bytes.ptr, @intCast(bytes.len), 2) < 0) {
+    if (!hostRandom(bytes)) {
         requestNativeThrow("System random source failed");
         return Value.UNDEFINED;
     }

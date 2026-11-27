@@ -140,6 +140,35 @@ pub fn computeBounded(audio: []const f32, output: []f32, work: *Workspace) Error
     return frames;
 }
 
+/// Fixed-window frontend for streaming ASR. Reflect only the left boundary;
+/// samples beyond the supplied window are zero. This differs deliberately
+/// from computeBounded's symmetric reflection and matches Whisper's padded
+/// stream input. Output remains frame-major. Padding is part of normalization.
+pub fn computeZeroPadded(audio: []const f32, frames: usize, output: []f32, work: *Workspace) Error!void {
+    if (audio.len > MAX_AUDIO_SAMPLES or frames > MAX_FRAMES) return error.AudioTooLong;
+    if (audio.len == 0 or frames == 0) return error.AudioTooShort;
+    const elements = frames * N_MELS;
+    if (output.len < elements) return error.OutputTooSmall;
+    const source = @intFromPtr(audio.ptr);
+    const destination = @intFromPtr(output.ptr);
+    if ((source <= destination and destination - source < audio.len * @sizeOf(f32)) or
+        (destination < source and source - destination < elements * @sizeOf(f32))) return error.AliasedBuffers;
+    for (audio) |sample| if (!math.isFinite(sample)) return error.InvalidSample;
+    var maximum: f32 = -math.inf(f32);
+    for (0..frames) |frame| {
+        const center: isize = @intCast(frame * HOP_LENGTH);
+        for (&work.windowed, 0..) |*value, i| {
+            var position = center + @as(isize, @intCast(i)) - N_FFT / 2;
+            if (position < 0) position = -position;
+            value.* = if (position >= audio.len) 0 else @as(f64, audio[@intCast(position)]) * window[i];
+        }
+        const row: *[N_MELS]f32 = @ptrCast(output[frame * N_MELS ..][0..N_MELS]);
+        energies(work, row, true);
+        for (row) |value| maximum = @max(maximum, value);
+    }
+    for (output[0..elements]) |*value| value.* = (@max(value.*, maximum - 8) + 4) / 4;
+}
+
 // Legacy prototype API: natural log, no centering, externally sized output.
 // New model consumers must use computeBounded rather than normalize twice.
 var legacy_work: Workspace = .{};

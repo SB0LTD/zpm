@@ -20,6 +20,7 @@ pub const Error = quantized.Error || transformer.Error || error{
     StorageFailure,
     ArithmeticOverflow,
     Cancelled,
+    MatrixBackendFailure,
 };
 
 pub const Stage = enum(u8) {
@@ -48,11 +49,23 @@ pub const ProgressEvent = struct {
 
 pub const ProgressFn = *const fn (context: *anyopaque, event: ProgressEvent) bool;
 pub const HiddenFn = *const fn (context: *anyopaque, layer: u8, position: u32, hidden: []const f32) bool;
+/// Optional storage-neutral accelerator for a caller-bounded matrix row slice.
+/// Returning false is terminal; the executor never silently retries on CPU.
+pub const MatrixFn = *const fn (
+    context: *anyopaque,
+    tensor: *const gguf.TensorInfo,
+    input: []const f32,
+    output: []f32,
+    first_row: usize,
+    end_row: usize,
+) bool;
 
 pub const Progress = struct {
     context: ?*anyopaque = null,
     callback: ?ProgressFn = null,
     hidden_callback: ?HiddenFn = null,
+    matrix_callback: ?MatrixFn = null,
+    matrix_context: ?*anyopaque = null,
 
     pub fn report(self: Progress, event: ProgressEvent) Error!void {
         const callback = self.callback orelse return;
@@ -698,7 +711,14 @@ fn matvecRows(
         tensor_info.dimensions[1] != output.len or first_row > output.len or row_budget == 0)
         return error.InvalidPlan;
     const row_bytes = try matrixRowBytes(tensor_info);
-    const end = @min(output.len, first_row + @as(usize, row_budget));
+    const end = @min(output.len, first_row +| @as(usize, row_budget));
+    if (kernel_mode == .fused) if (progress.matrix_callback) |callback| {
+        const context = progress.matrix_context orelse progress.context orelse return error.InvalidPlan;
+        if (!callback(context, tensor_info, input, output, first_row, end)) return error.MatrixBackendFailure;
+        for (output[first_row..end]) |value| if (!math.isFinite(value)) return error.NonFinite;
+        try progress.report(.{ .stage = stage, .layer = layer, .completed = @intCast(end), .total = @intCast(output.len) });
+        return end;
+    };
     for (output[first_row..end], first_row..) |*destination, row_index| {
         const row = try readRow(source, tensor_info, row_index, row_bytes, row_scratch);
         destination.* = if (kernel_mode == .scalar_reference and tensor_info.ggml_type != 0) block: {
@@ -865,4 +885,46 @@ fn validateLimits(comptime limits: Limits) void {
     if (limits.hidden == 0 or limits.query == 0 or limits.key_value == 0 or
         limits.feed_forward == 0 or limits.vocabulary == 0 or limits.context == 0 or
         limits.row_bytes < 4) @compileError("Qwen executor limits must be non-zero");
+}
+
+test "optional matrix backend respects row slices failures and scalar-reference isolation" {
+    const testing = @import("std").testing;
+    const Probe = struct {
+        calls: usize = 0,
+        accept: bool = true,
+        finite: bool = true,
+        fn read(_: *const anyopaque, _: u64, _: []u8) bool {
+            return false;
+        }
+        fn matrix(context: *anyopaque, _: *const gguf.TensorInfo, input: []const f32, output: []f32, first: usize, end: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.calls += 1;
+            if (!self.accept) return false;
+            for (first..end) |row| output[row] = if (self.finite) input[0] + @as(f32, @floatFromInt(row)) else @import("std").math.nan(f32);
+            return true;
+        }
+    };
+    var probe: Probe = .{};
+    const source: gguf.Source = .{ .context = &probe, .size = 24, .read_at = Probe.read };
+    const matrix_tensor: gguf.TensorInfo = .{ .dimension_count = 2, .dimensions = .{ 2, 3, 0, 0 }, .ggml_type = 0, .byte_size = 24 };
+    const progress: Progress = .{ .matrix_context = &probe, .matrix_callback = &Probe.matrix };
+    var output: [3]f32 = @splat(-99);
+    var row: [8]u8 = undefined;
+    var expanded: [2]f32 = undefined;
+    const end = try matvecRows(source, &matrix_tensor, &.{ 7, 9 }, &output, &row, &expanded, .fused, 1, 1, progress, .logits, 0);
+    try testing.expectEqual(@as(usize, 2), end);
+    try testing.expectEqualSlices(f32, &.{ -99, 8, -99 }, &output);
+    try testing.expectEqual(@as(usize, 1), probe.calls);
+    probe.accept = false;
+    try testing.expectError(error.MatrixBackendFailure, matvecRows(source, &matrix_tensor, &.{ 7, 9 }, &output, &row, &expanded, .fused, 0, 3, progress, .logits, 0));
+    try testing.expectEqual(@as(usize, 2), probe.calls);
+    try testing.expectError(error.StorageFailure, matvecRows(source, &matrix_tensor, &.{ 7, 9 }, &output, &row, &expanded, .scalar_reference, 0, 3, progress, .logits, 0));
+    try testing.expectEqual(@as(usize, 2), probe.calls);
+    probe.accept = true;
+    probe.finite = false;
+    try testing.expectError(error.NonFinite, matvecRows(source, &matrix_tensor, &.{ 7, 9 }, &output, &row, &expanded, .fused, 0, 3, progress, .logits, 0));
+    try testing.expectEqual(@as(usize, 3), probe.calls);
+    const missing_context: Progress = .{ .matrix_callback = &Probe.matrix };
+    try testing.expectError(error.InvalidPlan, matvecRows(source, &matrix_tensor, &.{ 7, 9 }, &output, &row, &expanded, .fused, 0, 3, missing_context, .logits, 0));
+    try testing.expectEqual(@as(usize, 3), probe.calls);
 }

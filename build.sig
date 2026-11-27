@@ -109,6 +109,15 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     const safetensors = try ctx.addModule("safetensors", "src/core/safetensors.sig");
     try wire(ctx, safetensors, "sig_text", "src/core/sig_text.sig");
     _ = try ctx.addModule("asr_mel", "src/asr/mel.sig");
+    _ = try ctx.addModule("native_audio", "src/audio.sig");
+    _ = try ctx.addModule("whisper", "src/whisper.sig");
+    const native_media_test = try ctx.addTestStep(.{
+        .name = "test-native-media",
+        .source_path = "src/native_media_tests.sig",
+        .imports = &.{},
+    });
+    try ctx.addDependency(test_all, native_media_test);
+    _ = try addTest(ctx, test_all, "test-whisper-gpu", "src/whisper_gpu_test.sig", &.{});
     const asr = try ctx.addModule("asr", "src/asr/root.sig");
     try wire(ctx, asr, "safetensors", "src/core/safetensors.sig");
     try wire(ctx, asr, "asr_mel", "src/asr/mel.sig");
@@ -299,14 +308,14 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("protobuf", "src/core/protobuf.sig"),
     });
     _ = try addTest(ctx, test_all, "test-sabr-player-fields", "src/youtube/sabr/player_fields.sig", &.{});
-    _ = try addTest(ctx, test_all, "test-sabr-loop", "src/youtube/sabr/stream.sig", &.{
+    _ = try addTest(ctx, test_all, "test-sabr-loop", "src/youtube_sabr_test.sig", &.{
         importEntry("protobuf", "src/core/protobuf.sig"),
         importEntry("youtube_net", "src/youtube/net.sig"),
         importEntry("zpm_http", "src/net/http/client.sig"),
         importEntry("tls_client", "src/core/crypto/tls/client.sig"),
         importEntry("win32", win32_path),
     });
-    _ = try addTest(ctx, test_all, "test-manifest-sabr", "src/youtube/manifest.sig", &.{});
+    _ = try addTest(ctx, test_all, "test-manifest-sabr", "src/youtube_manifest_test.sig", &.{});
     const jsonl = try ctx.addModule("jsonl", "src/core/jsonl.sig");
     try wire(ctx, jsonl, "json", "src/core/json.sig");
     try wire(ctx, jsonl, "sig_mem", "src/core/sig_mem.sig");
@@ -693,6 +702,10 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("qwen3_decoder_plan", "src/core/qwen3_decoder_plan.sig"),
         importEntry("quantized_linear", "src/core/quantized_linear.sig"),
         importEntry("transformer_ops", "src/core/transformer_ops.sig"),
+    });
+    _ = try addTest(ctx, test_all, "test-text-gpu", "src/text_gpu_test.sig", &.{
+        importEntry("gguf", "src/core/gguf.sig"),
+        importEntry("quantized_linear", "src/core/quantized_linear.sig"),
     });
     _ = try addTest(ctx, test_all, "test-inference-session", "src/core/inference_session.sig", &.{
         importEntry("gguf", "src/core/gguf.sig"),
