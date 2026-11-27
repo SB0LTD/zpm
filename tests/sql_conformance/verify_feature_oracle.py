@@ -229,7 +229,7 @@ def main():
     missing = [p['id'] for p in probes if p['id'] not in previous]
     if missing:
         report['unrecorded'] = missing
-    args.report.write_text(json.dumps(report, indent=1, ensure_ascii=False) + '\n', encoding='utf8')
+    args.report.write_text(json.dumps(report, indent=1, ensure_ascii=False) + '\n', encoding='utf8', newline='\n')
     if unstable:
         print('unstable probes:', ' '.join(unstable), file=sys.stderr)
         return 1

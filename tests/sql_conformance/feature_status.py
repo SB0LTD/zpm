@@ -236,7 +236,7 @@ def main():
     report['probe_results'] = OrderedDict(
         [('pass', [p['id'] for p in probes if results[p['id']]['pass']]),
          ('fail', [p['id'] for p in probes if not results[p['id']]['pass']])])
-    args.status.write_text(json.dumps(report, indent=1, ensure_ascii=False) + '\n', encoding='utf8')
+    args.status.write_text(json.dumps(report, indent=1, ensure_ascii=False) + '\n', encoding='utf8', newline='\n')
     write_doc(args.doc, features, entries, report)
     print(json.dumps(report['totals']), json.dumps(report['probes']))
 

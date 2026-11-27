@@ -121,7 +121,7 @@ def main():
         admin.close()
     if failures:
         report['failures'] = failures
-    args.report.write_text(json.dumps(report, indent=1) + '\n', encoding='utf8')
+    args.report.write_text(json.dumps(report, indent=1) + '\n', encoding='utf8', newline='\n')
     print(json.dumps({'cases': list(report['cases']), 'failures': len(failures)}))
     return 1 if failures else 0
 
