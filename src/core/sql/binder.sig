@@ -1301,6 +1301,34 @@ pub fn Binder(comptime config: types.Config) type {
             }
         }
 
+        /// The tsvector / tsquery utilities (pg_proc signatures; wave 4
+        /// text-json). ts_delete's second argument is text or text[].
+        fn typeTextSearchUtility(context: *const Context, n: *ast.Node, count: usize) Error!void {
+            if (context.dialect != .postgres) return error.UndefinedFunction;
+            const T = ast.Type;
+            const text_array = types.arrayType(.text).?;
+            switch (n.func) {
+                .tsvector_length => try bindSignature(context, n, &[_]T{.tsvector}, .int4, true),
+                .ts_strip => try bindSignature(context, n, &[_]T{.tsvector}, .tsvector, true),
+                .ts_setweight => switch (count) {
+                    2 => try bindSignature(context, n, &[_]T{ .tsvector, .pg_internal_char }, .tsvector, true),
+                    3 => try bindSignature(context, n, &[_]T{ .tsvector, .pg_internal_char, text_array }, .tsvector, true),
+                    else => return error.UndefinedFunction,
+                },
+                .tsvector_to_array => try bindSignature(context, n, &[_]T{.tsvector}, text_array, true),
+                .array_to_tsvector => try bindSignature(context, n, &[_]T{text_array}, .tsvector, true),
+                .ts_delete => {
+                    if (count != 2) return error.UndefinedFunction;
+                    const second = argumentType(context, n, 1);
+                    const array = second != .unknown and types.isArray(second);
+                    try bindSignature(context, n, &[_]T{ .tsvector, if (array) text_array else .text }, .tsvector, true);
+                },
+                .ts_filter => try bindSignature(context, n, &[_]T{ .tsvector, types.arrayType(.pg_internal_char) orelse return error.UndefinedFunction }, .tsvector, true),
+                .ts_numnode => try bindSignature(context, n, &[_]T{.tsquery}, .int4, true),
+                else => return error.UndefinedFunction,
+            }
+        }
+
         /// int2/int4/int8 & | # (common integer type) and << >> (int4 count).
         fn bitwiseType(context: *const Context, n: *ast.Node) Error!void {
             const left = context.node(n.a).ty;
@@ -1646,6 +1674,10 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "to_tsquery", .func = .to_tsquery },
                 .{ .name = "plainto_tsquery", .func = .plainto_tsquery },
                 .{ .name = "phraseto_tsquery", .func = .phraseto_tsquery },
+                .{ .name = "strip", .func = .ts_strip },           .{ .name = "setweight", .func = .ts_setweight },
+                .{ .name = "tsvector_to_array", .func = .tsvector_to_array }, .{ .name = "array_to_tsvector", .func = .array_to_tsvector },
+                .{ .name = "ts_delete", .func = .ts_delete },       .{ .name = "ts_filter", .func = .ts_filter },
+                .{ .name = "numnode", .func = .ts_numnode },
                 .{ .name = "similar_to_escape", .func = .similar_to_escape },
                 // Discovery functions (B11 text lane).
                 .{ .name = "pg_typeof", .func = .pg_typeof },
@@ -2842,6 +2874,7 @@ pub fn Binder(comptime config: types.Config) type {
                     try typeRegexFunction(context, n, count);
                 },
                 .substring_regex, .substring_similar => try typeRegexFunction(context, n, count),
+                .tsvector_length, .ts_strip, .ts_setweight, .tsvector_to_array, .array_to_tsvector, .ts_delete, .ts_filter, .ts_numnode => try typeTextSearchUtility(context, n, count),
                 .json_query_function, .is_json, .json_constructor => unreachable, // bound before the arguments
                 .jsonb_path_query => {
                     const seen = scope.set_calls orelse return error.UnsupportedStatement;
@@ -4012,7 +4045,14 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 // octet_length(bpchar) counts CHAR(n) padding; the others read
                 // CHAR(n) through text, which drops trailing spaces.
-                .char_length, .octet_length, .bit_length, .ascii => try bindSignature(context, n, &[_]T{if (n.func == .octet_length and count == 1 and argumentType(context, n, 0) == .bpchar) .bpchar else .text}, .int4, true),
+                .char_length, .octet_length, .bit_length, .ascii => {
+                    // length(tsvector) (wave 4 text-json).
+                    if (n.func == .char_length and count == 1 and argumentType(context, n, 0) == .tsvector and types.same(toName(context, n.name).slice(), "length")) {
+                        n.func = .tsvector_length;
+                        return typeTextSearchUtility(context, n, count);
+                    }
+                    try bindSignature(context, n, &[_]T{if (n.func == .octet_length and count == 1 and argumentType(context, n, 0) == .bpchar) .bpchar else .text}, .int4, true);
+                },
                 .substring => {
                     // Unknown or text arguments after the first select the
                     // regular-expression overloads substring(text,text[,text]),
@@ -5000,6 +5040,13 @@ pub fn Binder(comptime config: types.Config) type {
                         .concat => {
                             const left_ty = context.node(n.a).ty;
                             const right_ty = context.node(n.b).ty;
+                            // tsvector || tsvector (wave 4 text-json).
+                            if ((left_ty == .tsvector and (right_ty == .tsvector or right_ty == .unknown)) or (right_ty == .tsvector and left_ty == .unknown)) {
+                                try coerce(context, n.a, .tsvector);
+                                try coerce(context, n.b, .tsvector);
+                                n.ty = .tsvector;
+                                return;
+                            }
                             if (types.isArray(left_ty) or types.isArray(right_ty)) {
                                 n.ty = try arrayConcatTypes(context, &n.a, &n.b, .operator);
                                 return;

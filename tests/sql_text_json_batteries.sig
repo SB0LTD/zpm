@@ -909,3 +909,22 @@ pub const contract_mixed_battery = [_][2][]const u8{
     .{ "SELECT JSON_VALUE(jsonb '{\"a\": 1}', '$.a' RETURNING int4range)", "NULL" },
     .{ "SELECT JSON_OBJECT('a' VALUE 1 RETURNING int)", "!42846" },
 };
+
+pub const ts_utility_battery = [_][2][]const u8{
+    .{ "SELECT length(to_tsvector('english', 'The fat cats ate the fat rats')), length(''::tsvector), length('a:1 b c:2,3'::tsvector)", "4|0|3" },
+    .{ "SELECT strip('a:1,2 b:3A c'::tsvector), strip(''::tsvector)", "'a' 'b' 'c'|" },
+    .{ "SELECT setweight('a:1,2 b:3A c'::tsvector, 'B'), setweight('a:1,2 b:3A c'::tsvector, 'd'), setweight('a:1,2 b:3A c d:4'::tsvector, 'A', '{a,c,zz}'), setweight('a:1 b:2'::tsvector, 'a', ARRAY['b', NULL])", "'a':1B,2B 'b':3B 'c'|'a':1,2 'b':3 'c'|'a':1A,2A 'b':3A 'c' 'd':4|'a':1 'b':2A" },
+    .{ "SELECT setweight('a:1'::tsvector, 'x')", "!22023" },
+    .{ "SELECT tsvector_to_array('fat:2 rat:3 cat'::tsvector), tsvector_to_array(''::tsvector), array_to_tsvector('{fat,cat,rat,cat}'::text[]), array_to_tsvector(ARRAY['b','a'])", "{cat,fat,rat}|{}|'cat' 'fat' 'rat'|'a' 'b'" },
+    .{ "SELECT array_to_tsvector('{a,NULL}'::text[])", "!22004" },
+    .{ "SELECT array_to_tsvector('{a,\"\"}'::text[])", "!2200F" },
+    .{ "SELECT ts_delete('fat:2,4 cat:3 rat:5A'::tsvector, 'fat'), ts_delete('fat:2,4 cat:3 rat:5A'::tsvector, ARRAY['fat','rat','zz']), ts_delete('a b'::tsvector, 'zz'), ts_delete('a b'::tsvector, ARRAY['a', NULL])", "'cat':3 'rat':5A|'cat':3|'a' 'b'|'b'" },
+    .{ "SELECT ts_filter('fat:2,4 cat:3b,7c rat:5A'::tsvector, '{a,b}'), ts_filter('fat:2,4 cat:3b,7c rat:5A'::tsvector, '{d}'), ts_filter('a b:1C'::tsvector, '{c}')", "'cat':3B 'rat':5A|'fat':2,4|'b':1C" },
+    .{ "SELECT ts_filter('a:1'::tsvector, '{a,NULL}')", "!22004" },
+    .{ "SELECT ts_filter('a:1'::tsvector, '{z}')", "!22023" },
+    .{ "SELECT numnode('(fat & rat) | cat'::tsquery), numnode('fat'::tsquery), numnode(''::tsquery), numnode('!a <-> b:*'::tsquery), numnode(plainto_tsquery('english', 'the a'))", "5|1|0|4|0" },
+    .{ "SELECT pg_typeof(length('a'::tsvector)), pg_typeof(strip('a'::tsvector)), pg_typeof(tsvector_to_array('a'::tsvector)), length('abc'), length(NULL::tsvector)", "integer|tsvector|text[]|3|NULL" },
+    .{ "SELECT setweight(to_tsvector('english', 'The quick brown fox'), 'A') || setweight(to_tsvector('english', 'jumped over'), 'B')", "'brown':3A 'fox':4A 'jump':5B 'quick':2A" },
+    .{ "SELECT 'a:1 b:2'::tsvector || 'a:1 c:3B'::tsvector, 'a b'::tsvector || 'a:5 c'::tsvector, ''::tsvector || 'x:2'::tsvector, 'a:16380'::tsvector || 'b:10'::tsvector", "'a':1,3 'b':2 'c':5B|'a':5 'b' 'c'|'x':2|'a':16380 'b':16383" },
+    .{ "SELECT pg_typeof('a'::tsvector || 'b'), 'a'::tsvector || NULL", "tsvector|NULL" },
+};

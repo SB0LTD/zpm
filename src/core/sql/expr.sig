@@ -1203,6 +1203,80 @@ pub fn Eval(comptime config: types.Config) type {
             };
         }
 
+        /// length(tsvector), strip, setweight, tsvector_to_array,
+        /// array_to_tsvector, ts_delete, ts_filter and numnode.
+        fn textSearchUtility(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
+            const TS = Io.TextSearch;
+            var args: [3]V.Cell = undefined;
+            var count: usize = 0;
+            var item = n.b;
+            while (item != none) : (item = node(ctx, item).next) {
+                if (count == args.len) return error.UndefinedFunction;
+                args[count] = try eval(ctx, item);
+                if (args[count] == .null_value) return .null_value;
+                count += 1;
+            }
+            var out: TS.Out = .{};
+            const A = V.Arrays;
+            var list: [config.text_bytes / 2 + 2]?[]const u8 = undefined;
+            switch (n.func) {
+                .tsvector_length => return .{ .integer = @intCast(try TS.lexemeCount(args[0].tsvector.slice())) },
+                .ts_numnode => return .{ .integer = @intCast(try TS.queryItemCount(args[0].tsquery.slice())) },
+                .ts_strip => try TS.editVector(args[0].tsvector.slice(), .strip, &out),
+                .ts_setweight => {
+                    const weight = try TS.weightCode(args[1].pg_internal_char);
+                    var only: ?[]const ?[]const u8 = null;
+                    if (count == 3) {
+                        const total = A.textSlices(args[2].array.slice(), &list);
+                        if (total > list.len) return error.ProgramLimitExceeded;
+                        only = list[0..total];
+                    }
+                    try TS.editVector(args[0].tsvector.slice(), .{ .setweight = .{ .weight = weight, .only = only } }, &out);
+                },
+                .ts_delete => {
+                    var single: [1]?[]const u8 = undefined;
+                    var victims: []const ?[]const u8 = undefined;
+                    if (args[1] == .array) {
+                        const total = A.textSlices(args[1].array.slice(), &list);
+                        if (total > list.len) return error.ProgramLimitExceeded;
+                        victims = list[0..total];
+                    } else {
+                        single[0] = args[1].text.slice();
+                        victims = &single;
+                    }
+                    try TS.editVector(args[0].tsvector.slice(), .{ .delete = victims }, &out);
+                },
+                .ts_filter => {
+                    var mask: u4 = 0;
+                    var reader = A.Reader.init(args[1].array.slice());
+                    var element: V.Cell = undefined;
+                    while (reader.next(&element)) {
+                        if (element == .null_value) return error.NullValueNotAllowed;
+                        mask |= @as(u4, 1) << @intCast(try TS.weightCode(element.pg_internal_char));
+                    }
+                    try TS.editVector(args[0].tsvector.slice(), .{ .filter = mask }, &out);
+                },
+                .array_to_tsvector => {
+                    const total = A.textSlices(args[0].array.slice(), &list);
+                    if (total > list.len) return error.ProgramLimitExceeded;
+                    try TS.vectorOfLexemes(list[0..total], &out);
+                },
+                .tsvector_to_array => {
+                    var vector: TS.Vector = .{};
+                    const total = try TS.lexemes(args[0].tsvector.slice(), &vector);
+                    var result: V.Text = .{};
+                    var writer = try A.Writer.begin(&result, &.{ .element = .text, .ndim = if (total == 0) 0 else 1, .dims = .{ @intCast(total), 0, 0, 0, 0, 0 } });
+                    for (0..total) |index| {
+                        const cell = try textCell(TS.lexemeAt(&vector, index));
+                        try writer.append(&cell);
+                    }
+                    return .{ .array = result };
+                },
+                else => return error.UnsupportedStatement,
+            }
+            return .{ .tsvector = (try textCell(out.slice())).text };
+        }
+
         fn defaultTextSearch(ctx: *const Context) Io.TextSearch.Configuration {
             return if (ctx.session.text_search_config == 0) .simple else .english;
         }
@@ -1303,6 +1377,11 @@ pub fn Eval(comptime config: types.Config) type {
                         return array_eval.ArrayEval(config, @This()).concat(kind, &left, &right, n.ty);
                     }
                     if (left == .null_value or right == .null_value) return .null_value;
+                    if (n.ty == .tsvector) {
+                        var out: Io.TextSearch.Out = .{};
+                        try Io.TextSearch.concatVectors(left.tsvector.slice(), right.tsvector.slice(), &out);
+                        return .{ .tsvector = (try textCell(out.slice())).text };
+                    }
                     if (n.ty == .jsonb) {
                         var out: J.Buffer = .{};
                         try J.concatControlled(left.jsonb.slice(), right.jsonb.slice(), &out, ctx.session.control);
@@ -1637,6 +1716,7 @@ pub fn Eval(comptime config: types.Config) type {
                 .regexp_matches, .regexp_split_to_table, .jsonb_path_query => return if (ctx.set_value) |current| current.* else error.UnsupportedStatement,
                 .json_query_function => return json_eval.JsonEval(config, @This()).queryFunction(ctx, n),
                 .json_constructor => return json_eval.JsonEval(config, @This()).constructor(ctx, n),
+                .tsvector_length, .ts_strip, .ts_setweight, .tsvector_to_array, .array_to_tsvector, .ts_delete, .ts_filter, .ts_numnode => return textSearchUtility(ctx, n),
                 .is_json => {
                     // ExecEvalJsonIsPredicate: invalid text is false; jsonb
                     // keys are always unique.

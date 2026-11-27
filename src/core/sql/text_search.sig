@@ -1478,6 +1478,132 @@ pub fn TextSearch(comptime text_bytes: usize, comptime depth_limit: usize) type 
             }
         }
 
+        /// The weight code of a setweight / ts_filter weight: A 3, B 2,
+        /// C 1, D 0 (either case); anything else is 22023.
+        pub fn weightCode(c: u8) Error!u16 {
+            return switch (c) {
+                'A', 'a' => 3,
+                'B', 'b' => 2,
+                'C', 'c' => 1,
+                'D', 'd' => 0,
+                else => error.InvalidParameterValue,
+            };
+        }
+
+        /// length(tsvector): the number of lexemes.
+        pub fn lexemeCount(text: []const u8) Error!usize {
+            var vector: Vector = .{};
+            try readVector(text, &vector);
+            return vector.count;
+        }
+
+        /// The edits of strip, setweight, ts_delete and ts_filter.
+        pub const Edit = union(enum) {
+            strip,
+            /// The weight, and the lexemes it applies to (all when null).
+            setweight: struct { weight: u16, only: ?[]const ?[]const u8 },
+            delete: []const ?[]const u8,
+            /// A mask of weight codes to keep.
+            filter: u4,
+        };
+
+        fn listed(list: []const ?[]const u8, lexeme: []const u8) bool {
+            for (list) |item| if (item) |candidate| if (std.mem.eql(u8, candidate, lexeme)) return true;
+            return false;
+        }
+
+        /// Rewrites canonical tsvector text by `edit` (tsvector_op.c).
+        pub fn editVector(text: []const u8, edit: Edit, out: *Out) Error!void {
+            var source: Vector = .{};
+            try readVector(text, &source);
+            var result: Vector = .{};
+            for (source.entries[0..source.count]) |entry| {
+                const lexeme = source.lexeme(entry);
+                const positions = source.positionsOf(entry);
+                switch (edit) {
+                    .delete => |list| if (listed(list, lexeme)) continue,
+                    else => {},
+                }
+                if (edit == .filter) {
+                    var any = false;
+                    for (positions) |position| {
+                        if (edit.filter & (@as(u4, 1) << @intCast(position >> 14)) != 0) any = true;
+                    }
+                    if (!any) continue;
+                }
+                const added = try result.add(lexeme);
+                if (edit == .strip) continue;
+                for (positions) |position| {
+                    var kept = position;
+                    switch (edit) {
+                        .setweight => |weight| if (weight.only == null or listed(weight.only.?, lexeme)) {
+                            kept = (position & 0x3fff) | (weight.weight << 14);
+                        },
+                        .filter => |mask| if (mask & (@as(u4, 1) << @intCast(position >> 14)) == 0) continue,
+                        else => {},
+                    }
+                    try result.addPosition(added, kept);
+                }
+            }
+            try writeVector(&result, out, max_positions_per_lexeme);
+        }
+
+        /// The lexemes of canonical tsvector text, in order, into `out`
+        /// (their count; tsvector_to_array).
+        pub fn lexemes(text: []const u8, vector: *Vector) Error!usize {
+            try readVector(text, vector);
+            return vector.count;
+        }
+
+        pub fn lexemeAt(vector: *const Vector, index: usize) []const u8 {
+            return vector.lexeme(vector.entries[index]);
+        }
+
+        /// array_to_tsvector: lexemes without positions (22004 for a NULL,
+        /// 2200F for an empty string).
+        pub fn vectorOfLexemes(list: []const ?[]const u8, out: *Out) Error!void {
+            var vector: Vector = .{};
+            for (list) |item| {
+                const lexeme = item orelse return error.NullValueNotAllowed;
+                if (lexeme.len == 0) return error.ZeroLengthCharacterString;
+                _ = try vector.add(lexeme);
+            }
+            try writeVector(&vector, out, max_positions_per_lexeme);
+        }
+
+        /// tsvector || tsvector (tsvector_concat): the right operand's
+        /// positions move past the left operand's largest position (at most
+        /// 16383); equal lexemes merge their positions.
+        pub fn concatVectors(left_text: []const u8, right_text: []const u8, out: *Out) Error!void {
+            var left: Vector = .{};
+            try readVector(left_text, &left);
+            var right: Vector = .{};
+            try readVector(right_text, &right);
+            var shift: u16 = 0;
+            for (left.positions[0..left.pos_len]) |position| shift = @max(shift, positionValue(position));
+            var result: Vector = .{};
+            for (left.entries[0..left.count]) |entry| {
+                const added = try result.add(left.lexeme(entry));
+                for (left.positionsOf(entry)) |position| try result.addPosition(added, position);
+            }
+            for (right.entries[0..right.count]) |entry| {
+                const added = try result.add(right.lexeme(entry));
+                for (right.positionsOf(entry)) |position| {
+                    const moved: u16 = @min(@as(u32, positionValue(position)) + shift, max_position);
+                    try result.addPosition(added, moved | (position & 0xc000));
+                }
+            }
+            try writeVector(&result, out, max_positions_per_lexeme);
+        }
+
+        /// numnode(tsquery): the query's items.
+        pub fn queryItemCount(text: []const u8) Error!usize {
+            var query: Query = .{};
+            try readQuery(text, &query, .as_is);
+            if (query.root == null) return 0;
+            return query.count;
+        }
+
         /// to_tsvector(config, text).
         pub fn toVector(text: []const u8, config: Config, out: *Out, control: ?*types.ExecutionControl) Error!void {
             var vector: Vector = .{};

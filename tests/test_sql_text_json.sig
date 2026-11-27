@@ -97,7 +97,7 @@ fn stateOf(err: anyerror) []const u8 {
         .{ "SqlJsonMemberNotFound", "2203A" },    .{ "SqlJsonObjectNotFound", "2203C" },     .{ "MoreThanOneSqlJsonItem", "22034" },
         .{ "NoSqlJsonItem", "22035" },            .{ "SqlJsonScalarRequired", "2203F" },     .{ "CannotCoerce", "42846" },
         .{ "NullValueNotAllowed", "22004" },      .{ "DuplicateJsonObjectKeyValue", "22030" }, .{ "SqlJsonArrayNotFound", "22039" },
-        .{ "ColumnNotFound", "42703" },           .{ "TableNotFound", "42P01" },
+        .{ "ZeroLengthCharacterString", "2200F" }, .{ "ColumnNotFound", "42703" },           .{ "TableNotFound", "42P01" },
     };
     for (table) |entry| if (std.mem.eql(u8, entry[0], @errorName(err))) return entry[1];
     return @errorName(err);
@@ -143,6 +143,11 @@ fn single(source: []const u8, want: []const u8) !void {
     try check(result.row_count == 1 and result.rows[0].cells[0].integer == 4242);
     const usage = db.usage();
     try check(usage.transactions == 0 and usage.pending_versions == 0);
+}
+
+/// The error maps to this SQLSTATE in the contract's table.
+fn stateCheck(err: anyerror, wanted: []const u8) !void {
+    try check(std.mem.eql(u8, stateOf(err), wanted));
 }
 
 fn battery(entries: []const [2][]const u8) !void {
@@ -359,6 +364,10 @@ fn textSearchEnglish() !void {
     // of stop words, default_text_search_config and the forms using it,
     // text @@ tsquery and text @@ text.
     try battery(&batteries.fts_english_battery);
+    // length, strip, setweight, tsvector_to_array, array_to_tsvector,
+    // ts_delete, ts_filter, numnode and tsvector || tsvector.
+    try battery(&batteries.ts_utility_battery);
+    try stateCheck(error.ZeroLengthCharacterString, "2200F");
     try rows("SELECT to_tsvector('Fat Rats'), plainto_tsquery('rats'), 'a b' @@ 'b'", "'fat':1 'rat':2|'rat'|t");
     try meta(0, "to_tsvector", 3614, -1);
     try meta(1, "plainto_tsquery", 3615, -1);

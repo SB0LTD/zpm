@@ -190,7 +190,12 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     // `integer` bits 0-1 the form (0 object, 1 array, 2 scalar, 3
     // serialize), bit 2 ABSENT ON NULL, bit 3 WITH UNIQUE KEYS; the
     // RETURNING type in cast_type / typmod.
-    json_constructor };
+    json_constructor,
+    // tsvector / tsquery utilities (wave 4 text-json, text_search.sig):
+    // length(tsvector), strip, setweight (2 or 3 arguments),
+    // tsvector_to_array, array_to_tsvector, ts_delete (text or text[]),
+    // ts_filter and numnode.
+    tsvector_length, ts_strip, ts_setweight, tsvector_to_array, array_to_tsvector, ts_delete, ts_filter, ts_numnode };
 
 
 /// mr_call variants: the range accessors applied to a multirange's span.
@@ -285,6 +290,7 @@ pub fn immutableBuiltin(func: Func) bool {
         .to_json, .to_jsonb => false,
         .regexp_like, .similar_to_escape => true,
         .regexp_match, .regexp_replace, .regexp_split_to_array, .regexp_count, .regexp_instr, .regexp_substr, .substring_regex, .substring_similar => true,
+        .tsvector_length, .ts_strip, .ts_setweight, .tsvector_to_array, .array_to_tsvector, .ts_delete, .ts_filter, .ts_numnode => true,
         .to_tsvector, .to_tsquery, .plainto_tsquery, .phraseto_tsquery => true,
         else => jsonFunction(func),
     };
@@ -320,6 +326,7 @@ pub fn strictFunction(func: Func) bool {
         .pg_get_serial_sequence, .pg_table_is_visible, .pg_get_indexdef, .pg_get_constraintdef, .pg_get_triggerdef, .pg_get_ruledef, .pg_get_viewdef, .pg_partition_ancestors, .pg_get_statisticsobjdef_columns, .pg_relation_is_publishable, .pg_get_partkeydef => true,
         .regexp_like, .similar_to_escape => true,
         .regexp_match, .regexp_matches, .regexp_replace, .regexp_split_to_array, .regexp_split_to_table, .regexp_count, .regexp_instr, .regexp_substr, .substring_regex, .substring_similar => true,
+        .tsvector_length, .ts_strip, .ts_setweight, .tsvector_to_array, .array_to_tsvector, .ts_delete, .ts_filter, .ts_numnode => true,
         .to_tsvector, .to_tsquery, .plainto_tsquery, .phraseto_tsquery => true,
         else => jsonFunction(func),
     };

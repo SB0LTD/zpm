@@ -2798,6 +2798,7 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "StackDepthExceeded")) return "54001";
     if (equal(name, "NullValueNotAllowed")) return "22004";
     if (equal(name, "DuplicateJsonObjectKeyValue")) return "22030";
+    if (equal(name, "ZeroLengthCharacterString")) return "2200F";
     if (equal(name, "ErrorInAssignment")) return "22005";
     if (equal(name, "SqlJsonArrayNotFound")) return "22039";
     if (equal(name, "SqlJsonMemberNotFound")) return "2203A";
