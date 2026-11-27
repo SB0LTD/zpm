@@ -117,6 +117,7 @@ pub const HandshakeOptions = struct {
     /// A 16-byte nonce for Sec-WebSocket-Key. If null, a fixed dev nonce is
     /// used (the key is not a secret; it only guards against caching proxies).
     key_nonce: ?[16]u8 = null,
+    extra_headers: []const u8 = "",
 };
 
 /// The magic GUID appended to the client key before hashing, per RFC 6455 §4.2.
@@ -168,8 +169,8 @@ pub const Client = struct {
                     "Connection: Upgrade\r\n" ++
                     "Sec-WebSocket-Key: {s}\r\n" ++
                     "Sec-WebSocket-Version: 13\r\n" ++
-                    "\r\n",
-                .{ opts.path, opts.host, key_b64 },
+                    "{s}\r\n",
+                .{ opts.path, opts.host, key_b64, opts.extra_headers },
             ) catch return Error.ScratchTooSmall
         else
             std.fmt.bufPrint(opts.scratch,
@@ -179,8 +180,8 @@ pub const Client = struct {
                     "Connection: Upgrade\r\n" ++
                     "Sec-WebSocket-Key: {s}\r\n" ++
                     "Sec-WebSocket-Version: 13\r\n" ++
-                    "\r\n",
-                .{ opts.path, opts.host, opts.port, key_b64 },
+                    "{s}\r\n",
+                .{ opts.path, opts.host, opts.port, key_b64, opts.extra_headers },
             ) catch return Error.ScratchTooSmall;
 
         self.transport.writeAll(req) catch return Error.IoFailed;
