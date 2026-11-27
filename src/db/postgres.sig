@@ -2493,6 +2493,8 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                 .refresh_materialized_view => "REFRESH MATERIALIZED VIEW",
                 .create_index => "CREATE INDEX",
                 .create_view => "CREATE VIEW",
+                .drop_view => "DROP VIEW",
+                .drop_materialized_view => "DROP MATERIALIZED VIEW",
                 .drop_table => "drop",
                 .create_sequence => "create_sequence",
                 .drop_sequence => "drop_sequence",
