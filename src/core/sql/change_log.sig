@@ -2126,7 +2126,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         if (late) {
                             const base = &db.tables[index];
                             if (vt.mutated or !vt.base or definition.primary_index_oid == 0 or
-                                base.relkind != 'r' or base.parent != 0 or definition.extras.parent != 0 or
+                                // ATTACH PARTITION may give a plain table its parent's key (ddl-dml).
+                                base.relkind != 'r' or base.parent != 0 or
                                 definition.constraint_count != base.constraint_count + 1 or definition.extras.index_count != vt.index_count or
                                 definition.count != vt.column_count or !types.same(definition.name.slice(), vt.name.slice()) or
                                 oidTaken(db, scratch, definition.primary_index_oid, 1)) return error.ChangeRecordConflict;

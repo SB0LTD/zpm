@@ -2093,6 +2093,14 @@ pub fn Database(comptime config: Config) type {
         /// in rules (42P17).
         rule_active: [8]u64 = @splat(0),
         rule_active_len: usize = 0,
+        /// ddl-dml (wave 4): the table an UPDATE / DELETE without ONLY
+        /// named while its family's members run (familyMutation), and which
+        /// written rows its RETURNING reads (an UPDATE that moved a row
+        /// across partitions logs a delete and an insert).
+        family_root: ?usize = null,
+        family_returning: CommandTag = .none,
+        /// ON CONFLICT DO UPDATE of a routed partition row is running.
+        conflict_routed: bool = false,
 
         /// Borrow the embedding's cluster catalogue while serving statements.
         /// The embedding keeps the provider and its rows consistent for the
@@ -2744,6 +2752,7 @@ pub fn Database(comptime config: Config) type {
                 tx.copy_table = null;
                 tx.copy_rows = 0;
                 tx.deferred_checks = false;
+                tx.statement_checks = false;
                 tx.constraints_all = null;
                 tx.constraint_mode_count = 0;
                 tx.isolation = .read_committed;
@@ -3248,6 +3257,7 @@ pub fn Database(comptime config: Config) type {
                 tx.mysql_insert_value = null;
                 tx.mysql_first_generated = 0;
                 tx.mysql_explicit_insert_id = 0;
+                tx.statement_checks = false;
                 self.modifying[slot] = .{};                snap = .{ .csn = self.csn, .slot = slot, .epoch = tx.epoch, .cid = tx.cid };
                 // The first statement that needs a snapshot fixes the
                 // transaction snapshot (REPEATABLE READ / SERIALIZABLE use it).
@@ -3281,12 +3291,14 @@ pub fn Database(comptime config: Config) type {
                 self.wake_epoch +%= 1;
                 return legacy(options.mode, err);
             };
-            // DEFERRABLE constraints in IMMEDIATE mode: end of statement.
-            self.deferredCheck(slot, start, true) catch |err| {
+            // DEFERRABLE constraints in IMMEDIATE mode and the foreign keys
+            // a row could not satisfy yet: end of statement.
+            self.deferredCheck(slot, start, true, true) catch |err| {
                 self.dropStatement(slot);
                 self.wake_epoch +%= 1;
                 return err;
             };
+            tx.statement_checks = false;
             if (!options.writes and tx.write_len > start) {
                 self.dropStatement(slot);
                 return error.ReadOnlyTransaction;
@@ -3360,6 +3372,8 @@ pub fn Database(comptime config: Config) type {
                 text = try self.rewriteViewTarget(slot, original, &statement_copy, view, snap);
                 view_owner = self.catalog_objects.owner(self.tables[view].oid, snap);
             }
+            // UPDATE / DELETE through an inheritance parent or a partitioned table (ddl-dml, wave 4).
+            if (explain == null and view_owner == null) if (try self.familyRoot(&statement_copy, original, mode, snap)) |root| return self.familyMutation(slot, original, root, snap, result, mode);
             const expanded = try expandRelations(self, &self.workspace, text, snap, &statement_copy, self.session.role, &self.session);
             const source = try self.secureTarget(&statement_copy, expanded, text, snap);
             // A user function in a single-table SELECT runs once per row in
@@ -3566,6 +3580,164 @@ pub fn Database(comptime config: Config) type {
                 .delete => |*delete| if (delete.returning.count != 0) try self.returnRows(slot, source, &delete.returning, delete.table, true, result.rows.len, snap.cid),
                 else => {},
             }
+        }
+
+        // ---- inheritance and partition families (ddl-dml, wave 4) ---------
+
+        /// The table an UPDATE / DELETE without ONLY names, when it is a
+        /// partitioned table or an inheritance parent with children.
+        /// Anything else (including a failed lookup, reported by the normal
+        /// binding) returns null.
+        fn familyRoot(self: *Self, statement_copy: *const A.Statement, original: []const u8, mode: ParseMode, snap: Snapshot) Error!?usize {
+            if (self.dialect != .postgres or mode != .standard) return null;
+            const schema: ?ast.Ident, const name: ast.Ident = switch (statement_copy.*) {
+                .update => |*update| if (update.only) return null else .{ update.schema, update.table },
+                .delete => |*delete| if (delete.only) return null else .{ delete.schema, delete.table },
+                else => return null,
+            };
+            const context = self.bindContext(original, mode, snap);
+            const index = B.resolveQualified(&context, schema, name) catch return null;
+            const table = &self.tables[index];
+            if (table.relkind != 'p' and (table.relkind != 'r' or !self.hasChildren(table.oid, snap))) return null;
+            return index;
+        }
+
+        /// Visible members of `root`'s family, root first, breadth first
+        /// (the order the family's reads expand to).
+        fn familyMembers(self: *const Self, root: usize, snap: Snapshot, out: *[config.tables]usize) usize {
+            out[0] = root;
+            var count: usize = 1;
+            var relations: [K.relation_rows]K.Found = undefined;
+            const relation_count = self.catalog.visibleRelations(snap, &relations);
+            var next: usize = 0;
+            while (next < count) : (next += 1) {
+                const oid = self.tables[out[next]].oid;
+                for (relations[0..relation_count]) |found| {
+                    if (found.kind == 'S' or self.tables[found.slot].parent != oid or count == out.len) continue;
+                    out[count] = found.slot;
+                    count += 1;
+                }
+            }
+            return count;
+        }
+
+        /// Parses and binds `original` again with `member` as its target
+        /// (the statement keeps naming the root). Returns the bound source.
+        fn bindFamily(self: *Self, original: []const u8, mode: ParseMode, member: usize, snap: Snapshot, bound: *B.Bound) Error![]const u8 {
+            const top = try P.parseTopWithOptions(original, &self.workspace.nodes, .{ .mode = mode, .dialect = self.dialect });
+            var statement_copy = top.command;
+            const expanded = try expandRelations(self, &self.workspace, original, snap, &statement_copy, self.session.role, &self.session);
+            const source = try self.secureTarget(&statement_copy, expanded, original, snap);
+            var context = self.bindContext(source, mode, snap);
+            context.stored_source_start = original.len;
+            context.family_target = member;
+            try B.bindInto(&context, &statement_copy, bound);
+            switch (bound.*) {
+                .update, .delete => {},
+                else => return error.UnsupportedStatement,
+            }
+            return source;
+        }
+
+        /// UPDATE / DELETE through an inheritance parent or a partitioned
+        /// table, as PostgreSQL's inherited UPDATE / DELETE: one statement
+        /// over every member (FROM ONLY each; a partitioned table holds no
+        /// rows). Each member is parsed and bound again as the target
+        /// (members share the root's column prefix), privileges, rules and
+        /// statement-level triggers are the root's, row triggers each
+        /// member's, and RETURNING evaluates the root's list over every
+        /// member row the statement wrote. An UPDATE whose new row leaves
+        /// its partition moves it (moveRow).
+        fn familyMutation(self: *Self, slot: u16, original: []const u8, root: usize, snap: Snapshot, result: *Result, mode: ParseMode) Error!void {
+            var members: [config.tables]usize = undefined;
+            const count = self.familyMembers(root, snap, &members);
+            // PostgreSQL applies only the root's rules to the statement.
+            for (members[1..count]) |member| if (self.anyRule(member, snap)) return error.UnsupportedStatement;
+            var bound: B.Bound = undefined;
+            _ = try self.bindFamily(original, mode, root, snap, &bound);
+            const is_update = bound == .update;
+            const returning = if (is_update) bound.update.returning.count else bound.delete.returning.count;
+            if (self.txs[slot].read_only) try readOnlyCheck(&bound, &self.workspace.plans);
+            try self.checkPrivileges(&bound, snap);
+            self.workspace.security_check = ast.none;
+            const event: u8 = if (is_update) routine_catalog.tg_update else routine_catalog.tg_delete;
+            const command: CommandTag = if (is_update) .update else .delete;
+            try self.lockTable(slot, root, .row_exclusive);
+            if (try self.insteadNothing(root, if (is_update) '2' else '4', returning != 0, snap)) {
+                self.outcome = .{ .affected = 0, .command = command };
+                return;
+            }
+            try self.statementTriggers(root, routine_catalog.tg_before, &.{event}, snap);
+            self.family_root = root;
+            defer self.family_root = null;
+            var affected: usize = 0;
+            for (members[0..count]) |member| {
+                if (self.tables[member].relkind == 'p') continue;
+                const source = try self.bindFamily(original, mode, member, snap, &bound);
+                try self.lockTable(slot, member, .row_exclusive);
+                try self.ssiRead(slot, member);
+                try self.lockSources(slot);
+                affected += switch (bound) {
+                    .update => |*update| try self.updateRows(slot, source, update, snap),
+                    .delete => |*delete| try self.deleteRows(slot, source, delete, snap),
+                    else => return error.UnsupportedStatement,
+                };
+            }
+            try self.afterTriggers(slot, self.statement_start, if (bound == .update) &bound.update.values else null, snap);
+            try self.statementTriggers(root, 0, &.{event}, snap);
+            self.outcome = .{ .affected = affected, .command = command };
+            if (returning == 0) return;
+            const source = try self.bindFamily(original, mode, root, snap, &bound);
+            self.family_returning = command;
+            defer self.family_returning = .none;
+            switch (bound) {
+                .update => |*update| try self.returnRows(slot, source, &update.returning, root, true, result.rows.len),
+                .delete => |*delete| try self.returnRows(slot, source, &delete.returning, root, true, result.rows.len),
+                else => return error.UnsupportedStatement,
+            }
+        }
+
+        /// Row movement (PostgreSQL ExecCrossPartitionUpdate): an UPDATE
+        /// through a partitioned table whose new row leaves its partition
+        /// deletes the old row there and inserts the new one into the
+        /// partition the statement's target routes it to, with that
+        /// partition's constraints. The row must stay inside the target
+        /// (23514). BEFORE ROW triggers or rules on either partition are
+        /// outside the subset (0A000); AFTER ROW triggers fire for the
+        /// delete and the insert, as PostgreSQL's do.
+        fn moveRow(self: *Self, slot: u16, ctx: *E.Context, update: *const B.Update, old: u32, old_cells: *const E.Row, cells: *E.Row, snap: Snapshot) Error!bool {
+            const root = self.family_root orelse return error.CheckViolation;
+            try self.partitionBound(root, cells, snap);
+            const destination = try self.routeRow(slot, root, cells, snap);
+            if (self.rowHooks(update.table, routine_catalog.tg_delete, '4', snap) or self.insertHooks(destination, snap)) return error.UnsupportedStatement;
+            // The destination's NOT NULL and CHECK constraints.
+            const target_table = &self.tables[destination];
+            for (target_table.columns[0..target_table.column_count], 0..) |*column, index| {
+                if (cells[index] == .null_value and column.not_null) return error.NotNullViolation;
+            }
+            var flags: [config.table_constraints]bool = @splat(true);
+            var checks: [config.table_constraints]u16 = @splat(ast.none);
+            const context = self.bindContext(ctx.source, .standard, snap);
+            try B.bindFlaggedChecks(&context, destination, &flags, &checks);
+            try D.checkRow(ctx, target_table, &checks, cells);
+            // The old row leaves its partition (referencing rows see a delete).
+            try self.referencedChange(slot, update.table, old_cells, null, snap);
+            if (self.tables[update.table].versions[old].hasDeletion()) return true;
+            try self.placeDelete(slot, update.table, old, snap);
+            if (target_table.primary_column) |column| switch (S.primaryKeyCheck(target_table, &cells[column], 0xffffffff, snap)) {
+                .free => {},
+                .taken => return error.PrimaryKeyViolation,
+                .wait => |owner| {
+                    var waits: L.Set = .{};
+                    waits.add(owner);
+                    return self.park(slot, waits);
+                },
+            };
+            if (try self.uniqueTaken(slot, destination, cells, 0xffffffff, null, snap)) |_| return error.PrimaryKeyViolation;
+            try self.exclusionTaken(slot, destination, cells, 0xffffffff, null, snap);
+            try self.checkReferences(slot, destination, cells, null, snap);
+            try self.appendRow(slot, destination, cells, snap);
+            return true;
         }
 
         fn lockSelect(self: *Self, slot: u16, select: *const B.Select) Error!void {
@@ -3786,7 +3958,7 @@ pub fn Database(comptime config: Config) type {
             const start = self.statement_start;
             const writes = tx.writes[start..tx.write_len];
             var count: usize = 0;
-            for (writes) |entry| if (rowWrite(entry.kind) and (entry.table == table_index or self.descends(entry.table, table_index)) and self.writeCid(entry) == cid) {
+            for (writes) |entry| if (self.returnedWrite(entry.kind) and (entry.table == table_index or self.descends(entry.table, table_index)) and self.writeCid(entry) == cid) {
                 count += 1;
             };
             if (list.output and count != self.outcome.affected) return error.UnsupportedStatement;
@@ -3800,7 +3972,7 @@ pub fn Database(comptime config: Config) type {
             var cell_scratch: Cell = undefined;
             var row: usize = 0;
             for (writes) |entry| {
-                if (!rowWrite(entry.kind) or (entry.table != table_index and !self.descends(entry.table, table_index))) continue;
+                if (!self.returnedWrite(entry.kind) or (entry.table != table_index and !self.descends(entry.table, table_index))) continue;
                 if (self.writeCid(entry) != cid) continue;
                 const table = &self.tables[entry.table];
                 if (list.output) {
@@ -3825,6 +3997,16 @@ pub fn Database(comptime config: Config) type {
 
         fn rowWrite(kind: anytype) bool {
             return kind == .insert or kind == .update or kind == .delete;
+        }
+
+        /// RETURNING rows: through a family an UPDATE returns its updated
+        /// and moved (inserted) rows, a DELETE its deleted ones.
+        fn returnedWrite(self: *const Self, kind: anytype) bool {
+            return switch (self.family_returning) {
+                .update => kind == .insert or kind == .update,
+                .delete => kind == .delete,
+                else => rowWrite(kind),
+            };
         }
 
         fn validateTsqlOutput(self: *const Self, index: usize, command: CommandTag, snap: Snapshot) Error!void {
@@ -9469,7 +9651,10 @@ pub fn Database(comptime config: Config) type {
             if (!types.same(alter.name.slice(), source.name.slice())) {
                 try self.checkRelationTypeName(slot, source.namespace, alter.name.slice(), snap);
             }
+            // ATTACH / DETACH PARTITION lock the partitioned table first (ddl-dml).
+            if (alter.partition_parent) |parent| try self.lockTable(slot, parent, if (alter.attach) .share_update_exclusive else .access_exclusive);
             try self.lockTable(slot, alter.table, .access_exclusive);
+            if (alter.partition_default) |default| try self.lockTable(slot, default, .access_exclusive);
             const tx = &self.txs[slot];
             try self.reserveWrites(slot, 3 + 2 * config.columns);
             var destination: ?usize = null;
@@ -9501,6 +9686,10 @@ pub fn Database(comptime config: Config) type {
             S.reset(copy, source.oid, alter.name, alter.columns[0..alter.count]);
             copy.namespace = source.namespace;
             S.setConstraints(copy, alter.constraints[0..alter.constraint_count]);
+            // ADD FOREIGN KEY ... REFERENCES the table itself (ddl-dml).
+            for (copy.constraints[0..copy.constraint_count]) |*constraint| {
+                if (constraint.kind == .foreign and constraint.ref_oid == 0) constraint.ref_oid = copy.oid;
+            }
             S.setExtras(copy, &alter.extras);
             if (S.keyed(copy)) copy.primary_index_oid = source.primary_index_oid;
             try self.assignConstraintOids(copy, source);
@@ -9561,6 +9750,41 @@ pub fn Database(comptime config: Config) type {
             }
             var ctx = self.evalContext("");
             var row_scratch: S.VersionRowScratch = undefined;
+            // ATTACH PARTITION: the DEFAULT partition gives up the new bound.
+            if (alter.partition_default) |default| attach: {
+                const parent_index = alter.partition_parent orelse break :attach;
+                const key = self.tables[parent_index].partition.key;
+                var members: [config.tables]usize = undefined;
+                const count = self.familyMembers(default, snap, &members);
+                for (members[0..count]) |member| {
+                    const other = &self.tables[member];
+                    for (0..other.row_high) |row| {
+                        if (other.rows[row].newest == 0) continue;
+                        const version = S.visibleAt(other, row, snap) orelse continue;
+                        try self.session.checkpoint();
+                        var temporary: Cell = undefined;
+                        if (S.partitionContains(&table.partition, S.borrowVersionCell(other, version, key, &temporary))) return error.CheckViolation;
+                    }
+                }
+            }
+            // ATTACH PARTITION: every row inside the bound, a partitioned
+            // table's through its partitions (23514).
+            if (alter.attach) attach: {
+                const parent_index = alter.partition_parent orelse break :attach;
+                const key = self.tables[parent_index].partition.key;
+                var members: [config.tables]usize = undefined;
+                const count = self.familyMembers(index, snap, &members);
+                for (members[0..count]) |member| {
+                    const part = &self.tables[member];
+                    for (0..part.row_high) |row| {
+                        if (part.rows[row].newest == 0) continue;
+                        const version = S.visibleAt(part, row, snap) orelse continue;
+                        try self.session.checkpoint();
+                        var temporary: Cell = undefined;
+                        try self.partitionKeyFits(index, S.borrowVersionCell(part, version, key, &temporary), snap);
+                    }
+                }
+            }
             for (0..table.row_high) |row| {
                 if (table.rows[row].newest == 0) continue;
                 const version = S.visibleAt(table, row, snap) orelse continue;
@@ -9733,6 +9957,49 @@ pub fn Database(comptime config: Config) type {
             return @intFromBool(try self.updateOne(slot, ctx, update, row, goal, old, snap));
         }
 
+        /// ON CONFLICT through a partitioned table (ddl-dml, wave 4): the
+        /// arbiter of `root` as the routed partition's equivalent key.
+        fn partitionArbiter(self: *const Self, root: usize, partition: usize, arbiter: B.Arbiter) Error!B.Arbiter {
+            const parent = &self.tables[root];
+            const leaf = &self.tables[partition];
+            switch (arbiter) {
+                .any => return .any,
+                .primary => {
+                    if (leaf.primary_column != null and leaf.primary_column == parent.primary_column) return .primary;
+                    return error.UnsupportedStatement;
+                },
+                .constraint => |position| {
+                    const wanted = &parent.constraints[position];
+                    for (leaf.constraints[0..leaf.constraint_count], 0..) |*candidate, index| {
+                        if (!S.scannedUnique(leaf, candidate) or candidate.nulls_not_distinct != wanted.nulls_not_distinct) continue;
+                        if (candidate.column_count != wanted.column_count) continue;
+                        var same = true;
+                        for (candidate.keyColumns(), wanted.keyColumns()) |a, b| same = same and a == b;
+                        if (same) return .{ .constraint = index };
+                    }
+                    if (wanted.kind == .primary and wanted.column_count == 1 and leaf.primary_column == wanted.columns[0]) return .primary;
+                    return error.UnsupportedStatement;
+                },
+                .index => return error.UnsupportedStatement,
+            }
+        }
+
+        /// DO UPDATE of a row a partitioned table's INSERT routed to a
+        /// partition: the bound SET list over the partition (same column
+        /// layout) with the partition's CHECK constraints. A new row that
+        /// would leave the partition is 0A000, as in PostgreSQL.
+        fn routedConflictUpdate(self: *Self, slot: u16, ctx: *E.Context, table_index: usize, update: *const B.Update, version: u32, proposed: *const E.Row, snap: Snapshot) Error!usize {
+            var routed = update.*;
+            routed.table = table_index;
+            routed.checks = @splat(ast.none);
+            const flags: [config.table_constraints]bool = @splat(true);
+            const context = self.bindContext(ctx.source, .standard, snap);
+            try B.bindFlaggedChecks(&context, table_index, &flags, &routed.checks);
+            self.conflict_routed = true;
+            defer self.conflict_routed = false;
+            return self.conflictUpdate(slot, ctx, table_index, &routed, version, proposed, snap);
+        }
+
         /// A primary-key replacement is one real delete and one insert. More
         /// than one uniqueness key, trigger and foreign-key effects require
         /// their own replacement path before those schemas can be admitted.
@@ -9805,10 +10072,17 @@ pub fn Database(comptime config: Config) type {
             // ON CONFLICT: the arbiter is checked first (PostgreSQL's
             // speculative pre-check); other unique indexes still raise 23505.
             const conflict = &insert.conflict;
-            if (conflict.action != .none) if (try self.arbiterTaken(slot, table_index, conflict.arbiter, &cells, snap)) |version| switch (conflict.action) {
-                .nothing, .none => return 0,
-                .update => return self.conflictUpdate(slot, ctx, table_index, &conflict.update, version, &cells, snap),
-            };
+            if (conflict.action != .none) {
+                // Through a partitioned table the routed partition's key arbitrates.
+                const arbiter = if (table_index == insert.table) conflict.arbiter else try self.partitionArbiter(insert.table, table_index, conflict.arbiter);
+                if (try self.arbiterTaken(slot, table_index, arbiter, &cells, snap)) |version| switch (conflict.action) {
+                    .nothing, .none => return 0,
+                    .update => {
+                        if (table_index == insert.table) return self.conflictUpdate(slot, ctx, table_index, &conflict.update, version, &cells, snap);
+                        return self.routedConflictUpdate(slot, ctx, table_index, &conflict.update, version, &cells, snap);
+                    },
+                };
+            }
             if (table.primary_column) |column| switch (S.primaryKeyCheck(table, &cells[column], 0xffffffff, snap)) {
                 .free => {},
                 .taken => return error.PrimaryKeyViolation,
@@ -9948,7 +10222,12 @@ pub fn Database(comptime config: Config) type {
                     self.txs[slot].deferred_checks = true;
                     continue;
                 }
-                try self.referencedRow(slot, table_index, constraint, cells, snap);
+                // A missing referenced row may still appear before the
+                // statement ends (PostgreSQL's RI check is an AFTER trigger).
+                self.referencedRow(slot, table_index, constraint, cells, snap) catch |err| {
+                    if (err != error.ForeignKeyViolation) return err;
+                    self.txs[slot].statement_checks = true;
+                };
             }
         }
 
@@ -10013,6 +10292,16 @@ pub fn Database(comptime config: Config) type {
                     const action = if (new == null) constraint.on_delete else constraint.on_update;
                     if (action == .no_action and constraint.deferrable) {
                         self.txs[slot].deferred_checks = true;
+                        continue;
+                    }
+                    // NO ACTION and RESTRICT are checked when the statement
+                    // ends: the references may be gone (and for NO ACTION
+                    // the key live again) by then.
+                    if (action == .no_action or action == .restrict) {
+                        self.referencingRows(slot, child_index, constraint, action, old, new, snap) catch |err| {
+                            if (err != error.ForeignKeyViolation) return err;
+                            self.txs[slot].statement_checks = true;
+                        };
                         continue;
                     }
                     try self.referencingRows(slot, child_index, constraint, action, old, new, snap);
@@ -10173,7 +10462,7 @@ pub fn Database(comptime config: Config) type {
                     tx.constraint_mode_count += 1;
                 }
             }
-            if (!set.deferred) try self.deferredCheck(slot, 0, true);
+            if (!set.deferred) try self.deferredCheck(slot, 0, true, false);
         }
 
         /// The deferred checks of a transaction (COMMIT, SET CONSTRAINTS
@@ -10186,15 +10475,20 @@ pub fn Database(comptime config: Config) type {
         pub fn deferredViolation(self: *const Self, slot: u16) Error!void {
             // SERIALIZABLE: a doomed transaction or pivot cannot commit.
             if (self.active(slot)) if (self.txs[slot].ssi) |index| try self.ssi.check(index);
-            return self.deferredCheck(slot, 0, false);
+            return self.deferredCheck(slot, 0, false, false);
         }
 
         /// Writes from `start`; `immediate_only` skips constraints whose
         /// mode is DEFERRED now (statement end, SET CONSTRAINTS IMMEDIATE).
-        fn deferredCheck(self: *const Self, slot: u16, start: usize, immediate_only: bool) Error!void {
+        /// `statement_end`: also the non-deferred foreign key checks a row
+        /// left for the end of its statement (PostgreSQL's RI triggers fire
+        /// then): a missing referenced row, a removed key that NO ACTION
+        /// rows still reference, and one RESTRICT rows reference at all.
+        fn deferredCheck(self: *const Self, slot: u16, start: usize, immediate_only: bool, statement_end: bool) Error!void {
             const tx = &self.txs[slot];
             var row_scratch: S.VersionRowScratch = undefined;
-            if (!tx.active or !tx.deferred_checks) return;
+            var new_scratch: S.VersionRowScratch = undefined;
+            if (!tx.active or !(tx.deferred_checks or (statement_end and tx.statement_checks))) return;
             const snap: Snapshot = .{ .csn = self.csn, .slot = slot, .epoch = tx.epoch, .cid = tx.cid +% 1 };
             for (tx.writes[start..tx.write_len]) |entry| {
                 if (entry.kind != .insert and entry.kind != .update and entry.kind != .delete) continue;
@@ -10202,15 +10496,20 @@ pub fn Database(comptime config: Config) type {
                 if (!table.live or table.pending_drop) continue;
                 if (entry.kind != .delete) {
                     const version = &table.versions[entry.new];
-                    if (version.rowLink() != 0 and !version.hasDeletion()) try self.deferredRow(slot, table, S.borrowVersionRow(table, entry.new, &row_scratch), version.rowSlot(), immediate_only, snap);
+                    if (version.rowLink() != 0 and !version.hasDeletion()) try self.deferredRow(slot, table, S.borrowVersionRow(table, entry.new, &row_scratch), version.rowSlot(), immediate_only, statement_end, snap);
                 }
-                if (entry.kind != .insert) try self.deferredParent(slot, table, S.borrowVersionRow(table, entry.old, &row_scratch), immediate_only, snap);
+                if (entry.kind != .insert) {
+                    const new: ?*const E.Row = if (entry.kind == .update) S.borrowVersionRow(table, entry.new, &new_scratch) else null;
+                    try self.deferredParent(slot, table, S.borrowVersionRow(table, entry.old, &row_scratch), new, immediate_only, statement_end, snap);
+                }
             }
         }
 
-        fn deferredRow(self: *const Self, slot: u16, table: *const S.Table, cells: *const E.Row, row: u32, immediate_only: bool, snap: Snapshot) Error!void {
+        fn deferredRow(self: *const Self, slot: u16, table: *const S.Table, cells: *const E.Row, row: u32, immediate_only: bool, statement_end: bool, snap: Snapshot) Error!void {
             for (table.constraints[0..table.constraint_count], 0..) |*constraint, position| {
-                if (!constraint.deferrable or (immediate_only and self.deferredNow(slot, table, position))) continue;
+                if (constraint.deferrable) {
+                    if (immediate_only and self.deferredNow(slot, table, position)) continue;
+                } else if (constraint.kind != .foreign or !statement_end) continue;
                 switch (constraint.kind) {
                     .unique, .primary => switch (S.uniqueCheck(table, constraint, cells, row, snap)) {
                         .taken => return error.PrimaryKeyViolation,
@@ -10232,23 +10531,41 @@ pub fn Database(comptime config: Config) type {
             }
         }
 
-        /// A key this transaction removed or changed in `table`: unless the
-        /// key is live again, no live row may reference it through a
-        /// deferrable foreign key.
-        fn deferredParent(self: *const Self, slot: u16, table: *const S.Table, old: *const E.Row, immediate_only: bool, snap: Snapshot) Error!void {
+        /// A key this transaction removed or changed in `table` (`new`: the
+        /// row's new version, null for a delete): unless the key is live
+        /// again, no live row may reference it through a deferrable NO
+        /// ACTION foreign key, nor (at statement end) a non-deferrable one;
+        /// a RESTRICT key that changed may not be referenced at all.
+        fn deferredParent(self: *const Self, slot: u16, table: *const S.Table, old: *const E.Row, new: ?*const E.Row, immediate_only: bool, statement_end: bool, snap: Snapshot) Error!void {
             var relations: [K.relation_rows]K.Found = undefined;
             const count = self.catalog.visibleRelations(snap, &relations);
             for (relations[0..count]) |found| {
                 if (found.kind == 'S') continue;
                 const child = &self.tables[found.slot];
                 for (child.constraints[0..child.constraint_count], 0..) |*constraint, position| {
-                    if (constraint.kind != .foreign or !constraint.deferrable or constraint.ref_oid != table.oid) continue;
-                    if (immediate_only and self.deferredNow(slot, child, position)) continue;
+                    if (constraint.kind != .foreign or constraint.ref_oid != table.oid) continue;
+                    const action = if (new == null) constraint.on_delete else constraint.on_update;
+                    switch (action) {
+                        .cascade, .set_null, .set_default => continue,
+                        .no_action, .restrict => {},
+                    }
+                    if (constraint.deferrable and action == .no_action) {
+                        if (immediate_only and self.deferredNow(slot, child, position)) continue;
+                    } else if (!statement_end) continue;
                     var has_null = false;
                     for (constraint.refColumns()) |column| has_null = has_null or old[column] == .null_value;
                     if (has_null) continue;
-                    if (liveKey(table, constraint.refColumns(), old, constraint.refColumns(), snap) != .missing) continue;
-                    if (liveKey(child, constraint.keyColumns(), old, constraint.refColumns(), snap) != .missing) return error.ForeignKeyViolation;
+                    if (action == .restrict) {
+                        if (new) |cells| {
+                            var changed = false;
+                            for (constraint.refColumns()) |column| {
+                                if (@as(V.CellTag, old[column]) != @as(V.CellTag, cells[column]) or V.compare(&old[column], &cells[column]) != 0) changed = true;
+                            }
+                            if (!changed) continue;
+                        }
+                    } else if (liveKey(table, constraint.refColumns(), old, constraint.refColumns(), snap) != .missing) continue;
+                    if (liveKey(child, constraint.keyColumns(), old, constraint.refColumns(), snap) != .missing)
+                        return if (action == .restrict) error.RestrictViolation else error.ForeignKeyViolation;
                 }
             }
         }
@@ -10299,7 +10616,14 @@ pub fn Database(comptime config: Config) type {
             const table = &self.tables[index];
             if (table.parent == 0 or table.partition.bound == .none) return;
             const parent_slot = self.visibleTableSlot(table.parent, snap) orelse return;
-            const key = &cells[self.tables[parent_slot].partition.key];
+            return self.partitionKeyFits(index, &cells[self.tables[parent_slot].partition.key], snap);
+        }
+
+        /// The partition key value `key` lies inside partition `index`'s
+        /// bound (23514).
+        fn partitionKeyFits(self: *const Self, index: usize, key: *const Cell, snap: Snapshot) Error!void {
+            const table = &self.tables[index];
+            if (table.parent == 0 or table.partition.bound == .none) return;
             if (table.partition.bound != .default) {
                 if (!S.partitionContains(&table.partition, key)) return error.CheckViolation;
                 return;
@@ -11056,14 +11380,30 @@ pub fn Database(comptime config: Config) type {
             const table = &self.tables[update.table];
             const derived: D.Derived = .{ .defaults = &update.defaults, .generated = &update.generated, .checks = &update.checks };
             const hooked = self.rowHooks(update.table, routine_catalog.tg_update, '2', snap);
-            var cells = if (hooked) try D.updatedRowDeferred(ctx, table, &update.values, derived, old_cells) else try D.updatedRow(ctx, table, &update.values, derived, old_cells);
+            // Through a partitioned table the partition decides first: a
+            // moved row meets its destination's CHECKs, not these (ddl-dml).
+            const movable = if (self.family_root) |root| self.tables[root].relkind == 'p' else false;
+            var unchecked = derived;
+            if (movable) unchecked.checks = null;
+            var cells = if (hooked) try D.updatedRowDeferred(ctx, table, &update.values, unchecked, old_cells) else try D.updatedRow(ctx, table, &update.values, unchecked, old_cells);
             if (hooked) {
                 if (try self.ruleSkips(update.table, '2', &cells, old_cells, snap)) return false;
                 if (!try self.beforeRow(update.table, routine_catalog.tg_update, &cells, old_cells, &update.values, snap)) return false;
-                try D.finishRow(ctx, table, derived, &cells);
+                try D.finishRow(ctx, table, unchecked, &cells);
+            }
+            if (movable) {
+                self.partitionBound(update.table, &cells, snap) catch |err| {
+                    if (err != error.CheckViolation) return err;
+                    return self.moveRow(slot, ctx, update, old, old_cells, &cells, snap);
+                };
+                try D.checkRow(ctx, table, &update.checks, &cells);
             }
             try self.securityCheck(ctx, update.table, &cells);
-            try self.partitionBound(update.table, &cells, snap);
+            self.partitionBound(update.table, &cells, snap) catch |err| {
+                // ON CONFLICT DO UPDATE never moves a row (0A000).
+                if (err == error.CheckViolation and self.conflict_routed) return error.UnsupportedStatement;
+                return err;
+            };
             if (table.primary_column) |column| {
                 if (update.values[column] != ast.none) switch (S.primaryKeyCheck(table, &cells[column], row, snap)) {
                     .free => {},
@@ -12831,7 +13171,7 @@ pub fn Database(comptime config: Config) type {
             frame.variables.node_low = 0;
             frame.variables.node_high = self.workspace.nodes.len;
             const rows = try self.subStatement(slot, text, &parsed, snap, capture, read_only, staging);
-            try self.deferredCheck(slot, start, true);
+            try self.deferredCheck(slot, start, true, true);
             return rows;
         }
 

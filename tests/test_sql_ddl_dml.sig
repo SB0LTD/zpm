@@ -1,0 +1,610 @@
+//! DDL / DML contracts (conformance lane B11, wave 4, ddl-dml): TRUNCATE
+//! ONLY, UPDATE / DELETE through inheritance parents and partitioned tables
+//! (row movement), INHERITS column merging, ATTACH / DETACH PARTITION,
+//! PRIMARY KEY / UNIQUE / ON CONFLICT on partitioned tables and foreign
+//! keys checked as their statement ends. Each section checks values
+//! (PostgreSQL 18 text output), exact errors (SQLSTATE through the error
+//! name), atomicity after a failure, concurrency where a lock decides, and
+//! replay: every committed record is applied to a replica that must answer
+//! every probe exactly like the primary. Expectations were checked against
+//! native PostgreSQL 18.7 (row order only where PostgreSQL defines it).
+//! The assertion counter proves this suite ran.
+const std = @import("std");
+const sql = @import("sql");
+
+const DB = sql.Database(.{ .tables = 16, .columns = 8, .rows_per_table = 32, .name_bytes = 32, .text_bytes = 128, .nulls_first_ascending = false, .integer_bits = 32, .transactions = 4, .sequences = 8, .expr_nodes = 1024 });
+
+var assertions: usize = 0;
+var db: DB = .{};
+var replica: DB = .{};
+var scratch: DB.ReplayScratch = .{};
+var record: [65536]u8 = undefined;
+var records_applied: usize = 0;
+
+fn check(ok: bool) !void {
+    assertions += 1;
+    if (!ok) {
+        std.debug.print("ddl-dml contract failed at assertion {d}\n", .{assertions});
+        std.debug.dumpCurrentStackTrace(.{ .first_address = @returnAddress() });
+        return error.DdlDmlContractFailed;
+    }
+}
+
+var text_buffer: [16384]u8 = undefined;
+/// Rows as `a|b;c|d`, NULL for null cells (PostgreSQL text output).
+fn render(result: *const DB.Result) ![]const u8 {
+    var at: usize = 0;
+    var cell_buffer: [DB.Io.format_bytes]u8 = undefined;
+    for (0..result.row_count) |row| {
+        if (row != 0) {
+            text_buffer[at] = ';';
+            at += 1;
+        }
+        for (0..result.column_count) |column| {
+            if (column != 0) {
+                text_buffer[at] = '|';
+                at += 1;
+            }
+            const cell = &result.rows[row].cells[column];
+            const text = if (cell.* == .null_value) "NULL" else try DB.Io.format(cell, false, DB.Result.default_session, &cell_buffer);
+            @memcpy(text_buffer[at..][0..text.len], text);
+            at += text.len;
+        }
+    }
+    return text_buffer[0..at];
+}
+
+fn same(got: []const u8, wanted: []const u8) !void {
+    if (!std.mem.eql(u8, got, wanted)) std.debug.print("  got  {s}\n  want {s}\n", .{ got, wanted });
+    try check(std.mem.eql(u8, got, wanted));
+}
+
+fn query(target: *DB, source: []const u8) ![]const u8 {
+    var result: DB.Result = .{};
+    target.execute(source, &result) catch |err| {
+        std.debug.print("{s}: {s}\n", .{ source, @errorName(err) });
+        return err;
+    };
+    return render(&result);
+}
+
+fn expect(source: []const u8, wanted: []const u8) !void {
+    try same(try query(&db, source), wanted);
+}
+
+/// Autocommit on the primary; its change record (if any) is applied to the
+/// replica. Returns the completed statement's result.
+fn replicate(source: []const u8) !DB.Result {
+    var result: DB.Result = .{};
+    var used: usize = 0;
+    db.executeChanges(source, &result, &record, &used, null, null) catch |err| {
+        std.debug.print("{s}: {s}\n", .{ source, @errorName(err) });
+        return err;
+    };
+    if (used != 0) {
+        try replica.applyChangeRecord(record[0..used], &scratch);
+        records_applied += 1;
+    }
+    return result;
+}
+
+fn run(source: []const u8) !void {
+    _ = try replicate(source);
+}
+
+/// The statement's command count and rendered RETURNING rows.
+fn affects(source: []const u8, count: usize, returned: []const u8) !void {
+    const result = try replicate(source);
+    if (result.affected_rows != count) std.debug.print("{s}: affected {d}, wanted {d}\n", .{ source, result.affected_rows, count });
+    try check(result.affected_rows == count);
+    try same(try render(&result), returned);
+}
+
+/// The autocommit statement fails with `wanted`; the probe answers
+/// `unchanged` afterwards (atomicity) on primary and replica.
+fn rejects(source: []const u8, wanted: anyerror, probe: []const u8, unchanged: []const u8) !void {
+    var result: DB.Result = .{};
+    var used: usize = 0;
+    if (db.executeChanges(source, &result, &record, &used, null, null)) |_| {
+        std.debug.print("accepted: {s}\n", .{source});
+        return error.InvalidStatementAccepted;
+    } else |err| {
+        if (err != wanted) std.debug.print("{s}: {s} (wanted {s})\n", .{ source, @errorName(err), @errorName(wanted) });
+        try check(err == wanted);
+    }
+    try check(used == 0);
+    try same(try query(&db, probe), unchanged);
+    try same(try query(&replica, probe), unchanged);
+    try check(db.usage().transactions == 0 and db.usage().pending_versions == 0 and db.usage().table_locks == 0);
+}
+
+fn statement(slot: u16, source: []const u8) !void {
+    var result: DB.Result = .{};
+    db.statement(slot, source, &result, .{}) catch |err| {
+        std.debug.print("{s}: {s}\n", .{ source, @errorName(err) });
+        return err;
+    };
+}
+
+fn rows(slot: u16, source: []const u8) ![]const u8 {
+    var result: DB.Result = .{};
+    db.statement(slot, source, &result, .{}) catch |err| {
+        std.debug.print("{s}: {s}\n", .{ source, @errorName(err) });
+        return err;
+    };
+    return render(&result);
+}
+
+fn statementFails(slot: u16, source: []const u8, wanted: anyerror) !void {
+    var result: DB.Result = .{};
+    if (db.statement(slot, source, &result, .{})) |_| {
+        std.debug.print("accepted: {s}\n", .{source});
+        return error.InvalidStatementAccepted;
+    } else |err| {
+        if (err != wanted) std.debug.print("{s}: {s} (wanted {s})\n", .{ source, @errorName(err), @errorName(wanted) });
+        try check(err == wanted);
+    }
+}
+
+fn parks(slot: u16, source: []const u8) !void {
+    try statementFails(slot, source, error.WouldBlock);
+    try check(db.parked(slot));
+}
+
+fn resumed(slot: u16, source: []const u8) !DB.Result {
+    var result: DB.Result = .{};
+    try db.statement(slot, source, &result, .{ .@"resume" = true });
+    return result;
+}
+
+/// Encodes, replays and publishes a transaction (Store.commit order).
+fn commit(slot: u16) !void {
+    if (!db.readOnly(slot)) {
+        const payload = db.prepareCommit(slot, &record) catch |err| {
+            std.debug.print("commit of slot {d} after assertion {d}: {s}\n", .{ slot, assertions, @errorName(err) });
+            return err;
+        };
+        try replica.applyChangeRecord(payload, &scratch);
+        records_applied += 1;
+    }
+    db.publishCommit(slot);
+}
+
+/// Every probe answers identically on the primary and the replay.
+fn sameState(probes: []const []const u8) !void {
+    for (probes) |probe| {
+        const left = try query(&db, probe);
+        var copy: [16384]u8 = undefined;
+        @memcpy(copy[0..left.len], left);
+        const right = try query(&replica, probe);
+        if (!std.mem.eql(u8, copy[0..left.len], right)) std.debug.print("replay differs: {s}\n  primary {s}\n  replica {s}\n", .{ probe, copy[0..left.len], right });
+        try check(std.mem.eql(u8, copy[0..left.len], right));
+    }
+    try check(db.tableCount() == replica.tableCount());
+    try check(db.oid_counter == replica.oid_counter);
+}
+
+fn reset() void {
+    db = .{};
+    replica = .{};
+}
+
+// ---- TRUNCATE ONLY -----------------------------------------------------------
+
+fn truncateOnly() !void {
+    reset();
+    try run("CREATE TABLE tp (id INT, v TEXT)");
+    try run("CREATE TABLE tc (extra INT) INHERITS (tp)");
+    try run("CREATE TABLE tg () INHERITS (tc)");
+    const fill = "INSERT INTO tp VALUES (1, 'p')";
+    try run(fill);
+    try run("INSERT INTO tc VALUES (2, 'c', 20)");
+    try run("INSERT INTO tg VALUES (3, 'g', 30)");
+    const all = "SELECT id FROM tp ORDER BY id";
+    // ONLY keeps the children; a listed child keeps its own children.
+    try run("TRUNCATE ONLY tp");
+    try expect(all, "2;3");
+    try run(fill);
+    try run("TRUNCATE ONLY tc");
+    try expect(all, "1;3");
+    try sameState(&.{all});
+    // A child named with ONLY is still reached through a parent without it.
+    try run("INSERT INTO tc VALUES (2, 'c', 20)");
+    try run("TRUNCATE TABLE ONLY tc, tp");
+    try expect(all, "");
+    try run(fill);
+    try run("INSERT INTO tg VALUES (3, 'g', 30)");
+    // `name *` is the whole family, as without ONLY.
+    try run("TRUNCATE ONLY tp, tc *");
+    try expect(all, "");
+    // A partitioned table holds no rows: ONLY is 42809.
+    try run("CREATE TABLE pt (k INT) PARTITION BY LIST (k)");
+    try run("CREATE TABLE pt1 PARTITION OF pt FOR VALUES IN (1)");
+    try run("INSERT INTO pt VALUES (1)");
+    try rejects("TRUNCATE ONLY pt", error.WrongObjectType, "SELECT k FROM pt", "1");
+    try run("TRUNCATE ONLY pt1");
+    try expect("SELECT COUNT(*) FROM pt", "0");
+    try sameState(&.{ all, "SELECT k FROM pt" });
+}
+
+// ---- UPDATE / DELETE through an inheritance parent ---------------------------
+
+const family_probes = [_][]const u8{
+    "SELECT id, v FROM fa ORDER BY id",
+    "SELECT id, v FROM ONLY fa ORDER BY id",
+    "SELECT id, v, w FROM fb ORDER BY id",
+};
+
+fn familyWrites() !void {
+    reset();
+    try run("CREATE TABLE fa (id INT PRIMARY KEY, v INT CHECK (v < 100))");
+    try run("CREATE TABLE fb (w INT) INHERITS (fa)");
+    try run("CREATE TABLE fc () INHERITS (fb)");
+    try run("INSERT INTO fa VALUES (1, 10), (2, 20)");
+    try run("INSERT INTO fb VALUES (3, 30, 1), (4, 40, 2)");
+    try run("INSERT INTO fc VALUES (5, 50, 3)");
+    // Every member's rows, through grandchildren; ONLY keeps the parent's.
+    try affects("UPDATE fa SET v = v + 1 WHERE id % 2 = 1", 3, "");
+    try expect(family_probes[0], "1|11;2|20;3|31;4|40;5|51");
+    // RETURNING reads the parent's columns of every member's row; the
+    // statement's name (or alias) qualifies the columns of each member.
+    try affects("UPDATE fa SET v = fa.v * 2 WHERE fa.id = 3 RETURNING *", 1, "3|62");
+    try affects("UPDATE fa AS x SET v = x.v - 1 WHERE x.id = 5 RETURNING x.id, x.v", 1, "5|50");
+    try affects("UPDATE ONLY fa SET v = 0", 2, "");
+    try expect(family_probes[0], "1|0;2|0;3|62;4|40;5|50");
+    // UPDATE ... FROM joins each member.
+    try affects("UPDATE fa SET v = s.n FROM (VALUES (4, 7), (5, 8)) AS s (id, n) WHERE fa.id = s.id", 2, "");
+    try expect(family_probes[0], "1|0;2|0;3|62;4|7;5|8");
+    // A member's own CHECK fails the whole statement (23514), as does an
+    // inherited one; nothing changes in any member.
+    try run("ALTER TABLE fb ADD CONSTRAINT fb_v CHECK (v <> 99)");
+    try rejects("UPDATE fa SET v = 99", error.CheckViolation, family_probes[0], "1|0;2|0;3|62;4|7;5|8");
+    try rejects("UPDATE fa SET v = 100 WHERE id = 5", error.CheckViolation, family_probes[0], "1|0;2|0;3|62;4|7;5|8");
+    try expect(family_probes[2], "3|62|1;4|7|2;5|8|3");
+    try sameState(&family_probes);
+    // DELETE through a parent, USING, RETURNING and ONLY.
+    try affects("DELETE FROM fa USING (VALUES (4)) AS s (id) WHERE fa.id = s.id", 1, "");
+    try affects("DELETE FROM fb WHERE v > 7 RETURNING id", 2, "3;5");
+    try affects("DELETE FROM ONLY fb", 0, "");
+    try affects("DELETE FROM fa RETURNING id, v", 2, "1|0;2|0");
+    try expect("SELECT COUNT(*) FROM fa", "0");
+    try sameState(&family_probes);
+    // Privileges are the parent's (a child needs its own for direct access).
+    try run("INSERT INTO fa VALUES (1, 1)");
+    try run("INSERT INTO fc VALUES (2, 2, 2)");
+    try run("CREATE ROLE fr");
+    try run("GRANT SELECT, UPDATE ON fa TO fr");
+    try run("SET ROLE fr");
+    try affects("UPDATE fa SET v = 5 WHERE id = 2", 1, "");
+    try rejects("UPDATE fc SET v = 6", error.InsufficientPrivilege, "SELECT v FROM fa ORDER BY id", "1;5");
+    try rejects("DELETE FROM fa", error.InsufficientPrivilege, "SELECT v FROM fa ORDER BY id", "1;5");
+    try run("RESET ROLE");
+    // A member's row another transaction is updating: the parent's UPDATE
+    // waits for it and then sees the committed row (READ COMMITTED).
+    const writer = try db.begin();
+    try statement(writer, "UPDATE fc SET v = 30 WHERE id = 2");
+    const reader = try db.begin();
+    try parks(reader, "UPDATE fa SET v = v * 2");
+    try commit(writer);
+    const done = try resumed(reader, "UPDATE fa SET v = v * 2");
+    try check(done.affected_rows == 2);
+    try same(try rows(reader, family_probes[0]), "1|2;2|60");
+    try commit(reader);
+    try expect(family_probes[0], "1|2;2|60");
+    // A failed member statement inside a transaction leaves earlier ones.
+    const tx = try db.begin();
+    try statement(tx, "UPDATE fa SET v = 1");
+    try statementFails(tx, "UPDATE fa SET v = 100", error.CheckViolation);
+    try same(try rows(tx, family_probes[0]), "1|1;2|1");
+    try commit(tx);
+    try sameState(&family_probes);
+}
+
+// ---- UPDATE / DELETE through a partitioned table: row movement ---------------
+
+const movement_probes = [_][]const u8{
+    "SELECT id, k, v FROM r ORDER BY id",
+    "SELECT id FROM r1 ORDER BY id",
+    "SELECT id FROM r2 ORDER BY id",
+    "SELECT id, k FROM rd ORDER BY id",
+};
+
+fn rowMovement() !void {
+    reset();
+    try run("CREATE TABLE r (id INT, k INT, v TEXT) PARTITION BY RANGE (k)");
+    try run("CREATE TABLE r1 PARTITION OF r FOR VALUES FROM (0) TO (10)");
+    try run("CREATE TABLE r2 PARTITION OF r FOR VALUES FROM (10) TO (20)");
+    try run("CREATE TABLE rd PARTITION OF r DEFAULT");
+    try run("ALTER TABLE r2 ADD CONSTRAINT r2_v CHECK (v <> 'no')");
+    try run("INSERT INTO r VALUES (1, 5, 'a'), (2, 15, 'b'), (3, 25, 'c')");
+    // A new key outside the row's partition moves the row; RETURNING
+    // reports it once, with its new values.
+    try affects("UPDATE r SET k = 12 WHERE id = 1 RETURNING id, k, v", 1, "1|12|a");
+    try expect(movement_probes[1], "");
+    try expect(movement_probes[2], "1;2");
+    try affects("UPDATE r SET k = k + 10 WHERE k < 20", 2, "");
+    try expect(movement_probes[3], "1|22;2|25;3|25");
+    try sameState(&movement_probes);
+    // The destination's constraints apply, not the source's.
+    try affects("UPDATE r SET k = 5, v = 'no' WHERE id = 1", 1, "");
+    try expect("SELECT id, k, v FROM r1", "1|5|no");
+    try rejects("UPDATE r SET k = 15 WHERE id = 1", error.CheckViolation, movement_probes[0], "1|5|no;2|25|b;3|25|c");
+    // A partition's own UPDATE keeps its bound (no movement): 23514.
+    try rejects("UPDATE r1 SET k = 15", error.CheckViolation, movement_probes[0], "1|5|no;2|25|b;3|25|c");
+    // A NULL key moves to the DEFAULT partition.
+    try affects("UPDATE r SET k = NULL WHERE id = 2 RETURNING id, k", 1, "2|NULL");
+    try expect(movement_probes[3], "2|NULL;3|25");
+    try affects("UPDATE r SET v = 'z' WHERE id IN (1, 3)", 2, "");
+    try expect(movement_probes[0], "1|5|z;2|NULL|b;3|25|z");
+    try affects("DELETE FROM r WHERE k IS NULL OR k < 10 RETURNING id", 2, "1;2");
+    try affects("UPDATE r SET k = 2, v = 'm' WHERE id = 3", 1, "");
+    try expect("SELECT id, k, v FROM r1 ORDER BY id", "3|2|m");
+    try sameState(&movement_probes);
+    // Rows trade partitions in one statement: each moves once.
+    try run("CREATE TABLE q (id INT, k INT) PARTITION BY LIST (k)");
+    try run("CREATE TABLE q1 PARTITION OF q FOR VALUES IN (1)");
+    try run("CREATE TABLE q2 PARTITION OF q FOR VALUES IN (2)");
+    try run("INSERT INTO q VALUES (1, 1), (2, 2)");
+    try affects("UPDATE q SET k = 3 - k", 2, "");
+    try expect("SELECT id, k FROM q1", "2|1");
+    try expect("SELECT id, k FROM q2", "1|2");
+    // No partition for the new key: 23514 and nothing moved.
+    try rejects("UPDATE q SET k = 3", error.CheckViolation, "SELECT id, k FROM q ORDER BY id", "1|2;2|1");
+    try rejects("UPDATE q2 SET k = 1", error.CheckViolation, "SELECT id, k FROM q ORDER BY id", "1|2;2|1");
+    try sameState(&.{ "SELECT id, k FROM q1", "SELECT id, k FROM q2" });
+    // A moving row waits for another writer of it; the moved row is the
+    // committed version, rerouted.
+    const writer = try db.begin();
+    try statement(writer, "UPDATE q1 SET id = 20");
+    const mover = try db.begin();
+    try parks(mover, "UPDATE q SET k = 2 WHERE k = 1");
+    try commit(writer);
+    const moved = try resumed(mover, "UPDATE q SET k = 2 WHERE k = 1");
+    try check(moved.affected_rows == 1);
+    try commit(mover);
+    try expect("SELECT id, k FROM q2 ORDER BY id", "1|2;20|2");
+    try expect("SELECT COUNT(*) FROM q1", "0");
+    try sameState(&.{ "SELECT id, k FROM q1", "SELECT id, k FROM q2" });
+}
+
+// ---- INHERITS merges same-named columns --------------------------------------
+
+fn inheritsMerge() !void {
+    reset();
+    try run("CREATE TABLE m (id INT NOT NULL, v TEXT DEFAULT 'pv', w INT CHECK (w > 0))");
+    // A local column named like a parent column merges into the parent's
+    // position: NOT NULL from either, the local DEFAULT wins.
+    try run("CREATE TABLE mc (z INT, v TEXT DEFAULT 'cv', id INT) INHERITS (m)");
+    const columns = "SELECT column_name, is_nullable, column_default FROM information_schema.columns WHERE table_name = 'mc' ORDER BY ordinal_position";
+    try expect(columns, "id|NO|NULL;v|YES|'cv'::text;w|YES|NULL;z|YES|NULL");
+    try run("INSERT INTO mc (id) VALUES (1)");
+    try expect("SELECT * FROM mc", "1|cv|NULL|NULL");
+    try expect("SELECT id, v FROM m", "1|cv");
+    try rejects("INSERT INTO mc (id, w) VALUES (2, 0)", error.CheckViolation, "SELECT COUNT(*) FROM mc", "1");
+    try run("CREATE TABLE mc4 (w INT NOT NULL CHECK (w < 10)) INHERITS (m)");
+    try expect("SELECT conname FROM pg_constraint WHERE conrelid = 'mc4'::regclass ORDER BY 1", "m_w_check;mc4_w_check");
+    try rejects("INSERT INTO mc4 (id, w) VALUES (1, NULL)", error.NotNullViolation, "SELECT COUNT(*) FROM mc4", "0");
+    try rejects("INSERT INTO mc4 (id, w) VALUES (1, 10)", error.CheckViolation, "SELECT COUNT(*) FROM mc4", "0");
+    // An empty element list inherits every column.
+    try run("CREATE TABLE me () INHERITS (m)");
+    try expect("SELECT column_name FROM information_schema.columns WHERE table_name = 'me' ORDER BY ordinal_position", "id;v;w");
+    const names = "SELECT relname FROM pg_class WHERE relname LIKE 'm%' AND relkind = 'r' ORDER BY relname";
+    // Type (and typmod) conflicts are 42804; merging identity or generated
+    // columns is outside the subset (0A000).
+    try rejects("CREATE TABLE bad (id BIGINT) INHERITS (m)", error.TypeMismatch, names, "m;mc;mc4;me");
+    try rejects("CREATE TABLE bad (v VARCHAR(3)) INHERITS (m)", error.TypeMismatch, names, "m;mc;mc4;me");
+    try rejects("CREATE TABLE bad (id INT GENERATED ALWAYS AS IDENTITY) INHERITS (m)", error.UnsupportedStatement, names, "m;mc;mc4;me");
+    // Neither a partitioned table nor a partition can be a parent (42809).
+    try run("CREATE TABLE pa (a INT) PARTITION BY LIST (a)");
+    try run("CREATE TABLE pa1 PARTITION OF pa FOR VALUES IN (1)");
+    try rejects("CREATE TABLE bad () INHERITS (pa)", error.WrongObjectType, names, "m;mc;mc4;me");
+    try rejects("CREATE TABLE bad () INHERITS (pa1)", error.WrongObjectType, names, "m;mc;mc4;me");
+    try rejects("CREATE TABLE bad ()", error.UnsupportedStatement, names, "m;mc;mc4;me");
+    try sameState(&.{ columns, "SELECT * FROM m ORDER BY id", names });
+}
+
+// ---- ATTACH / DETACH PARTITION -------------------------------------------------
+
+const attach_probes = [_][]const u8{
+    "SELECT id, k, v FROM al ORDER BY id",
+    "SELECT inhrelid::regclass::text, inhparent::regclass::text FROM pg_inherits ORDER BY 1",
+    "SELECT relname, relispartition FROM pg_class WHERE relname LIKE 'x%' ORDER BY relname",
+};
+
+fn attachDetach() !void {
+    reset();
+    try run("CREATE TABLE al (id INT, k INT NOT NULL, v TEXT) PARTITION BY LIST (k)");
+    try run("CREATE TABLE al1 PARTITION OF al FOR VALUES IN (1)");
+    try run("CREATE TABLE x1 (id INT, k INT NOT NULL, v TEXT)");
+    try run("INSERT INTO x1 VALUES (1, 2, 'a')");
+    // Rows outside the bound (23514) and overlapping bounds (42P17).
+    try rejects("ALTER TABLE al ATTACH PARTITION x1 FOR VALUES IN (3)", error.CheckViolation, attach_probes[0], "");
+    try rejects("ALTER TABLE al ATTACH PARTITION x1 FOR VALUES IN (1)", error.InvalidObjectDefinition, attach_probes[0], "");
+    const attached = try replicate("ALTER TABLE al ATTACH PARTITION x1 FOR VALUES IN (2)");
+    try check(attached.command == .alter_table and attached.affected_rows == 0);
+    try expect(attach_probes[0], "1|2|a");
+    try expect(attach_probes[1], "al1|al;x1|al");
+    // The attached partition keeps its bound for direct writes and routes.
+    try run("INSERT INTO al VALUES (2, 2, 'b')");
+    try rejects("INSERT INTO x1 VALUES (3, 1, 'c')", error.CheckViolation, attach_probes[0], "1|2|a;2|2|b");
+    try rejects("ALTER TABLE al ATTACH PARTITION x1 FOR VALUES IN (4)", error.WrongObjectType, attach_probes[0], "1|2|a;2|2|b");
+    try sameState(&attach_probes);
+    // DETACH: a standalone table again, keeping its rows.
+    try run("ALTER TABLE al DETACH PARTITION x1");
+    try expect(attach_probes[0], "");
+    try expect("SELECT id FROM x1 ORDER BY id", "1;2");
+    try run("INSERT INTO x1 VALUES (3, 9, 'free')");
+    try rejects("ALTER TABLE al DETACH PARTITION x1", error.TableNotFound, attach_probes[1], "al1|al");
+    // Column checks (42804), reordered columns (0A000), an inheritance
+    // child (42809), a table that is not partitioned (42809).
+    try run("CREATE TABLE x2 (id INT, k INT, v TEXT)");
+    try rejects("ALTER TABLE al ATTACH PARTITION x2 FOR VALUES IN (5)", error.TypeMismatch, attach_probes[1], "al1|al");
+    try run("CREATE TABLE x3 (id INT, k INT NOT NULL, v TEXT, z INT)");
+    try rejects("ALTER TABLE al ATTACH PARTITION x3 FOR VALUES IN (5)", error.TypeMismatch, attach_probes[1], "al1|al");
+    try run("CREATE TABLE x4 (id BIGINT, k INT NOT NULL, v TEXT)");
+    try rejects("ALTER TABLE al ATTACH PARTITION x4 FOR VALUES IN (5)", error.TypeMismatch, attach_probes[1], "al1|al");
+    try run("CREATE TABLE x6 (id INT, k INT NOT NULL)");
+    try rejects("ALTER TABLE al ATTACH PARTITION x6 FOR VALUES IN (6)", error.TypeMismatch, attach_probes[1], "al1|al");
+    try run("CREATE TABLE x5 (k INT NOT NULL, id INT, v TEXT)");
+    try rejects("ALTER TABLE al ATTACH PARTITION x5 FOR VALUES IN (5)", error.UnsupportedStatement, attach_probes[1], "al1|al");
+    try run("CREATE TABLE xp (id INT, k INT NOT NULL, v TEXT)");
+    try run("CREATE TABLE xc () INHERITS (xp)");
+    try rejects("ALTER TABLE al ATTACH PARTITION xc FOR VALUES IN (8)", error.WrongObjectType, attach_probes[1], "al1|al;xc|xp");
+    try rejects("ALTER TABLE al ATTACH PARTITION xp FOR VALUES IN (8)", error.WrongObjectType, attach_probes[1], "al1|al;xc|xp");
+    try rejects("ALTER TABLE x1 ATTACH PARTITION x2 FOR VALUES IN (7)", error.WrongObjectType, attach_probes[1], "al1|al;xc|xp");
+    try rejects("ALTER TABLE al DETACH PARTITION al1 FINALIZE", error.UnsupportedStatement, attach_probes[1], "al1|al;xc|xp");
+    // A DEFAULT partition gives up the attached bound: its rows are checked.
+    try run("CREATE TABLE ald PARTITION OF al DEFAULT");
+    try run("INSERT INTO al VALUES (7, 7, 'd')");
+    try run("CREATE TABLE x7 (id INT, k INT NOT NULL, v TEXT)");
+    try rejects("ALTER TABLE al ATTACH PARTITION x7 FOR VALUES IN (7)", error.CheckViolation, attach_probes[1], "al1|al;ald|al;xc|xp");
+    try rejects("ALTER TABLE al ATTACH PARTITION x7 DEFAULT", error.InvalidObjectDefinition, attach_probes[1], "al1|al;ald|al;xc|xp");
+    try run("ALTER TABLE al ATTACH PARTITION x7 FOR VALUES IN (8)");
+    try run("INSERT INTO al VALUES (8, 8, 'e')");
+    try expect("SELECT id FROM x7", "8");
+    // CONCURRENTLY detaches like the plain form here.
+    try run("ALTER TABLE al DETACH PARTITION al1 CONCURRENTLY");
+    try expect(attach_probes[1], "ald|al;x7|al;xc|xp");
+    try run("INSERT INTO al VALUES (9, 1, 'f')");
+    try expect("SELECT id FROM ald ORDER BY id", "7;9");
+    try sameState(&attach_probes);
+    // ATTACH waits behind a reader of the attached table (AccessExclusive)
+    // and does not block a reader of the partitioned table's other rows
+    // (SHARE UPDATE EXCLUSIVE on the parent).
+    const reader = try db.begin();
+    try same(try rows(reader, "SELECT COUNT(*) FROM x1"), "3");
+    const attacher = try db.begin();
+    try parks(attacher, "ALTER TABLE al ATTACH PARTITION x1 FOR VALUES IN (2, 3, 9)");
+    try commit(reader);
+    try check((try resumed(attacher, "ALTER TABLE al ATTACH PARTITION x1 FOR VALUES IN (2, 3, 9)")).command == .alter_table);
+    try commit(attacher);
+    try expect(attach_probes[0], "1|2|a;2|2|b;3|9|free;7|7|d;8|8|e;9|1|f");
+    try sameState(&attach_probes);
+}
+
+// ---- PRIMARY KEY / UNIQUE / ON CONFLICT on partitioned tables --------------
+
+fn partitionKeys() !void {
+    reset();
+    const names = "SELECT tablename FROM pg_tables WHERE tablename LIKE 'pk%' ORDER BY 1";
+    // The key must include the partition key (0A000).
+    try rejects("CREATE TABLE pk (id INT PRIMARY KEY, k INT) PARTITION BY RANGE (k)", error.UnsupportedStatement, names, "");
+    try rejects("CREATE TABLE pk (id INT, k INT, UNIQUE (id)) PARTITION BY LIST (k)", error.UnsupportedStatement, names, "");
+    try run("CREATE TABLE pk2 (id INT, k INT, PRIMARY KEY (id, k)) PARTITION BY RANGE (k)");
+    try run("CREATE TABLE pk2a PARTITION OF pk2 FOR VALUES FROM (0) TO (10)");
+    try run("CREATE TABLE pk2b PARTITION OF pk2 FOR VALUES FROM (10) TO (20)");
+    try expect("SELECT conname, contype FROM pg_constraint WHERE conrelid IN ('pk2'::regclass, 'pk2a'::regclass) AND contype <> 'n' ORDER BY 1", "pk2_pkey|p;pk2a_pkey|p");
+    const all = "SELECT id, k FROM pk2 ORDER BY 1, 2";
+    try run("INSERT INTO pk2 VALUES (1, 1)");
+    try rejects("INSERT INTO pk2 VALUES (1, 1)", error.PrimaryKeyViolation, all, "1|1");
+    try run("INSERT INTO pk2 VALUES (1, 11)");
+    // ON CONFLICT arbitrates with the routed partition's key.
+    try affects("INSERT INTO pk2 VALUES (1, 1) ON CONFLICT DO NOTHING", 0, "");
+    try affects("INSERT INTO pk2 VALUES (1, 1) ON CONFLICT (id, k) DO UPDATE SET id = 7 RETURNING *", 1, "7|1");
+    // DO UPDATE never moves a row across partitions (0A000); an arbiter
+    // that is not a key is 42P10.
+    try rejects("INSERT INTO pk2 VALUES (7, 1) ON CONFLICT (id, k) DO UPDATE SET k = 15", error.UnsupportedStatement, all, "1|11;7|1");
+    try rejects("INSERT INTO pk2 VALUES (2, 2) ON CONFLICT (id) DO NOTHING", error.InvalidColumnReference, all, "1|11;7|1");
+    try affects("INSERT INTO pk2 VALUES (7, 1), (8, 12) ON CONFLICT ON CONSTRAINT pk2_pkey DO UPDATE SET id = excluded.id * 10 RETURNING *", 2, "70|1;8|12");
+    try expect(all, "1|11;8|12;70|1");
+    // Row movement keeps the keys (here into a free key).
+    try affects("UPDATE pk2 SET k = 11 WHERE id = 70", 1, "");
+    try expect(all, "1|11;8|12;70|11");
+    try sameState(&.{ all, names });
+    // NULLS NOT DISTINCT and a single-column key equal to the partition key.
+    try run("CREATE TABLE pk4 (id INT, k INT, UNIQUE NULLS NOT DISTINCT (id, k)) PARTITION BY LIST (k)");
+    try run("CREATE TABLE pk4a PARTITION OF pk4 FOR VALUES IN (1)");
+    try rejects("INSERT INTO pk4 VALUES (NULL, 1), (NULL, 1)", error.PrimaryKeyViolation, "SELECT COUNT(*) FROM pk4", "0");
+    try run("CREATE TABLE pks (k INT PRIMARY KEY, v TEXT) PARTITION BY LIST (k)");
+    try run("CREATE TABLE pks1 PARTITION OF pks FOR VALUES IN (1, 2)");
+    try run("CREATE TABLE pks2 PARTITION OF pks FOR VALUES IN (3)");
+    try run("INSERT INTO pks VALUES (1, 'a'), (3, 'c')");
+    try affects("INSERT INTO pks VALUES (1, 'b') ON CONFLICT (k) DO UPDATE SET v = excluded.v RETURNING *", 1, "1|b");
+    try rejects("INSERT INTO pks VALUES (3, 'z') ON CONFLICT (k) DO UPDATE SET k = 2", error.UnsupportedStatement, "SELECT k, v FROM pks ORDER BY k", "1|b;3|c");
+    // ATTACH gives the partition the parent's key, checked over its rows.
+    try run("CREATE TABLE pk5 (id INT, k INT, PRIMARY KEY (id, k)) PARTITION BY LIST (k)");
+    try run("CREATE TABLE pkx (id INT NOT NULL, k INT NOT NULL)");
+    try run("INSERT INTO pkx VALUES (1, 3), (1, 3)");
+    try rejects("ALTER TABLE pk5 ATTACH PARTITION pkx FOR VALUES IN (3)", error.PrimaryKeyViolation, "SELECT COUNT(*) FROM pk5", "0");
+    try run("DELETE FROM pkx WHERE id = 1");
+    try run("INSERT INTO pkx VALUES (1, 3), (2, 3)");
+    try run("ALTER TABLE pk5 ATTACH PARTITION pkx FOR VALUES IN (3)");
+    try expect("SELECT conname FROM pg_constraint WHERE conrelid = 'pkx'::regclass AND contype <> 'n'", "pkx_pkey");
+    try rejects("INSERT INTO pk5 VALUES (2, 3)", error.PrimaryKeyViolation, "SELECT id FROM pk5 ORDER BY id", "1;2");
+    try run("CREATE TABLE pky (id INT, k INT)");
+    try rejects("ALTER TABLE pk5 ATTACH PARTITION pky FOR VALUES IN (4)", error.TypeMismatch, "SELECT COUNT(*) FROM pg_inherits", "6");
+    try run("CREATE TABLE pkz (k INT NOT NULL, v TEXT)");
+    try run("INSERT INTO pkz VALUES (5, 'e')");
+    try run("ALTER TABLE pks ATTACH PARTITION pkz FOR VALUES IN (5)");
+    try rejects("INSERT INTO pks VALUES (5, 'f')", error.PrimaryKeyViolation, "SELECT k, v FROM pks ORDER BY k", "1|b;3|c;5|e");
+    try sameState(&.{ all, names, "SELECT k, v FROM pks ORDER BY k", "SELECT id, k FROM pk5 ORDER BY id" });
+}
+
+// ---- foreign keys checked as the statement ends ----------------------------
+
+fn foreignKeyTiming() !void {
+    reset();
+    // A row may reference one inserted later in the same statement.
+    try run("CREATE TABLE t (id INT PRIMARY KEY, parent INT REFERENCES t)");
+    try affects("INSERT INTO t VALUES (1, 2), (2, 1)", 2, "");
+    try expect("SELECT id, parent FROM t ORDER BY id", "1|2;2|1");
+    // Deleting every row of a self-referencing table is consistent at the
+    // end of the statement (NO ACTION and RESTRICT alike).
+    try affects("DELETE FROM t", 2, "");
+    try run("CREATE TABLE tr (id INT PRIMARY KEY, parent INT REFERENCES tr ON DELETE RESTRICT)");
+    try run("INSERT INTO tr VALUES (1, NULL), (2, 1)");
+    try affects("DELETE FROM tr", 2, "");
+    // A foreign key added by ALTER TABLE may reference its own table.
+    try run("CREATE TABLE s (id INT PRIMARY KEY, ref INT)");
+    try run("ALTER TABLE s ADD FOREIGN KEY (ref) REFERENCES s");
+    try run("INSERT INTO s VALUES (1, 1)");
+    try affects("UPDATE s SET id = 2, ref = 2", 1, "");
+    try expect("SELECT id, ref FROM s", "2|2");
+    try rejects("INSERT INTO s VALUES (3, 4)", error.ForeignKeyViolation, "SELECT id, ref FROM s", "2|2");
+    // NO ACTION: a removed key that is live again by the end is fine;
+    // RESTRICT fails whenever a changed key is referenced (23001).
+    try run("CREATE TABLE p (id INT PRIMARY KEY, v INT UNIQUE)");
+    try run("CREATE TABLE c (pid INT REFERENCES p (v))");
+    try run("INSERT INTO p VALUES (1, 10), (2, 20)");
+    try run("INSERT INTO c VALUES (10)");
+    try affects("UPDATE p SET v = CASE v WHEN 10 THEN 30 WHEN 20 THEN 10 END", 2, "");
+    try expect("SELECT id, v FROM p ORDER BY id", "1|30;2|10");
+    try run("CREATE TABLE cr (pid INT REFERENCES p (v) ON UPDATE RESTRICT ON DELETE RESTRICT)");
+    try run("INSERT INTO cr VALUES (30)");
+    try rejects("UPDATE p SET v = CASE v WHEN 30 THEN 15 WHEN 10 THEN 30 END WHERE id >= 1", error.RestrictViolation, "SELECT id, v FROM p ORDER BY id", "1|30;2|10");
+    try rejects("DELETE FROM p WHERE id = 1", error.RestrictViolation, "SELECT id, v FROM p ORDER BY id", "1|30;2|10");
+    try affects("UPDATE p SET id = id + 5", 2, "");
+    try rejects("DELETE FROM p WHERE id = 7", error.ForeignKeyViolation, "SELECT id, v FROM p ORDER BY id", "6|30;7|10");
+    try rejects("INSERT INTO c VALUES (5)", error.ForeignKeyViolation, "SELECT pid FROM c", "10");
+    // A deferrable RESTRICT constraint is still checked when the statement
+    // ends, not at COMMIT.
+    try run("CREATE TABLE cd (pid INT REFERENCES p (v) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED)");
+    try run("INSERT INTO cd VALUES (10)");
+    try run("DELETE FROM c");
+    const tx = try db.begin();
+    try statementFails(tx, "DELETE FROM p WHERE id = 7", error.RestrictViolation);
+    try same(try rows(tx, "SELECT id FROM p ORDER BY id"), "6;7");
+    try commit(tx);
+    // Within a transaction: a statement that fails its end check rolls
+    // back alone; a later statement may make the earlier ones consistent.
+    try run("DELETE FROM cd");
+    const tx2 = try db.begin();
+    try statement(tx2, "INSERT INTO c VALUES (10)");
+    try statementFails(tx2, "DELETE FROM p WHERE id = 7", error.ForeignKeyViolation);
+    try statement(tx2, "DELETE FROM c");
+    try statement(tx2, "DELETE FROM p WHERE id = 7");
+    try commit(tx2);
+    try expect("SELECT id, v FROM p ORDER BY id", "6|30");
+    try sameState(&.{ "SELECT id, v FROM p ORDER BY id", "SELECT pid FROM c", "SELECT pid FROM cr", "SELECT id, ref FROM s" });
+}
+
+pub fn main() !void {
+    try truncateOnly();
+    try familyWrites();
+    try rowMovement();
+    try inheritsMerge();
+    try attachDetach();
+    try partitionKeys();
+    try foreignKeyTiming();
+    std.debug.print("ddl-dml: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });
+}

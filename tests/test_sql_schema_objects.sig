@@ -491,7 +491,8 @@ fn foreignKeys() !void {
     try run("UPDATE p SET id = 5 WHERE id = 2");
     try expect("SELECT id, pid, note FROM n ORDER BY id", "1|5|two;2|5|two again;3|3|three");
     try expect("SELECT id, pid, g FROM s ORDER BY id", "1|NULL|20;2|3|30");
-    try rejects("UPDATE p SET g = 31 WHERE id = 3", error.ForeignKeyViolation, "SELECT id, g FROM p ORDER BY id", "1|11;3|30;4|40;5|20");
+    // RESTRICT is 23001 (restrict_violation), checked as the statement ends.
+    try rejects("UPDATE p SET g = 31 WHERE id = 3", error.RestrictViolation, "SELECT id, g FROM p ORDER BY id", "1|11;3|30;4|40;5|20");
     try run("DELETE FROM p WHERE id = 3");
     try expect("SELECT id, pid, note FROM n ORDER BY id", "1|5|two;2|5|two again");
     try expect("SELECT id, pid, g FROM s ORDER BY id", "1|NULL|20;2|NULL|NULL");
@@ -1133,12 +1134,17 @@ fn inheritance() !void {
     try run("UPDATE child SET v = 7 WHERE id = 9");
     try run("DELETE FROM ONLY a WHERE id = 4");
     try expect(inherit_probes[0], "1|1|5;1|1|10;2|1|21;3|2|30;9|1|7");
-    // Parent writes that would reach the children, column changes and a
-    // conflicting column name are outside the subset or errors.
-    try rejects("UPDATE a SET v = 0", error.UnsupportedStatement, inherit_probes[0], "1|1|5;1|1|10;2|1|21;3|2|30;9|1|7");
-    try rejects("DELETE FROM a", error.UnsupportedStatement, inherit_probes[0], "1|1|5;1|1|10;2|1|21;3|2|30;9|1|7");
+    // Parent writes reach the children (ddl-dml, wave 4: contract-sql-ddl-dml
+    // covers them); column changes and a conflicting column type are
+    // outside the subset or errors.
+    const parent_tx = try db.begin();
+    try statement(parent_tx, "UPDATE a SET v = 0 WHERE v > 6");
+    try same(try rows(parent_tx, inherit_probes[0]), "1|1|0;1|1|5;2|1|0;3|2|0;9|1|0");
+    try statement(parent_tx, "DELETE FROM a WHERE id <> 1");
+    try same(try rows(parent_tx, inherit_probes[0]), "1|1|0;1|1|5");
+    db.abort(parent_tx);
     try rejects("ALTER TABLE a ADD COLUMN w INT", error.UnsupportedStatement, inherit_probes[0], "1|1|5;1|1|10;2|1|21;3|2|30;9|1|7");
-    try rejects("CREATE TABLE bad (v INT) INHERITS (a)", error.DuplicateColumn, "SELECT COUNT(*) FROM pg_class WHERE relname = 'bad'", "0");
+    try rejects("CREATE TABLE bad (v TEXT) INHERITS (a)", error.TypeMismatch, "SELECT COUNT(*) FROM pg_class WHERE relname = 'bad'", "0");
     try rejects("CREATE TABLE bad (x INT) INHERITS (missing)", error.TableNotFound, "SELECT COUNT(*) FROM pg_class WHERE relname = 'bad'", "0");
     try rejects("DROP TABLE a", error.DependentObjects, inherit_probes[0], "1|1|5;1|1|10;2|1|21;3|2|30;9|1|7");
     // A grandchild is read through both ancestors.
@@ -1206,9 +1212,14 @@ fn partitions() !void {
     try rejects("CREATE TABLE part2 PARTITION OF part FOR VALUES FROM (30) TO (30)", error.InvalidObjectDefinition, names, "part;part0;part1");
     try rejects("CREATE TABLE part2 PARTITION OF part FOR VALUES IN (30)", error.InvalidTableDefinition, names, "part;part0;part1");
     try rejects("CREATE TABLE part2 PARTITION OF part0 FOR VALUES FROM (30) TO (40)", error.WrongObjectType, names, "part;part0;part1");
-    try rejects("UPDATE part SET v = 'x'", error.UnsupportedStatement, partition_probes[0], "1|one;16|fifteen;19|none");
-    try rejects("DELETE FROM part", error.UnsupportedStatement, partition_probes[0], "1|one;16|fifteen;19|none");
-    try rejects("CREATE TABLE keyed (id INT PRIMARY KEY) PARTITION BY RANGE (id)", error.UnsupportedStatement, names, "part;part0;part1");
+    // Writes through the parent reach the partitions (ddl-dml, wave 4).
+    const parent_tx = try db.begin();
+    try statement(parent_tx, "UPDATE part SET v = 'x' WHERE id > 1");
+    try same(try rows(parent_tx, partition_probes[0]), "1|one;16|x;19|x");
+    try statement(parent_tx, "DELETE FROM part WHERE id = 1");
+    try same(try rows(parent_tx, partition_probes[0]), "16|x;19|x");
+    db.abort(parent_tx);
+    try rejects("CREATE TABLE keyed (id INT, k INT PRIMARY KEY) PARTITION BY RANGE (id)", error.UnsupportedStatement, names, "part;part0;part1");
     try rejects("CREATE TABLE keyed (id INT) PARTITION BY RANGE (missing)", error.ColumnNotFound, names, "part;part0;part1");
     // A DEFAULT partition takes the rest; LIST partitioning.
     try run("CREATE TABLE part_other PARTITION OF part DEFAULT");

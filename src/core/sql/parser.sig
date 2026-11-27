@@ -841,6 +841,27 @@ pub fn Parser(comptime config: types.Config) type {
             _ = try self.takeWord("ONLY");
             out.table = try self.qualifiedName();
             _ = try self.takeSymbol(.star);
+            // ATTACH / DETACH PARTITION stand alone (gram.y partition_cmd).
+            if (self.mode == .standard and try self.takeRaw("attach")) {
+                if (!try self.takeRaw("partition")) return error.Syntax;
+                const table = try self.qualifiedName();
+                var bound: Ast.PartitionBound = .{};
+                try self.partitionBound(&bound);
+                try pushAction(&out, .{ .attach_partition = .{ .table = table, .bound = bound } });
+                try self.finish();
+                return out;
+            }
+            if (self.mode == .standard and try self.takeRaw("detach")) {
+                if (!try self.takeRaw("partition")) return error.Syntax;
+                const table = try self.qualifiedName();
+                const concurrently = try self.takeRaw("concurrently");
+                // FINALIZE completes an interrupted concurrent detach, which
+                // never remains pending here.
+                if (self.rawWord("finalize")) return error.UnsupportedStatement;
+                try pushAction(&out, .{ .detach_partition = .{ .table = table, .concurrently = concurrently } });
+                try self.finish();
+                return out;
+            }
             if (try self.takeRaw("rename")) {
                 if (try self.takeWord("TO")) {
                     try pushAction(&out, .{ .rename_table = try self.identifier() });
@@ -968,10 +989,12 @@ pub fn Parser(comptime config: types.Config) type {
             var out: Ast.Truncate = .{};
             _ = try self.takeWord("TABLE");
             while (true) {
-                _ = try self.takeRaw("only");
+                const only = try self.takeRaw("only");
                 if (out.count == config.tables) return error.TableCapacity;
                 out.tables[out.count] = try self.qualifiedName();
+                out.only[out.count] = only;
                 out.count += 1;
+                // `name *` names the children explicitly (ONLY name * is ONLY).
                 _ = try self.takeSymbol(.star);
                 if (!try self.takeSymbol(.comma)) break;
             }
@@ -2474,7 +2497,9 @@ pub fn Parser(comptime config: types.Config) type {
             try self.expectSymbol(.lparen);
             var has_primary = false;
             const sink: ConstraintSink = .{ .items = out.constraints[0..], .count = &out.constraint_count };
-            while (true) {
+            // An empty element list (CREATE TABLE child () INHERITS (parent)).
+            const empty = self.mode == .standard and self.isSymbol(.rparen);
+            while (!empty) {
                 if (self.mode == .standard and self.isWord("LIKE")) {
                     try self.advance();
                     if (out.like != null) return error.UnsupportedStatement;
@@ -2520,6 +2545,8 @@ pub fn Parser(comptime config: types.Config) type {
                 if (!try self.takeSymbol(.comma)) break;
             }
             try self.expectSymbol(.rparen);
+            // A table without columns is outside the subset.
+            if (empty and !self.rawWord("inherits")) return error.UnsupportedStatement;
             if (self.mode == .standard and try self.takeRaw("inherits")) {
                 try self.expectSymbol(.lparen);
                 out.inherits = try self.qualifiedName();

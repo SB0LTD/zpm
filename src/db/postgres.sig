@@ -2760,6 +2760,7 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "NotNullViolation")) return "23502";
     if (equal(name, "CheckViolation")) return "23514";
     if (equal(name, "ForeignKeyViolation")) return "23503";
+    if (equal(name, "RestrictViolation")) return "23001";
     if (equal(name, "ExclusionViolation")) return "23P01";
     if (equal(name, "IndexCapacity")) return "54000";
     if (equal(name, "InvalidForeignKey")) return "42830";

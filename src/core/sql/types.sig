@@ -555,6 +555,9 @@ pub const Error = error{
     /// SQLSTATE 44000: a new row of an auto-updatable view violates its
     /// WITH CHECK OPTION (B11 wave 4).
     WithCheckOptionViolation,
+    /// SQLSTATE 23001: a key an ON DELETE / ON UPDATE RESTRICT foreign key
+    /// still references when the statement ends (ddl-dml, wave 4).
+    RestrictViolation,
 };
 
 /// Caller-owned execution accounting and interrupt polling. This is independent

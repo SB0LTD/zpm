@@ -1021,6 +1021,8 @@ pub fn Ast(comptime config: types.Config) type {
             tables: [config.tables]TableRef = undefined,
             count: usize = 0,
             restart_identity: bool = false,
+            /// TRUNCATE ONLY name: no inheritance children (ddl-dml, wave 4).
+            only: [config.tables]bool = @splat(false),
         };
 
         /// One ALTER TABLE action. Column-level CHECK / UNIQUE of an ADD
@@ -1043,6 +1045,9 @@ pub fn Ast(comptime config: types.Config) type {
             add_constraint: ConstraintDef,
             drop_constraint: struct { name: Ident, if_exists: bool = false },
             rename_table: Ident,
+            // ddl-dml (wave 4): ALTER TABLE parent ATTACH / DETACH PARTITION.
+            attach_partition: struct { table: TableRef, bound: PartitionBound },
+            detach_partition: struct { table: TableRef, concurrently: bool = false },
         };
 
         /// ALTER TABLE [IF EXISTS] [ONLY] name action [, ...] | RENAME ...
