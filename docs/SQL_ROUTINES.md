@@ -119,7 +119,7 @@ triggers and DO NOTHING rules, including subsequent owner/body/ACL WAL changes.
 ALTER FUNCTION/PROCEDURE OWNER retains OIDs and transfers ACL owner endpoints.
 Stock PG16/18 archives preserve these objects both ways; typed default ACLs and
 definition output use caller-owned memory for long names/text. Other catalog
-image classes, synthetic view rule deparsing and arbitrary rule actions remain
+image classes and arbitrary rule actions remain
 open. See the TDD checkpoint for exact qualification evidence.
 
 `pg_proc.proacl` is a typed ACL array rendered in grant-dependency order, using
@@ -133,6 +133,16 @@ prosrc), `pg_trigger` (oid, tgrelid, tgname, tgfoid, tgtype with
 PostgreSQL's bits, tgenabled, tgisinternal, tgnargs, tgparentid), `pg_rewrite` (oid,
 rulename, ev_class, ev_type, ev_enabled, is_instead) and `pg_rules`
 (schemaname, tablename, rulename, definition in pg_get_ruledef's layout).
+
+`pg_get_ruledef` also renders the implicit `_RETURN` rules exposed by `pg_rewrite`
+for supported views and materialized views. Their actual SELECT is rendered using
+the view-definition writer, preserving declared column aliases and qualifying
+dependencies. The target respects pretty mode and `quote_all_identifiers`.
+Caller-owned value storage handles definitions wider than an inline text cell;
+exhausted storage returns an error without truncation. `pg_rules` excludes these
+implicit rules. Formatting can differ from native PostgreSQL; executing the SELECT
+action must retain the view's rows, column names and type OIDs. Stock PG16/18 archive
+qualification of this addition is pending.
 
 `pg_get_triggerdef(oid [, pretty])` renders the stored trigger version visible
 to the statement, including decoded arguments and UPDATE OF column names.

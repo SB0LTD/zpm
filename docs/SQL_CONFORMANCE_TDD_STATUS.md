@@ -1,5 +1,28 @@
 # SQL conformance TDD checkpoint
 
+## View _RETURN rule definitions — candidate, 27 November 2026
+
+The failing contract reproduced a non-null pg_rewrite row whose pg_get_ruledef
+returned NULL. View and materialized-view return rules now render their actual
+stored SELECT through the existing pg_get_viewdef writer, including namespace
+qualification, quoted identifiers and declared column aliases. Wide output uses
+the caller's value region; insufficient space fails without clipping or publishing
+a transaction. pg_rules continues to exclude implicit view rules.
+
+Contracts exercise materialized views, quoted names, column aliases, drop/recreate,
+rollback, WAL replay, unknown OIDs and exhausted result memory. The stock PG16/18
+archive fixtures execute both pretty/non-pretty deparsed SELECT actions with an
+empty search_path, comparing rows and column names/types with the real view before
+dump and after restore/reopen. Formatting is not claimed byte-identical to native
+PostgreSQL. Native PostgreSQL 18.3 independently confirms the _RETURN rule shape.
+Debug/ReleaseSafe and stock PG16/18 CI qualification are pending; do not merge until
+all required evidence passes.
+
+This does not implement arbitrary CREATE RULE actions. Named routine namespaces,
+broader search_path behavior, CREATE OR REPLACE VIEW and ALTER VIEW column rename
+also remain open. The last two forms explicitly reject with 0A000 in the current
+parser; the fixture uses supported DROP/CREATE and declared view-column aliases.
+
 ## Routine catalog checkpoints and stock archives - qualified, 27 November 2026
 
 RSBASE10 preserves live SQL/PLpgSQL functions, procedures, delegated EXECUTE ACLs,
