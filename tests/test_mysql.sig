@@ -509,8 +509,9 @@ fn nativeReplace() !void {
     try check(result.affected_rows == 2);
     try syntax_recovered.execute("SELECT v FROM replay_replace WHERE id=1", &result);
     try check(result.row_count == 1 and result.rows[0].cells[0].integer == 90);
+    // The PostgreSQL dialect has no REPLACE: a syntax error (42601), as native.
     if (syntax_recovered.execute("REPLACE INTO replay_replace VALUES(1,0)", &result)) |_| return error.UnexpectedDialectSyntax else |err|
-        try check(err == error.UnsupportedStatement);
+        try check(err == error.Syntax);
 }
 
 fn nativeAutoIncrement() !void {
