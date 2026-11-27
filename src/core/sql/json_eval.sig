@@ -416,6 +416,94 @@ pub fn JsonEval(comptime config: types.Config, comptime E: type) type {
             _ = try JP.run(&rows, &emitter);
         }
 
+        /// JSON_OBJECT / JSON_ARRAY (json_build_object / json_build_array
+        /// text, or jsonb), JSON_SCALAR (to_json; NULL stays NULL) and
+        /// JSON_SERIALIZE (the JSON text). A NULL key is 22004, a repeated
+        /// key with WITH UNIQUE KEYS 22030.
+        pub fn constructor(ctx: *const E.Context, n: *const ast.Node) Error!V.Cell {
+            const form = n.integer & 3;
+            const absent = n.integer & 4 != 0;
+            const unique = n.integer & 8 != 0;
+            const jsonb_result = n.ty == .jsonb;
+            const session = ctx.session;
+            var buffer: [JB.buffer_bytes]u8 = undefined;
+            var out: json_build.Out = .{ .bytes = &buffer };
+            switch (form) {
+                2, 3 => {
+                    const argument = try E.eval(ctx, n.b);
+                    if (argument == .null_value) return .null_value;
+                    const ty = node(ctx, n.b).ty;
+                    if (form == 3) {
+                        if (argument == .jsonb) {
+                            var text: V.Text = .{};
+                            var rendered: J.Text = .{ .bytes = &text.bytes };
+                            try J.render(argument.jsonb.slice(), 0, &rendered);
+                            try out.append(text.bytes[0..rendered.len]);
+                        } else {
+                            const bytes = if (argument == .bpchar) argument.bpchar.slice() else argument.text.slice();
+                            if (ty != .json) try J.validateJsonControlled(bytes, session.control);
+                            try out.append(bytes);
+                        }
+                    } else try JB.append(&out, &argument, ty, false, jsonb_result, session);
+                },
+                0 => {
+                    try out.byte('{');
+                    // Rendered keys (also of skipped pairs) for WITH UNIQUE KEYS.
+                    var key_bytes: [JB.buffer_bytes]u8 = undefined;
+                    var key_out: json_build.Out = .{ .bytes = &key_bytes };
+                    var keys: [64][2]usize = undefined;
+                    var key_count: usize = 0;
+                    var first = true;
+                    var item = n.b;
+                    while (item != none) {
+                        const key_id = item;
+                        const value_id = node(ctx, key_id).next;
+                        const key = try E.eval(ctx, key_id);
+                        if (key == .null_value) return error.NullValueNotAllowed;
+                        const value_cell = try E.eval(ctx, value_id);
+                        item = node(ctx, value_id).next;
+                        const key_ty = node(ctx, key_id).ty;
+                        if (unique) {
+                            const key_start = key_out.len;
+                            try JB.append(&key_out, &key, key_ty, true, jsonb_result, session);
+                            const rendered = key_out.bytes[key_start..key_out.len];
+                            for (keys[0..key_count]) |span| {
+                                if (session.control) |control| try control.checkpoint();
+                                if (types.same(key_out.bytes[span[0]..][0..span[1]], rendered)) return error.DuplicateJsonObjectKeyValue;
+                            }
+                            if (key_count == keys.len) return error.ProgramLimitExceeded;
+                            keys[key_count] = .{ key_start, rendered.len };
+                            key_count += 1;
+                        }
+                        if (absent and value_cell == .null_value) continue;
+                        if (!first) try out.append(", ");
+                        first = false;
+                        try JB.append(&out, &key, key_ty, true, jsonb_result, session);
+                        try out.append(" : ");
+                        try JB.append(&out, &value_cell, node(ctx, value_id).ty, false, jsonb_result, session);
+                    }
+                    try out.byte('}');
+                },
+                else => {
+                    try out.byte('[');
+                    var first = true;
+                    var item = n.b;
+                    while (item != none) : (item = node(ctx, item).next) {
+                        const value_cell = try E.eval(ctx, item);
+                        if (absent and value_cell == .null_value) continue;
+                        if (!first) try out.append(", ");
+                        first = false;
+                        try JB.append(&out, &value_cell, node(ctx, item).ty, false, jsonb_result, session);
+                    }
+                    try out.byte(']');
+                },
+            }
+            if (jsonb_result) return JB.jsonbOf(&out, session);
+            const cell = try JB.jsonOf(&out);
+            if (n.ty == .json or n.ty == .text) return cell;
+            return Io.cast(cell, .text, n.ty, n.typmod, session);
+        }
+
         /// PASSING values (json_table_passing nodes from `first`) as a
         /// jsonb object (to_jsonb of each value), or NULL without any.
         fn passingObject(ctx: *const E.Context, first: u16) Error!V.Cell {

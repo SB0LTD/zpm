@@ -513,7 +513,10 @@ pub fn Binder(comptime config: types.Config) type {
 
         pub const SortKey = struct { column: u16, descending: bool, nulls_first: bool };
 
-        pub const Agg = struct { kind: ast.Agg, arg: u16, filter: u16, distinct: bool, arg_ty: ast.Type, ty: ast.Type };
+        pub const Agg = struct { kind: ast.Agg, arg: u16, filter: u16, distinct: bool, arg_ty: ast.Type, ty: ast.Type,
+            /// JSON aggregates (wave 4 text-json): bit 0 strict (ABSENT ON
+            /// NULL), bit 1 unique keys.
+            variant: u8 = 0 };
 
         /// One FROM item of a plan, joined to the items before it.
         pub const Source = struct {
@@ -1654,8 +1657,29 @@ pub fn Binder(comptime config: types.Config) type {
             return .none;
         }
 
+        fn jsonAggregate(kind: ast.Agg) bool {
+            return kind == .json_agg or kind == .jsonb_agg or kind == .json_object_agg or kind == .jsonb_object_agg;
+        }
+
+        /// The strict / unique variant bits of a JSON aggregate call by name
+        /// (json_agg_strict, json_object_agg_unique_strict, ...), or the
+        /// flags JSON_ARRAYAGG / JSON_OBJECTAGG were parsed with.
+        fn jsonAggregateVariant(context: *const Context, n: *const ast.Node) u8 {
+            const name = toName(context, n.name).slice();
+            if (types.same(name, "json_arrayagg") or types.same(name, "json_objectagg")) return @intCast(n.integer & 3);
+            var variant: u8 = 0;
+            if (name.len > 7 and types.same(name[name.len - 7 ..], "_strict")) variant |= 1;
+            if (std.mem.indexOf(u8, name, "_unique") != null) variant |= 2;
+            return variant;
+        }
+
         fn aggregateKind(context: *const Context, n: *const ast.Node) ast.Agg {
             const name = toName(context, n.name);
+            if (context.dialect == .postgres) {
+                const jsonb_result = n.integer & 4 != 0;
+                if (types.same(name.slice(), "json_arrayagg")) return if (jsonb_result) .jsonb_agg else .json_agg;
+                if (types.same(name.slice(), "json_objectagg")) return if (jsonb_result) .jsonb_object_agg else .json_object_agg;
+            }
             const table = [_]struct { name: []const u8, agg: ast.Agg }{
                 .{ .name = "count", .agg = .count },
                 .{ .name = "sum", .agg = .sum },
@@ -1683,6 +1707,11 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "xmlagg", .agg = .xmlagg },
                 .{ .name = "json_agg", .agg = .json_agg },          .{ .name = "jsonb_agg", .agg = .jsonb_agg },
                 .{ .name = "json_object_agg", .agg = .json_object_agg }, .{ .name = "jsonb_object_agg", .agg = .jsonb_object_agg },
+                // The strict and unique variants (wave 4 text-json).
+                .{ .name = "json_agg_strict", .agg = .json_agg },   .{ .name = "jsonb_agg_strict", .agg = .jsonb_agg },
+                .{ .name = "json_object_agg_strict", .agg = .json_object_agg }, .{ .name = "jsonb_object_agg_strict", .agg = .jsonb_object_agg },
+                .{ .name = "json_object_agg_unique", .agg = .json_object_agg }, .{ .name = "jsonb_object_agg_unique", .agg = .jsonb_object_agg },
+                .{ .name = "json_object_agg_unique_strict", .agg = .json_object_agg }, .{ .name = "jsonb_object_agg_unique_strict", .agg = .jsonb_object_agg },
                 .{ .name = "percentile_cont", .agg = .percentile_cont }, .{ .name = "percentile_disc", .agg = .percentile_disc },
                 .{ .name = "mode", .agg = .mode },
             };
@@ -1940,7 +1969,9 @@ pub fn Binder(comptime config: types.Config) type {
             // WITHIN GROUP is required for an ordered-set aggregate (42809).
             if (ast.orderedSetAggregate(kind)) return error.WrongObjectType;
             if (ast.collectingAggregate(kind)) {
+                const variant: i64 = if (jsonAggregate(kind)) jsonAggregateVariant(context, n) else 0;
                 const result = try typeCollectAggregate(context, &inner, n, kind);
+                n.integer = variant;
                 try aggregateInput(context, &inner, n, if (kind == .string_agg or kind == .json_object_agg or kind == .jsonb_object_agg) 2 else 1);
                 if (n.c != none) {
                     inner.window_error = error.WindowingError;
@@ -2366,6 +2397,7 @@ pub fn Binder(comptime config: types.Config) type {
             // Built by linkAggregateInput with typed members (B11).
             if (n.func == .aggregate_input) return;
             if (n.func == .json_query_function) return bindJsonQueryFunction(context, scope, n);
+            if (n.func == .json_constructor) return bindJsonConstructor(context, scope, n);
             if (n.func == .is_json) {
                 // IS JSON over a string or JSON value (42804 otherwise).
                 try typeExpr(context, scope, n.b);
@@ -2810,7 +2842,7 @@ pub fn Binder(comptime config: types.Config) type {
                     try typeRegexFunction(context, n, count);
                 },
                 .substring_regex, .substring_similar => try typeRegexFunction(context, n, count),
-                .json_query_function, .is_json => unreachable, // bound before the arguments
+                .json_query_function, .is_json, .json_constructor => unreachable, // bound before the arguments
                 .jsonb_path_query => {
                     const seen = scope.set_calls orelse return error.UnsupportedStatement;
                     seen.* +|= 1;
@@ -5386,6 +5418,10 @@ pub fn Binder(comptime config: types.Config) type {
                         .to_macaddr8 => break :blk .{ .name = "macaddr8", .strength = 2 },
                         .to_macaddr => break :blk .{ .name = "macaddr", .strength = 2 },
                         .mac_trunc => break :blk .{ .name = "trunc", .strength = 2 },
+                        .json_constructor => {
+                            buffer.* = toName(context, n.name);
+                            break :blk .{ .name = buffer.slice(), .strength = 2 };
+                        },
                         else => {},
                     }
                     buffer.* = toName(context, n.name);
@@ -7342,11 +7378,12 @@ pub fn Binder(comptime config: types.Config) type {
 
         fn registerAgg(context: *const Context, p: *Plan, id: u16) Error!usize {
             const n = context.node(id);
+            const variant: u8 = if (jsonAggregate(n.agg)) @intCast(n.integer & 3) else 0;
             for (p.aggs[0..p.agg_count], 0..) |*agg, index| {
-                if (agg.kind == n.agg and agg.distinct == n.distinct and sameExpr(context, agg.arg, n.a) and sameExpr(context, agg.filter, n.c)) return index;
+                if (agg.kind == n.agg and agg.variant == variant and agg.distinct == n.distinct and sameExpr(context, agg.arg, n.a) and sameExpr(context, agg.filter, n.c)) return index;
             }
             if (p.agg_count == config.columns) return error.StatementTooComplex;
-            p.aggs[p.agg_count] = .{ .kind = n.agg, .arg = n.a, .filter = n.c, .distinct = n.distinct, .arg_ty = if (n.a == none) .unknown else context.node(n.a).ty, .ty = n.ty };
+            p.aggs[p.agg_count] = .{ .kind = n.agg, .arg = n.a, .filter = n.c, .distinct = n.distinct, .arg_ty = if (n.a == none) .unknown else context.node(n.a).ty, .ty = n.ty, .variant = variant };
             p.agg_count += 1;
             return p.agg_count - 1;
         }
@@ -7797,6 +7834,30 @@ pub fn Binder(comptime config: types.Config) type {
             p.count = count;
             p.width = count;
             return id;
+        }
+
+        /// JSON_OBJECT / JSON_ARRAY / JSON_SCALAR / JSON_SERIALIZE (wave 4
+        /// text-json): untyped arguments are text; the result is the
+        /// RETURNING type (json, jsonb or a string type; json by default,
+        /// text for JSON_SERIALIZE).
+        fn bindJsonConstructor(context: *const Context, scope: *const Scope, n: *ast.Node) Error!void {
+            if (context.dialect != .postgres) return error.UndefinedFunction;
+            var item = n.b;
+            while (item != none) : (item = context.node(item).next) {
+                try typeExpr(context, scope, item);
+                if (context.node(item).ty == .unknown) try coerce(context, item, .text);
+            }
+            switch (n.cast_type) {
+                .json, .jsonb, .text, .varchar, .bpchar => {},
+                else => return error.TypeMismatch,
+            }
+            if (n.integer & 3 == 3) switch (context.node(n.b).ty) {
+                .json, .jsonb, .text, .varchar, .bpchar => {},
+                else => return error.TypeMismatch,
+            };
+            n.ty = n.cast_type;
+            n.typmod = n.typmod;
+            n.constant = false;
         }
 
         /// JSON_EXISTS / JSON_VALUE / JSON_QUERY (wave 4 text-json): the

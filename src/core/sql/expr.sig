@@ -1636,6 +1636,7 @@ pub fn Eval(comptime config: types.Config) type {
                 // A set-returning call reads the value exec is expanding.
                 .regexp_matches, .regexp_split_to_table, .jsonb_path_query => return if (ctx.set_value) |current| current.* else error.UnsupportedStatement,
                 .json_query_function => return json_eval.JsonEval(config, @This()).queryFunction(ctx, n),
+                .json_constructor => return json_eval.JsonEval(config, @This()).constructor(ctx, n),
                 .is_json => {
                     // ExecEvalJsonIsPredicate: invalid text is false; jsonb
                     // keys are always unique.

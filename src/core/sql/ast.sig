@@ -184,7 +184,13 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     // [KEYS]] (wave 4 text-json): `b` the operand, `integer` bits 0-1 the
     // item type (value, array, object, scalar), bit 2 WITH UNIQUE KEYS,
     // bit 3 NOT.
-    is_json };
+    is_json,
+    // JSON_OBJECT / JSON_ARRAY / JSON_SCALAR / JSON_SERIALIZE (wave 4
+    // text-json): `b` -> next the arguments (object: key, value pairs);
+    // `integer` bits 0-1 the form (0 object, 1 array, 2 scalar, 3
+    // serialize), bit 2 ABSENT ON NULL, bit 3 WITH UNIQUE KEYS; the
+    // RETURNING type in cast_type / typmod.
+    json_constructor };
 
 
 /// mr_call variants: the range accessors applied to a multirange's span.

@@ -3797,7 +3797,10 @@ pub fn Exec(comptime config: types.Config) type {
                     for (members[direct..][0..width], 0..) |id, column| self.work.cells[slot + column] = try E.eval(&ctx, id);
                     const first_cell = &self.work.cells[slot];
                     const skip = switch (agg.kind) {
-                        .array_agg, .json_agg, .jsonb_agg, .json_object_agg, .jsonb_object_agg => false,
+                        .array_agg => false,
+                        // The strict variants (ABSENT ON NULL) skip NULL values.
+                        .json_agg, .jsonb_agg => agg.variant & 1 != 0 and first_cell.* == .null_value,
+                        .json_object_agg, .jsonb_object_agg => agg.variant & 1 != 0 and first_cell.* != .null_value and self.work.cells[slot + 1] == .null_value,
                         .string_agg, .percentile_cont, .percentile_disc, .mode => first_cell.* == .null_value,
                         .hypothetical_rank, .hypothetical_dense_rank, .hypothetical_percent_rank, .hypothetical_cume_dist => false,
                         // Strict ordinary aggregates skip a NULL argument.
@@ -3858,7 +3861,7 @@ pub fn Exec(comptime config: types.Config) type {
                     .range_agg, .range_intersect_agg => return types_ext_eval.TypesExt(config, E).rangeAggregate(sorted.cells, sorted.handles, agg.kind == .range_agg, agg.ty, self.session),
                     .xmlagg => return types_ext_eval.TypesExt(config, E).xmlAggregate(sorted.cells, sorted.handles, self.session),
                     .json_agg, .jsonb_agg => return C.jsonAgg(sorted, node_ty(self, members[0]), agg.kind == .jsonb_agg, self.session),
-                    .json_object_agg, .jsonb_object_agg => return C.objectAgg(sorted, node_ty(self, members[0]), node_ty(self, members[1]), agg.kind == .jsonb_object_agg, self.session),
+                    .json_object_agg, .jsonb_object_agg => return C.objectAgg(sorted, node_ty(self, members[0]), node_ty(self, members[1]), agg.kind == .jsonb_object_agg, agg.variant & 2 != 0, self.session),
                     .percentile_cont, .percentile_disc => {
                         const percentile = try C.fraction(&direct_values[0]) orelse return .null_value;
                         if (agg.kind == .percentile_disc) return C.percentileDisc(sorted, percentile);
