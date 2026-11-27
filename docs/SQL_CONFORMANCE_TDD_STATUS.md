@@ -1,5 +1,51 @@
 # SQL conformance TDD checkpoint
 
+## Qualified routine resolution — 27 November 2026
+
+The failing contract reproduced `public`-qualified expression calls, CALL and
+DROP returning 0A000. Parsing now preserves an ordinary function's qualifier;
+binding resolves that schema before classifying built-in scalar, aggregate or
+window names. `public.abs` and `public.count` therefore resolve the actual user
+routine, while unqualified and pg_catalog-qualified built-ins retain their
+previous resolution. Quoted routine names are preserved.
+
+Public-qualified CREATE/CALL/DROP and EXECUTE grants work with an empty explicit
+search path. Unqualified routine lookup does not silently use public in that
+state; unqualified CREATE returns 3F000. This extends the existing public/empty
+path subset, not arbitrary schema ordering or other routine namespaces.
+An additional failing window query exposed missing repeatability classification
+for user routines. Window planning now recognizes visible IMMUTABLE routines,
+while checking every argument separately; volatile routines retain the existing
+demand restrictions. Qualified routines are tested within aggregates and full
+window aggregates, including scalar/aggregate/window built-in name collisions.
+The native Windows Debug contract passes 904 assertions and 224 replayed records;
+the existing window contract passes 9,971 assertions. The new sequence-argument
+case verifies that an immutable wrapper does not erase volatile argument effects.
+RAMSQL's PG16/18 stock fixture adds qualified calls, prepared parameters,
+same-name built-ins, empty-path failures and executable archive/recovery checks.
+Native Windows Debug and ReleaseSafe pass the routine contract. Linux CI passed
+both modes and the hard 4 MiB wide-cell contract. Both PG16 and PG18 passed 48
+stock tooling, 10 large-object archive/checkpoint and 11 file/routine checks in
+[CI 45928135880](https://github.com/SB0LTD/ramsql/actions/runs/45928135880).
+
+The unchanged strict inventory matched all **106 PostgreSQL smoke programs**
+against frozen PostgreSQL 18.3 in
+[CI 45929457438](https://github.com/SB0LTD/ramsql/actions/runs/45929457438).
+It covers 103 transaction/COPY programs plus database lifecycle, two-phase and
+maintenance scopes. The inventory binary SHA-256 matches the passing PG18 stock
+binary. The initial 105/106 run used a single-database server for CREATE DATABASE;
+the corrected harness uses the documented cluster profile for that case and
+records the actual profile per scope. Neither SQL nor comparison rules changed.
+
+This is smoke qualification, not feature-family closure. The 755 upstream
+records still require applicability review and closure evidence; six MySQL and
+six T-SQL programs need their own current native lanes. Routine default ACLs,
+schema-wide grants, non-public routine namespaces, SECURITY DEFINER, broader
+function bodies, OUT/INOUT/VARIADIC/default parameters and volatile-window demand
+semantics remain open. See the
+[machine-readable checkpoint](../tests/sql_conformance/checkpoint_20261127.json).
+[PostgreSQL routine volatility](https://www.postgresql.org/docs/18/xfunc-volatility.html)
+
 ## SQL routine EXECUTE delegation — 27 November 2026
 
 User-defined SQL/PLpgSQL functions and procedures use the shared, caller-owned
@@ -22,13 +68,17 @@ A failing regression also exposed routine CREATE/DROP/GRANT/REVOKE in read-only
 transactions. These now return 25006. Read-only CALL/DO and scalar function reads
 continue to work; statements inside routines still enforce their own write rules.
 The routine contract passes 858 assertions with 205 committed records replayed
-in native Windows Debug. ZPM CI runs routine and catalog-security contracts in
-Debug and ReleaseSafe, alongside the hard 4 MiB wide-cell contract.
+in native Windows Debug and ReleaseSafe; catalog security passes 1,761 assertions
+and 432 records. ZPM CI passed both modes and the hard 4 MiB wide-cell contract.
 
 RAMSQL's stock PG16/18 fixture now exercises SQL functions and procedures with
 delegated ACLs, actual execution by each role, rollback, forced-process recovery,
-and plain/custom archives in both directions. **Candidate: CI qualification is
-pending; this section does not claim merge or release qualification.** General
+and plain/custom archives in both directions. Both PG16 and PG18 passed 48 stock
+tooling checks, 10 large-object archive/checkpoint checks and 10 file/routine
+checks in [CI 45924960970](https://github.com/SB0LTD/ramsql/actions/runs/45924960970).
+All three reports within each lane identify the same binary. ZPM #326 and RAMSQL
+#129 merged after these gates and the targeted ZPM contracts passed. The broader
+platform/release matrix is separate and was still running at this checkpoint. General
 built-in function ACLs, ALL FUNCTIONS/PROCEDURES IN SCHEMA, routine default ACLs,
 other routine namespaces and the wider routine-language inventory remain open.
 

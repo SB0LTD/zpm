@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "date": "2026-11-27",
+  "qualification": "incomplete",
+  "scope": "postgresql_smoke_only",
+  "zpm_runtime_revision": "70da33328324d6e660af993a558fc5b4be4276fb",
+  "ramsql_revision": "e0ae3a619afd91009a4fcf1f28b501180b19074f",
+  "oracle": "PostgreSQL 18.3",
+  "oracle_image": "postgres:18.3-bookworm@sha256:80630f83606d8db77d30b3851b16a9f78be2d0d4dda6f7b82a1fdca5ebe3acba",
+  "manifest_sha256": "1feee91259a68605cd6d50c3a1863b79f3882e0d5c424126912ba3036520f47c",
+  "audit_sha256": "6fb343fb3c088985501fe5512eb678d6c5b3589eb965d0688fcf1482fc8d5b7b",
+  "inventory_binary_sha256": "559a5e6f004236ae322d9fa99b98bae17923e337156ef86eaa805b6d8cd638c1",
+  "inventory_evidence": "https://github.com/SB0LTD/ramsql/actions/runs/45929457438",
+  "stock_tooling_evidence": "https://github.com/SB0LTD/ramsql/actions/runs/45928135880",
+  "counts": {"postgresql_smoke_pass": 106, "postgresql_fail": 0},
+  "scopes": {"transaction_and_copy": 103, "database_cluster": 1, "two_phase": 1, "maintenance": 1},
+  "stock_checks_per_pg16_pg18_lane": {"stock_tooling": 48, "large_object_archives": 10, "files_and_routines": 11},
+  "local_contracts": {"routines_debug_and_release_safe": 904, "routine_records_replayed": 224, "windows": 9971},
+  "separate_native_lanes_required": {"mysql": 6, "tsql": 6},
+  "upstream_records": {"total": 755, "postgres_supported": 459, "postgres_unsupported": 296, "applicability": "unreviewed"},
+  "remaining": [
+    "Reviewed applicability and full semantic closure of the upstream inventory",
+    "Current native MySQL and T-SQL inventory lanes",
+    "Routine default ACLs, schema-wide grants and non-public namespaces",
+    "Broader routine execution, signatures, SECURITY DEFINER and volatile-window demand",
+    "Upstream/application regressions and production qualification beyond finite smoke coverage"
+  ]
+}

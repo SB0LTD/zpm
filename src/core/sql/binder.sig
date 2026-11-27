@@ -1866,7 +1866,7 @@ pub fn Binder(comptime config: types.Config) type {
             if(id==none) return true;const n=context.node(id);
             if(n.planned_null) return true;
             switch(n.kind){
-                .function=>if(!ast.canRepeatFunction(n.func) and n.func!=.jsonb_typeof and n.func!=.jsonb_array_length) return false,
+                .function=>if(!ast.canRepeatFunction(n.func) and n.func!=.jsonb_typeof and n.func!=.jsonb_array_length and !immutableRoutine(context,n)) return false,
                 .scalar_subquery,.exists_subquery,.in_subquery=>return false,
                 else=>{},
             }
@@ -1874,6 +1874,14 @@ pub fn Binder(comptime config: types.Config) type {
             if(listOwner(n.kind)){var item=n.b;while(item!=none):(item=context.node(item).next) if(!repeatableWindowInput(context,item)) return false;}
             else if(!repeatableWindowInput(context,n.b)) return false;
             return true;
+        }
+
+        fn immutableRoutine(context: *const Context, n: *const ast.Node) bool {
+            if (n.func != .routine) return false;
+            const routines = context.routines orelse return false;
+            if (n.integer < 0 or n.integer >= routines.routines.len) return false;
+            const routine = &routines.routines[@intCast(n.integer)];
+            return routine.live and routine.stamp.visible(context.snapshot) and routine.volatility == 'i';
         }
 
         fn framePlanRepeatable(context:*const Context,id:u16,seen:*[config.subqueries]bool) bool {
@@ -2103,6 +2111,21 @@ pub fn Binder(comptime config: types.Config) type {
         }
 
         fn typeFunction(context: *const Context, scope: *const Scope, n: *ast.Node) Error!void {
+            // An explicitly named schema never falls back to a built-in.
+            // Resolve ordinary routines before name-based aggregate/window
+            // classification (public.count, public.row_number, etc.).
+            if (n.qualifier.len != 0 and !types.same(toName(context, n.qualifier).slice(), "pg_catalog")) {
+                if (n.func == .routine) return;
+                if (n.window != none or n.within_group or n.order != none) return error.WrongObjectType;
+                if (n.distinct or n.c != none or n.star) return error.UndefinedFunction;
+                var count: usize = 0;
+                var item = n.b;
+                while (item != none) : (item = context.node(item).next) {
+                    try typeExpr(context, scope, item);
+                    count += 1;
+                }
+                return bindRoutineCall(context, n, count);
+            }
             // Built by linkAggregateInput with typed members (B11).
             if (n.func == .aggregate_input) return;
             if (n.within_group) return typeOrderedSet(context, scope, n);
@@ -5286,8 +5309,9 @@ pub fn Binder(comptime config: types.Config) type {
         /// Arguments are converted to the parameter types; the routine hook
         /// evaluates the body when the call runs.
         fn bindRoutineCall(context: *const Context, n: *ast.Node, count: usize) Error!void {
-            // A pg_catalog-qualified call can never resolve a public routine.
-            if (n.qualifier.len != 0 or !publicLookup(context, n.name)) return error.UndefinedFunction;
+            if (n.qualifier.len != 0) {
+                if (try qualifierNamespace(context, n.qualifier) != catalog.public_namespace) return error.UndefinedFunction;
+            } else if (!publicLookup(context, n.name)) return error.UndefinedFunction;
             const set = context.routines orelse return error.UndefinedFunction;
             const name = toName(context, n.name);
             var best: ?usize = null;

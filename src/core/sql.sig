@@ -12479,6 +12479,7 @@ pub fn Database(comptime config: Config) type {
         /// CREATE [OR REPLACE] FUNCTION / PROCEDURE: validates the signature
         /// and optionally analyzes the quoted body before writing its version.
         fn createRoutine(self: *Self, slot: u16, definition: *const R.CreateRoutine, snap: Snapshot) Error!void {
+            if (!definition.has_schema and !self.session.public_schema_on_path) return error.UndefinedSchema;
             var oid_buffer: [config.routine_args]u32 = undefined;
             const args = definition.argOids(&oid_buffer);
             const namespace = catalog_module.public_namespace;
@@ -12637,6 +12638,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn findRoutineTarget(self: *Self, slot: u16, drop: *const R.DropRoutine, snap: Snapshot) Error!?usize {
+            if (!drop.has_schema and !self.session.public_schema_on_path) return null;
             const namespace = catalog_module.public_namespace;
             const name = drop.name.slice();
             var found: ?usize = null;
@@ -12910,6 +12912,7 @@ pub fn Database(comptime config: Config) type {
         /// CALL: the visible procedure whose parameters accept the
         /// arguments (42809 when only a function matches), then its body.
         fn callProcedure(self: *Self, slot: u16, source: []const u8, call: *const R.Call, snap: Snapshot) Error!void {
+            if (!call.has_schema and !self.session.public_schema_on_path) return error.UndefinedFunction;
             _ = slot;
             var args: [config.routine_args]Argument = undefined;
             for (call.args[0..call.arg_count], 0..) |span, position| args[position] = try self.evaluateArgument(source, span);
