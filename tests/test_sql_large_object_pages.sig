@@ -741,6 +741,7 @@ fn routineDefaultCheckpoint() !void {
     try routine_default_copy.execute("CREATE TRIGGER image_before BEFORE INSERT ON image_rows FOR EACH ROW EXECUTE FUNCTION image_trigger()", &result);
     try routine_default_copy.execute("CREATE RULE image_keep AS ON DELETE TO image_rows DO INSTEAD NOTHING", &result);
     try routine_default_copy.execute("CREATE PROCEDURE image_proc() LANGUAGE SQL AS 'INSERT INTO image_rows VALUES (1,2)'", &result);
+    try routine_default_copy.execute("INSERT INTO image_rows VALUES (2,5)", &result);
     var live_image: ImageBuffer = .{};
     try DB.BaseSnapshot.write(&routine_default_copy, &live_image, &wal);
     try expect(std.mem.eql(u8, live_image.bytes[0..8], "RSBASE10"));
@@ -754,6 +755,13 @@ fn routineDefaultCheckpoint() !void {
     try routine_image_copy.execute("SELECT restored_default()", &result);
     try expect(result.rows[0].cells[0].integer == 9);
     try routine_image_copy.execute("RESET ROLE", &result);
+    const revocation = try executeWAL(&routine_default_copy, "REVOKE EXECUTE ON FUNCTION restored_default() FROM default_member CASCADE", &wal);
+    try routine_image_copy.applyChangeRecord(revocation, &replay_scratch);
+    try routine_image_copy.execute("SET ROLE default_recipient", &result);
+    if (routine_image_copy.execute("SELECT restored_default()", &result)) |_| return error.RestoredRoutineRevokeLost else |err| try expect(err == error.InsufficientPrivilege);
+    try routine_image_copy.execute("RESET ROLE", &result);
+    try routine_image_copy.execute("SELECT v FROM image_rows WHERE id=2", &result);
+    try expect(result.rows[0].cells[0].integer == 15); // Restore does not refire the INSERT trigger.
     try routine_image_copy.execute("CALL image_proc()", &result);
     try routine_image_copy.execute("DELETE FROM image_rows", &result);
     try routine_image_copy.execute("SELECT v FROM image_rows WHERE id=1", &result);
