@@ -710,6 +710,11 @@ pub fn Ast(comptime config: types.Config) type {
             /// it to a composite type; B11 wave 5, composite lane).
             user_type: Ident = .{},
             user_type_schema: Ident = .{},
+            /// COLLATE clause (ddl-alter, wave 5): a collation.lookup value,
+            /// 0 when none was written.
+            collation: u8 = 0,
+            /// CONSTRAINT name NOT NULL (ddl-alter): the constraint's name.
+            not_null_name: ?Ident = null,
         };
 
         /// ALTER SEQUENCE [IF EXISTS] name options (RESTART included).

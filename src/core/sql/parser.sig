@@ -2724,13 +2724,13 @@ pub fn Parser(comptime config: types.Config) type {
                         column.default_kind = .generated;
                     }
                 } else if (self.mode == .standard and name == null and try self.takeRaw("collate")) {
-                    // Column collations would need the table definition to
-                    // carry them: only the database collation ("default",
-                    // the same as no clause) is accepted.
+                    // Column collations (ddl-alter, wave 5): stored by
+                    // definition format 8; "default" is the same as no clause.
                     const value = try self.collationName();
                     if (value == collation_module.unknown) return error.UndefinedObject;
                     if (!collation_module.collatable(column.type_name)) return error.TypeMismatch;
-                    if (value != collation_module.database_default) return error.UnsupportedStatement;
+                    if (value == collation_module.unsupported) return error.UnsupportedStatement;
+                    column.collation = value;
                 } else if (self.mode == .standard and self.isWord("NULL")) {
                     try self.advance();
                 } else if (try self.takeWord("NOT")) {
@@ -2738,6 +2738,7 @@ pub fn Parser(comptime config: types.Config) type {
                     try self.expectWord("NULL");
                     has_not_null = true;
                     column.not_null = true;
+                    if (name != null) column.not_null_name = name;
                 } else if (try self.takeWord("PRIMARY")) {
                     // Multiple primary keys: 42P16, as PostgreSQL (ddl-dml).
                     if (has_primary.*) {if(if_not_exists) invalid.*=true else return error.InvalidTableDefinition;}

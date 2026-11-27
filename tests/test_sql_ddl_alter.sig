@@ -613,6 +613,85 @@ fn schemaElements() !void {
     try sameState(&.{ schema_probes[0], schema_probes[1], schema_probes[2], "SELECT a FROM s2.y", "SELECT a FROM s5.t" });
 }
 
+// ---- NOT NULL constraints and column collations (definition format 8) ---------
+
+const constraint_probes = [_][]const u8{
+    "SELECT conname, contype FROM pg_constraint WHERE conrelid = 't'::regclass ORDER BY conname",
+    "SELECT constraint_name, constraint_type FROM information_schema.table_constraints WHERE table_name = 't' ORDER BY 1",
+};
+
+const collation_probes = [_][]const u8{
+    "SELECT column_name, collation_name FROM information_schema.columns WHERE table_name = 'c' ORDER BY ordinal_position",
+    "SELECT attname, attcollation FROM pg_attribute WHERE attrelid = 'c'::regclass AND attnum > 0 ORDER BY attnum",
+    "SELECT s FROM c ORDER BY s",
+};
+
+fn constraintsAndCollations() !void {
+    reset();
+    // F491 probe: NOT NULL constraints are pg_constraint rows (contype 'n',
+    // a "char"), named or `<table>_<column>_not_null`, primary key columns too.
+    try run("CREATE TABLE t(a INT CONSTRAINT a_pos CHECK (a > 0), b INT CONSTRAINT b_nn NOT NULL, CONSTRAINT t_pk PRIMARY KEY (a))");
+    try rejects("INSERT INTO t VALUES (-1, 1)", error.CheckViolation, "SELECT count(*) FROM t", "0");
+    try rejects("INSERT INTO t VALUES (1, NULL)", error.NotNullViolation, "SELECT count(*) FROM t", "0");
+    try expect(constraint_probes[0], "a_pos|c;b_nn|n;t_a_not_null|n;t_pk|p");
+    try expect(constraint_probes[1], "a_pos|CHECK;b_nn|CHECK;t_a_not_null|CHECK;t_pk|PRIMARY KEY");
+    try run("ALTER TABLE t DROP CONSTRAINT a_pos");
+    try run("INSERT INTO t VALUES (-1, 1)");
+    try run("ALTER TABLE t RENAME CONSTRAINT t_pk TO t_key");
+    try expect("SELECT conname FROM pg_constraint WHERE conrelid = 't'::regclass AND contype = 'p'", "t_key");
+    // Names survive renames of the table and column; SET NOT NULL names
+    // the new constraint after the current names.
+    try run("ALTER TABLE t RENAME COLUMN b TO bb");
+    try run("ALTER TABLE t ALTER COLUMN bb DROP NOT NULL");
+    try run("ALTER TABLE t ALTER COLUMN bb SET NOT NULL");
+    try expect(constraint_probes[0], "t_a_not_null|n;t_bb_not_null|n;t_key|p");
+    try run("ALTER TABLE t RENAME CONSTRAINT t_bb_not_null TO bb_set");
+    try rejects("ALTER TABLE t RENAME CONSTRAINT bb_set TO t_key", error.DuplicateObject, constraint_probes[0], "bb_set|n;t_a_not_null|n;t_key|p");
+    // A primary key column keeps its NOT NULL (42P16); DROP CONSTRAINT of
+    // another one is DROP NOT NULL.
+    try rejects("ALTER TABLE t DROP CONSTRAINT t_a_not_null", error.InvalidTableDefinition, constraint_probes[0], "bb_set|n;t_a_not_null|n;t_key|p");
+    try run("ALTER TABLE t DROP CONSTRAINT bb_set");
+    try run("INSERT INTO t VALUES (2, NULL)");
+    try expect(constraint_probes[0], "t_a_not_null|n;t_key|p");
+    try sameState(&constraint_probes);
+    // F690 probe: column collations ("C", "POSIX", "default", ucs_basic and
+    // the C.utf8 libc collation; code point order like the database's).
+    try expect("SELECT 'a' < 'B' COLLATE \"C\", 'a' < 'B' COLLATE \"POSIX\", 'abc' COLLATE \"C\" = 'abc'", "f|f|t");
+    try run("CREATE TABLE c(s TEXT COLLATE \"C\", u TEXT, v VARCHAR(3) COLLATE \"C.utf8\", w TEXT COLLATE \"default\", x TEXT COLLATE ucs_basic)");
+    try run("INSERT INTO c VALUES ('b', 'b', 'b', 'b', 'b'), ('B', 'B', 'B', 'B', 'B'), ('a', 'a', 'a', 'a', 'a')");
+    try expect(collation_probes[2], "B;a;b");
+    try expect("SELECT s FROM c ORDER BY s COLLATE \"C\" DESC", "b;a;B");
+    try expect(collation_probes[0], "s|C;u|NULL;v|C.utf8;w|NULL;x|ucs_basic");
+    try expect(collation_probes[1], "s|950;u|100;v|12359;w|100;x|962");
+    // ALTER COLUMN TYPE takes COLLATE, else the new type's default.
+    try run("ALTER TABLE c ALTER COLUMN u TYPE VARCHAR(5) COLLATE \"POSIX\"");
+    try run("ALTER TABLE c ALTER COLUMN s TYPE VARCHAR(5)");
+    try expect(collation_probes[0], "s|NULL;u|POSIX;v|C.utf8;w|NULL;x|ucs_basic");
+    try rejects("CREATE TABLE ci(i INT COLLATE \"C\")", error.TypeMismatch, "SELECT count(*) FROM c", "3");
+    try rejects("CREATE TABLE ci(i TEXT COLLATE \"nope\")", error.UndefinedObject, "SELECT count(*) FROM c", "3");
+    try rejects("ALTER TABLE c ALTER COLUMN w TYPE INT COLLATE \"C\" USING 1", error.TypeMismatch, "SELECT count(*) FROM c", "3");
+    // ICU collations are not available here (0A000).
+    try rejects("CREATE TABLE ci(i TEXT COLLATE \"unicode\")", error.UnsupportedStatement, "SELECT count(*) FROM c", "3");
+    try sameState(&collation_probes);
+    // Crafted format-8 definitions: an unknown collation, a collation on
+    // an integer column, unknown flags.
+    var result: DB.Result = .{};
+    var used: usize = 0;
+    try db.executeChanges("CREATE TABLE k8(a TEXT COLLATE \"POSIX\")", &result, &record, &used, null, null);
+    const good = record[0..used];
+    // The extension block ends the record: flags u8 then the OID 951.
+    try check(good[good.len - 5] == 1 and good[good.len - 4] == 0xb7 and good[good.len - 3] == 3);
+    for ([_]struct { at: usize, value: u8 }{ .{ .at = good.len - 4, .value = 0xb8 }, .{ .at = good.len - 5, .value = 9 }, .{ .at = good.len - 5, .value = 0 }, .{ .at = good.len - 5, .value = 2 } }) |mutation| {
+        @memcpy(crafted[0..good.len], good);
+        crafted[mutation.at] = mutation.value;
+        if (replica.applyChangeRecord(crafted[0..good.len], &scratch)) |_| return error.CraftedRecordAccepted else |err| {
+            try check(err == error.InvalidChangeRecord or err == error.ChangeRecordConflict);
+        }
+    }
+    try replica.applyChangeRecord(good, &scratch);
+    try sameState(&.{"SELECT attname, attcollation FROM pg_attribute WHERE attrelid = 'k8'::regclass AND attnum > 0"});
+}
+
 pub fn main() !void {
     try alterColumnType();
     try alterTypeTransactions();
@@ -620,5 +699,6 @@ pub fn main() !void {
     try dropColumnCascade();
     try columnOptionsAndTiming();
     try schemaElements();
+    try constraintsAndCollations();
     std.debug.print("contract-sql-ddl-alter: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });
 }

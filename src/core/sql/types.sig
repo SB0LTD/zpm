@@ -1623,6 +1623,13 @@ pub fn Values(comptime config: Config) type {
             /// catalogs report 'v'. The immutable expression is evaluated
             /// when a row is written, so reads equal evaluation on read.
             virtual: bool = false,
+            /// Definition format 8 (ddl-alter, wave 5): the column's
+            /// pg_collation OID (0: its type's default), the name of its NOT
+            /// NULL constraint when not `<table>_<column>_not_null` as the
+            /// current names spell it, and a domain type OID (0: none).
+            collation: u32 = 0,
+            not_null_name: Name = .{},
+            domain: u32 = 0,
         };
 
         pub fn cellTag(data_type: DataType) CellTag {

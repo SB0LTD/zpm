@@ -36,10 +36,13 @@ pub const database_default: u8 = 1;
 
 /// Supported collations: pg_collation OID and collname. Indexes are
 /// Node.collation - 1 (stable: append only).
-pub const oids = [_]u32{ 100, 950, 951, 962 };
-pub const names = [_][]const u8{ "default", "C", "POSIX", "ucs_basic" };
+/// "C.utf8" (ddl-alter, wave 5) is the libc collation PostgreSQL 18 imports
+/// from a C.UTF-8 system locale (OID as on the reference cluster): code
+/// point order, as C.
+pub const oids = [_]u32{ 100, 950, 951, 962, 12359 };
+pub const names = [_][]const u8{ "default", "C", "POSIX", "ucs_basic", "C.utf8" };
 /// generate_collation_name spellings (quote_identifier).
-pub const sql_names = [_][]const u8{ "\"default\"", "\"C\"", "\"POSIX\"", "ucs_basic" };
+pub const sql_names = [_][]const u8{ "\"default\"", "\"C\"", "\"POSIX\"", "ucs_basic", "\"C.utf8\"" };
 
 /// Built-in collations of PostgreSQL 18 that are not supported here.
 const foreign = [_][]const u8{ "pg_c_utf8", "pg_unicode_fast", "unicode" };
@@ -50,6 +53,24 @@ pub fn lookup(name: []const u8) u8 {
     for (names, 0..) |candidate, index| if (types.same(candidate, name)) return @intCast(index + 1);
     for (foreign) |candidate| if (types.same(candidate, name)) return unsupported;
     return unknown;
+}
+
+/// A column collation a table definition may store (ddl-alter): a
+/// supported collation other than the database default.
+pub fn storedOid(oid: u32) bool {
+    for (oids[1..]) |candidate| if (candidate == oid) return true;
+    return false;
+}
+
+/// The pg_collation OID of a supported Node.collation value.
+pub fn oidOf(value: u8) u32 {
+    return oids[value - 1];
+}
+
+/// The collname of a stored column collation OID ("" when unknown).
+pub fn nameOfOid(oid: u32) []const u8 {
+    for (oids, names) |candidate, name| if (candidate == oid) return name;
+    return "";
 }
 
 /// A supported Node.collation value (an entry of `names`).

@@ -144,6 +144,7 @@
 //! not an ascending one: OIDs are taken when CREATE runs, so concurrent DDL
 //! commits out of OID order. The OID counter keeps the maximum seen.
 const types = @import("types.sig");
+const collation_module = @import("collation.sig");
 const storage = @import("storage.sig");
 const numeric = @import("numeric.sig");
 const temporal = @import("temporal.sig");
@@ -186,6 +187,12 @@ pub const default_identity_format_version: u16 = 6;
 /// ENFORCED (one never checked). Written only when a constraint has either:
 /// older definitions stay byte-identical.
 pub const not_valid_format_version: u16 = 7;
+/// ddl-alter (wave 5): version 7 plus, after the version-5 fields, one
+/// entry per column: flags u8 (1 collation, 2 NOT NULL constraint name, 4
+/// domain), then collation OID u32, name (len u8 + bytes) and domain OID
+/// u32 as flagged. Written only when some column has one of them: older
+/// definitions stay byte-identical.
+pub const column_extension_format_version: u16 = 8;
 
 pub const Op = enum(u8) { create_table = 1, drop_table = 2, insert = 3, update = 4, delete = 5, catalog_counters = 6, create_sequence = 7, drop_sequence = 8, sequence = 9, truncate = 11, alter_table = 12, create_sequence_cached = 13, alter_sequence = 14, create_schema = 15, drop_schema = 16, catalog_counters_with_constraints = 17, create_owned_schema = 18, create_private_schema = 19, catalog_counters_with_defaults = 20, create_scoped_identity_sequence = 21, create_scoped_sequence = 22, alter_sequence_ownership = 23, create_scoped_serial_sequence = 24, create_routine = 60, drop_routine = 61, create_trigger = 62, drop_trigger = 63, create_rule = 64, drop_rule = 65, object_create = 70, object_drop = 71, large_object_page = 72, create_routine_extended = 80, create_rule_action = 85, alter_table_rewrite = 105, view_check_option = 115, create_trigger_extended = 120,
     // B11 wave 5 (composite lane): user casts.
@@ -561,7 +568,9 @@ pub fn ChangeLog(comptime config: types.Config) type {
         /// Name, format version, columns and (version 2) namespace and
         /// constraints of a table definition.
         pub fn encodeDefinition(writer: *Writer, table: *const S.Table) Error!void {
-            var v7 = false;
+            var v8 = false;
+            for (table.columns[0..table.column_count]) |*column| v8 = v8 or columnExtended(column);
+            var v7 = v8;
             for (table.constraints[0..table.constraint_count]) |*constraint| v7 = v7 or constraint.not_valid or constraint.not_enforced;
             var v6 = v7;
             for (table.columns[0..table.column_count]) |*column| v6 = v6 or column.default_oid != 0;
@@ -570,7 +579,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
             const v3 = v4 or S.extended(table);
             const extended = v3 or table.namespace != public_namespace or table.constraint_count != 0;
             try writer.name(table.name.slice());
-            try writer.int(u16, if (v7) not_valid_format_version else if (v6) default_identity_format_version else if (v5) primary_index_identity_format_version else if (v4) constraint_identity_format_version else if (v3) extensions_format_version else if (extended) definition_format_version else expr_format_version);
+            try writer.int(u16, if (v8) column_extension_format_version else if (v7) not_valid_format_version else if (v6) default_identity_format_version else if (v5) primary_index_identity_format_version else if (v4) constraint_identity_format_version else if (v3) extensions_format_version else if (extended) definition_format_version else expr_format_version);
             try writer.int(u8, @intCast(table.column_count));
             for (table.columns[0..table.column_count]) |*column| {
                 try writer.name(column.name.slice());
@@ -643,6 +652,18 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 }
             }
             if (v5) try writer.int(u32, table.primary_index_oid);
+            if (v8) for (table.columns[0..table.column_count]) |*column| {
+                const flags: u8 = @as(u8, @intFromBool(column.collation != 0)) | (@as(u8, @intFromBool(column.not_null_name.len != 0)) << 1) | (@as(u8, @intFromBool(column.domain != 0)) << 2);
+                try writer.int(u8, flags);
+                if (column.collation != 0) try writer.int(u32, column.collation);
+                if (column.not_null_name.len != 0) try writer.name(column.not_null_name.slice());
+                if (column.domain != 0) try writer.int(u32, column.domain);
+            };
+        }
+
+        /// A column with a format-8 attribute (collation, constraint name, domain).
+        fn columnExtended(column: *const V.Column) bool {
+            return column.collation != 0 or column.not_null_name.len != 0 or column.domain != 0;
         }
 
         pub fn encodeCreateSequence(writer: *Writer, seq: anytype, serial: bool) Error!void {
@@ -1836,7 +1857,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
             out.name.len = table_name.len;
             @memcpy(out.name.bytes[0..table_name.len], table_name);
             const version = try reader.int(u16);
-            if (version < expr_format_version or version > not_valid_format_version) return error.UnsupportedLogVersion;
+            if (version < expr_format_version or version > column_extension_format_version) return error.UnsupportedLogVersion;
             out.count = try reader.int(u8);
             if (out.count == 0) return error.InvalidChangeRecord;
             if (out.count > config.columns) return error.ChangeRecordConflict;
@@ -1910,6 +1931,31 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 if (version == primary_index_identity_format_version or out.primary_index_oid != 0) {
                     if (!out.keyed() or !validConstraintOid(out.primary_index_oid) or out.primary_index_oid == out.oid) return error.InvalidChangeRecord;
                 }
+            }
+            if (version >= column_extension_format_version) {
+                var any = false;
+                for (out.columns[0..out.count]) |*column| {
+                    const flags = try reader.int(u8);
+                    if (flags == 0) continue;
+                    if (flags > 7) return error.InvalidChangeRecord;
+                    any = true;
+                    if (flags & 1 != 0) {
+                        column.collation = try reader.int(u32);
+                        // A known collation of a collatable column.
+                        if (!collation_module.collatable(types.typeOfData(column.data_type)) or !collation_module.storedOid(column.collation)) return error.InvalidChangeRecord;
+                    }
+                    if (flags & 2 != 0) {
+                        const label = try reader.name();
+                        if (!validName(label) or label.len > config.name_bytes or !column.not_null) return error.InvalidChangeRecord;
+                        column.not_null_name.len = label.len;
+                        @memcpy(column.not_null_name.bytes[0..label.len], label);
+                    }
+                    if (flags & 4 != 0) {
+                        column.domain = try reader.int(u32);
+                        if (column.domain < first_oid) return error.InvalidChangeRecord;
+                    }
+                }
+                if (!any) return error.InvalidChangeRecord;
             }
         }
 

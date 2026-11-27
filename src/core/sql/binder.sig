@@ -5045,6 +5045,29 @@ pub fn Binder(comptime config: types.Config) type {
             return error.ColumnNotFound;
         }
 
+        /// The name of a column's NOT NULL constraint (PostgreSQL 18).
+        pub fn notNullName(table: V.Name, column: *const V.Column) V.Name {
+            if (column.not_null_name.len != 0) return column.not_null_name;
+            return objectName(table.slice(), column.name.slice(), "not_null");
+        }
+
+        /// Before a rename: the derived NOT NULL constraint name is stored.
+        fn freezeNotNullName(table: V.Name, column: *V.Column) void {
+            if (column.not_null and column.not_null_name.len == 0) column.not_null_name = objectName(table.slice(), column.name.slice(), "not_null");
+        }
+
+        /// COLLATE and a named NOT NULL constraint of a column definition
+        /// (ddl-alter, wave 5; definition format 8).
+        fn columnAttributes(context: *const Context, table: V.Name, definition: *const Ast.ColumnDef, column: *V.Column) Error!void {
+            if (definition.collation != collation.none and definition.collation != collation.database_default)
+                column.collation = collation.oidOf(definition.collation);
+            if (definition.not_null_name) |ident| {
+                const name = toName(context, ident);
+                const derived = objectName(table.slice(), column.name.slice(), "not_null");
+                if (!types.same(name.slice(), derived.slice())) column.not_null_name = name;
+            }
+        }
+
         /// A variable-length (typlen -1) type: storage other than PLAIN.
         fn varlenaColumn(data_type: types.DataType) bool {
             return types.typeInfo(data_type).len < 0;
@@ -11341,6 +11364,7 @@ pub fn Binder(comptime config: types.Config) type {
                         var column: V.Column = .{ .name = toName(context, definition.name), .not_null = definition.not_null, .primary_key = definition.primary_key, .typmod = definition.typmod, .default_kind = definition.default_kind, .virtual = definition.virtual };
                         for (out.columns[0..index]) |*previous|
                             if (types.same(previous.name.slice(), column.name.slice())) return error.DuplicateColumn;
+                        try columnAttributes(context, table_name, definition, &column);
                         column.data_type = columnType(context, definition);
                         if (column.data_type == .record) column.typmod = try compositeColumnTypmod(context, definition);
                         if (column.data_type == .mysql_bigint_unsigned and
@@ -11980,6 +12004,8 @@ pub fn Binder(comptime config: types.Config) type {
             var target = column.*;
             target.data_type = columnType(context, &definition);
             target.typmod = change.typmod;
+            // COLLATE, else the new type's default collation.
+            target.collation = if (change.collation != collation.none and change.collation != collation.database_default) collation.oidOf(change.collation) else 0;
             if (target.data_type == .mysql_bigint_unsigned) return error.UnsupportedStatement;
             // An identity column stays an integer (22023).
             switch (column.default_kind) {
@@ -12217,6 +12243,7 @@ pub fn Binder(comptime config: types.Config) type {
                     }
                     if (out.count == config.columns) return error.ColumnCapacity;
                     var column: V.Column = .{ .name = name, .not_null = definition.not_null, .typmod = definition.typmod, .default_kind = definition.default_kind };
+                    try columnAttributes(context, out.name, definition, &column);
                     column.data_type = columnType(context, definition);
                     if (column.data_type == .record) column.typmod = try compositeColumnTypmod(context, definition);
                     if (column.data_type == .mysql_bigint_unsigned) return error.UnsupportedStatement;
@@ -12255,6 +12282,8 @@ pub fn Binder(comptime config: types.Config) type {
                     const to = toName(context, rename.to);
                     const position = alterColumn(&out, from.slice()) orelse return error.ColumnNotFound;
                     if (alterColumn(&out, to.slice()) != null) return error.DuplicateColumn;
+                    // A NOT NULL constraint keeps the name it was created with.
+                    freezeNotNullName(out.name, &out.columns[position]);
                     out.columns[position].name = to;
                     for (out.columns[0..out.count]) |*column| {
                         if (column.default_kind == .generated) column.expression = try renameReferences(column.expression.slice(), from.slice(), to.slice());
@@ -12320,6 +12349,7 @@ pub fn Binder(comptime config: types.Config) type {
                         else => {},
                     }
                     out.columns[position].not_null = false;
+                    out.columns[position].not_null_name = .{};
                     out.check_not_null[position] = false;
                 },
                 .legacy_attribute_options => {},
@@ -12373,11 +12403,27 @@ pub fn Binder(comptime config: types.Config) type {
                             dropped = true;
                         };
                     }
+                    // A NOT NULL constraint (PostgreSQL 18, ddl-alter): DROP
+                    // NOT NULL, refused for a primary key column (42P16).
+                    if (!dropped) for (out.columns[0..out.count], 0..) |*column, position| {
+                        if (!column.not_null or !types.same(notNullName(out.name, column).slice(), name.slice())) continue;
+                        if (inPrimaryKey(&out, position)) return error.InvalidTableDefinition;
+                        switch (column.default_kind) {
+                            .identity_always, .identity_by_default => return error.Syntax,
+                            else => {},
+                        }
+                        column.not_null = false;
+                        column.not_null_name = .{};
+                        out.check_not_null[position] = false;
+                        dropped = true;
+                        break;
+                    };
                     if (!dropped and !drop.if_exists) return error.UndefinedObject;
                 },
                 .rename_table => |ident| {
                     const name = toName(context, ident);
                     if (context.catalog.findIn(entry.namespace, name.slice(), context.snapshot) != null) return error.TableExists;
+                    for (out.columns[0..out.count]) |*column| freezeNotNullName(out.name, column);
                     // PostgreSQL keeps the index name `<old>_pkey`.
                     var primary = false;
                     for (out.columns[0..out.count]) |*column| primary = primary or column.primary_key;
@@ -12539,7 +12585,16 @@ pub fn Binder(comptime config: types.Config) type {
                             out.constraint_count += 1;
                         }
                     }
-                    const at = position orelse return error.UndefinedObject;
+                    // A NOT NULL constraint (PostgreSQL 18, ddl-alter).
+                    if (position == null) for (out.columns[0..out.count]) |*column| {
+                        if (!column.not_null or !types.same(notNullName(out.name, column).slice(), from.slice())) continue;
+                        for (out.constraints[0..out.constraint_count]) |*constraint| if (types.same(constraint.name.slice(), to.slice())) return error.DuplicateObject;
+                        for (out.columns[0..out.count]) |*other| if (other.not_null and types.same(notNullName(out.name, other).slice(), to.slice())) return error.DuplicateObject;
+                        const derived = objectName(out.name.slice(), column.name.slice(), "not_null");
+                        column.not_null_name = if (types.same(derived.slice(), to.slice())) .{} else to;
+                        break;
+                    } else return error.UndefinedObject;
+                    const at = position orelse continue;
                     for (out.constraints[0..out.constraint_count]) |*constraint| {
                         if (types.same(constraint.name.slice(), to.slice())) return error.DuplicateObject;
                     }
@@ -12764,7 +12819,7 @@ pub fn Binder(comptime config: types.Config) type {
         /// PostgreSQL makeObjectName: name1[_name2]_label, shortening the
         /// longer part first so the whole fits NAMEDATALEN - 1 (63) bytes and
         /// Config.name_bytes.
-        fn objectName(name1: []const u8, name2: []const u8, label: []const u8) V.Name {
+        pub fn objectName(name1: []const u8, name2: []const u8, label: []const u8) V.Name {
             const limit = @min(@as(usize, 63), config.name_bytes);
             const overhead = label.len + 1 + (if (name2.len != 0) @as(usize, 1) else 0);
             const available = if (limit > overhead) limit - overhead else 0;

@@ -9846,6 +9846,8 @@ pub fn Database(comptime config: Config) type {
             local: bool = true,
             /// attacl (privileges lane).
             acl: Cell = .null_value,
+            /// A column collation (ddl-alter); 0 is the type's default.
+            collation: u32 = 0,
         };
 
         fn attributeRow(sink: *X.RowSink, relation: i64, name: []const u8, data_type: DataType, typmod: i32, ordinal: i64, metadata: AttributeMetadata) Error!void {
@@ -9859,7 +9861,7 @@ pub fn Database(comptime config: Config) type {
                 intCell(relation), nameCell(name), intCell(type_oid), intCell(attribute_typmod), intCell(ordinal),
                 boolCell(metadata.not_null), boolCell(false), .{ .pg_internal_char = metadata.identity },
                 .{ .pg_internal_char = metadata.generated }, boolCell(metadata.has_expression),
-                intCell(collation.typeCollation(types.typeOfData(data_type))), intCell(info.len),
+                intCell(if (metadata.collation != 0) metadata.collation else collation.typeCollation(types.typeOfData(data_type))), intCell(info.len),
                 .{ .pg_internal_char = info.alignment }, intCell(-1), .{ .pg_internal_char = types.typeStorage(data_type) },
                 boolCell(metadata.local), .null_value, .null_value, .{ .pg_internal_char = 0 }, boolCell(false), .null_value, metadata.acl,
             });
@@ -10350,6 +10352,9 @@ pub fn Database(comptime config: Config) type {
                             if (constraint.kind == .primary) continue;
                             try self.constraintRow(sink, table, constraint.oid, constraint.name.slice(), constraint, constraint.kind, snapshot, pool);
                         }
+                        if (table.relkind == 'r' or table.relkind == 'p') for (table.columns[0..table.column_count]) |*column| {
+                            if (column.not_null) try notNullRow(sink, table, B.notNullName(table.name, column).slice());
+                        };
                     },
                     .pg_indexes => {
                         var text: [512]u8 = undefined;
@@ -10411,6 +10416,7 @@ pub fn Database(comptime config: Config) type {
                                     .has_expression = has_expression,
                                     .local = self.attributeIsLocal(table, column.name.slice(), snapshot),
                                     .acl = if (sink.referencesColumn(catalog_module.pg_attribute_acl_column)) try self.columnAcl(table.oid, index, snapshot) else .null_value,
+                                    .collation = column.collation,
                                 });
                             },
                             .pg_attrdef => if (has_expression) {
@@ -10596,6 +10602,17 @@ pub fn Database(comptime config: Config) type {
                 .{ .pg_internal_char = if (foreign != null) 's' else ' ' }, boolCell(false),
                 boolCell(kind != .check or self.checkConstraintIsLocal(table, name, snapshot)),
                 try attnumArray(keys), if (foreign) |item| try attnumArray(item.refColumns()) else .null_value,
+            });
+        }
+
+        /// A NOT NULL constraint row (PostgreSQL 18 contype 'n', ddl-alter).
+        /// Its definition stores no constraint OID: the row reports 0.
+        fn notNullRow(sink: *X.RowSink, table: *const S.Table, name: []const u8) Error!void {
+            try sink.add(&.{
+                intCell(0), nameCell(name), intCell(table.namespace), .{ .pg_internal_char = 'n' },
+                boolCell(false), boolCell(false), boolCell(true), boolCell(true),
+                intCell(table.oid), intCell(0), intCell(0), intCell(0), intCell(0),
+                .{ .pg_internal_char = ' ' }, .{ .pg_internal_char = ' ' }, .{ .pg_internal_char = ' ' }, boolCell(false), boolCell(true),
             });
         }
 
