@@ -2779,6 +2779,9 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "InvalidEscapeCharacterUse")) return "2200C";
     if (equal(name, "InvalidTablesampleArgument")) return "2202H";
     if (equal(name, "InvalidTablesampleRepeat")) return "2202G";
+    // Nested statements, views and rules (B11 wave 4).
+    if (equal(name, "TriggeredDataChangeViolation")) return "27000";
+    if (equal(name, "WithCheckOptionViolation")) return "44000";
     // Routines, triggers and rules (B11 wave 3).
     if (equal(name, "DuplicateFunction")) return "42723";
     if (equal(name, "InvalidFunctionDefinition")) return "42P13";

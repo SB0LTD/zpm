@@ -235,6 +235,13 @@ pub const Config = struct {
     /// ProgramLimitExceeded (54000). Bracket sets and their non-ASCII
     /// ranges are sized from it.
     regex_states: usize = 512,
+    /// Statements running inside an executing statement at once (B11 wave
+    /// 4, nested.sig): the SQL of trigger functions and of functions called
+    /// from expressions, and rule actions. Deeper is StackDepthExceeded
+    /// (54001). Each one keeps the suspended statement's node pool, plans
+    /// and expansion text in the free query workspace (WorkspaceCapacity,
+    /// 54000, when they do not fit).
+    nested_statements: usize = 8,
 };
 
 pub fn workRows(comptime config: Config) usize {
@@ -542,6 +549,12 @@ pub const Error = error{
     InvalidXmlProcessingInstruction,
     /// SQLSTATE 2200S: XMLCOMMENT text with "--" or a trailing "-".
     InvalidXmlComment,
+    /// SQLSTATE 27000: an UPDATE or DELETE target row was already changed
+    /// by a statement its own triggers or functions ran (B11 wave 4).
+    TriggeredDataChangeViolation,
+    /// SQLSTATE 44000: a new row of an auto-updatable view violates its
+    /// WITH CHECK OPTION (B11 wave 4).
+    WithCheckOptionViolation,
 };
 
 /// Caller-owned execution accounting and interrupt polling. This is independent

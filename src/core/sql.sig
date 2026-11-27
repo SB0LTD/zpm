@@ -120,6 +120,7 @@ const session_module = @import("sql/session.sig");
 const ssi_module = @import("sql/ssi.sig");
 const routine_catalog = @import("sql/routine_catalog.sig");
 const routine_module = @import("sql/routine.sig");
+const nested_module = @import("sql/nested.sig");
 const CO = @import("sql/catalog_objects.sig");
 const operator_catalog = @import("sql/operator_catalog.sig");
 const index_operator_catalog = @import("sql/index_operator_catalog.sig");
@@ -996,6 +997,9 @@ pub fn Database(comptime config: Config) type {
             security_start: usize = 0,
             security_len: usize = 0,
             security_table: usize = 0,
+            /// Bytes of `expansion` the running statement uses (a nested
+            /// statement saves and restores them, B11 wave 4).
+            expansion_used: usize = 0,
         };
 
         /// A decoded identifier (quoted names keep case, others fold).
@@ -1254,6 +1258,7 @@ pub fn Database(comptime config: Config) type {
                     }
                 }
             }
+            workspace.expansion_used = length;
             if (length == 0) return source;
             if (bound_statement.* == .select) {
                 const top = bound_statement.select;
@@ -2059,6 +2064,15 @@ pub fn Database(comptime config: Config) type {
         /// Write-set index where the running statement's writes begin (its
         /// AFTER ROW triggers read them); kept across a park.
         statement_start: usize = 0,
+        /// Nested statements (B11 wave 4, sql/nested.sig): how many run
+        /// inside an executing statement now (54001 beyond
+        /// Config.nested_statements); whether one ran in the current
+        /// top-level statement (a park then restarts the whole statement);
+        /// the volatility of the routine body running now ('v', 's', 'i',
+        /// or 0 for a statement).
+        nested_depth: usize = 0,
+        nested_ran: bool = false,
+        routine_volatility: u8 = 0,
 
         /// Borrow the embedding's cluster catalogue while serving statements.
         /// The embedding keeps the provider and its rows consistent for the
@@ -2509,6 +2523,9 @@ pub fn Database(comptime config: Config) type {
             self.routine_frame = null;
             self.routine_depth = 0;
             self.routine_nested = 0;
+            self.nested_depth = 0;
+            self.nested_ran = false;
+            self.routine_volatility = 0;
             // A logical copy has fresh session/execution state. In particular,
             // never copy caller-owned interrupt or sequence-hook pointers.
             self.sequence_session = null;
@@ -3194,7 +3211,7 @@ pub fn Database(comptime config: Config) type {
                 // fresh snapshot, as PostgreSQL locks before snapshotting
                 // (the transaction snapshot too, when this statement took it).
                 if (tx.fresh) {
-                    if (tx.snapshot_csn != null and tx.snapshot_cid == tx.cid) {
+                    if (tx.snapshot_csn != null and tx.snapshot_cid == pinned.cid) {
                         tx.snapshot_csn = self.csn;
                         if (tx.ssi) |index| self.ssi.records[index].snapshot = self.csn;
                     }
@@ -3234,6 +3251,9 @@ pub fn Database(comptime config: Config) type {
             const ran = if (routine) self.routineBody(slot, source, snap, result) else self.body(slot, source, parsed, snap, result, .{ .mode = options.mode, .explain = top.explain });
             ran catch |err| {
                 if (err == error.WouldBlock) {
+                    // A nested statement ran (trigger or function SQL): the
+                    // resumed statement starts over, so no effect repeats.
+                    if (self.nested_ran) self.restartStatement(slot);
                     tx.pin = snap;
                     return err;
                 }
@@ -3309,6 +3329,17 @@ pub fn Database(comptime config: Config) type {
             var statement_copy = parsed.*;
             const expanded = try expandRelations(self, &self.workspace, original, snap, &statement_copy, self.session.role, &self.session);
             const source = try self.secureTarget(&statement_copy, expanded, original, snap);
+            // A user function in a single-table SELECT runs once per row in
+            // the query engine (B11 wave 4): the simple path evaluates
+            // projections twice (validation, then publication) and keeps
+            // its scan state outside the workspace a nested statement uses.
+            if (statement_copy == .select and self.callsUserRoutine(source, snap)) {
+                const top = statement_copy.select;
+                if (self.workspace.nodes.queries[top].lock.strength == .none) {
+                    statement_copy = .{ .query = top };
+                    self.workspace.nodes.complex = true;
+                }
+            }
             var context = self.bindContext(source, mode, snap);
             context.stored_source_start = original.len;
             if (explain) |options| context.describe_only = !options.analyze;
@@ -3477,9 +3508,9 @@ pub fn Database(comptime config: Config) type {
                 self.outcome.mysql_insert_id = if (tx.mysql_first_generated != 0) tx.mysql_first_generated else tx.mysql_explicit_insert_id;
             }
             switch (bound.*) {
-                .insert => |*insert| if (insert.returning.count != 0) try self.returnRows(slot, source, &insert.returning, insert.table, insert.plan == ast.none, result.rows.len),
-                .update => |*update| if (update.returning.count != 0) try self.returnRows(slot, source, &update.returning, update.table, true, result.rows.len),
-                .delete => |*delete| if (delete.returning.count != 0) try self.returnRows(slot, source, &delete.returning, delete.table, true, result.rows.len),
+                .insert => |*insert| if (insert.returning.count != 0) try self.returnRows(slot, source, &insert.returning, insert.table, insert.plan == ast.none, result.rows.len, snap.cid),
+                .update => |*update| if (update.returning.count != 0) try self.returnRows(slot, source, &update.returning, update.table, true, result.rows.len, snap.cid),
+                .delete => |*delete| if (delete.returning.count != 0) try self.returnRows(slot, source, &delete.returning, delete.table, true, result.rows.len, snap.cid),
                 else => {},
             }
         }
@@ -3634,7 +3665,7 @@ pub fn Database(comptime config: Config) type {
                 state.progress[k] = tx.progress;
                 state.affected[k] = tx.progress_affected;
                 const last = if (k + 1 < plans.dml_len and state.started[k + 1]) state.start[k + 1] else tx.write_len;
-                work.dml_rows[k] = try self.captureReturning(source, returning, table_index, state.start[k], last, slot);
+                work.dml_rows[k] = try self.captureReturning(source, returning, table_index, state.start[k], last, slot, snap.cid);
             }
             tx.progress = 0;
             tx.progress_affected = 0;
@@ -3659,11 +3690,11 @@ pub fn Database(comptime config: Config) type {
 
         /// RETURNING of the rows `table_index` got from writes first..last,
         /// in write order, into the pinned top of the query workspace.
-        fn captureReturning(self: *Self, source: []const u8, list: *const B.Returning, table_index: usize, first: usize, last: usize, slot: u16) Error!X.List {
+        fn captureReturning(self: *Self, source: []const u8, list: *const B.Returning, table_index: usize, first: usize, last: usize, slot: u16, cid: u32) Error!X.List {
             const tx = &self.txs[slot];
             const writes = tx.writes[first..last];
             var count: usize = 0;
-            for (writes) |entry| if (rowWrite(entry.kind) and entry.table == table_index) {
+            for (writes) |entry| if (rowWrite(entry.kind) and entry.table == table_index and self.writeCid(entry) == cid) {
                 count += 1;
             };
             const work = &self.workspace.query;
@@ -3677,7 +3708,7 @@ pub fn Database(comptime config: Config) type {
             const table = &self.tables[table_index];
             var row: usize = 0;
             for (writes) |entry| {
-                if (!rowWrite(entry.kind) or entry.table != table_index) continue;
+                if (!rowWrite(entry.kind) or entry.table != table_index or self.writeCid(entry) != cid) continue;
                 try self.session.checkpoint();
                 ctx.row = S.borrowVersionRow(table, if (entry.kind == .delete) entry.old else entry.new, &row_scratch);
                 const at = work.cell_high + row * width;
@@ -3685,8 +3716,8 @@ pub fn Database(comptime config: Config) type {
                 work.refs[out.start + row] = @intCast(at);
                 row += 1;
             }
-            work.pinned_cells = work.cells.len - work.cell_high;
-            work.pinned_refs = work.refs.len - work.ref_high;
+            work.pinned_cells = work.cells.len - work.top_cells - work.cell_high;
+            work.pinned_refs = work.refs.len - work.top_refs - work.ref_high;
             return out;
         }
 
@@ -3695,14 +3726,14 @@ pub fn Database(comptime config: Config) type {
         /// The statement's write slice survives a park, so a resumed
         /// statement emits every row exactly once. Every value is computed
         /// into the workspace first; a failure leaves the result untouched.
-        fn returnRows(self: *Self, slot: u16, source: []const u8, list: *const B.Returning, table_index: usize, fresh: bool, result_capacity: usize) Error!void {
+        fn returnRows(self: *Self, slot: u16, source: []const u8, list: *const B.Returning, table_index: usize, fresh: bool, result_capacity: usize, cid: u32) Error!void {
             const tx = &self.txs[slot];
             // The statement's own writes (a routine's statement starts
             // inside the CALL / DO statement's subtransaction).
             const start = self.statement_start;
             const writes = tx.writes[start..tx.write_len];
             var count: usize = 0;
-            for (writes) |entry| if (rowWrite(entry.kind) and (entry.table == table_index or self.descends(entry.table, table_index))) {
+            for (writes) |entry| if (rowWrite(entry.kind) and (entry.table == table_index or self.descends(entry.table, table_index)) and self.writeCid(entry) == cid) {
                 count += 1;
             };
             if (list.output and count != self.outcome.affected) return error.UnsupportedStatement;
@@ -3717,6 +3748,7 @@ pub fn Database(comptime config: Config) type {
             var row: usize = 0;
             for (writes) |entry| {
                 if (!rowWrite(entry.kind) or (entry.table != table_index and !self.descends(entry.table, table_index))) continue;
+                if (self.writeCid(entry) != cid) continue;
                 const table = &self.tables[entry.table];
                 if (list.output) {
                     try self.session.checkpoint();
@@ -6339,6 +6371,7 @@ pub fn Database(comptime config: Config) type {
                 try text.add(" AND ");
                 try self.catalog_objects.securityText(role, table.oid, .select, false, snap, &self.workspace.expansion, &length);
             }
+            self.workspace.expansion_used = length;
             const id = try P.parseExpressionAt(self.workspace.expansion[0..length], start, length, &self.workspace.nodes);
             goal.where.* = if (goal.where.* == ast.none) id else try self.workspace.nodes.add(.{ .kind = .and_op, .a = id, .b = goal.where.* });
             return self.workspace.expansion[0..length];
@@ -6379,6 +6412,7 @@ pub fn Database(comptime config: Config) type {
             try self.securedSource(source, source, &length);
             const start = length;
             try self.catalog_objects.securityText(role, oid, goal.command, true, snap, &self.workspace.expansion, &length);
+            self.workspace.expansion_used = @max(self.workspace.expansion_used, length);
             const text = self.workspace.expansion[start..length];
             const context = self.bindContext(text, .standard, snap);
             self.workspace.security_check = try B.bindPolicyText(&context, text, goal.table);
@@ -8989,7 +9023,13 @@ pub fn Database(comptime config: Config) type {
                         continue;
                     }
                     const deletion = entry.pendingDeletion().?;
-                    if (snap.own(deletion.tx)) return if (deletion.cid == snap.cid) .authored else .skip;
+                    if (snap.own(deletion.tx)) {
+                        // Changed by a statement this one's triggers or
+                        // functions ran (PostgreSQL TM_SelfModified with a
+                        // later command id): 27000 for UPDATE / DELETE.
+                        if (deletion.cid > snap.cid and mode == .write and self.nested_ran) return error.TriggeredDataChangeViolation;
+                        return if (deletion.cid == snap.cid) .authored else .skip;
+                    }
                     waits.add(deletion.tx.slot);
                 }
                 self.locks.rowHolders(table_index, table.rows[entry.rowSlot()].rowid, slot, mode, waits);
@@ -10645,6 +10685,9 @@ pub fn Database(comptime config: Config) type {
             self.routine_diag.active = false;
             self.routine_definer = null;
             self.routine_configured = 0;
+            self.nested_depth = 0;
+            self.nested_ran = false;
+            self.routine_volatility = 0;
             self.installRole();
         }
 
@@ -12443,12 +12486,13 @@ pub fn Database(comptime config: Config) type {
         }
 
         /// Syntax of a statement inside a routine body.
+        /// Only CREATE FUNCTION and DO check bodies; a DO inside a running
+        /// statement is itself a nested statement with its own workspace.
         pub fn routineCheckStatement(self: *Self, text: []const u8) Error!void {
             if (R.classify(text) != null) {
                 var routine: R.Statement = undefined;
                 return R.parse(text, &self.workspace.nodes, &routine);
             }
-            if (self.routine_nested != 0) return error.UnsupportedStatement;
             _ = try P.parse(text, &self.workspace.nodes, .standard);
         }
 
@@ -12459,10 +12503,48 @@ pub fn Database(comptime config: Config) type {
             const mark = poolMark(pool);
             defer poolRestore(pool, mark);
             const id = try P.parseExpressionAt(source, start, end, pool);
+            // An expression that reads tables runs as `SELECT expr`, like
+            // PL/pgSQL's exec_eval_expr (B11 wave 4).
+            for (pool.nodes[mark.len..pool.len]) |*n| {
+                const reads = switch (n.kind) {
+                    .scalar_subquery, .exists_subquery, .in_subquery => true,
+                    .function => n.func == .array_subquery,
+                    else => false,
+                };
+                if (!reads) continue;
+                poolRestore(pool, mark);
+                return self.routineQueryValue(frame, source[start..end], goal);
+            }
             return self.routineValue(frame, source, id, mark.len, goal);
         }
 
+        /// `SELECT expr` as a statement of the routine: its one value,
+        /// converted like an assignment to `goal`.
+        fn routineQueryValue(self: *Self, frame: *R.Frame, expression: []const u8, goal: ?*const V.Column) Error!V.Cell {
+            const prefix = "SELECT ";
+            var buffer: [config.routine_bytes + prefix.len]u8 = undefined;
+            if (expression.len > config.routine_bytes) return error.TextCapacity;
+            @memcpy(buffer[0..prefix.len], prefix);
+            @memcpy(buffer[prefix.len..][0..expression.len], expression);
+            var capture: R.Capture = .{};
+            _ = try self.routineStatement(frame, buffer[0 .. prefix.len + expression.len], &capture);
+            if (capture.count != 1) return error.Syntax;
+            var cell: V.Cell = if (capture.rows == 0) .null_value else capture.cells[0];
+            const column = goal orelse return cell;
+            const from = capture.tys[0];
+            const to = types.typeOfData(column.data_type);
+            if (to == .boolean and from != .boolean and from != .unknown) return error.TypeMismatch;
+            if (cell != .null_value and from != to) cell = try E.cast(cell, if (from == .unknown) .text else from, to, column.typmod, &self.session);
+            return D.store(column, cell, &self.session);
+        }
+
         fn routineValue(self: *Self, frame: *R.Frame, source: []const u8, id: u16, low: usize, goal: ?*const V.Column) Error!V.Cell {
+            // A volatile routine's expression sees every earlier change of
+            // its transaction (PostgreSQL: CommandCounterIncrement and a new
+            // snapshot per evaluation); STABLE / IMMUTABLE keep the caller's.
+            const saved_snap = self.routine_snap;
+            defer self.routine_snap = saved_snap;
+            if (self.routine_volatility == 'v') self.routine_snap = self.routineSnapshot(self.routine_slot, false);
             frame.variables.node_low = low;
             frame.variables.node_high = self.workspace.nodes.len;
             var context = self.bindContext(source, .standard, self.routine_snap);
@@ -12597,58 +12679,113 @@ pub fn Database(comptime config: Config) type {
             self.routine_depth += 1;
         }
 
-        /// A statement of a procedure or DO block: a new command id and
-        /// snapshot (READ COMMITTED), its variables bound through `frame`.
-        /// Only routines started by CALL / DO run statements: inside an
-        /// expression or a trigger they are 0A000. Returns the rows it
+        /// A statement of a routine body, its variables bound through
+        /// `frame`. In a procedure or DO block it runs as the next statement
+        /// of the CALL / DO; inside an executing statement (a trigger
+        /// function, a function called from an expression) it runs nested
+        /// (B11 wave 4): the suspended statement's workspace is saved and
+        /// restored around it. A volatile routine's statement takes a new
+        /// command id and snapshot (CommandCounterIncrement; the latest
+        /// committed data under READ COMMITTED, the transaction snapshot
+        /// otherwise); a STABLE or IMMUTABLE one runs under its caller's
+        /// snapshot and cannot modify data (0A000). Returns the rows it
         /// processed; `capture` takes its first row (INTO).
         pub fn routineStatement(self: *Self, frame: *R.Frame, text: []const u8, capture: ?*R.Capture) Error!usize {
-            if (self.routine_nested != 0) return error.UnsupportedStatement;
             const slot = self.routine_slot;
             const tx = &self.txs[slot];
-            tx.cid +%= 1;
+            const nested = self.routine_nested != 0;
+            const read_only = self.routine_volatility == 's' or self.routine_volatility == 'i';
+            const kind = R.classify(text);
+            // Inside a running statement only queries, data changes, CALL
+            // and DO run (DDL there is outside the subset).
+            if (nested) if (kind) |which| if (which != .call and which != .do_block) return error.UnsupportedStatement;
+            if (read_only and kind != null) return error.UnsupportedStatement;
+            var mark: usize = 0;
+            if (nested) mark = try self.nestedEnter(slot);
+            defer if (nested) self.nestedLeave(slot, mark);
+            const snap: Snapshot = if (read_only) self.routine_snap else self.routineSnapshot(slot, true);
             tx.progress = 0;
             tx.progress_affected = 0;
             self.modifying[slot] = .{};
-            const snap: Snapshot = .{ .csn = self.csn, .slot = slot, .epoch = tx.epoch, .cid = tx.cid };
             const start = tx.write_len;
             const saved_snap = self.routine_snap;
             const saved_frame = self.routine_frame;
             const saved_shared = self.session.routine_frame;
             const saved_start = self.statement_start;
             const saved_sequences = self.seq_snap;
+            const saved_volatility = self.routine_volatility;
+            const saved_params = self.active_params;
+            const saved_session_params = self.session.params;
             defer {
                 self.routine_snap = saved_snap;
                 self.routine_frame = saved_frame;
                 self.session.routine_frame = saved_shared;
                 self.statement_start = saved_start;
                 self.seq_snap = saved_sequences;
+                self.routine_volatility = saved_volatility;
+                self.active_params = saved_params;
+                self.session.params = saved_session_params;
             }
             self.routine_snap = snap;
             self.seq_snap = snap;
             self.routine_frame = frame;
             self.session.routine_frame = frame.evalFrame();
             self.statement_start = start;
-            if (R.classify(text) != null) {
+            self.routine_volatility = 0;
+            // The routine's own parameters, not the caller's bind values.
+            self.active_params = null;
+            self.session.params = null;
+            if (kind != null) {
                 try self.routineBody(slot, text, snap, self.routine_result orelse return error.UnsupportedStatement);
                 return 0;
             }
             var parsed = try P.parse(text, &self.workspace.nodes, .standard);
             // Transaction control inside a routine statement (0A000).
             if (parsed == .control) return error.UnsupportedStatement;
+            if (read_only) switch (parsed) {
+                .select, .query => {},
+                else => return error.UnsupportedStatement,
+            };
             frame.variables.node_low = 0;
             frame.variables.node_high = self.workspace.nodes.len;
-            const rows = try self.subStatement(slot, text, &parsed, snap, capture);
+            const rows = try self.subStatement(slot, text, &parsed, snap, capture, read_only);
             try self.deferredCheck(slot, start, true);
             return rows;
         }
 
-        fn subStatement(self: *Self, slot: u16, text: []const u8, parsed: *A.Statement, snap: Snapshot, capture: ?*R.Capture) Error!usize {
+        /// PostgreSQL's CommandCounterIncrement + GetTransactionSnapshot for
+        /// a volatile routine: the latest committed data under READ
+        /// COMMITTED (the transaction snapshot otherwise, taken now if no
+        /// statement took it yet) and every earlier command of its own
+        /// transaction. `claim` takes the next command id for a statement;
+        /// an expression reads at it without taking it.
+        fn routineSnapshot(self: *Self, slot: u16, claim: bool) Snapshot {
+            const tx = &self.txs[slot];
+            if (claim) tx.cid +%= 1;
+            const cid = if (claim) tx.cid else tx.cid +% 1;
+            var csn = self.csn;
+            if (transactionSnapshot(tx.isolation)) {
+                if (tx.snapshot_csn == null) {
+                    tx.snapshot_csn = self.csn;
+                    tx.snapshot_cid = cid;
+                }
+                csn = tx.snapshot_csn.?;
+            }
+            return .{ .csn = csn, .slot = slot, .epoch = tx.epoch, .cid = cid };
+        }
+
+        fn subStatement(self: *Self, slot: u16, text: []const u8, parsed: *A.Statement, snap: Snapshot, capture: ?*R.Capture, read_only: bool) Error!usize {
             if (parsed.* == .select) {
                 const top = parsed.select;
                 parsed.* = .{ .query = top };
                 self.workspace.nodes.complex = true;
             }
+            // A non-volatile function neither locks rows nor writes
+            // (PostgreSQL: "SELECT FOR UPDATE / INSERT is not allowed in a
+            // non-volatile function", 0A000).
+            if (read_only) for (self.workspace.nodes.queries[0..self.workspace.nodes.query_len]) |*block| {
+                if (block.lock.strength != .none) return error.UnsupportedStatement;
+            };
             if (parsed.* != .query) {
                 const result = self.routine_result orelse return error.UnsupportedStatement;
                 try self.body(slot, text, parsed, snap, result, .{ .mode = .standard });
@@ -12687,6 +12824,7 @@ pub fn Database(comptime config: Config) type {
                 self.workspace.query.pinned_refs = 0;
             }
             if (plans.dml_len != 0) {
+                if (read_only) return error.UnsupportedStatement;
                 try self.secureNewRows(&bound, source, snap);
                 try self.modifyingCtes(slot, source, snap);
                 try self.afterTriggers(slot, self.statement_start, null, snap);
@@ -13638,6 +13776,9 @@ pub fn Database(comptime config: Config) type {
             };
             try self.enterRoutine();
             defer self.routine_depth -= 1;
+            const saved_volatility = self.routine_volatility;
+            defer self.routine_volatility = saved_volatility;
+            self.routine_volatility = 'v';
             var frame: R.Frame = .{};
             try routineFrame(&frame, routine);
             // Arguments (and DEFAULTs) are evaluated as the caller.
@@ -13728,6 +13869,9 @@ pub fn Database(comptime config: Config) type {
         fn doBlock(self: *Self, block: *const R.DoBlock) Error!void {
             try self.enterRoutine();
             defer self.routine_depth -= 1;
+            const saved_volatility = self.routine_volatility;
+            defer self.routine_volatility = saved_volatility;
+            self.routine_volatility = 'v';
             var frame: R.Frame = .{};
             try routineParameters(&frame, &.{}, &.{}, &.{}, .{}, true);
             var checker: Interp = .{ .host = self, .source = block.body.slice(), .frame = &frame, .purpose = .do_block, .void_result = true };
@@ -13851,6 +13995,9 @@ pub fn Database(comptime config: Config) type {
             var scope: RoutineScope = .{};
             try self.enterScope(routine, &scope);
             defer self.leaveScope(&scope);
+            const saved_volatility = self.routine_volatility;
+            defer self.routine_volatility = saved_volatility;
+            self.routine_volatility = routine.volatility;
             var frame: R.Frame = .{};
             try routineFrame(&frame, routine);
             for (args[0..count], 0..) |cell, position| frame.cells[position] = cell;
@@ -13859,24 +14006,65 @@ pub fn Database(comptime config: Config) type {
             if (routine.language == 1) {
                 // A function with OUT parameters returns their final values.
                 const outputs = routine.out_count != 0;
-                var interpreter: Interp = .{ .host = self, .source = text_body, .frame = &frame, .purpose = .function, .return_column = result_column, .void_result = outputs };
+                var interpreter: Interp = .{ .host = self, .source = text_body, .frame = &frame, .purpose = .function, .return_column = result_column, .void_result = outputs or routine.return_oid == tg.void_oid };
                 try interpreter.execute(.run);
                 out.* = if (outputs) frame.cells[outputVariable(routine, 0)] else interpreter.result;
                 return;
             }
+            if (try self.sqlFunctionExpression(&frame, text_body, &result_column)) |value| {
+                out.* = value;
+                return;
+            }
+            out.* = try self.sqlFunctionBody(&frame, text_body, &result_column, routine.return_oid == tg.void_oid);
+        }
+
+        /// A SQL body that is one SELECT of one expression without FROM is
+        /// evaluated in place (no statement); null for any other body.
+        fn sqlFunctionExpression(self: *Self, frame: *R.Frame, text_body: []const u8, result_column: *const V.Column) Error!?V.Cell {
             var statements: R.Statements = .{ .source = text_body };
-            const span = (try statements.next()) orelse return error.UnsupportedStatement;
-            if ((try statements.next()) != null) return error.UnsupportedStatement;
+            const span = (try statements.next()) orelse return null;
+            if ((try statements.next()) != null) return null;
             const pool = &self.workspace.nodes;
             const mark = poolMark(pool);
             defer poolRestore(pool, mark);
-            const query_index = P.parseQueryAt(text_body, span.start, span.end, pool) catch return error.UnsupportedStatement;
+            const query_index = P.parseQueryAt(text_body, span.start, span.end, pool) catch return null;
             const q = &pool.queries[query_index];
             if (q.count != 1 or q.targets[0].star or q.item_count != 0 or q.from != null or q.where != ast.none or q.group_count != 0 or
                 q.having != ast.none or q.order_count != 0 or q.limit_present or q.offset_present or q.set_op != .none or q.cte_count != 0 or
-                q.distinct or q.values != ast.none or q.window_defs != ast.none or q.grouping_sets != ast.none) return error.UnsupportedStatement;
-            const value = try self.routineValue(&frame, text_body, q.targets[0].expr, mark.len, &result_column);
-            out.* = try D.store(&result_column, value, &self.session);
+                q.distinct or q.values != ast.none or q.window_defs != ast.none or q.grouping_sets != ast.none) return null;
+            // A subquery in the expression reads tables: run it as a statement.
+            for (pool.nodes[mark.len..pool.len]) |*n| switch (n.kind) {
+                .scalar_subquery, .exists_subquery, .in_subquery => return null,
+                else => {},
+            };
+            const value = try self.routineValue(frame, text_body, q.targets[0].expr, mark.len, result_column);
+            return try D.store(result_column, value, &self.session);
+        }
+
+        /// The statements of a SQL-language function called from an
+        /// expression, each run as a nested statement (B11 wave 4) under the
+        /// function's volatility (a volatile body's statements see the
+        /// earlier ones); the result is the first column of the final
+        /// statement's first row, NULL when it returns no row or the
+        /// function returns void. This is the entry point for SQL function
+        /// bodies beyond one expression: DML bodies, and set-returning bodies
+        /// once they collect every row of the final statement.
+        pub fn sqlFunctionBody(self: *Self, frame: *R.Frame, text_body: []const u8, result_column: *const V.Column, void_result: bool) Error!V.Cell {
+            var statements: R.Statements = .{ .source = text_body };
+            var last: R.Capture = .{};
+            while (try statements.next()) |span| {
+                try self.session.checkpoint();
+                last = .{};
+                _ = try self.routineStatement(frame, text_body[span.start..span.end], &last);
+            }
+            if (void_result or last.rows == 0 or last.count == 0) return .null_value;
+            var cell = last.cells[0];
+            if (cell != .null_value) {
+                const from = last.tys[0];
+                const to = types.typeOfData(result_column.data_type);
+                if (from != to) cell = try E.cast(cell, if (from == .unknown) .text else from, to, result_column.typmod, &self.session);
+            }
+            return D.store(result_column, cell, &self.session);
         }
 
         // ---- triggers -------------------------------------------------------
@@ -13884,9 +14072,53 @@ pub fn Database(comptime config: Config) type {
         const tg_names = [_][]const u8{ "tg_name", "tg_when", "tg_level", "tg_op", "tg_relid", "tg_relname", "tg_table_name", "tg_table_schema", "tg_nargs" };
         const tg_types = [_]types.Type{ .name, .text, .text, .text, .oid, .name, .name, .name, .int4 };
 
-        /// FOUND is declared already; the TG_* variables follow it.
+        /// FOUND is declared already; the TG_* variables follow it, then
+        /// TG_ARGV (B11 wave 4).
         fn triggerVariableNames(frame: *R.Frame) Error!void {
             for (tg_names, tg_types) |name, ty| _ = try frame.declare(name, ty, -1);
+            _ = try frame.declare("tg_argv", types.arrayType(.text).?, -1);
+        }
+
+        /// TG_ARGV: the trigger's arguments as a text array indexed from 0
+        /// (`[0:n-1]={...}`), NULL without arguments, as in PostgreSQL.
+        fn triggerArguments(self: *Self, trigger: *const RC.Trigger) Error!V.Cell {
+            if (trigger.nargs == 0) return .null_value;
+            var text: [2 * RC.arg_bytes + 32]u8 = undefined;
+            var at: usize = 0;
+            const header_prefix = "[0:";
+            @memcpy(text[at..][0..header_prefix.len], header_prefix);
+            at += header_prefix.len;
+            var digits: [20]u8 = undefined;
+            const last = formatUnsigned(trigger.nargs - 1, &digits);
+            @memcpy(text[at..][0..last.len], last);
+            at += last.len;
+            const header_suffix = "]={";
+            @memcpy(text[at..][0..header_suffix.len], header_suffix);
+            at += header_suffix.len;
+            for (0..trigger.nargs) |index| {
+                const argument = trigger.argument(index);
+                if (at + 2 * argument.len + 4 > text.len) return error.TextCapacity;
+                if (index != 0) {
+                    text[at] = ',';
+                    at += 1;
+                }
+                text[at] = '"';
+                at += 1;
+                for (argument) |byte| {
+                    if (byte == '"' or byte == '\\') {
+                        text[at] = '\\';
+                        at += 1;
+                    }
+                    text[at] = byte;
+                    at += 1;
+                }
+                text[at] = '"';
+                at += 1;
+            }
+            text[at] = '}';
+            at += 1;
+            if (at > config.text_bytes) return error.TextCapacity;
+            return E.cast(textValue(text[0..at]), .text, types.arrayType(.text).?, -1, &self.session);
         }
 
         fn textValue(bytes: []const u8) V.Cell {
@@ -13958,8 +14190,9 @@ pub fn Database(comptime config: Config) type {
             return cell == .boolean and cell.boolean;
         }
 
-        /// Runs a trigger's function (PL/pgSQL, no statements of its own)
-        /// with NEW / OLD and the TG_* variables; returns what it RETURNed.
+        /// Runs a trigger's function (PL/pgSQL; its SQL statements run as
+        /// nested statements, B11 wave 4) with NEW / OLD and the TG_*
+        /// variables; returns what it RETURNed.
         fn callTrigger(self: *Self, trigger: *const RC.Trigger, table_index: usize, timing: u8, row: bool, event: u8, new: ?*E.Row, old: ?*E.Row, snap: Snapshot) Error!R.Record {
             const function = self.objects.routineByOid(trigger.function_oid, snap) orelse return error.UndefinedFunction;
             const routine = &self.objects.routines[function];
@@ -13972,6 +14205,9 @@ pub fn Database(comptime config: Config) type {
             var scope: RoutineScope = .{};
             try self.enterScope(routine, &scope);
             defer self.leaveScope(&scope);
+            const saved_volatility = self.routine_volatility;
+            defer self.routine_volatility = saved_volatility;
+            self.routine_volatility = routine.volatility;
             var frame: R.Frame = .{};
             try routineParameters(&frame, &.{}, &.{}, &.{}, routine.name, true);
             try triggerVariableNames(&frame);
@@ -13994,6 +14230,7 @@ pub fn Database(comptime config: Config) type {
             frame.cells[first + 6] = textValue(table.name.slice());
             frame.cells[first + 7] = textValue(self.namespaceName(table.namespace));
             frame.cells[first + 8] = .{ .integer = @intCast(trigger.nargs) };
+            frame.cells[first + 9] = try self.triggerArguments(trigger);
             var interpreter: Interp = .{ .host = self, .source = routine.body.slice(), .frame = &frame, .purpose = .trigger };
             try interpreter.execute(.run);
             return interpreter.record;
@@ -14051,8 +14288,12 @@ pub fn Database(comptime config: Config) type {
         fn afterTriggers(self: *Self, slot: u16, start: usize, assigned: ?*const [config.columns]u16, snap: Snapshot) Error!void {
             if (!self.anyTrigger(0, true, tg.tg_insert, snap) and !self.anyTrigger(0, true, tg.tg_update, snap) and !self.anyTrigger(0, true, tg.tg_delete, snap)) return;
             const tx = &self.txs[slot];
+            // Statements the triggers run append after `end` and fire their
+            // own AFTER triggers; writes of nested statements in between
+            // (BEFORE triggers, functions) carry later command ids.
+            const end = tx.write_len;
             var index = start;
-            while (index < tx.write_len) : (index += 1) {
+            while (index < @min(end, tx.write_len)) : (index += 1) {
                 const entry = tx.writes[index];
                 const event: u8 = switch (entry.kind) {
                     .insert => tg.tg_insert,
@@ -14060,6 +14301,7 @@ pub fn Database(comptime config: Config) type {
                     .delete => tg.tg_delete,
                     else => continue,
                 };
+                if (self.writeCid(entry) != snap.cid) continue;
                 var list: [config.triggers]u8 = undefined;
                 const count = self.rowTriggerList(entry.table, snap, &list);
                 if (count == 0) continue;
@@ -14312,6 +14554,110 @@ pub fn Database(comptime config: Config) type {
                 if (rule.stamp.deleterOther(snap)) |other| return self.waitObject(slot, other);
                 try self.dropObject(slot, .rule, index, snap);
             }
+        }
+
+        // ---- nested statements (B11 wave 4, sql/nested.sig) -----------------
+
+        /// The suspended statement's state that a nested statement
+        /// replaces: its workspace (sql/nested.sig) and its statement-scoped
+        /// Database fields.
+        fn nestedTransfer(self: *Self, stream: *nested_module.Stream, slot: u16) void {
+            const tx = &self.txs[slot];
+            nested_module.workspace(stream, &self.workspace);
+            stream.value(&self.outcome);
+            stream.value(&self.modifying[slot]);
+            stream.value(&tx.progress);
+            stream.value(&tx.progress_affected);
+            stream.value(&tx.mysql_insert_value);
+            stream.value(&self.statement_start);
+            stream.value(&self.routine_snap);
+            stream.value(&self.seq_snap);
+            stream.value(&self.routine_frame);
+            stream.value(&self.session.routine_frame);
+            stream.value(&self.session.params);
+            stream.value(&self.active_params);
+            stream.value(&self.routine_result);
+            stream.value(&self.routine_volatility);
+        }
+
+        /// Suspends the running statement for a nested one: saves its state
+        /// at the top of the free query workspace and gives the nested
+        /// statement the free middle (floors and tops). Returns the cell
+        /// where the state was saved.
+        fn nestedEnter(self: *Self, slot: u16) Error!usize {
+            if (self.nested_depth >= config.nested_statements) return error.StackDepthExceeded;
+            try self.session.checkpoint();
+            var measure: nested_module.Stream = .{ .mode = .measure };
+            self.nestedTransfer(&measure, slot);
+            const work = &self.workspace.query;
+            const need = nested_module.cellsFor(Cell, measure.at);
+            if (work.cell_high < work.cell_low or work.cell_high - work.cell_low < need) return error.WorkspaceCapacity;
+            const at = work.cell_high - need;
+            var save: nested_module.Stream = .{ .mode = .save, .bytes = @ptrCast(&work.cells[at]) };
+            self.nestedTransfer(&save, slot);
+            work.floor_values = nested_module.valueFloor(work);
+            work.floor_cells = work.cell_low;
+            work.top_cells = work.cells.len - at;
+            work.floor_refs = work.ref_low;
+            work.top_refs = work.refs.len - work.ref_high;
+            work.pinned_cells = 0;
+            work.pinned_refs = 0;
+            X.resetWork(work);
+            self.nested_depth += 1;
+            self.nested_ran = true;
+            return at;
+        }
+
+        /// Resumes the suspended statement exactly as nestedEnter found it.
+        fn nestedLeave(self: *Self, slot: u16, at: usize) void {
+            const work = &self.workspace.query;
+            var restore: nested_module.Stream = .{ .mode = .restore, .bytes = @ptrCast(&work.cells[at]) };
+            self.nestedTransfer(&restore, slot);
+            self.nested_depth -= 1;
+        }
+
+        /// A statement in which a nested statement ran must wait: undo all
+        /// of it, so the re-delivered statement runs again from its start
+        /// (with a fresh snapshot, as after a wait before any data access)
+        /// and no trigger or function effect happens twice.
+        fn restartStatement(self: *Self, slot: u16) void {
+            const tx = &self.txs[slot];
+            if (tx.sub_len == 0 or !tx.subs[tx.sub_len - 1].statement) return;
+            const sub = tx.subs[tx.sub_len - 1];
+            M.abortSlice(self, slot, sub.write_start, sub.lock_start);
+            tx.progress = 0;
+            tx.progress_affected = 0;
+            tx.mysql_insert_value = null;
+            self.modifying[slot] = .{};
+            tx.fresh = true;
+            self.wake_epoch +%= 1;
+        }
+
+        /// A parsed function call names a visible user function (bound
+        /// later; built-in names a user function shadows count too).
+        fn callsUserRoutine(self: *const Self, source: []const u8, snap: Snapshot) bool {
+            var any = false;
+            for (&self.objects.routines) |*routine| any = any or (routine.live and routine.kind == 'f');
+            if (!any) return false;
+            const pool = &self.workspace.nodes;
+            for (pool.nodes[0..pool.len]) |*n| {
+                if (n.kind != .function or n.name.span.len == 0 or n.name.span.start + n.name.span.len > source.len) continue;
+                const name = identName(source, n.name);
+                for (&self.objects.routines) |*routine| {
+                    if (routine.live and routine.kind == 'f' and routine.stamp.visible(snap) and types.same(routine.name.slice(), name.slice())) return true;
+                }
+            }
+            return false;
+        }
+
+        /// The command id that made a row write (row versions carry it).
+        fn writeCid(self: *const Self, entry: M.Write) u32 {
+            const table = &self.tables[entry.table];
+            return switch (entry.kind) {
+                .insert, .update => table.versions[entry.new].xmin_cid,
+                .delete => table.versions[entry.old].xmax_cid,
+                else => 0,
+            };
         }
 
         // ---- durability -------------------------------------------------------

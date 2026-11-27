@@ -486,9 +486,13 @@ fn plpgsqlFunctions() !void {
     try run("CREATE FUNCTION depth(n INT) RETURNS INT LANGUAGE plpgsql AS $$BEGIN IF n <= 0 THEN RETURN 0; END IF; RETURN depth(n - 1) + 1; END$$");
     try expect("SELECT depth(10)", "10");
     try fails("SELECT depth(100)", error.StackDepthExceeded);
-    // Statements are not run inside an expression (0A000), atomically.
+    // Statements run nested inside an expression (B11 wave 4); a failing
+    // one undoes the whole statement.
     try run("CREATE FUNCTION writes() RETURNS INT LANGUAGE plpgsql AS $$BEGIN INSERT INTO tdd_b VALUES (9, 9); RETURN 1; END$$");
-    try rejects("SELECT writes()", error.UnsupportedStatement, "SELECT count(*) FROM tdd_b", "3");
+    var wrote = try replicate("SELECT writes()");
+    try same(try render(&wrote), "1");
+    try rejects("SELECT writes()", error.PrimaryKeyViolation, "SELECT count(*) FROM tdd_b", "4");
+    try run("DELETE FROM tdd_b WHERE id = 9");
     // Compile errors at CREATE (42601, 22005, 22004, 42704).
     try fails("CREATE FUNCTION e1() RETURNS INT LANGUAGE plpgsql AS $$BEGIN x := ; RETURN 1; END$$", error.Syntax);
     try fails("CREATE FUNCTION e2() RETURNS INT LANGUAGE plpgsql AS $$BEGIN y := 1; RETURN 1; END$$", error.Syntax);
