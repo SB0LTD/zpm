@@ -76,7 +76,9 @@
 //!   EXCLUDE (one operator u8 per key column: 1 =, 2 &&), constraint flags
 //!   bit 1 DEFERRABLE, bit 2 INITIALLY DEFERRED; then relkind u8 ('r', 'v',
 //!   'm', 'p'), index_count u8 and per secondary index: oid u32, name, flags
-//!   u8 (1 unique, 2 nulls not distinct), key_count u8, keys (column u8 or
+//!   u8 (1 unique, 2 nulls not distinct, 4 USING hash; an index without
+//!   4 is an ordered btree index, also when logged before B11 wave 5 wrote
+//!   the bit), key_count u8, keys (column u8 or
 //!   255 for an expression), options u8 per key (1 DESC, 2 NULLS FIRST),
 //!   include_count u8 + columns, expression texts (NUL-separated) and
 //!   predicate text (each u16 + bytes); view query text (u16 + bytes),
@@ -578,7 +580,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
             for (table.indexes[0..table.index_count]) |*index| {
                 try writer.int(u32, index.oid);
                 try writer.name(index.name.slice());
-                try writer.int(u8, @as(u8, @intFromBool(index.unique)) | (@as(u8, @intFromBool(index.nulls_not_distinct)) << 1));
+                try writer.int(u8, @as(u8, @intFromBool(index.unique)) | (@as(u8, @intFromBool(index.nulls_not_distinct)) << 1) | (@as(u8, @intFromBool(index.hash)) << 2));
                 try writer.int(u8, index.key_count);
                 try writer.bytes(index.keyColumns());
                 try writer.bytes(index.options[0..index.key_count]);
@@ -1663,9 +1665,10 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     if (previous.oid == index.oid or types.same(previous.name.slice(), index.name.slice())) return error.InvalidChangeRecord;
                 }
                 const flags = try reader.int(u8);
-                if (flags > 3) return error.InvalidChangeRecord;
+                if (flags > 7) return error.InvalidChangeRecord;
                 index.unique = flags & 1 != 0;
                 index.nulls_not_distinct = flags & 2 != 0;
+                index.hash = flags & 4 != 0;
                 index.key_count = try reader.int(u8);
                 if (index.key_count == 0 or index.key_count > config.columns) return error.InvalidChangeRecord;
                 @memcpy(index.keys[0..index.key_count], try reader.take(index.key_count));
@@ -1687,6 +1690,11 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 }
                 if (parts != expressions) return error.InvalidChangeRecord;
                 if (index.unique and (expressions != 0 or index.predicate.len != 0)) return error.InvalidChangeRecord;
+                // A hash index has one key element, no ordering options, no
+                // INCLUDE columns and is never unique.
+                if (index.hash) {
+                    if (index.unique or index.key_count != 1 or index.include_count != 0 or index.options[0] != 0) return error.InvalidChangeRecord;
+                }
             }
             try decodeText(reader, &extras.query);
             const view = extras.relkind == 'v' or extras.relkind == 'm';

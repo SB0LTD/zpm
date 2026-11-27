@@ -667,8 +667,9 @@ pub fn Parser(comptime config: types.Config) type {
             _ = try self.takeWord("ONLY");
             out.table = try self.qualifiedName();
             if (try self.takeWord("USING")) {
-                // Hash entries serve btree and hash requests; others are 0A000.
-                try self.accessMethod(false);
+                // btree (the default) and hash indexes; other built-in
+                // methods are 0A000, unknown ones 42704.
+                out.hash = try self.accessMethod(false);
             }
             try self.expectSymbol(.lparen);
             while (true) {
@@ -2450,7 +2451,7 @@ pub fn Parser(comptime config: types.Config) type {
             if (try self.takeWord("EXCLUDE")) {
                 var out: Ast.ConstraintDef = .{ .name = name, .kind = .exclusion };
                 if (try self.takeWord("USING")) {
-                    try self.accessMethod(true);
+                    _ = try self.accessMethod(true);
                 }
                 try self.expectSymbol(.lparen);
                 while (true) {
@@ -4550,12 +4551,17 @@ pub fn Parser(comptime config: types.Config) type {
             return out[0..ident.len];
         }
 
-        fn accessMethod(self: *Self, allow_gist: bool) Error!void {
+        /// An index access method name; true for hash.
+        fn accessMethod(self: *Self, allow_gist: bool) Error!bool {
             const ident = try self.identifier();
             var buffer: [64]u8 = undefined;
-            const method = identText(self.source, ident, &buffer) orelse return error.UnsupportedStatement;
-            if (types.same(method, "btree") or types.same(method, "hash") or (allow_gist and types.same(method, "gist"))) return;
-            return error.UnsupportedStatement;
+            const method = identText(self.source, ident, &buffer) orelse return error.UndefinedObject;
+            if (types.same(method, "btree") or (allow_gist and types.same(method, "gist"))) return false;
+            if (types.same(method, "hash")) return true;
+            for ([_][]const u8{ "gist", "gin", "brin", "spgist" }) |known| {
+                if (types.same(method, known)) return error.UnsupportedStatement;
+            }
+            return error.UndefinedObject;
         }
 
         fn requireCatalogQualifier(self: *const Self, name: ast.Ident) Error!void {

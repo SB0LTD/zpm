@@ -99,6 +99,8 @@ pub fn Exec(comptime config: types.Config) type {
             joined_projection_plans: usize = 0,
             joined_topk_plans: usize = 0,
             probes: usize = 0,
+            /// Nested-loop and aggregate lookups through ordered indexes.
+            index_probes: usize = 0,
             window_frame_rows:usize=0,
             window_prefix_rows:usize=0,
             window_scalar_visits:usize=0,
@@ -120,6 +122,9 @@ pub fn Exec(comptime config: types.Config) type {
             key_fallbacks: usize = 0,
             key_successes: usize = 0,
             nonnull_sort_keys: usize = 0,
+            /// Ordered index walks (B11 wave 5) and the entries they read.
+            index_scans: usize = 0,
+            index_entries: usize = 0,
         };
 
         /// The statement's query workspace (design §4.9): caller-owned,
@@ -5926,9 +5931,169 @@ pub fn Exec(comptime config: types.Config) type {
             return found;
         }
 
+        // ---- ordered index paths (B11 wave 5) ------------------------------
+
+        fn indexOperation(path: *const B.IndexPath) SelectOperation {
+            if (path.covering) return .index_only_scan;
+            return if (path.ordered or path.unique_lookup) .index_scan else .bitmap_heap_scan;
+        }
+
+        /// EXPLAIN without ANALYZE: the top node of a bound index path.
+        pub fn plannedOperation(query: *const B.Select) ?SelectOperation {
+            if (query.index.which == B.no_index or query.table == null) return null;
+            if (query.limit != 0xffffffffffffffff) return .limit;
+            if (query.order_count != 0 and !query.index.ordered) return .sort;
+            return indexOperation(&query.index);
+        }
+
+        /// Evaluates the path's bounds into `span`; true when no row can
+        /// match (an equality or range bound is NULL).
+        fn evalSpan(ctx: *E.Context, path: *const B.IndexPath, span: *S.Span) Error!bool {
+            span.eq = path.eq_count;
+            for (0..path.eq_count) |i| {
+                if (path.eq[i] == none) {
+                    span.cells[i] = .null_value;
+                    continue;
+                }
+                const value = try E.eval(ctx, path.eq[i]);
+                if (value == .null_value) return true;
+                span.cells[i] = value;
+            }
+            if (path.ranged) {
+                span.ranged = true;
+                if (path.low != none) {
+                    span.low = try E.eval(ctx, path.low);
+                    if (span.low == .null_value) return true;
+                    span.has_low = true;
+                    span.low_inclusive = path.low_inclusive;
+                }
+                if (path.high != none) {
+                    span.high = try E.eval(ctx, path.high);
+                    if (span.high == .null_value) return true;
+                    span.has_high = true;
+                    span.high_inclusive = path.high_inclusive;
+                }
+            }
+            return false;
+        }
+
+        /// The distinct non-NULL values of an IN list in the index
+        /// element's order (insertion sort; at most index_list_capacity).
+        fn listValues(ctx: *E.Context, list: u16, option: u8, values: *[B.index_list_capacity]V.Cell) Error!usize {
+            var count: usize = 0;
+            var item = ctx.pool.nodes[list].b;
+            while (item != none) : (item = ctx.pool.nodes[item].next) {
+                const value = try E.eval(ctx, item);
+                if (value == .null_value) continue;
+                var at = count;
+                var duplicate = false;
+                while (at != 0) : (at -= 1) {
+                    const order = S.keyOrder(&values[at - 1], &value, option);
+                    if (order == 0) duplicate = true;
+                    if (order <= 0) break;
+                }
+                if (duplicate) continue;
+                if (count == values.len) return error.WorkspaceCapacity;
+                var move = count;
+                while (move > at) : (move -= 1) values[move] = values[move - 1];
+                values[at] = value;
+                count += 1;
+            }
+            return count;
+        }
+
+        fn reverseRun(items: []u32) void {
+            var low: usize = 0;
+            var high: usize = items.len;
+            while (low + 1 < high) {
+                high -= 1;
+                const swap = items[low];
+                items[low] = items[high];
+                items[high] = swap;
+                low += 1;
+            }
+        }
+
+        /// Walks one span, appending the visible versions WHERE keeps. A
+        /// backward walk restores heap order within runs of equal keys (a
+        /// stable sort's tie order); `stop` ends at LIMIT rows.
+        fn walkSpan(ctx: *E.Context, table: *const S.Table, row_scratch: *S.VersionRowScratch, query: *const B.Select, snap: storage.Snapshot, span: *const S.Span, indices: []u32, found: *usize, stop: u64, session: *const value_module.Session, stats: *ReadStats) Error!void {
+            const which: usize = query.index.which;
+            const backward = query.index.backward;
+            var scan = S.indexScan(table, which, span, backward);
+            var run_start = found.*;
+            while (S.scanNext(table, which, &scan)) |version| {
+                try session.checkpoint();
+                stats.index_entries += 1;
+                if (S.visibleAt(table, table.versions[version].rowSlot(), snap) != version) continue;
+                if (!try keep(ctx, query.where, S.borrowVersionRow(table, version, row_scratch))) continue;
+                if (backward and found.* != run_start and !S.sameIndexKey(table, which, indices[found.* - 1], version)) {
+                    reverseRun(indices[run_start..found.*]);
+                    if (found.* >= stop) return;
+                    run_start = found.*;
+                }
+                if (found.* == indices.len) return error.WorkspaceCapacity;
+                indices[found.*] = version;
+                found.* += 1;
+                if (!backward and found.* >= stop) return;
+            }
+            if (backward) reverseRun(indices[run_start..found.*]);
+        }
+
+        const HeapSorter = struct {
+            table: *const S.Table,
+            pub fn order(self: *const HeapSorter, left: u32, right: u32) Error!i8 {
+                const a = self.table.versions[left].rowSlot();
+                const b = self.table.versions[right].rowSlot();
+                return if (a < b) -1 else if (a > b) 1 else 0;
+            }
+        };
+
+        /// Candidates of a bound index path: in index order when it serves
+        /// ORDER BY, else in heap order (a scan's order). Null when a bound
+        /// cannot be evaluated: the caller scans, as without the index.
+        fn indexCandidates(ctx: *E.Context, table: *const S.Table, row_scratch: *S.VersionRowScratch, query: *const B.Select, snap: storage.Snapshot, indices: []u32, heap_scratch: []u32, locking: bool, session: *const value_module.Session, stats: *ReadStats) Error!?usize {
+            const path = &query.index;
+            var span: S.Span = .{};
+            ctx.row = null;
+            // Bounds are row-independent; a bound that fails to evaluate
+            // leaves the statement (and any error a row raises) to the scan.
+            const empty = evalSpan(ctx, path, &span) catch |err| switch (err) {
+                error.QueryCanceled, error.QueryWorkLimit => return err,
+                else => return null,
+            };
+            var values: [B.index_list_capacity]V.Cell = undefined;
+            var value_count: usize = 0;
+            if (!empty and path.list != none) {
+                const option = table.indexes[path.which].options[path.eq_count];
+                value_count = listValues(ctx, path.list, option, &values) catch |err| switch (err) {
+                    error.QueryCanceled, error.QueryWorkLimit => return err,
+                    else => return null,
+                };
+            }
+            stats.index_scans += 1;
+            if (empty) return 0;
+            // Only an ordered walk without row locks can stop at LIMIT.
+            const stop: u64 = if (path.ordered and !locking) query.limit else 0xffffffffffffffff;
+            var found: usize = 0;
+            if (path.list != none) {
+                span.eq = path.eq_count + 1;
+                for (values[0..value_count]) |*value| {
+                    span.cells[path.eq_count] = value.*;
+                    try walkSpan(ctx, table, row_scratch, query, snap, &span, indices, &found, stop, session, stats);
+                }
+            } else try walkSpan(ctx, table, row_scratch, query, snap, &span, indices, &found, stop, session, stats);
+            if (!path.ordered and found > 1) {
+                const sorter: HeapSorter = .{ .table = table };
+                _ = try sort_module.mergeSort(indices[0..found], heap_scratch, &sorter);
+            }
+            return found;
+        }
+
         pub const SelectOperation = enum {
             select_plan, query_plan, result, limit, primary_lookup, table_scan,
             ordered_scan, primary_walk, compact_filter, integer_top_k, sort, lock_rows,
+            index_scan, index_only_scan, bitmap_heap_scan,
 
             pub fn name(operation: SelectOperation) []const u8 {
                 return switch (operation) {
@@ -5944,6 +6109,9 @@ pub fn Exec(comptime config: types.Config) type {
                     .integer_top_k => "Integer Top-N Scan",
                     .sort => "Sort",
                     .lock_rows => "Lock Rows",
+                    .index_scan => "Index Scan",
+                    .index_only_scan => "Index Only Scan",
+                    .bitmap_heap_scan => "Bitmap Heap Scan",
                 };
             }
         };
@@ -6026,6 +6194,16 @@ pub fn Exec(comptime config: types.Config) type {
                 },
                 .scan => scan: {
                   if (comptime observing) observation.operation = .table_scan;
+                  if (query.index.which != B.no_index and S.hasIndexTree(table, query.index.which)) {
+                    var inline_heap: [if (config.external_workspace) 0 else types.workRows(config)]u32 = undefined;
+                    const heap_scratch = if (config.external_workspace) work.refs[index_capacity..][0..index_capacity] else inline_heap[0..];
+                    if (try indexCandidates(&ctx, table, &row_scratch, query, snap, indices, heap_scratch, locking, session, stats)) |count| {
+                        if (comptime observing) observation.operation = indexOperation(&query.index);
+                        found = count;
+                        ordered = query.index.ordered;
+                        break :scan;
+                    }
+                  }
                   if (layout_reverse) |reverse| {
                     if (comptime observing) observation.operation = .ordered_scan;
                     var offset: usize = 0;

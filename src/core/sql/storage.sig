@@ -382,8 +382,19 @@ pub fn Storage(comptime config: types.Config) type {
                     self.versions.len > self.rows.len and self.versions.len <= 0x7fffffff and
                     self.hash_load.allows(self.row_index.len, self.rows.len) and powerOfTwo(self.row_index.len) and
                     self.hash_load.allows(self.key_index.len, self.versions.len) and powerOfTwo(self.key_index.len) and
-                    self.index_slots.len % self.key_index.len == 0 and self.index_slots.len / self.key_index.len <= index_capacity and
-                    self.scan_index_limit <= index_capacity;
+                    self.indexRunsValid() and self.scan_index_limit <= index_capacity;
+            }
+
+            /// Words of each index run: a hash of key_index.len slots or an
+            /// ordered index's node arena over every version (0: overflow).
+            pub fn indexStride(self: Backing) usize {
+                return indexRunWords(self.key_index.len, self.versions.len) catch 0;
+            }
+
+            fn indexRunsValid(self: Backing) bool {
+                if (self.index_slots.len == 0) return true;
+                const stride = self.indexStride();
+                return stride != 0 and self.index_slots.len % stride == 0 and self.index_slots.len / stride <= index_capacity;
             }
         };
 
@@ -485,11 +496,82 @@ pub fn Storage(comptime config: types.Config) type {
         pub const index_capacity: usize = config.table_indexes;
         pub const index_entry_capacity: usize = if (config.index_entries != 0) config.index_entries else if (config.external_storage) 0 else versions_capacity;
         pub const index_slot_capacity: usize = if (index_entry_capacity == 0 or index_capacity == 0) 0 else pow2(index_entry_capacity * 2);
+        /// Words of one inline index run: a hash index uses its first
+        /// index_slot_capacity slots, an ordered index the whole run as its
+        /// node arena (B11 wave 5).
+        pub const index_run_capacity: usize = if (index_slot_capacity == 0) 0 else @max(index_slot_capacity, treeWordsOf(index_entry_capacity));
         /// Whether any table can hold a secondary index entry.
         pub const index_storage: bool = index_capacity != 0 and (config.external_storage or index_slot_capacity != 0);
         /// Indexes per table that Database.bindMemory carves (external only).
         pub const bound_indexes: usize = if (config.external_storage) config.external_indexes else 0;
-        pub const IndexSlots = if (config.external_storage) []u32 else [index_capacity][index_slot_capacity]u32;
+        pub const IndexSlots = if (config.external_storage) []u32 else [index_capacity][index_run_capacity]u32;
+
+        // ---- ordered (btree) index sizing (B11 wave 5) ----------------------
+
+        pub const btree_fanout: usize = config.index_fanout;
+        const half_fanout: usize = btree_fanout / 2;
+        /// u32 words of one tree node: count | leaf flag, next leaf, previous
+        /// leaf, a spare word, then `btree_fanout` cached keys (two words
+        /// each), the entry references (leaf: version; internal: child node)
+        /// and the version of each entry's first leaf entry.
+        pub const node_words: usize = 4 + 4 * btree_fanout;
+
+        fn depthEntries(depth: usize) usize {
+            var entries: u64 = 2;
+            for (0..depth) |_| {
+                entries *= half_fanout;
+                if (entries > 0xffffffff) return 0xffffffff;
+            }
+            return @intCast(entries - 1);
+        }
+
+        /// Height limit of every ordered index: Config.index_depth, or the
+        /// smallest height any addressable entry count fits.
+        pub const btree_depth: usize = if (config.index_depth != 0) config.index_depth else derived: {
+            @setEvalBranchQuota(100000);
+            var depth: usize = 1;
+            while (depthEntries(depth) < 0x7fffffff) depth += 1;
+            break :derived depth;
+        };
+        /// Entries an ordered index can hold within btree_depth: a tree of
+        /// height h + 1 holds at least 2 x (fanout / 2)^h entries.
+        pub const btree_entries: usize = depthEntries(btree_depth);
+        comptime {
+            if (btree_fanout < 8 or btree_fanout > 1024 or btree_fanout % 2 != 0) @compileError("index_fanout must be even and between 8 and 1024");
+            if (btree_depth > 64) @compileError("index_depth exceeds 64");
+        }
+
+        /// Nodes of a tree of `entries` entries in the worst case (every
+        /// non-root node half full).
+        pub fn treeNodes(entries: usize) usize {
+            var level: usize = @max(1, (entries + half_fanout - 1) / half_fanout);
+            var total = level;
+            while (level > 1) {
+                level = (level + half_fanout - 1) / half_fanout;
+                total += level;
+            }
+            return total;
+        }
+
+        fn treeWordsOf(entries: usize) usize {
+            @setEvalBranchQuota(100000);
+            return (1 + treeNodes(@min(entries, btree_entries))) * node_words;
+        }
+
+        /// u32 words of an ordered index's node arena (its metadata node
+        /// included) for `entries` entries.
+        pub fn treeWords(entries: usize) Error!usize {
+            const nodes = 1 + treeNodes(@min(entries, btree_entries));
+            const words = @mulWithOverflow(nodes, node_words);
+            if (words[1] != 0) return error.InvalidParameterValue;
+            return words[0];
+        }
+
+        /// Words of one external index run: a hash of `key_slots` slots or
+        /// the node arena of a tree over `versions` entries.
+        pub fn indexRunWords(key_slots: usize, versions: usize) Error!usize {
+            return @max(key_slots, try treeWords(versions));
+        }
         comptime {
             if (config.external_storage and config.index_entries != 0) @compileError("index_entries sizes inline index storage; external_storage binds index slots (external_indexes)");
             if (!config.external_storage and config.external_indexes != 0) @compileError("external_indexes requires external_storage");
@@ -519,6 +601,10 @@ pub fn Storage(comptime config: types.Config) type {
             expressions: V.Text = .{},
             /// Partial-index WHERE source text (empty: none).
             predicate: V.Text = .{},
+            /// USING hash (change-log index flag 4). Every other index,
+            /// including definitions logged before access methods were
+            /// recorded, is an ordered (btree) index.
+            hash: bool = false,
 
             pub fn keyColumns(self: *const Index) []const u8 {
                 return self.keys[0..self.key_count];
@@ -568,6 +654,8 @@ pub fn Storage(comptime config: types.Config) type {
             indexes: [index_capacity]Index = @splat(.{}),
             index_slots: IndexSlots = if (config.external_storage) &.{} else @splat(@splat(0)),
             scan_index_limit: if (config.external_storage) usize else void = if (config.external_storage) 0 else {},
+            /// Words of each bound index run (Backing.indexStride).
+            index_stride: if (config.external_storage) usize else void = if (config.external_storage) 0 else {},
             /// View / materialized view defining query (SELECT text).
             query: QueryText = .{},
             /// A materialized view created WITH NO DATA is unpopulated.
@@ -713,6 +801,7 @@ pub fn Storage(comptime config: types.Config) type {
             table.scan_presence = backing.scan_presence;
             table.index_slots = backing.index_slots;
             table.scan_index_limit = backing.scan_index_limit;
+            table.index_stride = backing.indexStride();
         }
 
         /// A table every committed reader can see (created and not dropped).
@@ -815,11 +904,12 @@ pub fn Storage(comptime config: types.Config) type {
         pub fn setExtras(table: *Table, extras: *const Extras) void {
             table.relkind = extras.relkind;
             table.index_count = extras.index_count;
-            // Empty hashes for the installed indexes: external memory starts
-            // uninitialized and a reused slot keeps its last table's entries.
-            // Callers checked indexFits; a rebuild or copy fills them.
-            if (comptime index_storage) for (0..activeHashCount(table)) |which| @memset(slotsOf(table, which), 0);
             table.indexes = extras.indexes;
+            // Empty hashes and trees for the installed indexes: external
+            // memory starts uninitialized and a reused slot keeps its last
+            // table's entries. Callers checked indexFits; a rebuild or copy
+            // fills them.
+            if (comptime index_storage) for (0..activeHashCount(table)) |which| clearIndex(table, which);
             table.query = extras.query;
             table.populated = extras.populated;
             table.depend_count = extras.depend_count;
@@ -889,29 +979,41 @@ pub fn Storage(comptime config: types.Config) type {
             return @intCast(hash & mask);
         }
 
-        /// Entry hash of secondary index `which` (a power of two of slots).
-        /// Callers keep which < hashCapacity(table).
-        fn slotsOf(table: *Table, which: usize) []u32 {
+        /// The whole storage run of secondary index `which`. Callers keep
+        /// which < hashCapacity(table).
+        fn runOf(table: *Table, which: usize) []u32 {
             if (comptime config.external_storage) {
-                const stride = table.key_index.len;
+                const stride = table.index_stride;
                 return table.index_slots[which * stride ..][0..stride];
             }
             return table.index_slots[which][0..];
         }
 
-        fn slotsConst(table: *const Table, which: usize) []const u32 {
+        fn runConst(table: *const Table, which: usize) []const u32 {
             if (comptime config.external_storage) {
-                const stride = table.key_index.len;
+                const stride = table.index_stride;
                 return table.index_slots[which * stride ..][0..stride];
             }
             return table.index_slots[which][0..];
+        }
+
+        /// Entry hash of hash index `which` (a power of two of slots at the
+        /// start of its run).
+        fn slotsOf(table: *Table, which: usize) []u32 {
+            if (comptime config.external_storage) return runOf(table, which)[0..table.key_index.len];
+            return table.index_slots[which][0..index_slot_capacity];
+        }
+
+        fn slotsConst(table: *const Table, which: usize) []const u32 {
+            if (comptime config.external_storage) return runConst(table, which)[0..table.key_index.len];
+            return table.index_slots[which][0..index_slot_capacity];
         }
 
         fn hashCapacity(table: *const Table) usize {
             if (comptime !index_storage) return 0;
             if (comptime !config.external_storage) return index_capacity;
-            if (table.key_index.len == 0) return 0;
-            return @min(index_capacity, table.index_slots.len / table.key_index.len);
+            if (table.key_index.len == 0 or table.index_stride == 0) return 0;
+            return @min(index_capacity, table.index_slots.len / table.index_stride);
         }
 
         fn activeHashCount(table: *const Table) usize {
@@ -922,8 +1024,15 @@ pub fn Storage(comptime config: types.Config) type {
             return table.index_count;
         }
 
+        /// Whether index `which` has entries (a hash or a tree); others are
+        /// scanned over the version arena.
         pub fn hasIndexHash(table: *const Table, which: usize) bool {
             return which < activeHashCount(table);
+        }
+
+        /// Whether index `which` is an ordered index with a tree.
+        pub fn hasIndexTree(table: *const Table, which: usize) bool {
+            return hasIndexHash(table, which) and !table.indexes[which].hash;
         }
 
         /// Logical index admission, including explicitly enabled scanned indexes.
@@ -933,19 +1042,35 @@ pub fn Storage(comptime config: types.Config) type {
             return hashes;
         }
 
+        /// Entries one index of this table can hold: the inline entry
+        /// capacity (every version under external storage), within the
+        /// ordered index height limit.
+        fn entryLimit() usize {
+            if (comptime config.external_storage) return btree_entries;
+            return @min(index_entry_capacity, btree_entries);
+        }
+
         /// Whether this table slot can carry `count` secondary indexes over
         /// `versions` allocated versions (external entries cover every
         /// version the slot can allocate).
         pub fn indexFits(table: *const Table, count: usize, versions: usize) bool {
             if (count == 0) return true;
             if (count > indexLimit(table)) return false;
-            return config.external_storage or versions <= index_entry_capacity;
+            return versions <= entryLimit();
+        }
+
+        fn clearIndex(table: *Table, which: usize) void {
+            if (table.indexes[which].hash) @memset(slotsOf(table, which), 0) else @memset(runOf(table, which)[0..node_words], 0);
         }
 
         fn indexSecondary(table: *Table, version: u32) void {
             var row_scratch: VersionRowScratch = undefined;
             if (comptime !index_storage) return;
             for (0..activeHashCount(table)) |which| {
+                if (!table.indexes[which].hash) {
+                    treeInsert(table, which, version);
+                    continue;
+                }
                 const slots = slotsOf(table, which);
                 const mask = slots.len - 1;
                 var position = secondaryHash(&table.indexes[which], borrowVersionRow(table, version, &row_scratch), mask);
@@ -978,6 +1103,10 @@ pub fn Storage(comptime config: types.Config) type {
             var row_scratch: VersionRowScratch = undefined;
             if (comptime !index_storage) return;
             for (0..activeHashCount(table)) |which| {
+                if (!table.indexes[which].hash) {
+                    treeDelete(table, which, version);
+                    continue;
+                }
                 const slots = slotsOf(table, which);
                 const mask = slots.len - 1;
                 var position = secondaryHash(&table.indexes[which], borrowVersionRow(table, version, &row_scratch), mask);
@@ -989,21 +1118,23 @@ pub fn Storage(comptime config: types.Config) type {
             }
         }
 
-        /// Rebuilds the backed secondary hashes from the version arena.
+        /// Rebuilds the backed secondary hashes and trees from the version arena.
         pub fn rebuildSecondary(table: *Table) void {
             if (comptime !index_storage) return;
             const hashes = activeHashCount(table);
             if (hashes == 0) return;
-            for (0..hashes) |which| @memset(slotsOf(table, which), 0);
+            for (0..hashes) |which| clearIndex(table, which);
             for (0..table.version_high) |version| {
                 if (table.versions[version].rowLink() != 0) indexSecondary(table, @intCast(version));
             }
         }
 
-        /// Physical entries of a backed secondary index.
+        /// Physical entries of a backed secondary index (a tree counts its
+        /// leaf entries).
         pub fn indexEntries(table: *const Table, which: usize) usize {
             if (comptime !index_storage) return 0;
             if (!hasIndexHash(table, which)) return 0;
+            if (!table.indexes[which].hash) return treeCount(runConst(table, which));
             var count: usize = 0;
             for (slotsConst(table, which)) |entry| {
                 if (entry != 0) count += 1;
@@ -1014,8 +1145,38 @@ pub fn Storage(comptime config: types.Config) type {
         /// Whether `count` more versions fit every secondary index. External
         /// entries hold every version the arena can allocate.
         pub fn indexRoom(table: *const Table, count: usize) bool {
-            if (table.index_count == 0 or config.external_storage) return true;
-            return table.version_used + count <= index_entry_capacity;
+            if (table.index_count == 0) return true;
+            return table.version_used + count <= entryLimit();
+        }
+
+        /// Bytes an ordered index entry spends on one value.
+        fn cellBytes(cell: *const V.Cell) usize {
+            return switch (cell.*) {
+                .null_value => 0,
+                .text, .jsonb, .bpchar, .bytea, .array, .range, .xml, .tsvector, .tsquery, .geo, .multirange => |*text| text.len,
+                inline else => |value| @sizeOf(@TypeOf(value)),
+            };
+        }
+
+        /// Ordered index admission of a new version (before it is created):
+        /// the entry's key and INCLUDE bytes stay within index_key_bytes and
+        /// every tree can still split along a full path (IndexCapacity, 54000).
+        pub fn admitVersion(table: *const Table, cells: []const V.Cell) Error!void {
+            if (comptime !index_storage) return;
+            for (table.indexes[0..table.index_count], 0..) |*index, which| {
+                if (index.hash) continue;
+                var bytes: usize = 0;
+                for (index.keyColumns()) |column| {
+                    if (column != expression_key and column < cells.len) bytes += cellBytes(&cells[column]);
+                }
+                for (index.includes[0..index.include_count]) |column| {
+                    if (column < cells.len) bytes += cellBytes(&cells[column]);
+                }
+                if (bytes > config.index_key_bytes) return error.IndexCapacity;
+                if (!hasIndexHash(table, which)) continue;
+                const run = runConst(table, which);
+                if (freeNodes(run) < nodeConst(run, 0)[meta_height] + 1) return error.IndexCapacity;
+            }
         }
 
         fn sameColumns(columns: []const u8, left: *const [config.columns]V.Cell, right: *const [config.columns]V.Cell) bool {
@@ -1025,6 +1186,17 @@ pub fn Storage(comptime config: types.Config) type {
             return true;
         }
 
+        /// The leading plain key elements of an ordered index as an
+        /// equality span over `cells` (a row in column order).
+        fn plainSpan(index: *const Index, cells: *const [config.columns]V.Cell, span: *Span) void {
+            span.* = .{};
+            for (index.keyColumns()) |column| {
+                if (column == expression_key) break;
+                span.cells[span.eq] = cells[column];
+                span.eq += 1;
+            }
+        }
+
         /// Versions visible to `snap` whose plain key columns of index
         /// `which` equal `cells`, found through the index (probe path).
         pub fn indexLookup(table: *const Table, which: usize, cells: *const [config.columns]V.Cell, snap: Snapshot, out: []u32) usize {
@@ -1032,9 +1204,21 @@ pub fn Storage(comptime config: types.Config) type {
             if (comptime !index_storage) return 0;
             if (!hasIndexHash(table, which)) return scanLookup(table, which, cells, snap, out);
             const index = &table.indexes[which];
+            var count: usize = 0;
+            if (!index.hash) {
+                var span: Span = undefined;
+                plainSpan(index, cells, &span);
+                var scan = indexScan(table, which, &span, false);
+                while (scanNext(table, which, &scan)) |entry| {
+                    if (!plainKeyEqual(index, borrowVersionRow(table, entry, &row_scratch), cells)) continue;
+                    if (visibleAt(table, table.versions[entry].rowSlot(), snap) != entry) continue;
+                    if (count < out.len) out[count] = entry;
+                    count += 1;
+                }
+                return count;
+            }
             const slots = slotsConst(table, which);
             const mask = slots.len - 1;
-            var count: usize = 0;
             var position = secondaryHash(index, cells, mask);
             while (slots[position] != 0) : (position = (position + 1) & mask) {
                 const entry = slots[position] - 1;
@@ -1081,9 +1265,24 @@ pub fn Storage(comptime config: types.Config) type {
                 if (cells[column] == .null_value) return .free;
             };
             if (!hasIndexHash(table, which)) return scanUnique(table, index.keyColumns(), cells, own_slot, snap, control);
+            var waiting: ?u16 = null;
+            if (!index.hash) {
+                // Every candidate is an entry with an equal key: a range of
+                // the tree (unique indexes have plain key columns only).
+                var span: Span = undefined;
+                plainSpan(index, cells, &span);
+                var scan = indexScan(table, which, &span, false);
+                while (scanNext(table, which, &scan)) |entry| {
+                    if (control) |accounting| try accounting.checkpoint();
+                    const version = &table.versions[entry];
+                    if (version.rowSlot() == own_slot) continue;
+                    if (!sameColumns(index.keyColumns(), borrowVersionRow(table, entry, &row_scratch), cells)) continue;
+                    if (classify(version, entry, snap, &waiting)) |state| return state;
+                }
+                return if (waiting) |slot| .{ .wait = slot } else .free;
+            }
             const slots = slotsConst(table, which);
             const mask = slots.len - 1;
-            var waiting: ?u16 = null;
             var position = secondaryHash(index, cells, mask);
             while (slots[position] != 0) : (position = (position + 1) & mask) {
                 const entry = slots[position] - 1;
@@ -1093,6 +1292,684 @@ pub fn Storage(comptime config: types.Config) type {
                 if (classify(version, entry, snap, &waiting)) |state| return state;
             }
             return if (waiting) |slot| .{ .wait = slot } else .free;
+        }
+
+        // ---- ordered (btree) index trees (B11 wave 5) -----------------------
+        //
+        // An ordered index is a B+tree of version references in the index's
+        // run: node 0 holds the tree's metadata, every other node is a leaf
+        // or an internal node of node_words words. A leaf entry is (cached
+        // key, version). An internal entry is (cached key, child, version)
+        // of its child's first leaf entry, so every separator is a live entry
+        // of the tree: a reclaimed version never leaves a stale separator.
+        // Entries order by the key elements (DESC and NULLS FIRST per
+        // element, values by the engine's comparator: code-point order for
+        // text), then by row slot (heap order, the order a stable sort of a
+        // scan keeps for ties), then by version. Expression elements do not
+        // take part in the order. Every version is an entry, visible or not,
+        // until reclamation removes it; readers filter by visibility.
+        //
+        // Inserts split full nodes upward (the left half keeps half + 1
+        // entries), deletes borrow from a sibling with more than half or
+        // merge with it, so every non-root node keeps at least half its
+        // fanout: the node arena sized by treeNodes always suffices and
+        // every operation touches at most btree_depth nodes per level step.
+
+        const key_at: usize = 4;
+        const ref_at: usize = 4 + 2 * btree_fanout;
+        const min_at: usize = 4 + 3 * btree_fanout;
+        const leaf_flag: u32 = 0x10000;
+        const meta_root: usize = 0;
+        const meta_height: usize = 1;
+        const meta_free: usize = 2;
+        const meta_high: usize = 3;
+        const meta_entries: usize = 4;
+        const meta_free_count: usize = 5;
+        /// Cached key of a value the comparator alone orders.
+        const opaque_key: u64 = 0x8000000000000000;
+        const null_cell: V.Cell = .null_value;
+
+        inline fn nodeAt(run: []u32, node: u32) []u32 {
+            return run[@as(usize, node) * node_words ..][0..node_words];
+        }
+
+        inline fn nodeConst(run: []const u32, node: u32) []const u32 {
+            return run[@as(usize, node) * node_words ..][0..node_words];
+        }
+
+        inline fn nodeCount(n: []const u32) usize {
+            return n[0] & 0xffff;
+        }
+
+        inline fn nodeLeaf(n: []const u32) bool {
+            return n[0] & leaf_flag != 0;
+        }
+
+        inline fn setCount(n: []u32, count: usize) void {
+            n[0] = (n[0] & leaf_flag) | @as(u32, @intCast(count));
+        }
+
+        inline fn entryKey(n: []const u32, i: usize) u64 {
+            return @as(u64, n[key_at + 2 * i + 1]) << 32 | n[key_at + 2 * i];
+        }
+
+        inline fn entryRef(n: []const u32, i: usize) u32 {
+            return n[ref_at + i];
+        }
+
+        inline fn entryMin(n: []const u32, i: usize) u32 {
+            return n[min_at + i];
+        }
+
+        inline fn setEntry(n: []u32, i: usize, key: u64, ref: u32, min: u32) void {
+            n[key_at + 2 * i] = @truncate(key);
+            n[key_at + 2 * i + 1] = @truncate(key >> 32);
+            n[ref_at + i] = ref;
+            n[min_at + i] = min;
+        }
+
+        inline fn setMin(n: []u32, i: usize, key: u64, min: u32) void {
+            n[key_at + 2 * i] = @truncate(key);
+            n[key_at + 2 * i + 1] = @truncate(key >> 32);
+            n[min_at + i] = min;
+        }
+
+        inline fn copyEntry(dst: []u32, di: usize, src: []const u32, si: usize) void {
+            setEntry(dst, di, entryKey(src, si), entryRef(src, si), entryMin(src, si));
+        }
+
+        fn moveEntries(dst: []u32, di: usize, src: []const u32, si: usize, count: usize) void {
+            for (0..count) |k| copyEntry(dst, di + k, src, si + k);
+        }
+
+        /// Opens a hole at `pos` of a node holding `count` entries.
+        fn shiftRight(n: []u32, pos: usize, count: usize) void {
+            var k = count;
+            while (k > pos) : (k -= 1) copyEntry(n, k, n, k - 1);
+        }
+
+        /// Closes entry `pos` of a node holding `count` entries.
+        fn shiftLeft(n: []u32, pos: usize, count: usize) void {
+            for (pos + 1..count) |k| copyEntry(n, k - 1, n, k);
+        }
+
+        fn allocNode(run: []u32, leaf: bool) u32 {
+            const meta = nodeAt(run, 0);
+            var node: u32 = undefined;
+            if (meta[meta_free] != 0) {
+                node = meta[meta_free];
+                meta[meta_free] = nodeConst(run, node)[1];
+                meta[meta_free_count] -= 1;
+            } else {
+                if (meta[meta_high] == 0) meta[meta_high] = 1;
+                node = meta[meta_high];
+                meta[meta_high] += 1;
+            }
+            const n = nodeAt(run, node);
+            n[0] = if (leaf) leaf_flag else 0;
+            n[1] = 0;
+            n[2] = 0;
+            n[3] = 0;
+            return node;
+        }
+
+        fn freeNode(run: []u32, node: u32) void {
+            const meta = nodeAt(run, 0);
+            const n = nodeAt(run, node);
+            n[0] = 0;
+            n[1] = meta[meta_free];
+            meta[meta_free] = node;
+            meta[meta_free_count] += 1;
+        }
+
+        /// Nodes a tree can still allocate.
+        fn freeNodes(run: []const u32) usize {
+            const meta = nodeConst(run, 0);
+            const capacity = run.len / node_words;
+            const high = @max(1, meta[meta_high]);
+            if (high > capacity) return 0;
+            return capacity - high + meta[meta_free_count];
+        }
+
+        fn treeCount(run: []const u32) usize {
+            const meta = nodeConst(run, 0);
+            if (meta[meta_root] == 0) return 0;
+            var node = meta[meta_root];
+            while (!nodeLeaf(nodeConst(run, node))) node = entryRef(nodeConst(run, node), 0);
+            var count: usize = 0;
+            while (node != 0) : (node = nodeConst(run, node)[1]) count += nodeCount(nodeConst(run, node));
+            return count;
+        }
+
+        /// The order of one key element: NULLs first or last per element,
+        /// values by the engine comparator, reversed for DESC.
+        fn elementOrder(a: *const V.Cell, b: *const V.Cell, option: u8) i8 {
+            const a_null = a.* == .null_value;
+            const b_null = b.* == .null_value;
+            if (a_null or b_null) {
+                if (a_null and b_null) return 0;
+                return if (a_null == (option & 2 != 0)) -1 else 1;
+            }
+            const order = V.compare(a, b);
+            return if (option & 1 != 0) -order else order;
+        }
+
+        /// The order of two values of one key element with index options
+        /// `option` (bit 0 DESC, bit 1 NULLS FIRST).
+        pub fn keyOrder(a: *const V.Cell, b: *const V.Cell, option: u8) i8 {
+            return elementOrder(a, b, option);
+        }
+
+        /// Whether two versions have equal plain key elements in index `which`.
+        pub fn sameIndexKey(table: *const Table, which: usize, left: u32, right: u32) bool {
+            var left_scratch: VersionRowScratch = undefined;
+            var right_scratch: VersionRowScratch = undefined;
+            const index = &table.indexes[which];
+            const a = borrowVersionRow(table, left, &left_scratch);
+            const b = borrowVersionRow(table, right, &right_scratch);
+            for (index.keyColumns(), index.options[0..index.key_count]) |column, option| {
+                if (column == expression_key) continue;
+                if (elementOrder(&a[column], &b[column], option) != 0) return false;
+            }
+            return true;
+        }
+
+        fn signedKey(value: i64) u64 {
+            return @as(u64, @bitCast(value)) ^ 0x8000000000000000;
+        }
+
+        fn bytesKey(bytes: []const u8) u64 {
+            var key: u64 = 0;
+            for (0..8) |i| {
+                key <<= 8;
+                if (i < bytes.len) key |= bytes[i];
+            }
+            return key;
+        }
+
+        /// The cached (abbreviated) key of a first key element: an order
+        /// the element order never contradicts (a < b implies key(a) <=
+        /// key(b)), so unequal cached keys decide and equal ones fall back
+        /// to the comparator.
+        pub fn abbreviate(cell: *const V.Cell, option: u8) u64 {
+            if (cell.* == .null_value) return if (option & 2 != 0) 0 else 0xffffffffffffffff;
+            const raw: u64 = switch (cell.*) {
+                .integer => |value| signedKey(value),
+                .date => |value| signedKey(value),
+                .timestamp, .timestamptz, .time, .money => |value| signedKey(value),
+                .boolean => |value| @intFromBool(value),
+                .pg_lsn, .xid8 => |value| value,
+                .regtype, .regproc => |value| value,
+                .pg_internal_char => |value| value,
+                .text, .bytea => |*text| bytesKey(text.slice()),
+                .bpchar => |*text| bytesKey(character.trimmed(text.slice())),
+                else => opaque_key,
+            };
+            return if (option & 1 != 0) ~raw else raw;
+        }
+
+        fn rowKey(index: *const Index, row: *const VersionRow) u64 {
+            if (index.key_count == 0 or index.keys[0] == expression_key) return opaque_key;
+            return abbreviate(&row[index.keys[0]], index.options[0]);
+        }
+
+        /// A position in the order: a version's own entry, or a probe of the
+        /// first `count` key elements (`cells`, the last one `tail` when
+        /// set) that sorts before (-1) or after (+1) every equal entry.
+        const Target = struct {
+            row: ?*const VersionRow = null,
+            cells: [*]const V.Cell = undefined,
+            tail: ?*const V.Cell = null,
+            count: usize = 0,
+            key: u64 = 0,
+            sentinel: i8 = 0,
+            slot: u32 = 0,
+            version: u32 = 0,
+
+            fn cell(self: *const Target, index: *const Index, i: usize) *const V.Cell {
+                if (self.row) |row| return &row[index.keys[i]];
+                if (self.tail) |tail| if (i + 1 == self.count) return tail;
+                return &self.cells[i];
+            }
+        };
+
+        fn probeKey(index: *const Index, target: *const Target) u64 {
+            if (target.count == 0 or index.keys[0] == expression_key) return opaque_key;
+            return abbreviate(target.cell(index, 0), index.options[0]);
+        }
+
+        fn versionTarget(table: *const Table, index: *const Index, version: u32, scratch: *VersionRowScratch) Target {
+            const row = borrowVersionRow(table, version, scratch);
+            return .{ .row = row, .count = index.key_count, .key = rowKey(index, row), .slot = table.versions[version].rowSlot(), .version = version };
+        }
+
+        /// Order of entry (version, cached key) against a target.
+        fn compareEntry(table: *const Table, index: *const Index, version: u32, key: u64, target: *const Target, scratch: *VersionRowScratch) i8 {
+            if (target.count != 0) {
+                if (key != target.key) return if (key < target.key) -1 else 1;
+                const row = borrowVersionRow(table, version, scratch);
+                for (0..target.count) |i| {
+                    const column = index.keys[i];
+                    if (column == expression_key) continue;
+                    const order = elementOrder(&row[column], target.cell(index, i), index.options[i]);
+                    if (order != 0) return order;
+                }
+            }
+            if (target.sentinel != 0) return -target.sentinel;
+            const slot = table.versions[version].rowSlot();
+            if (slot != target.slot) return if (slot < target.slot) -1 else 1;
+            if (version != target.version) return if (version < target.version) -1 else 1;
+            return 0;
+        }
+
+        /// The child of an internal node whose subtree holds the target's
+        /// position: the last entry whose first version is not after it.
+        fn childFor(table: *const Table, index: *const Index, n: []const u32, target: *const Target, scratch: *VersionRowScratch) usize {
+            var low: usize = 0;
+            var high: usize = nodeCount(n);
+            while (low < high) {
+                const mid = low + (high - low) / 2;
+                if (compareEntry(table, index, entryMin(n, mid), entryKey(n, mid), target, scratch) <= 0) low = mid + 1 else high = mid;
+            }
+            return if (low == 0) 0 else low - 1;
+        }
+
+        /// First leaf position whose entry is not before the target.
+        fn lowerPos(table: *const Table, index: *const Index, n: []const u32, target: *const Target, scratch: *VersionRowScratch) usize {
+            var low: usize = 0;
+            var high: usize = nodeCount(n);
+            while (low < high) {
+                const mid = low + (high - low) / 2;
+                if (compareEntry(table, index, entryRef(n, mid), entryKey(n, mid), target, scratch) < 0) low = mid + 1 else high = mid;
+            }
+            return low;
+        }
+
+        const Step = struct { node: u32, pos: u32 };
+        const Path = [btree_depth]Step;
+
+        /// Descends to the leaf for `target`, recording the internal steps.
+        fn descend(table: *const Table, index: *const Index, run: []const u32, target: *const Target, path: *Path, depth: *usize, scratch: *VersionRowScratch) u32 {
+            var node = nodeConst(run, 0)[meta_root];
+            depth.* = 0;
+            while (!nodeLeaf(nodeConst(run, node))) {
+                const n = nodeConst(run, node);
+                const pos = childFor(table, index, n, target, scratch);
+                path[depth.*] = .{ .node = node, .pos = @intCast(pos) };
+                depth.* += 1;
+                node = entryRef(n, pos);
+            }
+            return node;
+        }
+
+        /// A node's first entry changed: its ancestors' entries for it (and
+        /// theirs, while it stays a first child) follow.
+        fn propagateMin(run: []u32, path: *const Path, depth: usize, key: u64, min: u32) void {
+            var level = depth;
+            while (level != 0) {
+                level -= 1;
+                const step = path[level];
+                setMin(nodeAt(run, step.node), step.pos, key, min);
+                if (step.pos != 0) return;
+            }
+        }
+
+        /// Inserts (key, ref, min) at `pos` of `node`, whose ancestors are
+        /// path[0..depth], splitting full nodes upward.
+        fn insertEntry(run: []u32, path: *const Path, depth_in: usize, node_in: u32, pos_in: usize, key_in: u64, ref_in: u32, min_in: u32) void {
+            var depth = depth_in;
+            var node = node_in;
+            var pos = pos_in;
+            var key = key_in;
+            var ref = ref_in;
+            var min = min_in;
+            while (true) {
+                const n = nodeAt(run, node);
+                const count = nodeCount(n);
+                if (count < btree_fanout) {
+                    shiftRight(n, pos, count);
+                    setEntry(n, pos, key, ref, min);
+                    setCount(n, count + 1);
+                    if (pos == 0) propagateMin(run, path, depth, key, min);
+                    return;
+                }
+                const leaf = nodeLeaf(n);
+                const right = allocNode(run, leaf);
+                const r = nodeAt(run, right);
+                if (pos <= half_fanout) {
+                    moveEntries(r, 0, n, half_fanout, half_fanout);
+                    setCount(r, half_fanout);
+                    shiftRight(n, pos, half_fanout);
+                    setEntry(n, pos, key, ref, min);
+                    setCount(n, half_fanout + 1);
+                    if (pos == 0) propagateMin(run, path, depth, key, min);
+                } else {
+                    moveEntries(r, 0, n, half_fanout + 1, half_fanout - 1);
+                    setCount(n, half_fanout + 1);
+                    const at = pos - (half_fanout + 1);
+                    shiftRight(r, at, half_fanout - 1);
+                    setEntry(r, at, key, ref, min);
+                    setCount(r, half_fanout);
+                }
+                if (leaf) {
+                    r[1] = n[1];
+                    r[2] = node;
+                    if (n[1] != 0) nodeAt(run, n[1])[2] = right;
+                    n[1] = right;
+                }
+                if (depth == 0) {
+                    const root = allocNode(run, false);
+                    const t = nodeAt(run, root);
+                    setEntry(t, 0, entryKey(n, 0), node, entryMin(n, 0));
+                    setEntry(t, 1, entryKey(r, 0), right, entryMin(r, 0));
+                    setCount(t, 2);
+                    const meta = nodeAt(run, 0);
+                    meta[meta_root] = root;
+                    meta[meta_height] += 1;
+                    return;
+                }
+                depth -= 1;
+                const parent = path[depth];
+                key = entryKey(r, 0);
+                min = entryMin(r, 0);
+                ref = right;
+                node = parent.node;
+                pos = parent.pos + 1;
+            }
+        }
+
+        fn treeInsert(table: *Table, which: usize, version: u32) void {
+            const index = &table.indexes[which];
+            const run = runOf(table, which);
+            var target_scratch: VersionRowScratch = undefined;
+            var scratch: VersionRowScratch = undefined;
+            const target = versionTarget(table, index, version, &target_scratch);
+            const meta = nodeAt(run, 0);
+            meta[meta_entries] += 1;
+            if (meta[meta_root] == 0) {
+                const root = allocNode(run, true);
+                const n = nodeAt(run, root);
+                setEntry(n, 0, target.key, version, version);
+                setCount(n, 1);
+                meta[meta_root] = root;
+                meta[meta_height] = 1;
+                return;
+            }
+            var path: Path = undefined;
+            var depth: usize = 0;
+            const leaf = descend(table, index, run, &target, &path, &depth, &scratch);
+            const pos = lowerPos(table, index, nodeConst(run, leaf), &target, &scratch);
+            insertEntry(run, &path, depth, leaf, pos, target.key, version, version);
+        }
+
+        /// Restores half occupancy from `node` (at path depth `depth`) up:
+        /// borrow from a sibling with more than half, else merge with it;
+        /// a root with one child gives way to that child.
+        fn rebalance(run: []u32, path: *const Path, depth_in: usize, node_in: u32) void {
+            var depth = depth_in;
+            var node = node_in;
+            while (depth != 0 and nodeCount(nodeConst(run, node)) < half_fanout) {
+                const parent = path[depth - 1];
+                const p = nodeAt(run, parent.node);
+                const n = nodeAt(run, node);
+                const pcount = nodeCount(p);
+                const count = nodeCount(n);
+                if (parent.pos > 0) {
+                    const l = nodeAt(run, entryRef(p, parent.pos - 1));
+                    const lcount = nodeCount(l);
+                    if (lcount > half_fanout) {
+                        shiftRight(n, 0, count);
+                        copyEntry(n, 0, l, lcount - 1);
+                        setCount(n, count + 1);
+                        setCount(l, lcount - 1);
+                        setMin(p, parent.pos, entryKey(n, 0), entryMin(n, 0));
+                        return;
+                    }
+                }
+                if (parent.pos + 1 < pcount) {
+                    const r = nodeAt(run, entryRef(p, parent.pos + 1));
+                    const rcount = nodeCount(r);
+                    if (rcount > half_fanout) {
+                        copyEntry(n, count, r, 0);
+                        setCount(n, count + 1);
+                        shiftLeft(r, 0, rcount);
+                        setCount(r, rcount - 1);
+                        setMin(p, parent.pos + 1, entryKey(r, 0), entryMin(r, 0));
+                        return;
+                    }
+                }
+                // Merge: the left node of the pair absorbs the right one.
+                const left_pos: usize = if (parent.pos > 0) parent.pos - 1 else 0;
+                const keep = entryRef(p, left_pos);
+                const gone = entryRef(p, left_pos + 1);
+                const k = nodeAt(run, keep);
+                const g = nodeAt(run, gone);
+                const kcount = nodeCount(k);
+                moveEntries(k, kcount, g, 0, nodeCount(g));
+                setCount(k, kcount + nodeCount(g));
+                if (nodeLeaf(k)) {
+                    k[1] = g[1];
+                    if (g[1] != 0) nodeAt(run, g[1])[2] = keep;
+                }
+                freeNode(run, gone);
+                shiftLeft(p, left_pos + 1, pcount);
+                setCount(p, pcount - 1);
+                depth -= 1;
+                node = parent.node;
+            }
+            const meta = nodeAt(run, 0);
+            while (meta[meta_root] != 0) {
+                const root = meta[meta_root];
+                const r = nodeConst(run, root);
+                if (nodeLeaf(r) or nodeCount(r) != 1) break;
+                meta[meta_root] = entryRef(r, 0);
+                meta[meta_height] -= 1;
+                freeNode(run, root);
+            }
+        }
+
+        fn treeDelete(table: *Table, which: usize, version: u32) void {
+            const index = &table.indexes[which];
+            const run = runOf(table, which);
+            const meta = nodeAt(run, 0);
+            if (meta[meta_root] == 0) return;
+            var target_scratch: VersionRowScratch = undefined;
+            var scratch: VersionRowScratch = undefined;
+            const target = versionTarget(table, index, version, &target_scratch);
+            var path: Path = undefined;
+            var depth: usize = 0;
+            const leaf = descend(table, index, run, &target, &path, &depth, &scratch);
+            const n = nodeAt(run, leaf);
+            const count = nodeCount(n);
+            const pos = lowerPos(table, index, n, &target, &scratch);
+            if (pos == count or entryRef(n, pos) != version) return;
+            meta[meta_entries] -= 1;
+            shiftLeft(n, pos, count);
+            setCount(n, count - 1);
+            if (depth == 0) {
+                if (count == 1) {
+                    freeNode(run, leaf);
+                    meta[meta_root] = 0;
+                    meta[meta_height] = 0;
+                }
+                return;
+            }
+            if (pos == 0) propagateMin(run, &path, depth, entryKey(n, 0), entryMin(n, 0));
+            rebalance(run, &path, depth, leaf);
+        }
+
+        /// Value-domain bounds over an ordered index: key elements
+        /// 0..eq equal cells[0..eq] (a NULL cell matches NULL keys, as IS
+        /// NULL does); with `ranged`, element `eq` is non-NULL and lies
+        /// within the bounds that are set.
+        pub const Span = struct {
+            cells: [config.columns]V.Cell = undefined,
+            eq: usize = 0,
+            ranged: bool = false,
+            has_low: bool = false,
+            low_inclusive: bool = true,
+            low: V.Cell = .null_value,
+            has_high: bool = false,
+            high_inclusive: bool = true,
+            high: V.Cell = .null_value,
+        };
+
+        /// An ordered index walk between two targets, in either direction.
+        pub const Scan = struct {
+            start: Target,
+            stop: Target,
+            node: u32 = 0,
+            pos: u32 = 0,
+            backward: bool = false,
+        };
+
+        fn spanTargets(index: *const Index, span: *const Span, start: *Target, stop: *Target) void {
+            start.* = .{ .cells = &span.cells, .count = span.eq, .sentinel = -1 };
+            stop.* = .{ .cells = &span.cells, .count = span.eq, .sentinel = 1 };
+            if (span.ranged and span.eq < index.key_count) {
+                const option = index.options[span.eq];
+                const descending = option & 1 != 0;
+                const nulls_first = option & 2 != 0;
+                // The bound met first in index order, then the last one.
+                const first_set = if (descending) span.has_high else span.has_low;
+                const first: *const V.Cell = if (descending) &span.high else &span.low;
+                const first_inclusive = if (descending) span.high_inclusive else span.low_inclusive;
+                const last_set = if (descending) span.has_low else span.has_high;
+                const last: *const V.Cell = if (descending) &span.low else &span.high;
+                const last_inclusive = if (descending) span.low_inclusive else span.high_inclusive;
+                if (first_set) {
+                    start.* = .{ .cells = &span.cells, .tail = first, .count = span.eq + 1, .sentinel = if (first_inclusive) -1 else 1 };
+                } else if (nulls_first) {
+                    start.* = .{ .cells = &span.cells, .tail = &null_cell, .count = span.eq + 1, .sentinel = 1 };
+                }
+                if (last_set) {
+                    stop.* = .{ .cells = &span.cells, .tail = last, .count = span.eq + 1, .sentinel = if (last_inclusive) 1 else -1 };
+                } else if (!nulls_first) {
+                    stop.* = .{ .cells = &span.cells, .tail = &null_cell, .count = span.eq + 1, .sentinel = -1 };
+                }
+            }
+            start.key = probeKey(index, start);
+            stop.key = probeKey(index, stop);
+        }
+
+        /// Positions a walk over the entries of `span` (ordered index
+        /// `which` with a tree); scanNext returns their versions in index
+        /// order (reversed when `backward`), visible or not.
+        pub fn indexScan(table: *const Table, which: usize, span: *const Span, backward: bool) Scan {
+            var scratch: VersionRowScratch = undefined;
+            const index = &table.indexes[which];
+            const run = runConst(table, which);
+            var scan: Scan = .{ .start = undefined, .stop = undefined, .backward = backward };
+            spanTargets(index, span, &scan.start, &scan.stop);
+            if (nodeConst(run, 0)[meta_root] == 0) return scan;
+            var path: Path = undefined;
+            var depth: usize = 0;
+            const target = if (backward) &scan.stop else &scan.start;
+            const leaf = descend(table, index, run, target, &path, &depth, &scratch);
+            const pos = lowerPos(table, index, nodeConst(run, leaf), target, &scratch);
+            scan.node = leaf;
+            // Backward walks keep the position after the next entry.
+            scan.pos = @intCast(pos);
+            return scan;
+        }
+
+        pub fn scanNext(table: *const Table, which: usize, scan: *Scan) ?u32 {
+            var scratch: VersionRowScratch = undefined;
+            const index = &table.indexes[which];
+            const run = runConst(table, which);
+            while (scan.node != 0) {
+                const n = nodeConst(run, scan.node);
+                if (scan.backward) {
+                    if (scan.pos == 0) {
+                        scan.node = n[2];
+                        if (scan.node != 0) scan.pos = @intCast(nodeCount(nodeConst(run, scan.node)));
+                        continue;
+                    }
+                    const at = scan.pos - 1;
+                    const version = entryRef(n, at);
+                    if (compareEntry(table, index, version, entryKey(n, at), &scan.start, &scratch) <= 0) {
+                        scan.node = 0;
+                        return null;
+                    }
+                    scan.pos = at;
+                    return version;
+                }
+                if (scan.pos >= nodeCount(n)) {
+                    scan.node = n[1];
+                    scan.pos = 0;
+                    continue;
+                }
+                const version = entryRef(n, scan.pos);
+                if (compareEntry(table, index, version, entryKey(n, scan.pos), &scan.stop, &scratch) >= 0) {
+                    scan.node = 0;
+                    return null;
+                }
+                scan.pos += 1;
+                return version;
+            }
+            return null;
+        }
+
+        /// Structural check of tree `which` (contracts): entry order,
+        /// separators equal to their child's first entry, half occupancy
+        /// below the root, uniform height, leaf links, counts, and one entry
+        /// per allocated version.
+        pub fn indexTreeValid(table: *const Table, which: usize) bool {
+            if (!hasIndexTree(table, which)) return true;
+            var scratch: VersionRowScratch = undefined;
+            var target_scratch: VersionRowScratch = undefined;
+            const index = &table.indexes[which];
+            const run = runConst(table, which);
+            const meta = nodeConst(run, 0);
+            if (meta[meta_root] == 0) return table.version_used == 0 and meta[meta_entries] == 0;
+            var first = meta[meta_root];
+            var height: usize = 1;
+            while (!nodeLeaf(nodeConst(run, first))) : (height += 1) {
+                if (height > btree_depth) return false;
+                first = entryRef(nodeConst(run, first), 0);
+            }
+            if (height != meta[meta_height]) return false;
+            if (!subtreeValid(run, meta[meta_root], meta[meta_root], height)) return false;
+            var previous: u32 = 0;
+            var last: ?u32 = null;
+            var count: usize = 0;
+            var node = first;
+            while (node != 0) {
+                const n = nodeConst(run, node);
+                if (!nodeLeaf(n) or n[2] != previous) return false;
+                for (0..nodeCount(n)) |i| {
+                    const version = entryRef(n, i);
+                    if (version >= table.version_high or table.versions[version].rowLink() == 0) return false;
+                    if (entryMin(n, i) != version) return false;
+                    const own = versionTarget(table, index, version, &target_scratch);
+                    if (own.key != entryKey(n, i)) return false;
+                    if (last) |before| {
+                        if (compareEntry(table, index, before, rowKey(index, borrowVersionRow(table, before, &scratch)), &own, &scratch) >= 0) return false;
+                    }
+                    last = version;
+                    count += 1;
+                }
+                if (count > table.version_high) return false;
+                previous = node;
+                node = n[1];
+            }
+            return count == table.version_used and count == meta[meta_entries];
+        }
+
+        fn subtreeValid(run: []const u32, node: u32, root: u32, height: usize) bool {
+            const n = nodeConst(run, node);
+            const count = nodeCount(n);
+            if (count == 0 or count > btree_fanout) return false;
+            if (node != root and count < half_fanout) return false;
+            if (nodeLeaf(n)) return height == 1;
+            if (height <= 1) return false;
+            for (0..count) |i| {
+                const c = nodeConst(run, entryRef(n, i));
+                if (nodeCount(c) == 0) return false;
+                if (entryMin(c, 0) != entryMin(n, i) or entryKey(c, 0) != entryKey(n, i)) return false;
+                if (!subtreeValid(run, entryRef(n, i), root, height - 1)) return false;
+            }
+            return true;
         }
 
         /// One candidate of a unique check (PostgreSQL's dirty snapshot):

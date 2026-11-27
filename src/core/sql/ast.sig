@@ -794,6 +794,8 @@ pub fn Ast(comptime config: types.Config) type {
             nulls_not_distinct: bool = false,
             predicate: Span = .{},
             predicate_node: u16 = none,
+            /// USING hash (B11 wave 5); btree otherwise.
+            hash: bool = false,
         };
 
         /// CREATE [OR REPLACE] [TEMP] VIEW / CREATE MATERIALIZED VIEW name

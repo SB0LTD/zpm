@@ -291,18 +291,26 @@ var report_1m: usize = 0;
 var ram_version_bytes: usize = 0;
 var ram_plan_bytes: usize = 0;
 
+/// One run: the larger of a hash of key_index slots (pow2(2 x versions))
+/// and an ordered index's worst-case node arena over every version (B11
+/// wave 5: CREATE INDEX defaults to btree).
+fn runWords(key_slots: usize, versions: usize) !usize {
+    const words = try DB.indexRunWords(key_slots, versions);
+    try check(words >= key_slots and words % DB.index_node_words == 0);
+    return words;
+}
+
 fn layout() !void {
-    // pow2(2 x versions) u32 slots per index: the key-index size.
-    try check(try perIndex(rows_budget, versions_budget) == 128 * 4);
+    try check(try perIndex(rows_budget, versions_budget) == try runWords(128, versions_budget) * 4);
     report_1k = try perIndex(512, 1024);
-    try check(report_1k == 2048 * 4);
+    try check(report_1k == try runWords(2048, 1024) * 4);
     report_8k = try perIndex(4096, 8192);
-    try check(report_8k == 16384 * 4);
+    try check(report_8k == try runWords(16384, 8192) * 4);
     report_1m = try perIndex(524288, 1048576);
-    try check(report_1m == 2097152 * 4);
-    try check(try perIndex(500000, 1000000) == 2097152 * 4);
+    try check(report_1m == try runWords(2097152, 1048576) * 4);
+    try check(try perIndex(500000, 1000000) == try runWords(2097152, 1000000) * 4);
     // Just above a power of two the hash doubles (load 25%..50%).
-    try check(try perIndex(600, 1025) == 4096 * 4);
+    try check(try perIndex(600, 1025) == try runWords(4096, 1025) * 4);
     ram_version_bytes = @sizeOf(Ram.StorageVersion);
     ram_plan_bytes = try Ram.backingBytesFor(@splat(.{ .rows = 4096, .versions = 8192 }), try Ram.queryReferenceCount(4096));
     // Binding: two runs of key_index.len slots per table; none when unbound.
@@ -313,7 +321,7 @@ fn layout() !void {
     // Odd row counts leave the compact scan bytes unaligned: both plans bind.
     try bind(&odd_bare, &mirror_region, 33, 67);
     try bind(&odd, &copy_region, 33, 67);
-    try check(odd_bare.tables[3].index_slots.len == 0 and odd.tables[3].index_slots.len == 2 * 256);
+    try check(odd_bare.tables[3].index_slots.len == 0 and odd.tables[3].index_slots.len == 2 * try runWords(256, 67));
     // Caller memory is not zeroed: nothing may read it before writing it.
     for ([_][]u8{ &primary_region, &replica_region, &copy_region, &recovered_region, &scanned_region, &bare_region }) |region| @memset(region, 0xaa);
     try bind(&db, &primary_region, rows_budget, versions_budget);
@@ -323,7 +331,7 @@ fn layout() !void {
     try check(DB.backingBytesFor(scan_plan, refs_count) == error.InvalidParameterValue);
     for (&scan_plan) |*budget| budget.secondary_hashes = 0;
     const scan_bytes = try DB.backingBytesFor(scan_plan, refs_count);
-    try check(required - scan_bytes == 4 * 2 * 128 * @sizeOf(u32));
+    try check(required - scan_bytes == 4 * 2 * try runWords(128, versions_budget) * @sizeOf(u32));
     try copy.bindMemoryFor(copy_region[0..scan_bytes], scan_plan, refs_count);
     try scanned.bindMemoryFor(scanned_region[0..scan_bytes], scan_plan, refs_count);
     var recover_plan = budgets(DB, 48, 128);
@@ -331,8 +339,8 @@ fn layout() !void {
     try recovered.bindMemoryFor(&recovered_region, recover_plan, refs_count);
     try bind(&bare, &bare_region, 48, 128);
     for (&db.tables, &recovered.tables, &bare.tables, recover_plan) |*table, *large, *unbound, budget| {
-        try check(table.key_index.len == 128 and table.index_slots.len == 2 * 128);
-        try check(large.key_index.len == 256 and large.index_slots.len == budget.secondary_hashes.? * 256 and large.scan_index_limit == 2);
+        try check(table.key_index.len == 128 and table.index_slots.len == 2 * try runWords(128, versions_budget));
+        try check(large.key_index.len == 256 and large.index_slots.len == budget.secondary_hashes.? * try runWords(256, 128) and large.scan_index_limit == 2);
         try check(unbound.index_slots.len == 0);
     }
     // Index slots sit inside the region, after their table's key index.
@@ -681,12 +689,15 @@ fn scannedIndexes() !void {
 
 // ---- per-slot bindings (bindStorage) ----------------------------------------
 
+/// One index run of a Manual table slot (32 versions, 64 key slots).
+const manual_run = DB.indexRunWords(64, 32) catch unreachable;
+
 const Manual = struct {
     rows: [4][16]DB.StorageRowSlot = undefined,
     versions: [4][32]DB.StorageVersion = undefined,
     row_index: [4][32]u32 = undefined,
     key_index: [4][64]u32 = undefined,
-    index_slots: [4][3 * 64]u32 = undefined,
+    index_slots: [4][3 * manual_run]u32 = undefined,
     refs: [2048]u32 = undefined,
     scan_values: [4][16 * 4]i64 = undefined,
     scan_nonnull: [4][16]u64 = undefined,
@@ -702,7 +713,7 @@ const Manual = struct {
             .scan_values = &self.scan_values[i],
             .scan_nonnull = &self.scan_nonnull[i],
             .scan_live = &self.scan_live[i],
-            .index_slots = self.index_slots[i][0 .. runs[i] * 64],
+            .index_slots = self.index_slots[i][0 .. runs[i] * manual_run],
         };
         return out;
     }
@@ -735,12 +746,12 @@ fn perSlot() !void {
     bad[1].index_slots = manual.index_slots[2][0..];
     if (sliced.bindStorage(bad, &manual.refs)) |_| return error.AliasingAccepted else |err| try check(err == error.InvalidParameterValue);
     bad = manual.backings(.{ 2, 0, 3, 1 });
-    bad[3].index_slots = @as([*]u32, @ptrCast(@alignCast(&manual.versions[3])))[0..64];
+    bad[3].index_slots = @as([*]u32, @ptrCast(@alignCast(&manual.versions[3])))[0..manual_run];
     if (sliced.bindStorage(bad, &manual.refs)) |_| return error.AliasingAccepted else |err| try check(err == error.InvalidParameterValue);
     try check(sliced.tables[0].rows.len == 0 and sliced.tables[0].index_slots.len == 0);
     // Slots 0..3 carry 2, 0, 3 and 1 index runs.
     try sliced.bindStorage(manual.backings(.{ 2, 0, 3, 1 }), &manual.refs);
-    try check(sliced.tables[2].index_slots.len == 3 * 64);
+    try check(sliced.tables[2].index_slots.len == 3 * manual_run);
     try mirror.bindMemoryFor(&mirror_region, budgets(DB, 16, 32), refs_count);
     try slicedRun("CREATE TABLE a (id INT PRIMARY KEY, g INT, v INT, w INT)");
     try slicedRun("INSERT INTO a VALUES (1, 1, 1, 1), (2, 1, 2, 2), (3, 2, 3, 3)");

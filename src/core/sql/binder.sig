@@ -144,6 +144,8 @@ pub fn Binder(comptime config: types.Config) type {
             order_count: usize,
             limit: u64,
             lock: ast.Locking = .{},
+            /// Ordered index access path (B11 wave 5), or none.
+            index: IndexPath = .{},
         };
 
         /// `values[c]` is the expression assigned to column c (a
@@ -5534,6 +5536,472 @@ pub fn Binder(comptime config: types.Config) type {
             return none;
         }
 
+        // ---- ordered index paths (B11 wave 5) ------------------------------
+
+        pub const no_index: u8 = 0xff;
+        /// Values of an IN list an index path walks one by one.
+        pub const index_list_capacity: usize = 16;
+        const index_conjuncts: usize = 32;
+
+        /// An ordered (btree) index access path of a single-table SELECT.
+        /// The executor evaluates the bound expressions once, walks the
+        /// index between them, keeps the versions its snapshot sees and
+        /// re-checks the whole WHERE on each, so a path only narrows the
+        /// rows a scan would test.
+        pub const IndexPath = struct {
+            which: u8 = no_index,
+            /// Leading key elements fixed by `element = bound` (eq[i]) or by
+            /// `element IS NULL` (eq[i] == none).
+            eq_count: u8 = 0,
+            eq: [config.columns]u16 = @splat(none),
+            /// Element eq_count: an IN (bounds) list (the in_list node), or
+            /// a range (`ranged`: non-NULL, between the bounds that are set).
+            list: u16 = none,
+            ranged: bool = false,
+            low: u16 = none,
+            low_inclusive: bool = true,
+            high: u16 = none,
+            high_inclusive: bool = true,
+            /// The walk yields the ORDER BY order (backward: reversed).
+            ordered: bool = false,
+            backward: bool = false,
+            /// Every column the query reads is a key or INCLUDE column.
+            covering: bool = false,
+            /// Equality on every key column of a UNIQUE index.
+            unique_lookup: bool = false,
+        };
+
+        fn collectConjuncts(context: *const Context, root: u16, out: *[index_conjuncts]u16) usize {
+            if (root == none) return 0;
+            var stack: [config.expr_depth + 2]u16 = undefined;
+            var used: usize = 1;
+            var count: usize = 0;
+            stack[0] = root;
+            while (used != 0) {
+                used -= 1;
+                const n = context.node(stack[used]);
+                if (n.kind == .and_op) {
+                    if (used + 2 > stack.len) continue;
+                    stack[used] = n.b;
+                    stack[used + 1] = n.a;
+                    used += 2;
+                    continue;
+                }
+                if (count == out.len) continue;
+                out[count] = stack[used];
+                count += 1;
+            }
+            return count;
+        }
+
+        /// A level-0 column of relation 0, through casts that keep its
+        /// values and order (integer widening, varchar / text).
+        fn indexedColumn(context: *const Context, id: u16) ?u16 {
+            var n = context.node(id);
+            var depth: usize = 0;
+            while (n.kind == .cast) : (depth += 1) {
+                if (depth == 4) return null;
+                const inner = context.node(n.a);
+                if (!keepingCast(inner.ty, n.ty, n.typmod)) return null;
+                n = inner;
+            }
+            if (n.kind != .column or n.level != 0 or n.relation != 0) return null;
+            return n.column;
+        }
+
+        fn integralWidth(ty: ast.Type) usize {
+            return switch (ty) {
+                .int2 => 2,
+                .int4 => 4,
+                .int8 => 8,
+                else => 0,
+            };
+        }
+
+        fn keepingCast(from: ast.Type, to: ast.Type, typmod: i32) bool {
+            if (from == to and typmod < 0) return true;
+            const from_width = integralWidth(from);
+            const to_width = integralWidth(to);
+            if (from_width != 0 and to_width != 0) return to_width >= from_width;
+            return (from == .varchar or from == .text) and (to == .text or (to == .varchar and typmod < 0));
+        }
+
+        /// A row-independent bound: literals, parameters, and casts,
+        /// arithmetic and immutable built-in calls over them.
+        fn indexBound(context: *const Context, id: u16, depth: usize) bool {
+            if (id == none or depth > 16) return false;
+            const n = context.node(id);
+            switch (n.kind) {
+                .null_literal, .bool_literal, .int_literal, .text_literal, .decimal_literal, .param => return true,
+                .cast, .unary => return indexBound(context, n.a, depth + 1),
+                .binary => return switch (n.op) {
+                    .add, .sub, .mul, .div, .mod, .concat => indexBound(context, n.a, depth + 1) and indexBound(context, n.b, depth + 1),
+                    else => false,
+                },
+                .function => {
+                    if (!ast.immutableBuiltin(n.func)) return false;
+                    var item = n.b;
+                    var items: usize = 0;
+                    while (item != none) : (item = context.node(item).next) {
+                        items += 1;
+                        if (items > 8 or !indexBound(context, item, depth + 1)) return false;
+                    }
+                    return true;
+                },
+                else => return false,
+            }
+        }
+
+        fn boundFor(context: *const Context, entry: *const S.Table, column: u16, id: u16) bool {
+            return indexBound(context, id, 0) and storedTag(entry, column, context.node(id).ty);
+        }
+
+        /// `column = bound` (either side): the bound.
+        fn equalityBound(context: *const Context, entry: *const S.Table, term: u16, column: u16) ?u16 {
+            const n = context.node(term);
+            if (n.kind != .binary or n.op != .eq) return null;
+            for ([2][2]u16{ .{ n.a, n.b }, .{ n.b, n.a } }) |pair| {
+                const side = indexedColumn(context, pair[0]) orelse continue;
+                if (side == column and boundFor(context, entry, column, pair[1])) return pair[1];
+            }
+            return null;
+        }
+
+        const RangeBound = struct { bound: u16, low: bool, inclusive: bool };
+
+        /// `column < bound` and the like (either side), as a value bound.
+        fn rangeBound(context: *const Context, entry: *const S.Table, term: u16, column: u16) ?RangeBound {
+            const n = context.node(term);
+            if (n.kind != .binary) return null;
+            switch (n.op) {
+                .lt, .le, .gt, .ge => {},
+                else => return null,
+            }
+            for ([2][2]u16{ .{ n.a, n.b }, .{ n.b, n.a } }, 0..) |pair, flipped| {
+                const side = indexedColumn(context, pair[0]) orelse continue;
+                if (side != column or !boundFor(context, entry, column, pair[1])) continue;
+                const less = (n.op == .lt or n.op == .le) == (flipped == 0);
+                return .{ .bound = pair[1], .low = !less, .inclusive = n.op == .le or n.op == .ge };
+            }
+            return null;
+        }
+
+        fn nullTest(context: *const Context, term: u16, column: u16, kind: ast.Test) bool {
+            const n = context.node(term);
+            if (n.kind != .test_op or n.test_kind != kind) return false;
+            const side = indexedColumn(context, n.a) orelse return false;
+            return side == column;
+        }
+
+        fn listBound(context: *const Context, entry: *const S.Table, term: u16, column: u16) bool {
+            const n = context.node(term);
+            if (n.kind != .in_list or n.negated) return false;
+            const side = indexedColumn(context, n.a) orelse return false;
+            if (side != column) return false;
+            var item = n.b;
+            var count: usize = 0;
+            while (item != none) : (item = context.node(item).next) {
+                count += 1;
+                if (count > index_list_capacity or !boundFor(context, entry, column, item)) return false;
+            }
+            return count != 0;
+        }
+
+        /// An integer literal (through casts and unary minus).
+        fn literalInteger(context: *const Context, id: u16) ?i64 {
+            const n = context.node(id);
+            return switch (n.kind) {
+                .int_literal => n.integer,
+                .cast => if (integralWidth(n.ty) != 0) literalInteger(context, n.a) else null,
+                .unary => if (n.op == .neg) blk: {
+                    const literal = literalInteger(context, n.a) orelse break :blk null;
+                    if (literal == -0x8000000000000000) break :blk null;
+                    break :blk -literal;
+                } else null,
+                else => null,
+            };
+        }
+
+        fn sameIndexExpr(context: *const Context, a: u16, b: u16, depth: usize) bool {
+            if (a == none or b == none) return a == b;
+            if (depth > 32) return false;
+            const x = context.node(a);
+            const y = context.node(b);
+            if (x.kind != y.kind or x.op != y.op or x.ty != y.ty or x.negated != y.negated) return false;
+            switch (x.kind) {
+                .column => return x.column == y.column and x.relation == y.relation and x.level == y.level,
+                .null_literal => return true,
+                .int_literal => return x.integer == y.integer,
+                .bool_literal => return x.boolean == y.boolean,
+                .test_op => return x.test_kind == y.test_kind and sameIndexExpr(context, x.a, y.a, depth + 1),
+                .cast => return x.typmod == y.typmod and sameIndexExpr(context, x.a, y.a, depth + 1),
+                .unary, .not_op => return sameIndexExpr(context, x.a, y.a, depth + 1),
+                .binary, .and_op, .or_op => return sameIndexExpr(context, x.a, y.a, depth + 1) and sameIndexExpr(context, x.b, y.b, depth + 1),
+                .in_list => {
+                    if (!sameIndexExpr(context, x.a, y.a, depth + 1)) return false;
+                    var i = x.b;
+                    var j = y.b;
+                    while (i != none and j != none) : ({
+                        i = context.node(i).next;
+                        j = context.node(j).next;
+                    }) if (!sameIndexExpr(context, i, j, depth + 1)) return false;
+                    return i == none and j == none;
+                },
+                else => return false,
+            }
+        }
+
+        /// A comparison of a column with an integer literal, column first.
+        const IntegerTerm = struct { column: u16, op: ast.Op, value: i64 };
+
+        fn integerTerm(context: *const Context, id: u16) ?IntegerTerm {
+            const n = context.node(id);
+            if (n.kind != .binary) return null;
+            switch (n.op) {
+                .eq, .lt, .le, .gt, .ge => {},
+                else => return null,
+            }
+            if (indexedColumn(context, n.a)) |column| {
+                const literal = literalInteger(context, n.b) orelse return null;
+                return .{ .column = column, .op = n.op, .value = literal };
+            }
+            const column = indexedColumn(context, n.b) orelse return null;
+            const literal = literalInteger(context, n.a) orelse return null;
+            const op: ast.Op = switch (n.op) {
+                .lt => .gt,
+                .le => .ge,
+                .gt => .lt,
+                .ge => .le,
+                else => n.op,
+            };
+            return .{ .column = column, .op = op, .value = literal };
+        }
+
+        /// Whether WHERE conjunct `term` implies partial-index predicate
+        /// conjunct `part` (PostgreSQL predicate_implied_by, a subset):
+        /// equal expressions, `col IS NOT NULL` by any strict comparison
+        /// of col, and integer comparisons a narrower one implies.
+        fn impliesTerm(context: *const Context, term: u16, part: u16) bool {
+            if (sameIndexExpr(context, term, part, 0)) return true;
+            const p = context.node(part);
+            if (p.kind == .test_op and p.test_kind == .is_not_null) {
+                const column = indexedColumn(context, p.a) orelse return false;
+                const t = context.node(term);
+                if (t.kind == .test_op and t.test_kind == .is_not_null) return (indexedColumn(context, t.a) orelse return false) == column;
+                if ((t.kind == .in_list or t.kind == .between) and !t.negated) return (indexedColumn(context, t.a) orelse return false) == column;
+                if (t.kind == .binary) switch (t.op) {
+                    .eq, .lt, .le, .gt, .ge => for ([_]u16{ t.a, t.b }) |side| {
+                        if ((indexedColumn(context, side) orelse continue) == column) return true;
+                    },
+                    else => {},
+                };
+                return false;
+            }
+            const want = integerTerm(context, part) orelse return false;
+            const have = integerTerm(context, term) orelse return false;
+            if (want.column != have.column) return false;
+            const k = want.value;
+            const v = have.value;
+            return switch (want.op) {
+                .eq => have.op == .eq and v == k,
+                .gt => switch (have.op) {
+                    .gt => v >= k,
+                    .ge, .eq => v > k,
+                    else => false,
+                },
+                .ge => switch (have.op) {
+                    .gt, .ge, .eq => v >= k,
+                    else => false,
+                },
+                .lt => switch (have.op) {
+                    .lt => v <= k,
+                    .le, .eq => v < k,
+                    else => false,
+                },
+                .le => switch (have.op) {
+                    .lt, .le, .eq => v <= k,
+                    else => false,
+                },
+                else => false,
+            };
+        }
+
+        /// A partial index is usable when the WHERE conjuncts imply every
+        /// conjunct of its predicate (its entries cover every row anyway).
+        fn predicateImplied(context: *const Context, table: usize, index: *const S.Index, terms: []const u16) bool {
+            const text = index.predicate.slice();
+            if (text.len == 0) return true;
+            const root = bindIndexText(context, text, table, true) catch return false;
+            var parts: [index_conjuncts]u16 = undefined;
+            const count = collectConjuncts(context, root, &parts);
+            if (count == 0 or count == parts.len) return false;
+            for (parts[0..count]) |part| {
+                var implied = false;
+                for (terms) |term| {
+                    if (impliesTerm(context, term, part)) {
+                        implied = true;
+                        break;
+                    }
+                }
+                if (!implied) return false;
+            }
+            return true;
+        }
+
+        /// Whether every column under `id` is one of `columns` (bit set).
+        fn columnsWithin(context: *const Context, id: u16, columns: u64, depth: usize) bool {
+            if (id == none) return true;
+            if (depth > config.expr_depth + 8) return false;
+            const n = context.node(id);
+            switch (n.kind) {
+                .column => return n.level != 0 or (n.column < 64 and columns & (@as(u64, 1) << @intCast(n.column)) != 0),
+                .catalog_tableoid, .scalar_subquery, .exists_subquery, .in_subquery, .aggregate => return false,
+                else => {},
+            }
+            if (!columnsWithin(context, n.a, columns, depth + 1) or !columnsWithin(context, n.c, columns, depth + 1)) return false;
+            if (!listOwner(n.kind)) return columnsWithin(context, n.b, columns, depth + 1);
+            var item = n.b;
+            while (item != none) : (item = context.node(item).next) if (!columnsWithin(context, item, columns, depth + 1)) return false;
+            return true;
+        }
+
+        /// Whether walking `index` in order yields ORDER BY's order, ties
+        /// included: the keys (after elements fixed by equality) must be
+        /// every remaining key element, all forward or all reversed. Null
+        /// when it does not; else whether the walk runs backward.
+        fn orderWalk(context: *const Context, index: *const S.Index, path: *const IndexPath, out: *const Select) ?bool {
+            if (out.order_count == 0 or path.list != none) return null;
+            var element: usize = path.eq_count;
+            var backward: ?bool = null;
+            for (out.order[0..out.order_count]) |*key| {
+                const n = context.node(key.expr);
+                if (n.kind != .column or n.level != 0 or n.relation != 0) return null;
+                var fixed = false;
+                for (index.keys[0..path.eq_count]) |column| fixed = fixed or column == n.column;
+                if (fixed) continue;
+                if (element >= index.key_count or index.keys[element] != n.column) return null;
+                const option = index.options[element];
+                const nulls_first = key.nulls_first orelse (config.nulls_first_ascending != key.descending);
+                const same_order = key.descending == (option & 1 != 0);
+                const same_nulls = nulls_first == (option & 2 != 0);
+                if (same_order != same_nulls) return null;
+                if (backward) |direction| if (direction == same_order) return null;
+                backward = !same_order;
+                element += 1;
+            }
+            if (element != index.key_count) return null;
+            return backward orelse false;
+        }
+
+        /// The index path of ordered index `which` for these WHERE
+        /// conjuncts, or null when it narrows nothing.
+        fn indexPathFor(context: *const Context, table: usize, which: usize, terms: []const u16, out: *const Select) ?IndexPath {
+            const entry = &context.tables[table];
+            const index = &entry.indexes[which];
+            var path: IndexPath = .{ .which = @intCast(which) };
+            for (index.keyColumns()) |column| {
+                if (column == S.expression_key) break;
+                var found = false;
+                for (terms) |term| {
+                    if (equalityBound(context, entry, term, column)) |bound| {
+                        path.eq[path.eq_count] = bound;
+                        found = true;
+                        break;
+                    }
+                    if (nullTest(context, term, column, .is_null)) {
+                        path.eq[path.eq_count] = none;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) break;
+                path.eq_count += 1;
+            }
+            if (path.eq_count < index.key_count and index.keys[path.eq_count] != S.expression_key) {
+                const column = index.keys[path.eq_count];
+                for (terms) |term| if (listBound(context, entry, term, column)) {
+                    path.list = term;
+                    break;
+                };
+                if (path.list == none) for (terms) |term| {
+                    const n = context.node(term);
+                    if (n.kind == .between and !n.negated and !n.symmetric and (indexedColumn(context, n.a) orelse 0xffff) == column and
+                        boundFor(context, entry, column, n.b) and boundFor(context, entry, column, n.c))
+                    {
+                        path.ranged = true;
+                        if (path.low == none) {
+                            path.low = n.b;
+                            path.low_inclusive = true;
+                        }
+                        if (path.high == none) {
+                            path.high = n.c;
+                            path.high_inclusive = true;
+                        }
+                        continue;
+                    }
+                    if (rangeBound(context, entry, term, column)) |range| {
+                        path.ranged = true;
+                        if (range.low and path.low == none) {
+                            path.low = range.bound;
+                            path.low_inclusive = range.inclusive;
+                        } else if (!range.low and path.high == none) {
+                            path.high = range.bound;
+                            path.high_inclusive = range.inclusive;
+                        }
+                    } else if (nullTest(context, term, column, .is_not_null)) path.ranged = true;
+                };
+            }
+            if (orderWalk(context, index, &path, out)) |backward| {
+                path.ordered = true;
+                path.backward = backward;
+            }
+            const narrows = path.eq_count != 0 or path.list != none or path.ranged;
+            // An ORDER BY alone uses the index for a LIMIT (top-N).
+            if (!narrows and !(path.ordered and out.limit != 0xffffffffffffffff)) return null;
+            path.unique_lookup = index.unique and path.eq_count == index.key_count;
+            var columns: u64 = 0;
+            for (index.keyColumns()) |column| if (column < 64) {
+                columns |= @as(u64, 1) << @intCast(column);
+            };
+            for (index.includes[0..index.include_count]) |column| if (column < 64) {
+                columns |= @as(u64, 1) << @intCast(column);
+            };
+            var covering = columnsWithin(context, out.where, columns, 0);
+            for (out.targets[0..out.count]) |target| covering = covering and columnsWithin(context, target, columns, 0);
+            for (out.order[0..out.order_count]) |*key| covering = covering and columnsWithin(context, key.expr, columns, 0);
+            path.covering = covering;
+            return path;
+        }
+
+        fn pathScore(path: *const IndexPath) usize {
+            return @as(usize, path.eq_count) * 8 + @as(usize, @intFromBool(path.list != none or path.ranged)) * 4 +
+                @as(usize, @intFromBool(path.ordered)) * 2 + @intFromBool(path.covering);
+        }
+
+        /// The best ordered index path of a single-table SELECT: the most
+        /// leading equalities, then a range or IN list, then an ORDER BY it
+        /// serves, then covering; the first such index on a tie. A primary
+        /// key equality keeps its own lookup.
+        fn chooseIndex(context: *const Context, table: usize, out: *const Select) IndexPath {
+            const entry = &context.tables[table];
+            if (entry.index_count == 0 or out.key != none) return .{};
+            var terms: [index_conjuncts]u16 = undefined;
+            const count = collectConjuncts(context, out.where, &terms);
+            var best: IndexPath = .{};
+            var best_score: usize = 0;
+            for (entry.indexes[0..entry.index_count], 0..) |*index, which| {
+                if (!S.hasIndexTree(entry, which)) continue;
+                const path = indexPathFor(context, table, which, terms[0..count], out) orelse continue;
+                if (!predicateImplied(context, table, index, terms[0..count])) continue;
+                const score = pathScore(&path);
+                if (score > best_score) {
+                    best = path;
+                    best_score = score;
+                }
+            }
+            return best;
+        }
+
         /// Whether a probe value of type `ty` has the key column's cell tag.
         fn storedTag(entry: *const S.Table, column: usize, ty: ast.Type) bool {
             return V.cellTag(entry.columns[column].data_type) == V.cellTag(types.dataTypeOf(ty));
@@ -5891,7 +6359,15 @@ pub fn Binder(comptime config: types.Config) type {
                 'p' => return error.UnsupportedStatement,
                 else => return error.WrongObjectType,
             }
-            var definition: S.Index = .{ .unique = create.unique, .nulls_not_distinct = create.nulls_not_distinct };
+            var definition: S.Index = .{ .unique = create.unique, .nulls_not_distinct = create.nulls_not_distinct, .hash = create.hash };
+            // PostgreSQL's hash access method (DefineIndex order): no
+            // unique, INCLUDE or multicolumn indexes, no ordering options.
+            if (create.hash) {
+                if (create.unique or create.include_count != 0 or create.count != 1) return error.UnsupportedStatement;
+                for (create.elements[0..create.count]) |*element| {
+                    if (element.descending or element.nulls_first != null) return error.UnsupportedStatement;
+                }
+            }
             var expressions: V.Text = .{};
             for (create.elements[0..create.count]) |*element| {
                 var column: u8 = S.expression_key;
@@ -6383,6 +6859,7 @@ pub fn Binder(comptime config: types.Config) type {
                 out.order_count += 1;
             }
             if (select.negative_limit) return error.InvalidRowCountInLimit;
+            if (out.table) |index| out.index = chooseIndex(context, index, &out);
             return out;
         }
 
