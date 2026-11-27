@@ -158,9 +158,10 @@ pub const extensions_format_version: u16 = 3;
 pub const constraint_identity_format_version: u16 = 4;
 pub const primary_index_identity_format_version: u16 = 5;
 pub const default_identity_format_version: u16 = 6;
-/// ddl-dml (wave 4): version 6 plus constraint flag bit 3, NOT VALID (a
-/// CHECK or FOREIGN KEY whose existing rows were not checked). Written only
-/// when a constraint is NOT VALID: older definitions stay byte-identical.
+/// ddl-dml (wave 4): version 6 plus constraint flag bits 3, NOT VALID (a
+/// CHECK or FOREIGN KEY whose existing rows were not checked), and 4, NOT
+/// ENFORCED (one never checked). Written only when a constraint has either:
+/// older definitions stay byte-identical.
 pub const not_valid_format_version: u16 = 7;
 
 pub const Op = enum(u8) { create_table = 1, drop_table = 2, insert = 3, update = 4, delete = 5, catalog_counters = 6, create_sequence = 7, drop_sequence = 8, sequence = 9, truncate = 11, alter_table = 12, create_sequence_cached = 13, alter_sequence = 14, create_schema = 15, drop_schema = 16, catalog_counters_with_constraints = 17, create_owned_schema = 18, create_private_schema = 19, catalog_counters_with_defaults = 20, create_scoped_identity_sequence = 21, create_scoped_sequence = 22, alter_sequence_ownership = 23, create_scoped_serial_sequence = 24, create_routine = 60, drop_routine = 61, create_trigger = 62, drop_trigger = 63, create_rule = 64, drop_rule = 65, object_create = 70, object_drop = 71, large_object_page = 72, create_routine_extended = 80, create_rule_action = 85 };
@@ -511,7 +512,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
         /// constraints of a table definition.
         pub fn encodeDefinition(writer: *Writer, table: *const S.Table) Error!void {
             var v7 = false;
-            for (table.constraints[0..table.constraint_count]) |*constraint| v7 = v7 or constraint.not_valid;
+            for (table.constraints[0..table.constraint_count]) |*constraint| v7 = v7 or constraint.not_valid or constraint.not_enforced;
             var v6 = v7;
             for (table.columns[0..table.column_count]) |*column| v6 = v6 or column.default_oid != 0;
             const v5 = v6 or table.primary_index_oid != 0;
@@ -537,7 +538,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
             for (table.constraints[0..table.constraint_count]) |*constraint| {
                 try writer.int(u8, @intFromEnum(constraint.kind));
                 try writer.name(constraint.name.slice());
-                try writer.int(u8, @as(u8, @intFromBool(constraint.nulls_not_distinct)) | (@as(u8, @intFromBool(constraint.deferrable)) << 1) | (@as(u8, @intFromBool(constraint.initially_deferred)) << 2) | (@as(u8, @intFromBool(constraint.not_valid)) << 3));
+                try writer.int(u8, @as(u8, @intFromBool(constraint.nulls_not_distinct)) | (@as(u8, @intFromBool(constraint.deferrable)) << 1) | (@as(u8, @intFromBool(constraint.initially_deferred)) << 2) | (@as(u8, @intFromBool(constraint.not_valid)) << 3) | (@as(u8, @intFromBool(constraint.not_enforced)) << 4));
                 try writer.int(u8, constraint.column_count);
                 try writer.bytes(constraint.keyColumns());
                 const text = constraint.expression.slice();
@@ -1550,12 +1551,13 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 @memcpy(constraint.name.bytes[0..constraint_name.len], constraint_name);
                 for (out.constraints[0..index]) |*previous| if (types.same(previous.name.slice(), constraint.name.slice())) return error.InvalidChangeRecord;
                 const flags = try reader.int(u8);
-                if (flags > @as(u8, if (version >= not_valid_format_version) 15 else if (v3) 7 else 1)) return error.InvalidChangeRecord;
+                if (flags > @as(u8, if (version >= not_valid_format_version) 31 else if (v3) 7 else 1)) return error.InvalidChangeRecord;
                 constraint.nulls_not_distinct = flags & 1 != 0;
                 constraint.deferrable = flags & 2 != 0;
                 constraint.initially_deferred = flags & 4 != 0;
                 constraint.not_valid = flags & 8 != 0;
-                if (constraint.not_valid and constraint.kind != .check and constraint.kind != .foreign) return error.InvalidChangeRecord;
+                constraint.not_enforced = flags & 16 != 0;
+                if ((constraint.not_valid or constraint.not_enforced) and constraint.kind != .check and constraint.kind != .foreign) return error.InvalidChangeRecord;
                 if (constraint.initially_deferred and !constraint.deferrable) return error.InvalidChangeRecord;
                 constraint.column_count = try reader.int(u8);
                 if (constraint.column_count > out.count) return error.InvalidChangeRecord;

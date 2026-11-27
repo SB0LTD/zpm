@@ -3545,8 +3545,8 @@ pub fn Database(comptime config: Config) type {
                     try self.alterSequence(slot, alter.slot, alter.options, alter.ownership, snap);
                     break :blk 0;
                 },
-                .create_schema => |name| blk: {
-                    try self.createSchema(slot, name, snap);
+                .create_schema => |*create| blk: {
+                    try self.createSchema(slot, create.name, try self.createSchemaOwner(create, snap), snap);
                     break :blk 0;
                 },
                 .drop_schema => |*drop| blk: {
@@ -4092,7 +4092,17 @@ pub fn Database(comptime config: Config) type {
         /// CREATE SCHEMA: a schema slot, an OID and a cat_relations row
         /// (relkind 'n'), all transactional. A concurrent creator of the same
         /// name is waited for; the binder already rejected a visible name.
-        fn createSchema(self: *Self, slot: u16, name: Name, snap: Snapshot) Error!void {
+        /// CREATE SCHEMA ... AUTHORIZATION: the owner role (42704 when it
+        /// does not exist, PUBLIC included); else the current role.
+        fn createSchemaOwner(self: *Self, create: *const B.CreateSchema, snap: Snapshot) Error!u32 {
+            return switch (create.owner_special) {
+                1 => self.session.role,
+                2 => self.sessionState().sessionUser(),
+                else => if (create.owner) |name| self.catalog_objects.roleByName(name.slice(), snap) orelse error.UndefinedObject else self.session.role,
+            };
+        }
+
+        fn createSchema(self: *Self, slot: u16, name: Name, owner: u32, snap: Snapshot) Error!void {
             const tx = &self.txs[slot];
             if (self.catalog.creator(name.slice(), snap)) |other| {
                 var waits: L.Set = .{};
@@ -4100,7 +4110,6 @@ pub fn Database(comptime config: Config) type {
                 tx.fresh = tx.write_len == tx.subs[tx.sub_len - 1].write_start;
                 return self.park(slot, waits);
             }
-            const owner = self.session.role;
             if (owner != CO.bootstrap_role) {
                 if (self.catalog_objects.pendingReference(owner, snap)) |other| return self.objectPark(slot, other);
                 var latest = snap;
@@ -8658,12 +8667,13 @@ pub fn Database(comptime config: Config) type {
             const label = switch (kind) { .check => "c", .unique => "u", .primary => "p", .foreign => "f", .exclusion => "x" };
             const deferrable = if (constraint) |item| item.deferrable else false;
             const deferred = if (constraint) |item| item.initially_deferred else false;
-            const validated = if (constraint) |item| !item.not_valid else true;
+            const validated = if (constraint) |item| !item.not_valid and !item.not_enforced else true;
+            const enforced = if (constraint) |item| !item.not_enforced else true;
             const foreign = if (kind == .foreign) constraint else null;
             const index = if (kind == .primary) S.primaryIndexOid(table) else if (foreign) |item| self.referencedConstraintIndex(item, snapshot) else 0;
             try sink.add(&.{
                 intCell(oid), nameCell(name), intCell(table.namespace), nameCell(label),
-                boolCell(deferrable), boolCell(deferred), boolCell(true), boolCell(validated),
+                boolCell(deferrable), boolCell(deferred), boolCell(enforced), boolCell(validated),
                 intCell(table.oid), intCell(0), intCell(index), intCell(0),
                 intCell(if (foreign) |item| item.ref_oid else 0),
                 nameCell(if (foreign) |item| foreignActionCode(item.on_update) else " "),
@@ -9063,7 +9073,7 @@ pub fn Database(comptime config: Config) type {
             if (constraint) |item| {
                 if (item.deferrable) text.add(" DEFERRABLE");
                 if (item.initially_deferred) text.add(" INITIALLY DEFERRED");
-                if (item.not_valid) text.add(" NOT VALID");
+                if (item.not_enforced) text.add(" NOT ENFORCED") else if (item.not_valid) text.add(" NOT VALID");
             }
             if (text.shortened) return error.TextCapacity;
             return text.len;
@@ -9800,6 +9810,24 @@ pub fn Database(comptime config: Config) type {
             try self.remapColumnComments(slot, source.oid, alter.sources[0..alter.count], snap);
             try self.remapStatistics(slot, source.oid, alter.sources[0..alter.count], snap);
             if (alter.identity) |identity| try self.createSequence(slot, copy.namespace, identity.name, identity.spec, copy.oid, identity.column, false, snap);
+            // DROP IDENTITY / RESTART: the column's own sequence (ddl-dml).
+            if (alter.restart_identity) |column| {
+                const position = self.ownedSequence(copy.oid, column, snap) orelse return error.UndefinedObject;
+                try self.alterSequence(slot, position, .{ .restart = true, .restart_value = alter.restart_value }, null, snap);
+            }
+            if (alter.drop_identity) |column| {
+                const position = self.ownedSequence(copy.oid, column, snap) orelse return error.UndefinedObject;
+                try self.dropSequence(slot, position, snap);
+            }
+        }
+
+        /// The live sequence a column of table `oid` owns (identity, SERIAL).
+        fn ownedSequence(self: *const Self, oid: u32, column: u8, snap: Snapshot) ?usize {
+            _ = snap;
+            for (&self.seqs, 0..) |*seq, position| {
+                if (seq.live and seq.dead_csn == 0 and !seq.pending_drop and seq.owner == oid and seq.owner_column == column) return position;
+            }
+            return null;
         }
 
         /// Existing rows against the constraints ALTER TABLE added or
@@ -10294,7 +10322,7 @@ pub fn Database(comptime config: Config) type {
         fn checkReferences(self: *Self, slot: u16, table_index: usize, cells: *const E.Row, old: ?*const E.Row, snap: Snapshot) Error!void {
             const table = &self.tables[table_index];
             for (table.constraints[0..table.constraint_count]) |*constraint| {
-                if (constraint.kind != .foreign) continue;
+                if (constraint.kind != .foreign or constraint.not_enforced) continue;
                 if (old) |previous| if (!S.keyChanged(constraint, previous, cells)) continue;
                 var has_null = false;
                 for (constraint.keyColumns()) |column| has_null = has_null or cells[column] == .null_value;
@@ -10360,7 +10388,7 @@ pub fn Database(comptime config: Config) type {
                 const child_index = found.slot;
                 const child = &self.tables[child_index];
                 for (child.constraints[0..child.constraint_count]) |*constraint| {
-                    if (constraint.kind != .foreign or constraint.ref_oid != parent.oid) continue;
+                    if (constraint.kind != .foreign or constraint.ref_oid != parent.oid or constraint.not_enforced) continue;
                     var has_null = false;
                     for (constraint.refColumns()) |column| has_null = has_null or old[column] == .null_value;
                     if (has_null) continue;
@@ -10589,6 +10617,7 @@ pub fn Database(comptime config: Config) type {
 
         fn deferredRow(self: *const Self, slot: u16, table: *const S.Table, cells: *const E.Row, row: u32, immediate_only: bool, statement_end: bool, snap: Snapshot) Error!void {
             for (table.constraints[0..table.constraint_count], 0..) |*constraint, position| {
+                if (constraint.not_enforced) continue;
                 if (constraint.deferrable) {
                     if (immediate_only and self.deferredNow(slot, table, position)) continue;
                 } else if (constraint.kind != .foreign or !statement_end) continue;
@@ -10625,7 +10654,7 @@ pub fn Database(comptime config: Config) type {
                 if (found.kind == 'S') continue;
                 const child = &self.tables[found.slot];
                 for (child.constraints[0..child.constraint_count], 0..) |*constraint, position| {
-                    if (constraint.kind != .foreign or constraint.ref_oid != table.oid) continue;
+                    if (constraint.kind != .foreign or constraint.ref_oid != table.oid or constraint.not_enforced) continue;
                     const action = if (new == null) constraint.on_delete else constraint.on_update;
                     switch (action) {
                         .cascade, .set_null, .set_default => continue,

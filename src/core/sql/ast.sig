@@ -631,6 +631,9 @@ pub fn Ast(comptime config: types.Config) type {
             /// NOT VALID (ddl-dml, wave 4): ALTER TABLE ADD skips the
             /// existing rows of a CHECK or FOREIGN KEY constraint.
             not_valid: bool = false,
+            /// NOT ENFORCED (PostgreSQL 18): a CHECK or FOREIGN KEY never
+            /// checked.
+            not_enforced: bool = false,
         };
 
         /// LIKE source [INCLUDING | EXCLUDING option ...] inside CREATE TABLE:
@@ -764,7 +767,15 @@ pub fn Ast(comptime config: types.Config) type {
         pub const Drop = struct { name: Ident, if_exists: bool = false, schema: ?Ident = null, cascade: bool = false, concurrently: bool = false };
 
         /// CREATE SCHEMA [IF NOT EXISTS] name.
-        pub const CreateSchema = struct { name: Ident = .{}, if_not_exists: bool = false };
+        pub const CreateSchema = struct {
+            name: Ident = .{},
+            if_not_exists: bool = false,
+            /// AUTHORIZATION role (ddl-dml, wave 4): a role name, or 1
+            /// CURRENT_USER / CURRENT_ROLE, 2 SESSION_USER.
+            owner: ?Ident = null,
+            owner_special: u8 = 0,
+            named: bool = true,
+        };
 
         /// DROP SCHEMA [IF EXISTS] name [CASCADE | RESTRICT].
         pub const DropSchema = struct { name: Ident = .{}, if_exists: bool = false, cascade: bool = false };
@@ -1029,6 +1040,8 @@ pub fn Ast(comptime config: types.Config) type {
             restart_identity: bool = false,
             /// TRUNCATE ONLY name: no inheritance children (ddl-dml, wave 4).
             only: [config.tables]bool = @splat(false),
+            /// CASCADE: tables referencing a truncated table are truncated.
+            cascade: bool = false,
         };
 
         /// One ALTER TABLE action. Column-level CHECK / UNIQUE of an ADD
@@ -1056,6 +1069,14 @@ pub fn Ast(comptime config: types.Config) type {
             detach_partition: struct { table: TableRef, concurrently: bool = false },
             rename_constraint: struct { from: Ident, to: Ident },
             validate_constraint: Ident,
+            // ALTER [COLUMN] c DROP IDENTITY / DROP EXPRESSION [IF EXISTS],
+            // SET GENERATED { ALWAYS | BY DEFAULT }, RESTART [[WITH] n].
+            drop_identity: struct { column: Ident, if_exists: bool = false },
+            drop_expression: struct { column: Ident, if_exists: bool = false },
+            set_generated: struct { column: Ident, always: bool },
+            restart_identity: struct { column: Ident, value: ?i64 = null },
+            /// ALTER CONSTRAINT name [NOT] ENFORCED.
+            alter_enforced: struct { name: Ident, enforced: bool },
         };
 
         /// ALTER TABLE [IF EXISTS] [ONLY] name action [, ...] | RENAME ...

@@ -464,8 +464,18 @@ pub fn Parser(comptime config: types.Config) type {
                 if (self.mode == .standard and try self.takeWord("SEQUENCE")) return .{ .create_sequence = try self.createSequence() };
                 if (self.mode == .standard and try self.takeRaw("schema")) {
                     var out: Ast.CreateSchema = .{ .if_not_exists = try self.ifNotExists() };
-                    out.name = try self.identifier();
-                    // AUTHORIZATION and schema elements are outside the subset.
+                    // [name] [AUTHORIZATION role_spec] (ddl-dml, wave 4).
+                    if (!self.rawWord("authorization")) out.name = try self.identifier() else out.named = false;
+                    if (try self.takeRaw("authorization")) {
+                        if (try self.takeRaw("current_user") or try self.takeRaw("current_role")) {
+                            out.owner_special = 1;
+                        } else if (try self.takeRaw("session_user")) {
+                            out.owner_special = 2;
+                        } else out.owner = try self.identifier();
+                        // Without a name the schema is named after a named role.
+                        if (!out.named) out.name = out.owner orelse return error.UnsupportedStatement;
+                    } else if (!out.named) return error.Syntax;
+                    // Schema elements are outside the subset.
                     if (self.current.kind != .end and !self.isSymbol(.semicolon)) return error.UnsupportedStatement;
                     try self.finish();
                     return .{ .create_schema = out };
@@ -576,7 +586,21 @@ pub fn Parser(comptime config: types.Config) type {
                 return .{ .control = try self.preparedTransaction(.prepare) };
             }
             if (self.mode == .standard) if (try self.sessionCommand()) |command| return .{ .session = command };
+            // A word that starts no PostgreSQL statement is a syntax error
+            // (42601), not an unsupported command (ddl-dml, wave 4).
+            if (self.mode == .standard and self.tokens.dialect == .postgres and !self.statementKeyword()) return error.Syntax;
             return .{ .control = try self.controlStatement() };
+        }
+
+        /// The first token can start a statement of PostgreSQL's grammar
+        /// (gram.y stmt).
+        fn statementKeyword(self: *const Self) bool {
+            if (self.current.kind == .end) return true;
+            if (self.current.kind == .symbol) return self.current.symbol == .lparen;
+            if (self.current.kind != .word) return false;
+            const words = [_][]const u8{ "abort", "alter", "analyze", "analyse", "begin", "call", "checkpoint", "close", "cluster", "comment", "commit", "copy", "create", "deallocate", "declare", "delete", "discard", "do", "drop", "end", "execute", "explain", "fetch", "grant", "import", "insert", "listen", "load", "lock", "merge", "move", "notify", "prepare", "reassign", "refresh", "reindex", "release", "reset", "revoke", "rollback", "savepoint", "security", "select", "set", "show", "start", "table", "truncate", "unlisten", "update", "vacuum", "values", "with" };
+            inline for (words) |word| if (self.rawWord(word)) return true;
+            return false;
         }
 
         /// `[CASCADE | RESTRICT]`: true for CASCADE.
@@ -893,6 +917,16 @@ pub fn Parser(comptime config: types.Config) type {
                         try pushAction(&out, .{ .add_column = .{ .column = column, .if_not_exists = conditional } });
                         for (constraints[0..constraint_count]) |constraint| try pushAction(&out, .{ .add_constraint = constraint });
                     }
+                } else if (self.mode == .standard and self.rawWord("alter") and (try self.peek()).isWord("CONSTRAINT")) {
+                    try self.advance();
+                    try self.advance();
+                    const constraint = try self.identifier();
+                    const enforced = if (self.isWord("NOT") and wordIs(self.source, try self.peek(), "enforced")) blk: {
+                        try self.advance();
+                        try self.advance();
+                        break :blk false;
+                    } else if (try self.takeRaw("enforced")) true else return error.UnsupportedStatement;
+                    try pushAction(&out, .{ .alter_enforced = .{ .name = constraint, .enforced = enforced } });
                 } else if (self.mode == .standard and try self.takeRaw("validate")) {
                     try self.expectWord("CONSTRAINT");
                     try pushAction(&out, .{ .validate_constraint = try self.identifier() });
@@ -930,7 +964,14 @@ pub fn Parser(comptime config: types.Config) type {
                         }
                         try pushAction(&out, action);
                     } else if (try self.takeWord("SET")) {
-                        if (try self.takeWord("DEFAULT")) {
+                        if (self.mode == .standard and try self.takeWord("GENERATED")) {
+                            const always = try self.takeWord("ALWAYS");
+                            if (!always) {
+                                try self.expectWord("BY");
+                                try self.expectWord("DEFAULT");
+                            }
+                            try pushAction(&out, .{ .set_generated = .{ .column = name, .always = always } });
+                        } else if (try self.takeWord("DEFAULT")) {
                             const start = self.tokenStart();
                             _ = try self.expression();
                             try pushAction(&out, .{ .set_default = .{ .column = name, .expression = try self.storedSpan(start) } });
@@ -950,7 +991,17 @@ pub fn Parser(comptime config: types.Config) type {
                         } else if (try self.takeWord("NOT")) {
                             try self.expectWord("NULL");
                             try pushAction(&out, .{ .drop_not_null = name });
+                        } else if (self.mode == .standard and try self.takeWord("IDENTITY")) {
+                            try pushAction(&out, .{ .drop_identity = .{ .column = name, .if_exists = try self.ifExists() } });
+                        } else if (self.mode == .standard and try self.takeRaw("expression")) {
+                            try pushAction(&out, .{ .drop_expression = .{ .column = name, .if_exists = try self.ifExists() } });
                         } else return error.UnsupportedStatement;
+                    } else if (self.mode == .standard and try self.takeRaw("restart")) {
+                        var value: ?i64 = null;
+                        if (try self.takeWord("WITH") or self.current.kind == .integer or self.isSymbol(.minus) or self.isSymbol(.plus)) {
+                            value = try self.signedInteger();
+                        }
+                        try pushAction(&out, .{ .restart_identity = .{ .column = name, .value = value } });
                     } else return error.UnsupportedStatement;
                 } else return error.Syntax;
                 if (!try self.takeSymbol(.comma)) break;
@@ -1010,7 +1061,8 @@ pub fn Parser(comptime config: types.Config) type {
             } else if (try self.takeRaw("continue")) {
                 if (!try self.takeRaw("identity")) return error.Syntax;
             }
-            if (!try self.takeRaw("cascade")) _ = try self.takeRaw("restrict");
+            out.cascade = try self.takeRaw("cascade");
+            if (!out.cascade) _ = try self.takeRaw("restrict");
             try self.finish();
             return out;
         }
@@ -2219,12 +2271,37 @@ pub fn Parser(comptime config: types.Config) type {
         /// A table constraint, then NOT VALID (ddl-dml, wave 4).
         fn tableConstraint(self: *Self) Error!?Ast.ConstraintDef {
             var out = (try self.tableConstraintBody()) orelse return null;
-            if (self.isWord("NOT") and wordIs(self.source, try self.peek(), "valid")) {
-                try self.advance();
-                try self.advance();
-                out.not_valid = true;
-            }
+            try self.constraintAttributes(&out);
             return out;
+        }
+
+        /// [NOT] ENFORCED and NOT VALID after a constraint, in any order;
+        /// enforceability is for CHECK and FOREIGN KEY only (42601).
+        fn constraintAttributes(self: *Self, out: *Ast.ConstraintDef) Error!void {
+            while (true) {
+                if (self.isWord("NOT") and wordIs(self.source, try self.peek(), "valid")) {
+                    try self.advance();
+                    try self.advance();
+                    out.not_valid = true;
+                } else if (self.isWord("NOT") and wordIs(self.source, try self.peek(), "enforced")) {
+                    try self.advance();
+                    try self.advance();
+                    if (out.kind != .check and out.kind != .foreign) return error.Syntax;
+                    out.not_enforced = true;
+                } else if (try self.takeRaw("enforced")) {
+                    if (out.kind != .check and out.kind != .foreign) return error.Syntax;
+                    out.not_enforced = false;
+                } else return;
+            }
+        }
+
+        /// A column constraint's [NOT] ENFORCED.
+        fn enforceability(self: *Self, out: *Ast.ConstraintDef) Error!void {
+            if (self.isWord("NOT") and wordIs(self.source, try self.peek(), "enforced")) {
+                try self.advance();
+                try self.advance();
+                out.not_enforced = true;
+            } else _ = try self.takeRaw("enforced");
         }
 
         fn tableConstraintBody(self: *Self) Error!?Ast.ConstraintDef {
@@ -2438,7 +2515,8 @@ pub fn Parser(comptime config: types.Config) type {
                     has_not_null = true;
                     column.not_null = true;
                 } else if (try self.takeWord("PRIMARY")) {
-                    if (has_primary.*) {if(if_not_exists) invalid.*=true else return error.Syntax;}
+                    // Multiple primary keys: 42P16, as PostgreSQL (ddl-dml).
+                    if (has_primary.*) {if(if_not_exists) invalid.*=true else return error.InvalidTableDefinition;}
                     try self.expectWord("KEY");
                     has_primary.* = true;
                     column.primary_key = true;
@@ -2449,7 +2527,9 @@ pub fn Parser(comptime config: types.Config) type {
                         try pushConstraint(sink, definition);
                     }
                 } else if (self.mode == .standard and try self.takeRaw("check")) {
-                    try pushConstraint(sink, try self.checkConstraint(name));
+                    var definition = try self.checkConstraint(name);
+                    try self.enforceability(&definition);
+                    try pushConstraint(sink, definition);
                 } else if (self.mode == .standard and try self.takeRaw("unique")) {
                     var definition: Ast.ConstraintDef = .{ .name = name, .kind = .unique, .nulls_not_distinct = try self.nullsDistinct(), .column_count = 1 };
                     definition.columns[0] = column.name;
@@ -2459,6 +2539,7 @@ pub fn Parser(comptime config: types.Config) type {
                     var definition: Ast.ConstraintDef = .{ .name = name, .kind = .foreign, .column_count = 1 };
                     definition.columns[0] = column.name;
                     try self.references(&definition);
+                    try self.enforceability(&definition);
                     try pushConstraint(sink, definition);
                 } else if (self.mode == .standard and (self.rawWord("deferrable") or self.rawWord("initially") or (self.isWord("NOT") and wordIs(self.source, try self.peek(), "deferrable")))) {
                     // After an unnamed column PRIMARY KEY: a deferrable
@@ -3506,11 +3587,14 @@ pub fn Parser(comptime config: types.Config) type {
                 self.pool.complex = true;
             } else {
                 if (self.mode == .standard and try self.takeWord("ONLY")) item.only = true;
+                // ONLY (name): the parenthesized form (S111, ddl-dml).
+                const wrapped = item.only and try self.takeSymbol(.lparen);
                 item.name = try self.identifier();
                 if (self.mode == .standard and try self.takeSymbol(.dot)) {
                     item.schema = item.name;
                     item.name = try self.identifier();
                 }
+                if (wrapped) try self.expectSymbol(.rparen);
                 // A function call in FROM (B11), implicitly LATERAL, with
                 // optional WITH ORDINALITY.
                 if (self.mode == .standard and !item.only and self.isSymbol(.lparen)) {

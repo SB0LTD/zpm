@@ -256,7 +256,7 @@ pub fn Binder(comptime config: types.Config) type {
             alter_table: AlterTable,
             legacy_attribute_options: struct { table: usize, validation: ?Error },
             alter_sequence: AlterSequence,
-            create_schema: V.Name,
+            create_schema: CreateSchema,
             drop_schema: DropSchema,
             drop_relation: DropRelation,
             refresh_view: Refresh,
@@ -322,7 +322,15 @@ pub fn Binder(comptime config: types.Config) type {
             partition_parent: ?usize = null,
             attach: bool = false,
             partition_default: ?usize = null,
+            /// DROP IDENTITY drops the column's sequence; RESTART restarts
+            /// it (ddl-dml, wave 4).
+            drop_identity: ?u8 = null,
+            restart_identity: ?u8 = null,
+            restart_value: ?i64 = null,
         };
+
+        /// CREATE SCHEMA name [AUTHORIZATION role] (ddl-dml, wave 4).
+        pub const CreateSchema = struct { name: V.Name, owner: ?V.Name = null, owner_special: u8 = 0 };
 
         /// TRUNCATE targets: distinct table slots in statement order.
         pub const Truncate = struct { tables: [config.tables]u8 = undefined, count: usize = 0, restart_identity: bool = false };
@@ -4264,7 +4272,7 @@ pub fn Binder(comptime config: types.Config) type {
         /// Every CHECK constraint of the table, by constraint index.
         fn bindChecks(context: *const Context, index: usize, entry: *const S.Table, checks: *[config.table_constraints]u16) Error!void {
             for (entry.constraints[0..entry.constraint_count], 0..) |*constraint, position| {
-                if (constraint.kind == .check) checks[position] = try bindCheckText(context, constraint.expression.slice(), index);
+                if (constraint.kind == .check and !constraint.not_enforced) checks[position] = try bindCheckText(context, constraint.expression.slice(), index);
             }
         }
 
@@ -4272,7 +4280,7 @@ pub fn Binder(comptime config: types.Config) type {
         pub fn bindFlaggedChecks(context: *const Context, index: usize, flags: *const [config.table_constraints]bool, checks: *[config.table_constraints]u16) Error!void {
             const entry = &context.tables[index];
             for (entry.constraints[0..entry.constraint_count], 0..) |*constraint, position| {
-                if (constraint.kind == .check and flags[position]) checks[position] = try bindCheckText(context, constraint.expression.slice(), index);
+                if (constraint.kind == .check and flags[position] and !constraint.not_enforced) checks[position] = try bindCheckText(context, constraint.expression.slice(), index);
             }
         }
 
@@ -9299,7 +9307,7 @@ pub fn Binder(comptime config: types.Config) type {
                         if (create.if_not_exists) return setBound(bound, .noop, .create_schema);
                         return error.DuplicateSchema;
                     }
-                    return setBound(bound, .create_schema, name);
+                    return setBound(bound, .create_schema, .{ .name = name, .owner = if (create.owner) |ident| toName(context, ident) else null, .owner_special = create.owner_special });
                 },
                 .drop_schema => {
                     const drop = &statement.drop_schema;
@@ -9861,7 +9869,7 @@ pub fn Binder(comptime config: types.Config) type {
                         if (definition.kind != .check and definition.kind != .foreign) return error.UnsupportedStatement;
                         out.constraints[out.constraint_count].not_valid = true;
                     }
-                    out.check_constraint[out.constraint_count] = !definition.not_valid;
+                    out.check_constraint[out.constraint_count] = !definition.not_valid and !definition.not_enforced;
                     out.constraint_count += 1;
                 },
                 .drop_constraint => |*drop| {
@@ -9907,6 +9915,49 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 // Parsed alone (bindAttach / bindDetach above).
                 .attach_partition, .detach_partition => return error.Syntax,
+                // ddl-dml (wave 4): identity and generated columns. A column
+                // of another kind is 55000 (IF EXISTS: nothing to do).
+                .set_generated => |*set| {
+                    const position = alterColumn(&out, toName(context, set.column).slice()) orelse return error.ColumnNotFound;
+                    const column = &out.columns[position];
+                    switch (column.default_kind) {
+                        .identity_always, .identity_by_default => column.default_kind = if (set.always) .identity_always else .identity_by_default,
+                        else => return error.ObjectNotInPrerequisiteState,
+                    }
+                },
+                .drop_identity => |*drop| {
+                    const position = alterColumn(&out, toName(context, drop.column).slice()) orelse return error.ColumnNotFound;
+                    const column = &out.columns[position];
+                    switch (column.default_kind) {
+                        .identity_always, .identity_by_default => {},
+                        else => if (drop.if_exists) continue else return error.ObjectNotInPrerequisiteState,
+                    }
+                    if (out.drop_identity != null or entry.parent != 0 or hasChildren(context, entry.oid)) return error.UnsupportedStatement;
+                    column.default_kind = .none;
+                    out.drop_identity = @intCast(position);
+                },
+                .drop_expression => |*drop| {
+                    const position = alterColumn(&out, toName(context, drop.column).slice()) orelse return error.ColumnNotFound;
+                    const column = &out.columns[position];
+                    if (column.default_kind != .generated) {
+                        if (drop.if_exists) continue;
+                        return error.ObjectNotInPrerequisiteState;
+                    }
+                    // A virtual column has no stored values to keep.
+                    if (column.virtual or entry.parent != 0 or hasChildren(context, entry.oid)) return error.UnsupportedStatement;
+                    column.default_kind = .none;
+                    column.expression = .{};
+                },
+                .restart_identity => |*restart| {
+                    const position = alterColumn(&out, toName(context, restart.column).slice()) orelse return error.ColumnNotFound;
+                    switch (out.columns[position].default_kind) {
+                        .identity_always, .identity_by_default => {},
+                        else => return error.ObjectNotInPrerequisiteState,
+                    }
+                    if (out.restart_identity != null) return error.UnsupportedStatement;
+                    out.restart_identity = @intCast(position);
+                    out.restart_value = restart.value;
+                },
                 .validate_constraint => |ident| {
                     // ddl-dml (wave 4): 42704 when missing, 42809 for a kind
                     // other than CHECK / FOREIGN KEY; a validated constraint
@@ -9918,6 +9969,8 @@ pub fn Binder(comptime config: types.Config) type {
                         if (!types.same(constraint.name.slice(), name.slice())) continue;
                         named = true;
                         if (constraint.kind != .check and constraint.kind != .foreign) return error.WrongObjectType;
+                        // A NOT ENFORCED constraint cannot be validated (55000).
+                        if (constraint.not_enforced) return error.ObjectNotInPrerequisiteState;
                         if (!constraint.not_valid) break;
                         if (constraint.kind == .check and hasChildren(context, entry.oid)) return error.UnsupportedStatement;
                         constraint.not_valid = false;
@@ -9929,6 +9982,25 @@ pub fn Binder(comptime config: types.Config) type {
                         if (entry.primary_column != null and types.same(pkey.slice(), name.slice())) return error.WrongObjectType;
                         return error.UndefinedObject;
                     }
+                },
+                .alter_enforced => |*alter_enforced| {
+                    // PostgreSQL 18 alters the enforceability of foreign
+                    // keys only (42809); ENFORCED checks the rows (ddl-dml).
+                    const name = toName(context, alter_enforced.name);
+                    var named = false;
+                    for (out.constraints[0..out.constraint_count], 0..) |*constraint, at| {
+                        if (!types.same(constraint.name.slice(), name.slice())) continue;
+                        named = true;
+                        if (constraint.kind != .foreign) return error.WrongObjectType;
+                        if (constraint.not_enforced == !alter_enforced.enforced) break;
+                        constraint.not_enforced = !alter_enforced.enforced;
+                        if (alter_enforced.enforced) {
+                            constraint.not_valid = false;
+                            out.check_constraint[at] = true;
+                        }
+                        break;
+                    }
+                    if (!named) return error.UndefinedObject;
                 },
                 .rename_constraint => |*rename| {
                     // ddl-dml (wave 4): 42704 when missing, 42710 when the
@@ -10294,7 +10366,7 @@ pub fn Binder(comptime config: types.Config) type {
                 named_count += 1;
             };
             for (definitions) |*definition| {
-                var entry: S.Constraint = .{ .nulls_not_distinct = definition.nulls_not_distinct, .deferrable = definition.deferrable, .initially_deferred = definition.initially_deferred, .kind = switch (definition.kind) {
+                var entry: S.Constraint = .{ .nulls_not_distinct = definition.nulls_not_distinct, .deferrable = definition.deferrable, .initially_deferred = definition.initially_deferred, .not_enforced = definition.not_enforced, .kind = switch (definition.kind) {
                     .check => .check,
                     .unique => .unique,
                     .primary => .primary,
@@ -10471,7 +10543,9 @@ pub fn Binder(comptime config: types.Config) type {
                 const a = types.typeOfData(columns[child].data_type);
                 const b = types.typeOfData(parent_columns[key].data_type);
                 const integral = (a == .int2 or a == .int4 or a == .int8) and (b == .int2 or b == .int4 or b == .int8);
-                if (a != b and !integral) return error.TypeMismatch;
+                // text and varchar share text equality (T201, ddl-dml).
+                const textual = (a == .text or a == .varchar) and (b == .text or b == .varchar);
+                if (a != b and !integral and !textual) return error.TypeMismatch;
             }
         }
 
@@ -10939,8 +11013,24 @@ pub fn Binder(comptime config: types.Config) type {
             while (position < out.count) {
                 var next = position + 1;
                 defer position = next;
-                if (only[position]) continue;
                 const oid = context.tables[out.tables[position]].oid;
+                // CASCADE: every table with a foreign key to a truncated
+                // table (itself, not its children, as PostgreSQL).
+                if (truncate.cascade) for (slots[0..count]) |slot| {
+                    const other = &context.tables[slot];
+                    var references = false;
+                    for (other.constraints[0..other.constraint_count]) |*constraint| references = references or (constraint.kind == .foreign and constraint.ref_oid == oid);
+                    if (!references) continue;
+                    for (out.tables[0..out.count]) |previous| {
+                        if (previous == slot) break;
+                    } else {
+                        if (out.count == out.tables.len) return error.TableCapacity;
+                        out.tables[out.count] = @intCast(slot);
+                        only[out.count] = true;
+                        out.count += 1;
+                    }
+                };
+                if (only[position]) continue;
                 for (slots[0..count]) |slot| {
                     if (context.tables[slot].parent != oid) continue;
                     for (out.tables[0..out.count], 0..) |previous, listed| {
