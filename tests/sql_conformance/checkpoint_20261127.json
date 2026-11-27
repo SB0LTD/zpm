@@ -3,20 +3,20 @@
   "date": "2026-11-27",
   "qualification": "incomplete",
   "scope": "postgresql_smoke_only",
-  "zpm_runtime_revision": "a3735e76c90d8fa291a45915a24c13702e1db612",
-  "ramsql_revision": "b7780b75c3e75f23be5f585443f34545a02f32a6",
+  "zpm_runtime_revision": "5d8478f58cc6fd62e791b678f357468e562ada5e",
+  "ramsql_revision": "c2b19cc5c5326a48eceeb7c26c3564f8c3397f06",
   "oracle": "PostgreSQL 18.3",
   "oracle_image": "postgres:18.3-bookworm@sha256:80630f83606d8db77d30b3851b16a9f78be2d0d4dda6f7b82a1fdca5ebe3acba",
   "manifest_sha256": "1feee91259a68605cd6d50c3a1863b79f3882e0d5c424126912ba3036520f47c",
   "audit_sha256": "6fb343fb3c088985501fe5512eb678d6c5b3589eb965d0688fcf1482fc8d5b7b",
-  "inventory_binary_sha256": "7995a165bcba86333f890db649367308eb28ebfd7151a4a3285cf5244c5f83d2",
+  "inventory_binary_sha256": "309fbe76d3f902f0ec17fa7e88e49d409fc63e3347ebb3324186f9949b366170",
   "stock_binary_sha256": {
-    "pg16": "2e9c8f73d22fc555e246711ee66da6aa311e51942a7275d263b0f7324c032274",
-    "pg18": "264c8de2ad9308e53b1a5904d121fdd33f45e4d5f6f00c383a03f3350301b220"
+    "pg16": "c753fab7face567d032718100b30fa553e2c0fa8561bdeac4cb4783f69c4fb8c",
+    "pg18": "51fb932ed34cbf78279a4acffeef68a64e6de0151d325f188e1b7718503e133d"
   },
-  "inventory_evidence": "https://github.com/SB0LTD/ramsql/actions/runs/46014847242",
-  "stock_tooling_evidence": "https://github.com/SB0LTD/ramsql/actions/runs/46014842554",
-  "contract_evidence": "https://github.com/SB0LTD/zpm/actions/runs/46014717587",
+  "inventory_evidence": "https://github.com/SB0LTD/ramsql/actions/runs/46033234852",
+  "stock_tooling_evidence": "https://github.com/SB0LTD/ramsql/actions/runs/46033230142",
+  "contract_evidence": "https://github.com/SB0LTD/zpm/actions/runs/46036894578",
   "counts": {
     "postgresql_smoke_pass": 106,
     "postgresql_fail": 0
@@ -39,13 +39,14 @@
     ],
     "wide_cell_stack_mib": 4,
     "status": "passed",
-    "routines": 1078,
-    "routine_records_replayed": 329,
+    "routines": 1096,
+    "routine_records_replayed": 340,
     "wide_cell_checkpoint": 2521,
     "base_images": 158,
     "catalog_security": 1761,
     "security_records_replayed": 432,
-    "full_zpm_workflow": "passed"
+    "full_zpm_workflow": "passed",
+    "routine_stack_mib": 4
   },
   "separate_native_lanes_required": {
     "mysql": 6,
@@ -61,15 +62,27 @@
     "Reviewed applicability and full semantic closure of the upstream inventory",
     "Current native MySQL and T-SQL inventory lanes",
     "Other default-privilege object classes, schema-wide grants and non-public namespaces",
-    "Other catalog image classes/layouts, synthetic view rule deparsing and broader rule actions",
+    "Other catalog image classes/layouts and broader rule actions",
     "Broader routine execution, signatures, SECURITY DEFINER and volatile-window demand",
-    "Upstream/application regressions and production qualification beyond finite smoke coverage"
+    "Upstream/application regressions and production qualification beyond finite smoke coverage",
+    "CREATE OR REPLACE VIEW, ALTER VIEW column rename and broader search_path behavior"
   ],
   "local_contracts": {
-    "debug_routines": 1078,
-    "routine_records_replayed": 329,
+    "debug_routines": 1096,
+    "routine_records_replayed": 340,
     "debug_wide_cell_checkpoint": 2521,
     "base_images": 158,
-    "windows_debug_diagnostic_stack_mib": 4
+    "windows_debug_diagnostic_stack_mib": 4,
+    "windows_release_safe_diagnostic_stack_mib": 4,
+    "malformed_wal_test_frame_before_bytes": 4698600,
+    "malformed_wal_test_frame_after_bytes": 114168
+  },
+  "contract_revision": "6ec92bc1ebea5ee787dc1b03130ae62260fb5d1a",
+  "contract_revision_difference": "CI timeout only; production sources and tests identical to runtime pin",
+  "qualified_view_return_rules": {
+    "status": "passed",
+    "formatting": "SQL-equivalent, not byte-identical",
+    "checks": "Execute pretty/non-pretty actions under empty search_path; rows, names/types, archive restore/reopen",
+    "arbitrary_rule_actions": "not_implemented"
   }
 }

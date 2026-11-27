@@ -13,12 +13,15 @@ require their own versioned native oracles. See the
 
 The November 1 counts and table entries are historical, not current feature
 absence claims. Subsequent semantic slices and their evidence are recorded in
-the TDD checkpoint. [CI 46014847242](https://github.com/SB0LTD/ramsql/actions/runs/46014847242)
+the TDD checkpoint. [CI 46033234852](https://github.com/SB0LTD/ramsql/actions/runs/46033234852)
 passes all 106 PostgreSQL smoke programs on frozen PostgreSQL 18.3, including
 COPY, database, two-phase and maintenance scopes. The database case uses the
 documented cluster profile, not the default single-database profile.
 The strict comparator and manifest come from the exact
 ZPM dependency pin; failures and unexecuted cases block that smoke gate.
+Stock PG16/18 also pass both archive directions and execute actual deparsed view
+return-rule SELECT actions in
+[CI 46033230142](https://github.com/SB0LTD/ramsql/actions/runs/46033230142).
 The separate six MySQL and six T-SQL cases need their own native lanes.
 
 ## What this inventory proves

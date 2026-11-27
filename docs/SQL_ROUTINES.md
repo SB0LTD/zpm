@@ -141,8 +141,11 @@ dependencies. The target respects pretty mode and `quote_all_identifiers`.
 Caller-owned value storage handles definitions wider than an inline text cell;
 exhausted storage returns an error without truncation. `pg_rules` excludes these
 implicit rules. Formatting can differ from native PostgreSQL; executing the SELECT
-action must retain the view's rows, column names and type OIDs. Stock PG16/18 archive
-qualification of this addition is pending.
+action must retain the view's rows, column names and type OIDs. Stock PG16/18
+qualification passes both directions in
+[CI 46033230142](https://github.com/SB0LTD/ramsql/actions/runs/46033230142).
+Debug/ReleaseSafe routine contracts also pass on the 4 MiB Linux CI stack in
+[ZPM CI 46036894578](https://github.com/SB0LTD/zpm/actions/runs/46036894578).
 
 `pg_get_triggerdef(oid [, pretty])` renders the stored trigger version visible
 to the statement, including decoded arguments and UPDATE OF column names.
