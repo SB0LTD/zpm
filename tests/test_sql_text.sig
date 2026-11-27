@@ -13,7 +13,11 @@
 //! marked "oracle". Every other expectation follows PostgreSQL 18.3 and is
 //! PENDING NATIVE VERIFICATION: it was checked by hand against a local
 //! PostgreSQL 18.3 build (database LOCALE 'C', UTF8), which is not a
-//! recorded oracle run.
+//! recorded oracle run. Wave 4 (text-json lane) moved the engine's ctype to
+//! C.UTF-8, the feature-probe oracle's locale: the regular-expression and
+//! text-search batteries were re-run on native PostgreSQL 18.7 in a
+//! C.UTF-8 database, where all entries agree except six non-ASCII ones
+//! (marked "C.UTF-8"), which now hold that result.
 const std = @import("std");
 const sql = @import("sql");
 const pg_types = @import("pg_types");
@@ -548,7 +552,7 @@ const regex_battery = [_][2][]const u8{
     .{ "SELECT '-' ~ '[[.hyphen.]]'", "t" },
     .{ "SELECT 'a' ~ '[[=a=]]'", "t" },
     .{ "SELECT 'b' ~ '[a[.-.]z]'", "f" },
-    .{ "SELECT 'Ã©' ~ '[[:alpha:]]'", "f" },
+    .{ "SELECT 'Ã©' ~ '[[:alpha:]]'", "t" }, // C.UTF-8
     .{ "SELECT 'Ã©' ~ '.'", "t" },
     .{ "SELECT 'Ã©' ~ '^.$'", "f" },
     .{ "SELECT 'Ã©' ~ '[Ã©]'", "t" },
@@ -824,7 +828,7 @@ const regex_battery = [_][2][]const u8{
     .{ "SELECT '5' ~ '[[:alpha:][:digit:]]'", "t" },
     .{ "SELECT '_' ~ '[^[:alnum:]]'", "t" },
     .{ "SELECT 'A' ~* '[[:lower:]]'", "t" },
-    .{ "SELECT 'é' ~* 'É'", "f" },
+    .{ "SELECT 'é' ~* 'É'", "t" }, // C.UTF-8
     .{ "SELECT 'ab' ~ 'a(?=b(?=$))'", "t" },
     .{ "SELECT 'ab' ~ 'a(?=(?=(?=b)))'", "t" },
 };
@@ -835,17 +839,17 @@ fn regularExpressions() !void {
     for (0..3) |index| try meta(index, "?column?", 16, -1);
     for (regex_battery) |case| try single(case[0], case[1]);
 
-    // Not supported here (0A000), where PostgreSQL matches: back
-    // references, BREs (embedded `b`; regexp_like options `b` and `e`,
-    // which parse_re_flags turns into BREs) and lookarounds nested more
-    // than three deep.
-    for ([_][]const u8{
-        "SELECT 'aa' ~ '(a)\\1'",              "SELECT 'aa' ~ '(a)(b)\\2'",
-        "SELECT 'aa' ~ '(a)\\1*'",             "SELECT 'a' ~ '(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)(k)(l)\\12'",
-        "SELECT 'a' ~ '(?b)a'",                "SELECT regexp_like('Abc','^a','b')",
-        "SELECT regexp_like('a','a{1}?','e')", "SELECT regexp_like('a.','a.','qe')",
-        "SELECT 'ab' ~ 'a(?=(?=(?=(?=b))))'",
-    }) |source| try rejects(source, error.UnsupportedStatement);
+    // Back references, BREs (embedded `b`; regexp_like options `b` and
+    // `e`, which parse_re_flags turns into BREs) and lookarounds nested
+    // more than three deep (wave 4 text-json; checked against native
+    // PostgreSQL 18.7).
+    for ([_][2][]const u8{
+        .{ "SELECT 'aa' ~ '(a)\\1'", "t" },                                          .{ "SELECT 'aa' ~ '(a)(b)\\2'", "f" },
+        .{ "SELECT 'aa' ~ '(a)\\1*'", "t" },                                         .{ "SELECT 'a' ~ '(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)(k)(l)\\12'", "f" },
+        .{ "SELECT 'a' ~ '(?b)a'", "t" },                                            .{ "SELECT regexp_like('Abc','^a','b')", "f" },
+        .{ "SELECT regexp_like('a','a{1}?','e')", "f" },                             .{ "SELECT regexp_like('a.','a.','qe')", "t" },
+        .{ "SELECT 'ab' ~ 'a(?=(?=(?=(?=b))))'", "t" },
+    }) |case| try single(case[0], case[1]);
     // A program beyond Config.regex_states instructions is 54000 (the
     // first one PostgreSQL also refuses, as too complex: 2201B).
     try rejects("SELECT 'aaa' ~ '(a{255}){255}'", error.ProgramLimitExceeded);
@@ -921,7 +925,7 @@ const fts_battery = [_][2][]const u8{
     .{ "SELECT to_tsvector('simple', 'a.b')", "'a.b':1" },
     .{ "SELECT to_tsvector('simple', 'x@y.com')", "'x@y.com':1" },
     .{ "SELECT to_tsvector('simple', 'don''t stop')", "'don':1 'stop':3 't':2" },
-    .{ "SELECT to_tsvector('simple', 'Café Über ÄÖ')", "'café':1 'ÄÖ':3 'Über':2" },
+    .{ "SELECT to_tsvector('simple', 'Café Über ÄÖ')", "'café':1 'äö':3 'über':2" }, // C.UTF-8
     .{ "SELECT to_tsvector('simple', 'abc123 123abc')", "'123abc':2 'abc123':1" },
     .{ "SELECT to_tsvector('simple', 'foo.bar baz@qux.com http://x.org/a/b <b>tag</b> &amp; -5 +6 1.5e3 1.2.3 /usr/bin ~/x.txt a_b')", "'+6':8 '-5':7 '/a/b':5 '/usr/bin':11 '/x.txt':12 '1.2.3':10 '1.5e3':9 'a':13 'b':14 'baz@qux.com':2 'foo.bar':1 'tag':6 'x.org':4 'x.org/a/b':3" },
     .{ "SELECT to_tsvector('simple', 'The quick brown fox')", "'brown':3 'fox':4 'quick':2 'the':1" },
@@ -954,7 +958,7 @@ const fts_battery = [_][2][]const u8{
     .{ "SELECT to_tsvector('simple', 'foo--bar')", "'bar':2 'foo':1" },
     .{ "SELECT to_tsvector('simple', 'über-cool')", "'cool':3 'über':2 'über-cool':1" },
     .{ "SELECT to_tsvector('simple', 'naïve café')", "'café':2 'naïve':1" },
-    .{ "SELECT to_tsvector('simple', 'Ελληνικά κείμενο')", "'Ελληνικά':1 'κείμενο':2" },
+    .{ "SELECT to_tsvector('simple', 'Ελληνικά κείμενο')", "'ελληνικά':1 'κείμενο':2" }, // C.UTF-8
     .{ "SELECT to_tsvector('simple', '日本語 テキスト')", "'テキスト':2 '日本語':1" },
     .{ "SELECT to_tsvector('simple', 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx')", "'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx':1" },
     .{ "SELECT to_tsvector('simple', 'w w w w w w w w w w w w w w w w w w w w w w w w w w w w w w')", "'w':1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30" },
@@ -1068,7 +1072,7 @@ const fts_battery = [_][2][]const u8{
     .{ "SELECT plainto_tsquery('simple', '(a | b) & c')", "'a' & 'b' & 'c'" },
     .{ "SELECT plainto_tsquery('simple', 'a b')", "'a' & 'b'" },
     .{ "SELECT plainto_tsquery('simple', 'a:B & b:*A')", "'a' & 'b' & 'b' & 'a'" },
-    .{ "SELECT plainto_tsquery('simple', 'Über alles')", "'Über' & 'alles'" },
+    .{ "SELECT plainto_tsquery('simple', 'Über alles')", "'über' & 'alles'" }, // C.UTF-8
     .{ "SELECT plainto_tsquery('simple', 'a & - & b')", "'a' & 'b'" },
     .{ "SELECT plainto_tsquery('simple', 'a <-> - <-> b')", "'a' & 'b'" },
     .{ "SELECT plainto_tsquery('simple', '!-')", "" },
@@ -1086,7 +1090,7 @@ const fts_battery = [_][2][]const u8{
     .{ "SELECT phraseto_tsquery('simple', '(a | b) & c')", "'a' <-> 'b' <-> 'c'" },
     .{ "SELECT phraseto_tsquery('simple', 'a b')", "'a' <-> 'b'" },
     .{ "SELECT phraseto_tsquery('simple', 'a:B & b:*A')", "'a' <-> 'b' <-> 'b' <-> 'a'" },
-    .{ "SELECT phraseto_tsquery('simple', 'Über alles')", "'Über' <-> 'alles'" },
+    .{ "SELECT phraseto_tsquery('simple', 'Über alles')", "'über' <-> 'alles'" }, // C.UTF-8
     .{ "SELECT phraseto_tsquery('simple', 'a & - & b')", "'a' <-> 'b'" },
     .{ "SELECT phraseto_tsquery('simple', 'a <-> - <-> b')", "'a' <-> 'b'" },
     .{ "SELECT phraseto_tsquery('simple', '!-')", "" },
@@ -1288,13 +1292,15 @@ fn textSearch() !void {
     try meta(1, "tsquery", 3615, -1);
     for (fts_battery) |case| try single(case[0], case[1]);
 
-    // Not here (0A000): the Snowball configurations, and the forms that
-    // use default_text_search_config (pg_catalog.english).
-    for ([_][]const u8{
-        "SELECT to_tsvector('english', 'x')",     "SELECT to_tsvector('x')",
-        "SELECT to_tsquery('x')",                 "SELECT plainto_tsquery('x')",
-        "SELECT 'a' @@ to_tsquery('simple', 'a')",
-    }) |source| try rejects(source, error.UnsupportedStatement);
+    // english and the forms that use default_text_search_config
+    // (pg_catalog.english; wave 4 text-json, checked against native
+    // PostgreSQL 18.7). The other Snowball configurations are 0A000.
+    for ([_][2][]const u8{
+        .{ "SELECT to_tsvector('english', 'x')", "'x':1" }, .{ "SELECT to_tsvector('x')", "'x':1" },
+        .{ "SELECT to_tsquery('x')", "'x'" },               .{ "SELECT plainto_tsquery('x')", "'x'" },
+        .{ "SELECT 'a' @@ to_tsquery('simple', 'a')", "f" },
+    }) |case| try single(case[0], case[1]);
+    try rejects("SELECT to_tsvector('french', 'x')", error.UnsupportedStatement);
     try rejects("SELECT to_tsvector('nope', 'x')", error.UndefinedObject);
     try rejects("SELECT 'a <16385> b'::tsquery", error.InvalidParameterValue);
     try rejects("SELECT 'a:0'::tsvector", error.Syntax);

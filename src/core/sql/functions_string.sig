@@ -6,10 +6,12 @@
 //! fixed buffer (`Out`, TextCapacity 54000 beyond it). Every loop whose
 //! length depends on the input calls the statement's execution checkpoint.
 //!
-//! Case mapping (lower/upper/initcap) follows PostgreSQL's C/POSIX ctype
-//! (asc_tolower and friends): only ASCII letters change. Locale-specific
-//! folding of other characters is not modelled.
+//! Case mapping (lower/upper/initcap) follows the C.UTF-8 ctype of a
+//! PostgreSQL database created with the libc provider (wave 4 text-json):
+//! towupper / towlower per character and iswalnum word boundaries for
+//! initcap (unicode_case.sig); ASCII maps as asc_toupper does.
 const types = @import("types.sig");
+const unicode_case = @import("unicode_case.sig");
 const Error = types.Error;
 
 pub const Control = ?*types.ExecutionControl;
@@ -143,19 +145,71 @@ fn asciiUpper(byte: u8) u8 {
 
 pub const Case = enum { lower, upper, initcap };
 
-/// lower/upper/initcap under C/POSIX ctype (asc_tolower, asc_toupper,
-/// asc_initcap: words are runs of ASCII letters and digits).
+/// One UTF-8 character at `at` and its width (an invalid sequence is its
+/// first byte, unmapped).
+fn decodeAt(text: []const u8, at: usize) struct { cp: u32, width: usize, valid: bool } {
+    const lead = text[at];
+    const width: usize = if (lead >= 0xf0 and lead < 0xf8) 4 else if (lead >= 0xe0 and lead < 0xf0) 3 else if (lead >= 0xc0 and lead < 0xe0) 2 else 1;
+    if (width == 1 or at + width > text.len) return .{ .cp = lead, .width = 1, .valid = lead < 0x80 };
+    var cp: u32 = lead & (@as(u32, 0x7f) >> @intCast(width));
+    for (text[at + 1 .. at + width]) |byte| {
+        if (byte & 0xc0 != 0x80) return .{ .cp = lead, .width = 1, .valid = false };
+        cp = (cp << 6) | (byte & 0x3f);
+    }
+    return .{ .cp = cp, .width = width, .valid = true };
+}
+
+fn encodeTo(cp: u32, out: *Out) Error!void {
+    if (cp < 0x80) return out.byte(@intCast(cp));
+    if (cp < 0x800) {
+        try out.byte(@intCast(0xc0 | (cp >> 6)));
+    } else if (cp < 0x10000) {
+        try out.byte(@intCast(0xe0 | (cp >> 12)));
+        try out.byte(@intCast(0x80 | ((cp >> 6) & 0x3f)));
+    } else {
+        try out.byte(@intCast(0xf0 | (cp >> 18)));
+        try out.byte(@intCast(0x80 | ((cp >> 12) & 0x3f)));
+        try out.byte(@intCast(0x80 | ((cp >> 6) & 0x3f)));
+    }
+    try out.byte(@intCast(0x80 | (cp & 0x3f)));
+}
+
+/// lower/upper/initcap (str_tolower and friends over wide characters):
+/// each character maps through towlower / towupper; initcap upper-cases
+/// a character after a non-alphanumeric one and lower-cases the others.
+/// Every input byte is one work checkpoint.
 pub fn mapCase(text: []const u8, mode: Case, out: *Out, control: Control) Error!void {
     var in_word = false;
-    for (text) |byte| {
-        try tick(control);
-        const mapped = switch (mode) {
-            .lower => asciiLower(byte),
-            .upper => asciiUpper(byte),
-            .initcap => if (in_word) asciiLower(byte) else asciiUpper(byte),
-        };
-        in_word = (mapped >= 'A' and mapped <= 'Z') or (mapped >= 'a' and mapped <= 'z') or (mapped >= '0' and mapped <= '9');
-        try out.byte(mapped);
+    var at: usize = 0;
+    while (at < text.len) {
+        const lead = text[at];
+        if (lead < 0x80) {
+            try tick(control);
+            const mapped = switch (mode) {
+                .lower => asciiLower(lead),
+                .upper => asciiUpper(lead),
+                .initcap => if (in_word) asciiLower(lead) else asciiUpper(lead),
+            };
+            in_word = (mapped >= 'A' and mapped <= 'Z') or (mapped >= 'a' and mapped <= 'z') or (mapped >= '0' and mapped <= '9');
+            try out.byte(mapped);
+            at += 1;
+            continue;
+        }
+        const character = decodeAt(text, at);
+        for (0..character.width) |_| try tick(control);
+        if (!character.valid) {
+            try out.append(text[at..][0..character.width]);
+            in_word = false;
+        } else {
+            const mapped = switch (mode) {
+                .lower => unicode_case.toLower(character.cp),
+                .upper => unicode_case.toUpper(character.cp),
+                .initcap => if (in_word) unicode_case.toLower(character.cp) else unicode_case.toUpper(character.cp),
+            };
+            in_word = unicode_case.isAlnum(mapped);
+            try encodeTo(mapped, out);
+        }
+        at += character.width;
     }
 }
 

@@ -72,6 +72,9 @@ pub const Session = struct {
     row_security: bool = true,
     synchronize_seqscans: bool = true,
     quote_all_identifiers: bool = false,
+    /// default_text_search_config as a text_search.Config ordinal (wave 4
+    /// text-json; 1 is english).
+    text_search_config: u8 = 1,
     extra_float_digits: i8 = 1,
     mysql_keep_zero: bool = false,
     mysql_last_insert_id: u64 = 0,

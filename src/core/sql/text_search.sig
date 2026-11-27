@@ -11,15 +11,24 @@
 //! bounded caller-stack tables. Nothing allocates.
 //!
 //! The parser's state tables are a mechanical translation of
-//! wparser_def.c (PostgreSQL 18.3). Character classes follow this
-//! database's C ctype under UTF-8 (TParser's pgwstr path): non-ASCII
-//! characters are letters and alphanumerics and nothing else. Only the
-//! `simple` configuration exists here: every token type except blank,
-//! tag, protocol and entity maps to the simple dictionary, which folds
-//! ASCII letters to lower case. The other built-in configurations
-//! (english, ... with Snowball stemmers) are 0A000; unknown names 42704.
+//! wparser_def.c (PostgreSQL 18.3). Character classes follow the C.UTF-8
+//! ctype (TParser's wide-character path, wave 4 text-json lane): iswalpha
+//! and iswspace for non-ASCII characters (unicode_case.sig), digits ASCII
+//! only, and p_isspecial (zero-width characters and spacing combining
+//! marks continue a word). Two configurations exist: `simple` (every
+//! token type except blank, tag, protocol and entity maps to the simple
+//! dictionary, which lower-cases with towlower like lower()) and
+//! `english` (wave 4 text-json lane: the word
+//! token types map to english_stem, the Snowball English stemmer with the
+//! english stop-word list, snowball_english.sig; the others to simple).
+//! The other built-in Snowball configurations are 0A000; unknown names
+//! 42704. default_text_search_config selects the configuration of the
+//! one-argument forms.
 const std = @import("std");
 const types = @import("types.sig");
+const snowball_english = @import("snowball_english.sig");
+const unicode_case = @import("unicode_case.sig");
+const functions_string = @import("functions_string.sig");
 const Error = types.Error;
 
 // ---- default parser ----------------------------------------------------------
@@ -128,8 +137,19 @@ pub const Parser = struct {
         return self.state().charlen == 1 and self.byteAt() < 0x80;
     }
 
+    /// The code point of the current character (two bytes or more).
+    fn wide(self: *Parser) u32 {
+        const at = self.state().posbyte;
+        const len = self.state().charlen;
+        const lead = self.str[at];
+        var cp: u32 = lead & (@as(u32, 0x7f) >> @intCast(len));
+        for (self.str[at + 1 .. at + len]) |byte| cp = (cp << 6) | (byte & 0x3f);
+        return cp;
+    }
+
     fn isAlpha(self: *Parser) bool {
-        if (self.state().charlen != 1) return self.state().charlen > 1;
+        if (self.state().charlen > 1) return unicode_case.isAlnum(self.wide());
+        if (self.state().charlen != 1) return false;
         const b = self.byteAt();
         if (b >= 0x80) return true;
         return (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z');
@@ -142,6 +162,7 @@ pub const Parser = struct {
     }
 
     fn isSpace(self: *Parser) bool {
+        if (self.state().charlen > 1) return unicode_case.highSpace(self.wide());
         if (self.state().charlen != 1) return false;
         const b = self.byteAt();
         return b == ' ' or (b >= 9 and b <= 13);
@@ -179,9 +200,9 @@ pub const Parser = struct {
             .digit => self.isDigit(),
             .notalnum => !(self.isAlpha() or self.isDigit()),
             .space => self.isSpace(),
-            // pg_dsplen() == 0 or a spacing combining mark: never reached
-            // for a character that is not already a letter in C ctype.
-            .special => false,
+            // pg_dsplen() == 0 or a spacing combining mark (always after
+            // an alpha or alnum test with the same target).
+            .special => self.state().charlen > 1 and unicode_case.textSearchSpecial(self.wide()),
             .stophost => blk: {
                 if (!self.wanthost) break :blk false;
                 self.wanthost = false;
@@ -981,11 +1002,41 @@ fn actions(state: State) []const Item {
 
 // ---- configurations ----------------------------------------------------------
 
-pub const Config = enum { simple };
+pub const Config = enum(u8) { simple, english };
+
+/// pg_ts_config OIDs of the supported configurations (PostgreSQL 18).
+pub fn configOid(config: Config) u32 {
+    return switch (config) {
+        .simple => 3748,
+        .english => 13228,
+    };
+}
+
+/// The canonical default_text_search_config text of a configuration.
+pub fn settingText(config: Config) []const u8 {
+    return switch (config) {
+        .simple => "pg_catalog.simple",
+        .english => "pg_catalog.english",
+    };
+}
+
+/// The configuration a default_text_search_config value names (the
+/// canonical text this module writes; english for anything else).
+pub fn settingConfig(text: []const u8) Config {
+    return if (types.same(text, "pg_catalog.simple")) .simple else .english;
+}
+
+/// default_text_search_config assignment: the canonical value, 22023 for
+/// a name that is no configuration, 0A000 for an unsupported one.
+pub fn settingValue(input: []const u8) Error![]const u8 {
+    const config = configByNameImpl(input) catch |err| return if (err == error.UndefinedObject) error.InvalidSettingValue else err;
+    return settingText(config);
+}
 
 /// regconfigin: an identifier list (surrounding spaces allowed, unquoted
-/// parts folded to lower case) naming `simple`, optionally qualified by
-/// pg_catalog. Snowball configurations are 0A000; anything else 42704.
+/// parts folded to lower case) naming `simple` or `english`, optionally
+/// qualified by pg_catalog. Other Snowball configurations are 0A000;
+/// anything else 42704.
 pub fn configByNameImpl(input: []const u8) Error!Config {
     var parts: [2][64]u8 = undefined;
     var lengths: [2]usize = .{ 0, 0 };
@@ -1032,7 +1083,8 @@ pub fn configByNameImpl(input: []const u8) Error!Config {
     if (count == 2 and !types.same(parts[0][0..lengths[0]], "pg_catalog")) return error.UndefinedObject;
     const name = parts[count - 1][0..lengths[count - 1]];
     if (types.same(name, "simple")) return .simple;
-    const snowball = [_][]const u8{ "arabic", "armenian", "basque", "catalan", "danish", "dutch", "english", "finnish", "french", "german", "greek", "hindi", "hungarian", "indonesian", "irish", "italian", "lithuanian", "nepali", "norwegian", "portuguese", "romanian", "russian", "serbian", "spanish", "swedish", "tamil", "turkish", "yiddish" };
+    if (types.same(name, "english")) return .english;
+    const snowball = [_][]const u8{ "arabic", "armenian", "basque", "catalan", "danish", "dutch", "finnish", "french", "german", "greek", "hindi", "hungarian", "indonesian", "irish", "italian", "lithuanian", "nepali", "norwegian", "portuguese", "romanian", "russian", "serbian", "spanish", "swedish", "tamil", "turkish", "yiddish" };
     for (snowball) |candidate| if (types.same(candidate, name)) return error.UnsupportedStatement;
     return error.UndefinedObject;
 }
@@ -1394,34 +1446,187 @@ pub fn TextSearch(comptime text_bytes: usize, comptime depth_limit: usize) type 
             try writeVector(&vector, out, max_positions_per_lexeme);
         }
 
-        /// Lexizes one token with the built-in simple dictionary under C ctype.
-        fn simpleLexize(word: []const u8, buffer: []u8) []const u8 {
-            for (word, 0..) |byte, index| buffer[index] = if (byte >= 'A' and byte <= 'Z') byte + 32 else byte;
-            return buffer[0..word.len];
+        /// Lexizes one token with the built-in simple dictionary:
+        /// lowerstr (towlower per character, as lower()); a result beyond
+        /// `buffer` is 54000.
+        fn simpleLexize(word: []const u8, buffer: []u8) Error![]const u8 {
+            var out: functions_string.Out = .{ .bytes = buffer };
+            try functions_string.mapCase(word, .lower, &out, null);
+            return out.slice();
         }
 
-        /// parsetext with `simple`: each indexed token is one lexeme at the
-        /// next position.
-        fn parseText(text: []const u8, vector: *Vector, control: ?*types.ExecutionControl) Error!void {
+        /// english_stem (dict_snowball): the lower-cased word, nothing for
+        /// a stop word, else its Snowball stem (words over 1000 bytes are
+        /// only lower-cased).
+        fn englishLexize(word: []const u8, buffer: []u8, stemmed: []u8) Error!?[]const u8 {
+            const lower = try simpleLexize(word, buffer);
+            if (lower.len > snowball_english.max_word) return lower;
+            if (lower.len == 0) return null;
+            for (snowball_english.stop_words) |stop| if (std.mem.eql(u8, stop, lower)) return null;
+            return snowball_english.stem(lower, stemmed);
+        }
+
+        /// The english configuration's english_stem token types.
+        fn englishStemmed(kind: u8) bool {
+            return switch (kind) {
+                1, 2, 10, 11, 16, 17 => true,
+                else => false,
+            };
+        }
+
+        /// parsetext: each indexed token takes the next position; its
+        /// lexeme (none for a stop word) comes from the configuration's
+        /// dictionary for its type.
+        fn parseText(text: []const u8, vector: *Vector, control: ?*types.ExecutionControl, config: Config) Error!void {
             var parser = Parser.init(text);
             var position: usize = 0;
             var buffer: [text_bytes]u8 = undefined;
+            var stemmed: [@max(text_bytes, snowball_english.max_word) + 8]u8 = undefined;
             while (try parser.next()) |token| {
                 if (control) |active| try active.checkpoint();
                 if (!simpleIndexes(token.kind)) continue;
                 if (token.bytes.len >= max_word) continue;
                 position += 1;
-                const lexeme = simpleLexize(token.bytes, &buffer);
+                const lexeme = if (config == .english and englishStemmed(token.kind))
+                    (try englishLexize(token.bytes, &buffer, &stemmed)) orelse continue
+                else
+                    try simpleLexize(token.bytes, &buffer);
                 const entry = try vector.add(lexeme);
                 // Positions beyond 16383 are recorded as 16383.
                 try vector.addPosition(entry, @intCast(@min(position, max_position)));
             }
         }
 
-        /// to_tsvector(config, text).
-        pub fn toVector(text: []const u8, out: *Out, control: ?*types.ExecutionControl) Error!void {
+        /// The weight code of a setweight / ts_filter weight: A 3, B 2,
+        /// C 1, D 0 (either case); anything else is 22023.
+        pub fn weightCode(c: u8) Error!u16 {
+            return switch (c) {
+                'A', 'a' => 3,
+                'B', 'b' => 2,
+                'C', 'c' => 1,
+                'D', 'd' => 0,
+                else => error.InvalidParameterValue,
+            };
+        }
+
+        /// length(tsvector): the number of lexemes.
+        pub fn lexemeCount(text: []const u8) Error!usize {
             var vector: Vector = .{};
-            try parseText(text, &vector, control);
+            try readVector(text, &vector);
+            return vector.count;
+        }
+
+        /// The edits of strip, setweight, ts_delete and ts_filter.
+        pub const Edit = union(enum) {
+            strip,
+            /// The weight, and the lexemes it applies to (all when null).
+            setweight: struct { weight: u16, only: ?[]const ?[]const u8 },
+            delete: []const ?[]const u8,
+            /// A mask of weight codes to keep.
+            filter: u4,
+        };
+
+        fn listed(list: []const ?[]const u8, lexeme: []const u8) bool {
+            for (list) |item| if (item) |candidate| if (std.mem.eql(u8, candidate, lexeme)) return true;
+            return false;
+        }
+
+        /// Rewrites canonical tsvector text by `edit` (tsvector_op.c).
+        pub fn editVector(text: []const u8, edit: Edit, out: *Out) Error!void {
+            var source: Vector = .{};
+            try readVector(text, &source);
+            var result: Vector = .{};
+            for (source.entries[0..source.count]) |entry| {
+                const lexeme = source.lexeme(entry);
+                const positions = source.positionsOf(entry);
+                switch (edit) {
+                    .delete => |list| if (listed(list, lexeme)) continue,
+                    else => {},
+                }
+                if (edit == .filter) {
+                    var any = false;
+                    for (positions) |position| {
+                        if (edit.filter & (@as(u4, 1) << @intCast(position >> 14)) != 0) any = true;
+                    }
+                    if (!any) continue;
+                }
+                const added = try result.add(lexeme);
+                if (edit == .strip) continue;
+                for (positions) |position| {
+                    var kept = position;
+                    switch (edit) {
+                        .setweight => |weight| if (weight.only == null or listed(weight.only.?, lexeme)) {
+                            kept = (position & 0x3fff) | (weight.weight << 14);
+                        },
+                        .filter => |mask| if (mask & (@as(u4, 1) << @intCast(position >> 14)) == 0) continue,
+                        else => {},
+                    }
+                    try result.addPosition(added, kept);
+                }
+            }
+            try writeVector(&result, out, max_positions_per_lexeme);
+        }
+
+        /// The lexemes of canonical tsvector text, in order, into `out`
+        /// (their count; tsvector_to_array).
+        pub fn lexemes(text: []const u8, vector: *Vector) Error!usize {
+            try readVector(text, vector);
+            return vector.count;
+        }
+
+        pub fn lexemeAt(vector: *const Vector, index: usize) []const u8 {
+            return vector.lexeme(vector.entries[index]);
+        }
+
+        /// array_to_tsvector: lexemes without positions (22004 for a NULL,
+        /// 2200F for an empty string).
+        pub fn vectorOfLexemes(list: []const ?[]const u8, out: *Out) Error!void {
+            var vector: Vector = .{};
+            for (list) |item| {
+                const lexeme = item orelse return error.NullValueNotAllowed;
+                if (lexeme.len == 0) return error.ZeroLengthCharacterString;
+                _ = try vector.add(lexeme);
+            }
+            try writeVector(&vector, out, max_positions_per_lexeme);
+        }
+
+        /// tsvector || tsvector (tsvector_concat): the right operand's
+        /// positions move past the left operand's largest position (at most
+        /// 16383); equal lexemes merge their positions.
+        pub fn concatVectors(left_text: []const u8, right_text: []const u8, out: *Out) Error!void {
+            var left: Vector = .{};
+            try readVector(left_text, &left);
+            var right: Vector = .{};
+            try readVector(right_text, &right);
+            var shift: u16 = 0;
+            for (left.positions[0..left.pos_len]) |position| shift = @max(shift, positionValue(position));
+            var result: Vector = .{};
+            for (left.entries[0..left.count]) |entry| {
+                const added = try result.add(left.lexeme(entry));
+                for (left.positionsOf(entry)) |position| try result.addPosition(added, position);
+            }
+            for (right.entries[0..right.count]) |entry| {
+                const added = try result.add(right.lexeme(entry));
+                for (right.positionsOf(entry)) |position| {
+                    const moved: u16 = @min(@as(u32, positionValue(position)) + shift, max_position);
+                    try result.addPosition(added, moved | (position & 0xc000));
+                }
+            }
+            try writeVector(&result, out, max_positions_per_lexeme);
+        }
+
+        /// numnode(tsquery): the query's items.
+        pub fn queryItemCount(text: []const u8) Error!usize {
+            var query: Query = .{};
+            try readQuery(text, &query, .as_is);
+            if (query.root == null) return 0;
+            return query.count;
+        }
+
+        /// to_tsvector(config, text).
+        pub fn toVector(text: []const u8, config: Config, out: *Out, control: ?*types.ExecutionControl) Error!void {
+            var vector: Vector = .{};
+            try parseText(text, &vector, control, config);
             // uniqueWORD keeps at most MAXNUMPOS - 1 positions per word.
             try writeVector(&vector, out, max_positions_per_lexeme - 1);
         }
@@ -1437,6 +1642,8 @@ pub fn TextSearch(comptime text_bytes: usize, comptime depth_limit: usize) type 
             bytes: [text_bytes]u8 = undefined,
             bytes_len: usize = 0,
             root: ?u16 = null,
+            /// The configuration that turns operands into lexemes.
+            config: Config = .simple,
 
             fn node(self: *Query, value: Node) Error!u16 {
                 if (self.count == max_nodes) return error.TextCapacity;
@@ -1472,17 +1679,28 @@ pub fn TextSearch(comptime text_bytes: usize, comptime depth_limit: usize) type 
 
         /// An operand: as written, or each indexed word of it joined by
         /// `morph`'s operator (pushval_morph: words of one operand are
-        /// left-nested); one without words is a stop-word placeholder that
-        /// cleanup() removes.
+        /// left-nested, and positions of stop words between them become
+        /// placeholders joined the same way); one without words is a
+        /// stop-word placeholder. cleanup() removes placeholders.
         fn pushOperand(query: *Query, text: []const u8, weight: u8, prefix: bool, morph: Morph) Error!u16 {
             if (morph == .as_is) return try query.operand(text, weight, prefix);
             var vector: Vector = .{};
-            try parseText(text, &vector, null);
+            try parseText(text, &vector, null, query.config);
             if (vector.count == 0) return query.node(.{ .kind = .void });
+            const kind: Kind = if (morph == .@"and") .@"and" else .phrase;
             var result: ?u16 = null;
+            var previous: u16 = 0;
             for (vector.entries[0..vector.count]) |entry| {
+                const position = vector.positionsOf(entry)[0];
+                if (previous > 0) {
+                    while (previous + 1 < position) : (previous += 1) {
+                        const stop = try query.node(.{ .kind = .void });
+                        result = try query.node(.{ .kind = kind, .left = result.?, .right = stop, .distance = 1 });
+                    }
+                }
+                previous = position;
                 const id = try query.operand(vector.lexeme(entry), weight, prefix);
-                result = if (result) |left| try query.node(.{ .kind = if (morph == .@"and") .@"and" else .phrase, .left = left, .right = id, .distance = 1 }) else id;
+                result = if (result) |left| try query.node(.{ .kind = kind, .left = left, .right = id, .distance = 1 }) else id;
             }
             return result.?;
         }
@@ -1729,8 +1947,8 @@ pub fn TextSearch(comptime text_bytes: usize, comptime depth_limit: usize) type 
 
         /// to_tsquery (phrase), plainto_tsquery (and: the whole text is one
         /// operand) and phraseto_tsquery (phrase: one operand).
-        pub fn toQuery(text: []const u8, which: enum { to, plain, phrase }, out: *Out) Error!void {
-            var query: Query = .{};
+        pub fn toQuery(text: []const u8, which: enum { to, plain, phrase }, config: Config, out: *Out) Error!void {
+            var query: Query = .{ .config = config };
             switch (which) {
                 .to => try readQuery(text, &query, .phrase),
                 .plain, .phrase => {
@@ -2029,6 +2247,7 @@ pub fn TextSearch(comptime text_bytes: usize, comptime depth_limit: usize) type 
         }
 
         pub const configByName = configByNameImpl;
+        pub const Configuration = Config;
 
         pub fn canonicalQuery(text: []const u8) bool {
             var out: Out = .{};

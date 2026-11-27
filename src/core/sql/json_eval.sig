@@ -237,10 +237,16 @@ pub fn JsonEval(comptime config: types.Config, comptime E: type) type {
             } };
             if (state.mode == .array) header = try J.beginContainer(&out, false);
             const sink: JP.Sink = .{ .context = &state, .emit = collectEmit };
-            _ = JP.run(&context, &sink) catch |err| {
-                if (silent and jsonpath.suppressible(err)) return .null_value;
-                return err;
+            // A silent error ends the evaluation: exists and match give
+            // NULL, the array and first forms what was found before it.
+            const failed = run: {
+                _ = JP.run(&context, &sink) catch |err| {
+                    if (silent and jsonpath.suppressible(err)) break :run true;
+                    return err;
+                };
+                break :run false;
             };
+            if (failed and (state.mode == .exists or state.mode == .match)) return .null_value;
             switch (state.mode) {
                 .exists => return .{ .boolean = state.count != 0 },
                 .match => {
@@ -264,6 +270,43 @@ pub fn JsonEval(comptime config: types.Config, comptime E: type) type {
                     return jsonbCell(&out);
                 },
             }
+        }
+
+        const RowState = struct {
+            context: *anyopaque,
+            row: *const fn (*anyopaque, *const V.Cell) Error!bool,
+            stopped: bool = false,
+        };
+
+        fn rowItemEmit(raw: ?*anyopaque, item: JP.Item) Error!bool {
+            const state: *RowState = @ptrCast(@alignCast(raw.?));
+            var out: J.Buffer = .{};
+            try out.append(item.bytes[item.at..][0..jsonb.sizeAt(item.bytes, item.at)]);
+            const cell = try jsonbCell(&out);
+            if (!try state.row(state.context, &cell)) state.stopped = true;
+            return state.stopped;
+        }
+
+        /// The rows of jsonb_path_query (wave 4 text-json): every item the
+        /// path yields, in order; NULL arguments give none, and a silent
+        /// call ends quietly at a suppressible error.
+        pub fn pathRows(ctx: *const E.Context, n: *const ast.Node, context: *anyopaque, row: *const fn (*anyopaque, *const V.Cell) Error!bool) Error!void {
+            var args: Args = .{};
+            try arguments(ctx, n, &args);
+            if (args.any_null) return;
+            const session = ctx.session;
+            const silent = args.count > 3 and args.cells[3].boolean;
+            const vars: ?[]const u8 = if (args.count > 2) args.cells[2].jsonb.slice() else null;
+            var path: JP.P = undefined;
+            try path.parse(args.cells[1].text.slice(), session.control);
+            var evaluation: JP.Context = undefined;
+            try JP.init(&evaluation, &path, args.cells[0].jsonb.slice(), vars, session.control, session);
+            var state: RowState = .{ .context = context, .row = row };
+            const sink: JP.Sink = .{ .context = &state, .emit = rowItemEmit };
+            _ = JP.run(&evaluation, &sink) catch |err| {
+                if (silent and jsonpath.suppressible(err)) return;
+                return err;
+            };
         }
 
         // ---- JSON_TABLE (B11 json-agg lane) ---------------------------------
@@ -352,26 +395,7 @@ pub fn JsonEval(comptime config: types.Config, comptime E: type) type {
             const path_cell = try E.eval(ctx, table.c);
             if (path_cell == .null_value) return;
             const control = ctx.session.control;
-            // PASSING values as a jsonb object (to_jsonb of each value).
-            var vars_cell: V.Cell = .null_value;
-            var member = table.b;
-            var any_passing = false;
-            var buffer: [JB.buffer_bytes]u8 = undefined;
-            var out: json_build.Out = .{ .bytes = &buffer };
-            try out.byte('{');
-            while (member != none) : (member = node(ctx, member).next) {
-                const n = node(ctx, member);
-                if (n.func != .json_table_passing) continue;
-                if (any_passing) try out.append(", ");
-                any_passing = true;
-                var name_buffer: [64]u8 = undefined;
-                try json_build.escaped(&out, try identifier(ctx, n.name, &name_buffer));
-                try out.append(": ");
-                const passed = try E.eval(ctx, n.b);
-                try JB.append(&out, &passed, node(ctx, n.b).ty, false, true, ctx.session);
-            }
-            try out.byte('}');
-            if (any_passing) vars_cell = try JB.jsonbOf(&out, ctx.session);
+            const vars_cell = try passingObject(ctx, table.b);
             const vars: ?[]const u8 = if (vars_cell == .jsonb) vars_cell.jsonb.slice() else null;
             var path: JP.P = undefined;
             try path.parse(path_cell.text.slice(), control);
@@ -392,6 +416,143 @@ pub fn JsonEval(comptime config: types.Config, comptime E: type) type {
             _ = try JP.run(&rows, &emitter);
         }
 
+        /// JSON_OBJECT / JSON_ARRAY (json_build_object / json_build_array
+        /// text, or jsonb), JSON_SCALAR (to_json; NULL stays NULL) and
+        /// JSON_SERIALIZE (the JSON text). A NULL key is 22004, a repeated
+        /// key with WITH UNIQUE KEYS 22030.
+        pub fn constructor(ctx: *const E.Context, n: *const ast.Node) Error!V.Cell {
+            const form = n.integer & 3;
+            const absent = n.integer & 4 != 0;
+            const unique = n.integer & 8 != 0;
+            const jsonb_result = n.ty == .jsonb;
+            const session = ctx.session;
+            var buffer: [JB.buffer_bytes]u8 = undefined;
+            var out: json_build.Out = .{ .bytes = &buffer };
+            switch (form) {
+                2, 3 => {
+                    const argument = try E.eval(ctx, n.b);
+                    if (argument == .null_value) return .null_value;
+                    const ty = node(ctx, n.b).ty;
+                    if (form == 3) {
+                        if (argument == .jsonb) {
+                            var text: V.Text = .{};
+                            var rendered: J.Text = .{ .bytes = &text.bytes };
+                            try J.render(argument.jsonb.slice(), 0, &rendered);
+                            try out.append(text.bytes[0..rendered.len]);
+                        } else {
+                            const bytes = if (argument == .bpchar) argument.bpchar.slice() else argument.text.slice();
+                            if (ty != .json) try J.validateJsonControlled(bytes, session.control);
+                            try out.append(bytes);
+                        }
+                    } else try JB.append(&out, &argument, ty, false, jsonb_result, session);
+                },
+                0 => {
+                    try out.byte('{');
+                    // Rendered keys (also of skipped pairs) for WITH UNIQUE KEYS.
+                    var key_bytes: [JB.buffer_bytes]u8 = undefined;
+                    var key_out: json_build.Out = .{ .bytes = &key_bytes };
+                    var keys: [64][2]usize = undefined;
+                    var key_count: usize = 0;
+                    var first = true;
+                    var item = n.b;
+                    while (item != none) {
+                        const key_id = item;
+                        const value_id = node(ctx, key_id).next;
+                        const key = try E.eval(ctx, key_id);
+                        if (key == .null_value) return error.NullValueNotAllowed;
+                        const value_cell = try E.eval(ctx, value_id);
+                        item = node(ctx, value_id).next;
+                        const key_ty = node(ctx, key_id).ty;
+                        if (unique) {
+                            const key_start = key_out.len;
+                            try JB.append(&key_out, &key, key_ty, true, jsonb_result, session);
+                            const rendered = key_out.bytes[key_start..key_out.len];
+                            for (keys[0..key_count]) |span| {
+                                if (session.control) |control| try control.checkpoint();
+                                if (types.same(key_out.bytes[span[0]..][0..span[1]], rendered)) return error.DuplicateJsonObjectKeyValue;
+                            }
+                            if (key_count == keys.len) return error.ProgramLimitExceeded;
+                            keys[key_count] = .{ key_start, rendered.len };
+                            key_count += 1;
+                        }
+                        if (absent and value_cell == .null_value) continue;
+                        if (!first) try out.append(", ");
+                        first = false;
+                        try JB.append(&out, &key, key_ty, true, jsonb_result, session);
+                        try out.append(" : ");
+                        try JB.append(&out, &value_cell, node(ctx, value_id).ty, false, jsonb_result, session);
+                    }
+                    try out.byte('}');
+                },
+                else => {
+                    try out.byte('[');
+                    var first = true;
+                    var item = n.b;
+                    while (item != none) : (item = node(ctx, item).next) {
+                        const value_cell = try E.eval(ctx, item);
+                        if (absent and value_cell == .null_value) continue;
+                        if (!first) try out.append(", ");
+                        first = false;
+                        try JB.append(&out, &value_cell, node(ctx, item).ty, false, jsonb_result, session);
+                    }
+                    try out.byte(']');
+                },
+            }
+            if (jsonb_result) return JB.jsonbOf(&out, session);
+            const cell = try JB.jsonOf(&out);
+            if (n.ty == .json or n.ty == .text) return cell;
+            return Io.cast(cell, .text, n.ty, n.typmod, session);
+        }
+
+        /// PASSING values (json_table_passing nodes from `first`) as a
+        /// jsonb object (to_jsonb of each value), or NULL without any.
+        fn passingObject(ctx: *const E.Context, first: u16) Error!V.Cell {
+            var member = first;
+            var any_passing = false;
+            var buffer: [JB.buffer_bytes]u8 = undefined;
+            var out: json_build.Out = .{ .bytes = &buffer };
+            try out.byte('{');
+            while (member != none) : (member = node(ctx, member).next) {
+                const n = node(ctx, member);
+                if (n.func != .json_table_passing) continue;
+                if (any_passing) try out.append(", ");
+                any_passing = true;
+                var name_buffer: [64]u8 = undefined;
+                try json_build.escaped(&out, try identifier(ctx, n.name, &name_buffer));
+                try out.append(": ");
+                const passed = try E.eval(ctx, n.b);
+                try JB.append(&out, &passed, node(ctx, n.b).ty, false, true, ctx.session);
+            }
+            try out.byte('}');
+            if (!any_passing) return .null_value;
+            return JB.jsonbOf(&out, ctx.session);
+        }
+
+        /// JSON_EXISTS / JSON_VALUE / JSON_QUERY (ExecEvalJsonExprPath):
+        /// the column rules of JSON_TABLE over the context item; a NULL
+        /// context item or path is NULL.
+        pub fn queryFunction(ctx: *const E.Context, n: *const ast.Node) Error!V.Cell {
+            const document = try E.eval(ctx, n.a);
+            const column = node(ctx, n.c);
+            if (document == .null_value) {
+                // The path is still evaluated (its errors surface).
+                _ = try E.eval(ctx, column.a);
+                return .null_value;
+            }
+            const vars_cell = try passingObject(ctx, n.b);
+            const vars: ?[]const u8 = if (vars_cell == .jsonb) vars_cell.jsonb.slice() else null;
+            const path_cell = try E.eval(ctx, column.a);
+            if (path_cell == .null_value) return .null_value;
+            const Sinkless = struct {
+                fn row(_: *anyopaque, _: []const V.Cell) Error!void {}
+            };
+            var unused: u8 = 0;
+            var state: TableState = .{ .ctx = ctx, .table = n, .names = &.{}, .tys = &.{}, .typmods = &.{}, .vars = vars, .sink = .{ .context = &unused, .row = Sinkless.row }, .error_on_error = false };
+            var name_buffer: [64]u8 = undefined;
+            const name = try identifier(ctx, column.name, &name_buffer);
+            return columnValue(&state, column, .{ .bytes = document.jsonb.slice(), .at = 0 }, name, n.ty, n.typmod);
+        }
+
         fn columnValue(state: *TableState, n: *const ast.Node, item: JP.Item, name: []const u8, ty: types.Type, typmod: i32) Error!V.Cell {
             const spec = ast.JsonTableColumn.decode(n.integer);
             if (spec.kind == .ordinality) return .{ .integer = state.ordinal };
@@ -405,10 +566,8 @@ pub fn JsonEval(comptime config: types.Config, comptime E: type) type {
             // Empty: ON EMPTY (NULL by default); its ERROR is itself handled
             // by ON ERROR unless that is ERROR (ExecEvalJsonExprPath).
             const on_empty = if (spec.on_empty == .unspecified) ast.JsonTableColumn.Behavior.null_value else spec.on_empty;
-            if (on_empty == .error_value) {
-                if (on_error == .error_value) return error.NoSqlJsonItem;
-                return behavior(state, n.c, on_error, ty, typmod);
-            }
+            // ERROR ON EMPTY raises whatever ON ERROR says (PostgreSQL 18).
+            if (on_empty == .error_value) return error.NoSqlJsonItem;
             return behavior(state, n.b, on_empty, ty, typmod);
         }
 
@@ -488,6 +647,8 @@ pub fn JsonEval(comptime config: types.Config, comptime E: type) type {
                     .null_value => return .null_value,
                     .array, .object => return error.SqlJsonScalarRequired,
                     .string => return try convertText(jsonb.stringAt(bytes, first), ty, typmod, session),
+                    // A boolean converts through its output text (boolout).
+                    .true_value, .false_value => return try convertText(if (bytes[first] == @intFromEnum(jsonb.Tag.true_value)) "t" else "f", ty, typmod, session),
                     else => {
                         var text: V.Text = .{};
                         var rendered: J.Text = .{ .bytes = &text.bytes };
@@ -512,8 +673,9 @@ pub fn JsonEval(comptime config: types.Config, comptime E: type) type {
                 try canonical.append(collected.bytes[first..collected.len]);
             }
             const result = canonical.bytes[0..canonical.len];
-            if (ty == .jsonb) return try jsonbCell(&canonical);
+            // OMIT QUOTES: a string's text goes through the type's input.
             if (spec.quotes == .omit and result[0] == @intFromEnum(jsonb.Tag.string)) return try convertText(jsonb.stringAt(result, 0), ty, typmod, session);
+            if (ty == .jsonb) return try jsonbCell(&canonical);
             var text: V.Text = .{};
             var rendered: J.Text = .{ .bytes = &text.bytes };
             try J.render(result, 0, &rendered);

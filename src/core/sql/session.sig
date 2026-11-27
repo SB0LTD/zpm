@@ -89,6 +89,8 @@ pub fn Sessions(comptime config: types.Config) type {
             restricted_relation_kinds: RelationKinds = .{},
             restriction_text: SettingText = .{},
             search_path: SettingText = SettingText.literal("\"$user\", public"),
+            /// default_text_search_config, canonical (wave 4 text-json).
+            text_search_config: SettingText = SettingText.literal("pg_catalog.english"),
             /// Origin bits for the named engine settings in pg_settings.
             client_settings: u8 = 0,
             session_settings: u8 = 0,

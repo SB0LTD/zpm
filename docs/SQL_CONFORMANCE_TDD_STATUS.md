@@ -1,5 +1,90 @@
 # SQL conformance TDD checkpoint
 
+## Text and JSON (lane B11 wave 4, text-json) — 27 November 2026
+
+Branch `w4/text-json` closes most of the regular-expression, text-search
+and SQL/JSON gaps left by waves 3 (`b11/text`, `b11/json-agg`).
+`contract-sql-text-json` (tests/test_sql_text_json.sig, batteries in
+tests/sql_text_json_batteries.sig) checks values, result names, OIDs and
+typmods, NULLs, exact SQLSTATEs with statement atomicity, work budgets and
+cancellation points, and change-record replay into a replica. Every
+expectation was checked against native PostgreSQL 18.7, case by case: the
+batteries are psql output, never edited by hand.
+
+- **Character semantics (ctype)**: the engine follows glibc's C.UTF-8
+  ctype under the libc provider, the locale of the feature-probe oracle.
+  upper/lower/initcap use towupper/towlower per character and iswalnum
+  word boundaries; regular expressions use regc_pg_locale.c's libc wide
+  strategy (non-ASCII classes per iswalpha, iswupper, ... ; `\w` and the
+  word constraints use alnum; a case-insensitive character is allcases(),
+  towlower and towupper but not the character itself; bracket ranges add
+  the case variants of their members; back references compare towlower);
+  the text search parser classifies non-ASCII characters with iswalpha /
+  iswspace and p_isspecial, and its dictionaries lower-case with towlower;
+  ILIKE compares lower() of both sides. The tables (unicode_case.sig) were
+  extracted from native PostgreSQL 18.7. Sorting is unchanged: C.UTF-8
+  collates by code point, as C does for UTF-8. Six non-ASCII entries of
+  contract-sql-text and two of the new batteries, first written for a C
+  database, now hold the C.UTF-8 result.
+- **Regular expressions** (regex.sig rewritten after regcomp.c /
+  regexec.c): a subexpression tree with PostgreSQL's LONGER / SHORTER /
+  MIXED preferences, leftmost start then longest or shortest match by the
+  tree, and cdissect-style dissection, so back references (also inside
+  quantified groups, `{0}`-removed groups never match), BREs (`(?b)` and
+  regexp option `b`), quoted patterns (`q`), lookarounds nested to any depth (54001
+  beyond Config.expr_depth) and capture positions all behave as in
+  PostgreSQL. Matching stays a Pike VM per subexpression; dissection
+  spends one work checkpoint per candidate split.
+- **Regex functions**: regexp_match, regexp_matches (set-returning, in FROM
+  with ORDINALITY and in the select list), regexp_replace (flags, start,
+  N), regexp_split_to_array / regexp_split_to_table, regexp_count,
+  regexp_instr, regexp_substr, `substring(... FROM pattern)` and
+  `substring(... SIMILAR ... ESCAPE ...)`.
+- **Full text search**: the english configuration (a port of Snowball
+  2.2.0's English stemmer, snowball_english.sig, and PostgreSQL's english
+  stop-word list; stop words keep their positions and become phrase
+  gaps); `default_text_search_config` (session setting, SET / SET LOCAL /
+  RESET, SHOW, pg_settings; default `pg_catalog.english`, other Snowball
+  configurations 0A000, unknown names 22023); the one-argument to_tsvector
+  / to_tsquery / plainto_tsquery / phraseto_tsquery; `text @@ tsquery` and
+  `text @@ text` (two untyped operands now resolve to text @@ text);
+  length(tsvector), strip, setweight (with and without lexemes), ts_delete
+  (text and text[]), ts_filter, tsvector_to_array, array_to_tsvector,
+  numnode and `tsvector || tsvector`.
+- **SQL/JSON**: jsonpath like_regex (flags i, s, m, q; x is 0A000 as in
+  PostgreSQL) and keyvalue() (ids from PostgreSQL's jsonb binary layout);
+  jsonb_path_query as a set-returning function (FROM and select list) and
+  the `_tz` variants; JSON_EXISTS, JSON_VALUE and JSON_QUERY as
+  expressions (PASSING, RETURNING, FORMAT JSON, wrappers, quotes, ON EMPTY
+  / ON ERROR with DEFAULT expressions); IS [NOT] JSON [VALUE | ARRAY |
+  OBJECT | SCALAR] [WITH | WITHOUT UNIQUE [KEYS]]; JSON_OBJECT (`VALUE`
+  and `:`), JSON_ARRAY, JSON_SCALAR, JSON_SERIALIZE with NULL / ABSENT ON
+  NULL, WITH UNIQUE KEYS, RETURNING and FORMAT JSON; JSON_OBJECTAGG and
+  JSON_ARRAYAGG (ORDER BY, NULL clauses, UNIQUE, RETURNING json / jsonb);
+  json[b]_agg_strict and json[b]_object_agg_strict / _unique /
+  _unique_strict.
+
+Open, each 0A000 here: JSON_TABLE NESTED PATH; the jsonpath datetime
+methods (datetime(), date(), time[_tz](), timestamp[_tz]()); jsonb
+subscript assignment; JSON_ARRAYAGG / JSON_OBJECTAGG RETURNING a string
+type; ts_rank, ts_rank_cd, ts_headline, websearch_to_tsquery, querytree,
+tsvector / tsquery comparison and ordering operators and their binary
+wire forms; Snowball configurations other than english. Collations other
+than the C-equivalent built-ins are untouched: column collations need a
+table-definition format change (ddl-dml lane), and pg_collation, COLLATION
+FOR, 42P22 and CREATE COLLATION were not started.
+
+Deviations kept on purpose: JSON_SERIALIZE(jsonb) returns the jsonb text
+(PostgreSQL 18.7 returns a corrupt '\x01'); JSON_OBJECT WITH UNIQUE KEYS
+checks at most 64 keys (54000 beyond); a lexeme or case-mapped value that
+grows past Config.text_bytes is 54000; regex dissection end points are
+bounded by the caller's workspace (54000).
+
+New SQLSTATE mappings: 22030 (DuplicateJsonObjectKeyValue) and 2200F
+(ZeroLengthCharacterString). Change records: no new op, value tag or
+format; the new values are stored in existing json, jsonb, tsvector and
+text columns and replay unchanged. No new Config constant.
+
 ## Extended types (lane B11 wave 4, types-ext) — 27 November 2026
 
 Branch `w4/types-ext` closes most of the advanced-types gaps of wave 2.

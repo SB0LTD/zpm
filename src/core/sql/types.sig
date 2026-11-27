@@ -561,6 +561,12 @@ pub const Error = error{
     /// SQLSTATE 23001: a key an ON DELETE / ON UPDATE RESTRICT foreign key
     /// still references when the statement ends (ddl-dml, wave 4).
     RestrictViolation,
+    /// SQLSTATE 22030: a duplicate key where JSON object keys must be
+    /// unique (wave 4 text-json).
+    DuplicateJsonObjectKeyValue,
+    /// SQLSTATE 2200F: an empty string where one is not allowed
+    /// (array_to_tsvector lexemes; wave 4 text-json).
+    ZeroLengthCharacterString,
 };
 
 /// Caller-owned execution accounting and interrupt polling. This is independent

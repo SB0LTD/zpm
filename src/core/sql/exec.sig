@@ -18,6 +18,7 @@ const collect_module = @import("aggregates_collect.sig");
 const array_module = @import("array.sig");
 const json_eval = @import("json_eval.sig");
 const types_ext_eval = @import("types_ext_eval.sig");
+const regex_eval = @import("regex_eval.sig");
 const temporal = @import("temporal.sig");
 const builtin = @import("builtin");
 const Error = types.Error;
@@ -348,6 +349,7 @@ pub fn Exec(comptime config: types.Config) type {
                 if (p.series == .unnest) return self.unnestRows(p, &ctx);
                 if (p.series == .routine) return self.routineRows(p, &ctx);
                 if (p.series == .subscripts) return self.subscriptRows(p, &ctx);
+                if (p.series == .set_function) return self.setFunctionRows(p, &ctx);
                 if (p.series == .none) {
                     const at = try self.cells(p.width);
                     self.work.cells[at] = try E.eval(&ctx, p.function);
@@ -381,7 +383,7 @@ pub fn Exec(comptime config: types.Config) type {
                         const zero: V.Cell = .{ .interval = .{} };
                         direction = V.compare(&step, &zero);
                     },
-                    .none, .json_table, .partition_ancestors, .options_to_table, .unnest, .routine, .subscripts => unreachable,
+                    .none, .json_table, .partition_ancestors, .options_to_table, .unnest, .routine, .subscripts, .set_function => unreachable,
                 }
                 if (direction == 0) return error.InvalidParameterValue;
                 var current = args[0];
@@ -587,6 +589,38 @@ pub fn Exec(comptime config: types.Config) type {
                 if (count == 0) return .{};
                 if (reverse.boolean) return .{ .current = shape.upper(index), .step = -1, .remaining = count };
                 return .{ .current = shape.lbounds[index], .step = 1, .remaining = count };
+            }
+
+            /// The values of a set-returning built-in call (wave 4 text-json).
+            fn setRows(ctx: *const E.Context, call: u16, sink: regex_eval.RegexEval(config, E).Sink) Error!void {
+                const n = &ctx.pool.nodes[call];
+                return switch (n.func) {
+                    .regexp_matches, .regexp_split_to_table => regex_eval.RegexEval(config, E).rows(ctx, n, sink),
+                    .jsonb_path_query => json_eval.JsonEval(config, E).pathRows(ctx, n, sink.context, sink.row),
+                    else => error.UnsupportedStatement,
+                };
+            }
+
+            /// A set-returning built-in in FROM: one row per value, ORDINALITY
+            /// numbering them from 1; rows count against the workspace.
+            fn setFunctionRows(self: *Query, p: *const B.Plan, ctx: *const E.Context) Error!List {
+                var rows: List = .{ .start = @intCast(self.work.ref_low) };
+                const Emit = struct {
+                    query: *Query,
+                    list: *List,
+                    plan: *const B.Plan,
+                    fn row(raw: *anyopaque, cell: *const V.Cell) Error!bool {
+                        const state: *@This() = @ptrCast(@alignCast(raw));
+                        const at = try state.query.cells(state.plan.width);
+                        state.query.work.cells[at] = cell.*;
+                        if (state.plan.ordinality) state.query.work.cells[at + 1] = .{ .integer = @as(i64, state.list.count) + 1 };
+                        try state.query.push(state.list, at);
+                        return true;
+                    }
+                };
+                var producer: Emit = .{ .query = self, .list = &rows, .plan = p };
+                try setRows(ctx, p.function, .{ .context = &producer, .row = Emit.row });
+                return self.finish(p, rows);
             }
 
             /// JSON_TABLE rows (B11 json-agg lane, json_eval.sig): each row's
@@ -1061,11 +1095,42 @@ pub fn Exec(comptime config: types.Config) type {
                     self.setTuple(p, &ctx, &tuple_rows, tuples, index);
                     if (p.unnest_column == none) {
                         try self.projectRow(p, &ctx, &out);
+                    } else if (p.set_call != none) {
+                        try self.projectSet(p, &ctx, &out, if (lazy) wanted else 0xffffffffffffffff);
                     } else {
                         try self.projectUnnest(p, &ctx, &out, if (lazy) wanted else 0xffffffffffffffff);
                     }
                 }
                 return out;
+            }
+
+            /// A select list with a set-returning call (wave 4 text-json):
+            /// one output row per produced value, every target evaluated
+            /// with the call reading that value.
+            fn projectSet(self: *Query, p: *const B.Plan, ctx: *const E.Context, out: *List, wanted: u64) Error!void {
+                const Emit = struct {
+                    query: *Query,
+                    plan: *const B.Plan,
+                    context: *const E.Context,
+                    out: *List,
+                    wanted: u64,
+                    fn row(raw: *anyopaque, cell: *const V.Cell) Error!bool {
+                        const state: *@This() = @ptrCast(@alignCast(raw));
+                        if (state.out.count >= state.wanted) return false;
+                        try state.query.session.checkpoint();
+                        var inner = state.context.*;
+                        inner.set_value = cell;
+                        const at = try state.query.cells(state.plan.width);
+                        for (state.plan.targets[0..state.plan.width], 0..) |id, column| {
+                            state.query.work.cells[at + column] = if (!state.plan.required[column]) .null_value else try E.eval(&inner, id);
+                        }
+                        try state.query.push(state.out, at);
+                        return true;
+                    }
+                };
+                if (out.count >= wanted) return;
+                var producer: Emit = .{ .query = self, .plan = p, .context = ctx, .out = out, .wanted = wanted };
+                try setRows(ctx, p.set_call, .{ .context = &producer, .row = Emit.row });
             }
 
             /// Top-level set-returning targets (B11 wave 4: several, in
@@ -3732,7 +3797,10 @@ pub fn Exec(comptime config: types.Config) type {
                     for (members[direct..][0..width], 0..) |id, column| self.work.cells[slot + column] = try E.eval(&ctx, id);
                     const first_cell = &self.work.cells[slot];
                     const skip = switch (agg.kind) {
-                        .array_agg, .json_agg, .jsonb_agg, .json_object_agg, .jsonb_object_agg => false,
+                        .array_agg => false,
+                        // The strict variants (ABSENT ON NULL) skip NULL values.
+                        .json_agg, .jsonb_agg => agg.variant & 1 != 0 and first_cell.* == .null_value,
+                        .json_object_agg, .jsonb_object_agg => agg.variant & 1 != 0 and first_cell.* != .null_value and self.work.cells[slot + 1] == .null_value,
                         .string_agg, .percentile_cont, .percentile_disc, .mode => first_cell.* == .null_value,
                         .hypothetical_rank, .hypothetical_dense_rank, .hypothetical_percent_rank, .hypothetical_cume_dist => false,
                         // Strict ordinary aggregates skip a NULL argument.
@@ -3793,7 +3861,7 @@ pub fn Exec(comptime config: types.Config) type {
                     .range_agg, .range_intersect_agg => return types_ext_eval.TypesExt(config, E).rangeAggregate(sorted.cells, sorted.handles, agg.kind == .range_agg, agg.ty, self.session),
                     .xmlagg => return types_ext_eval.TypesExt(config, E).xmlAggregate(sorted.cells, sorted.handles, self.session),
                     .json_agg, .jsonb_agg => return C.jsonAgg(sorted, node_ty(self, members[0]), agg.kind == .jsonb_agg, self.session),
-                    .json_object_agg, .jsonb_object_agg => return C.objectAgg(sorted, node_ty(self, members[0]), node_ty(self, members[1]), agg.kind == .jsonb_object_agg, self.session),
+                    .json_object_agg, .jsonb_object_agg => return C.objectAgg(sorted, node_ty(self, members[0]), node_ty(self, members[1]), agg.kind == .jsonb_object_agg, agg.variant & 2 != 0, self.session),
                     .percentile_cont, .percentile_disc => {
                         const percentile = try C.fraction(&direct_values[0]) orelse return .null_value;
                         if (agg.kind == .percentile_disc) return C.percentileDisc(sorted, percentile);

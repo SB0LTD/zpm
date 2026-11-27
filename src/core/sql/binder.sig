@@ -526,11 +526,17 @@ pub fn Binder(comptime config: types.Config) type {
             window_defs:u16=none,
             saw_aggregate: ?*bool = null,
             ctes: ?*const CteEnv = null,
+            /// Set-returning calls may appear (one select-list target): the
+            /// count of those seen (wave 4 text-json).
+            set_calls: ?*u8 = null,
         };
 
         pub const SortKey = struct { column: u16, descending: bool, nulls_first: bool };
 
-        pub const Agg = struct { kind: ast.Agg, arg: u16, filter: u16, distinct: bool, arg_ty: ast.Type, ty: ast.Type };
+        pub const Agg = struct { kind: ast.Agg, arg: u16, filter: u16, distinct: bool, arg_ty: ast.Type, ty: ast.Type,
+            /// JSON aggregates (wave 4 text-json): bit 0 strict (ABSENT ON
+            /// NULL), bit 1 unique keys.
+            variant: u8 = 0 };
 
         /// One FROM item of a plan, joined to the items before it.
         pub const Source = struct {
@@ -582,7 +588,10 @@ pub fn Binder(comptime config: types.Config) type {
             // A user routine in FROM (B11 wave 4): Exec.routineRows.
             routine,
             // generate_subscripts(anyarray, int4 [, bool]) (B11 wave 4).
-            subscripts };
+            subscripts,
+            // A set-returning built-in in FROM (wave 4 text-json):
+            // `function` is the call (regexp_matches, regexp_split_to_table).
+            set_function };
 
         /// A bound query block of the general engine (design §4.9). Its
         /// materialized rows are `width` cells: the `count` visible output
@@ -627,6 +636,10 @@ pub fn Binder(comptime config: types.Config) type {
             /// Every top-level set-returning target (unnest, generate_subscripts;
             /// B11 wave 4); `unnest_column` is the first. They run in lockstep.
             srf_set: std.StaticBitSet(types.projectionColumns(config)) = .empty,
+            /// The set-returning call inside target `unnest_column` when it is
+            /// not UNNEST (wave 4 text-json; exec evaluates the target once
+            /// per produced value).
+            set_call: u16 = none,
             count: usize = 0,
             width: usize = 0,
             names: [types.projectionColumns(config)]V.Name = undefined,
@@ -1180,12 +1193,27 @@ pub fn Binder(comptime config: types.Config) type {
             return ty == .tsvector or ty == .tsquery;
         }
 
+        fn textOrUnknown(ty: ast.Type) bool {
+            return ty == .unknown or value.characterType(ty);
+        }
+
         /// @@: tsvector @@ tsquery and tsquery @@ tsvector (an untyped side
-        /// takes the other operand type). text @@ tsquery and text @@ text
-        /// use default_text_search_config (pg_catalog.english): 0A000.
+        /// takes the other operand type), text @@ tsquery (`integer` 1:
+        /// to_tsvector of the text) and text @@ text (`integer` 2, also for
+        /// two untyped operands: to_tsvector @@ plainto_tsquery), both
+        /// under default_text_search_config.
         fn textMatchOperator(context: *const Context, n: *ast.Node) Error!void {
             const left = context.node(n.a).ty;
             const right = context.node(n.b).ty;
+            if (textOrUnknown(left) and (right == .tsquery or textOrUnknown(right))) {
+                n.a = try convert(context, n.a, .text, -1, .implicit);
+                if (right != .tsquery) n.b = try convert(context, n.b, .text, -1, .implicit);
+                if (context.node(n.a).ty != .text or (right != .tsquery and context.node(n.b).ty != .text)) return error.UndefinedFunction;
+                n.integer = if (right == .tsquery) 1 else 2;
+                n.ty = .boolean;
+                n.constant = false;
+                return;
+            }
             if (left == .tsvector or right == .tsquery) {
                 if (left == .unknown) return error.UnsupportedStatement;
                 try coerce(context, n.b, .tsquery);
@@ -1204,14 +1232,121 @@ pub fn Binder(comptime config: types.Config) type {
         /// to_tsvector / to_tsquery / plainto_tsquery / phraseto_tsquery
         /// (regconfig, text). The configuration is an untyped literal
         /// (regconfig input, checked now when constant); the one-argument
-        /// forms use default_text_search_config (english): 0A000.
+        /// forms (`integer` 1) read default_text_search_config when they
+        /// run (STABLE).
         fn typeTextSearchFunction(context: *const Context, n: *ast.Node, count: usize) Error!void {
-            if (count == 1) return error.UnsupportedStatement;
+            if (count == 1) {
+                try bindSignature(context, n, &[_]ast.Type{.text}, if (n.func == .to_tsvector) .tsvector else .tsquery, true);
+                n.integer = 1;
+                n.constant = false;
+                return;
+            }
             if (count != 2) return error.UndefinedFunction;
             const config_node = context.node(n.b);
             if (config_node.ty != .unknown) return error.UndefinedFunction;
             if (config_node.kind == .text_literal) _ = try Io.TextSearch.configByName(E.literalText(context.source, config_node.text).slice());
             try bindSignature(context, n, &[_]ast.Type{ .text, .text }, if (n.func == .to_tsvector) .tsvector else .tsquery, true);
+        }
+
+        /// The regular-expression functions (pg_proc signatures over text
+        /// and int4; wave 4 text-json lane, regex_eval.sig). A fourth
+        /// regexp_replace argument that is untyped or a string selects the
+        /// flags signature over the start position, as PostgreSQL's
+        /// preference for the string category does.
+        fn typeRegexFunction(context: *const Context, n: *ast.Node, count: usize) Error!void {
+            const T = ast.Type;
+            if (context.dialect != .postgres) return if (n.func == .substring_regex or n.func == .substring_similar) error.UnsupportedStatement else error.UndefinedFunction;
+            const text_array = types.arrayType(.text).?;
+            const texts = [_]T{ .text, .text, .text, .text };
+            switch (n.func) {
+                .regexp_match, .regexp_matches, .regexp_split_to_array, .regexp_split_to_table => {
+                    if (count != 2 and count != 3) return error.UndefinedFunction;
+                    try bindSignature(context, n, texts[0..count], if (n.func == .regexp_split_to_table) .text else text_array, true);
+                },
+                .substring_regex, .substring_similar => try bindSignature(context, n, texts[0..count], .text, true),
+                .regexp_replace => {
+                    const flags_form = count == 4 and (argumentType(context, n, 3) == .unknown or value.stringType(argumentType(context, n, 3)));
+                    const signature: []const T = switch (count) {
+                        3 => &.{ .text, .text, .text },
+                        4 => if (flags_form) &.{ .text, .text, .text, .text } else &.{ .text, .text, .text, .int4 },
+                        5 => &.{ .text, .text, .text, .int4, .int4 },
+                        6 => &.{ .text, .text, .text, .int4, .int4, .text },
+                        else => return error.UndefinedFunction,
+                    };
+                    try bindSignature(context, n, signature, .text, true);
+                },
+                .regexp_count => {
+                    if (count < 2 or count > 4) return error.UndefinedFunction;
+                    try bindSignature(context, n, (&[_]T{ .text, .text, .int4, .text })[0..count], .int4, true);
+                },
+                .regexp_instr => {
+                    if (count < 2 or count > 7) return error.UndefinedFunction;
+                    try bindSignature(context, n, (&[_]T{ .text, .text, .int4, .int4, .int4, .text, .int4 })[0..count], .int4, true);
+                },
+                .regexp_substr => {
+                    if (count < 2 or count > 6) return error.UndefinedFunction;
+                    try bindSignature(context, n, (&[_]T{ .text, .text, .int4, .int4, .text, .int4 })[0..count], .text, true);
+                },
+                else => return error.UndefinedFunction,
+            }
+            if (ast.setFunction(n.func)) n.constant = false;
+        }
+
+        /// The set-returning call of a select-list target reachable through
+        /// expressions PostgreSQL evaluates unconditionally (not CASE,
+        /// COALESCE, aggregates, window calls or subqueries), or none.
+        fn setCallIn(context: *const Context, id: u16) u16 {
+            if (id == none) return none;
+            const n = context.node(id);
+            switch (n.kind) {
+                .function => {
+                    if (ast.setFunction(n.func)) return id;
+                    if (n.window != none) return none;
+                    var item = n.b;
+                    while (item != none) : (item = context.node(item).next) {
+                        const found = setCallIn(context, item);
+                        if (found != none) return found;
+                    }
+                    return none;
+                },
+                .cast, .unary, .not_op, .test_op => return setCallIn(context, n.a),
+                .binary, .and_op, .or_op, .nullif, .at_zone, .like, .between => {
+                    for ([_]u16{ n.a, n.b, n.c }) |child| {
+                        const found = setCallIn(context, child);
+                        if (found != none) return found;
+                    }
+                    return none;
+                },
+                else => return none,
+            }
+        }
+
+        /// The tsvector / tsquery utilities (pg_proc signatures; wave 4
+        /// text-json). ts_delete's second argument is text or text[].
+        fn typeTextSearchUtility(context: *const Context, n: *ast.Node, count: usize) Error!void {
+            if (context.dialect != .postgres) return error.UndefinedFunction;
+            const T = ast.Type;
+            const text_array = types.arrayType(.text).?;
+            switch (n.func) {
+                .tsvector_length => try bindSignature(context, n, &[_]T{.tsvector}, .int4, true),
+                .ts_strip => try bindSignature(context, n, &[_]T{.tsvector}, .tsvector, true),
+                .ts_setweight => switch (count) {
+                    2 => try bindSignature(context, n, &[_]T{ .tsvector, .pg_internal_char }, .tsvector, true),
+                    3 => try bindSignature(context, n, &[_]T{ .tsvector, .pg_internal_char, text_array }, .tsvector, true),
+                    else => return error.UndefinedFunction,
+                },
+                .tsvector_to_array => try bindSignature(context, n, &[_]T{.tsvector}, text_array, true),
+                .array_to_tsvector => try bindSignature(context, n, &[_]T{text_array}, .tsvector, true),
+                .ts_delete => {
+                    if (count != 2) return error.UndefinedFunction;
+                    const second = argumentType(context, n, 1);
+                    const array = second != .unknown and types.isArray(second);
+                    try bindSignature(context, n, &[_]T{ .tsvector, if (array) text_array else .text }, .tsvector, true);
+                },
+                .ts_filter => try bindSignature(context, n, &[_]T{ .tsvector, types.arrayType(.pg_internal_char) orelse return error.UndefinedFunction }, .tsvector, true),
+                .ts_numnode => try bindSignature(context, n, &[_]T{.tsquery}, .int4, true),
+                else => return error.UndefinedFunction,
+            }
         }
 
         /// int2/int4/int8 & | # (common integer type) and << >> (int4 count).
@@ -1322,8 +1457,11 @@ pub fn Binder(comptime config: types.Config) type {
                     n.planned_null = knownNull(context, n.b);
                     if (n.planned_null) context.pool.planned_nulls = true;
                 },
-                .jsonb_path_exists, .jsonb_path_match, .jsonb_path_query_array, .jsonb_path_query_first => {
+                .jsonb_path_exists, .jsonb_path_match, .jsonb_path_query_array, .jsonb_path_query_first, .jsonb_path_query => {
                     const result: T = if (n.func == .jsonb_path_exists or n.func == .jsonb_path_match) .boolean else .jsonb;
+                    defer if (n.func == .jsonb_path_query) {
+                        n.constant = false;
+                    };
                     switch (count) {
                         2 => try bindSignature(context, n, &[_]T{ .jsonb, .jsonpath }, result, true),
                         3 => try bindSignature(context, n, &[_]T{ .jsonb, .jsonpath, .jsonb }, result, true),
@@ -1525,6 +1663,10 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "to_json", .func = .to_json },           .{ .name = "to_jsonb", .func = .to_jsonb },
                 .{ .name = "jsonb_path_exists", .func = .jsonb_path_exists }, .{ .name = "jsonb_path_match", .func = .jsonb_path_match },
                 .{ .name = "jsonb_path_query_array", .func = .jsonb_path_query_array }, .{ .name = "jsonb_path_query_first", .func = .jsonb_path_query_first },
+                // The *_tz variants differ only in datetime comparisons (wave 4).
+                .{ .name = "jsonb_path_query", .func = .jsonb_path_query },       .{ .name = "jsonb_path_query_tz", .func = .jsonb_path_query },
+                .{ .name = "jsonb_path_exists_tz", .func = .jsonb_path_exists },  .{ .name = "jsonb_path_match_tz", .func = .jsonb_path_match },
+                .{ .name = "jsonb_path_query_array_tz", .func = .jsonb_path_query_array }, .{ .name = "jsonb_path_query_first_tz", .func = .jsonb_path_query_first },
                 .{ .name = "jsonb_exists_any", .func = .jsonb_exists_any }, .{ .name = "jsonb_exists_all", .func = .jsonb_exists_all },
                 // Comments (B11 wave 3).
                 .{ .name = "obj_description", .func = .obj_description },
@@ -1536,13 +1678,26 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "pg_get_function_result", .func = .pg_get_function_result },
                 .{ .name = "pg_get_function_sqlbody", .func = .pg_get_function_sqlbody },
                 .{ .name = "pg_tablespace_location", .func = .pg_tablespace_location },
-                // Regular expressions (B11 text lane).
+                // Regular expressions (B11 text lane; positional functions:
+                // wave 4 text-json lane).
                 .{ .name = "regexp_like", .func = .regexp_like },
+                .{ .name = "regexp_match", .func = .regexp_match },
+                .{ .name = "regexp_matches", .func = .regexp_matches },
+                .{ .name = "regexp_replace", .func = .regexp_replace },
+                .{ .name = "regexp_split_to_array", .func = .regexp_split_to_array },
+                .{ .name = "regexp_split_to_table", .func = .regexp_split_to_table },
+                .{ .name = "regexp_count", .func = .regexp_count },
+                .{ .name = "regexp_instr", .func = .regexp_instr },
+                .{ .name = "regexp_substr", .func = .regexp_substr },
                 // Full text search (B11 text lane).
                 .{ .name = "to_tsvector", .func = .to_tsvector },
                 .{ .name = "to_tsquery", .func = .to_tsquery },
                 .{ .name = "plainto_tsquery", .func = .plainto_tsquery },
                 .{ .name = "phraseto_tsquery", .func = .phraseto_tsquery },
+                .{ .name = "strip", .func = .ts_strip },           .{ .name = "setweight", .func = .ts_setweight },
+                .{ .name = "tsvector_to_array", .func = .tsvector_to_array }, .{ .name = "array_to_tsvector", .func = .array_to_tsvector },
+                .{ .name = "ts_delete", .func = .ts_delete },       .{ .name = "ts_filter", .func = .ts_filter },
+                .{ .name = "numnode", .func = .ts_numnode },
                 .{ .name = "similar_to_escape", .func = .similar_to_escape },
                 // Discovery functions (B11 text lane).
                 .{ .name = "pg_typeof", .func = .pg_typeof },
@@ -1554,8 +1709,29 @@ pub fn Binder(comptime config: types.Config) type {
             return .none;
         }
 
+        fn jsonAggregate(kind: ast.Agg) bool {
+            return kind == .json_agg or kind == .jsonb_agg or kind == .json_object_agg or kind == .jsonb_object_agg;
+        }
+
+        /// The strict / unique variant bits of a JSON aggregate call by name
+        /// (json_agg_strict, json_object_agg_unique_strict, ...), or the
+        /// flags JSON_ARRAYAGG / JSON_OBJECTAGG were parsed with.
+        fn jsonAggregateVariant(context: *const Context, n: *const ast.Node) u8 {
+            const name = toName(context, n.name).slice();
+            if (types.same(name, "json_arrayagg") or types.same(name, "json_objectagg")) return @intCast(n.integer & 3);
+            var variant: u8 = 0;
+            if (name.len > 7 and types.same(name[name.len - 7 ..], "_strict")) variant |= 1;
+            if (std.mem.indexOf(u8, name, "_unique") != null) variant |= 2;
+            return variant;
+        }
+
         fn aggregateKind(context: *const Context, n: *const ast.Node) ast.Agg {
             const name = toName(context, n.name);
+            if (context.dialect == .postgres) {
+                const jsonb_result = n.integer & 4 != 0;
+                if (types.same(name.slice(), "json_arrayagg")) return if (jsonb_result) .jsonb_agg else .json_agg;
+                if (types.same(name.slice(), "json_objectagg")) return if (jsonb_result) .jsonb_object_agg else .json_object_agg;
+            }
             const table = [_]struct { name: []const u8, agg: ast.Agg }{
                 .{ .name = "count", .agg = .count },
                 .{ .name = "sum", .agg = .sum },
@@ -1583,6 +1759,11 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "xmlagg", .agg = .xmlagg },
                 .{ .name = "json_agg", .agg = .json_agg },          .{ .name = "jsonb_agg", .agg = .jsonb_agg },
                 .{ .name = "json_object_agg", .agg = .json_object_agg }, .{ .name = "jsonb_object_agg", .agg = .jsonb_object_agg },
+                // The strict and unique variants (wave 4 text-json).
+                .{ .name = "json_agg_strict", .agg = .json_agg },   .{ .name = "jsonb_agg_strict", .agg = .jsonb_agg },
+                .{ .name = "json_object_agg_strict", .agg = .json_object_agg }, .{ .name = "jsonb_object_agg_strict", .agg = .jsonb_object_agg },
+                .{ .name = "json_object_agg_unique", .agg = .json_object_agg }, .{ .name = "jsonb_object_agg_unique", .agg = .jsonb_object_agg },
+                .{ .name = "json_object_agg_unique_strict", .agg = .json_object_agg }, .{ .name = "jsonb_object_agg_unique_strict", .agg = .jsonb_object_agg },
                 .{ .name = "percentile_cont", .agg = .percentile_cont }, .{ .name = "percentile_disc", .agg = .percentile_disc },
                 .{ .name = "mode", .agg = .mode },
             };
@@ -1840,7 +2021,9 @@ pub fn Binder(comptime config: types.Config) type {
             // WITHIN GROUP is required for an ordered-set aggregate (42809).
             if (ast.orderedSetAggregate(kind)) return error.WrongObjectType;
             if (ast.collectingAggregate(kind)) {
+                const variant: i64 = if (jsonAggregate(kind)) jsonAggregateVariant(context, n) else 0;
                 const result = try typeCollectAggregate(context, &inner, n, kind);
+                n.integer = variant;
                 try aggregateInput(context, &inner, n, if (kind == .string_agg or kind == .json_object_agg or kind == .jsonb_object_agg) 2 else 1);
                 if (n.c != none) {
                     inner.window_error = error.WindowingError;
@@ -2265,6 +2448,20 @@ pub fn Binder(comptime config: types.Config) type {
             }
             // Built by linkAggregateInput with typed members (B11).
             if (n.func == .aggregate_input) return;
+            if (n.func == .json_query_function) return bindJsonQueryFunction(context, scope, n);
+            if (n.func == .json_constructor) return bindJsonConstructor(context, scope, n);
+            if (n.func == .is_json) {
+                // IS JSON over a string or JSON value (42804 otherwise).
+                try typeExpr(context, scope, n.b);
+                if (context.node(n.b).ty == .unknown) try coerce(context, n.b, .text);
+                switch (context.node(n.b).ty) {
+                    .text, .varchar, .bpchar, .name, .json, .jsonb => {},
+                    else => return error.TypeMismatch,
+                }
+                n.ty = .boolean;
+                n.constant = isConstant(context, n.b);
+                return;
+            }
             // Named notation and VARIADIC reach user routines only (B11
             // wave 4; built-in functions have no parameter names here).
             if (n.func == .none and n.window == none and !n.within_group and n.order == none and namedArguments(context, n)) {
@@ -2688,6 +2885,22 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 .to_tsvector, .to_tsquery, .plainto_tsquery, .phraseto_tsquery => try typeTextSearchFunction(context, n, count),
                 .regexp_like => try bindSignature(context, n, if (count == 2) &[_]ast.Type{ .text, .text } else &[_]ast.Type{ .text, .text, .text }, .boolean, true),
+                .regexp_match, .regexp_matches, .regexp_replace, .regexp_split_to_array, .regexp_split_to_table, .regexp_count, .regexp_instr, .regexp_substr => {
+                    if (ast.setFunction(n.func)) {
+                        // Only inside a select-list target (exec expands it).
+                        const seen = scope.set_calls orelse return error.UnsupportedStatement;
+                        seen.* +|= 1;
+                    }
+                    try typeRegexFunction(context, n, count);
+                },
+                .substring_regex, .substring_similar => try typeRegexFunction(context, n, count),
+                .tsvector_length, .ts_strip, .ts_setweight, .tsvector_to_array, .array_to_tsvector, .ts_delete, .ts_filter, .ts_numnode => try typeTextSearchUtility(context, n, count),
+                .json_query_function, .is_json, .json_constructor => return error.UnsupportedStatement, // bound before the arguments
+                .jsonb_path_query => {
+                    const seen = scope.set_calls orelse return error.UnsupportedStatement;
+                    seen.* +|= 1;
+                    try typeJsonFunction(context, n, count);
+                },
                 .similar_to_escape => try bindSignature(context, n, if (count == 1) &[_]ast.Type{.text} else &[_]ast.Type{ .text, .text }, .text, true),
                 .point_constructor => try bindSignature(context, n, &[_]ast.Type{ .float8, .float8 }, .point, true),
                 .box_constructor => try bindSignature(context, n, &[_]ast.Type{ .point, .point }, .box, true),
@@ -3852,7 +4065,14 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 // octet_length(bpchar) counts CHAR(n) padding; the others read
                 // CHAR(n) through text, which drops trailing spaces.
-                .char_length, .octet_length, .bit_length, .ascii => try bindSignature(context, n, &[_]T{if (n.func == .octet_length and count == 1 and argumentType(context, n, 0) == .bpchar) .bpchar else .text}, .int4, true),
+                .char_length, .octet_length, .bit_length, .ascii => {
+                    // length(tsvector) (wave 4 text-json).
+                    if (n.func == .char_length and count == 1 and argumentType(context, n, 0) == .tsvector and types.same(toName(context, n.name).slice(), "length")) {
+                        n.func = .tsvector_length;
+                        return typeTextSearchUtility(context, n, count);
+                    }
+                    try bindSignature(context, n, &[_]T{if (n.func == .octet_length and count == 1 and argumentType(context, n, 0) == .bpchar) .bpchar else .text}, .int4, true);
+                },
                 .substring => {
                     // Unknown or text arguments after the first select the
                     // regular-expression overloads substring(text,text[,text]),
@@ -3867,7 +4087,10 @@ pub fn Binder(comptime config: types.Config) type {
                             if (ty != .unknown and !value.stringType(ty)) regex = false;
                             if (!knownNull(context, item)) concrete = true;
                         }
-                        if (regex and concrete) return error.UnsupportedStatement;
+                        if (regex and concrete) {
+                            n.func = if (count == 2) .substring_regex else .substring_similar;
+                            return typeRegexFunction(context, n, count);
+                        }
                     }
                     try bindSignature(context, n, if (count == 2) &[_]T{ .text, .int4 } else &[_]T{ .text, .int4, .int4 }, .text, true);
                 },
@@ -4828,13 +5051,22 @@ pub fn Binder(comptime config: types.Config) type {
                         .exists_all => try jsonOperatorCall(context, n, .jsonb_exists_all_op),
                         .path_exists => try jsonOperatorCall(context, n, .jsonb_path_exists_op),
                         // @@ is also tsvector @@ tsquery (either order).
-                        .path_match => if (textSearchType(context.node(n.a).ty) or textSearchType(context.node(n.b).ty)) {
+                        .path_match => if (textSearchType(context.node(n.a).ty) or textSearchType(context.node(n.b).ty) or
+                            (textOrUnknown(context.node(n.a).ty) and textOrUnknown(context.node(n.b).ty)))
+                        {
                             n.op = .text_match;
                             try textMatchOperator(context, n);
                         } else try jsonOperatorCall(context, n, .jsonb_path_match_op),
                         .concat => {
                             const left_ty = context.node(n.a).ty;
                             const right_ty = context.node(n.b).ty;
+                            // tsvector || tsvector (wave 4 text-json).
+                            if ((left_ty == .tsvector and (right_ty == .tsvector or right_ty == .unknown)) or (right_ty == .tsvector and left_ty == .unknown)) {
+                                try coerce(context, n.a, .tsvector);
+                                try coerce(context, n.b, .tsvector);
+                                n.ty = .tsvector;
+                                return;
+                            }
                             if (types.isArray(left_ty) or types.isArray(right_ty)) {
                                 n.ty = try arrayConcatTypes(context, &n.a, &n.b, .operator);
                                 return;
@@ -5246,13 +5478,17 @@ pub fn Binder(comptime config: types.Config) type {
                         .array_constructor => break :blk .{ .name = "array", .strength = 2 },
                         .array_subscript => break :blk figure(context, n.b, buffer),
                         .array_any => break :blk .{ .name = "?column?", .strength = 0 },
-                        .jsonb_minus_op, .jsonb_delete_path_op, .jsonb_exists_any_op, .jsonb_exists_all_op, .jsonb_path_exists_op, .jsonb_path_match_op => break :blk .{ .name = "?column?", .strength = 0 },
+                        .jsonb_minus_op, .jsonb_delete_path_op, .jsonb_exists_any_op, .jsonb_exists_all_op, .jsonb_path_exists_op, .jsonb_path_match_op, .is_json => break :blk .{ .name = "?column?", .strength = 0 },
                         .ext_op => break :blk .{ .name = "?column?", .strength = 0 },
                         .xmlelement, .xmlforest, .xmlpi, .xmlroot => break :blk .{ .name = @tagName(n.func), .strength = 2 },
                         .inet_abbrev => break :blk .{ .name = "abbrev", .strength = 2 },
                         .to_macaddr8 => break :blk .{ .name = "macaddr8", .strength = 2 },
                         .to_macaddr => break :blk .{ .name = "macaddr", .strength = 2 },
                         .mac_trunc => break :blk .{ .name = "trunc", .strength = 2 },
+                        .json_constructor => {
+                            buffer.* = toName(context, n.name);
+                            break :blk .{ .name = buffer.slice(), .strength = 2 };
+                        },
                         else => {},
                     }
                     buffer.* = toName(context, n.name);
@@ -5655,7 +5891,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .column, .aggregate => n.typmod,
                 .cast => if (n.typmod == ast.mysql_integer_cast_typmod) -1 else n.typmod,
                 // A subscript keeps the array's typmod (reftypmod).
-                .function => if (n.func == .array_subscript or n.func == .xmlserialize or n.func == .mysql_date_add) n.typmod else -1,
+                .function => if (n.func == .array_subscript or n.func == .xmlserialize or n.func == .mysql_date_add or n.func == .json_query_function) n.typmod else -1,
                 else => -1,
             };
         }
@@ -7255,11 +7491,12 @@ pub fn Binder(comptime config: types.Config) type {
 
         fn registerAgg(context: *const Context, p: *Plan, id: u16) Error!usize {
             const n = context.node(id);
+            const variant: u8 = if (jsonAggregate(n.agg)) @intCast(n.integer & 3) else 0;
             for (p.aggs[0..p.agg_count], 0..) |*agg, index| {
-                if (agg.kind == n.agg and agg.distinct == n.distinct and sameExpr(context, agg.arg, n.a) and sameExpr(context, agg.filter, n.c)) return index;
+                if (agg.kind == n.agg and agg.variant == variant and agg.distinct == n.distinct and sameExpr(context, agg.arg, n.a) and sameExpr(context, agg.filter, n.c)) return index;
             }
             if (p.agg_count == config.columns) return error.StatementTooComplex;
-            p.aggs[p.agg_count] = .{ .kind = n.agg, .arg = n.a, .filter = n.c, .distinct = n.distinct, .arg_ty = if (n.a == none) .unknown else context.node(n.a).ty, .ty = n.ty };
+            p.aggs[p.agg_count] = .{ .kind = n.agg, .arg = n.a, .filter = n.c, .distinct = n.distinct, .arg_ty = if (n.a == none) .unknown else context.node(n.a).ty, .ty = n.ty, .variant = variant };
             p.agg_count += 1;
             return p.agg_count - 1;
         }
@@ -7649,7 +7886,7 @@ pub fn Binder(comptime config: types.Config) type {
             switch (context.node(table.a).ty) {
                 .jsonb => {},
                 .unknown, .json, .text, .varchar, .bpchar, .name => table.a = try convert(context, table.a, .jsonb, -1, .explicit),
-                else => return error.TypeMismatch,
+                else => return error.CannotCoerce,
             }
             try typeExpr(context, &inner, table.c);
             try coerce(context, table.c, .jsonpath);
@@ -7710,6 +7947,81 @@ pub fn Binder(comptime config: types.Config) type {
             p.count = count;
             p.width = count;
             return id;
+        }
+
+        /// JSON_OBJECT / JSON_ARRAY / JSON_SCALAR / JSON_SERIALIZE (wave 4
+        /// text-json): untyped arguments are text; the result is the
+        /// RETURNING type (json, jsonb or a string type; json by default,
+        /// text for JSON_SERIALIZE).
+        fn bindJsonConstructor(context: *const Context, scope: *const Scope, n: *ast.Node) Error!void {
+            if (context.dialect != .postgres) return error.UndefinedFunction;
+            var item = n.b;
+            while (item != none) : (item = context.node(item).next) {
+                try typeExpr(context, scope, item);
+                if (context.node(item).ty == .unknown) try coerce(context, item, .text);
+            }
+            switch (n.cast_type) {
+                .json, .jsonb, .text, .varchar, .bpchar => {},
+                else => return error.CannotCoerce,
+            }
+            if (n.integer & 3 == 3) switch (context.node(n.b).ty) {
+                .json, .jsonb, .text, .varchar, .bpchar => {},
+                else => return error.TypeMismatch,
+            };
+            n.ty = n.cast_type;
+            n.typmod = n.typmod;
+            n.constant = false;
+        }
+
+        /// JSON_EXISTS / JSON_VALUE / JSON_QUERY (wave 4 text-json): the
+        /// context item becomes jsonb (an untyped or string item is parsed,
+        /// json converts), the path jsonpath, PASSING values keep their
+        /// types, DEFAULT expressions convert to the result type. The
+        /// clauses follow the JSON_TABLE column rules.
+        fn bindJsonQueryFunction(context: *const Context, scope: *const Scope, n: *ast.Node) Error!void {
+            if (context.dialect != .postgres) return error.UndefinedFunction;
+            try typeExpr(context, scope, n.a);
+            switch (context.node(n.a).ty) {
+                .jsonb => {},
+                .unknown, .json, .text, .varchar, .bpchar, .name => n.a = try convert(context, n.a, .jsonb, -1, .explicit),
+                else => return error.CannotCoerce,
+            }
+            var entry = n.b;
+            while (entry != none) : (entry = context.node(entry).next) {
+                const passing = context.node(entry);
+                try typeExpr(context, scope, passing.b);
+                if (context.node(passing.b).ty == .unknown) try coerce(context, passing.b, .text);
+                passing.ty = context.node(passing.b).ty;
+            }
+            const column = context.node(n.c);
+            try typeExpr(context, scope, column.a);
+            try coerce(context, column.a, .jsonpath);
+            if (context.node(column.a).ty != .jsonpath and !value.stringType(context.node(column.a).ty)) return error.UndefinedFunction;
+            const spec = ast.JsonTableColumn.decode(column.integer);
+            const B = ast.JsonTableColumn.Behavior;
+            if (spec.kind == .exists) {
+                if (spec.on_empty != .unspecified) return error.Syntax;
+                switch (spec.on_error) {
+                    .unspecified, .error_value, .true_value, .false_value, .unknown => {},
+                    else => return error.Syntax,
+                }
+            } else {
+                for ([_]B{ spec.on_empty, spec.on_error }) |behavior| switch (behavior) {
+                    .unspecified, .null_value, .error_value, .default_value => {},
+                    .empty_array, .empty_object => if (n.integer != 2) return error.Syntax,
+                    else => return error.Syntax,
+                };
+                if (spec.wrapper != .unspecified and spec.wrapper != .without and spec.quotes == .omit) return error.Syntax;
+            }
+            const ty = column.cast_type;
+            const typmod = column.typmod;
+            for ([_]*u16{ &column.b, &column.c }) |slot| if (slot.* != none) {
+                try typeExpr(context, scope, slot.*);
+                slot.* = try convert(context, slot.*, ty, typmod, .assignment);
+            };
+            n.ty = ty;
+            n.typmod = typmod;
+            n.constant = false;
         }
 
         fn partitionAncestorsName(context: *const Context, name: ast.Ident, schema: ?ast.Ident) bool {
@@ -7890,6 +8202,19 @@ pub fn Binder(comptime config: types.Config) type {
                 try bindSubscriptsArguments(context, &inner, call);
                 ty = .int4;
                 series = .subscripts;
+            } else if (item.schema == null and context.dialect == .postgres and ast.setFunction(functionName(context, call))) {
+                // regexp_matches / regexp_split_to_table (wave 4 text-json).
+                if (call.star or call.distinct or call.c != none or call.order != none) return error.UndefinedFunction;
+                call.func = functionName(context, call);
+                var count: usize = 0;
+                var arg = call.b;
+                while (arg != none) : (arg = context.node(arg).next) {
+                    try typeExpr(context, &inner, arg);
+                    count += 1;
+                }
+                if (call.func == .jsonb_path_query) try typeJsonFunction(context, call, count) else try typeRegexFunction(context, call, count);
+                ty = call.ty;
+                series = .set_function;
             } else {
                 var from_context = context.*;
                 from_context.table_function = item.function;
@@ -8247,9 +8572,23 @@ pub fn Binder(comptime config: types.Config) type {
                         call.integer = 1;
                     }
                     scope.windows = true;
+                    if (p.set_call != none) return error.UnsupportedStatement;
                     if (p.unnest_column == none) p.unnest_column = @intCast(p.count);
                     p.srf_set.set(p.count);
-                } else if (branch) try typeExpr(context, &scope, target.expr) else try valueExpr(context, &scope, target.expr);
+                } else {
+                    // One set-returning built-in may sit inside one target
+                    // (wave 4 text-json): exec evaluates the target per value.
+                    var set_calls: u8 = 0;
+                    scope.set_calls = &set_calls;
+                    if (branch) try typeExpr(context, &scope, target.expr) else try valueExpr(context, &scope, target.expr);
+                    scope.set_calls = null;
+                    if (set_calls != 0) {
+                        const found = setCallIn(context, target.expr);
+                        if (set_calls > 1 or found == none or p.unnest_column != none or q.lock.strength != .none) return error.UnsupportedStatement;
+                        p.unnest_column = @intCast(p.count);
+                        p.set_call = found;
+                    }
+                }
                 const name = if (target.alias) |alias| toName(context, alias) else targetName(context, target.expr);
                 try addTarget(context, p, target.expr, name);
             }
