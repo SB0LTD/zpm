@@ -619,7 +619,8 @@ fn triggers() !void {
     try fails("CREATE TRIGGER x BEFORE TRUNCATE ON a FOR EACH ROW EXECUTE FUNCTION guard()", error.UnsupportedStatement);
     try fails("CREATE TRIGGER x AFTER UPDATE OF nosuch ON a FOR EACH ROW EXECUTE FUNCTION guard()", error.ColumnNotFound);
     try fails("CREATE TRIGGER x AFTER INSERT ON nosuch FOR EACH ROW EXECUTE FUNCTION guard()", error.TableNotFound);
-    try fails("CREATE TRIGGER x INSTEAD OF INSERT ON a FOR EACH ROW EXECUTE FUNCTION guard()", error.UnsupportedStatement);
+    // Tables have no INSTEAD OF triggers (42809).
+    try fails("CREATE TRIGGER x INSTEAD OF INSERT ON a FOR EACH ROW EXECUTE FUNCTION guard()", error.WrongObjectType);
     try fails("DROP TRIGGER nosuch ON a", error.UndefinedObject);
     try completes("DROP TRIGGER IF EXISTS nosuch ON a", .drop_trigger, 0);
     // A function used by a trigger needs CASCADE; DROP TABLE takes its triggers.

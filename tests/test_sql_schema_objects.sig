@@ -730,7 +730,7 @@ fn views() !void {
     try same(try render(&read_result), "row 2");
     try sameState(&view_probes);
     // Errors: 42P07, 42P01 inside the definition, 42701, 42809 for the
-    // wrong DROP kind, 2BP01 for dependents, 0A000 for writes and renames.
+    // wrong DROP kind, 2BP01 for dependents, 0A000 for renames.
     const names = "SELECT relname FROM pg_class WHERE relkind = 'v' ORDER BY relname";
     try rejects("CREATE VIEW v AS SELECT 1 AS one", error.TableExists, names, "labels;totals;v");
     try rejects("CREATE VIEW a AS SELECT 1 AS one", error.TableExists, names, "labels;totals;v");
@@ -743,8 +743,9 @@ fn views() !void {
     try rejects("DROP TABLE a", error.DependentObjects, names, "labels;totals;v");
     try rejects("ALTER TABLE a DROP COLUMN v", error.DependentObjects, view_probes[0], "1|10;2|20;3|30;4|NULL;5|50");
     try rejects("ALTER TABLE a RENAME COLUMN v TO w", error.UnsupportedStatement, view_probes[0], "1|10;2|20;3|30;4|NULL;5|50");
-    try rejects("INSERT INTO v VALUES (9, 9)", error.UnsupportedStatement, view_probes[0], "1|10;2|20;3|30;4|NULL;5|50");
-    try rejects("DELETE FROM v", error.UnsupportedStatement, view_probes[0], "1|10;2|20;3|30;4|NULL;5|50");
+    // A grouped view is not automatically updatable (55000, B11 wave 4).
+    try rejects("INSERT INTO totals VALUES (9, 9, 9)", error.ObjectNotInPrerequisiteState, view_probes[0], "1|10;2|20;3|30;4|NULL;5|50");
+    try rejects("DELETE FROM totals", error.ObjectNotInPrerequisiteState, view_probes[0], "1|10;2|20;3|30;4|NULL;5|50");
     try rejects("DROP VIEW missing", error.TableNotFound, names, "labels;totals;v");
     _ = try replicate("DROP VIEW IF EXISTS missing");
     // CASCADE drops the dependent views; RESTRICT of a leaf view works.

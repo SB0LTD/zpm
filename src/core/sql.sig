@@ -2073,6 +2073,8 @@ pub fn Database(comptime config: Config) type {
         nested_depth: usize = 0,
         nested_ran: bool = false,
         routine_volatility: u8 = 0,
+        /// PostgreSQL's errdetail of the last view error (lastErrorDetail).
+        error_detail: []const u8 = "",
 
         /// Borrow the embedding's cluster catalogue while serving statements.
         /// The embedding keeps the provider and its rows consistent for the
@@ -3327,8 +3329,20 @@ pub fn Database(comptime config: Config) type {
                 return self.catalogObject(slot, original, &parsed.catalog_object, snap);
             }
             var statement_copy = parsed.*;
-            const expanded = try expandRelations(self, &self.workspace, original, snap, &statement_copy, self.session.role, &self.session);
-            const source = try self.secureTarget(&statement_copy, expanded, original, snap);
+            // INSERT / UPDATE / DELETE on a view (B11 wave 4): its INSTEAD
+            // OF triggers, or the same statement on its base relation.
+            var text = original;
+            var view_owner: ?u32 = null;
+            const work_bounds = viewBounds(&self.workspace.query);
+            defer restoreBounds(&self.workspace.query, work_bounds);
+            if (self.dmlView(original, parsed, snap)) |view| {
+                if (explain != null) return error.UnsupportedStatement;
+                if (self.insteadTriggers(view, eventOf(parsed), snap)) return self.viewModify(slot, original, parsed, snap, mode, view);
+                text = try self.rewriteViewTarget(slot, original, &statement_copy, view, snap);
+                view_owner = self.catalog_objects.owner(self.tables[view].oid, snap);
+            }
+            const expanded = try expandRelations(self, &self.workspace, text, snap, &statement_copy, self.session.role, &self.session);
+            const source = try self.secureTarget(&statement_copy, expanded, text, snap);
             // A user function in a single-table SELECT runs once per row in
             // the query engine (B11 wave 4): the simple path evaluates
             // projections twice (validation, then publication) and keeps
@@ -3347,7 +3361,13 @@ pub fn Database(comptime config: Config) type {
             var bound: B.Bound = undefined;
             try B.bindInto(&context, &statement_copy, &bound);
             if (self.txs[slot].read_only and (explain == null or explain.?.analyze)) try readOnlyCheck(&bound, &self.workspace.plans);
-            try self.checkPrivileges(&bound, snap);
+            if (view_owner) |owner| {
+                // The view's owner needs the privileges on the base relation.
+                const role = self.session.role;
+                defer self.session.role = role;
+                self.session.role = owner;
+                try self.checkPrivileges(&bound, snap);
+            } else try self.checkPrivileges(&bound, snap);
             try self.secureNewRows(&bound, source, snap);
             if (explain) |options| return self.runExplain(slot, source, &bound, snap, result, options);
             switch (bound) {
@@ -10688,6 +10708,7 @@ pub fn Database(comptime config: Config) type {
             self.nested_depth = 0;
             self.nested_ran = false;
             self.routine_volatility = 0;
+            self.error_detail = "";
             self.installRole();
         }
 
@@ -14344,10 +14365,14 @@ pub fn Database(comptime config: Config) type {
             const table = &self.tables[table_index];
             const kind = definition.tgtype;
             const row = kind & tg.tg_row != 0;
-            // INSTEAD OF triggers (views) are outside the subset.
-            if (kind & tg.tg_instead != 0) return error.UnsupportedStatement;
             if (table.relkind == 'm' or table.relkind == 'S') return error.WrongObjectType;
-            if (table.relkind == 'v' and row) return error.WrongObjectType;
+            // INSTEAD OF triggers are row triggers of views without column
+            // lists or WHEN (B11 wave 4); views have no BEFORE / AFTER row
+            // triggers (42809, 0A000 as PostgreSQL).
+            if (kind & tg.tg_instead != 0) {
+                if (table.relkind != 'v') return error.WrongObjectType;
+                if (!row or definition.column_count != 0 or definition.when.end != definition.when.start) return error.UnsupportedStatement;
+            } else if (table.relkind == 'v' and row) return error.WrongObjectType;
             if (kind & tg.tg_truncate != 0 and row) return error.UnsupportedStatement;
             var columns: [config.columns]u8 = undefined;
             for (definition.columns[0..definition.column_count], 0..) |*column_name, position| {
@@ -14554,6 +14579,688 @@ pub fn Database(comptime config: Config) type {
                 if (rule.stamp.deleterOther(snap)) |other| return self.waitObject(slot, other);
                 try self.dropObject(slot, .rule, index, snap);
             }
+        }
+
+        // ---- views as INSERT / UPDATE / DELETE targets (B11 wave 4) ---------
+
+        /// The view an INSERT / UPDATE / DELETE names, if it names one
+        /// (other targets, and names that do not resolve, bind as usual).
+        fn dmlView(self: *Self, original: []const u8, parsed: *const A.Statement, snap: Snapshot) ?usize {
+            const schema: ?ast.Ident, const name: ast.Ident = switch (parsed.*) {
+                .insert => |*insert| .{ insert.schema, insert.table },
+                .update => |*update| .{ update.schema, update.table },
+                .delete => |*delete| .{ delete.schema, delete.table },
+                else => return null,
+            };
+            if (schema == null and !self.session.public_schema_on_path) return null;
+            const schema_name = if (schema) |qualifier| identName(original, qualifier) else Name{};
+            const namespace = (self.namespaceForUsage(self.session.role, if (schema != null) schema_name.slice() else null, snap) catch return null) orelse return null;
+            const found = self.catalog.findIn(namespace, identName(original, name).slice(), snap) orelse return null;
+            return if (found.kind == 'v') found.slot else null;
+        }
+
+        fn eventOf(parsed: *const A.Statement) u8 {
+            return switch (parsed.*) {
+                .insert => tg.tg_insert,
+                .update => tg.tg_update,
+                else => tg.tg_delete,
+            };
+        }
+
+        fn insteadTriggers(self: *const Self, view: usize, event: u8, snap: Snapshot) bool {
+            var list: [config.triggers]u8 = undefined;
+            const count = self.objects.tableTriggers(self.tables[view].oid, snap, &list);
+            for (list[0..count]) |position| {
+                if (triggerMatches(&self.objects.triggers[position], tg.tg_instead, true, event)) return true;
+            }
+            return false;
+        }
+
+        /// The workspace bounds a view statement changes (restored after it).
+        const ViewBounds = struct { floor_cells: usize, top_cells: usize, floor_refs: usize, top_refs: usize, floor_values: usize, pinned_cells: usize, pinned_refs: usize };
+
+        fn viewBounds(work: *const X.Work) ViewBounds {
+            return .{ .floor_cells = work.floor_cells, .top_cells = work.top_cells, .floor_refs = work.floor_refs, .top_refs = work.top_refs,
+                .floor_values = work.floor_values, .pinned_cells = work.pinned_cells, .pinned_refs = work.pinned_refs };
+        }
+
+        fn restoreBounds(work: *X.Work, bounds: ViewBounds) void {
+            work.floor_cells = bounds.floor_cells;
+            work.top_cells = bounds.top_cells;
+            work.floor_refs = bounds.floor_refs;
+            work.top_refs = bounds.top_refs;
+            work.floor_values = bounds.floor_values;
+            work.pinned_cells = bounds.pinned_cells;
+            work.pinned_refs = bounds.pinned_refs;
+        }
+
+        /// INSERT / UPDATE / DELETE on a view: its INSTEAD OF row triggers
+        /// run for every new row (INSERT) or every view row the WHERE keeps
+        /// (UPDATE / DELETE), with NEW / OLD shaped like the view. A NULL
+        /// result skips the row; RETURNING reads the row a trigger returned
+        /// (OLD for DELETE). Statement triggers of the view fire around it.
+        /// A view without a trigger for the event is not updatable here
+        /// (55000).
+        fn viewModify(self: *Self, slot: u16, original: []const u8, parsed: *const A.Statement, snap: Snapshot, mode: ParseMode, view: usize) Error!void {
+            const event = eventOf(parsed);
+            try self.lockTable(slot, view, .row_exclusive);
+            if (!self.insteadTriggers(view, event, snap)) return error.ObjectNotInPrerequisiteState;
+            try self.statementTriggers(view, tg.tg_before, &.{event}, snap);
+            const work = &self.workspace.query;
+            const bounds = viewBounds(work);
+            defer restoreBounds(work, bounds);
+            var rows: X.List = .{ .start = 0, .count = 0 };
+            if (event != tg.tg_insert) rows = try self.viewRowList(slot, view, snap);
+            // The statement itself binds over the view's columns.
+            const top = try P.parseTopWithOptions(original, &self.workspace.nodes, .{ .mode = mode, .dialect = self.dialect });
+            var statement_copy = top.command;
+            const source = try expandRelations(self, &self.workspace, original, snap, &statement_copy, self.session.role, &self.session);
+            var context = self.bindContext(source, mode, snap);
+            context.stored_source_start = original.len;
+            context.view_target = true;
+            var bound: B.Bound = undefined;
+            try B.bindInto(&context, &statement_copy, &bound);
+            if (self.txs[slot].read_only) try readOnlyCheck(&bound, &self.workspace.plans);
+            try self.checkPrivileges(&bound, snap);
+            try self.lockSources(slot);
+            var staged: ViewStaging = .{};
+            const affected: usize = switch (bound) {
+                .insert => |*insert| try self.viewInsert(slot, source, insert, view, snap, &staged),
+                .update => |*update| try self.viewUpdate(source, update, view, rows, snap, &staged),
+                .delete => |*delete| try self.viewDelete(source, delete, view, rows, snap, &staged),
+                else => return error.UnsupportedStatement,
+            };
+            try self.statementTriggers(view, 0, &.{event}, snap);
+            self.outcome = .{ .affected = affected, .command = B.command(&bound) };
+            const returning: ?*const B.Returning = switch (bound) {
+                .insert => |*insert| &insert.returning,
+                .update => |*update| &update.returning,
+                .delete => |*delete| &delete.returning,
+                else => null,
+            };
+            if (returning) |list| if (list.count != 0) {
+                if (list.output) return error.UnsupportedStatement;
+                var returned: Returned = .{ .count = list.count, .rows = staged.rows, .base = staged.base, .non_null_columns = list.non_null_columns };
+                @memcpy(returned.names[0..list.count], list.names[0..list.count]);
+                @memcpy(returned.types[0..list.count], list.types[0..list.count]);
+                @memcpy(returned.typmods[0..list.count], list.typmods[0..list.count]);
+                self.outcome.returning = returned;
+            };
+        }
+
+        /// Every row of a view under the statement snapshot, materialized in
+        /// the query workspace and kept below its floors while the
+        /// statement runs (the caller restores them).
+        fn viewRowList(self: *Self, slot: u16, view: usize, snap: Snapshot) Error!X.List {
+            const table = &self.tables[view];
+            var text: [2 * 2 * config.name_bytes + 32]u8 = undefined;
+            var used: usize = 0;
+            try appendText(&text, &used, "SELECT * FROM ");
+            try appendQuoted(&text, &used, self.namespaceName(table.namespace));
+            try appendText(&text, &used, ".");
+            try appendQuoted(&text, &used, table.name.slice());
+            const query_text = text[0..used];
+            var parsed = try P.parse(query_text, &self.workspace.nodes, .standard);
+            const source = try expandRelations(self, &self.workspace, query_text, snap, &parsed, self.session.role, &self.session);
+            if (parsed == .select) {
+                const top_query = parsed.select;
+                parsed = .{ .query = top_query };
+                self.workspace.nodes.complex = true;
+            }
+            var context = self.bindContext(source, .standard, snap);
+            context.stored_source_start = query_text.len;
+            var bound: B.Bound = undefined;
+            try B.bindInto(&context, &parsed, &bound);
+            const root = switch (bound) {
+                .query => |root| root,
+                else => return error.UnsupportedStatement,
+            };
+            try self.lockSources(slot);
+            const work = &self.workspace.query;
+            const list = try X.queryRows(&self.tables, source, &self.workspace.nodes, &self.workspace.plans, root, snap, &self.session, work);
+            if (self.workspace.plans.items[root].count != table.column_count) return error.UnsupportedStatement;
+            work.floor_values = nested_module.valueFloor(work);
+            work.floor_cells = work.cell_low;
+            work.floor_refs = work.ref_low;
+            work.top_cells = work.cells.len - work.cell_high;
+            work.top_refs = work.refs.len - work.ref_high;
+            work.pinned_cells = 0;
+            work.pinned_refs = 0;
+            return list;
+        }
+
+        /// RETURNING rows of a view statement, staged in the workspace in
+        /// row order.
+        const ViewStaging = struct { base: usize = 0, rows: usize = 0 };
+
+        fn stageReturning(self: *Self, source: []const u8, list: *const B.Returning, row: *const E.Row, staged: *ViewStaging, capacity: usize) Error!void {
+            if (list.count == 0) return;
+            if (staged.rows >= capacity) return error.RowCapacity;
+            const work = &self.workspace.query;
+            const at = try X.stageCells(work, list.count);
+            if (staged.rows == 0) staged.base = at else if (at != staged.base + staged.rows * list.count) return error.WorkspaceCapacity;
+            var ctx = self.evalContext(source);
+            ctx.row = row;
+            for (list.targets[0..list.count], 0..) |id, column| work.cells[at + column] = try E.eval(&ctx, id);
+            staged.rows += 1;
+        }
+
+        /// INSTEAD OF row triggers of `view` in name order: each receives
+        /// the row the previous one returned; false when one returned NULL.
+        fn insteadRow(self: *Self, view: usize, event: u8, new: ?*E.Row, old: ?*E.Row, snap: Snapshot) Error!bool {
+            var list: [config.triggers]u8 = undefined;
+            const count = self.objects.tableTriggers(self.tables[view].oid, snap, &list);
+            for (list[0..count]) |position| {
+                const trigger = &self.objects.triggers[position];
+                if (!triggerMatches(trigger, tg.tg_instead, true, event)) continue;
+                switch (try self.callTrigger(trigger, view, tg.tg_instead, true, event, new, old, snap)) {
+                    .new => if (new == null) return false,
+                    .old => {
+                        const row = old orelse return false;
+                        if (new) |target_row| target_row.* = row.*;
+                    },
+                    .null_row, .none => return false,
+                }
+            }
+            return true;
+        }
+
+        fn viewInsert(self: *Self, slot: u16, source: []const u8, insert: *const B.Insert, view: usize, snap: Snapshot, staged: *ViewStaging) Error!usize {
+            _ = slot;
+            if (insert.conflict.action != .none or insert.replace) return error.UnsupportedStatement;
+            const table = &self.tables[view];
+            var ctx = self.evalContext(source);
+            const derived: D.Derived = .{ .defaults = &insert.defaults, .generated = &insert.generated, .checks = &insert.checks };
+            const capacity = self.routine_result.?.rows.len;
+            var affected: usize = 0;
+            if (insert.plan != ast.none) {
+                const work = &self.workspace.query;
+                const rows = try X.queryRows(&self.tables, source, &self.workspace.nodes, &self.workspace.plans, insert.plan, snap, &self.session, work);
+                for (0..rows.count) |index| {
+                    try self.session.checkpoint();
+                    ctx.tuple[1] = X.rowAt(work, rows, index);
+                    var cells = try D.insertedRow(&ctx, table, &insert.values, derived);
+                    if (!try self.insteadRow(view, tg.tg_insert, &cells, null, snap)) continue;
+                    affected += 1;
+                    try self.stageReturning(source, &insert.returning, &cells, staged, capacity);
+                }
+            } else if (insert.rows == ast.none) {
+                var cells = try D.insertedRow(&ctx, table, &insert.values, derived);
+                if (try self.insteadRow(view, tg.tg_insert, &cells, null, snap)) {
+                    affected += 1;
+                    try self.stageReturning(source, &insert.returning, &cells, staged, capacity);
+                }
+            } else {
+                const nodes = &self.workspace.nodes.nodes;
+                var row = insert.rows;
+                while (row != ast.none) : (row = nodes[row].next) {
+                    try self.session.checkpoint();
+                    var values: [config.columns]u16 = @splat(ast.none);
+                    var item = nodes[row].b;
+                    var item_index: usize = 0;
+                    while (item != ast.none) : (item = nodes[item].next) {
+                        values[insert.mapping[item_index]] = item;
+                        item_index += 1;
+                    }
+                    var cells = try D.insertedRow(&ctx, table, &values, derived);
+                    if (!try self.insteadRow(view, tg.tg_insert, &cells, null, snap)) continue;
+                    affected += 1;
+                    try self.stageReturning(source, &insert.returning, &cells, staged, capacity);
+                }
+            }
+            return affected;
+        }
+
+        fn viewUpdate(self: *Self, source: []const u8, update: *const B.Update, view: usize, rows: X.List, snap: Snapshot, staged: *ViewStaging) Error!usize {
+            const table = &self.tables[view];
+            var ctx = self.evalContext(source);
+            const derived: D.Derived = .{ .defaults = &update.defaults, .generated = &update.generated, .checks = &update.checks };
+            const joined = try self.joinedRows(source, update.from, &update.offsets, snap);
+            const capacity = self.routine_result.?.rows.len;
+            var affected: usize = 0;
+            for (0..rows.count) |index| {
+                try self.session.checkpoint();
+                var old: E.Row = @splat(.null_value);
+                const row = X.rowAt(&self.workspace.query, rows, index);
+                for (0..table.column_count) |column| old[column] = row[column];
+                if (!try self.keepJoined(&ctx, update.where, joined, &old)) continue;
+                var new = try D.updatedRow(&ctx, table, &update.values, derived, &old);
+                if (!try self.insteadRow(view, tg.tg_update, &new, &old, snap)) continue;
+                affected += 1;
+                try self.stageReturning(source, &update.returning, &new, staged, capacity);
+            }
+            return affected;
+        }
+
+        fn viewDelete(self: *Self, source: []const u8, delete: *const B.Delete, view: usize, rows: X.List, snap: Snapshot, staged: *ViewStaging) Error!usize {
+            const table = &self.tables[view];
+            var ctx = self.evalContext(source);
+            const joined = try self.joinedRows(source, delete.using, &delete.offsets, snap);
+            const capacity = self.routine_result.?.rows.len;
+            var affected: usize = 0;
+            for (0..rows.count) |index| {
+                try self.session.checkpoint();
+                var old: E.Row = @splat(.null_value);
+                const row = X.rowAt(&self.workspace.query, rows, index);
+                for (0..table.column_count) |column| old[column] = row[column];
+                if (!try self.keepJoined(&ctx, delete.where, joined, &old)) continue;
+                var kept = old;
+                if (!try self.insteadRow(view, tg.tg_delete, null, &kept, snap)) continue;
+                affected += 1;
+                try self.stageReturning(source, &delete.returning, &old, staged, capacity);
+            }
+            return affected;
+        }
+
+        /// PostgreSQL's errdetail for a view that is not automatically
+        /// updatable (SQLSTATE 55000), kept for the caller after the error.
+        pub const view_details = struct {
+            pub const distinct = "Views containing DISTINCT are not automatically updatable.";
+            pub const group = "Views containing GROUP BY are not automatically updatable.";
+            pub const having = "Views containing HAVING are not automatically updatable.";
+            pub const set_operation = "Views containing UNION, INTERSECT, or EXCEPT are not automatically updatable.";
+            pub const with = "Views containing WITH are not automatically updatable.";
+            pub const limit = "Views containing LIMIT or OFFSET are not automatically updatable.";
+            pub const aggregate = "Views that return aggregate functions are not automatically updatable.";
+            pub const window = "Views that return window functions are not automatically updatable.";
+            pub const single = "Views that do not select from a single table or view are not automatically updatable.";
+            pub const no_columns = "Views that have no updatable columns are not automatically updatable.";
+            pub const column = "View columns that are not columns of their base relation are not updatable.";
+        };
+
+        /// The detail of the last view updatability error (empty: none).
+        pub fn lastErrorDetail(self: *const Self) []const u8 {
+            return self.error_detail;
+        }
+
+        fn viewError(self: *Self, detail: []const u8) Error {
+            self.error_detail = detail;
+            return error.ObjectNotInPrerequisiteState;
+        }
+
+        fn columnError(self: *Self) Error {
+            self.error_detail = view_details.column;
+            return error.UnsupportedStatement;
+        }
+
+        /// Text of a rewritten view statement: the user's statement and the
+        /// stored view definitions it reaches, in the top of the query
+        /// workspace (kept until the statement ends).
+        const RewriteText = struct {
+            bytes: []u8,
+            len: usize,
+
+            fn add(self: *RewriteText, text: []const u8) Error!usize {
+                if (text.len > self.bytes.len - self.len) return error.TextCapacity;
+                const start = self.len;
+                @memcpy(self.bytes[start..][0..text.len], text);
+                self.len += text.len;
+                return start;
+            }
+
+            /// A quoted identifier for `name` (a view column name).
+            fn ident(self: *RewriteText, name: []const u8) Error!ast.Ident {
+                _ = try self.add(" \"");
+                const start = self.len;
+                for (name) |byte| {
+                    if (byte == '"') _ = try self.add("\"\"") else _ = try self.add(&[_]u8{byte});
+                }
+                const span_len = self.len - start;
+                _ = try self.add("\"");
+                return .{ .span = .{ .start = start - 1, .len = span_len + 2 }, .quoted = true, .len = name.len };
+            }
+        };
+
+        /// One auto-updatable view: its parsed definition, the base relation
+        /// it selects from and the expression of each view column.
+        const ViewShape = struct {
+            query: u16 = ast.none,
+            item: A.FromItem = .{},
+            columns: [config.columns]u16 = @splat(ast.none),
+            plain: [config.columns]bool = @splat(false),
+            count: usize = 0,
+            where: u16 = ast.none,
+        };
+
+        /// PostgreSQL's view_query_is_auto_updatable over the stored
+        /// definition, parsed into the pool from `text`.
+        fn viewShape(self: *Self, view: usize, text: *RewriteText, for_columns: bool) Error!ViewShape {
+            const table = &self.tables[view];
+            _ = try text.add(" ");
+            const start = try text.add(table.query.slice());
+            const pool = &self.workspace.nodes;
+            const query = try P.parseQueryAt(text.bytes[0..text.len], start, text.len, pool);
+            const q = &pool.queries[query];
+            if (q.distinct or q.distinct_on_count != 0) return self.viewError(view_details.distinct);
+            if (q.group_count != 0 or q.grouping_sets != ast.none or q.rollup) return self.viewError(view_details.group);
+            if (q.having != ast.none) return self.viewError(view_details.having);
+            if (q.set_op != .none) return self.viewError(view_details.set_operation);
+            if (q.cte_count != 0) return self.viewError(view_details.with);
+            if (q.limit_present or q.offset_present) return self.viewError(view_details.limit);
+            var shape: ViewShape = .{ .query = query, .where = q.where };
+            // Targets: `*` (the base columns) or one expression per column.
+            var star = false;
+            for (q.targets[0..q.count]) |item_target| {
+                if (item_target.star) {
+                    star = true;
+                    continue;
+                }
+                if (containsKind(pool, item_target.expr, .aggregate)) return self.viewError(view_details.aggregate);
+                if (containsWindow(pool, item_target.expr)) return self.viewError(view_details.window);
+            }
+            if (q.item_count != 1 or q.from == null and q.item_count == 0) return self.viewError(view_details.single);
+            const item = q.items[0];
+            if (item.query != ast.none or item.function != ast.none or item.join != .first or item.sample_method != 0 or item.column_aliases != ast.none)
+                return self.viewError(view_details.single);
+            shape.item = item;
+            const base = try self.viewBase(text.bytes[0..text.len], &item);
+            const base_table = &self.tables[base];
+            if (base_table.relkind != 'r' and base_table.relkind != 'p' and base_table.relkind != 'v') return self.viewError(view_details.single);
+            // View columns in order.
+            var count: usize = 0;
+            for (q.targets[0..q.count]) |item_target| {
+                if (item_target.star) {
+                    for (base_table.columns[0..base_table.column_count]) |*column| {
+                        if (count == config.columns) return error.ColumnCapacity;
+                        const name = try text.ident(column.name.slice());
+                        shape.columns[count] = try pool.add(.{ .kind = .column, .name = name, .qualifier = if (item.alias) |alias| alias else item.name });
+                        shape.plain[count] = true;
+                        count += 1;
+                    }
+                    continue;
+                }
+                if (count == config.columns) return error.ColumnCapacity;
+                const n = &pool.nodes[item_target.expr];
+                shape.columns[count] = item_target.expr;
+                shape.plain[count] = n.kind == .column and !n.star and (n.qualifier.len == 0 or sameIdent(text.bytes[0..text.len], n.qualifier, if (item.alias) |alias| alias else item.name));
+                count += 1;
+            }
+            if (star and count == 0) return self.viewError(view_details.single);
+            if (count != table.column_count) return error.UnsupportedStatement;
+            shape.count = count;
+            if (for_columns) {
+                var any = false;
+                for (shape.plain[0..count]) |plain| any = any or plain;
+                if (!any) return self.viewError(view_details.no_columns);
+            }
+            // The definition's FROM item is not expanded with the statement.
+            q.item_count = 0;
+            return shape;
+        }
+
+        fn viewBase(self: *Self, text: []const u8, item: *const A.FromItem) Error!usize {
+            const snap = self.routine_snap;
+            const schema_name = if (item.schema) |qualifier| identName(text, qualifier) else Name{};
+            const namespace = (try self.namespaceForUsage(self.session.role, if (item.schema != null) schema_name.slice() else null, snap)) orelse return error.TableNotFound;
+            const found = self.catalog.findIn(namespace, identName(text, item.name).slice(), snap) orelse return error.TableNotFound;
+            if (found.kind == 'S') return self.viewError(view_details.single);
+            return found.slot;
+        }
+
+        fn sameIdent(text: []const u8, a: ast.Ident, b: ast.Ident) bool {
+            return types.same(identName(text, a).slice(), identName(text, b).slice());
+        }
+
+        fn containsKind(pool: *const A.Pool, id: u16, kind: ast.NodeKind) bool {
+            if (id == ast.none) return false;
+            const n = &pool.nodes[id];
+            if (n.kind == kind) return true;
+            for ([_]u16{ n.a, n.b, n.c }) |child| {
+                var item = child;
+                while (item != ast.none) : (item = pool.nodes[item].next) if (containsKind(pool, item, kind)) return true;
+            }
+            return false;
+        }
+
+        fn containsWindow(pool: *const A.Pool, id: u16) bool {
+            if (id == ast.none) return false;
+            const n = &pool.nodes[id];
+            if (n.window != ast.none) return true;
+            for ([_]u16{ n.a, n.b, n.c }) |child| {
+                var item = child;
+                while (item != ast.none) : (item = pool.nodes[item].next) if (containsWindow(pool, item)) return true;
+            }
+            return false;
+        }
+
+        /// A copy of an expression tree in the pool (a view column read
+        /// through the view); subqueries are outside the subset.
+        fn copyTree(pool: *A.Pool, id: u16) Error!u16 {
+            if (id == ast.none) return ast.none;
+            var n = pool.nodes[id];
+            switch (n.kind) {
+                .scalar_subquery, .exists_subquery, .in_subquery, .aggregate => return error.UnsupportedStatement,
+                else => {},
+            }
+            if (n.window != ast.none or n.order != ast.none) return error.UnsupportedStatement;
+            n.a = try copyChain(pool, n.a);
+            n.b = try copyChain(pool, n.b);
+            n.c = try copyChain(pool, n.c);
+            n.next = ast.none;
+            return pool.add(n);
+        }
+
+        fn copyChain(pool: *A.Pool, head: u16) Error!u16 {
+            var first: u16 = ast.none;
+            var last: u16 = ast.none;
+            var item = head;
+            while (item != ast.none) : (item = pool.nodes[item].next) {
+                const copy = try copyTree(pool, item);
+                if (last == ast.none) first = copy else pool.nodes[last].next = copy;
+                last = copy;
+            }
+            return first;
+        }
+
+        /// The view column a statement's column node names, if it names one:
+        /// unqualified, or qualified by the view's name or alias.
+        fn viewColumnOf(self: *const Self, text: []const u8, view: usize, n: *const ast.Node, names: []const ast.Ident) Error!?usize {
+            if (n.kind != .column or n.star) return null;
+            if (n.qualifier.len != 0) {
+                var mine = false;
+                for (names) |name| mine = mine or sameIdent(text, n.qualifier, name);
+                if (!mine) return null;
+            }
+            const wanted = identName(text, n.name);
+            const table = &self.tables[view];
+            for (table.columns[0..table.column_count], 0..) |*column, index| {
+                if (types.same(column.name.slice(), wanted.slice())) return index;
+            }
+            return error.ColumnNotFound;
+        }
+
+        /// Rewrites the view's column references under `id` (not inside
+        /// subqueries) to the base relation's columns or expressions.
+        fn substituteView(self: *Self, text: []const u8, view: usize, shape: *const ViewShape, names: []const ast.Ident, id: u16) Error!void {
+            if (id == ast.none) return;
+            const pool = &self.workspace.nodes;
+            const n = &pool.nodes[id];
+            if (try self.viewColumnOf(text, view, n, names)) |column| {
+                const keep_next = n.next;
+                const source_node = shape.columns[column];
+                if (shape.plain[column]) {
+                    const base = pool.nodes[source_node];
+                    n.name = base.name;
+                    n.qualifier = base.qualifier;
+                } else {
+                    const copy = try copyTree(pool, source_node);
+                    pool.nodes[id] = pool.nodes[copy];
+                }
+                pool.nodes[id].next = keep_next;
+                return;
+            }
+            for ([_]u16{ n.a, n.b, n.c }) |child| {
+                var item = child;
+                while (item != ast.none) : (item = pool.nodes[item].next) try self.substituteView(text, view, shape, names, item);
+            }
+        }
+
+        /// A RETURNING list over the view: `*` becomes the view's columns,
+        /// every reference reads the base relation.
+        fn rewriteReturning(self: *Self, text: *RewriteText, view: usize, shape: *const ViewShape, names: []const ast.Ident, list: *A.Returning) Error!void {
+            if (list.count == 0) return;
+            if (list.output) return error.UnsupportedStatement;
+            var out: [config.columns]A.Target = undefined;
+            var count: usize = 0;
+            const table = &self.tables[view];
+            for (list.targets[0..list.count]) |item_target| {
+                if (item_target.star) {
+                    if (item_target.expr != ast.none) {
+                        const n = &self.workspace.nodes.nodes[item_target.expr];
+                        if (n.qualifier.len != 0) {
+                            var mine = false;
+                            for (names) |name| mine = mine or sameIdent(text.bytes[0..text.len], n.qualifier, name);
+                            if (!mine) return error.UnsupportedStatement;
+                        }
+                    }
+                    for (0..shape.count) |column| {
+                        if (count == config.columns) return error.ColumnCapacity;
+                        const expr = if (shape.plain[column]) try self.workspace.nodes.add(self.workspace.nodes.nodes[shape.columns[column]]) else try copyTree(&self.workspace.nodes, shape.columns[column]);
+                        self.workspace.nodes.nodes[expr].next = ast.none;
+                        out[count] = .{ .expr = expr, .alias = try text.ident(table.columns[column].name.slice()) };
+                        count += 1;
+                    }
+                    continue;
+                }
+                if (count == config.columns) return error.ColumnCapacity;
+                var copy = item_target;
+                // An unaliased column keeps the view column's name.
+                if (copy.alias == null and item_target.expr != ast.none) {
+                    if (try self.viewColumnOf(text.bytes[0..text.len], view, &self.workspace.nodes.nodes[item_target.expr], names)) |column| copy.alias = try text.ident(table.columns[column].name.slice());
+                }
+                try self.substituteView(text.bytes[0..text.len], view, shape, names, copy.expr);
+                out[count] = copy;
+                count += 1;
+            }
+            @memcpy(list.targets[0..count], out[0..count]);
+            list.count = count;
+        }
+
+        /// The base column a view column assignment or INSERT target names
+        /// (0A000 for a column that is not a base column).
+        fn viewTargetColumn(self: *Self, text: []const u8, view: usize, shape: *const ViewShape, ident: ast.Ident) Error!ast.Ident {
+            const wanted = identName(text, ident);
+            const table = &self.tables[view];
+            for (table.columns[0..table.column_count], 0..) |*column, index| {
+                if (!types.same(column.name.slice(), wanted.slice())) continue;
+                if (!shape.plain[index]) return self.columnError();
+                return self.workspace.nodes.nodes[shape.columns[index]].name;
+            }
+            return error.ColumnNotFound;
+        }
+
+        /// An INSERT / UPDATE / DELETE on an automatically updatable view
+        /// becomes the same statement on its base relation (PostgreSQL's
+        /// rewriteTargetView): column names map to the base columns, reads
+        /// of view columns to their expressions, and UPDATE / DELETE keep
+        /// only rows of the view (its WHERE). Views over views repeat it.
+        /// Returns the statement text the rewritten statement reads.
+        fn rewriteViewTarget(self: *Self, slot: u16, original: []const u8, rewritten: *A.Statement, first_view: usize, snap: Snapshot) Error![]const u8 {
+            const work = &self.workspace.query;
+            const limit = @min(config.expansion_bytes, (work.cells.len - work.top_cells - work.pinned_cells - work.floor_cells) * @sizeOf(Cell) / 2);
+            const need = nested_module.cellsFor(Cell, limit);
+            if (limit < original.len or work.cells.len - work.top_cells - work.pinned_cells < work.floor_cells + need) return error.WorkspaceCapacity;
+            const at = work.cells.len - work.top_cells - work.pinned_cells - need;
+            work.top_cells = work.cells.len - at - work.pinned_cells;
+            if (work.cell_high > at) work.cell_high = at;
+            const bytes: [*]u8 = @ptrCast(&work.cells[at]);
+            var text: RewriteText = .{ .bytes = bytes[0..limit], .len = 0 };
+            _ = try text.add(original);
+            const event: u8 = switch (rewritten.*) {
+                .insert => tg.tg_insert,
+                .update => tg.tg_update,
+                else => tg.tg_delete,
+            };
+            var view = first_view;
+            var depth: usize = 0;
+            while (true) : (depth += 1) {
+                if (depth == config.tables) return error.StackDepthExceeded;
+                // Privileges on the view itself belong to the user.
+                if (!self.privilegedRole(snap)) try self.needTable(view, switch (event) {
+                    tg.tg_insert => CO.priv_insert,
+                    tg.tg_update => CO.priv_update,
+                    else => CO.priv_delete,
+                }, snap);
+                if (depth != 0) try self.lockTable(slot, view, .row_exclusive);
+                const shape = try self.viewShape(view, &text, event != tg.tg_delete);
+                const current = text.bytes[0..text.len];
+                var names: [2]ast.Ident = undefined;
+                var name_count: usize = 0;
+                switch (rewritten.*) {
+                    .insert => |*insert| {
+                        if (insert.conflict != null) return error.UnsupportedStatement;
+                        names[0] = insert.table;
+                        name_count = 1;
+                        if (insert.alias) |alias| {
+                            names[0] = alias;
+                        }
+                        var columns: [config.columns]ast.Ident = undefined;
+                        var count: usize = 0;
+                        if (insert.explicit_columns) {
+                            for (insert.columns[0..insert.column_count]) |ident| {
+                                columns[count] = try self.viewTargetColumn(current, view, &shape, ident);
+                                count += 1;
+                            }
+                        } else {
+                            count = shape.count;
+                            if (insert.source == .values and insert.rows != ast.none) {
+                                const first = self.workspace.nodes.nodes[insert.rows].integer;
+                                if (first >= 1 and first < @as(i64, @intCast(count))) count = @intCast(first);
+                            } else if (insert.source == .default_values) count = 0;
+                            for (0..count) |column| {
+                                if (!shape.plain[column]) return self.columnError();
+                                columns[column] = self.workspace.nodes.nodes[shape.columns[column]].name;
+                            }
+                        }
+                        @memcpy(insert.columns[0..count], columns[0..count]);
+                        insert.column_count = count;
+                        insert.explicit_columns = count != 0;
+                        insert.schema = shape.item.schema;
+                        insert.table = shape.item.name;
+                        insert.alias = shape.item.alias;
+                        try self.rewriteReturning(&text, view, &shape, names[0..name_count], &insert.returning);
+                    },
+                    .update => |*update| {
+                        names[0] = update.alias orelse update.table;
+                        name_count = 1;
+                        for (update.assignments[0..update.count]) |*item| {
+                            item.column = try self.viewTargetColumn(current, view, &shape, item.column);
+                            try self.substituteView(current, view, &shape, names[0..name_count], item.value);
+                        }
+                        try self.substituteView(current, view, &shape, names[0..name_count], update.where);
+                        update.where = try self.andWhere(shape.where, update.where);
+                        try self.rewriteReturning(&text, view, &shape, names[0..name_count], &update.returning);
+                        update.schema = shape.item.schema;
+                        update.table = shape.item.name;
+                        update.alias = shape.item.alias;
+                        update.only = update.only or shape.item.only;
+                    },
+                    .delete => |*delete| {
+                        names[0] = delete.alias orelse delete.table;
+                        name_count = 1;
+                        try self.substituteView(current, view, &shape, names[0..name_count], delete.where);
+                        delete.where = try self.andWhere(shape.where, delete.where);
+                        try self.rewriteReturning(&text, view, &shape, names[0..name_count], &delete.returning);
+                        delete.schema = shape.item.schema;
+                        delete.table = shape.item.name;
+                        delete.alias = shape.item.alias;
+                        delete.only = delete.only or shape.item.only;
+                    },
+                    else => return error.UnsupportedStatement,
+                }
+                const base = try self.viewBase(text.bytes[0..text.len], &shape.item);
+                if (self.tables[base].relkind != 'v') break;
+                // A view under an INSTEAD OF trigger view is outside the subset.
+                if (self.insteadTriggers(base, event, snap)) return error.UnsupportedStatement;
+                view = base;
+            }
+            return text.bytes[0..text.len];
+        }
+
+        fn andWhere(self: *Self, view_where: u16, where: u16) Error!u16 {
+            if (view_where == ast.none) return where;
+            if (where == ast.none) return view_where;
+            return self.workspace.nodes.add(.{ .kind = .and_op, .a = view_where, .b = where });
         }
 
         // ---- nested statements (B11 wave 4, sql/nested.sig) -----------------

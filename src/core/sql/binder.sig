@@ -358,6 +358,9 @@ pub fn Binder(comptime config: types.Config) type {
             /// Binding a data-modifying WITH entry (B11): plans of the
             /// enclosing statement stay in place.
             nested_dml: bool = false,
+            /// An INSERT / UPDATE / DELETE target may be a view (B11 wave 4:
+            /// its INSTEAD OF triggers run the statement over its columns).
+            view_target: bool = false,
             /// Declared parameter types of an EXECUTEd SQL prepared
             /// statement ($n nodes; their values are in the session).
             params: ?*const Parameters = null,
@@ -5359,6 +5362,7 @@ pub fn Binder(comptime config: types.Config) type {
                 'r' => {},
                 'p' => if (!routed) return error.UnsupportedStatement,
                 'm' => return error.WrongObjectType,
+                'v' => if (!context.view_target) return error.UnsupportedStatement,
                 else => return error.UnsupportedStatement,
             }
             return index;

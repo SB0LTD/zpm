@@ -16,7 +16,7 @@
 const std = @import("std");
 const sql = @import("sql");
 
-const DB = sql.Database(.{ .tables = 8, .columns = 8, .rows_per_table = 32, .name_bytes = 32, .text_bytes = 64, .nulls_first_ascending = false, .integer_bits = 32, .transactions = 4, .sequences = 4, .expr_nodes = 512, .routines = 16, .triggers = 12, .rules = 8, .routine_depth = 32, .nested_statements = 8, .work_rows = 256 });
+const DB = sql.Database(.{ .tables = 16, .columns = 8, .rows_per_table = 32, .name_bytes = 32, .text_bytes = 64, .nulls_first_ascending = false, .integer_bits = 32, .transactions = 4, .sequences = 4, .expr_nodes = 512, .routines = 16, .triggers = 12, .rules = 8, .routine_depth = 32, .nested_statements = 8, .work_rows = 256 });
 /// A small workspace: the saved statements do not fit (54000).
 const Small = sql.Database(.{ .tables = 4, .columns = 4, .rows_per_table = 8, .name_bytes = 32, .text_bytes = 32, .nulls_first_ascending = false, .integer_bits = 32, .expr_nodes = 256, .routines = 4, .triggers = 2, .rules = 1, .nested_statements = 8 });
 
@@ -140,6 +140,25 @@ fn rejects(source: []const u8, wanted: anyerror, probe: []const u8, unchanged: [
     try same(try query(&replica, probe), unchanged);
     const usage = db.usage();
     try check(usage.transactions == 0 and usage.pending_versions == 0 and usage.table_locks == 0);
+}
+
+/// rejects() whose error carries PostgreSQL's errdetail (lastErrorDetail).
+fn rejectsDetail(source: []const u8, wanted: anyerror, detail: []const u8, probe: []const u8, unchanged: []const u8) !void {
+    const result = &other_slot;
+    result.* = .{};
+    var used: usize = 0;
+    if (db.executeChanges(source, result, &record, &used, null, null)) |_| {
+        std.debug.print("accepted: {s}\n", .{source});
+        return error.InvalidStatementAccepted;
+    } else |err| {
+        if (err != wanted) std.debug.print("{s}: {s} (wanted {s})\n", .{ source, @errorName(err), @errorName(wanted) });
+        try check(err == wanted);
+    }
+    try same(db.lastErrorDetail(), detail);
+    try check(used == 0);
+    try same(try query(&db, probe), unchanged);
+    try same(try query(&replica, probe), unchanged);
+    try idle();
 }
 
 fn fails(source: []const u8, wanted: anyerror) !void {
@@ -534,6 +553,125 @@ fn triggerArguments() !void {
     try idle();
 }
 
+// ---- views as targets -------------------------------------------------------------
+
+/// INSTEAD OF row triggers run an INSERT / UPDATE / DELETE on a view: NEW
+/// and OLD have the view's columns, a NULL result skips the row, RETURNING
+/// reads the row the trigger returned (OLD for DELETE).
+fn insteadOfTriggers() !void {
+    reset();
+    try run("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)");
+    try run("INSERT INTO t VALUES (1, 'a'), (2, 'b')");
+    try run("CREATE VIEW v AS SELECT id, v, id * 10 AS big FROM t");
+    try run("CREATE TABLE log (what TEXT)");
+    try run("CREATE FUNCTION vi() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN INSERT INTO log VALUES (TG_OP || ':' || TG_WHEN || ':' || TG_LEVEL || ':' || coalesce(OLD.id::text, '-') || '->' || coalesce(NEW.id::text, '-') || ':' || coalesce(NEW.v, OLD.v)); IF TG_OP = 'INSERT' THEN INSERT INTO t VALUES (NEW.id, NEW.v); NEW.big := -1; RETURN NEW; END IF; IF TG_OP = 'UPDATE' THEN UPDATE t SET v = NEW.v WHERE id = OLD.id; RETURN NEW; END IF; DELETE FROM t WHERE id = OLD.id; RETURN OLD; END$$");
+    try completes("CREATE TRIGGER vt INSTEAD OF INSERT OR UPDATE OR DELETE ON v FOR EACH ROW EXECUTE FUNCTION vi()", .create_trigger, 0);
+    try returns("INSERT INTO v VALUES (3, 'c', 0) RETURNING *", "3|c|-1");
+    try completes("INSERT INTO v (id, v) VALUES (4, 'd'), (5, 'e')", .insert, 2);
+    try returns("UPDATE v SET v = v || '!' WHERE id >= 4 RETURNING id, v, big", "4|d!|40;5|e!|50");
+    try returns("DELETE FROM v WHERE id = 5 RETURNING *", "5|e!|50");
+    try expect("SELECT * FROM t ORDER BY id", "1|a;2|b;3|c;4|d!");
+    try expect("SELECT * FROM log", "INSERT:INSTEAD OF:ROW:-->3:c;INSERT:INSTEAD OF:ROW:-->4:d;INSERT:INSTEAD OF:ROW:-->5:e;UPDATE:INSTEAD OF:ROW:4->4:d!;UPDATE:INSTEAD OF:ROW:5->5:e!;DELETE:INSTEAD OF:ROW:5->-:e!");
+    try expect("SELECT tgname, tgtype FROM pg_trigger WHERE tgrelid = 'v'::regclass ORDER BY 1", "vt|93");
+    // A NULL result does nothing and counts nothing.
+    try run("CREATE FUNCTION skipper() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NULL; END$$");
+    try run("CREATE VIEW w AS SELECT * FROM t");
+    try run("CREATE TRIGGER wt INSTEAD OF DELETE ON w FOR EACH ROW EXECUTE FUNCTION skipper()");
+    try completes("DELETE FROM w", .delete, 0);
+    try expect("SELECT count(*) FROM t", "4");
+    // A failing trigger undoes the whole statement.
+    try run("CREATE FUNCTION partial() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN INSERT INTO t VALUES (NEW.id, NEW.v); IF NEW.id > 10 THEN RAISE EXCEPTION 'too big'; END IF; RETURN NEW; END$$");
+    try run("CREATE VIEW p AS SELECT id, v FROM t");
+    try run("CREATE TRIGGER pt INSTEAD OF INSERT ON p FOR EACH ROW EXECUTE FUNCTION partial()");
+    try rejects("INSERT INTO p VALUES (8, 'x'), (11, 'y')", error.RaiseException, "SELECT count(*) FROM t", "4");
+    // Statement triggers of a view fire around it.
+    try run("CREATE FUNCTION st() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN INSERT INTO log VALUES ('stmt:' || TG_WHEN || ':' || TG_TABLE_NAME); RETURN NULL; END$$");
+    try run("CREATE TRIGGER ps BEFORE INSERT ON p FOR EACH STATEMENT EXECUTE FUNCTION st()");
+    try run("CREATE TRIGGER pa AFTER INSERT ON p FOR EACH STATEMENT EXECUTE FUNCTION st()");
+    try completes("INSERT INTO p VALUES (8, 'x')", .insert, 1);
+    try expect("SELECT what FROM log WHERE what LIKE 'stmt%' ORDER BY what", "stmt:AFTER:p;stmt:BEFORE:p");
+    // Definition errors (42809 / 0A000 as PostgreSQL).
+    try fails("CREATE TRIGGER bad1 BEFORE INSERT ON v FOR EACH ROW EXECUTE FUNCTION vi()", error.WrongObjectType);
+    try fails("CREATE TRIGGER bad2 INSTEAD OF INSERT ON t FOR EACH ROW EXECUTE FUNCTION vi()", error.WrongObjectType);
+    try fails("CREATE TRIGGER bad3 INSTEAD OF INSERT ON v FOR EACH STATEMENT EXECUTE FUNCTION vi()", error.UnsupportedStatement);
+    try fails("CREATE TRIGGER bad4 INSTEAD OF UPDATE OF v ON v FOR EACH ROW EXECUTE FUNCTION vi()", error.UnsupportedStatement);
+    try fails("CREATE TRIGGER bad5 INSTEAD OF INSERT ON v FOR EACH ROW WHEN (NEW.id > 0) EXECUTE FUNCTION vi()", error.UnsupportedStatement);
+    // A view without a trigger for the event and not updatable: 55000.
+    try run("CREATE VIEW g AS SELECT v, count(*) AS n FROM t GROUP BY v");
+    try rejectsDetail("INSERT INTO g VALUES ('z', 1)", error.ObjectNotInPrerequisiteState, DB.view_details.group, "SELECT count(*) FROM t", "5");
+    try sameState(&.{ "SELECT * FROM t ORDER BY id", "SELECT * FROM log ORDER BY what", "SELECT tgname, tgtype FROM pg_trigger ORDER BY tgname" });
+    try run("DROP VIEW v");
+    try expect("SELECT count(*) FROM pg_trigger WHERE tgname = 'vt'", "0");
+    try sameState(&.{"SELECT count(*) FROM pg_trigger"});
+    try idle();
+}
+
+/// A view over one table or view without DISTINCT, GROUP BY, HAVING, set
+/// operations, WITH, LIMIT / OFFSET, aggregates or window functions is
+/// automatically updatable: the statement runs on the base relation, its
+/// columns mapped, and UPDATE / DELETE only reach rows of the view.
+fn updatableViews() !void {
+    reset();
+    try run("CREATE TABLE t (id INT PRIMARY KEY, val TEXT, n INT DEFAULT 7, secret TEXT)");
+    try run("INSERT INTO t VALUES (1, 'a', 1, 's1'), (2, 'b', 2, 's2'), (3, 'c', 30, 's3')");
+    try run("CREATE VIEW v AS SELECT id, val AS label, n, n * 2 AS dbl FROM t WHERE n < 10");
+    try returns("INSERT INTO v (id, label) VALUES (4, 'd') RETURNING *", "4|d|7|14");
+    try returns("INSERT INTO v VALUES (5, 'e', 3) RETURNING id, label, dbl", "5|e|6");
+    try rejectsDetail("INSERT INTO v VALUES (6, 'f', 4, 8)", error.UnsupportedStatement, DB.view_details.column, "SELECT count(*) FROM t", "5");
+    try rejects("INSERT INTO v (id, dbl) VALUES (6, 8)", error.UnsupportedStatement, "SELECT count(*) FROM t", "5");
+    try returns("UPDATE v SET label = label || '!' WHERE id <= 2 RETURNING *", "1|a!|1|2;2|b!|2|4");
+    try rejects("UPDATE v SET dbl = 1", error.UnsupportedStatement, "SELECT count(*) FROM t", "5");
+    // Without a check option a row may leave the view.
+    try completes("UPDATE v SET n = 50 WHERE id = 1", .update, 1);
+    try expect("SELECT * FROM t ORDER BY id", "1|a!|50|s1;2|b!|2|s2;3|c|30|s3;4|d|7|NULL;5|e|3|NULL");
+    try returns("DELETE FROM v WHERE label LIKE 'b%' RETURNING id, dbl", "2|4");
+    try completes("DELETE FROM v WHERE id = 3", .delete, 0);
+    try expect("SELECT id, val FROM t ORDER BY id", "1|a!;3|c;4|d;5|e");
+    // Base columns the view does not show do not exist through it.
+    try rejects("UPDATE v SET label = 'x' WHERE secret = 's1'", error.ColumnNotFound, "SELECT count(*) FROM t", "4");
+    // Not automatically updatable: 55000 with PostgreSQL's detail.
+    const Case = struct { create: []const u8, statement: []const u8, detail: []const u8 };
+    const cases = [_]Case{
+        .{ .create = "CREATE VIEW agg AS SELECT n, count(*) FROM t GROUP BY n", .statement = "INSERT INTO agg VALUES (1, 1)", .detail = DB.view_details.group },
+        .{ .create = "CREATE VIEW dist AS SELECT DISTINCT n FROM t", .statement = "DELETE FROM dist", .detail = DB.view_details.distinct },
+        .{ .create = "CREATE VIEW j AS SELECT t.id FROM t, t t2 WHERE t.id = t2.id", .statement = "UPDATE j SET id = 1", .detail = DB.view_details.single },
+        .{ .create = "CREATE VIEW lim AS SELECT * FROM t LIMIT 1", .statement = "DELETE FROM lim", .detail = DB.view_details.limit },
+        .{ .create = "CREATE VIEW u AS SELECT id FROM t UNION SELECT id FROM t", .statement = "INSERT INTO u VALUES (1)", .detail = DB.view_details.set_operation },
+        .{ .create = "CREATE VIEW nocols AS SELECT 1 AS one FROM t", .statement = "INSERT INTO nocols VALUES (1)", .detail = DB.view_details.no_columns },
+    };
+    for (cases) |item| {
+        try run(item.create);
+        try rejectsDetail(item.statement, error.ObjectNotInPrerequisiteState, item.detail, "SELECT count(*) FROM t", "4");
+    }
+    // A view with no updatable column still deletes.
+    try completes("DELETE FROM nocols", .delete, 4);
+    // Views over views.
+    try run("CREATE VIEW vv AS SELECT id, label FROM v WHERE id > 0");
+    try returns("INSERT INTO vv VALUES (9, 'nested') RETURNING *", "9|nested");
+    try completes("UPDATE vv SET label = 'N' WHERE id = 9", .update, 1);
+    try expect("SELECT id, val, n FROM t ORDER BY id", "9|N|7");
+    // Base triggers and constraints apply; failures are atomic.
+    try rejects("INSERT INTO vv VALUES (9, 'dup')", error.PrimaryKeyViolation, "SELECT count(*) FROM t", "1");
+    try run("CREATE TABLE log (what TEXT)");
+    try run("CREATE FUNCTION tl() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN INSERT INTO log VALUES (TG_OP || ':' || TG_TABLE_NAME || ':' || NEW.val); RETURN NEW; END$$");
+    try run("CREATE TRIGGER tl BEFORE INSERT OR UPDATE ON t FOR EACH ROW EXECUTE FUNCTION tl()");
+    try completes("INSERT INTO vv VALUES (10, 'x')", .insert, 1);
+    try expect("SELECT * FROM log", "INSERT:t:x");
+    // The user needs the privilege on the view, its owner on the base.
+    try run("CREATE ROLE viewer");
+    try run("GRANT SELECT, UPDATE ON v TO viewer");
+    // Base triggers run as the user.
+    try run("GRANT INSERT ON log TO viewer");
+    try run("SET ROLE viewer");
+    try completes("UPDATE v SET label = 'by viewer' WHERE id = 10", .update, 1);
+    try rejects("UPDATE t SET val = 'direct' WHERE id = 10", error.InsufficientPrivilege, "SELECT count(*) FROM v", "2");
+    try rejects("DELETE FROM v WHERE id = 10", error.InsufficientPrivilege, "SELECT count(*) FROM v", "2");
+    try run("RESET ROLE");
+    try expect("SELECT val FROM t WHERE id = 10", "by viewer");
+    try sameState(&.{ "SELECT * FROM t ORDER BY id", "SELECT * FROM log ORDER BY what" });
+    try idle();
+}
+
 pub fn main() !void {
     try triggerStatements();
     try functionStatements();
@@ -542,5 +680,7 @@ pub fn main() !void {
     try isolationSnapshots();
     try workAndCapacity();
     try triggerArguments();
+    try insteadOfTriggers();
+    try updatableViews();
     std.debug.print("nested statements: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });
 }
