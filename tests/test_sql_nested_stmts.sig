@@ -827,6 +827,42 @@ fn routineRows() !void {
     try idle();
 }
 
+// ---- values leaving a nested statement --------------------------------------------
+
+/// Values captured from a nested statement (SELECT INTO, RETURNING INTO,
+/// RETURN QUERY rows) are copied into the routine frame or the kept rows:
+/// later statements that reuse the nested statement's workspace do not
+/// change them. A value too wide for that bounded storage (wider than
+/// Config.text_bytes, here a long view definition) is 54000, atomically.
+fn capturedValues() !void {
+    reset();
+    try run("CREATE TABLE big (id INT PRIMARY KEY, t TEXT, b BYTEA, a INT[])");
+    try run("INSERT INTO big VALUES (1, repeat('a', 63) || 'Z', '\\xababababababababababababababababababababababababababababab0102'::bytea, ARRAY[1,2,3,4,5,6,7,8]), (2, repeat('q', 64), '\\xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd'::bytea, ARRAY[9,9,9,9,9,9,9,9])");
+    try run("CREATE FUNCTION keep() RETURNS TEXT LANGUAGE plpgsql AS $$DECLARE v TEXT; w BYTEA; x INT[]; y TEXT; n INT; BEGIN SELECT t, b, a INTO v, w, x FROM big WHERE id = 1; SELECT t INTO y FROM big WHERE id = 2; PERFORM left(t, 30) || right(b::text, 30) FROM big; UPDATE big SET t = repeat('r', 64) WHERE id = 2 RETURNING length(t) INTO n; RETURN right(v, 3) || length(v) || ':' || right(w::text, 6) || length(w::text) || ':' || x[8] || array_length(x, 1) || ':' || left(y, 2) || n; END$$");
+    try returns("SELECT keep()", "aaZ64:ab010264:88:qq64");
+    try run("CREATE FUNCTION rows_back() RETURNS SETOF TEXT LANGUAGE plpgsql AS $$BEGIN RETURN QUERY SELECT t FROM big ORDER BY id; RETURN QUERY SELECT repeat('s', 64); END$$");
+    try returns("SELECT length(r), right(r, 2) FROM rows_back() r", "64|aZ;64|rr;64|ss");
+    try run("CREATE TABLE trg_t (id INT, note TEXT)");
+    try run("CREATE FUNCTION trg_keep() RETURNS trigger LANGUAGE plpgsql AS $$DECLARE v TEXT; BEGIN SELECT t INTO v FROM big WHERE id = 1; PERFORM repeat('z', 64) FROM big; NEW.note := right(v, 4); RETURN NEW; END$$");
+    try run("CREATE TRIGGER k BEFORE INSERT ON trg_t FOR EACH ROW EXECUTE FUNCTION trg_keep()");
+    try completes("INSERT INTO trg_t VALUES (1, NULL), (2, NULL)", .insert, 2);
+    try expect("SELECT * FROM trg_t ORDER BY id", "1|aaaZ;2|aaaZ");
+    // A definition wider than an inline value cannot leave the statement.
+    try run("CREATE VIEW wide AS SELECT id, t, b, a FROM big WHERE id > 0 AND id < 99 AND t > ''");
+    try run("CREATE FUNCTION def_into() RETURNS INT LANGUAGE plpgsql AS $$DECLARE s TEXT; BEGIN INSERT INTO trg_t VALUES (9, 'x'); SELECT pg_get_viewdef('wide'::regclass) INTO s; RETURN length(s); END$$");
+    try rejects("SELECT def_into()", error.TextCapacity, "SELECT count(*) FROM trg_t", "2");
+    try run("CREATE FUNCTION def_rows() RETURNS SETOF TEXT LANGUAGE plpgsql AS $$BEGIN RETURN QUERY SELECT pg_get_viewdef('wide'::regclass); END$$");
+    try rejects("SELECT count(*) FROM def_rows()", error.TextCapacity, "SELECT count(*) FROM trg_t", "2");
+    // Its length is an ordinary value.
+    try run("CREATE FUNCTION def_length() RETURNS INT LANGUAGE plpgsql AS $$DECLARE n INT; BEGIN SELECT length(pg_get_viewdef('wide'::regclass)) INTO n; RETURN n; END$$");
+    const direct = try query(&db, "SELECT length(pg_get_viewdef('wide'::regclass))::text");
+    @memcpy(copy_buffer[0..direct.len], direct);
+    try check(direct.len > 0);
+    try same(try query(&db, "SELECT def_length()::text"), copy_buffer[0..direct.len]);
+    try sameState(&.{ "SELECT id, length(t), b::text, a::text FROM big ORDER BY id", "SELECT * FROM trg_t ORDER BY id" });
+    try idle();
+}
+
 pub fn main() !void {
     try triggerStatements();
     try functionStatements();
@@ -840,5 +876,6 @@ pub fn main() !void {
     try ruleActions();
     try ruleRecords();
     try routineRows();
+    try capturedValues();
     std.debug.print("nested statements: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });
 }

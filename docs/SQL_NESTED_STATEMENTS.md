@@ -72,6 +72,19 @@ PL/pgSQL function called from an expression, or a rule action
   to publish, and keeps its scan state outside the workspace.
 - Inside a running statement, only queries, INSERT / UPDATE / DELETE /
   MERGE, CALL and DO run. DDL there is 0A000.
+- **Values leaving a nested statement.** These are SELECT / RETURNING ...
+  INTO captures, table-reading PL/pgSQL expressions, SQL body results, and
+  rows kept for RETURN QUERY and set-returning bodies. Each value is copied
+  into the routine frame's variables or into the kept rows (`ownCell`). A
+  value up to Config.text_bytes is inline and is copied with its cell.
+  Only a wider value points into the nested statement's value region,
+  which the next statement reuses. Such a value can only be a wide catalog
+  rendering such as pg_get_viewdef, or a record or array decoded in place,
+  and it does not fit that bounded storage: 54000 (TextCapacity), with the
+  statement undone. PERFORM keeps no values. Values coming in (arguments,
+  NEW / OLD, the suspended statement's rows) stay valid because the nested
+  statement's value bytes start above the suspended statement's
+  (`Work.floor_values`).
 
 ## SQL in functions and trigger functions
 
@@ -227,5 +240,5 @@ raised yet. Also used: 54001, 54000, 0A000, 55000, 42P17, 42809, 42703,
   - T217 (TRIGGER privilege) belongs to the privileges lane.
 - **Other:**
   - `INSERT ... VALUES ((subquery))` is 0A000 in every context;
-  - large values captured by `SELECT ... INTO` keep pointing into the
-    nested statement's value region after it ends.
+  - a value wider than Config.text_bytes cannot leave a nested statement
+    (54000; PostgreSQL has no such bound).

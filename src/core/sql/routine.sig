@@ -1262,6 +1262,8 @@ pub fn Routines(comptime config: types.Config) type {
             tys: [config.columns]types.Type = @splat(.unknown),
             count: usize = 0,
             rows: usize = 0,
+            /// Only the row count is wanted (PERFORM): no value is kept.
+            rows_only: bool = false,
         };
 
         pub const Mode = enum { check, run, skip };
@@ -2477,7 +2479,7 @@ pub fn Routines(comptime config: types.Config) type {
                             try self.host.routineCheckStatement(buffer[0 .. 7 + text.len]);
                             return .normal;
                         }
-                        var capture: Capture = .{};
+                        var capture: Capture = .{ .rows_only = true };
                         const rows = try self.host.routineStatement(self.frame, buffer[0 .. 7 + text.len], &capture);
                         self.frame.cells[self.frame.found] = .{ .boolean = rows != 0 };
                         self.frame.row_count = rows;

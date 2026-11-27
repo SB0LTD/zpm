@@ -12883,9 +12883,9 @@ pub fn Database(comptime config: Config) type {
                     const returned = &outcome.returning;
                     out.rows = if (returned.count != 0) returned.rows else 0;
                     out.count = returned.count;
-                    if (returned.count != 0 and returned.rows != 0) {
+                    if (returned.count != 0 and returned.rows != 0 and !out.rows_only) {
                         for (0..returned.count) |column| {
-                            out.cells[column] = self.workspace.query.cells[returned.base + column];
+                            out.cells[column] = try ownCell(self.workspace.query.cells[returned.base + column]);
                             out.tys[column] = types.typeOfData(returned.types[column]);
                         }
                     }
@@ -12925,10 +12925,10 @@ pub fn Database(comptime config: Config) type {
                 const plan = &plans.items[root];
                 out.rows = list.count;
                 out.count = plan.count;
-                if (list.count != 0) {
+                if (list.count != 0 and !out.rows_only) {
                     const row = X.rowAt(work, list, 0);
                     for (0..plan.count) |column| {
-                        out.cells[column] = row[column];
+                        out.cells[column] = try ownCell(row[column]);
                         out.tys[column] = plan.tys[column];
                     }
                 }
@@ -15601,6 +15601,21 @@ pub fn Database(comptime config: Config) type {
 
         const StagedSource = union(enum) { list: X.List, returned: struct { base: usize, rows: usize } };
 
+        /// A value leaving a nested statement (INTO captures, kept rows)
+        /// must own its bytes. Values up to Config.text_bytes are inline and
+        /// copy with the cell into the routine frame or the kept rows; a
+        /// larger one points into the nested statement's value region, which
+        /// the next statement reuses, and does not fit that bounded storage:
+        /// 54000 (TextCapacity) instead of a value that could change later.
+        fn ownCell(cell: V.Cell) Error!V.Cell {
+            switch (cell) {
+                inline else => |payload| if (@TypeOf(payload) == V.Text) {
+                    if (payload.indirect()) return error.TextCapacity;
+                },
+            }
+            return cell;
+        }
+
         /// Copies a statement's result rows to the top of its free query
         /// workspace (through the free bottom, so no source is overwritten):
         /// the suspended statement's free region after nestedLeave.
@@ -15618,10 +15633,10 @@ pub fn Database(comptime config: Config) type {
             for (0..count) |index| {
                 try self.session.checkpoint();
                 for (0..width) |column| {
-                    work.cells[low + index * width + column] = switch (rows) {
+                    work.cells[low + index * width + column] = try ownCell(switch (rows) {
                         .list => |list| X.rowAt(work, list, index)[column],
                         .returned => |returned| work.cells[returned.base + index * width + column],
-                    };
+                    });
                 }
             }
             const start = top - total;
