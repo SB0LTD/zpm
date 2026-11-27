@@ -1,6 +1,6 @@
 # SQL conformance TDD checkpoint
 
-## Global routine default privileges — 27 November 2026 candidate
+## Global routine default privileges — 27 November 2026
 
 The failing contract reproduced ALTER DEFAULT PRIVILEGES rejecting EXECUTE on
 FUNCTIONS/ROUTINES. Global GRANT/REVOKE now applies to newly created functions
@@ -25,14 +25,23 @@ Creators read the latest committed defaults plus their own preceding commands.
 They do not wait for an unrelated, uncommitted default-ACL edit. Routine creation
 now checks pending changes to its owner role instead of all objects owned by that
 role. A two-transaction contract and a live native comparison cover this path.
-Local Windows Debug passes 968 routine assertions with 264 records replayed;
-the expanded wide-cell checkpoint contract passed 2,510 assertions. CI must still
-qualify Debug/ReleaseSafe on the 4 MiB stack, all 106 PostgreSQL smoke programs,
-and stock PG16/18 archives in both directions before merge.
+Local Windows Debug passed 968 routine assertions with 264 records replayed
+before the final own-transaction regression was added. The expanded wide-cell
+checkpoint contract passed 2,510 assertions. The final Debug/ReleaseSafe contracts
+and 4 MiB stack checks passed in
+[ZPM CI 46001571791](https://github.com/SB0LTD/zpm/actions/runs/46001571791).
+All 106 PostgreSQL smoke programs passed in
+[CI 46001794455](https://github.com/SB0LTD/ramsql/actions/runs/46001794455).
+PG16 and PG18 each passed 48 stock tooling, 10 large-object and 12 file/routine
+checks in [CI 46001792289](https://github.com/SB0LTD/ramsql/actions/runs/46001792289),
+including both archive formats/directions, concurrent template visibility,
+own-transaction rollback and committed/uncommitted default WAL recovery. Each
+artifact report records its binary hash; the stock and inventory jobs compiled
+separately. The broader platform/release matrix is separate.
 
 Per-schema routine defaults, other default-privilege object classes, other routine
 namespaces, broader role semantics and full routine/catalog snapshot parity remain
-open. This candidate does not close the complete privilege family.
+open. This slice does not close the complete privilege family.
 [PostgreSQL 18 default privileges](https://www.postgresql.org/docs/18/sql-alterdefaultprivileges.html)
 
 ## Qualified routine resolution — 27 November 2026

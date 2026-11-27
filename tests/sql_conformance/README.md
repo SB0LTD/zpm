@@ -13,7 +13,7 @@ require their own versioned native oracles. See the
 
 The November 1 counts and table entries are historical, not current feature
 absence claims. Subsequent semantic slices and their evidence are recorded in
-the TDD checkpoint. [CI 45929457438](https://github.com/SB0LTD/ramsql/actions/runs/45929457438)
+the TDD checkpoint. [CI 46001794455](https://github.com/SB0LTD/ramsql/actions/runs/46001794455)
 passes all 106 PostgreSQL smoke programs on frozen PostgreSQL 18.3, including
 COPY, database, two-phase and maintenance scopes. The database case uses the
 documented cluster profile, not the default single-database profile.
