@@ -1315,6 +1315,12 @@ pub fn Database(comptime config: Config) type {
         /// the routine hook) unless the routine returns a set or a record.
         fn inlineBody(routine: *const RC.Routine) ?[]const u8 {
             if (routine.language != 0 or routine.security_definer or routine.setting_count != 0 or routine.kind != 'f') return null;
+            // A volatile body runs as nested statements (B11 wave 4): each
+            // takes a new snapshot and command id, which an inlined plan
+            // under the caller's snapshot would not (PostgreSQL inlines
+            // neither volatile set-returning functions nor scalar bodies
+            // that read tables).
+            if (routine.volatility == 'v') return null;
             const text = routine.body.slice();
             var statements: R.Statements = .{ .source = text };
             const span = (statements.next() catch return null) orelse return null;
@@ -2079,6 +2085,9 @@ pub fn Database(comptime config: Config) type {
         routine_volatility: u8 = 0,
         /// PostgreSQL's errdetail of the last view error (lastErrorDetail).
         error_detail: []const u8 = "",
+        /// A RETURN QUERY / set-returning SQL body asks the next routine
+        /// statement to keep all its rows (consumed by that statement).
+        row_staging: ?*RowStaging = null,
         /// Relations whose rule actions are running ((oid << 8) | event):
         /// an action reaching one again is PostgreSQL's infinite recursion
         /// in rules (42P17).
@@ -12765,6 +12774,10 @@ pub fn Database(comptime config: Config) type {
             const nested = self.routine_nested != 0;
             const read_only = self.routine_volatility == 's' or self.routine_volatility == 'i';
             const kind = R.classify(text);
+            // A row request belongs to this statement, not to statements
+            // nested deeper inside it.
+            const staging = self.row_staging;
+            self.row_staging = null;
             // Inside a running statement only queries, data changes, CALL
             // and DO run (DDL there is outside the subset).
             if (nested) if (kind) |which| if (which != .call and which != .do_block) return error.UnsupportedStatement;
@@ -12817,7 +12830,7 @@ pub fn Database(comptime config: Config) type {
             };
             frame.variables.node_low = 0;
             frame.variables.node_high = self.workspace.nodes.len;
-            const rows = try self.subStatement(slot, text, &parsed, snap, capture, read_only);
+            const rows = try self.subStatement(slot, text, &parsed, snap, capture, read_only, staging);
             try self.deferredCheck(slot, start, true);
             return rows;
         }
@@ -12843,7 +12856,7 @@ pub fn Database(comptime config: Config) type {
             return .{ .csn = csn, .slot = slot, .epoch = tx.epoch, .cid = cid };
         }
 
-        fn subStatement(self: *Self, slot: u16, text: []const u8, parsed: *A.Statement, snap: Snapshot, capture: ?*R.Capture, read_only: bool) Error!usize {
+        fn subStatement(self: *Self, slot: u16, text: []const u8, parsed: *A.Statement, snap: Snapshot, capture: ?*R.Capture, read_only: bool, staging: ?*RowStaging) Error!usize {
             if (parsed.* == .select) {
                 const top = parsed.select;
                 parsed.* = .{ .query = top };
@@ -12859,6 +12872,13 @@ pub fn Database(comptime config: Config) type {
                 const result = self.routine_result orelse return error.UnsupportedStatement;
                 try self.body(slot, text, parsed, snap, result, .{ .mode = .standard });
                 const outcome = self.outcome;
+                if (staging) |out| {
+                    const returned = &outcome.returning;
+                    if (returned.count == 0) return error.UnsupportedStatement;
+                    var tys: [config.columns]types.Type = undefined;
+                    for (0..returned.count) |column| tys[column] = types.typeOfData(returned.types[column]);
+                    try self.stageRows(.{ .returned = .{ .base = returned.base, .rows = returned.rows } }, returned.count, tys[0..returned.count], out);
+                }
                 if (capture) |out| {
                     const returned = &outcome.returning;
                     out.rows = if (returned.count != 0) returned.rows else 0;
@@ -12900,6 +12920,7 @@ pub fn Database(comptime config: Config) type {
             }
             const work = &self.workspace.query;
             const list = try X.queryRows(&self.tables, source, &self.workspace.nodes, plans, root, snap, &self.session, work);
+            if (staging) |out| try self.stageRows(.{ .list = list }, plans.items[root].count, plans.items[root].tys[0..plans.items[root].count], out);
             if (capture) |out| {
                 const plan = &plans.items[root];
                 out.rows = list.count;
@@ -13995,6 +14016,9 @@ pub fn Database(comptime config: Config) type {
             var scope: RoutineScope = .{};
             try self.enterScope(routine, &scope);
             defer self.leaveScope(&scope);
+            const saved_volatility = self.routine_volatility;
+            defer self.routine_volatility = saved_volatility;
+            self.routine_volatility = routine.volatility;
             var frame: R.Frame = .{};
             try routineFrame(&frame, routine);
             for (args[0..count], 0..) |cell, position| frame.cells[position] = cell;
@@ -14011,19 +14035,34 @@ pub fn Database(comptime config: Config) type {
                 } else row[0] = interpreter.result;
                 return emit(sink, &row);
             }
-            // SQL: one `SELECT expression, ...` (other bodies are inlined).
+            // SQL: one `SELECT expression, ...`; other bodies that are not
+            // inlined run their statements nested (B11 wave 4).
+            const columns: usize = if (routine.out_count != 0) routine.out_count else 1;
             var statements: R.Statements = .{ .source = text_body };
-            const span = (try statements.next()) orelse return error.UnsupportedStatement;
-            if ((try statements.next()) != null) return error.UnsupportedStatement;
             const pool = &self.workspace.nodes;
             const mark = poolMark(pool);
             defer poolRestore(pool, mark);
-            const query_index = P.parseQueryAt(text_body, span.start, span.end, pool) catch return error.UnsupportedStatement;
-            const q = &pool.queries[query_index];
-            const columns: usize = if (routine.out_count != 0) routine.out_count else 1;
-            if (q.count != columns or q.item_count != 0 or q.from != null or q.where != ast.none or q.group_count != 0 or
-                q.having != ast.none or q.order_count != 0 or q.limit_present or q.offset_present or q.set_op != .none or q.cte_count != 0 or
-                q.distinct or q.values != ast.none or q.window_defs != ast.none or q.grouping_sets != ast.none) return error.UnsupportedStatement;
+            const simple = simple: {
+                const span = (try statements.next()) orelse break :simple null;
+                if ((try statements.next()) != null) break :simple null;
+                const query_index = P.parseQueryAt(text_body, span.start, span.end, pool) catch break :simple null;
+                const q = &pool.queries[query_index];
+                if (routine.retset or q.count != columns or q.item_count != 0 or q.from != null or q.where != ast.none or q.group_count != 0 or
+                    q.having != ast.none or q.order_count != 0 or q.limit_present or q.offset_present or q.set_op != .none or q.cte_count != 0 or
+                    q.distinct or q.values != ast.none or q.window_defs != ast.none or q.grouping_sets != ast.none) break :simple null;
+                for (pool.nodes[mark.len..pool.len]) |*n| switch (n.kind) {
+                    .scalar_subquery, .exists_subquery, .in_subquery => break :simple null,
+                    else => {},
+                };
+                break :simple q;
+            };
+            const q = simple orelse {
+                poolRestore(pool, mark);
+                var result_columns: [config.columns]V.Column = undefined;
+                if (columns > config.columns) return error.ColumnCapacity;
+                for (0..columns) |column| result_columns[column] = if (routine.out_count != 0) columnOfOid(routine.out_oids[column], routine.out_typmods[column]) else result_column;
+                return self.sqlFunctionRows(&frame, text_body, result_columns[0..columns], routine.retset, .{ .ptr = sink, .call = emit });
+            };
             for (0..columns) |column| {
                 if (q.targets[column].star) return error.UnsupportedStatement;
                 const target_column = if (routine.out_count != 0) columnOfOid(routine.out_oids[column], routine.out_typmods[column]) else result_column;
@@ -15545,6 +15584,139 @@ pub fn Database(comptime config: Config) type {
             if (view_where == ast.none) return where;
             if (where == ast.none) return view_where;
             return self.workspace.nodes.add(.{ .kind = .and_op, .a = view_where, .b = where });
+        }
+
+        // ---- rows of a routine statement (RETURN QUERY, SQL set bodies) ------
+
+        /// The rows a routine statement kept for its caller: `rows` rows of
+        /// `width` cells at `start` in the query workspace's free region,
+        /// right below the saved state of the statement that called it.
+        pub const RowStaging = struct {
+            done: bool = false,
+            start: usize = 0,
+            rows: usize = 0,
+            width: usize = 0,
+            tys: [config.columns]types.Type = @splat(.unknown),
+        };
+
+        const StagedSource = union(enum) { list: X.List, returned: struct { base: usize, rows: usize } };
+
+        /// Copies a statement's result rows to the top of its free query
+        /// workspace (through the free bottom, so no source is overwritten):
+        /// the suspended statement's free region after nestedLeave.
+        fn stageRows(self: *Self, rows: StagedSource, width: usize, tys: []const types.Type, out: *RowStaging) Error!void {
+            const work = &self.workspace.query;
+            const count: usize = switch (rows) {
+                .list => |list| list.count,
+                .returned => |returned| returned.rows,
+            };
+            if (width > config.columns) return error.ColumnCapacity;
+            const total = count * width;
+            const top = work.cells.len - work.top_cells - work.pinned_cells;
+            if (work.cell_high < work.cell_low or work.cell_high - work.cell_low < total or top < work.cell_low + total) return error.WorkspaceCapacity;
+            const low = work.cell_low;
+            for (0..count) |index| {
+                try self.session.checkpoint();
+                for (0..width) |column| {
+                    work.cells[low + index * width + column] = switch (rows) {
+                        .list => |list| X.rowAt(work, list, index)[column],
+                        .returned => |returned| work.cells[returned.base + index * width + column],
+                    };
+                }
+            }
+            const start = top - total;
+            var at = total;
+            while (at > 0) {
+                at -= 1;
+                work.cells[start + at] = work.cells[low + at];
+            }
+            out.* = .{ .done = true, .start = start, .rows = count, .width = width };
+            @memcpy(out.tys[0..width], tys);
+        }
+
+        /// RETURN QUERY (and the final statement of a set-returning SQL
+        /// body): the statement runs nested, its rows are kept, then emitted
+        /// one by one as rows of the function, each column of the result
+        /// type (PostgreSQL: 42804 when the query's structure differs).
+        pub fn routineReturnQuery(self: *Self, frame: *R.Frame, text: []const u8, sink: R.Emit, columns: []const V.Column) Error!usize {
+            var staged: RowStaging = .{};
+            const saved = self.row_staging;
+            defer self.row_staging = saved;
+            self.row_staging = &staged;
+            _ = try self.routineStatement(frame, text, null);
+            if (!staged.done) return error.UnsupportedStatement;
+            if (staged.width != columns.len) return error.TypeMismatch;
+            for (columns, staged.tys[0..staged.width]) |column, from| {
+                if (from != .unknown and from != types.typeOfData(column.data_type)) return error.TypeMismatch;
+            }
+            return self.emitStaged(&staged, sink, columns);
+        }
+
+        /// Emits kept rows through a function's row sink. The rows move to
+        /// the top of the free region first, which stays reserved while the
+        /// sink appends below it.
+        fn emitStaged(self: *Self, staged: *const RowStaging, sink: R.Emit, columns: []const V.Column) Error!usize {
+            const work = &self.workspace.query;
+            const width = staged.width;
+            const total = staged.rows * width;
+            if (staged.rows == 0) return 0;
+            if (work.cell_high < staged.start + total or work.cell_high - total < work.cell_low) return error.WorkspaceCapacity;
+            const start = work.cell_high - total;
+            var at = total;
+            while (at > 0) {
+                at -= 1;
+                work.cells[start + at] = work.cells[staged.start + at];
+            }
+            const saved_high = work.cell_high;
+            defer work.cell_high = saved_high;
+            work.cell_high = start;
+            var row: [config.columns]V.Cell = undefined;
+            for (0..staged.rows) |index| {
+                try self.session.checkpoint();
+                for (columns, 0..) |*column, position| {
+                    var cell = work.cells[start + index * width + position];
+                    if (cell != .null_value and staged.tys[position] == .unknown) cell = try E.cast(cell, .text, types.typeOfData(column.data_type), column.typmod, &self.session);
+                    row[position] = try D.store(column, cell, &self.session);
+                }
+                try sink.call(sink.ptr, &row);
+            }
+            return staged.rows;
+        }
+
+        /// A SQL body that is not inlined, called in FROM: every statement
+        /// runs nested; a set-returning body emits every row of its final
+        /// statement (a query or a RETURNING), another one the first row
+        /// (a row of NULLs without one).
+        fn sqlFunctionRows(self: *Self, frame: *R.Frame, text_body: []const u8, columns: []const V.Column, retset: bool, sink: R.Emit) Error!void {
+            var statements: R.Statements = .{ .source = text_body };
+            var pending: ?R.Span = null;
+            while (try statements.next()) |span| {
+                if (pending) |earlier| {
+                    try self.session.checkpoint();
+                    _ = try self.routineStatement(frame, text_body[earlier.start..earlier.end], null);
+                }
+                pending = span;
+            }
+            const last = pending orelse return error.InvalidFunctionDefinition;
+            const text = text_body[last.start..last.end];
+            if (retset) {
+                _ = try self.routineReturnQuery(frame, text, sink, columns);
+                return;
+            }
+            var capture: R.Capture = .{};
+            _ = try self.routineStatement(frame, text, &capture);
+            var row: [config.columns]V.Cell = @splat(.null_value);
+            if (capture.rows != 0) {
+                if (capture.count != columns.len) return error.TypeMismatch;
+                for (columns, 0..) |*column, position| {
+                    var cell = capture.cells[position];
+                    const from = capture.tys[position];
+                    const to = types.typeOfData(column.data_type);
+                    if (cell != .null_value and from != to) cell = try E.cast(cell, if (from == .unknown) .text else from, to, column.typmod, &self.session);
+                    row[position] = try D.store(column, cell, &self.session);
+                }
+            }
+            try sink.call(sink.ptr, &row);
         }
 
         // ---- nested statements (B11 wave 4, sql/nested.sig) -----------------

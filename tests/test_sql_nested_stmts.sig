@@ -788,6 +788,45 @@ fn ruleRecords() !void {
     try idle();
 }
 
+// ---- set-returning bodies (routines-sig hand-off) --------------------------------
+
+/// RETURN QUERY, set-returning and OUT-parameter SQL bodies that are not
+/// inlined, data-modifying and multi-statement bodies, CALL from a
+/// function and `RETURN (SELECT ...)` run through nested statements.
+fn routineRows() !void {
+    reset();
+    try run("CREATE TABLE tc (v INT)");
+    try run("INSERT INTO tc VALUES (400)");
+    try run("CREATE FUNCTION evq(n INT) RETURNS SETOF INT LANGUAGE plpgsql AS $$BEGIN RETURN QUERY SELECT i FROM generate_series(1, n) i; END$$");
+    try returns("SELECT * FROM evq(3)", "1;2;3");
+    try run("CREATE FUNCTION sqlmulti(a INT) RETURNS INT LANGUAGE sql AS $$SELECT 1; SELECT a + 1$$");
+    try returns("SELECT sqlmulti(1)", "2");
+    try run("CREATE FUNCTION upd() RETURNS INT LANGUAGE sql AS $$UPDATE tc SET v = v + 1 RETURNING v$$");
+    try returns("SELECT upd()", "401");
+    try run("CREATE FUNCTION rq2(n INT) RETURNS SETOF INT LANGUAGE plpgsql AS $$BEGIN RETURN QUERY SELECT v FROM tc; RETURN QUERY SELECT n; RETURN NEXT 7; END$$");
+    try returns("SELECT * FROM rq2(9)", "401;9;7");
+    // The query's structure must match the result (42804).
+    try run("CREATE FUNCTION rqbad() RETURNS SETOF BIGINT LANGUAGE plpgsql AS $$BEGIN RETURN QUERY SELECT 1; END$$");
+    try fails("SELECT * FROM rqbad()", error.TypeMismatch);
+    try run("CREATE FUNCTION rqtab() RETURNS TABLE (a INT, b TEXT) LANGUAGE plpgsql AS $$BEGIN RETURN QUERY SELECT v, v::text FROM tc; END$$");
+    try returns("SELECT * FROM rqtab()", "401|401");
+    try run("CREATE FUNCTION ins_ret(x INT) RETURNS SETOF INT LANGUAGE sql AS $$INSERT INTO tc VALUES (x), (x + 1) RETURNING v$$");
+    try returns("SELECT * FROM ins_ret(10)", "10;11");
+    try run("CREATE FUNCTION two(x INT, OUT a INT, OUT b INT) LANGUAGE sql AS $$INSERT INTO tc VALUES (x); SELECT x, x * 2$$");
+    try returns("SELECT * FROM two(5)", "5|10");
+    try run("CREATE PROCEDURE p(x INT) LANGUAGE sql AS $$INSERT INTO tc VALUES (x)$$");
+    try run("CREATE FUNCTION callp() RETURNS INT LANGUAGE plpgsql AS $$BEGIN CALL p(77); RETURN 1; END$$");
+    try returns("SELECT callp()", "1");
+    try run("CREATE FUNCTION rs() RETURNS BIGINT LANGUAGE plpgsql AS $$BEGIN RETURN (SELECT count(*) FROM tc); END$$");
+    try returns("SELECT rs()", "5");
+    try expect("SELECT v FROM tc ORDER BY v", "5;10;11;77;401");
+    // A failing row source undoes the whole statement.
+    try run("CREATE FUNCTION ins_bad(x INT) RETURNS SETOF INT LANGUAGE sql AS $$INSERT INTO tc VALUES (x) RETURNING v / 0$$");
+    try rejects("SELECT * FROM ins_bad(1)", error.DivisionByZero, "SELECT count(*) FROM tc", "5");
+    try sameState(&.{"SELECT v FROM tc ORDER BY v"});
+    try idle();
+}
+
 pub fn main() !void {
     try triggerStatements();
     try functionStatements();
@@ -800,5 +839,6 @@ pub fn main() !void {
     try updatableViews();
     try ruleActions();
     try ruleRecords();
+    try routineRows();
     std.debug.print("nested statements: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });
 }

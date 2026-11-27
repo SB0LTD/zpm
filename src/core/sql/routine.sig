@@ -2266,9 +2266,8 @@ pub fn Routines(comptime config: types.Config) type {
                     return .normal;
                 }
 
-                /// RETURN QUERY runs a query inside the running statement:
-                /// checked at CREATE, 0A000 when run (nested statement
-                /// execution is not available to functions here).
+                /// RETURN QUERY runs a query inside the running statement as a
+                /// nested statement and adds its rows (B11 wave 4).
                 noinline fn returnQuery(self: *Self, mode: Mode) Error!Signal {
                     const c = &self.cursor;
                     try c.expect("query");
@@ -2287,7 +2286,23 @@ pub fn Routines(comptime config: types.Config) type {
                     try c.expectSymbol(.semicolon);
                     switch (mode) {
                         .check => try self.host.routineCheckStatement(self.source[begin..end]),
-                        .run => return error.UnsupportedStatement,
+                        .run => {
+                            // The query runs as a nested statement (B11
+                            // wave 4); its rows become rows of the function.
+                            const sink = self.rows orelse return error.UnsupportedStatement;
+                            var columns: [config.routine_args]V.Column = undefined;
+                            var count: usize = 1;
+                            if (self.output_count != 0) {
+                                count = self.output_count;
+                                for (self.outputs[0..count], 0..) |variable, column| {
+                                    const item = &self.frame.variables.items[variable];
+                                    columns[column] = columnOf(item.ty, item.typmod);
+                                }
+                            } else columns[0] = self.return_column;
+                            const rows = try self.host.routineReturnQuery(self.frame, self.source[begin..end], sink, columns[0..count]);
+                            self.frame.row_count = rows;
+                            self.frame.cells[self.frame.found] = .{ .boolean = rows != 0 };
+                        },
                         .skip => {},
                     }
                     return .normal;

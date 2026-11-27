@@ -364,7 +364,13 @@ pub fn Eval(comptime config: types.Config) type {
                 // correlated scalar subquery over the arguments' frame.
                 const prepare = hook.prepare orelse return error.UnsupportedStatement;
                 if (!try prepare(hook.ptr, @intCast(n.integer), &args, count, defaulted)) return .null_value;
-                const run = ctx.hook orelse return error.UnsupportedStatement;
+                // Without a subquery runner (the row paths of INSERT /
+                // UPDATE / DELETE) the body runs as nested statements under
+                // the same snapshot rules (B11 wave 4).
+                const run = ctx.hook orelse {
+                    try hook.call(hook.ptr, @intCast(n.integer), &args, count, &out);
+                    return out;
+                };
                 const frame: Frame = .{ .cells = &args, .count = count };
                 var inner = ctx.*;
                 inner.frame = &frame;

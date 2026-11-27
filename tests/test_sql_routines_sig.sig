@@ -558,15 +558,15 @@ fn setFunctions() !void {
     try fails("CREATE FUNCTION bad3(OUT a INT) RETURNS SETOF INT LANGUAGE plpgsql AS $$BEGIN RETURN NEXT 1; END$$", error.TypeMismatch);
     try fails("CREATE FUNCTION bad4() RETURNS SETOF INT LANGUAGE plpgsql AS $$BEGIN RETURN NEXT; END$$", error.Syntax);
     // Not here (0A000): set-returning calls in the target list
-    // (ProjectSet), RETURN QUERY, multi-statement and data-modifying
-    // bodies called from an expression (nested statement execution).
+    // (ProjectSet). RETURN QUERY, multi-statement and data-modifying
+    // bodies run as nested statements (contract-sql-nested-stmts).
     try fails("SELECT names(20)", error.UnsupportedStatement);
     try run("CREATE FUNCTION evq(n INT) RETURNS SETOF INT LANGUAGE plpgsql AS $$BEGIN RETURN QUERY SELECT g FROM generate_series(1, n) g; END$$");
-    try fails("SELECT * FROM evq(3)", error.UnsupportedStatement);
+    try expect("SELECT * FROM evq(3)", "1;2;3");
     try run("CREATE FUNCTION sqlmulti(a INT) RETURNS INT LANGUAGE sql AS 'SELECT 1; SELECT a + 1'");
-    try fails("SELECT sqlmulti(1)", error.UnsupportedStatement);
+    try expect("SELECT sqlmulti(1)", "2");
     try run("CREATE FUNCTION upd() RETURNS INT LANGUAGE sql AS 'UPDATE items SET price = price RETURNING 1'");
-    try fails("SELECT upd()", error.UnsupportedStatement);
+    try runRows("SELECT upd()", "1");
     // An inlined body reads with the caller's privileges.
     try run("CREATE FUNCTION peek_secret() RETURNS INT LANGUAGE sql AS 'SELECT v FROM secret'");
     try run("SET ROLE alice");
