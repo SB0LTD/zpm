@@ -988,6 +988,11 @@ fn relationRestrictions() !void {
     try check(equal(out.rows[0].cells[0].text.slice(), "view, foreign-table"));
     if (limited.execute("SET restrict_nonsystem_relation_kind = 'view, bogus'", &out)) |_| return error.UnknownRelationKindAccepted else |err| try check(err == error.InvalidSettingValue);
     if (limited.execute("INSERT INTO restricted_v VALUES (32)", &out)) |_| return error.UnsafeViewWrite else |err| try check(err == error.RestrictedNonSystemView);
+    // Writes through an automatically updatable view are restricted too.
+    if (limited.execute("UPDATE restricted_v SET id = 33", &out)) |_| return error.UnsafeViewWrite else |err| try check(err == error.RestrictedNonSystemView);
+    if (limited.execute("DELETE FROM restricted_v", &out)) |_| return error.UnsafeViewWrite else |err| try check(err == error.RestrictedNonSystemView);
+    try other.execute("SELECT count(*) FROM restriction_base", &out);
+    try check(out.rows[0].cells[0].integer == 1);
     try limited.execute("SELECT count(*) FROM pg_catalog.pg_views WHERE viewname = 'restricted_v'", &out);
     try check(out.row_count == 1 and out.rows[0].cells[0].integer == 1);
     try limited.execute("DROP VIEW restricted_v", &out);
