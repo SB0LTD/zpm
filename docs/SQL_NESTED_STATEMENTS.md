@@ -90,6 +90,29 @@ PL/pgSQL function called from an expression, or a rule action
   collected.
 - `TG_ARGV` is a `text[]` indexed from 0 (`[0:n-1]={...}`), NULL without
   arguments, as in PostgreSQL.
+- **RETURN QUERY** runs its query as a nested statement and adds the rows
+  to the function's result. The query's columns must match the result
+  row's count and types: 42804, PostgreSQL's "structure of query does not
+  match function result type". FOUND and ROW_COUNT are set.
+  `Database.routineReturnQuery` keeps a statement's rows for its caller
+  (`RowStaging`) at the top of the free query workspace, then emits them
+  through the function's row sink.
+- **SQL bodies that are not inlined.** These are data-modifying bodies,
+  bodies with several statements, and volatile bodies. A volatile body is
+  never inlined, so each of its statements takes a new snapshot, as
+  PostgreSQL does: it inlines neither volatile set-returning functions nor
+  scalar bodies that read tables.
+  - From an expression, the body's first row is the value.
+  - From FROM, a set-returning body emits every row of its final query or
+    RETURNING. Any other body emits its first row: the OUT parameters, or
+    a row of NULLs without one.
+  - An inlined body evaluated where no subquery runner exists (the row
+    paths of INSERT / UPDATE / DELETE) runs nested instead.
+- CALL inside a function and `RETURN (SELECT ...)` work. COMMIT / ROLLBACK
+  in a procedure (`routineTransaction`) stay 0A000. Committing in the
+  middle of a CALL needs a change record per partial transaction, which
+  the store's protocol does not offer. That is not part of nested
+  statement execution.
 
 ## Views as INSERT / UPDATE / DELETE targets
 
