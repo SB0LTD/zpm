@@ -67,8 +67,11 @@ pub fn save(directory: []const u8, name: []const u8, data: []const u8) Error!voi
     if (fsync(dir_fd) != 0) return error.Io;
 }
 pub fn removeJournal(directory: []const u8) Error!void {
+    return remove(directory, "ledger-pending.bin");
+}
+pub fn remove(directory: []const u8, name: []const u8) Error!void {
     var buffer: [512]u8 = undefined;
-    const filename = try path(directory, "ledger-pending.bin", &buffer);
+    const filename = try path(directory, name, &buffer);
     if (unlink(filename) != 0 and __errno().* != 2) return error.Io;
 }
 pub fn seed(directory: []const u8, output: *[32]u8) Error!void {

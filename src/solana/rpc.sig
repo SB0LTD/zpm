@@ -50,11 +50,21 @@ pub fn API(comptime Transport: type) type {
             return result;
         }
         pub fn submit(buffers: *Buffers, packet: []const u8, expected_signature: *const [64]u8) !void {
+            return submitPolicy(buffers, packet, expected_signature, false);
+        }
+        /// Relay an already authenticated signed packet. Native rejection becomes
+        /// a finalized failed receipt rather than an ambiguous preflight outcome.
+        pub fn submitUnchecked(buffers: *Buffers, packet: []const u8, expected_signature: *const [64]u8) !void {
+            return submitPolicy(buffers, packet, expected_signature, true);
+        }
+        fn submitPolicy(buffers: *Buffers, packet: []const u8, expected_signature: *const [64]u8, unchecked: bool) !void {
             const size = std.base64.standard.Encoder.calcSize(packet.len);
             if (size > buffers.encoded.len) return error.Capacity;
             const encoded = std.base64.standard.Encoder.encode(&buffers.encoded, packet);
             var params: [2048]u8 = undefined;
-            const args = std.fmt.bufPrint(&params, "[\"{s}\",{{\"encoding\":\"base64\",\"preflightCommitment\":\"confirmed\",\"maxRetries\":3}}]", .{encoded}) catch return error.Capacity;
+            const args = if (unchecked)
+                std.fmt.bufPrint(&params, "[\"{s}\",{{\"encoding\":\"base64\",\"skipPreflight\":true,\"maxRetries\":3}}]", .{encoded}) catch return error.Capacity
+            else std.fmt.bufPrint(&params, "[\"{s}\",{{\"encoding\":\"base64\",\"preflightCommitment\":\"confirmed\",\"maxRetries\":3}}]", .{encoded}) catch return error.Capacity;
             const result = try json.string(try call(buffers, "sendTransaction", args));
             var decoded: [64]u8 = undefined;
             const len = base58.decode(result, &decoded) catch return error.InvalidEncoding;

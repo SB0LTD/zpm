@@ -10,6 +10,13 @@
 
 const std = @import("std");
 const testing = std.testing;
+const durable_sources = @import("build_embed");
+test "durable history allocation and core layer boundaries" {
+    inline for (.{ durable_sources.mesh_history, durable_sources.mesh_sync, durable_sources.mesh_file, durable_sources.fixed_journal }) |source| try testing.expectEqual(@as(usize, 0), scanSource("durable mesh", source));
+    inline for (.{ durable_sources.mesh_history, durable_sources.mesh_sync }) |source| {
+        inline for (.{ "win32", "conn", "mesh_network", "mesh_file", "fixed_journal" }) |name| try testing.expect(std.mem.indexOf(u8, source, "@import(\"" ++ name ++ "\")") == null);
+    }
+}
 
 const forbidden_patterns = [_][]const u8{
     "Allocator",
@@ -69,6 +76,10 @@ fn scanSource(name: []const u8, content: []const u8) usize {
 
 test "no allocator usage — udp.sig" {
     try testing.expectEqual(@as(usize, 0), scanSource("udp.sig", @embedFile("udp.sig")));
+}
+test "no allocator usage — mesh network" {
+    try testing.expectEqual(@as(usize, 0), scanSource("mesh_network.sig", @embedFile("mesh_network.sig")));
+    try testing.expectEqual(@as(usize, 0), scanSource("mesh_transport.sig", @embedFile("mesh_transport.sig")));
 }
 
 test "no allocator usage — packet.sig" {

@@ -17,7 +17,7 @@ pub const max_ranges: u8 = 32;  // handles heavily fragmented streams
 const std = @import("std");
 
 fn writeStdout(msg: []const u8) void {
-    _ = std.os.linux.write(1, msg.ptr, msg.len);
+    _ = msg;
 }
 
 fn writeHexU16(val: u16) void {

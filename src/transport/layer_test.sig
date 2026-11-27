@@ -25,6 +25,8 @@ const testing = std.testing;
 // ── Module sources loaded at comptime via @embedFile ──
 
 const modules = .{
+    .{ "mesh_network.sig", @embedFile("mesh_network.sig") },
+    .{ "mesh_transport.sig", @embedFile("mesh_transport.sig") },
     .{ "udp.sig", @embedFile("udp.sig") },
     .{ "packet.sig", @embedFile("packet.sig") },
     .{ "crypto.sig", @embedFile("crypto.sig") },
@@ -50,6 +52,8 @@ const allowed_imports = [_][]const u8{
     "math",
     "json",
     "core",
+    "mesh_overlay",
+    "mesh_transport",
     // Layer 1 (platform)
     "win32",
     "crypto",

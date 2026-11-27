@@ -21,6 +21,15 @@ pub const OfficialPackage = struct {
 };
 
 pub const packages = [_]OfficialPackage{
+    .{ .scope = "zpm", .name = "mesh-history", .version = "0.1.0", .layer = 0, .platform = .any, .system_libraries = &.{}, .zpm_dependencies = &.{}, .description = "Signed bounded event chains, checkpoint compaction and atomic cursor/state images", .source = "src/core/mesh_history.sig" },
+    .{ .scope = "zpm", .name = "mesh-sync", .version = "0.1.0", .layer = 0, .platform = .any, .system_libraries = &.{}, .zpm_dependencies = &.{"mesh-history"}, .description = "Bounded gap detection and signed snapshot catch-up protocol", .source = "src/core/mesh_sync.sig" },
+    .{ .scope = "zpm", .name = "fixed-journal", .version = "0.1.0", .layer = 1, .platform = .windows, .system_libraries = &.{"kernel32"}, .zpm_dependencies = &.{"win32"}, .description = "Bounded atomic flushed file replacement", .source = "src/platform/fixed_journal.sig" },
+    .{ .scope = "zpm", .name = "mesh-file", .version = "0.1.0", .layer = 1, .platform = .windows, .system_libraries = &.{"kernel32"}, .zpm_dependencies = &.{"fixed-journal"}, .description = "Atomic file backend for durable mesh streams", .source = "src/platform/mesh_file.sig" },
+    .{ .scope = "zpm", .name = "mesh-overlay", .version = "0.1.0", .layer = 0, .platform = .any, .system_libraries = &.{}, .zpm_dependencies = &.{}, .description = "Bounded signed membership, replay windows and opaque gossip cache", .source = "src/core/mesh_overlay.sig" },
+    .{ .scope = "zpm", .name = "tls13", .version = "0.1.0", .layer = 1, .platform = .any, .system_libraries = &.{}, .zpm_dependencies = &.{}, .description = "Pure Sig TLS 1.3 handshake engine", .source = "src/transport/tls13.sig" },
+    .{ .scope = "zpm", .name = "crypto-stream", .version = "0.1.0", .layer = 1, .platform = .any, .system_libraries = &.{}, .zpm_dependencies = &.{}, .description = "Bounded QUIC CRYPTO stream reassembly", .source = "src/transport/crypto_stream.sig" },
+    .{ .scope = "zpm", .name = "mesh-transport", .version = "0.1.0", .layer = 1, .platform = .windows, .system_libraries = &.{ "ws2_32", "bcrypt", "secur32", "kernel32" }, .zpm_dependencies = &.{ "conn", "streams", "datagram", "packet", "win32" }, .description = "Pinned channel-bound peer authentication over QUIC", .source = "src/transport/mesh_transport.sig" },
+    .{ .scope = "zpm", .name = "mesh-network", .version = "0.1.0", .layer = 1, .platform = .windows, .system_libraries = &.{ "ws2_32", "bcrypt", "secur32", "kernel32" }, .zpm_dependencies = &.{ "mesh-overlay", "mesh-transport", "conn", "streams", "udp", "win32" }, .description = "Bounded multi-peer discovery, QUIC connection pool and gossip routing", .source = "src/transport/mesh_network.sig" },
     // ── Layer 0: Core ──
     .{
         .scope = "zpm",
@@ -273,7 +282,7 @@ pub const packages = [_]OfficialPackage{
         .layer = 1,
         .platform = .windows,
         .system_libraries = &.{ "bcrypt", "secur32", "kernel32" },
-        .zpm_dependencies = &.{ "win32", "packet", "crypto" },
+        .zpm_dependencies = &.{ "win32", "packet", "crypto", "tls13" },
         .description = "TLS 1.3 integration and packet protection (RFC 9001)",
         .source = "src/transport/crypto.sig",
     },
@@ -339,7 +348,7 @@ pub const packages = [_]OfficialPackage{
         .layer = 1,
         .platform = .windows,
         .system_libraries = &.{ "ws2_32", "bcrypt", "secur32", "kernel32" },
-        .zpm_dependencies = &.{ "win32", "packet", "transport-crypto", "recovery", "streams", "datagram", "telemetry", "udp" },
+        .zpm_dependencies = &.{ "win32", "packet", "transport-crypto", "recovery", "streams", "datagram", "telemetry", "udp", "crypto-stream" },
         .description = "QUIC connection state machine (RFC 9000)",
         .source = "src/transport/conn.sig",
     },
@@ -470,7 +479,7 @@ fn eql(a: []const u8, b: []const u8) bool {
 const testing = @import("std").testing;
 
 test "official_packages: expected package count" {
-    try testing.expectEqual(@as(usize, 36), package_count);
+    try testing.expectEqual(@as(usize, 45), package_count);
 }
 
 test "official_packages: layer 0 packages have no platform dependencies" {
@@ -483,7 +492,7 @@ test "official_packages: layer 0 packages have no platform dependencies" {
 }
 
 test "official_packages: layer 0 includes portable AI foundations" {
-    try testing.expectEqual(@as(usize, 6), layer_0_count);
+    try testing.expectEqual(@as(usize, 9), layer_0_count);
     try testing.expect(findByName("ai-core") != null);
 }
 

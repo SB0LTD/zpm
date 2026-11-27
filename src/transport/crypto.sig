@@ -73,6 +73,7 @@ pub const HandshakeResult = struct {
 // ── TLS Engine ──
 
 pub const TlsEngine = struct {
+    last_error: tls13.HandshakeError = .none,
     // Handshake state machine
     state: State = .idle,
 
@@ -165,6 +166,7 @@ pub const TlsEngine = struct {
         var result = HandshakeResult{};
 
         const pr = self.tls13_engine.processMessage(data);
+        self.last_error = pr.err;
         if (pr.err != .none) {
             result.err = .handshake_failed;
             return result;

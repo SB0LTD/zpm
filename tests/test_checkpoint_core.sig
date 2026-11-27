@@ -165,23 +165,48 @@ pub fn main(init: std.process.Init) !void {
             var monsters = [_]game.Monster{.{ .position = .{ .z = 1 }, .hp = 30 }};
             const views: game.ResourceViews = .{ .nodes = nodes[0..], .monsters = monsters[0..] };
             const context: game.Context = .{ .signer = owner, .slot = 1 };
-            const seq_len = nextU64(s) % 5; // includes 0 (empty sequence vacuously settles).
-            var all_settle = true;
-            var j: usize = 0;
-            while (j < seq_len) : (j += 1) {
-                // mix in a guaranteed-conflict (wrong world) or replay (stale nonce) sometimes.
-                const bad = nextU64(s) % 4;
-                var action: game.Action = .{ .world = 1, .nonce = 0, .actor = owner, .kind = .rest };
-                if (bad == 0) action.world = 2; // WrongWorld -> conflict
-                if (bad == 1) action.nonce = 7; // stale/ahead nonce -> replay
-                const verdict = cp.classify(&rules, &player, &views, &action, &context, true);
-                if (verdict != .settle) all_settle = false;
-                _ = &player;
+            _ = &player;
+            var players = [_]game.Player{player};
+            var batch: [2]cp.Transition = .{
+                .{ .player = 0, .action = .{ .world = 1, .nonce = 0, .actor = owner, .kind = .mine }, .context = context, .sig_ok = true },
+                .{ .player = 0, .action = .{ .world = 1, .nonce = 1, .actor = owner, .kind = .rest }, .context = .{ .signer = owner, .slot = 10 }, .sig_ok = true },
+            };
+            const mode = i % 4;
+            if (mode == 1) batch[1].sig_ok = false;
+            if (mode == 2) batch[1].action.nonce = 0;
+            if (mode == 3) batch[1].action.world = 2;
+            const verdict = cp.applyBatch(&rules, &players, &views, &batch);
+            if (mode == 0) {
+                try check(verdict == .settle);
+                try check(players[0].nonce == 2 and players[0].ore == 1 and nodes[0].remaining == 99);
+                try check(players[0].next_slot == 12 and nodes[0].ready_slot == 5);
+            } else {
+                try check(verdict == (if (mode == 1) cp.Verdict.bad_signature else if (mode == 2) cp.Verdict.replay else cp.Verdict.conflict));
+                try check(std.meta.eql(players[0], player));
+                try check(nodes[0].remaining == 100 and nodes[0].ready_slot == 0);
             }
-            if (seq_len == 0) try check(all_settle);
         }
     }
 
+    // Two distinct owners contend for the same node in one ordered working snapshot.
+    {
+        var players = [_]game.Player{ .{ .owner = @splat(1) }, .{ .owner = @splat(2) } };
+        const original = players;
+        var nodes = [_]game.Node{.{ .position = .{ .x = 1 } }};
+        var monsters: [0]game.Monster = .{};
+        const resources: game.ResourceViews = .{ .nodes = &nodes, .monsters = &monsters };
+        var batch = [_]cp.Transition{
+            .{ .player = 0, .action = .{ .world = 1, .nonce = 0, .actor = @splat(1), .kind = .mine }, .context = .{ .signer = @splat(1), .slot = 1 }, .sig_ok = true },
+            .{ .player = 1, .action = .{ .world = 1, .nonce = 0, .actor = @splat(2), .kind = .mine }, .context = .{ .signer = @splat(2), .slot = 1 }, .sig_ok = true },
+        };
+        try check(cp.applyBatch(&rules, &players, &resources, &batch) == .conflict);
+        try check(std.meta.eql(players, original));
+        try check(nodes[0].remaining == 100 and nodes[0].ready_slot == 0);
+        batch[1].context.slot = 5;
+        try check(cp.applyBatch(&rules, &players, &resources, &batch) == .settle);
+        try check(players[0].nonce == 1 and players[1].nonce == 1);
+        try check(players[0].ore == 1 and players[1].ore == 1 and nodes[0].remaining == 98);
+    }
     // Feature: distributed-mmorpg-infrastructure, Property 3 (oversized-view degrade): resource views over the fixed cap classify as conflict for nodes and monsters independently.
     {
         var big_nodes: [cp.game_max_nodes + 1]game.Node = @splat(.{ .position = .{} });

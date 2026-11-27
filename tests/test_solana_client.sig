@@ -14,7 +14,11 @@ fn rejects(expected: anyerror, result: anytype) !void {
 }
 const Mock = struct {
     pub var response: []const u8 = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}";
-    pub fn post(_: []const u8, out: []u8) ![]const u8 {
+    pub var request: [4096]u8 = undefined;
+    pub var request_len: usize = 0;
+    pub fn post(input: []const u8, out: []u8) ![]const u8 {
+        @memcpy(request[0..input.len], input);
+        request_len = input.len;
         @memcpy(out[0..response.len], response);
         return out[0..response.len];
     }
@@ -83,6 +87,22 @@ pub fn main(init: std.process.Init) !void {
     Mock.response = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32002}}";
     try rejects(error.PreflightRejected, Rpc.call(&buffers, "sendTransaction", "[]"));
     try rejects(error.InvalidJson, json.number("01"));
+    var encoded_signature: [88]u8 = undefined;
+    const signature_len = try base58.encode(&signature, &encoded_signature);
+    var response: [192]u8 = undefined;
+    Mock.response = try std.fmt.bufPrint(&response, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"{s}\"}}", .{encoded_signature[0..signature_len]});
+    buffers.next_id = 0;
+    try Rpc.submit(&buffers, packet[0..length], &signature);
+    var options = try json.item(try json.field(Mock.request[0..Mock.request_len], "params"), 1);
+    try check(std.mem.eql(u8, try json.string(try json.field(options, "preflightCommitment")), "confirmed"));
+    try rejects(error.MissingField, json.field(options, "skipPreflight"));
+    buffers.next_id = 0;
+    try Rpc.submitUnchecked(&buffers, packet[0..length], &signature);
+    options = try json.item(try json.field(Mock.request[0..Mock.request_len], "params"), 1);
+    try check(std.mem.eql(u8, try json.field(options, "skipPreflight"), "true"));
+    const wrong_signature: [64]u8 = @splat(5);
+    buffers.next_id = 0;
+    try rejects(error.InvalidResponse, Rpc.submitUnchecked(&buffers, packet[0..length], &wrong_signature));
     var out: [96]u8 = undefined;
     const message = try std.fmt.bufPrint(&out, "Solana client PASS: {d} assertions\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, message);

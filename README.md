@@ -158,6 +158,17 @@ delegate to `sig build` regardless of which naming a project uses.
 
 ## QUIC Transport
 
+The [multi-peer infrastructure](docs/mesh-infrastructure.md) adds bounded signed
+membership, authenticated QUIC connection pools, gossip routing and a synthetic
+fault-testing lab. Run `sig build test-mesh -j1`; use
+`tools/run-mesh-lab.ps1` after `tools/build-mesh-lab.ps1` for independent processes
+and bootstrap crash/recovery tests. This layer does not implement game or ledger
+authority.
+
+[Durable history and cursor recovery](docs/mesh-history.md) add bounded signed
+event chains, atomic state/cursor persistence and snapshot catch-up after long
+outages. Run `sig build test-mesh-history -j1` for the recovery contracts.
+
 zpm includes a full QUIC implementation (RFC 9000, 9001, 9002, 9221) for high-performance registry access. Enable with `--transport quic`.
 
 Three application lanes map to QUIC primitives:

@@ -37,7 +37,8 @@ pub const StreamState = enum(u8) {
 ///   available = (write_pos - read_pos) mod buf_size
 ///   freeSpace = buf_size - 1 - available
 pub const RingBuffer = struct {
-    buf: [stream_buf_size]u8,
+    /// Caller-owned storage; bind before initialization and keep its address stable.
+    buf: []u8,
     read_pos: u32,
     write_pos: u32,
     contiguous_end: u32,
@@ -53,12 +54,12 @@ pub const RingBuffer = struct {
         if (self.write_pos >= self.read_pos) {
             return self.write_pos - self.read_pos;
         }
-        return stream_buf_size - self.read_pos + self.write_pos;
+        return @as(u32, @intCast(self.buf.len)) - self.read_pos + self.write_pos;
     }
 
     /// Bytes available for writing (leave 1 byte gap).
     pub fn freeSpace(self: *const RingBuffer) u32 {
-        return stream_buf_size - 1 - self.available();
+        return @as(u32, @intCast(self.buf.len)) - 1 - self.available();
     }
 
     /// Write data into the ring buffer. Returns bytes actually written.
@@ -67,7 +68,7 @@ pub const RingBuffer = struct {
         const to_write: u32 = @intCast(@min(data.len, free));
         if (to_write == 0) return 0;
 
-        const first_chunk = @min(to_write, stream_buf_size - self.write_pos);
+        const first_chunk = @min(to_write, @as(u32, @intCast(self.buf.len)) - self.write_pos);
         @memcpy(self.buf[self.write_pos..][0..first_chunk], data[0..first_chunk]);
 
         if (to_write > first_chunk) {
@@ -75,7 +76,7 @@ pub const RingBuffer = struct {
             @memcpy(self.buf[0..second_chunk], data[first_chunk..][0..second_chunk]);
         }
 
-        self.write_pos = (self.write_pos + to_write) % stream_buf_size;
+        self.write_pos = (self.write_pos + to_write) % @as(u32, @intCast(self.buf.len));
         self.contiguous_end = self.write_pos;
         return to_write;
     }
@@ -86,7 +87,7 @@ pub const RingBuffer = struct {
         const to_read: u32 = @intCast(@min(out.len, avail));
         if (to_read == 0) return 0;
 
-        const first_chunk = @min(to_read, stream_buf_size - self.read_pos);
+        const first_chunk = @min(to_read, @as(u32, @intCast(self.buf.len)) - self.read_pos);
         @memcpy(out[0..first_chunk], self.buf[self.read_pos..][0..first_chunk]);
 
         if (to_read > first_chunk) {
@@ -94,7 +95,7 @@ pub const RingBuffer = struct {
             @memcpy(out[first_chunk..][0..second_chunk], self.buf[0..second_chunk]);
         }
 
-        self.read_pos = (self.read_pos + to_read) % stream_buf_size;
+        self.read_pos = (self.read_pos + to_read) % @as(u32, @intCast(self.buf.len));
         return to_read;
     }
 };
@@ -127,25 +128,46 @@ pub const Stream = struct {
         self.recv_buf.initInPlace();
         self.recv_offset = 0;
         self.recv_fin_offset = max_u64;
-        self.recv_window = stream_buf_size;
+        self.recv_window = self.recv_buf.buf.len - 1;
         self.send_buf.initInPlace();
         self.send_offset = 0;
         self.send_acked = 0;
         self.send_fin = false;
         self.send_window = stream_buf_size;
-        self.max_data_local = stream_buf_size;
+        self.max_data_local = self.recv_window;
         self.max_data_remote = stream_buf_size;
     }
 };
 
-/// The stream storage array type. ~8MB — must be allocated externally
-/// (module-level static, or embedded in a larger connection struct).
-pub const StreamArray = [max_concurrent_streams]Stream;
+/// Storage budgets include both send and receive rings for every stream.
+pub const Budget = struct {
+    streams: u16 = max_concurrent_streams,
+    buffer_bytes: u32 = stream_buf_size,
+};
+/// Small mesh profile: four streams, 16 KiB in each direction per stream.
+/// Checkpoint batches up to 10 KiB fit without changing their framing.
+pub const mobile_budget: Budget = .{ .streams = 4, .buffer_bytes = 16384 };
+pub fn Storage(comptime budget: Budget) type {
+    if (budget.streams == 0 or budget.streams > max_concurrent_streams or budget.buffer_bytes < 2 or budget.buffer_bytes > stream_buf_size)
+        @compileError("Invalid bounded stream storage budget");
+    return struct {
+        items: [budget.streams]Stream,
+        receive: [budget.streams][budget.buffer_bytes]u8,
+        send: [budget.streams][budget.buffer_bytes]u8,
+        pub fn bind(self: *@This()) void {
+            for (0..budget.streams) |i| {
+                self.items[i].recv_buf.buf = &self.receive[i];
+                self.items[i].send_buf.buf = &self.send[i];
+            }
+        }
+    };
+}
+pub const StreamArray = Storage(.{});
 
 /// Manages all streams for a QUIC connection, including connection-level flow control.
 /// The stream storage is external (pointed to by `streams`) to keep this struct small.
 pub const StreamManager = struct {
-    streams: *StreamArray,
+    streams: []Stream,
     stream_count: u16,
 
     // Connection-level flow control
@@ -153,6 +175,9 @@ pub const StreamManager = struct {
     conn_recv_window: u64,
     conn_send_offset: u64,
     conn_send_max: u64,
+    peer_bidi_local_window: u64,
+    peer_bidi_remote_window: u64,
+    peer_uni_window: u64,
 
     // Stream limits
     max_bidi_streams: u64,
@@ -167,22 +192,26 @@ pub const StreamManager = struct {
     next_bidi_seq: u64,
     next_uni_seq: u64,
 
-    /// Initialize the manager. Caller must provide a pointer to a StreamArray.
-    pub fn init(self: *StreamManager, storage: *StreamArray, is_server: bool) void {
-        self.streams = storage;
+    /// Bind caller-owned Storage in place. It must not move while in use.
+    pub fn init(self: *StreamManager, storage: anytype, is_server: bool) void {
+        storage.bind();
+        self.streams = &storage.items;
         self.stream_count = 0;
         self.conn_recv_offset = 0;
         self.conn_recv_window = 1048576; // 1MB default
         self.conn_send_offset = 0;
         self.conn_send_max = 1048576;
-        self.max_bidi_streams = max_concurrent_streams;
-        self.max_uni_streams = max_concurrent_streams;
+        self.peer_bidi_local_window = stream_buf_size;
+        self.peer_bidi_remote_window = stream_buf_size;
+        self.peer_uni_window = stream_buf_size;
+        self.max_bidi_streams = self.streams.len;
+        self.max_uni_streams = self.streams.len;
         self.open_bidi_count = 0;
         self.open_uni_count = 0;
         self.is_server = is_server;
         self.next_bidi_seq = 0;
         self.next_uni_seq = 0;
-        for (0..max_concurrent_streams) |i| {
+        for (0..self.streams.len) |i| {
             self.streams[i].initInPlace(0);
         }
     }
@@ -194,7 +223,7 @@ pub const StreamManager = struct {
     ///   Client bidi: 0,4,8,...  Server bidi: 1,5,9,...
     ///   Client uni:  2,6,10,... Server uni:  3,7,11,...
     pub fn openStream(self: *StreamManager, bidi: bool) ?u64 {
-        if (self.stream_count >= max_concurrent_streams) return null;
+        if (self.stream_count >= self.streams.len) return null;
 
         if (bidi) {
             if (self.open_bidi_count >= self.max_bidi_streams) return null;
@@ -217,6 +246,7 @@ pub const StreamManager = struct {
 
         const idx: usize = @intCast(self.stream_count);
         self.streams[idx].initInPlace(stream_id);
+        self.streams[idx].max_data_remote = self.remoteWindow(stream_id);
         self.streams[idx].state = .open;
         self.stream_count += 1;
 
@@ -231,6 +261,12 @@ pub const StreamManager = struct {
             }
         }
         return null;
+    }
+
+    fn remoteWindow(self: *const StreamManager, id: u64) u64 {
+        if ((id & 2) != 0) return self.peer_uni_window;
+        const locally_initiated = (id & 1) == @as(u64, if (self.is_server) 1 else 0);
+        return if (locally_initiated) self.peer_bidi_remote_window else self.peer_bidi_local_window;
     }
 
     /// Close the local send side of a stream (half-close).
@@ -253,7 +289,7 @@ pub const StreamManager = struct {
     /// Implicitly create a stream for an incoming frame if it doesn't exist.
     fn getOrCreateStream(self: *StreamManager, stream_id: u64) ?*Stream {
         if (self.getStream(stream_id)) |s| return s;
-        if (self.stream_count >= max_concurrent_streams) return null;
+        if (self.stream_count >= self.streams.len) return null;
 
         const is_bidi = (stream_id & 0x02) == 0;
         if (is_bidi) {
@@ -266,6 +302,7 @@ pub const StreamManager = struct {
 
         const idx: usize = @intCast(self.stream_count);
         self.streams[idx].initInPlace(stream_id);
+        self.streams[idx].max_data_remote = self.remoteWindow(stream_id);
         self.streams[idx].state = .open;
         self.stream_count += 1;
         return &self.streams[idx];
@@ -461,12 +498,14 @@ const testing = @import("std").testing;
 var test_big_buf: [stream_buf_size]u8 = undefined;
 var test_big_out: [stream_buf_size]u8 = undefined;
 var test_rb: RingBuffer = undefined;
+var test_rb_bytes: [stream_buf_size]u8 = undefined;
 
 // StreamManager test state — module-level static because StreamArray is ~8MB.
 var test_sm: StreamManager = undefined;
 var test_storage: StreamArray = undefined;
 
 fn initTestRb() *RingBuffer {
+    test_rb.buf = &test_rb_bytes;
     test_rb.initInPlace();
     return &test_rb;
 }
@@ -620,4 +659,50 @@ test "implicit stream creation on incoming frame" {
     const s = sm.getStream(1).?;
     try testing.expectEqual(@as(u64, 1), s.id);
     try testing.expectEqual(StreamState.open, s.state);
+}
+
+var tiny_storage: Storage(.{ .streams = 2, .buffer_bytes = 8 }) = undefined;
+test "bounded profile saturates, wraps, rejects extra streams and resets in place" {
+    var manager: StreamManager = undefined;
+    manager.init(&tiny_storage, false);
+    const first = manager.openStream(true).?;
+    const second = manager.openStream(false).?;
+    try testing.expect(manager.openStream(true) == null);
+    try testing.expectEqual(@as(u32, 7), manager.writeToStream(first, "abcdefghijk"));
+    try testing.expectEqual(@as(u32, 0), manager.writeToStream(first, "x"));
+    try testing.expectEqual(@as(u32, 3), manager.writeToStream(second, "xyz"));
+    var out: [8]u8 = undefined;
+    const stream = manager.getStream(first).?;
+    try testing.expectEqual(@as(u32, 5), stream.send_buf.read(out[0..5]));
+    try testing.expectEqualStrings("abcde", out[0..5]);
+    try testing.expectEqual(@as(u32, 5), manager.writeToStream(first, "12345"));
+    try testing.expectEqual(@as(u32, 7), stream.send_buf.read(&out));
+    try testing.expectEqualStrings("fg12345", out[0..7]);
+    try testing.expectEqual(@as(u64, 7), stream.max_data_local);
+    manager.onStreamData(first, 0, "abcdefg", false);
+    try testing.expectEqual(@as(u32, 7), manager.readFromStream(first, &out));
+    try testing.expectEqualStrings("abcdefg", out[0..7]);
+    manager.init(&tiny_storage, true);
+    try testing.expectEqual(@as(u16, 0), manager.stream_count);
+    const reopened = manager.openStream(true).?;
+    try testing.expectEqual(@as(u32, 0), manager.getStream(reopened).?.send_buf.available());
+    try testing.expectEqual(@as(u32, 0), manager.getStream(reopened).?.recv_buf.available());
+    try testing.expect(@sizeOf(Storage(mobile_budget)) < @sizeOf(StreamArray) / 32);
+}
+
+test "peer initial windows constrain new streams by initiator and direction" {
+    var manager: StreamManager = undefined;
+    manager.init(&tiny_storage, false);
+    manager.peer_bidi_remote_window = 3;
+    manager.peer_bidi_local_window = 5;
+    manager.peer_uni_window = 2;
+    const local = manager.openStream(true).?;
+    try testing.expectEqual(@as(u32, 3), manager.writeToStream(local, "abcdefg"));
+    try testing.expectEqual(@as(u32, 0), manager.writeToStream(local, "x"));
+    manager.onStreamData(1, 0, "peer", false);
+    try testing.expectEqual(@as(u32, 5), manager.writeToStream(1, "1234567"));
+    manager.init(&tiny_storage, false);
+    manager.peer_uni_window = 2;
+    const uni = manager.openStream(false).?;
+    try testing.expectEqual(@as(u32, 2), manager.writeToStream(uni, "abcdefg"));
 }

@@ -1260,6 +1260,27 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     // the comptime seam, packet, transport_crypto, recovery, telemetry, udp,
     // crypto_stream, tls13) — mirror the conn registration above.
     const mesh_transport = try ctx.addModule("mesh_transport", "src/transport/mesh_transport.sig");
+    _ = try ctx.addModule("mesh_overlay", "src/core/mesh_overlay.sig");
+    _ = try ctx.addModule("mesh_history", "src/core/mesh_history.sig");
+    const mesh_sync = try ctx.addModule("mesh_sync", "src/core/mesh_sync.sig");
+    try wire(ctx,mesh_sync,"mesh_history","src/core/mesh_history.sig");
+    const mesh_file = try ctx.addModule("mesh_file", "src/platform/mesh_file.sig");
+    _ = try addTest(ctx,test_all,"test-mesh-history","tests/test_mesh_history.sig",&.{importEntry("mesh_history","src/core/mesh_history.sig"),importEntry("mesh_sync","src/core/mesh_sync.sig")});
+    const mesh_network = try ctx.addModule("mesh_network", "src/transport/mesh_network.sig");
+    inline for (.{"mesh_overlay","mesh_transport","conn","streams","udp","win32"}, .{"src/core/mesh_overlay.sig","src/transport/mesh_transport.sig","src/transport/conn.sig","src/transport/streams.sig","src/transport/udp.sig",win32_path}) |name,path| try wire(ctx,mesh_network,name,path);
+    const test_mesh = try ctx.addStep("test-mesh", "Bounded membership, fault simulation and real multi-peer QUIC", &noopStep);
+    try ctx.addDependency(test_all,test_mesh);
+    _ = try addContract(ctx,test_mesh,"contract-mesh-overlay","tests/test_mesh_overlay.sig",&.{importEntry("mesh_overlay","src/core/mesh_overlay.sig")});
+    _ = try addContract(ctx,test_mesh,"contract-mesh-faults","tests/test_mesh_faults.sig",&.{importEntry("mesh_overlay","src/core/mesh_overlay.sig")});
+    _ = try addContract(ctx,test_mesh,"contract-mesh-network","tests/test_mesh_network.sig",&.{
+        importEntry("mesh_overlay","src/core/mesh_overlay.sig"),importEntry("mesh_network","src/transport/mesh_network.sig"),
+        importEntry("udp","src/transport/udp.sig"),importEntry("win32",win32_path),
+    });
+    const local_rpc_http = try ctx.addModule("local_rpc_http", "src/platform/local_rpc_http.sig");
+    try wire(ctx, local_rpc_http, "win32", win32_path);
+    const fixed_journal = try ctx.addModule("fixed_journal", "src/platform/fixed_journal.sig");
+    try wire(ctx,mesh_file,"fixed_journal","src/platform/fixed_journal.sig");
+    try wire(ctx, fixed_journal, "win32", win32_path);
     try wire(ctx, mesh_transport, "conn", "src/transport/conn.sig");
     try wire(ctx, mesh_transport, "streams", "src/transport/streams.sig");
     try wire(ctx, mesh_transport, "datagram", "src/transport/datagram.sig");
@@ -1395,11 +1416,11 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         .imports = &mesh_node_imports,
     });
 
-    _ = try addTest(ctx, test_all, "test-no-alloc", "src/transport/no_alloc_test.sig", &.{});
+    _ = try ctx.addModule("build_embed", "build_embed.sig");
+    _ = try addTest(ctx, test_all, "test-no-alloc", "src/transport/no_alloc_test.sig", &.{importEntry("build_embed","build_embed.sig")});
     _ = try addTest(ctx, test_all, "test-comptime-sizes", "src/transport/comptime_sizes_test.sig", &.{});
     _ = try addTest(ctx, test_all, "test-layer", "src/transport/layer_test.sig", &.{});
     _ = try addTest(ctx, test_all, "test-domain-agnostic", "src/transport/domain_agnostic_test.sig", &.{});
-    _ = try ctx.addModule("build_embed", "build_embed.sig");
     _ = try addTest(ctx, test_all, "test-shared-source", "src/transport/shared_source_test.sig", &.{
         importEntry("build_embed", "build_embed.sig"),
     });

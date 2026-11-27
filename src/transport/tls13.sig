@@ -360,6 +360,11 @@ pub const Tls13Engine = struct {
                 result.output_len = self.output_len;
                 result.complete = true;
                 result.application_keys_available = true;
+                // ClientHello parameters become usable by the connection only
+                // once the client's Finished authenticates the transcript.
+                const n = self.peer_transport_params_len;
+                @memcpy(result.peer_transport_params[0..n], self.peer_transport_params[0..n]);
+                result.peer_transport_params_len = n;
             },
             .wait_server_hello => {
                 // Client: incoming ServerHello (Initial-level CRYPTO). Produces
@@ -466,6 +471,7 @@ pub const Tls13Engine = struct {
         const ext_end = pos + ext_len;
         var has_supported_versions = false;
         var has_key_share = false;
+        var has_transport_params = false;
 
         while (pos + 4 <= ext_end) {
             const ext_type = readU16(body[pos..][0..2]);
@@ -475,6 +481,12 @@ pub const Tls13Engine = struct {
             if (pos + ext_data_len > ext_end) return .decode_error;
 
             switch (ext_type) {
+                ExtType.quic_transport_params => {
+                    if (has_transport_params or ext_data_len > self.peer_transport_params.len) return .decode_error;
+                    has_transport_params = true;
+                    @memcpy(self.peer_transport_params[0..ext_data_len], body[pos..][0..ext_data_len]);
+                    self.peer_transport_params_len = @intCast(ext_data_len);
+                },
                 ExtType.supported_versions => {
                     if (ext_data_len < 3) {
                         pos += ext_data_len;
@@ -1466,6 +1478,8 @@ test "tls13 client+server: full in-process handshake derives matching app keys" 
     try testing.expectEqual(HandshakeError.none, sr2.err);
     try testing.expect(sr2.complete);
     try testing.expectEqual(HandshakeState.connected, server.state);
+    try testing.expectEqual(@as(u16, cp.len), sr2.peer_transport_params_len);
+    try testing.expectEqualSlices(u8, &cp, sr2.peer_transport_params[0..cp.len]);
 
     // Both engines must agree on all application + handshake secrets/keys.
     try testing.expect(client.client_app_keys.valid and client.server_app_keys.valid);

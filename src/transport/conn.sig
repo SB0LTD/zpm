@@ -18,9 +18,10 @@ const telemetry = @import("telemetry");
 const udp = @import("udp");
 const crypto_stream = @import("crypto_stream");
 
+/// Opt-in packet diagnostics; use the platform-aware stderr writer on Windows too.
+pub var trace_enabled: bool = false;
 fn writeStdout(msg: []const u8) void {
-    const linux = @import("std").os.linux;
-    _ = linux.write(1, msg.ptr, msg.len);
+    if (trace_enabled) @import("std").debug.print("{s}", .{msg});
 }
 
 fn writeHexU8(val: u8) void {
@@ -259,8 +260,8 @@ fn decodeTPVarint(buf: []const u8) u64 {
 // ── Compatible Version Negotiation (RFC 9368) ──
 
 /// QUIC version constants for negotiation.
-pub const quic_v1: u32 = @intFromEnum(packet.Version.quic_v1);
-pub const quic_v2: u32 = @intFromEnum(packet.Version.quic_v2);
+pub const quic_v1: u32 = @backingInt(packet.Version.quic_v1);
+pub const quic_v2: u32 = @backingInt(packet.Version.quic_v2);
 
 /// Negotiate the highest mutually supported QUIC version from two version_information
 /// transport parameter payloads. Per RFC 9368 §4, the format is:
@@ -427,7 +428,14 @@ pub const ZeroRttState = enum(u8) {
 
 // ── Connection Struct ──
 
+pub const AddressScope = enum { unrestricted, loopback, lan };
+pub fn addressAllowed(scope: AddressScope, address: u32) bool {
+    const bytes: [4]u8 = @bitCast(address);
+    if (scope == .unrestricted or bytes[0] == 127) return true;
+    return scope == .lan and (bytes[0] == 10 or (bytes[0] == 172 and bytes[1] >= 16 and bytes[1] <= 31) or (bytes[0] == 192 and bytes[1] == 168));
+}
 pub const Connection = struct {
+    address_scope: AddressScope = .unrestricted,
     state: ConnState,
     is_server: bool,
     version: u32,
@@ -452,7 +460,7 @@ pub const Connection = struct {
     // Sub-components (embedded)
     tls: transport_crypto.TlsEngine,
     recovery_engine: recovery.RecoveryEngine,
-    stream_storage: *streams.StreamArray,
+    stream_storage: []streams.Stream,
     stream_mgr: streams.StreamManager,
     datagrams: datagram.DatagramHandler,
     telem: telemetry.TelemetryCounters,
@@ -524,7 +532,7 @@ pub const Connection = struct {
     /// the caller's storage (always a module-level `var`) avoids that entirely.
     pub fn initClientInPlace(
         self: *Connection,
-        stream_storage: *streams.StreamArray,
+        stream_storage: anytype,
         server_addr: w32.sockaddr_in,
         local_port: u16,
     ) void {
@@ -533,7 +541,7 @@ pub const Connection = struct {
         self.socket = udp.UdpSocket.init();
         const bind_addr = w32.sockaddr_in{
             .sin_port = w32.htons(local_port),
-            .sin_addr = 0x0100007F,
+            .sin_addr = if (addressAllowed(.loopback, server_addr.sin_addr)) 0x0100007F else 0,
         };
         _ = self.socket.bind(bind_addr);
         self.peer_addr = server_addr;
@@ -544,7 +552,7 @@ pub const Connection = struct {
         generateRandomCid(&self.remote_cids[0]);
         self.remote_cid_count = 1;
 
-        self.version = @intFromEnum(packet.Version.quic_v1);
+        self.version = @backingInt(packet.Version.quic_v1);
 
         // Advertise both v1 and v2 in version_information (RFC 9368 §4)
         self.local_params.version_info_len = buildVersionInfo(
@@ -562,15 +570,19 @@ pub const Connection = struct {
     /// See initClientInPlace for the rationale (avoids a large stack temporary).
     pub fn initServerInPlace(
         self: *Connection,
-        stream_storage: *streams.StreamArray,
+        stream_storage: anytype,
         local_port: u16,
     ) void {
+        self.initServerScopedInPlace(stream_storage, local_port, .unrestricted);
+    }
+    pub fn initServerScopedInPlace(self: *Connection, stream_storage: anytype, local_port: u16, scope: AddressScope) void {
         self.initCommon(stream_storage, true);
+        self.address_scope = scope;
 
         self.socket = udp.UdpSocket.init();
         const bind_addr = w32.sockaddr_in{
             .sin_port = w32.htons(local_port),
-            .sin_addr = 0x00000000,
+            .sin_addr = if (scope == .loopback) 0x0100007f else 0,
         };
         _ = self.socket.bind(bind_addr);
         self.peer_addr = w32.sockaddr_in{};
@@ -579,7 +591,7 @@ pub const Connection = struct {
         self.local_cid_count = 1;
         self.remote_cid_count = 0;
 
-        self.version = @intFromEnum(packet.Version.quic_v1);
+        self.version = @backingInt(packet.Version.quic_v1);
 
         // Advertise both v1 and v2 in version_information (RFC 9368 §4)
         self.local_params.version_info_len = buildVersionInfo(
@@ -595,7 +607,8 @@ pub const Connection = struct {
     }
 
     /// Common initialization shared by client and server.
-    fn initCommon(self: *Connection, stream_storage: *streams.StreamArray, is_server: bool) void {
+    fn initCommon(self: *Connection, stream_storage: anytype, is_server: bool) void {
+        self.address_scope = .unrestricted;
         self.state = .idle;
         self.is_server = is_server;
         self.version = 0;
@@ -628,8 +641,19 @@ pub const Connection = struct {
         const qpc_freq: u64 = if (freq.QuadPart > 0) @intCast(freq.QuadPart) else 1_000_000;
         self.recovery_engine.initInPlace(qpc_freq);
 
-        self.stream_storage = stream_storage;
+        self.stream_storage = &stream_storage.items;
         self.stream_mgr.init(stream_storage, is_server);
+        // Advertise only the receive budget actually backed by caller storage.
+        // Keep the historical default connection window for the default profile.
+        const stream_window = stream_storage.items[0].recv_buf.buf.len - 1;
+        self.local_params.initial_max_stream_data_bidi_local = stream_window;
+        self.local_params.initial_max_stream_data_bidi_remote = stream_window;
+        self.local_params.initial_max_stream_data_uni = stream_window;
+        // Divide shared slots between the two stream directions: their sum must fit.
+        self.local_params.initial_max_streams_bidi = (stream_storage.items.len + 1) / 2;
+        self.local_params.initial_max_streams_uni = stream_storage.items.len / 2;
+        self.local_params.initial_max_data = @min(@as(u64, 1048576), stream_window * stream_storage.items.len);
+        self.stream_mgr.conn_recv_window = self.local_params.initial_max_data;
         self.datagrams = datagram.DatagramHandler.init();
         self.datagrams.enabled = true;
         self.datagrams.max_size = 1200;
@@ -676,18 +700,22 @@ pub const Connection = struct {
 
         // Terminal states — return immediately
         if (self.state == .closed) return .closed;
+        if (!self.is_server and !addressAllowed(self.address_scope, self.peer_addr.sin_addr)) {
+            self.state = .closed;
+            return .closed;
+        }
 
         // ── Server idle: listen for incoming Initial packets ──
         if (self.state == .idle and self.is_server) {
             const idle_recv = self.socket.recv(&self.recv_buf);
-            if (idle_recv.err == .none and idle_recv.bytes_read > 0) {
+            if (idle_recv.err == .none and idle_recv.bytes_read > 0 and addressAllowed(self.address_scope, idle_recv.src_addr.sin_addr)) {
                 const idle_hdr = packet.parseHeader(self.recv_buf[0..idle_recv.bytes_read]);
                 if (idle_hdr.err == .none and idle_hdr.header.is_long and
                     idle_hdr.header.pkt_type == .initial)
                 {
                     // Valid Initial received — transition to handshaking
                     self.state = .handshaking;
-                    @atomicStore(u8, &self.telem.conn_state, @intFromEnum(ConnState.handshaking), .monotonic);
+                    @atomicStore(u8, &self.telem.conn_state, @backingInt(ConnState.handshaking), .monotonic);
                     self.peer_addr = idle_recv.src_addr;
                     self.last_recv_tick = now_tick;
                     self.telem.recordReceived(idle_recv.bytes_read);
@@ -731,7 +759,7 @@ pub const Connection = struct {
                     self.client_initial_ks = client_ks;
 
                     // Install Initial encryption keys (server uses server_ks to encrypt, client_ks to decrypt)
-                    const lvl_idx = @intFromEnum(transport_crypto.EncryptionLevel.initial);
+                    const lvl_idx = @backingInt(transport_crypto.EncryptionLevel.initial);
 
                     // Process the Initial packet inline (decrypt + dispatch)
                     // Install client keys for decryption of the incoming Initial
@@ -765,7 +793,7 @@ pub const Connection = struct {
                         );
                         if (decrypt_err == .none) {
                             const space = self.spaceFromLevel(level);
-                            const s_idx = @intFromEnum(space);
+                            const s_idx = @backingInt(space);
                             if (pkt_number > self.largest_recv_pkt[s_idx]) {
                                 self.largest_recv_pkt[s_idx] = pkt_number;
                             }
@@ -806,7 +834,7 @@ pub const Connection = struct {
                 self.initiateClientHandshake();
                 self.client_initiated = true;
                 self.state = .handshaking;
-                @atomicStore(u8, &self.telem.conn_state, @intFromEnum(ConnState.handshaking), .monotonic);
+                @atomicStore(u8, &self.telem.conn_state, @backingInt(ConnState.handshaking), .monotonic);
                 self.last_recv_tick = now_tick;
                 // fall through to send phase below
             } else {
@@ -822,7 +850,7 @@ pub const Connection = struct {
         if (self.state == .connected or self.state == .handshaking) {
             if (self.isTimedOut(now_tick)) {
                 self.state = .closed;
-                @atomicStore(u8, &self.telem.conn_state, @intFromEnum(ConnState.closed), .monotonic);
+                @atomicStore(u8, &self.telem.conn_state, @backingInt(ConnState.closed), .monotonic);
                 return .closed;
             }
         }
@@ -831,7 +859,7 @@ pub const Connection = struct {
         if (self.state == .draining) {
             if (self.draining_end_tick > 0 and now_tick >= self.draining_end_tick) {
                 self.state = .closed;
-                @atomicStore(u8, &self.telem.conn_state, @intFromEnum(ConnState.closed), .monotonic);
+                @atomicStore(u8, &self.telem.conn_state, @backingInt(ConnState.closed), .monotonic);
                 return .closed;
             }
         }
@@ -839,7 +867,7 @@ pub const Connection = struct {
         // ── Receive phase ──
 
         const recv_result = self.socket.recv(&self.recv_buf);
-        if (recv_result.err == .none and recv_result.bytes_read > 0) {
+        if (recv_result.err == .none and recv_result.bytes_read > 0 and addressAllowed(self.address_scope, recv_result.src_addr.sin_addr)) {
             const recv_len = recv_result.bytes_read;
             self.last_recv_tick = now_tick;
             self.telem.recordReceived(recv_len);
@@ -947,7 +975,7 @@ pub const Connection = struct {
             .zero_rtt => .{},
         };
         const need_key_swap = peer_ks.valid;
-        const lvl_idx_recv = @intFromEnum(level);
+        const lvl_idx_recv = @backingInt(level);
         var saved_own_ks: transport_crypto.KeySet = .{};
         if (need_key_swap) {
             saved_own_ks = self.tls.keys[lvl_idx_recv];
@@ -981,7 +1009,7 @@ pub const Connection = struct {
             );
             if (decrypt_err == .none) {
                 const space = self.spaceFromLevel(level);
-                const s_idx = @intFromEnum(space);
+                const s_idx = @backingInt(space);
                 if (pkt_number > self.largest_recv_pkt[s_idx]) {
                     self.largest_recv_pkt[s_idx] = pkt_number;
                 }
@@ -1036,7 +1064,7 @@ pub const Connection = struct {
 
         const client_ks = transport_crypto.deriveInitialKeys(dcid_slice, false, self.version);
         const server_ks = transport_crypto.deriveInitialKeys(dcid_slice, true, self.version);
-        const lvl_idx = @intFromEnum(transport_crypto.EncryptionLevel.initial);
+        const lvl_idx = @backingInt(transport_crypto.EncryptionLevel.initial);
         // Client encrypts its Initial with client_ks and decrypts the server's
         // Initial with server_ks. Install client_ks for sending; the receive
         // phase swaps in the peer (server) keys via peer_initial handling below.
@@ -1058,7 +1086,7 @@ pub const Connection = struct {
         const eng = &self.tls.tls13_engine;
 
         if (eng.client_handshake_keys.valid and eng.server_handshake_keys.valid) {
-            const hs_lvl = @intFromEnum(transport_crypto.EncryptionLevel.handshake);
+            const hs_lvl = @backingInt(transport_crypto.EncryptionLevel.handshake);
             const own = if (self.is_server) eng.server_handshake_keys else eng.client_handshake_keys;
             const peer = if (self.is_server) eng.client_handshake_keys else eng.server_handshake_keys;
             self.tls.keys[hs_lvl] = toKeySet(own);
@@ -1066,7 +1094,7 @@ pub const Connection = struct {
         }
 
         if (eng.client_app_keys.valid and eng.server_app_keys.valid) {
-            const app_lvl = @intFromEnum(transport_crypto.EncryptionLevel.one_rtt);
+            const app_lvl = @backingInt(transport_crypto.EncryptionLevel.one_rtt);
             const own = if (self.is_server) eng.server_app_keys else eng.client_app_keys;
             const peer = if (self.is_server) eng.client_app_keys else eng.server_app_keys;
             self.tls.keys[app_lvl] = toKeySet(own);
@@ -1126,13 +1154,13 @@ pub const Connection = struct {
 
                 .ping => {
                     // PING: mark ACK needed for this packet number space
-                    self.ack_needed[@intFromEnum(space)] = true;
+                    self.ack_needed[@backingInt(space)] = true;
                 },
 
                 .ack => |ack| {
                     // ACK → recovery engine
                     // Convert conn.PktNumSpace to recovery.PktNumSpace (same layout, separate types)
-                    const recovery_space: recovery.PktNumSpace = @enumFromInt(@intFromEnum(space));
+                    const recovery_space: recovery.PktNumSpace = @fromBackingInt(@intCast(@backingInt(space)));
                     const ack_result = self.recovery_engine.onAckReceived(
                         recovery_space,
                         ack.largest_acked,
@@ -1152,7 +1180,7 @@ pub const Connection = struct {
                 .crypto => |crypto_frame| {
                     // CRYPTO stream reassembly via standalone module (RFC 9000 §19.6)
                     const level = self.levelFromSpace(space);
-                    const s_idx = @intFromEnum(space);
+                    const s_idx = @backingInt(space);
                     const data_end = crypto_frame.data_offset + crypto_frame.data_len;
 
                     if (data_end <= buf.len and crypto_frame.data_len > 0) {
@@ -1205,6 +1233,11 @@ pub const Connection = struct {
 
                                     // Feed to TLS engine
                                     const crypto_data = msg_buf[0..read_len];
+                                    if (trace_enabled) {
+                                        writeStdout("TLSINPUT:");
+                                        for (crypto_data) |byte| writeHexU8(byte);
+                                        writeStdout("\n");
+                                    }
                                     const hs_result = self.tls.feedCryptoData(level, crypto_data);
 
                                     // Sync TLS 1.3 derived keys from the embedded
@@ -1271,7 +1304,7 @@ pub const Connection = struct {
                                     if (hs_result.complete) {
                                         if (self.state == .handshaking) {
                                             self.state = .connected;
-                                            @atomicStore(u8, &self.telem.conn_state, @intFromEnum(ConnState.connected), .monotonic);
+                                            @atomicStore(u8, &self.telem.conn_state, @backingInt(ConnState.connected), .monotonic);
                                             // Server MUST send HANDSHAKE_DONE (RFC 9001 §4.1.2)
                                             if (self.is_server) {
                                                 self.pending_handshake_done = true;
@@ -1283,6 +1316,9 @@ pub const Connection = struct {
                                                 if (tp_result.err == .none) {
                                                     self.peer_params = tp_result.params;
                                                     self.stream_mgr.conn_send_max = tp_result.params.initial_max_data;
+                                                    self.stream_mgr.peer_bidi_local_window = tp_result.params.initial_max_stream_data_bidi_local;
+                                                    self.stream_mgr.peer_bidi_remote_window = tp_result.params.initial_max_stream_data_bidi_remote;
+                                                    self.stream_mgr.peer_uni_window = tp_result.params.initial_max_stream_data_uni;
                                                     self.stream_mgr.max_bidi_streams = tp_result.params.initial_max_streams_bidi;
                                                     self.stream_mgr.max_uni_streams = tp_result.params.initial_max_streams_uni;
                                                     if (tp_result.params.max_datagram_frame_size > 0) {
@@ -1301,14 +1337,14 @@ pub const Connection = struct {
                                     if (hs_result.err != .none) {
                                         if (self.state == .handshaking) {
                                             self.state = .closed;
-                                            @atomicStore(u8, &self.telem.conn_state, @intFromEnum(ConnState.closed), .monotonic);
+                                            @atomicStore(u8, &self.telem.conn_state, @backingInt(ConnState.closed), .monotonic);
                                         }
                                     }
                                 }
                             }
                         }
                     }
-                    self.ack_needed[@intFromEnum(space)] = true;
+                    self.ack_needed[@backingInt(space)] = true;
                 },
 
                 .stream => |sf| {
@@ -1331,7 +1367,7 @@ pub const Connection = struct {
                         // metadata path for FIN/flow-control bookkeeping.
                         self.stream_mgr.onStreamFrame(fr.frame);
                     }
-                    self.ack_needed[@intFromEnum(space)] = true;
+                    self.ack_needed[@backingInt(space)] = true;
                 },
 
                 .datagram => |dg| {
@@ -1344,7 +1380,7 @@ pub const Connection = struct {
                             _ = self.datagrams.enqueueReceived(payload);
                         }
                     }
-                    self.ack_needed[@intFromEnum(space)] = true;
+                    self.ack_needed[@backingInt(space)] = true;
                 },
 
                 .max_data => |md| {
@@ -1365,14 +1401,14 @@ pub const Connection = struct {
 
                 .reset_stream => |rs| {
                     self.stream_mgr.onResetStream(rs.stream_id, rs.error_code);
-                    self.ack_needed[@intFromEnum(space)] = true;
+                    self.ack_needed[@backingInt(space)] = true;
                 },
 
                 .connection_close => {
                     // CONNECTION_CLOSE → transition to draining
                     if (self.state != .draining and self.state != .closed) {
                         self.state = .draining;
-                        @atomicStore(u8, &self.telem.conn_state, @intFromEnum(ConnState.draining), .monotonic);
+                        @atomicStore(u8, &self.telem.conn_state, @backingInt(ConnState.draining), .monotonic);
                         // Drain timer = 3 × PTO
                         const pto = self.recovery_engine.getPto();
                         self.draining_end_tick = now_tick + 3 * pto;
@@ -1410,7 +1446,7 @@ pub const Connection = struct {
                     // HANDSHAKE_DONE: confirm handshake complete (client side)
                     if (!self.is_server and self.state == .handshaking) {
                         self.state = .connected;
-                        @atomicStore(u8, &self.telem.conn_state, @intFromEnum(ConnState.connected), .monotonic);
+                        @atomicStore(u8, &self.telem.conn_state, @backingInt(ConnState.connected), .monotonic);
                     }
                 },
 
@@ -1542,7 +1578,7 @@ pub const Connection = struct {
 
         // Transition to draining
         self.state = .draining;
-        @atomicStore(u8, &self.telem.conn_state, @intFromEnum(ConnState.draining), .monotonic);
+        @atomicStore(u8, &self.telem.conn_state, @backingInt(ConnState.draining), .monotonic);
 
         // Drain timer = 3 × PTO (RFC 9000 §10.2)
         const pto = self.recovery_engine.getPto();
@@ -1554,7 +1590,7 @@ pub const Connection = struct {
     /// Clean up all connection resources: close socket, release TLS handles,
     /// zero sensitive key material, and set state to closed.
     /// Feed an externally-received packet into this connection and produce response(s).
-    /// 
+    ///
     /// For servers with a shared listen socket: instead of using tick() (which reads
     /// from the connection's internal socket), call this function with the raw packet
     /// data received on the listen socket. It performs the full recv→parse→decrypt→
@@ -1569,10 +1605,11 @@ pub const Connection = struct {
     /// Returns the connection state after processing.
     pub fn feedAndRespond(self: *Connection, packet_data: []const u8, src_addr: w32.sockaddr_in) ConnState {
         self.last_send_len = 0;
+        if (!addressAllowed(self.address_scope, src_addr.sin_addr)) return self.state;
         self.peer_addr = src_addr;
 
         writeStdout("feedAndRespond: state=");
-        writeHexU8(@intFromEnum(self.state));
+        writeHexU8(@backingInt(self.state));
         writeStdout(" len=");
         writeHexU16(@intCast(packet_data.len));
         writeStdout("\n");
@@ -1593,7 +1630,7 @@ pub const Connection = struct {
         // Handle idle server receiving Initial
         if (self.state == .idle and self.is_server and hdr.is_long and hdr.pkt_type == .initial) {
             self.state = .handshaking;
-            @atomicStore(u8, &self.telem.conn_state, @intFromEnum(ConnState.handshaking), .monotonic);
+            @atomicStore(u8, &self.telem.conn_state, @backingInt(ConnState.handshaking), .monotonic);
             self.last_recv_tick = now_tick;
             self.telem.recordReceived(@intCast(packet_data.len));
 
@@ -1629,7 +1666,7 @@ pub const Connection = struct {
             const dcid_slice = hdr.dst_cid.slice();
             const client_ks = transport_crypto.deriveInitialKeys(dcid_slice, false, self.version);
             const server_ks = transport_crypto.deriveInitialKeys(dcid_slice, true, self.version);
-            const lvl_idx = @intFromEnum(transport_crypto.EncryptionLevel.initial);
+            const lvl_idx = @backingInt(transport_crypto.EncryptionLevel.initial);
 
             // Retain client Initial keys for decrypting subsequent Initial packets
             self.client_initial_ks = client_ks;
@@ -1659,7 +1696,7 @@ pub const Connection = struct {
                 const decrypt_err = self.tls.decrypt(level, pkt_number, self.recv_buf[0..pkt_len], payload_start, payload_len);
                 if (decrypt_err == .none) {
                     const space = self.spaceFromLevel(level);
-                    const s_idx = @intFromEnum(space);
+                    const s_idx = @backingInt(space);
                     if (pkt_number > self.largest_recv_pkt[s_idx]) {
                         self.largest_recv_pkt[s_idx] = pkt_number;
                     }
@@ -1670,7 +1707,6 @@ pub const Connection = struct {
 
             // Install server Initial keys for sending
             self.tls.keys[lvl_idx] = server_ks;
-
         } else if (self.state == .handshaking or self.state == .connected) {
             // Process subsequent packets (already handshaking)
             self.last_recv_tick = now_tick;
@@ -1690,7 +1726,7 @@ pub const Connection = struct {
                 .zero_rtt => .{},
             };
             const need_key_swap = peer_ks.valid;
-            const lvl_idx_recv = @intFromEnum(level);
+            const lvl_idx_recv = @backingInt(level);
             var saved_own_ks: transport_crypto.KeySet = .{};
             if (need_key_swap) {
                 saved_own_ks = self.tls.keys[lvl_idx_recv];
@@ -1718,7 +1754,7 @@ pub const Connection = struct {
                 const decrypt_err = self.tls.decrypt(level, pkt_number, self.recv_buf[0..pkt_len], payload_start, payload_len);
                 if (decrypt_err == .none) {
                     const space = self.spaceFromLevel(level);
-                    const s_idx = @intFromEnum(space);
+                    const s_idx = @backingInt(space);
                     if (pkt_number > self.largest_recv_pkt[s_idx]) {
                         self.largest_recv_pkt[s_idx] = pkt_number;
                     }
@@ -1761,7 +1797,7 @@ pub const Connection = struct {
         return self.state;
     }
 
-        /// Load TLS certificate into this connection's TLS engine.
+    /// Load TLS certificate into this connection's TLS engine.
     /// cert_der: DER-encoded certificate bytes.
     /// key_raw: 32-byte raw ECDSA P-256 private key scalar.
     pub fn loadTlsCertificate(self: *Connection, cert_der: []const u8, key_raw: []const u8) bool {
@@ -1893,7 +1929,7 @@ pub const Connection = struct {
         if (!self.is_server) return false;
 
         // Check if we have 0-RTT keys
-        if (!self.tls.keys[@intFromEnum(transport_crypto.EncryptionLevel.zero_rtt)].valid) {
+        if (!self.tls.keys[@backingInt(transport_crypto.EncryptionLevel.zero_rtt)].valid) {
             // No 0-RTT keys — reject
             self.zero_rtt_state = .rejected;
             self.zero_rtt_rejected = true;
@@ -1967,14 +2003,15 @@ pub const Connection = struct {
         if (hdr_result.err != .none) return;
         pos = hdr_result.len;
 
-        // Packet number (1 byte for simplicity)
-        const space_idx = @intFromEnum(PktNumSpace.application);
-        const pn: u8 = @truncate(self.next_pkt_num[space_idx]);
-        self.send_buf[pos] = pn;
-        // Encode pn_len in first byte
-        self.send_buf[0] = (self.send_buf[0] & 0xFC); // pn_len = 1 (0b00)
+        // Full packet number, matching the normal send path.
+        const space_idx = @backingInt(PktNumSpace.application);
+        const number = self.next_pkt_num[space_idx];
+        if (number > 0xffffffff) { self.state = .closed; return; }
+        const pn_len: u16 = if (number <= 0xff) 1 else if (number <= 0xffff) 2 else if (number <= 0xffffff) 3 else 4;
+        for (0..pn_len) |i| self.send_buf[pos + i] = @truncate(number >> @as(u6, @intCast((pn_len - 1 - i) * 8)));
+        self.send_buf[0] = (self.send_buf[0] & 0xFC) | @as(u8, @intCast(pn_len - 1));
         const pn_offset = pos;
-        pos += 1;
+        pos += pn_len;
 
         // Serialize CONNECTION_CLOSE frame with stored error code and reason
         const reason_len: u16 = self.close_reason_len;
@@ -1996,7 +2033,7 @@ pub const Connection = struct {
         }
 
         // Encrypt payload
-        const payload_start = pn_offset + 1;
+        const payload_start = pn_offset + pn_len;
         const payload_len = pos - payload_start;
         const encrypt_err = self.tls.encrypt(
             .one_rtt,
@@ -2029,7 +2066,7 @@ pub const Connection = struct {
         // During handshaking, we may need to send in Initial space (ACK to client Initial)
         // OR handshake space (ServerHello). Check Initial first if ack_needed.
         const space: PktNumSpace = if (self.state == .handshaking and
-            (self.ack_needed[@intFromEnum(PktNumSpace.initial)] or self.tls.initial_send_len > 0))
+            (self.ack_needed[@backingInt(PktNumSpace.initial)] or self.tls.initial_send_len > 0))
             // Initial space when an Initial ACK is pending OR there is Initial-
             // level CRYPTO to send (the client's ClientHello, or the server's
             // ServerHello before the client Initial is acked).
@@ -2039,7 +2076,7 @@ pub const Connection = struct {
         else
             .application;
         const level = self.levelFromSpace(space);
-        const space_idx = @intFromEnum(space);
+        const space_idx = @backingInt(space);
 
         // Check if there's anything to send
         const has_ack = self.ack_needed[space_idx];
@@ -2098,12 +2135,16 @@ pub const Connection = struct {
         if (hdr_result.err != .none) return 0;
         pos = hdr_result.len;
 
-        // Packet number (1 byte)
-        const pn: u8 = @truncate(self.next_pkt_num[space_idx]);
-        self.send_buf[pos] = pn;
-        self.send_buf[0] = (self.send_buf[0] & 0xFC); // pn_len = 1
+        // Carry the full packet number (1..4 bytes) for this bounded session.
+        // A single truncated byte reused after 255 breaks the AEAD nonce on
+        // receivers that have not reconstructed higher packet-number bits.
+        const number = self.next_pkt_num[space_idx];
+        if (number > 0xffffffff) { self.state = .closed; return 0; }
+        const pn_len: u16 = if (number <= 0xff) 1 else if (number <= 0xffff) 2 else if (number <= 0xffffff) 3 else 4;
+        for (0..pn_len) |i| self.send_buf[pos + i] = @truncate(number >> @as(u6, @intCast((pn_len - 1 - i) * 8)));
+        self.send_buf[0] = (self.send_buf[0] & 0xFC) | @as(u8, @intCast(pn_len - 1));
         const pn_offset = pos;
-        pos += 1;
+        pos += pn_len;
 
         const payload_start = pos;
         var is_ack_eliciting = false;
@@ -2317,7 +2358,7 @@ pub const Connection = struct {
 
         // Diagnostic: hex-dump first 40 bytes of packet before encryption
         writeStdout("SEND PKT space=");
-        writeHexU8(@intCast(@intFromEnum(space)));
+        writeHexU8(@intCast(@backingInt(space)));
         writeStdout(" pn=");
         writeHexU64(self.next_pkt_num[space_idx]);
         writeStdout(" total=");
@@ -2339,7 +2380,7 @@ pub const Connection = struct {
         );
         if (encrypt_err != .none) {
             writeStdout("ENCRYPT FAILED level=");
-            writeHexU8(@intCast(@intFromEnum(level)));
+            writeHexU8(@intCast(@backingInt(level)));
             writeStdout("\n");
             return 0;
         }
@@ -2357,7 +2398,7 @@ pub const Connection = struct {
         writeStdout("\n");
 
         // Record sent packet in recovery engine
-        const recovery_space: recovery.PktNumSpace = @enumFromInt(@intFromEnum(space));
+        const recovery_space: recovery.PktNumSpace = @fromBackingInt(@intCast(@backingInt(space)));
         self.recovery_engine.onPacketSent(recovery_space, .{
             .pkt_number = self.next_pkt_num[space_idx],
             .sent_tick = now_tick,
@@ -2407,12 +2448,7 @@ fn pemToDer(pem: []const u8, out: []u8) ?usize {
     var j: usize = start;
     while (j < end) : (j += 1) {
         const c = pem[j];
-        const val: ?u6 = if (c >= 'A' and c <= 'Z') @intCast(c - 'A')
-            else if (c >= 'a' and c <= 'z') @intCast(c - 'a' + 26)
-            else if (c >= '0' and c <= '9') @intCast(c - '0' + 52)
-            else if (c == '+') 62
-            else if (c == '/') 63
-            else null; // whitespace, padding
+        const val: ?u6 = if (c >= 'A' and c <= 'Z') @intCast(c - 'A') else if (c >= 'a' and c <= 'z') @intCast(c - 'a' + 26) else if (c >= '0' and c <= '9') @intCast(c - '0' + 52) else if (c == '+') 62 else if (c == '/') 63 else null; // whitespace, padding
         if (val) |v| {
             buf = (buf << 6) | @as(u32, v);
             bits += 6;
@@ -2463,7 +2499,7 @@ fn initTestClient() *Connection {
 
     conn.state = .idle;
     conn.is_server = false;
-    conn.version = @intFromEnum(packet.Version.quic_v1);
+    conn.version = @backingInt(packet.Version.quic_v1);
 
     for (0..max_cid_slots) |i| {
         conn.local_cids[i] = .{};
@@ -2487,7 +2523,7 @@ fn initTestClient() *Connection {
     conn.tls = .{};
     conn.tls.is_server = false;
     conn.recovery_engine.initInPlace(1_000_000); // 1MHz fake QPC freq
-    conn.stream_storage = &test_stream_storage;
+    conn.stream_storage = &test_stream_storage.items;
     conn.stream_mgr.init(&test_stream_storage, false);
     conn.datagrams = datagram.DatagramHandler.init();
     conn.datagrams.enabled = true;
@@ -2683,7 +2719,7 @@ test "state machine: handshaking to connected on successful handshake" {
 
     // Simulate successful handshake completion
     conn.state = .connected;
-    @atomicStore(u8, &conn.telem.conn_state, @intFromEnum(ConnState.connected), .monotonic);
+    @atomicStore(u8, &conn.telem.conn_state, @backingInt(ConnState.connected), .monotonic);
 
     try expectEqual(ConnState.connected, conn.state);
 }
@@ -2696,7 +2732,7 @@ test "state machine: handshaking to closed on handshake failure" {
 
     // Simulate handshake failure → close
     conn.state = .closed;
-    @atomicStore(u8, &conn.telem.conn_state, @intFromEnum(ConnState.closed), .monotonic);
+    @atomicStore(u8, &conn.telem.conn_state, @backingInt(ConnState.closed), .monotonic);
 
     try expectEqual(ConnState.closed, conn.state);
 }
@@ -2709,7 +2745,7 @@ test "state machine: connected to draining on CONNECTION_CLOSE received" {
 
     // Simulate receiving CONNECTION_CLOSE: transition to draining
     conn.state = .draining;
-    @atomicStore(u8, &conn.telem.conn_state, @intFromEnum(ConnState.draining), .monotonic);
+    @atomicStore(u8, &conn.telem.conn_state, @backingInt(ConnState.draining), .monotonic);
     const pto = conn.recovery_engine.getPto();
     const now_tick: u64 = 1_000_000;
     conn.draining_end_tick = now_tick + 3 * pto;
@@ -2733,7 +2769,7 @@ test "state machine: connected to closed on idle timeout" {
     // Simulate the tick() behavior: transition to closed on timeout
     if (timed_out) {
         conn.state = .closed;
-        @atomicStore(u8, &conn.telem.conn_state, @intFromEnum(ConnState.closed), .monotonic);
+        @atomicStore(u8, &conn.telem.conn_state, @backingInt(ConnState.closed), .monotonic);
     }
     try expectEqual(ConnState.closed, conn.state);
 }
@@ -2754,7 +2790,7 @@ test "state machine: draining to closed after 3xPTO" {
     const after_expiry = conn.draining_end_tick + 1;
     if (conn.draining_end_tick > 0 and after_expiry >= conn.draining_end_tick) {
         conn.state = .closed;
-        @atomicStore(u8, &conn.telem.conn_state, @intFromEnum(ConnState.closed), .monotonic);
+        @atomicStore(u8, &conn.telem.conn_state, @backingInt(ConnState.closed), .monotonic);
     }
     try expectEqual(ConnState.closed, conn.state);
 }
@@ -2964,7 +3000,7 @@ test "v2 packet type: Initial type bits are swapped vs v1" {
     // Build a v1 Initial header and a v2 Initial header, serialize both
     var hdr_v1 = PacketHeader{};
     hdr_v1.is_long = true;
-    hdr_v1.version = @intFromEnum(packet.Version.quic_v1);
+    hdr_v1.version = @backingInt(packet.Version.quic_v1);
     hdr_v1.pkt_type = .initial;
     hdr_v1.dst_cid.len = 8;
     hdr_v1.src_cid.len = 8;
@@ -2972,7 +3008,7 @@ test "v2 packet type: Initial type bits are swapped vs v1" {
 
     var hdr_v2 = PacketHeader{};
     hdr_v2.is_long = true;
-    hdr_v2.version = @intFromEnum(packet.Version.quic_v2);
+    hdr_v2.version = @backingInt(packet.Version.quic_v2);
     hdr_v2.pkt_type = .initial;
     hdr_v2.dst_cid.len = 8;
     hdr_v2.src_cid.len = 8;
@@ -2997,7 +3033,7 @@ test "v2 packet type: Initial type bits are swapped vs v1" {
 test "v2 packet type: Handshake type bits are swapped vs v1" {
     var hdr_v1 = PacketHeader{};
     hdr_v1.is_long = true;
-    hdr_v1.version = @intFromEnum(packet.Version.quic_v1);
+    hdr_v1.version = @backingInt(packet.Version.quic_v1);
     hdr_v1.pkt_type = .handshake;
     hdr_v1.dst_cid.len = 8;
     hdr_v1.src_cid.len = 8;
@@ -3005,7 +3041,7 @@ test "v2 packet type: Handshake type bits are swapped vs v1" {
 
     var hdr_v2 = PacketHeader{};
     hdr_v2.is_long = true;
-    hdr_v2.version = @intFromEnum(packet.Version.quic_v2);
+    hdr_v2.version = @backingInt(packet.Version.quic_v2);
     hdr_v2.pkt_type = .handshake;
     hdr_v2.dst_cid.len = 8;
     hdr_v2.src_cid.len = 8;
@@ -3030,7 +3066,7 @@ test "v2 packet type: serialize then parse with v2 produces correct packet type"
     // Serialize a v2 Initial packet
     var hdr = PacketHeader{};
     hdr.is_long = true;
-    hdr.version = @intFromEnum(packet.Version.quic_v2);
+    hdr.version = @backingInt(packet.Version.quic_v2);
     hdr.pkt_type = .initial;
     hdr.dst_cid.len = 8;
     hdr.src_cid.len = 8;
@@ -3045,12 +3081,12 @@ test "v2 packet type: serialize then parse with v2 produces correct packet type"
     const pr = packet.parseHeader(buf[0..sr.len]);
     try expectEqual(ParseError.none, pr.err);
     try expectEqual(packet.PacketType.initial, pr.header.pkt_type);
-    try expectEqual(@intFromEnum(packet.Version.quic_v2), pr.header.version);
+    try expectEqual(@backingInt(packet.Version.quic_v2), pr.header.version);
 
     // Also test Handshake round-trip
     var hdr2 = PacketHeader{};
     hdr2.is_long = true;
-    hdr2.version = @intFromEnum(packet.Version.quic_v2);
+    hdr2.version = @backingInt(packet.Version.quic_v2);
     hdr2.pkt_type = .handshake;
     hdr2.dst_cid.len = 8;
     hdr2.src_cid.len = 8;
@@ -3290,4 +3326,16 @@ test "0-RTT: setTicketCache copies external cache" {
     const entry = conn.ticket_cache.lookup(addr);
     try expect(entry != null);
     try expectEqual(@as(u64, 3_000_000), entry.?.transport_params.initial_max_data);
+}
+
+var mobile_test_conn: Connection = undefined;
+var mobile_test_storage: streams.Storage(streams.mobile_budget) = undefined;
+test "mobile connection advertises only backed receive storage" {
+    mobile_test_conn.initServerScopedInPlace(&mobile_test_storage, 0, .loopback);
+    defer mobile_test_conn.deinit();
+    try expectEqual(@as(u64, 16383), mobile_test_conn.local_params.initial_max_stream_data_bidi_local);
+    try expectEqual(@as(u64, 16383 * 4), mobile_test_conn.local_params.initial_max_data);
+    try expectEqual(@as(u64, 2), mobile_test_conn.local_params.initial_max_streams_bidi);
+    try expectEqual(@as(u64, 2), mobile_test_conn.local_params.initial_max_streams_uni);
+    try expectEqual(@as(usize, 4), mobile_test_conn.stream_mgr.streams.len);
 }

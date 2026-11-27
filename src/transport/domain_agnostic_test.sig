@@ -18,6 +18,8 @@ const testing = std.testing;
 // Every transport .sig file EXCEPT appmap.sig (the sole zpm-aware bridge).
 
 const modules = .{
+    .{ "mesh_network.sig", @embedFile("mesh_network.sig") },
+    .{ "mesh_transport.sig", @embedFile("mesh_transport.sig") },
     .{ "udp.sig", @embedFile("udp.sig") },
     .{ "packet.sig", @embedFile("packet.sig") },
     .{ "crypto.sig", @embedFile("crypto.sig") },

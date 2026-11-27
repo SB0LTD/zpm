@@ -10,7 +10,8 @@
 //   Gossip      → DATAGRAM frames (unreliable, latest-wins, <= 1200 B)
 //   Checkpoint  → reliable bidirectional stream (ordered, up to ~10 KB batches)
 //
-// Peer authentication uses Ed25519 over a 32-byte challenge. Ed25519 verify is
+// Peer authentication binds both fresh challenges, pinned identities and the
+// TLS session with Ed25519. Ed25519 verify is
 // pure Sig (std.crypto.sign.Ed25519) and is permitted at Layer 1.
 //
 // Caller-owned-struct convention (like appmap.AppMap): `Mesh` holds a pointer
@@ -40,16 +41,116 @@ pub const Error = error{
 /// is a DISABLED GATE — no public path is implemented in this module.
 pub const Config = struct {
     loopback_only: bool = true,
+    identity: ?*const std.crypto.sign.Ed25519.KeyPair = null,
+    peer: ?PeerId = null,
 };
 
 pub const Mesh = struct {
     conn: *conn.Connection,
     cfg: Config,
+    authenticated: bool = false,
+    auth_channel: [32]u8 = @splat(0),
+    failed: bool = false,
+    challenge: [32]u8 = undefined,
+    remote_challenge: ?[32]u8 = null,
+    next_auth: u64 = 0,
+    answer_auth: bool = false,
+    deadline: u64 = 0,
+    inbox: [8][1200]u8 = undefined,
+    lengths: [8]u16 = @splat(0),
+    head: u8 = 0,
+    tail: u8 = 0,
 
-    /// Wrap an externally-owned Connection. The connection owns the datagram
-    /// handler, stream manager and socket; `Mesh` holds a pointer to it.
+    /// Wrap an externally-owned Connection. The identity pointer must outlive
+    /// this Mesh. Reinitializing the connection requires a fresh Mesh as well.
+    /// Missing identity/pin configuration fails closed when authentication starts.
     pub fn init(c: *conn.Connection, cfg: Config) Mesh {
-        return .{ .conn = c, .cfg = cfg };
+        c.address_scope = if (cfg.loopback_only) .loopback else .lan;
+        var result: Mesh = .{ .conn = c, .cfg = cfg };
+        if (w32.BCryptGenRandom(null, &result.challenge, result.challenge.len, w32.BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) result.failed = true;
+        return result;
+    }
+    pub fn ready(self: *const Mesh) bool {
+        return self.authenticated and !self.failed and self.conn.state == .connected and std.mem.eql(u8, &self.auth_channel, &self.channel());
+    }
+    fn requireReady(self: *const Mesh) Error!void {
+        if (self.conn.state != .connected) return error.NotConnected;
+        if (!self.ready()) return error.AuthFailed;
+    }
+    fn rejectPeer(self: *Mesh) void {
+        self.failed = true;
+        self.authenticated = false;
+        self.conn.state = .closed;
+    }
+    fn channel(self: *const Mesh) [32]u8 {
+        var keys: [32]u8 = undefined;
+        @memcpy(keys[0..16], &self.conn.tls.tls13_engine.client_app_keys.key);
+        @memcpy(keys[16..32], &self.conn.tls.tls13_engine.server_app_keys.key);
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(&keys, &hash, .{});
+        return hash;
+    }
+    fn authBody(challenger_nonce: [32]u8, responder_nonce: [32]u8, challenger: PeerId, responder: PeerId, channel_hash: [32]u8) [176]u8 {
+        var out: [176]u8 = undefined;
+        @memcpy(out[0..16], "zpm-mesh-auth-v1");
+        @memcpy(out[16..48], &challenger_nonce);
+        @memcpy(out[48..80], &responder_nonce);
+        @memcpy(out[80..112], &challenger);
+        @memcpy(out[112..144], &responder);
+        @memcpy(out[144..176], &channel_hash);
+        return out;
+    }
+    fn ingress(self: *Mesh, data: []const u8) void {
+        if (std.mem.startsWith(u8, data, "ZMA1")) {
+            const identity = self.cfg.identity orelse {
+                self.rejectPeer();
+                return;
+            };
+            const peer = self.cfg.peer orelse {
+                self.rejectPeer();
+                return;
+            };
+            if (data.len != 72 or data[5] != 0 or data[6] != 0 or data[7] != 0) {
+                self.rejectPeer();
+                return;
+            }
+            if (data[4] == 1) {
+                if (!std.mem.eql(u8, data[8..40], &peer)) {
+                    self.rejectPeer();
+                    return;
+                }
+                const nonce = data[40..72].*;
+                if (self.remote_challenge) |old| {
+                    if (!std.mem.eql(u8, &old, &nonce)) {
+                        self.rejectPeer();
+                        return;
+                    }
+                } else {
+                    self.remote_challenge = nonce;
+                    self.next_auth = 0;
+                }
+                self.answer_auth = true;
+            } else if (data[4] == 2) {
+                const remote = self.remote_challenge orelse return;
+                const body = authBody(self.challenge, remote, identity.public_key.toBytes(), peer, self.channel());
+                const key = std.crypto.sign.Ed25519.PublicKey.fromBytes(peer) catch {
+                    self.rejectPeer();
+                    return;
+                };
+                const sig = std.crypto.sign.Ed25519.Signature.fromBytes(data[8..72].*);
+                sig.verifyStrict(&body, key) catch {
+                    self.rejectPeer();
+                    return;
+                };
+                self.authenticated = true;
+                self.auth_channel = self.channel();
+            } else self.rejectPeer();
+            return;
+        }
+        if (!self.ready() or data.len == 0 or data.len > 1200 or self.lengths[self.tail] != 0) return;
+        @memcpy(self.inbox[self.tail][0..data.len], data);
+        self.lengths[self.tail] = @intCast(data.len);
+        self.tail = (self.tail + 1) % 8;
     }
 
     /// Broadcast an opaque gossip payload as a single DATAGRAM frame.
@@ -57,7 +158,7 @@ pub const Mesh = struct {
     /// Oversized payloads return error.TooLarge; a full/unavailable queue
     /// returns error.StreamUnavailable.
     pub fn broadcastGossip(self: *Mesh, msg: []const u8) Error!void {
-        if (self.conn.state != .connected) return error.NotConnected;
+        try self.requireReady();
         if (msg.len > datagram.max_datagram_size) return error.TooLarge;
         if (!self.conn.datagrams.queueSend(msg)) return error.StreamUnavailable;
     }
@@ -71,7 +172,12 @@ pub const Mesh = struct {
         // ingress (conn.dispatchFrames validates them through onReceive first),
         // so pollGossip simply drains that ring — it reads the WIRE, not the
         // outbound send queue.
-        return self.conn.datagrams.dequeueReceived();
+        if (!self.ready() or self.lengths[self.head] == 0) return null;
+        const size = self.lengths[self.head];
+        const result = self.inbox[self.head][0..size];
+        self.lengths[self.head] = 0;
+        self.head = (self.head + 1) % 8;
+        return result;
     }
 
     /// Send an opaque checkpoint batch over a reliable bidirectional stream.
@@ -79,6 +185,7 @@ pub const Mesh = struct {
     /// stream. Opening a stream when the limit is reached returns
     /// error.StreamUnavailable; a partial write returns error.ShortWrite.
     pub fn sendCheckpointBatch(self: *Mesh, batch: []const u8) Error!void {
+        try self.requireReady();
         const sid = self.conn.stream_mgr.openStream(true) orelse return error.StreamUnavailable;
         const written = self.conn.stream_mgr.writeToStream(sid, batch);
         if (written < batch.len) return error.ShortWrite;
@@ -87,6 +194,7 @@ pub const Mesh = struct {
     /// Read an opaque checkpoint batch from a reliable stream into `out`.
     /// Returns the number of bytes read.
     pub fn readCheckpointBatch(self: *Mesh, stream_id: u64, out: []u8) u32 {
+        if (!self.ready()) return 0;
         return self.conn.stream_mgr.readFromStream(stream_id, out);
     }
 
@@ -102,14 +210,64 @@ pub const Mesh = struct {
         const Ed25519 = std.crypto.sign.Ed25519;
         const pub_key = Ed25519.PublicKey.fromBytes(peer.*) catch return error.AuthFailed;
         const signature = Ed25519.Signature.fromBytes(sig.*);
-        signature.verify(challenge, pub_key) catch return error.AuthFailed;
+        signature.verifyStrict(challenge, pub_key) catch return error.AuthFailed;
     }
 
     /// Drive the underlying connection forward (recv, process frames, send).
     pub fn tick(self: *Mesh) conn.ConnState {
-        return self.conn.tick();
+        if (self.failed) return .closed;
+        const now = nowMs();
+        if (self.deadline == 0) self.deadline = now + 30_000;
+        if (!self.authenticated and now >= self.deadline) {
+            self.rejectPeer();
+            return .closed;
+        }
+        const state = self.conn.tick();
+        if (state != .connected) return state;
+        while (self.conn.datagrams.dequeueReceived()) |data| {
+            self.ingress(data);
+            if (self.failed) return .closed;
+        }
+        // Continue answering proof requests after local authentication: the peer
+        // may still need our proof if its previous datagram was lost.
+        if ((!self.authenticated or self.answer_auth) and now >= self.next_auth) {
+            const identity = self.cfg.identity orelse {
+                self.rejectPeer();
+                return .closed;
+            };
+            const peer = self.cfg.peer orelse {
+                self.rejectPeer();
+                return .closed;
+            };
+            var message: [72]u8 = @splat(0);
+            @memcpy(message[0..4], "ZMA1");
+            message[4] = 1;
+            @memcpy(message[8..40], &identity.public_key.toBytes());
+            @memcpy(message[40..72], &self.challenge);
+            if (!self.authenticated) _ = self.conn.datagrams.queueSend(&message);
+            if (self.remote_challenge) |remote| {
+                const body = authBody(remote, self.challenge, peer, identity.public_key.toBytes(), self.channel());
+                const signature = identity.sign(&body, null) catch {
+                    self.rejectPeer();
+                    return .closed;
+                };
+                message[4] = 2;
+                @memcpy(message[8..72], &signature.toBytes());
+                _ = self.conn.datagrams.queueSend(&message);
+            }
+            self.next_auth = now + 100;
+            self.answer_auth = false;
+        }
+        return self.conn.state;
     }
 };
+fn nowMs() u64 {
+    var counter: w32.LARGE_INTEGER = .{};
+    var frequency: w32.LARGE_INTEGER = .{};
+    _ = w32.QueryPerformanceCounter(&counter);
+    _ = w32.QueryPerformanceFrequency(&frequency);
+    return @intCast(@divTrunc(counter.QuadPart, @divTrunc(frequency.QuadPart, 1000)));
+}
 
 // ── Tests ──
 // Feature: distributed-mmorpg-infrastructure
@@ -125,10 +283,25 @@ const w32 = @import("win32");
 
 // Module-level statics — StreamArray is multi-MB and Connection is large; these
 // must never be stack locals.
-var mesh_client_storage: streams.StreamArray = undefined;
+var mesh_client_storage: streams.Storage(streams.mobile_budget) = undefined;
 var mesh_server_storage: streams.StreamArray = undefined;
 var mesh_client_conn: conn.Connection = undefined;
 var mesh_server_conn: conn.Connection = undefined;
+var client_identity: std.crypto.sign.Ed25519.KeyPair = undefined;
+var server_identity: std.crypto.sign.Ed25519.KeyPair = undefined;
+fn authenticatedPair(sender: *Mesh, receiver: *Mesh) !void {
+    client_identity = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(11));
+    server_identity = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(22));
+    sender.* = Mesh.init(&mesh_client_conn, .{ .identity = &client_identity, .peer = server_identity.public_key.toBytes() });
+    receiver.* = Mesh.init(&mesh_server_conn, .{ .identity = &server_identity, .peer = client_identity.public_key.toBytes() });
+    for (0..2000) |_| {
+        _ = sender.tick();
+        _ = receiver.tick();
+        if (sender.ready() and receiver.ready()) return;
+        w32.Sleep(1);
+    }
+    return error.AuthenticationStalled;
+}
 
 // Large opaque payload buffers — module-level to avoid stack pressure.
 var ckpt_send_buf: [10016]u8 = undefined;
@@ -235,8 +408,9 @@ test "M2: 184-byte gossip datagram crosses the socket" {
     defer teardown();
     if (iters == null) return error.HandshakeStalled;
 
-    var sender = Mesh.init(&mesh_client_conn, .{});
-    var receiver = Mesh.init(&mesh_server_conn, .{});
+    var sender: Mesh = undefined;
+    var receiver: Mesh = undefined;
+    try authenticatedPair(&sender, &receiver);
 
     var payload: [184]u8 = undefined;
     for (&payload, 0..) |*b, i| b.* = @truncate(i);
@@ -248,8 +422,8 @@ test "M2: 184-byte gossip datagram crosses the socket" {
     var got: ?[]const u8 = null;
     var it: u32 = 0;
     while (it < 200) : (it += 1) {
-        _ = mesh_client_conn.tick();
-        _ = mesh_server_conn.tick();
+        _ = sender.tick();
+        _ = receiver.tick();
         got = receiver.pollGossip();
         if (got != null) break;
     }
@@ -269,8 +443,9 @@ test "M3: 10016-byte checkpoint batch reassembles over the socket" {
     defer teardown();
     if (iters == null) return error.HandshakeStalled;
 
-    var sender = Mesh.init(&mesh_client_conn, .{});
-    var receiver = Mesh.init(&mesh_server_conn, .{});
+    var sender: Mesh = undefined;
+    var receiver: Mesh = undefined;
+    try authenticatedPair(&sender, &receiver);
 
     for (&ckpt_send_buf, 0..) |*b, i| b.* = @truncate(i * 7 + 3);
 
@@ -282,8 +457,8 @@ test "M3: 10016-byte checkpoint batch reassembles over the socket" {
     // out once (reading repeatedly would consume partial data).
     var it: u32 = 0;
     while (it < 600) : (it += 1) {
-        _ = mesh_client_conn.tick();
-        _ = mesh_server_conn.tick();
+        _ = sender.tick();
+        _ = receiver.tick();
         if (mesh_server_conn.stream_mgr.getStream(0)) |s| {
             if (s.recv_buf.available() >= ckpt_send_buf.len) break;
         }
@@ -292,6 +467,22 @@ test "M3: 10016-byte checkpoint batch reassembles over the socket" {
     const total = receiver.readCheckpointBatch(0, &ckpt_recv_buf);
     try testing.expectEqual(@as(u32, ckpt_send_buf.len), total);
     try testing.expectEqualSlices(u8, &ckpt_send_buf, ckpt_recv_buf[0..total]);
+
+    // Reverse direction: the default-profile server must honor the mobile
+    // client's advertised window, not its own larger receive capacity.
+    try receiver.sendCheckpointBatch(&ckpt_send_buf);
+    it = 0;
+    while (it < 600) : (it += 1) {
+        _ = receiver.tick();
+        _ = sender.tick();
+        if (mesh_client_conn.stream_mgr.getStream(1)) |s| {
+            if (s.recv_buf.available() >= ckpt_send_buf.len) break;
+        }
+    }
+    const reverse_total = sender.readCheckpointBatch(1, &ckpt_recv_buf);
+    try testing.expectEqual(@as(u32, ckpt_send_buf.len), reverse_total);
+    try testing.expectEqualSlices(u8, &ckpt_send_buf, ckpt_recv_buf[0..reverse_total]);
+    try testing.expectEqual(@as(u64, 16383), mesh_server_conn.stream_mgr.getStream(1).?.max_data_remote);
 }
 
 // broadcastGossip precondition: NotConnected before the handshake completes.
@@ -305,6 +496,111 @@ test "broadcastGossip returns NotConnected when idle" {
 }
 
 const loopback_zero = w32.sockaddr_in{ .sin_port = 0, .sin_addr = 0x0100007F };
+
+test "unauthenticated connection cannot expose gossip or checkpoints" {
+    if (driveHandshake() == null) return error.HandshakeStalled;
+    defer teardown();
+    var sender = Mesh.init(&mesh_client_conn, .{});
+    try testing.expectError(error.AuthFailed, sender.broadcastGossip("forged"));
+    try testing.expectError(error.AuthFailed, sender.sendCheckpointBatch("forged"));
+    sender.ingress("forged");
+    try testing.expect(sender.pollGossip() == null);
+    var output: [8]u8 = undefined;
+    try testing.expectEqual(@as(u32, 0), sender.readCheckpointBatch(0, &output));
+}
+
+test "authentication proof from a different challenge closes the connection" {
+    if (driveHandshake() == null) return error.HandshakeStalled;
+    defer teardown();
+    var sender: Mesh = undefined;
+    var receiver: Mesh = undefined;
+    try authenticatedPair(&sender, &receiver);
+    var stale = receiver.challenge;
+    stale[0] ^= 1;
+    const body = Mesh.authBody(stale, sender.challenge, server_identity.public_key.toBytes(), client_identity.public_key.toBytes(), receiver.channel());
+    const signature = try client_identity.sign(&body, null);
+    var message: [72]u8 = @splat(0);
+    @memcpy(message[0..4], "ZMA1");
+    message[4] = 2;
+    @memcpy(message[8..72], &signature.toBytes());
+    receiver.ingress(&message);
+    try testing.expect(receiver.failed and !receiver.ready());
+    try testing.expectEqual(conn.ConnState.closed, mesh_server_conn.state);
+}
+
+test "network scope rejects nonlocal addresses and only explicitly allows private LAN" {
+    try testing.expect(conn.addressAllowed(.loopback, 0x0100007f));
+    try testing.expect(!conn.addressAllowed(.loopback, 0x0101a8c0));
+    try testing.expect(conn.addressAllowed(.lan, 0x0101a8c0));
+    try testing.expect(!conn.addressAllowed(.lan, 0x08080808));
+    conn.Connection.initClientInPlace(&mesh_client_conn, &mesh_client_storage, .{ .sin_addr = 0x08080808, .sin_port = w32.htons(443) }, 0);
+    defer mesh_client_conn.socket.deinit();
+    var sender = Mesh.init(&mesh_client_conn, .{});
+    try testing.expectEqual(conn.ConnState.closed, sender.tick());
+    try testing.expectEqual(@as(u64, 0), mesh_client_conn.telem.packets_sent);
+}
+
+test "gossip survives full packet-number width boundaries" {
+    if (driveHandshake() == null) return error.HandshakeStalled;
+    defer teardown();
+    var sender: Mesh = undefined;
+    var receiver: Mesh = undefined;
+    try authenticatedPair(&sender, &receiver);
+    for ([_]u64{ 0x100, 0x10000, 0x1000000 }) |number| {
+        mesh_client_conn.next_pkt_num[2] = number;
+        var payload: [184]u8 = @splat(0);
+        @memcpy(payload[0..8], &@as([8]u8, @bitCast(number)));
+        try sender.broadcastGossip(&payload);
+        var received = false;
+        for (0..2000) |_| {
+            _ = sender.tick();
+            _ = receiver.tick();
+            if (receiver.pollGossip()) |message| {
+                try testing.expectEqualSlices(u8, &payload, message);
+                received = true;
+                break;
+            }
+            w32.Sleep(1);
+        }
+        try testing.expect(received);
+    }
+}
+
+test "a different pinned identity never authenticates" {
+    if (driveHandshake() == null) return error.HandshakeStalled;
+    defer teardown();
+    client_identity = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(11));
+    server_identity = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(22));
+    const wrong = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(33));
+    var sender = Mesh.init(&mesh_client_conn, .{ .identity = &client_identity, .peer = wrong.public_key.toBytes() });
+    var receiver = Mesh.init(&mesh_server_conn, .{ .identity = &server_identity, .peer = client_identity.public_key.toBytes() });
+    for (0..2000) |_| {
+        _ = sender.tick();
+        _ = receiver.tick();
+        if (sender.failed) break;
+        w32.Sleep(1);
+    }
+    try testing.expect(sender.failed and !sender.ready());
+    try testing.expect(sender.pollGossip() == null);
+}
+
+test "a valid identity signature bound to another TLS channel is rejected" {
+    if (driveHandshake() == null) return error.HandshakeStalled;
+    defer teardown();
+    var sender: Mesh = undefined;
+    var receiver: Mesh = undefined;
+    try authenticatedPair(&sender, &receiver);
+    var channel_hash = receiver.channel();
+    channel_hash[0] ^= 1;
+    const body = Mesh.authBody(receiver.challenge, sender.challenge, server_identity.public_key.toBytes(), client_identity.public_key.toBytes(), channel_hash);
+    const signature = try client_identity.sign(&body, null);
+    var message: [72]u8 = @splat(0);
+    @memcpy(message[0..4], "ZMA1");
+    message[4] = 2;
+    @memcpy(message[8..72], &signature.toBytes());
+    receiver.ingress(&message);
+    try testing.expect(receiver.failed and !receiver.ready());
+}
 
 // Feature: distributed-mmorpg-infrastructure, Requirement 4.2-4.3
 test "onChallenge accepts a valid Ed25519 signature and rejects a wrong one" {

@@ -22,22 +22,38 @@
 // tiny platform-conditional seam so the same source links for Windows (kernel32
 // WriteFile) and Android/Linux (raw write syscall).
 
+const std = @import("std");
 const builtin = @import("builtin");
 const mesh_transport = @import("mesh_transport");
 const conn = @import("conn");
 const streams = @import("streams");
 const w32 = @import("win32");
 
+/// Deterministic loopback/LAN test certificate: a 32-byte ECDSA P-256 private
+/// scalar and its 65-byte SEC1 public point. Mirrors makeMeshTestCert in the
+/// mesh_transport M1 harness so a server mesh-node presents a cert the client
+/// can verify (loopback/LAN trust). NOT a production PKI certificate.
+fn makeMeshTestCert(cert_out: *[65]u8) [32]u8 {
+    const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+    var seed: [32]u8 = undefined;
+    for (&seed, 0..) |*b, i| b.* = @truncate(0x51 + i);
+    const kp = EcdsaP256.KeyPair.generateDeterministic(seed) catch unreachable;
+    const scalar = kp.secret_key.toBytes();
+    cert_out.* = kp.public_key.toUncompressedSec1();
+    return scalar;
+}
+
 // ── Config (edit for the target role/addresses; defaults = loopback client) ──
 
 const Role = enum { server, client };
 
 const role: Role = .client;
-const bind_port: u16 = 0; // 0 = OS-assigned ephemeral local port
-const peer_addr_be: u32 = 0x0100007F; // 127.0.0.1 (little-endian host 1.0.0.127 wire)
+const bind_port: u16 = 0; // OS-assigned ephemeral local port
+const peer_addr_be: u32 = 0xD601A8C0; // 192.168.1.214 (phone) network-order sin_addr
 const peer_port: u16 = 46000;
 const max_exchanges: u32 = 8; // exit after this many sent/received payloads
-const tick_budget: u32 = 20_000; // tick cap (timeout stand-in) if idle
+const tick_budget: u32 = 600_000; // tick cap; with ~1ms sleep/tick this is ~10 min
+const tick_sleep_ns: u64 = 1_000_000; // 1ms between ticks so the loop doesn't busy-spin
 
 // A small known gossip payload the client broadcasts and the server prints.
 const gossip_payload = "minegrind-mesh-hello";
@@ -77,6 +93,22 @@ fn writeOut(s: []const u8) void {
     }
 }
 
+const kernel32 = struct {
+    extern "kernel32" fn Sleep(dwMilliseconds: u32) callconv(.c) void;
+};
+
+/// Sleep ~tick_sleep_ns so the tick loop paces itself (keeps a server alive for
+/// a human-timescale client without busy-spinning through the tick budget).
+fn sleepTick() void {
+    if (builtin.os.tag == .windows) {
+        kernel32.Sleep(@intCast(tick_sleep_ns / 1_000_000));
+    } else {
+        const linux = @import("std").os.linux;
+        var ts = linux.timespec{ .sec = 0, .nsec = @intCast(tick_sleep_ns) };
+        _ = linux.syscall2(.nanosleep, @intFromPtr(&ts), @intFromPtr(&ts));
+    }
+}
+
 pub fn main() void {
     writeOut("mesh-node: start\n");
 
@@ -88,7 +120,12 @@ pub fn main() void {
     switch (role) {
         .server => {
             conn.Connection.initServerInPlace(&node_conn, &node_stream_storage, bind_port);
-            writeOut("mesh-node: role=server\n");
+            // Load the server's test certificate + ECDSA P-256 key before its
+            // first tick, so the client can verify CertificateVerify.
+            var cert: [65]u8 = undefined;
+            const scalar = makeMeshTestCert(&cert);
+            _ = node_conn.loadTlsCertificate(&cert, &scalar);
+            writeOut("mesh-node: role=server (cert loaded)\n");
         },
         .client => {
             conn.Connection.initClientInPlace(&node_conn, &node_stream_storage, peer, bind_port);
@@ -103,13 +140,17 @@ pub fn main() void {
     var ticks: u32 = 0;
     while (exchanges < max_exchanges and ticks < tick_budget) : (ticks += 1) {
         _ = mesh.tick();
+        sleepTick();
 
         switch (role) {
             .client => {
-                // Periodically broadcast a small known payload.
-                if (ticks % 64 == 0) {
+                // Only broadcast once the QUIC handshake has completed; before
+                // then broadcastGossip returns NotConnected (by design). Over a
+                // real network the handshake takes many ticks, so gate on state
+                // and pace the sends.
+                if (node_conn.state == .connected and ticks % 64 == 0) {
                     mesh.broadcastGossip(gossip_payload) catch |e| switch (e) {
-                        error.StreamUnavailable => {}, // queue momentarily full — retry next loop
+                        error.NotConnected, error.StreamUnavailable => {}, // not ready / queue full — retry
                         else => {
                             writeOut("mesh-node: broadcast error\n");
                             return;

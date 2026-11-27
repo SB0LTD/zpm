@@ -42,9 +42,37 @@ fn ensureWsa() SocketError {
 
 // ── UdpSocket ──
 
+/// Bounded receive queue for a connection sharing a listener. The owner alone
+/// reads the OS socket and demultiplexes packets; a borrower cannot drain peers.
+pub const Inbox = struct {
+    bytes: [4][1500]u8 = undefined,
+    sources: [4]w32.sockaddr_in = undefined,
+    lengths: [4]u16 = @splat(0),
+    head: u8 = 0,
+    tail: u8 = 0,
+    count: u8 = 0,
+    pub fn push(self: *Inbox, data: []const u8, source: w32.sockaddr_in) bool {
+        if (data.len > 1500 or self.count == 4) return false;
+        @memcpy(self.bytes[self.tail][0..data.len], data);
+        self.sources[self.tail] = source;
+        self.lengths[self.tail] = @intCast(data.len);
+        self.tail = (self.tail + 1) % 4;
+        self.count += 1;
+        return true;
+    }
+};
+
 pub const UdpSocket = struct {
     handle: w32.SOCKET,
     bound: bool,
+    owned: bool = true,
+    inbox: ?*Inbox = null,
+
+    /// Borrow only send access to the owner's bound socket. Receive is confined
+    /// to the caller-owned queue. Owner and queue must outlive the borrower.
+    pub fn borrow(self: *const UdpSocket, inbox: *Inbox) UdpSocket {
+        return .{ .handle = self.handle, .bound = self.bound, .owned = false, .inbox = inbox };
+    }
 
     pub fn init() UdpSocket {
         const wsa_err = ensureWsa();
@@ -68,6 +96,16 @@ pub const UdpSocket = struct {
     }
 
     pub fn recv(self: *UdpSocket, buf: []u8) RecvResult {
+        if (self.inbox) |inbox| {
+            if (inbox.count == 0) return .{ .bytes_read = 0, .src_addr = .{}, .err = .would_block };
+            const index = inbox.head;
+            const length = inbox.lengths[index];
+            inbox.head = (inbox.head + 1) % 4;
+            inbox.count -= 1;
+            if (length > buf.len) return .{ .bytes_read = 0, .src_addr = inbox.sources[index], .err = .buffer_too_small };
+            @memcpy(buf[0..length], inbox.bytes[index][0..length]);
+            return .{ .bytes_read = length, .src_addr = inbox.sources[index], .err = .none };
+        }
         var src_addr: w32.sockaddr_in = .{};
         var addr_len: c_int = @sizeOf(w32.sockaddr_in);
         const len: c_int = if (buf.len > 65535) 65535 else @intCast(buf.len);
@@ -103,10 +141,11 @@ pub const UdpSocket = struct {
     }
 
     pub fn deinit(self: *UdpSocket) void {
-        if (self.handle != w32.INVALID_SOCKET) {
+        if (self.owned and self.handle != w32.INVALID_SOCKET) {
             _ = w32.closesocket(self.handle);
-            self.handle = w32.INVALID_SOCKET;
         }
+        self.handle = w32.INVALID_SOCKET;
+        self.inbox = null;
         self.bound = false;
     }
 
