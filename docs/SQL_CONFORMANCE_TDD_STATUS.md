@@ -1,5 +1,61 @@
 # SQL conformance TDD checkpoint
 
+## Extended types (lane B11 wave 4, types-ext) — 27 November 2026
+
+Branch `w4/types-ext` closes most of the advanced-types gaps of wave 2.
+`contract-sql-types-ext` (tests/test_sql_types_ext.sig) checks values,
+result OIDs and typmods, NULLs, exact SQLSTATEs, statement atomicity, wire
+send/receive and change-record replay into a replica. Every expectation
+was checked against native PostgreSQL 18.7.
+
+- **void**: the pseudo-type (OID 2278, empty output, no operators, no
+  columns: 42P16) and the void-returning session functions `pg_notify`,
+  `pg_advisory_lock[_shared]`, `pg_advisory_xact_lock[_shared]` and
+  `pg_advisory_unlock_all`. A conflicting blocking advisory request parks the
+  statement (WouldBlock) waiting for the holders' transactions; a holder
+  outside any transaction wakes it through unlock. A parked statement's
+  session-level grants are undone so its re-delivery counts them once.
+  `pg_sleep` is not provided.
+- **Arrays**: `array_position(s)`, `array_replace`, `trim_array`,
+  `array_fill`, `array_reverse`, `array_sort`, `array_sample`,
+  `array_shuffle` (a session PRNG through the session hook),
+  `string_to_array`, `width_bucket(anycompatible, anycompatiblearray)`,
+  `generate_subscripts`, `unnest` of several arrays in FROM (WITH
+  ORDINALITY), several set-returning targets in lockstep, `UPDATE ... SET
+  a[i] = v` / `a[i:j] = v` (one-dimensional arrays extend with NULLs),
+  `array_agg`/`string_agg` as window functions (frames, exclusions, FILTER),
+  and collecting or DISTINCT aggregates in GROUPING SETS / ROLLUP / CUBE
+  through a sorted grouping-set path.
+- **Multiranges**: the six built-in multirange types (change-record value
+  tag 40, rebuilt and checked canonical on replay; multirange_send/recv),
+  constructors, `multirange(range)`, accessors, `range_merge`, the
+  operators with ranges and elements, ordering/hashing, `unnest`,
+  `range_agg` and `range_intersect_agg`. MIN/MAX over ranges stay 42883, as
+  in PostgreSQL 18.
+- **Geometry**: lseg, line, path, polygon and circle (value tag 41,
+  validated on replay; their send/recv forms), every geo_ops function
+  PostgreSQL 18 lists by name, the casts between geometric types, and the
+  operators `+ - * /`, `= < > <= >= <>`, `~=`, `<->`, `@>`, `<@`, `&&`,
+  `<< >> &< &>` for their PostgreSQL signatures. point/box/lseg/line take
+  subscripts. Operators that need new lexer tokens (`@-@`, `@@`, `#`, `##`,
+  `?#`, `?-`, `?|`, `?-|`, `?||`, `<<|`, `|>>`, `&<|`, `|&>`, `<^`, `>^`) and
+  polygon `&&`/`@>`/`<<` remain open, as does element assignment into
+  point/box columns.
+- **Network**: macaddr8 (OID 774, value tag 46) with its seven input
+  layouts, macaddr <-> macaddr8, `trunc`, `macaddr8_set7bit`, the bitwise
+  operators, `inet + - int8`, `inet - inet`, `abbrev`, `set_masklen`,
+  `hostmask`, `inet_merge` and `inet_same_family`.
+- **XML**: XMLELEMENT/XMLATTRIBUTES, XMLFOREST, XMLCONCAT, XMLAGG (ORDER
+  BY), XMLPI, XMLCOMMENT, XMLTEXT and XMLROOT with PostgreSQL's name
+  escaping and value mapping (2200T, 2200S). XPath (`xpath`,
+  `xpath_exists`, XMLEXISTS), XMLTABLE and `XMLSERIALIZE ... INDENT` remain
+  open: no libxml2 replacement was written in this wave.
+
+Change records: value tags 40 (multirange), 41 (geometry) and 46
+(macaddr8); older records never use them and replay unchanged. No new op.
+The built-in pg_type view grows from 99 to 123 rows; the types-advanced
+and text contract workspaces grow to 256 rows to scan it.
+
 ## View _RETURN rule definitions — qualified, 27 November 2026
 
 The failing contract reproduced a non-null pg_rewrite row whose pg_get_ruledef

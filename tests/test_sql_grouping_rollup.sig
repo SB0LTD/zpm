@@ -97,7 +97,9 @@ pub fn main() !void {
     try reject("SELECT GROUPING(v),COUNT(*) FROM fact GROUP BY ROLLUP(k)",error.GroupingError);
     try reject("SELECT id FROM fact WHERE GROUPING(k)=0",error.GroupingError);
     try reject("SELECT COUNT(*) FROM fact GROUP BY ROLLUP()",error.Syntax);
-    try reject("SELECT k,COUNT(DISTINCT v+1) FROM fact GROUP BY ROLLUP(k)",error.UnsupportedStatement);
+    // DISTINCT beyond count(DISTINCT column) uses the sorted grouping-set
+    // path (types-ext lane, B11 wave 4); checked against native PostgreSQL 18.7.
+    try fixture("SELECT k,COUNT(DISTINCT v+1) FROM fact GROUP BY ROLLUP(k) ORDER BY GROUPING(k),k NULLS LAST","1\x1f2\x1e2\x1f1\x1e<NULL>\x1f1\x1e<NULL>\x1f4");
     try reject("SELECT k,COUNT(*) FROM fact GROUP BY ROLLUP(k) HAVING 1/(COUNT(*)-COUNT(*))>0",error.DivisionByZero);
     // A volatile argument is evaluated once per input, shared across levels.
     try run("CREATE SEQUENCE s START 1");

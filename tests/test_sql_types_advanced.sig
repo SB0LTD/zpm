@@ -16,7 +16,7 @@ const std = @import("std");
 const sql = @import("sql");
 const pg_types = @import("pg_types");
 
-const DB = sql.Database(.{ .tables = 4, .columns = 8, .rows_per_table = 16, .name_bytes = 32, .text_bytes = 160, .integer_bits = 32, .nulls_first_ascending = false, .work_rows = 128, .result_rows = 48 });
+const DB = sql.Database(.{ .tables = 4, .columns = 8, .rows_per_table = 16, .name_bytes = 32, .text_bytes = 160, .integer_bits = 32, .nulls_first_ascending = false, .work_rows = 256, .result_rows = 48 });
 const Io = DB.Io;
 const Wire = pg_types.Types(DB.Result);
 var assertions: usize = 0;

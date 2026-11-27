@@ -1738,6 +1738,8 @@ pub fn Parser(comptime config: types.Config) type {
                 .integer, .int, .int4, .bigint, .int8, .smallint, .int2, .boolean, .@"bool", .text, .numeric, .decimal, .real, .float4, .float8, .float, .double, .name, .oid, .date, .timestamp, .timestamptz, .interval, .json, .jsonb, .regclass, .regtype, .regnamespace, .regproc => true,
                 .varchar, .character, .char, .bpchar, .uuid, .bytea, .time, .timetz, .bit, .varbit, .money => true,
                 .pg_lsn, .xid8, .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange, .inet, .cidr, .macaddr, .point, .box, .xml, .jsonpath, .tsvector, .tsquery => true,
+                .void, .macaddr8, .lseg, .line, .path, .polygon, .circle => true,
+                .int4multirange, .int8multirange, .nummultirange, .datemultirange, .tsmultirange, .tstzmultirange => true,
                 else => false,
             };
         }
@@ -1880,7 +1882,7 @@ pub fn Parser(comptime config: types.Config) type {
             }
             if (array) {
                 if (ast.regKind(spec.typmod) != .none) return error.UnsupportedStatement;
-                if (!types.isArray(spec.ty)) spec.ty = types.arrayType(spec.ty) orelse return error.Syntax;
+                if (!types.isArray(spec.ty)) spec.ty = types.arrayType(spec.ty) orelse return if (spec.ty == .void) error.UndefinedObject else error.Syntax;
             }
             return spec;
         }
@@ -1982,6 +1984,19 @@ pub fn Parser(comptime config: types.Config) type {
                 .jsonpath => .{ .ty = .jsonpath },
                 .tsvector => .{ .ty = .tsvector },
                 .tsquery => .{ .ty = .tsquery },
+                .void => .{ .ty = .void },
+                .macaddr8 => .{ .ty = .macaddr8 },
+                .lseg => .{ .ty = .lseg },
+                .line => .{ .ty = .line },
+                .path => .{ .ty = .path },
+                .polygon => .{ .ty = .polygon },
+                .circle => .{ .ty = .circle },
+                .int4multirange => .{ .ty = .int4multirange },
+                .int8multirange => .{ .ty = .int8multirange },
+                .nummultirange => .{ .ty = .nummultirange },
+                .datemultirange => .{ .ty = .datemultirange },
+                .tsmultirange => .{ .ty = .tsmultirange },
+                .tstzmultirange => .{ .ty = .tstzmultirange },
                 .character, .char => blk: {
                     const varying = try self.takeWord("VARYING");
                     break :blk .{ .ty = if (varying) .varchar else .bpchar, .typmod = try self.characterLength(!varying) };
@@ -2318,6 +2333,8 @@ pub fn Parser(comptime config: types.Config) type {
                 const spec = try self.typeName();
                 // regclass/regtype columns are outside the subset.
                 if (spec.typmod < -1) return error.UnsupportedStatement;
+                // A column cannot have the void pseudo-type (42P16).
+                if (spec.ty == .void) return error.InvalidTableDefinition;
                 column.type_name = if (mysql_bigint and spec.ty == .int8 and try self.takeRaw("unsigned")) .mysql_bigint_unsigned else spec.ty;
                 column.typmod = spec.typmod;
             }
@@ -3280,7 +3297,7 @@ pub fn Parser(comptime config: types.Config) type {
                         if (self.mode == .standard and self.tokens.dialect == .postgres and !self.pool.complex and n.kind == .function) {
                             var buf: [64]u8 = undefined;
                             if (identText(self.source, n.name, &buf)) |name| {
-                                if (types.same(name, "unnest")) self.pool.complex = true;
+                                if (types.same(name, "unnest") or types.same(name, "generate_subscripts")) self.pool.complex = true;
                             }
                         }
                         target.expression_end = self.previous_end;
@@ -3561,7 +3578,18 @@ pub fn Parser(comptime config: types.Config) type {
             if (self.mode != .standard or !self.isSymbol(.lparen)) {
                 if (count.* == config.columns) return error.DuplicateColumn;
                 const column = try self.identifier();
+                if (self.mode == .standard and self.isSymbol(.lbracket)) return self.subscriptedSetItem(items, count, column);
                 try self.expectSymbol(.eq);
+                // A plain assignment after a subscripted one: 42601.
+                if (self.mode == .standard) for (items[0..count.*]) |*item| {
+                    const previous = &self.pool.nodes[item.value];
+                    if (previous.kind != .function or previous.func != .array_set) continue;
+                    var a: [64]u8 = undefined;
+                    var b: [64]u8 = undefined;
+                    const left = identText(self.source, item.column, &a) orelse continue;
+                    const right = identText(self.source, column, &b) orelse continue;
+                    if (types.same(left, right)) return error.Syntax;
+                };
                 items[count.*] = .{ .column = column, .value = try self.valueItem() };
                 count.* += 1;
                 return;
@@ -3589,6 +3617,133 @@ pub fn Parser(comptime config: types.Config) type {
                 count.* += 1;
             }
             try self.expectSymbol(.rparen);
+        }
+
+        /// `column[...] = value` (B11 wave 4): the column becomes
+        /// array_set(column, value, subscripts...). Further subscripted
+        /// assignments to the same column apply to the previous result.
+        fn subscriptedSetItem(self: *Self, items: *[config.columns]Ast.Assignment, count: *usize, column: ast.Ident) Error!void {
+            const base = try self.pool.add(.{ .kind = .column, .name = column });
+            const node = try self.subscriptTail(base);
+            try self.expectSymbol(.eq);
+            const assigned = try self.valueItem();
+            if (self.pool.nodes[assigned].kind == .default_value) return error.UnsupportedStatement;
+            self.pool.nodes[node].func = .array_set;
+            self.pool.nodes[assigned].next = self.pool.nodes[base].next;
+            self.pool.nodes[base].next = assigned;
+            try self.pool.raise(node, assigned);
+            var wanted_buffer: [64]u8 = undefined;
+            const wanted = identText(self.source, column, &wanted_buffer);
+            for (items[0..count.*]) |*item| {
+                var buffer: [64]u8 = undefined;
+                const name = identText(self.source, item.column, &buffer);
+                if (wanted == null or name == null or !types.same(wanted.?, name.?)) continue;
+                const previous = &self.pool.nodes[item.value];
+                // A plain assignment of the same column: 42601.
+                if (previous.kind != .function or previous.func != .array_set) return error.Syntax;
+                const next = self.pool.nodes[base].next;
+                self.pool.nodes[base] = self.pool.nodes[item.value];
+                self.pool.nodes[base].next = next;
+                item.value = node;
+                return;
+            }
+            items[count.*] = .{ .column = column, .value = node };
+            count.* += 1;
+        }
+
+        /// An xml_attribute node: `expr [AS name]`; without AS the value must
+        /// be a column reference, whose name it takes (42601 otherwise).
+        fn xmlAttribute(self: *Self) Error!u16 {
+            const value_node = try self.expression();
+            var attribute_name: ast.Ident = .{};
+            if (try self.takeWord("AS")) {
+                attribute_name = if (self.current.kind == .quoted_word) try self.identifier() else try self.label();
+            } else {
+                const n = self.pool.nodes[value_node];
+                if (n.kind != .column) return error.Syntax;
+                attribute_name = n.name;
+            }
+            const node = try self.pool.add(.{ .kind = .function, .func = .xml_attribute, .name = attribute_name, .b = value_node });
+            try self.pool.raise(node, value_node);
+            return node;
+        }
+
+        /// XMLELEMENT(NAME n [, XMLATTRIBUTES(...)] [, content ...]),
+        /// XMLFOREST(expr [AS n], ...), XMLPI(NAME n [, content]) and
+        /// XMLROOT(xml, VERSION v | NO VALUE [, STANDALONE YES | NO | NO VALUE]).
+        fn xmlPublishing(self: *Self) Error!u16 {
+            const word = self.current;
+            const call_name = try self.identifier();
+            try self.expectSymbol(.lparen);
+            var items: [64]u16 = undefined;
+            var count: usize = 0;
+            var call: ast.Node = .{ .kind = .function, .name = call_name };
+            if (wordIs(self.source, word, "xmlforest")) {
+                call.func = .xmlforest;
+                while (true) {
+                    if (count == items.len) return error.StatementTooComplex;
+                    items[count] = try self.xmlAttribute();
+                    count += 1;
+                    if (!try self.takeSymbol(.comma)) break;
+                }
+            } else if (wordIs(self.source, word, "xmlroot")) {
+                call.func = .xmlroot;
+                items[0] = try self.expression();
+                count = 1;
+                try self.expectSymbol(.comma);
+                if (!try self.takeRaw("version")) return error.Syntax;
+                var flags: i64 = 0;
+                if (try self.takeWord("NO")) {
+                    if (!try self.takeWord("VALUE")) return error.Syntax;
+                } else {
+                    items[1] = try self.expression();
+                    count = 2;
+                    flags |= 1;
+                }
+                if (try self.takeSymbol(.comma)) {
+                    if (!try self.takeRaw("standalone")) return error.Syntax;
+                    if (try self.takeWord("NO")) {
+                        flags |= if (try self.takeWord("VALUE")) @as(i64, 3) << 1 else @as(i64, 2) << 1;
+                    } else if (try self.takeRaw("yes")) {
+                        flags |= @as(i64, 1) << 1;
+                    } else return error.Syntax;
+                }
+                call.integer = flags;
+            } else {
+                const pi = wordIs(self.source, word, "xmlpi");
+                call.func = if (pi) .xmlpi else .xmlelement;
+                if (!try self.takeRaw("name")) return error.Syntax;
+                const element = if (self.current.kind == .quoted_word) try self.identifier() else try self.label();
+                items[0] = try self.pool.add(.{ .kind = .function, .func = .xml_name, .name = element });
+                count = 1;
+                var attributes: usize = 0;
+                while (try self.takeSymbol(.comma)) {
+                    if (count == items.len) return error.StatementTooComplex;
+                    if (!pi and count == 1 and self.rawWord("xmlattributes") and lparenNext(try self.peek())) {
+                        try self.advance();
+                        try self.expectSymbol(.lparen);
+                        while (true) {
+                            if (count == items.len) return error.StatementTooComplex;
+                            items[count] = try self.xmlAttribute();
+                            count += 1;
+                            attributes += 1;
+                            if (!try self.takeSymbol(.comma)) break;
+                        }
+                        try self.expectSymbol(.rparen);
+                        continue;
+                    }
+                    if (pi and count == 2) return error.Syntax;
+                    items[count] = try self.expression();
+                    count += 1;
+                }
+                call.integer = @intCast(attributes);
+            }
+            try self.expectSymbol(.rparen);
+            for (0..count) |index| self.pool.nodes[items[index]].next = if (index + 1 < count) items[index + 1] else none;
+            call.b = items[0];
+            const node = try self.pool.add(call);
+            for (items[0..count]) |item| try self.pool.raise(node, item);
+            return node;
         }
 
         /// PostgreSQL reserved and type/function-name keywords the tokenizer
@@ -4957,6 +5112,10 @@ pub fn Parser(comptime config: types.Config) type {
                     try self.expectSymbol(.rparen);
                     return self.pool.add(call);
                 }
+                // SQL/XML publishing forms (B11 wave 4).
+                if (self.mode == .standard and lparenNext(try self.peek()) and (wordIs(self.source, token, "xmlelement") or wordIs(self.source, token, "xmlforest") or
+                    wordIs(self.source, token, "xmlpi") or wordIs(self.source, token, "xmlroot")))
+                    return self.xmlPublishing();
                 // Array literals and PostgreSQL's ARRAY(query) constructor.
                 if (self.mode == .standard and wordIs(self.source, token, "array")) {
                     const after = try self.peek();

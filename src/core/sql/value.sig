@@ -26,6 +26,8 @@ const array_text = @import("array_text.sig");
 const range_text = @import("range_text.sig");
 const network = @import("network.sig");
 const geometric = @import("geometric.sig");
+const geometry = @import("geometry.sig");
+const multirange = @import("multirange.sig");
 const xml = @import("xml.sig");
 const jsonpath = @import("jsonpath.sig");
 const text_search = @import("text_search.sig");
@@ -149,7 +151,9 @@ pub const SequenceHook = struct {
     routine_name: ?*const fn (ptr: *anyopaque, oid: u32, out: []u8) Error!?usize = null,
 };
 
-pub const SessionCall = enum { current_setting, set_config, advisory_lock, advisory_try_lock, advisory_unlock, advisory_unlock_all, notify, backend_pid, recovery_status };
+pub const SessionCall = enum { current_setting, set_config, advisory_lock, advisory_try_lock, advisory_unlock, advisory_unlock_all, notify, backend_pid, recovery_status,
+    // A pseudo-random 64-bit word (array_sample / array_shuffle, B11 wave 4).
+    random };
 
 pub fn routineOid(session: *const Session, input: []const u8, strict: bool) Error!?u32 {
     if (types.same(input, "-")) return 0;
@@ -203,6 +207,14 @@ const SessionType = Session;
 
 pub const Context = enum { implicit, assignment, explicit };
 
+/// The geometric types (point, box and the B11 wave-4 types).
+pub fn geometryType(ty: Type) bool {
+    return switch (ty) {
+        .point, .box, .lseg, .line, .path, .polygon, .circle => true,
+        else => false,
+    };
+}
+
 pub fn numericCategory(ty: Type) bool {
     return switch (ty) {
         .int2, .int4, .int8, .numeric, .float4, .float8 => true,
@@ -230,6 +242,12 @@ pub fn bitType(ty: Type) bool {
 
 /// pg_cast entries of the B11 types; null when the pair is not one of them.
 fn extendedCast(from: Type, to: Type, context: Context) ?bool {
+    if (from == .void or to == .void) {
+        // void (B11 wave 4): void_in/void_out only, by I/O conversion.
+        if (stringType(to)) return context != .implicit;
+        if (stringType(from)) return context == .explicit;
+        return false;
+    }
     if (to == .pg_internal_char) return switch (from) {
         .int4, .name => context == .explicit,
         .text, .varchar, .bpchar => context != .implicit,
@@ -254,6 +272,13 @@ fn extendedCast(from: Type, to: Type, context: Context) ?bool {
         // casts; strings by I/O conversion; nothing else.
         if (to == .money and (from == .int4 or from == .int8 or from == .numeric)) return context != .implicit;
         if (from == .money and to == .numeric) return context != .implicit;
+        if (stringType(to)) return context != .implicit;
+        if (stringType(from)) return context == .explicit;
+        return false;
+    }
+    if (from == .macaddr8 or to == .macaddr8) {
+        // macaddr <-> macaddr8 are implicit (B11 wave 4); strings by I/O.
+        if ((from == .macaddr and to == .macaddr8) or (from == .macaddr8 and to == .macaddr)) return true;
         if (stringType(to)) return context != .implicit;
         if (stringType(from)) return context == .explicit;
         return false;
@@ -296,8 +321,32 @@ fn extendedCast(from: Type, to: Type, context: Context) ?bool {
         if (stringType(from)) return context == .explicit;
         return false;
     }
+    if (geometryType(from) or geometryType(to)) {
+        // geo_ops casts (B11 wave 4): point -> box, path <-> polygon and
+        // box -> polygon by assignment; the other conversions explicitly;
+        // strings by I/O conversion.
+        if ((from == .point and to == .box) or (from == .path and to == .polygon) or (from == .polygon and to == .path) or (from == .box and to == .polygon)) return context != .implicit;
+        const explicit = switch (from) {
+            .lseg => to == .point,
+            .box => to == .point or to == .lseg or to == .circle,
+            .polygon => to == .point or to == .box or to == .circle,
+            .circle => to == .point or to == .box or to == .polygon,
+            else => false,
+        };
+        if (explicit) return context == .explicit;
+        if (stringType(to)) return context != .implicit;
+        if (stringType(from)) return context == .explicit;
+        return false;
+    }
     if (from == .point or to == .point or from == .box or to == .box) {
         // Geometric types: strings by I/O conversion only here.
+        if (stringType(to)) return context != .implicit;
+        if (stringType(from)) return context == .explicit;
+        return false;
+    }
+    if (multirange.isMultirange(from) or multirange.isMultirange(to)) {
+        // range -> its multirange explicitly (B11 wave 4); strings by I/O.
+        if (types.isRange(from) and multirange.ofRange(types.dataTypeOf(from)) == types.dataTypeOf(to)) return context == .explicit;
         if (stringType(to)) return context != .implicit;
         if (stringType(from)) return context == .explicit;
         return false;
@@ -421,6 +470,7 @@ pub fn comparisonType(a: Type, b: Type) ?Type {
     // point has no = operator and box compares only by area: neither has
     // ordinary comparison operators here.
     if (a == .point or b == .point or a == .box or b == .box) return null;
+    if (a == .void or b == .void) return null;
     // xml and jsonpath have no comparison operators; tsvector/tsquery have none here.
     if (a == .xml or b == .xml or a == .jsonpath or b == .jsonpath or a == .tsvector or b == .tsvector or a == .tsquery or b == .tsquery) return null;
     if (a != b and (a == .pg_internal_char or b == .pg_internal_char)) {
@@ -587,6 +637,9 @@ pub fn Io(comptime config: types.Config) type {
                 // inet hides a full-length netmask except in its text cast.
                 .inet => |*value| network.format(value, value.cidr or verbose, buffer),
                 .macaddr => |*value| network.formatMac(value, buffer),
+                .macaddr8 => |*value| network.formatMac8(value, buffer),
+                .geo => |*value| geometry.format(value.slice(), session.extra_float_digits, buffer),
+                .multirange => |*value| try MultirangeText.format(value.slice(), session, buffer),
                 .point => |value| geometric.formatPoint(value, session.extra_float_digits, buffer),
                 .box => |value| geometric.formatBox(value, session.extra_float_digits, buffer),
                 .xml => |*value| xml.output(value.slice(), buffer),
@@ -610,6 +663,92 @@ pub fn Io(comptime config: types.Config) type {
                 else
                     copy(buffer, &.{ '\\', '0' + (value >> 6), '0' + ((value >> 3) & 7), '0' + (value & 7) }),
             };
+        }
+
+        /// The lseg/line/path/polygon/circle layout (wire codecs).
+        pub const Geometry = geometry;
+
+        /// Multirange text I/O (multirange.sig).
+        pub const MultirangeText = multirange.MultirangeText(config, @This());
+        pub const Multiranges = V.Multiranges;
+
+        /// multirange(range) and the range -> multirange cast.
+        pub fn multirangeOf(range_cell: *const V.Cell) Error!V.Cell {
+            var set: V.Text = .{};
+            var scratch: V.Text = .{};
+            const range = V.Ranges.decode(range_cell.range.slice());
+            V.Multiranges.empty(types.rangeOfData(range.subtype).?, &set);
+            try V.Multiranges.add(&set, &range, &scratch);
+            return .{ .multirange = set };
+        }
+
+        fn geometryKind(ty: Type) geometry.Kind {
+            return switch (ty) {
+                .lseg => .lseg,
+                .line => .line,
+                .path => .path,
+                .polygon => .polygon,
+                else => .circle,
+            };
+        }
+
+        /// The function-based geometric casts (B11 wave 4): point(box |
+        /// lseg | polygon | circle), box(point | polygon | circle),
+        /// lseg(box), circle(box | polygon), polygon(box | circle | path)
+        /// and path(polygon).
+        pub fn geometryCast(cell: *const V.Cell, to: Type) Error!V.Cell {
+            var text: V.Text = .{};
+            var out: geometry.Writer = .{ .bytes = &text.bytes };
+            const bytes: []const u8 = if (cell.* == .geo) cell.geo.slice() else &.{};
+            const kind: ?geometry.Kind = if (cell.* == .geo) geometry.kindOf(bytes) else null;
+            switch (to) {
+                .point => return .{ .point = switch (cell.*) {
+                    .box => |value| geometric.center(value),
+                    .geo => switch (kind.?) {
+                        .lseg => try geometry.lsegCenter(geometry.lseg(bytes)),
+                        .circle => geometry.circle(bytes).center,
+                        .polygon => (try geometry.polygonCircle(bytes)).center,
+                        else => return error.CannotCoerce,
+                    },
+                    else => return error.CannotCoerce,
+                } },
+                .box => return .{ .box = switch (cell.*) {
+                    .point => |value| .{ .high = value, .low = value },
+                    .geo => switch (kind.?) {
+                        .polygon => geometry.boundBox(bytes),
+                        .circle => try geometry.circleBox(geometry.circle(bytes)),
+                        else => return error.CannotCoerce,
+                    },
+                    else => return error.CannotCoerce,
+                } },
+                .lseg => {
+                    if (cell.* != .box) return error.CannotCoerce;
+                    try geometry.writeLseg(&out, .{ .a = cell.box.high, .b = cell.box.low });
+                },
+                .circle => {
+                    if (cell.* == .box) {
+                        try geometry.writeCircle(&out, try geometry.boxCircle(cell.box));
+                    } else if (kind == .polygon) {
+                        try geometry.writeCircle(&out, try geometry.polygonCircle(bytes));
+                    } else return error.CannotCoerce;
+                },
+                .polygon => {
+                    if (cell.* == .box) {
+                        try geometry.boxPolygon(cell.box, &out);
+                    } else if (kind == .circle) {
+                        try geometry.circlePolygon(12, geometry.circle(bytes), &out);
+                    } else if (kind == .path) {
+                        try geometry.repoint(bytes, .polygon, &out);
+                    } else return error.CannotCoerce;
+                },
+                .path => {
+                    if (kind != .polygon) return error.CannotCoerce;
+                    try geometry.repoint(bytes, .path, &out);
+                },
+                else => return error.CannotCoerce,
+            }
+            text.len = out.len;
+            return .{ .geo = text };
         }
 
         /// Range text I/O and constructors (range_text.sig).
@@ -754,6 +893,21 @@ pub fn Io(comptime config: types.Config) type {
                 .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange => try RangeText.parse(ty, input, session),
                 .inet, .cidr => .{ .inet = try network.parse(input, ty == .cidr) },
                 .macaddr => .{ .macaddr = try network.parseMac(input) },
+                .macaddr8 => .{ .macaddr8 = try network.parseMac8(input) },
+                .int4multirange, .int8multirange, .nummultirange, .datemultirange, .tsmultirange, .tstzmultirange => return MultirangeText.parse(ty, input, session),
+                .lseg, .line, .path, .polygon, .circle => blk: {
+                    var text: V.Text = .{};
+                    var writer: geometry.Writer = .{ .bytes = &text.bytes };
+                    switch (ty) {
+                        .lseg => try geometry.parseLseg(input, &writer),
+                        .line => try geometry.parseLine(input, &writer),
+                        .path => try geometry.parsePath(input, &writer),
+                        .polygon => try geometry.parsePolygon(input, &writer),
+                        else => try geometry.parseCircle(input, &writer),
+                    }
+                    text.len = writer.len;
+                    break :blk .{ .geo = text };
+                },
                 .point => .{ .point = try geometric.parsePoint(input) },
                 .box => .{ .box = try geometric.parseBox(input) },
                 // xml_in: casts and textual input honor the session XML mode.
@@ -771,6 +925,8 @@ pub fn Io(comptime config: types.Config) type {
                 .regtype => .{ .regtype = try types.regtypeInput(input) },
                 .regproc => .{ .regproc = (try routineOid(session, input, true)) orelse return error.UndefinedFunction },
                 .aclitem => return error.UnsupportedStatement,
+                // void_in ignores its input.
+                .void => .{ .text = .{} },
                 .pg_internal_char => .{ .pg_internal_char = parseInternalChar(input) },
                 .tsvector, .tsquery => blk: {
                     var out: TS.Out = .{};
@@ -993,6 +1149,8 @@ pub fn Io(comptime config: types.Config) type {
             }
             const out: V.Cell = switch (to) {
                 .aclitem => return error.UnsupportedStatement,
+                // void_in ignores its input (I/O conversion from a string).
+                .void => V.Cell{ .text = .{} },
                 .pg_internal_char => switch (cell) {
                     .integer => |value| blk: {
                         if (value < -128 or value > 127) return error.NumericValueOutOfRange;
@@ -1198,8 +1356,27 @@ pub fn Io(comptime config: types.Config) type {
                     .text => |*value| try parse(.cidr, -1, value.slice(), session),
                     else => return error.CannotCoerce,
                 },
+                .int4multirange, .int8multirange, .nummultirange, .datemultirange, .tsmultirange, .tstzmultirange => switch (cell) {
+                    .multirange => cell,
+                    .range => try multirangeOf(&cell),
+                    .text => |*value| try parse(to, -1, value.slice(), session),
+                    else => return error.CannotCoerce,
+                },
+                .lseg, .line, .path, .polygon, .circle => switch (cell) {
+                    .text => |*value| try parse(to, -1, value.slice(), session),
+                    .geo => if (geometryKind(to) == geometry.kindOf(cell.geo.slice())) cell else try geometryCast(&cell, to),
+                    .box => try geometryCast(&cell, to),
+                    else => return error.CannotCoerce,
+                },
+                .macaddr8 => switch (cell) {
+                    .macaddr8 => cell,
+                    .macaddr => |*value| V.Cell{ .macaddr8 = network.mac8FromMac(value) },
+                    .text => |*value| try parse(.macaddr8, -1, value.slice(), session),
+                    else => return error.CannotCoerce,
+                },
                 .macaddr => switch (cell) {
                     .macaddr => cell,
+                    .macaddr8 => |*value| V.Cell{ .macaddr = try network.macFromMac8(value) },
                     .text => |*value| try parse(.macaddr, -1, value.slice(), session),
                     else => return error.CannotCoerce,
                 },
@@ -1226,9 +1403,8 @@ pub fn Io(comptime config: types.Config) type {
                     else => return error.CannotCoerce,
                 },
                 .point, .box => switch (cell) {
-                    .point, .box => cell,
                     .text => |*value| try parse(to, -1, value.slice(), session),
-                    else => return error.CannotCoerce,
+                    else => if (@as(V.CellTag, cell) == V.cellTag(types.dataTypeOf(to))) cell else try geometryCast(&cell, to),
                 },
                 .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange => switch (cell) {
                     .range => cell,

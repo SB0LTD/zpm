@@ -413,6 +413,30 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     try writer.int(u8, 24);
                     try writer.bytes(value);
                 },
+                // B11 wave 4 (types-ext): value tag 40 (multirange): range
+                // type OID, u16 count, then each range as a tag-22 value.
+                .multirange => |*set| {
+                    const MR = V.Multiranges;
+                    try writer.int(u8, 40);
+                    try writer.int(u32, types.typeOid(MR.rangeType(set.slice())));
+                    try writer.int(u16, @intCast(MR.count(set.slice())));
+                    var it = MR.iterate(set.slice());
+                    while (it.nextBytes()) |raw| {
+                        const range_cell: V.Cell = .{ .range = V.Text.fromValueBytes(raw) };
+                        try encodeValue(writer, &range_cell);
+                    }
+                },
+                // B11 wave 4 (types-ext): value tag 41, validated on replay.
+                .geo => |*text| {
+                    try writer.int(u8, 41);
+                    try writer.int(u32, @intCast(text.len));
+                    try writer.bytes(text.slice());
+                },
+                // B11 wave 4 (types-ext): value tag 46.
+                .macaddr8 => |*value| {
+                    try writer.int(u8, 46);
+                    try writer.bytes(value);
+                },
                 .xml => |*text| {
                     try writer.int(u8, 27);
                     try writer.int(u32, @intCast(text.len));
@@ -1307,6 +1331,16 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     break :blk .{ .inet = value };
                 },
                 24 => .{ .macaddr = (try reader.take(6))[0..6].* },
+                46 => .{ .macaddr8 = (try reader.take(8))[0..8].* },
+                40 => try decodeMultirange(reader),
+                41 => blk: {
+                    const len = try reader.int(u32);
+                    if (len > config.text_bytes) return error.ChangeRecordConflict;
+                    var text: V.Text = .{ .len = len };
+                    @memcpy(text.bytes[0..len], try reader.take(len));
+                    if (!@import("geometry.sig").valid(text.slice())) return error.InvalidChangeRecord;
+                    break :blk .{ .geo = text };
+                },
                 30 => .{ .regtype = try reader.int(u32) },
                 31 => .{ .pg_internal_char = try reader.int(u8) },
                 32 => .{ .regproc = try reader.int(u32) },
@@ -1411,6 +1445,29 @@ pub fn ChangeLog(comptime config: types.Config) type {
             var out: V.Text = .{};
             R.encode(&made, &out) catch return error.ChangeRecordConflict;
             return .{ .range = out };
+        }
+
+        /// Value tag 40: a range type, a count and that many tag-22
+        /// ranges; replay rebuilds the multirange and accepts it only when
+        /// the record was canonical (sorted, disjoint, non-adjacent).
+        fn decodeMultirange(reader: *Reader) Error!V.Cell {
+            const range_type = types.typeFromOid(try reader.int(u32)) orelse return error.InvalidChangeRecord;
+            if (types.rangeSubtype(types.typeOfData(range_type)) == null) return error.InvalidChangeRecord;
+            const MR = V.Multiranges;
+            const total = try reader.int(u16);
+            var set: V.Text = .{};
+            var scratch_text: V.Text = .{};
+            MR.empty(range_type, &set);
+            for (0..total) |_| {
+                if (reader.position >= reader.bytes.len or reader.bytes[reader.position] != 22) return error.InvalidChangeRecord;
+                reader.position += 1;
+                const cell = try decodeRange(reader);
+                const component = V.Ranges.decode(cell.range.slice());
+                if (component.empty or V.Ranges.subtypeOf(cell.range.slice()) != types.dataTypeOf(types.rangeSubtype(types.typeOfData(range_type)).?)) return error.InvalidChangeRecord;
+                MR.add(&set, &component, &scratch_text) catch return error.ChangeRecordConflict;
+            }
+            if (MR.count(set.slice()) != total) return error.InvalidChangeRecord;
+            return .{ .multirange = set };
         }
 
         fn valueAt(record: []const u8, offset: u32) Error!V.Cell {

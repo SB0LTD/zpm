@@ -137,7 +137,41 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     // is the regconfig name.
     to_tsvector, to_tsquery, plainto_tsquery, phraseto_tsquery, mysql_ifnull, mysql_date_add, mysql_last_insert_id, sind, cosd, acldefault, pg_encoding_to_char, current_schemas, array_remove, to_regproc,
     quote_ident, quote_literal, pg_get_userbyid, pg_tablespace_location,
-    pg_get_function_arguments, pg_get_function_identity_arguments, pg_get_function_result, pg_get_function_sqlbody };
+    pg_get_function_arguments, pg_get_function_identity_arguments, pg_get_function_result, pg_get_function_sqlbody,
+    // void-returning session functions (B11 wave-4 types-ext, Database
+    // session hook; volatile).
+    pg_notify, pg_advisory_lock, pg_advisory_lock_shared, pg_advisory_xact_lock, pg_advisory_xact_lock_shared, pg_advisory_unlock_all,
+    // Arrays (B11 wave-4 types-ext, array_eval.sig): the remaining
+    // array_userfuncs.c functions, width_bucket(anycompatible,
+    // anycompatiblearray) and the element / slice assignment of UPDATE
+    // SET a[...] = v (array_set: `b` the base, the new value, then the
+    // subscripts; its layout in `integer` as for array_subscript).
+    array_position, array_positions, array_replace, trim_array, array_fill, array_reverse, array_sort, array_sample, array_shuffle,
+    string_to_array, array_width_bucket, array_set,
+    // Types-ext operators and functions (B11 wave 4, types_ext_eval.sig):
+    // ext_op is an operator call (`integer` the Op, the operands in `b`),
+    // named ?column?; then the network and macaddr8 functions.
+    ext_op, inet_abbrev, set_masklen, hostmask, inet_merge, inet_same_family, macaddr8_set7bit, to_macaddr8, to_macaddr, mac_trunc,
+    // Geometric functions over the B11 wave-4 types (`integer` a GeoFn).
+    geo_call,
+    // Multiranges (B11 wave 4): the int4multirange(...) family (result
+    // type in the node), multirange(anyrange), range_merge, and the range
+    // accessors over a multirange (`integer` a MultirangeFn).
+    multirange_constructor, multirange_of, range_merge, mr_call,
+    // SQL/XML publishing (B11 wave 4, xml_publish.sig): XMLELEMENT (`b` an
+    // xml_name, then xml_attribute nodes, `integer` their count, then the
+    // content), XMLFOREST (xml_attribute nodes), XMLCONCAT, XMLCOMMENT,
+    // XMLPI (xml_name, optional content) and XMLROOT (`integer`: bit 0
+    // a version argument, bits 1-2 standalone 0 absent / 1 yes / 2 no /
+    // 3 no value). xml_name carries an identifier in `name`; an
+    // xml_attribute its name and value (`b`). Neither is a value.
+    xmlelement, xmlforest, xmlconcat, xmlcomment, xmlpi, xmlroot, xml_name, xml_attribute };
+
+/// mr_call variants: the range accessors applied to a multirange's span.
+pub const MultirangeFn = enum(u8) { lower, upper, isempty, lower_inc, upper_inc, lower_inf, upper_inf };
+
+/// geo_call variants (types_ext_eval.sig), chosen by name and arguments.
+pub const GeoFn = enum(u8) { area, center, length, npoints, radius, diameter, isclosed, isopen, pclose, popen, slope, diagonal, bound_box, box, circle, line, lseg, path, polygon, point, ishorizontal, isvertical, isparallel, isperp, pt_contained_circle, pt_contained_poly };
 
 /// JSON_TABLE column flags (Node.integer of a json_table_column).
 pub const JsonTableColumn = struct {
@@ -214,6 +248,9 @@ pub fn immutableBuiltin(func: Func) bool {
         .overlaps, .aggregate_pair, .normalize, .is_normalized, .mysql_date_add => true,
         .array_constructor, .array_subscript, .array_any, .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper,
         .array_append, .array_prepend, .array_cat, .array_remove => true,
+        .array_position, .array_positions, .array_replace, .trim_array, .array_fill, .array_reverse, .array_sort, .string_to_array, .array_width_bucket, .array_set => true,
+        .ext_op, .inet_abbrev, .set_masklen, .hostmask, .inet_merge, .inet_same_family, .macaddr8_set7bit, .to_macaddr8, .to_macaddr, .mac_trunc, .geo_call => true,
+        .multirange_constructor, .multirange_of, .range_merge, .mr_call => true,
         .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => true,
         .inet_host, .masklen, .inet_family, .inet_network, .broadcast, .netmask => true,
         .point_constructor, .box_constructor, .area, .center, .width, .height => true,
@@ -235,6 +272,7 @@ pub fn strictFunction(func: Func) bool {
         .current_timestamp, .current_date, .current_database, .current_schema, .current_schemas, .pg_encoding_to_char,
         .to_regtype, .to_regclass, .to_regproc, .pg_get_expr, .acldefault, .pg_get_userbyid, .pg_tablespace_location,
         .pg_get_function_arguments, .pg_get_function_identity_arguments, .pg_get_function_result, .pg_get_function_sqlbody,
+        .pg_advisory_lock, .pg_advisory_lock_shared, .pg_advisory_xact_lock, .pg_advisory_xact_lock_shared,
         .regclass_in, .regtype_in, .regclass_out, .regtype_out, .to_regnamespace, .regnamespace_in, .regnamespace_out => true,
         .lower, .upper, .initcap, .char_length, .octet_length, .bit_length, .substring, .btrim, .ltrim, .rtrim, .strpos, .replace,
         .left, .right, .repeat, .reverse, .lpad, .rpad, .split_part, .starts_with, .ascii, .chr, .translate, .overlay, .to_hex => true,
@@ -242,6 +280,10 @@ pub fn strictFunction(func: Func) bool {
         .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .date_bin, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => true,
         .to_date, .to_number, .to_timestamp, .aggregate_pair, .normalize, .is_normalized => true,
         .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper => true,
+        .trim_array, .array_reverse, .array_sort, .array_sample, .array_shuffle => true,
+        .ext_op, .inet_abbrev, .set_masklen, .hostmask, .inet_merge, .inet_same_family, .macaddr8_set7bit, .to_macaddr8, .to_macaddr, .mac_trunc, .geo_call => true,
+        .multirange_of, .range_merge, .mr_call => true,
+        .xmlcomment, .xmlpi => true,
         .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => true,
         .inet_host, .masklen, .inet_family, .inet_network, .broadcast, .netmask => true,
         .point_constructor, .box_constructor, .area, .center, .width, .height => true,
@@ -286,7 +328,11 @@ pub const Agg = enum { none, count, count_star, sum, avg, min, max, bool_and, bo
     // their ORDER BY / WITHIN GROUP keys) and so run only on the sorted
     // grouping operator; the other operators reject them with 0A000.
     array_agg, string_agg, json_agg, jsonb_agg, json_object_agg, jsonb_object_agg,
-    percentile_cont, percentile_disc, mode, hypothetical_rank, hypothetical_dense_rank, hypothetical_percent_rank, hypothetical_cume_dist };
+    percentile_cont, percentile_disc, mode, hypothetical_rank, hypothetical_dense_rank, hypothetical_percent_rank, hypothetical_cume_dist,
+    // Multirange aggregates (B11 wave 4): collecting, not ordered-set.
+    range_agg, range_intersect_agg,
+    // XMLAGG (B11 wave 4): collecting.
+    xmlagg };
 
 /// Aggregates that need their group's whole input (Exec.collectAggregate).
 pub fn collectingAggregate(agg: Agg) bool {
@@ -295,7 +341,7 @@ pub fn collectingAggregate(agg: Agg) bool {
 
 /// Ordered-set and hypothetical-set aggregates (WITHIN GROUP).
 pub fn orderedSetAggregate(agg: Agg) bool {
-    return @intFromEnum(agg) >= @intFromEnum(Agg.percentile_cont);
+    return @intFromEnum(agg) >= @intFromEnum(Agg.percentile_cont) and @intFromEnum(agg) <= @intFromEnum(Agg.hypothetical_cume_dist);
 }
 
 /// Two-argument (Y, X) aggregates; their argument is an aggregate_pair node.
