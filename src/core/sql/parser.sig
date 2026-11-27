@@ -1738,7 +1738,7 @@ pub fn Parser(comptime config: types.Config) type {
                 .integer, .int, .int4, .bigint, .int8, .smallint, .int2, .boolean, .@"bool", .text, .numeric, .decimal, .real, .float4, .float8, .float, .double, .name, .oid, .date, .timestamp, .timestamptz, .interval, .json, .jsonb, .regclass, .regtype, .regnamespace, .regproc => true,
                 .varchar, .character, .char, .bpchar, .uuid, .bytea, .time, .timetz, .bit, .varbit, .money => true,
                 .pg_lsn, .xid8, .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange, .inet, .cidr, .macaddr, .point, .box, .xml, .jsonpath, .tsvector, .tsquery => true,
-                .void => true,
+                .void, .macaddr8 => true,
                 else => false,
             };
         }
@@ -1984,6 +1984,7 @@ pub fn Parser(comptime config: types.Config) type {
                 .tsvector => .{ .ty = .tsvector },
                 .tsquery => .{ .ty = .tsquery },
                 .void => .{ .ty = .void },
+                .macaddr8 => .{ .ty = .macaddr8 },
                 .character, .char => blk: {
                     const varying = try self.takeWord("VARYING");
                     break :blk .{ .ty = if (varying) .varchar else .bpchar, .typmod = try self.characterLength(!varying) };
@@ -3284,7 +3285,7 @@ pub fn Parser(comptime config: types.Config) type {
                         if (self.mode == .standard and self.tokens.dialect == .postgres and !self.pool.complex and n.kind == .function) {
                             var buf: [64]u8 = undefined;
                             if (identText(self.source, n.name, &buf)) |name| {
-                                if (types.same(name, "unnest")) self.pool.complex = true;
+                                if (types.same(name, "unnest") or types.same(name, "generate_subscripts")) self.pool.complex = true;
                             }
                         }
                         target.expression_end = self.previous_end;
@@ -3565,7 +3566,18 @@ pub fn Parser(comptime config: types.Config) type {
             if (self.mode != .standard or !self.isSymbol(.lparen)) {
                 if (count.* == config.columns) return error.DuplicateColumn;
                 const column = try self.identifier();
+                if (self.mode == .standard and self.isSymbol(.lbracket)) return self.subscriptedSetItem(items, count, column);
                 try self.expectSymbol(.eq);
+                // A plain assignment after a subscripted one: 42601.
+                if (self.mode == .standard) for (items[0..count.*]) |*item| {
+                    const previous = &self.pool.nodes[item.value];
+                    if (previous.kind != .function or previous.func != .array_set) continue;
+                    var a: [64]u8 = undefined;
+                    var b: [64]u8 = undefined;
+                    const left = identText(self.source, item.column, &a) orelse continue;
+                    const right = identText(self.source, column, &b) orelse continue;
+                    if (types.same(left, right)) return error.Syntax;
+                };
                 items[count.*] = .{ .column = column, .value = try self.valueItem() };
                 count.* += 1;
                 return;
@@ -3593,6 +3605,38 @@ pub fn Parser(comptime config: types.Config) type {
                 count.* += 1;
             }
             try self.expectSymbol(.rparen);
+        }
+
+        /// `column[...] = value` (B11 wave 4): the column becomes
+        /// array_set(column, value, subscripts...). Further subscripted
+        /// assignments to the same column apply to the previous result.
+        fn subscriptedSetItem(self: *Self, items: *[config.columns]Ast.Assignment, count: *usize, column: ast.Ident) Error!void {
+            const base = try self.pool.add(.{ .kind = .column, .name = column });
+            const node = try self.subscriptTail(base);
+            try self.expectSymbol(.eq);
+            const assigned = try self.valueItem();
+            if (self.pool.nodes[assigned].kind == .default_value) return error.UnsupportedStatement;
+            self.pool.nodes[node].func = .array_set;
+            self.pool.nodes[assigned].next = self.pool.nodes[base].next;
+            self.pool.nodes[base].next = assigned;
+            try self.pool.raise(node, assigned);
+            var wanted_buffer: [64]u8 = undefined;
+            const wanted = identText(self.source, column, &wanted_buffer);
+            for (items[0..count.*]) |*item| {
+                var buffer: [64]u8 = undefined;
+                const name = identText(self.source, item.column, &buffer);
+                if (wanted == null or name == null or !types.same(wanted.?, name.?)) continue;
+                const previous = &self.pool.nodes[item.value];
+                // A plain assignment of the same column: 42601.
+                if (previous.kind != .function or previous.func != .array_set) return error.Syntax;
+                const next = self.pool.nodes[base].next;
+                self.pool.nodes[base] = self.pool.nodes[item.value];
+                self.pool.nodes[base].next = next;
+                item.value = node;
+                return;
+            }
+            items[count.*] = .{ .column = column, .value = node };
+            count.* += 1;
         }
 
         /// PostgreSQL reserved and type/function-name keywords the tokenizer

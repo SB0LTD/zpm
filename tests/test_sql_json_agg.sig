@@ -202,8 +202,9 @@ fn collectionAggregates() !void {
     try same(try metadata(&result), "array_agg:1015");
     // Errors: untyped polymorphic input (42804), unequal sub-arrays (2202E),
     // a NULL sub-array (22004), ORDER BY on a non-aggregate (42809),
-    // DISTINCT with an ORDER BY outside the arguments (42P10), window forms
-    // and operators without a sorted input (0A000).
+    // DISTINCT with an ORDER BY outside the arguments (42P10), and ORDER BY
+    // inside a window aggregate (0A000). array_agg windows and ROLLUP
+    // (types-ext lane, B11 wave 4) are contract-sql-types-ext's.
     try rejects("SELECT array_agg('a')", error.TypeMismatch);
     try rejects("SELECT array_agg(a) FROM (VALUES (ARRAY[1]), (ARRAY[1,2])) AS t(a)", error.ArraySubscriptError);
     try rejects("SELECT array_agg(a) FROM w", error.NullValueNotAllowed);
@@ -211,8 +212,8 @@ fn collectionAggregates() !void {
     try rejects("SELECT lower('A' ORDER BY 1)", error.WrongObjectType);
     try rejects("SELECT array_agg(DISTINCT v ORDER BY id) FROM tdd_a", error.InvalidColumnReference);
     try rejects("SELECT array_agg(v ORDER BY id) OVER () FROM tdd_a", error.UnsupportedStatement);
-    try rejects("SELECT array_agg(v) OVER () FROM tdd_a", error.UnsupportedStatement);
-    try rejects("SELECT g, array_agg(v) FROM tdd_a GROUP BY ROLLUP(g)", error.UnsupportedStatement);
+    try expect("SELECT id, array_agg(v) OVER (ORDER BY id) FROM tdd_a ORDER BY id", "1|{10};2|{10,20};3|{10,20,30};4|{10,20,30,NULL}");
+    try expect("SELECT g, array_agg(v ORDER BY id) FROM tdd_a GROUP BY ROLLUP(g) ORDER BY g NULLS LAST", "1|{10,20};2|{30,NULL};NULL|{10,20,30,NULL}");
     try rejects("SELECT string_agg(id, ',') FROM tdd_a", error.UndefinedFunction);
     try rejects("SELECT string_agg(s) FROM w", error.UndefinedFunction);
     try rejects("SELECT array_agg(j ORDER BY j) FROM w", error.UndefinedFunction);

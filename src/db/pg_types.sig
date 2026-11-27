@@ -152,6 +152,7 @@ pub fn Types(comptime Result: type) type {
                     try put(out, &at, value.address[0..size]);
                 },
                 .macaddr => |*value| try put(out, &at, value),
+                .macaddr8 => |*value| try put(out, &at, value),
                 .xml => at += try sendText(cell, session, out),
                 // regtypesend is oidsend.
                 .regtype, .regproc => |value| try putInt(u32, out, &at, value),
@@ -420,6 +421,12 @@ pub fn Types(comptime Result: type) type {
                 .macaddr => {
                     if (bytes.len != 6) return error.ProtocolViolation;
                     return .{ .macaddr = bytes[0..6].* };
+                },
+                // macaddr8_recv also takes the six-byte form.
+                .macaddr8 => {
+                    if (bytes.len == 6) return .{ .macaddr8 = .{ bytes[0], bytes[1], bytes[2], 0xff, 0xfe, bytes[3], bytes[4], bytes[5] } };
+                    if (bytes.len != 8) return error.ProtocolViolation;
+                    return .{ .macaddr8 = bytes[0..8].* };
                 },
                 .pg_internal_char => {
                     if (bytes.len == 0) return error.ProtocolViolation;

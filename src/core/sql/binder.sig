@@ -539,6 +539,8 @@ pub fn Binder(comptime config: types.Config) type {
             argument:u16=none,result:u16=0,output_node:u16=none,
             deferred_arg:u16=none,deferred_filter:u16=none,filter_column:u16=none,
             offset_arg:u16=none,default_arg:u16=none,offset_repeatable:bool=true,offset_total:bool=true,offset_prefix:bool=false,
+            /// string_agg's delimiter as a window aggregate (B11 wave 4).
+            second_arg:u16=none,
             partition:[config.columns]u16=undefined,partition_count:usize=0,
             order:[config.columns]SortKey=undefined,order_count:usize=0,
             frame:Ast.Frame=.default,
@@ -554,7 +556,9 @@ pub fn Binder(comptime config: types.Config) type {
             // JSON_TABLE (B11 json-agg lane): `function` is the table node.
             json_table, partition_ancestors, options_to_table, unnest,
             // A user routine in FROM (B11 wave 4): Exec.routineRows.
-            routine };
+            routine,
+            // generate_subscripts(anyarray, int4 [, bool]) (B11 wave 4).
+            subscripts };
 
         /// A bound query block of the general engine (design §4.9). Its
         /// materialized rows are `width` cells: the `count` visible output
@@ -596,6 +600,9 @@ pub fn Binder(comptime config: types.Config) type {
             targets: [2 * types.projectionColumns(config)]u16 = undefined,
             /// One top-level set-returning UNNEST target, expanded after WHERE.
             unnest_column: u16 = none,
+            /// Every top-level set-returning target (unnest, generate_subscripts;
+            /// B11 wave 4); `unnest_column` is the first. They run in lockstep.
+            srf_set: std.StaticBitSet(types.projectionColumns(config)) = .empty,
             count: usize = 0,
             width: usize = 0,
             names: [types.projectionColumns(config)]V.Name = undefined,
@@ -873,6 +880,7 @@ pub fn Binder(comptime config: types.Config) type {
             // tsvector / tsquery comparison operators are not provided.
             if (left == .tsvector or right == .tsvector or left == .tsquery or right == .tsquery) return error.UndefinedFunction;
             if (types.unorderable(left) or types.unorderable(right)) return error.UndefinedFunction;
+            if ((left == .macaddr and right == .macaddr8) or (left == .macaddr8 and right == .macaddr)) return error.AmbiguousFunction;
             if (left == right) return;
             if (value.integral(left) and value.integral(right)) return;
             if (context.legacy) {
@@ -1415,6 +1423,12 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "array_append", .func = .array_append }, .{ .name = "array_prepend", .func = .array_prepend },
                 .{ .name = "array_remove", .func = .array_remove },
                 .{ .name = "array_cat", .func = .array_cat },       .{ .name = "array_to_string", .func = .array_to_string },
+                .{ .name = "array_position", .func = .array_position }, .{ .name = "array_positions", .func = .array_positions },
+                .{ .name = "array_replace", .func = .array_replace }, .{ .name = "trim_array", .func = .trim_array },
+                .{ .name = "array_fill", .func = .array_fill },     .{ .name = "array_reverse", .func = .array_reverse },
+                .{ .name = "array_sort", .func = .array_sort },     .{ .name = "array_sample", .func = .array_sample },
+                .{ .name = "array_shuffle", .func = .array_shuffle }, .{ .name = "string_to_array", .func = .string_to_array },
+                .{ .name = "width_bucket", .func = .array_width_bucket },
                 // Range constructors and functions (B11 advanced types).
                 .{ .name = "int4range", .func = .range_constructor }, .{ .name = "int8range", .func = .range_constructor },
                 .{ .name = "numrange", .func = .range_constructor }, .{ .name = "daterange", .func = .range_constructor },
@@ -1426,6 +1440,11 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "host", .func = .inet_host },            .{ .name = "masklen", .func = .masklen },
                 .{ .name = "family", .func = .inet_family },        .{ .name = "network", .func = .inet_network },
                 .{ .name = "broadcast", .func = .broadcast },       .{ .name = "netmask", .func = .netmask },
+                // Network and macaddr8 functions (B11 wave 4).
+                .{ .name = "abbrev", .func = .inet_abbrev },        .{ .name = "set_masklen", .func = .set_masklen },
+                .{ .name = "hostmask", .func = .hostmask },         .{ .name = "inet_merge", .func = .inet_merge },
+                .{ .name = "inet_same_family", .func = .inet_same_family }, .{ .name = "macaddr8_set7bit", .func = .macaddr8_set7bit },
+                .{ .name = "macaddr8", .func = .to_macaddr8 },      .{ .name = "macaddr", .func = .to_macaddr },
                 // Geometric functions (B11 advanced types).
                 .{ .name = "point", .func = .point_constructor },   .{ .name = "box", .func = .box_constructor },
                 .{ .name = "area", .func = .area },                 .{ .name = "center", .func = .center },
@@ -2118,6 +2137,19 @@ pub fn Binder(comptime config: types.Config) type {
             } else {
                 var kind=aggregateKind(context,n);
                 if(kind==.none) return error.UndefinedFunction;
+                if(kind==.array_agg or kind==.string_agg) {
+                    // B11 wave 4: collecting window aggregates (no ORDER BY
+                    // inside, as PostgreSQL: 0A000).
+                    if(n.order!=none) return error.UnsupportedStatement;
+                    n.ty=try typeCollectAggregate(context,&inner,n,kind);n.agg=kind;
+                    if(n.c!=none) {
+                        var filter_scope=inner;filter_scope.aggregates=false;
+                        try typeExpr(context,&filter_scope,n.c);try booleanArgument(context,n.c);
+                    }
+                    try typeWindowSpec(context,scope,spec);
+                    n.func=.window_call;n.constant=false;
+                    return;
+                }
                 if(n.star) {if(kind!=.count) return error.Syntax;kind=.count_star;}
                 else if(n.b==none or context.node(n.b).next!=none) return error.UndefinedFunction;
                 if(n.b!=none) try typeExpr(context,&inner,n.b);
@@ -2212,6 +2244,7 @@ pub fn Binder(comptime config: types.Config) type {
             }
             // lower(anyrange) / upper(anyrange) beside the string functions.
             if ((n.func == .lower or n.func == .upper) and count == 1 and types.isRange(context.node(n.b).ty)) n.func = if (n.func == .lower) .range_lower else .range_upper;
+            extFunctionOverload(context, n, count);
             switch (n.func) {
                 .grouping => {
                     if(!scope.aggregates) return error.GroupingError;
@@ -2459,6 +2492,10 @@ pub fn Binder(comptime config: types.Config) type {
                 .to_timestamp => try bindSignature(context, n, if (count == 1) &[_]ast.Type{.float8} else &[_]ast.Type{ .text, .text }, .timestamptz, true),
                 .array_constructor, .array_subscript, .array_any, .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper,
                 .array_append, .array_prepend, .array_cat, .array_to_string, .array_remove => try typeArrayFunction(context, n, count),
+                .array_position, .array_positions, .array_replace, .trim_array, .array_fill, .array_reverse, .array_sort, .array_sample, .array_shuffle,
+                .string_to_array, .array_width_bucket, .array_set => try typeArrayFunction(context, n, count),
+                .ext_op => return,
+                .inet_abbrev, .set_masklen, .hostmask, .inet_merge, .inet_same_family, .macaddr8_set7bit, .to_macaddr8, .to_macaddr, .mac_trunc => try typeExtFunction(context, n, count),
                 .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => try typeRangeFunction(context, n, count),
                 .xmlparse => {
                     n.b = try convert(context, n.b, .text, -1, .implicit);
@@ -2619,6 +2656,126 @@ pub fn Binder(comptime config: types.Config) type {
 
         fn networkType(ty: ast.Type) bool {
             return ty == .inet or ty == .cidr;
+        }
+
+        // ---- types-ext lane (B11 wave 4) -----------------------------------------
+
+        /// Overloads chosen by argument type: trunc(macaddr[8]).
+        fn extFunctionOverload(context: *const Context, n: *ast.Node, count: usize) void {
+            if (count == 0) return;
+            const first = context.node(n.b).ty;
+            if (n.func == .trunc and count == 1 and (first == .macaddr or first == .macaddr8)) n.func = .mac_trunc;
+        }
+
+        fn extArgument(context: *const Context, id: u16, wanted: ast.Type) Error!u16 {
+            const ty = context.node(id).ty;
+            if (ty == .unknown) {
+                try coerce(context, id, wanted);
+                return id;
+            }
+            if (ty != wanted and !value.castable(ty, wanted, .implicit)) return error.UndefinedFunction;
+            return convert(context, id, wanted, -1, .implicit);
+        }
+
+        /// The network and macaddr8 functions of the types-ext lane.
+        fn typeExtFunction(context: *const Context, n: *ast.Node, count: usize) Error!void {
+            const T = ast.Type;
+            switch (n.func) {
+                .inet_abbrev => {
+                    // abbrev(inet) and abbrev(cidr): a cidr keeps its type.
+                    if (count != 1) return error.UndefinedFunction;
+                    if (context.node(n.b).ty != .cidr) n.b = try extArgument(context, n.b, .inet);
+                    n.ty = .text;
+                },
+                .set_masklen => {
+                    if (count != 2) return error.UndefinedFunction;
+                    const second = context.node(n.b).next;
+                    context.node(n.b).next = none;
+                    if (context.node(n.b).ty != .cidr) n.b = try extArgument(context, n.b, .inet);
+                    context.node(n.b).next = try extArgument(context, second, .int4);
+                    n.ty = context.node(n.b).ty;
+                },
+                .hostmask => try bindSignature(context, n, &[_]T{.inet}, .inet, true),
+                .inet_merge => try bindSignature(context, n, &[_]T{ .inet, .inet }, .cidr, true),
+                .inet_same_family => try bindSignature(context, n, &[_]T{ .inet, .inet }, .boolean, true),
+                .macaddr8_set7bit => try bindSignature(context, n, &[_]T{.macaddr8}, .macaddr8, true),
+                .to_macaddr8 => try bindSignature(context, n, &[_]T{.macaddr}, .macaddr8, true),
+                .to_macaddr => try bindSignature(context, n, &[_]T{.macaddr8}, .macaddr, true),
+                .mac_trunc => {
+                    const ty = context.node(n.b).ty;
+                    try bindSignature(context, n, &[_]T{ty}, ty, true);
+                },
+                else => unreachable,
+            }
+            n.constant = listConstant(context, n.b);
+        }
+
+        fn macType(ty: ast.Type) bool {
+            return ty == .macaddr or ty == .macaddr8;
+        }
+
+        /// Rewrites a bound operator node into an ext_op call over `left`
+        /// (and `right`), named ?column?.
+        fn extOperatorCall(context: *const Context, n: *ast.Node, left: u16, right: u16, result: ast.Type) void {
+            context.node(left).next = right;
+            if (right != none) context.node(right).next = none;
+            n.integer = @intFromEnum(n.op);
+            n.kind = .function;
+            n.func = .ext_op;
+            n.a = none;
+            n.b = left;
+            n.name = .{};
+            n.ty = result;
+            n.constant = isConstant(context, left) and (right == none or isConstant(context, right));
+        }
+
+        /// Binary operators over the types-ext types: inet + int8, int8 +
+        /// inet, inet - int8, inet - inet, & and | over inet / macaddr /
+        /// macaddr8. Returns false for every other operand type.
+        fn extOperator(context: *const Context, n: *ast.Node) Error!bool {
+            const T = ast.Type;
+            const left = context.node(n.a).ty;
+            const right = context.node(n.b).ty;
+            switch (n.op) {
+                .add, .sub => {
+                    if (!networkType(left) and !(n.op == .add and networkType(right))) return false;
+                    if (networkType(left)) {
+                        const a = try convert(context, n.a, .inet, -1, .implicit);
+                        // inet - unknown is inet - inet; otherwise an integer.
+                        const other: T = if (n.op == .sub and (right == .unknown or networkType(right))) .inet else .int8;
+                        if (right != .unknown and other == .int8 and !value.integral(right)) return error.UndefinedFunction;
+                        const b = try extArgument(context, n.b, other);
+                        extOperatorCall(context, n, a, b, if (other == .inet) .int8 else .inet);
+                        return true;
+                    }
+                    if (left != .unknown and !value.integral(left)) return error.UndefinedFunction;
+                    const a = try extArgument(context, n.a, .int8);
+                    const b = try convert(context, n.b, .inet, -1, .implicit);
+                    extOperatorCall(context, n, a, b, .inet);
+                    return true;
+                },
+                .bit_and, .bit_or => {
+                    const known = if (left != .unknown) left else right;
+                    if (!networkType(known) and !macType(known)) return false;
+                    const target: T = if (networkType(known)) .inet else known;
+                    for ([_]T{ left, right }) |ty| if (ty != .unknown and ty != target and !(target == .inet and networkType(ty))) return error.UndefinedFunction;
+                    const a = try extArgument(context, n.a, target);
+                    const b = try extArgument(context, n.b, target);
+                    extOperatorCall(context, n, a, b, target);
+                    return true;
+                },
+                else => return false,
+            }
+        }
+
+        /// ~inet, ~macaddr, ~macaddr8.
+        fn extUnary(context: *const Context, n: *ast.Node) Error!bool {
+            if (n.op != .bit_not) return false;
+            const ty = context.node(n.a).ty;
+            if (!networkType(ty) and !macType(ty)) return false;
+            const operand = if (networkType(ty)) try convert(context, n.a, .inet, -1, .implicit) else n.a;
+            extOperatorCall(context, n, operand, none, if (networkType(ty)) .inet else ty);
+            return true;
         }
 
         /// inet << <<= >> >>= && inet (cidr converts implicitly; an untyped
@@ -2866,6 +3023,110 @@ pub fn Binder(comptime config: types.Config) type {
                     context.node(second).next = none;
                     n.b = first;
                     n.constant = isConstant(context, first) and isConstant(context, second);
+                },
+                .array_position, .array_positions, .array_width_bucket => {
+                    // array_position(anycompatiblearray, anycompatible [, int4]),
+                    // width_bucket(anycompatible, anycompatiblearray).
+                    if (count != 2 and !(n.func == .array_position and count == 3)) return error.UndefinedFunction;
+                    var first = n.b;
+                    var second = context.node(first).next;
+                    const third = context.node(second).next;
+                    context.node(second).next = none;
+                    if (n.func == .array_width_bucket) {
+                        const array_ty = try arrayConcatTypes(context, &second, &first, .append);
+                        const element = types.elementType(array_ty).?;
+                        try sortableType(element);
+                    } else _ = try arrayConcatTypes(context, &first, &second, .append);
+                    context.node(first).next = second;
+                    if (third != none) context.node(second).next = try convert(context, third, .int4, -1, .implicit);
+                    n.b = first;
+                    n.ty = if (n.func == .array_positions) types.arrayType(.int4).? else .int4;
+                    n.constant = listConstant(context, n.b);
+                },
+                .array_replace => {
+                    // anycompatiblearray, anycompatible, anycompatible.
+                    if (count != 3) return error.UndefinedFunction;
+                    const first = n.b;
+                    const second = context.node(first).next;
+                    const third = context.node(second).next;
+                    const array_ty = context.node(first).ty;
+                    if (array_ty != .unknown and !types.isArray(array_ty)) return error.UndefinedFunction;
+                    var element: ast.Type = if (array_ty == .unknown) .unknown else types.elementType(array_ty).?;
+                    for ([_]u16{ second, third }) |id| {
+                        if (types.isArray(context.node(id).ty)) return error.UndefinedFunction;
+                        unifyInto(&element, context.node(id).ty) catch return error.UndefinedFunction;
+                    }
+                    if (element == .unknown) return error.TypeMismatch;
+                    const result = types.arrayType(element) orelse return error.UndefinedFunction;
+                    context.node(second).next = none;
+                    context.node(third).next = none;
+                    const a = try convert(context, first, result, -1, .implicit);
+                    const b = try convert(context, second, element, -1, .implicit);
+                    const c = try convert(context, third, element, -1, .implicit);
+                    context.node(a).next = b;
+                    context.node(b).next = c;
+                    n.b = a;
+                    n.ty = result;
+                    n.constant = listConstant(context, n.b);
+                },
+                .trim_array, .array_sample => {
+                    if (count != 2) return error.UndefinedFunction;
+                    try arrayArgument(context, n.b);
+                    try convertTail(context, n.b, .int4, .implicit);
+                    n.ty = context.node(n.b).ty;
+                    n.constant = n.func == .trim_array and listConstant(context, n.b);
+                },
+                .array_reverse, .array_shuffle => {
+                    if (count != 1) return error.UndefinedFunction;
+                    try arrayArgument(context, n.b);
+                    n.ty = context.node(n.b).ty;
+                    n.constant = n.func == .array_reverse and isConstant(context, n.b);
+                },
+                .array_sort => {
+                    // array_sort(anyarray [, descending [, nulls_first]]): the
+                    // element type needs an ordering operator (0A000).
+                    if (count < 1 or count > 3) return error.UndefinedFunction;
+                    try arrayArgument(context, n.b);
+                    const element = types.elementType(context.node(n.b).ty).?;
+                    // Comparing two elements needs the ordering operator.
+                    n.integer = if (sortableType(element)) |_| 0 else |_| 1;
+                    try convertTail(context, n.b, .boolean, .implicit);
+                    n.ty = context.node(n.b).ty;
+                    n.constant = listConstant(context, n.b);
+                },
+                .array_fill => {
+                    // array_fill(anyelement, int4[] [, int4[]]).
+                    if (count != 2 and count != 3) return error.UndefinedFunction;
+                    const element = context.node(n.b).ty;
+                    if (element == .unknown) return error.TypeMismatch;
+                    if (types.isArray(element)) return error.UndefinedObject;
+                    try convertTail(context, n.b, types.arrayType(.int4).?, .implicit);
+                    n.ty = types.arrayType(element) orelse return error.UndefinedObject;
+                    n.constant = listConstant(context, n.b);
+                },
+                .string_to_array => {
+                    if (count != 2 and count != 3) return error.UndefinedFunction;
+                    try bindSignature(context, n, if (count == 2) &[_]ast.Type{ .text, .text } else &[_]ast.Type{ .text, .text, .text }, types.arrayType(.text).?, false);
+                },
+                .array_set => {
+                    // UPDATE SET a[...] = v: the base column's array type; an
+                    // element is assigned in its element type, a slice as an
+                    // array (both by assignment); subscripts are int4.
+                    const base = n.b;
+                    const base_ty = context.node(base).ty;
+                    const element = types.elementType(base_ty) orelse return error.TypeMismatch;
+                    const layout = array_module.Subscripts.decode(n.integer);
+                    const assigned = context.node(base).next;
+                    const rest = context.node(assigned).next;
+                    context.node(assigned).next = none;
+                    const typmod = outputTypmod(context, base);
+                    const converted = try convert(context, assigned, if (layout.slice()) base_ty else element, typmod, .assignment);
+                    context.node(base).next = converted;
+                    context.node(converted).next = rest;
+                    try convertTail(context, converted, .int4, .assignment);
+                    n.ty = base_ty;
+                    n.typmod = typmod;
+                    n.constant = false;
                 },
                 .array_to_string => {
                     if (count != 2 and count != 3) return error.UndefinedFunction;
@@ -4118,6 +4379,7 @@ pub fn Binder(comptime config: types.Config) type {
                         return;
                     }
                     if (ty == .unknown) return error.AmbiguousFunction;
+                    if (try extUnary(context, n)) return;
                     if (!value.numericCategory(ty) and ty != .interval) return error.UndefinedFunction;
                     if (n.op == .bit_not and !value.integral(ty)) return error.UndefinedFunction;
                     n.ty = ty;
@@ -4128,6 +4390,7 @@ pub fn Binder(comptime config: types.Config) type {
                     try typeExpr(context, scope, n.a);
                     try typeExpr(context, scope, n.b);
                     n.constant = isConstant(context, n.a) and isConstant(context, n.b);
+                    if (try extOperator(context, n)) return;
                     switch (n.op) {
                         .eq, .ne, .lt, .le, .gt, .ge, .is_distinct, .is_not_distinct => {
                             try comparable(context, &n.a, &n.b);
@@ -4558,6 +4821,11 @@ pub fn Binder(comptime config: types.Config) type {
                         .array_subscript => break :blk figure(context, n.b, buffer),
                         .array_any => break :blk .{ .name = "?column?", .strength = 0 },
                         .jsonb_minus_op, .jsonb_delete_path_op, .jsonb_exists_any_op, .jsonb_exists_all_op, .jsonb_path_exists_op, .jsonb_path_match_op => break :blk .{ .name = "?column?", .strength = 0 },
+                        .ext_op => break :blk .{ .name = "?column?", .strength = 0 },
+                        .inet_abbrev => break :blk .{ .name = "abbrev", .strength = 2 },
+                        .to_macaddr8 => break :blk .{ .name = "macaddr8", .strength = 2 },
+                        .to_macaddr => break :blk .{ .name = "macaddr", .strength = 2 },
+                        .mac_trunc => break :blk .{ .name = "trunc", .strength = 2 },
                         else => {},
                     }
                     buffer.* = toName(context, n.name);
@@ -7001,6 +7269,50 @@ pub fn Binder(comptime config: types.Config) type {
             return types.elementType(argument) orelse error.UndefinedFunction;
         }
 
+        /// unnest(anyarray, anyarray [, ...]) in FROM (B11 wave 4): one
+        /// element type per argument into `out`; returns the count.
+        fn bindUnnestArguments(context: *const Context, scope: *const Scope, call: *ast.Node, out: []ast.Type) Error!usize {
+            if (call.star or call.distinct or call.c != none or call.order != none or call.b == none) return error.UndefinedFunction;
+            var count: usize = 0;
+            var arg = call.b;
+            while (arg != none) : (arg = context.node(arg).next) {
+                if (count == out.len) return error.ColumnCapacity;
+                try typeExpr(context, scope, arg);
+                const argument = context.node(arg).ty;
+                if (argument == .unknown) return error.AmbiguousFunction;
+                out[count] = types.elementType(argument) orelse return error.UndefinedFunction;
+                count += 1;
+            }
+            return count;
+        }
+
+        fn subscriptsName(context: *const Context, name: ast.Ident, schema: ?ast.Ident) bool {
+            if (context.dialect != .postgres or !types.same(toName(context, name).slice(), "generate_subscripts")) return false;
+            return if (schema) |namespace| types.same(toName(context, namespace).slice(), "pg_catalog") else true;
+        }
+
+        /// generate_subscripts(anyarray, int4 [, bool]) -> setof int4.
+        fn bindSubscriptsArguments(context: *const Context, scope: *const Scope, call: *ast.Node) Error!void {
+            if (call.star or call.distinct or call.c != none or call.order != none or call.b == none) return error.UndefinedFunction;
+            var count: usize = 0;
+            var arg = call.b;
+            while (arg != none) : (arg = context.node(arg).next) {
+                try typeExpr(context, scope, arg);
+                count += 1;
+            }
+            if (count != 2 and count != 3) return error.UndefinedFunction;
+            const array_ty = context.node(call.b).ty;
+            if (array_ty == .unknown) return error.TypeMismatch;
+            if (!types.isArray(array_ty)) return error.UndefinedFunction;
+            const dimension = context.node(call.b).next;
+            const reverse = context.node(dimension).next;
+            context.node(dimension).next = none;
+            const converted = try convert(context, dimension, .int4, -1, .implicit);
+            context.node(call.b).next = converted;
+            if (reverse != none) context.node(converted).next = try convert(context, reverse, .boolean, -1, .implicit);
+            call.ty = .int4;
+        }
+
         fn replacePartitionAncestorTarget(context: *const Context, expression: u16, function: u16, column: u16) Error!u16 {
             if (expression == function) return column;
             var cast = context.node(expression).*;
@@ -7025,6 +7337,8 @@ pub fn Binder(comptime config: types.Config) type {
             const name = toName(context, item.name);
             var series: Series = .none;
             var ty: ast.Type = .unknown;
+            var unnest_types: [config.columns]ast.Type = undefined;
+            var unnest_count: usize = 1;
             if (!call.name.quoted and types.same(name.slice(), "generate_series")) {
                 if (call.star or call.distinct or call.c != none) return error.UndefinedFunction;
                 var args: [3]u16 = undefined;
@@ -7094,8 +7408,13 @@ pub fn Binder(comptime config: types.Config) type {
                 series = .options_to_table;
                 ty = .text;
             } else if (unnestName(context, item.name, item.schema)) {
-                ty = try bindUnnestArgument(context, &inner, call);
+                unnest_count = try bindUnnestArguments(context, &inner, call, &unnest_types);
+                ty = unnest_types[0];
                 series = .unnest;
+            } else if (subscriptsName(context, item.name, item.schema)) {
+                try bindSubscriptsArguments(context, &inner, call);
+                ty = .int4;
+                series = .subscripts;
             } else {
                 var from_context = context.*;
                 from_context.table_function = item.function;
@@ -7118,6 +7437,18 @@ pub fn Binder(comptime config: types.Config) type {
             p.tys[0] = ty;
             p.typmods[0] = -1;
             p.count = 1;
+            if (series == .unnest and unnest_count > 1) {
+                // Several arrays: every column is named unnest.
+                if (unnest_count > p.names.len) return error.ColumnCapacity;
+                p.names[0] = literalName("unnest");
+                for (1..unnest_count) |column| {
+                    p.targets[column] = try context.pool.add(.{ .kind = .null_literal, .ty = unnest_types[column], .constant = true });
+                    p.names[column] = literalName("unnest");
+                    p.tys[column] = unnest_types[column];
+                    p.typmods[column] = -1;
+                }
+                p.count = unnest_count;
+            }
             if (series == .options_to_table) {
                 if (comptime p.names.len < 2) return error.ColumnCapacity;
                 p.names[0] = literalName("option_name");
@@ -7429,13 +7760,20 @@ pub fn Binder(comptime config: types.Config) type {
                     continue;
                 }
                 const call = context.node(target.expr);
-                if (call.kind == .function and unnestName(context, call.name, functionSchema(call))) {
-                    if (p.unnest_column != none or q.lock.strength != .none) return error.UnsupportedStatement;
+                if (call.kind == .function and (unnestName(context, call.name, functionSchema(call)) or subscriptsName(context, call.name, functionSchema(call)))) {
+                    if (q.lock.strength != .none) return error.UnsupportedStatement;
                     scope.windows = false;
-                    const element = try bindUnnestArgument(context, &scope, call);
+                    if (unnestName(context, call.name, functionSchema(call))) {
+                        call.ty = try bindUnnestArgument(context, &scope, call);
+                        call.integer = 0;
+                    } else {
+                        // `integer` 1 marks generate_subscripts for Exec.
+                        try bindSubscriptsArguments(context, &scope, call);
+                        call.integer = 1;
+                    }
                     scope.windows = true;
-                    call.ty = element;
-                    p.unnest_column = @intCast(p.count);
+                    if (p.unnest_column == none) p.unnest_column = @intCast(p.count);
+                    p.srf_set.set(p.count);
                 } else if (branch) try typeExpr(context, &scope, target.expr) else try valueExpr(context, &scope, target.expr);
                 const name = if (target.alias) |alias| toName(context, alias) else targetName(context, target.expr);
                 try addTarget(context, p, target.expr, name);
@@ -7690,6 +8028,20 @@ pub fn Binder(comptime config: types.Config) type {
                     }
                     win.deferred_arg=try cloneTree(context,n.b);
                     try lowerWindowTree(context,p,input,win.deferred_arg);
+                } else if(win.kind==.aggregate and (n.agg==.array_agg or n.agg==.string_agg)) {
+                    // B11 wave 4: array_agg / string_agg over the frame rows,
+                    // evaluated lazily; every frame uses the bounded resolver.
+                    win.offset_repeatable=repeatableWindowInput(context,n.b) and repeatableWindowInput(context,context.node(n.b).next) and repeatableWindowInput(context,n.c) and repeatableFrameInput(context,spec.start.offset) and repeatableFrameInput(context,spec.end.offset);
+                    win.deferred_arg=try cloneTree(context,n.b);try lowerWindowTree(context,p,input,win.deferred_arg);
+                    if(n.agg==.string_agg) {win.second_arg=try cloneTree(context,context.node(n.b).next);try lowerWindowTree(context,p,input,win.second_arg);}
+                    win.aggregate=.{.kind=n.agg,.arg=none,.filter=none,.distinct=false,.arg_ty=context.node(n.b).ty,.ty=n.ty};
+                    if(n.c!=none) {win.deferred_filter=try cloneTree(context,n.c);try lowerWindowTree(context,p,input,win.deferred_filter);}
+                    switch(win.frame) {
+                        .full=>{win.frame=.rows;win.start=.{.kind=.unbounded_preceding};win.end=.{.kind=.unbounded_following};},
+                        .rows_prefix=>{win.frame=.rows;win.start=.{.kind=.unbounded_preceding};win.end=.{.kind=.current_row};},
+                        .default=>{if(spec.order_count==0){win.frame=.rows;win.end=.{.kind=.unbounded_following};}else win.frame=.range;},
+                        else=>{},
+                    }
                 } else if(win.kind==.aggregate) {
                     win.offset_repeatable=repeatableWindowInput(context,n.b) and repeatableWindowInput(context,n.c) and repeatableFrameInput(context,spec.start.offset) and repeatableFrameInput(context,spec.end.offset);
                     // For a full unsorted partition, input projection evaluates

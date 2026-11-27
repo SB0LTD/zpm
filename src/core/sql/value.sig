@@ -149,7 +149,9 @@ pub const SequenceHook = struct {
     routine_name: ?*const fn (ptr: *anyopaque, oid: u32, out: []u8) Error!?usize = null,
 };
 
-pub const SessionCall = enum { current_setting, set_config, advisory_lock, advisory_try_lock, advisory_unlock, advisory_unlock_all, notify, backend_pid, recovery_status };
+pub const SessionCall = enum { current_setting, set_config, advisory_lock, advisory_try_lock, advisory_unlock, advisory_unlock_all, notify, backend_pid, recovery_status,
+    // A pseudo-random 64-bit word (array_sample / array_shuffle, B11 wave 4).
+    random };
 
 pub fn routineOid(session: *const Session, input: []const u8, strict: bool) Error!?u32 {
     if (types.same(input, "-")) return 0;
@@ -260,6 +262,13 @@ fn extendedCast(from: Type, to: Type, context: Context) ?bool {
         // casts; strings by I/O conversion; nothing else.
         if (to == .money and (from == .int4 or from == .int8 or from == .numeric)) return context != .implicit;
         if (from == .money and to == .numeric) return context != .implicit;
+        if (stringType(to)) return context != .implicit;
+        if (stringType(from)) return context == .explicit;
+        return false;
+    }
+    if (from == .macaddr8 or to == .macaddr8) {
+        // macaddr <-> macaddr8 are implicit (B11 wave 4); strings by I/O.
+        if ((from == .macaddr and to == .macaddr8) or (from == .macaddr8 and to == .macaddr)) return true;
         if (stringType(to)) return context != .implicit;
         if (stringType(from)) return context == .explicit;
         return false;
@@ -594,6 +603,7 @@ pub fn Io(comptime config: types.Config) type {
                 // inet hides a full-length netmask except in its text cast.
                 .inet => |*value| network.format(value, value.cidr or verbose, buffer),
                 .macaddr => |*value| network.formatMac(value, buffer),
+                .macaddr8 => |*value| network.formatMac8(value, buffer),
                 .point => |value| geometric.formatPoint(value, session.extra_float_digits, buffer),
                 .box => |value| geometric.formatBox(value, session.extra_float_digits, buffer),
                 .xml => |*value| xml.output(value.slice(), buffer),
@@ -761,6 +771,7 @@ pub fn Io(comptime config: types.Config) type {
                 .int4range, .int8range, .numrange, .daterange, .tsrange, .tstzrange => try RangeText.parse(ty, input, session),
                 .inet, .cidr => .{ .inet = try network.parse(input, ty == .cidr) },
                 .macaddr => .{ .macaddr = try network.parseMac(input) },
+                .macaddr8 => .{ .macaddr8 = try network.parseMac8(input) },
                 .point => .{ .point = try geometric.parsePoint(input) },
                 .box => .{ .box = try geometric.parseBox(input) },
                 // xml_in: casts and textual input honor the session XML mode.
@@ -1209,8 +1220,15 @@ pub fn Io(comptime config: types.Config) type {
                     .text => |*value| try parse(.cidr, -1, value.slice(), session),
                     else => return error.CannotCoerce,
                 },
+                .macaddr8 => switch (cell) {
+                    .macaddr8 => cell,
+                    .macaddr => |*value| V.Cell{ .macaddr8 = network.mac8FromMac(value) },
+                    .text => |*value| try parse(.macaddr8, -1, value.slice(), session),
+                    else => return error.CannotCoerce,
+                },
                 .macaddr => switch (cell) {
                     .macaddr => cell,
+                    .macaddr8 => |*value| V.Cell{ .macaddr = try network.macFromMac8(value) },
                     .text => |*value| try parse(.macaddr, -1, value.slice(), session),
                     else => return error.CannotCoerce,
                 },

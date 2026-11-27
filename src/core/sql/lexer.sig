@@ -235,6 +235,7 @@ pub const Keyword = enum {
     tsquery,
     // B11 wave-4 types-ext.
     void,
+    macaddr8,
 };
 
 /// Words that cannot be unquoted identifiers.

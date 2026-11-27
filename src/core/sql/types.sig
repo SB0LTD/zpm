@@ -600,13 +600,15 @@ pub const Dialect = enum { postgres, mysql, tds };
 /// array_bit set (arrayData/elementData); there are no arrays of arrays.
 pub const DataType = enum(u8) { integer, integer32, boolean, text, smallint, numeric, real, double, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, mysql_bigint_unsigned, pg_internal_char, aclitem, xid, regproc,
     // B11 wave-4 types-ext: the void pseudo-type (function results only).
-    void, _ };
+    void,
+    macaddr8, _ };
 
 /// Bound expression type. `unknown` is an untyped string or NULL literal
 /// that has not been resolved by context yet. Unnamed values are array
 /// types, encoded like DataType's (arrayType/elementType).
 pub const Type = enum(u8) { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, mysql_bigint_unsigned, pg_internal_char, aclitem, xid, regproc,
-    void, _ };
+    void,
+    macaddr8, _ };
 
 /// Array types set this bit over the element type's ordinal.
 pub const array_bit: u8 = 0x80;
@@ -742,6 +744,7 @@ pub fn dataTypeOf(ty: Type) DataType {
         .pg_internal_char => .pg_internal_char,
         .aclitem => .aclitem,
         .void => .void,
+        .macaddr8 => .macaddr8,
         _ => if (elementType(ty)) |element| arrayData(dataTypeOf(element)).? else .text,
     };
 }
@@ -798,6 +801,7 @@ pub fn typeOfData(data_type: DataType) Type {
         .pg_internal_char => .pg_internal_char,
         .aclitem => .aclitem,
         .void => .void,
+        .macaddr8 => .macaddr8,
         _ => if (elementData(data_type)) |element| arrayType(typeOfData(element)).? else .text,
     };
 }
@@ -910,6 +914,7 @@ fn baseInfo(data_type: DataType) TypeInfo {
         .tsvector => .{ .oid = 3614, .name = "tsvector", .len = -1, .category = 'U', .array = 3643 },
         .tsquery => .{ .oid = 3615, .name = "tsquery", .len = -1, .category = 'U', .array = 3645 },
         .void => .{ .oid = 2278, .name = "void", .len = 4, .category = 'P', .array = 0 },
+        .macaddr8 => .{ .oid = 774, .name = "macaddr8", .len = 8, .category = 'U', .array = 775 },
         _ => .{ .oid = 0, .name = "", .len = -1, .category = 'A', .array = 0 },
     };
 }
@@ -994,6 +999,7 @@ fn baseSqlName(data_type: DataType) []const u8 {
         .aclitem => "aclitem",
         .pg_internal_char => "\"char\"",
         .void => "void",
+        .macaddr8 => "macaddr8",
         _ => "",
     };
 }
@@ -1044,6 +1050,7 @@ pub fn typeInputName(data_type: DataType) []const u8 {
         .aclitem => "aclitemin",
         .pg_internal_char => "charin",
         .void => "void_in",
+        .macaddr8 => "macaddr8_in",
         _ => "array_in",
     };
 }
@@ -1315,7 +1322,9 @@ pub fn Values(comptime config: Config) type {
         /// `jsonb` holds the canonical binary (jsonb.sig) in a Text.
         /// varchar is `text`; `bpchar` (CHAR(n)) holds its padded bytes and
         /// compares/hashes without trailing spaces.
-        pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar, uuid, bytea, time, timetz, bits, money, pg_lsn, xid8, array, range, inet, macaddr, point, box, xml, regtype, tsvector, tsquery, pg_internal_char, regproc };
+        pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar, uuid, bytea, time, timetz, bits, money, pg_lsn, xid8, array, range, inet, macaddr, point, box, xml, regtype, tsvector, tsquery, pg_internal_char, regproc,
+            // B11 wave-4 types-ext.
+            macaddr8 };
 
         pub const Cell = union(CellTag) {
             null_value: void,
@@ -1364,6 +1373,8 @@ pub fn Values(comptime config: Config) type {
             tsquery: Text,
             pg_internal_char: u8,
             regproc: u32,
+            /// macaddr8: eight bytes (network.sig).
+            macaddr8: network.Mac8,
         };
 
         /// Range values of these cells (range.sig).
@@ -1431,6 +1442,7 @@ pub fn Values(comptime config: Config) type {
                 .pg_internal_char => .pg_internal_char,
                 // void values are the empty text (void_out).
                 .void => .text,
+                .macaddr8 => .macaddr8,
                 _ => .array,
             };
         }
@@ -1470,6 +1482,7 @@ pub fn Values(comptime config: Config) type {
                 .range => |*value| Ranges.compare(value.slice(), right.range.slice()),
                 .inet => |*value| network.compare(value, &right.inet),
                 .macaddr => |*value| bytesOrder(value, &right.macaddr),
+                .macaddr8 => |*value| bytesOrder(value, &right.macaddr8),
                 .point => |value| geometric.comparePoints(value, right.point),
                 .box => |value| geometric.compareBoxes(value, right.box),
                 .xml => |*value| bytesOrder(value.slice(), right.xml.slice()),
@@ -1551,6 +1564,10 @@ pub fn Values(comptime config: Config) type {
                     for (address.address) |byte| code = (code ^ byte) *% 1099511628211;
                 },
                 .macaddr => |*bytes| {
+                    mix(&code, tag);
+                    for (bytes) |byte| code = (code ^ byte) *% 1099511628211;
+                },
+                .macaddr8 => |*bytes| {
                     mix(&code, tag);
                     for (bytes) |byte| code = (code ^ byte) *% 1099511628211;
                 },

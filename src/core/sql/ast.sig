@@ -140,7 +140,18 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     pg_get_function_arguments, pg_get_function_identity_arguments, pg_get_function_result, pg_get_function_sqlbody,
     // void-returning session functions (B11 wave-4 types-ext, Database
     // session hook; volatile).
-    pg_notify, pg_advisory_lock, pg_advisory_lock_shared, pg_advisory_xact_lock, pg_advisory_xact_lock_shared, pg_advisory_unlock_all };
+    pg_notify, pg_advisory_lock, pg_advisory_lock_shared, pg_advisory_xact_lock, pg_advisory_xact_lock_shared, pg_advisory_unlock_all,
+    // Arrays (B11 wave-4 types-ext, array_eval.sig): the remaining
+    // array_userfuncs.c functions, width_bucket(anycompatible,
+    // anycompatiblearray) and the element / slice assignment of UPDATE
+    // SET a[...] = v (array_set: `b` the base, the new value, then the
+    // subscripts; its layout in `integer` as for array_subscript).
+    array_position, array_positions, array_replace, trim_array, array_fill, array_reverse, array_sort, array_sample, array_shuffle,
+    string_to_array, array_width_bucket, array_set,
+    // Types-ext operators and functions (B11 wave 4, types_ext_eval.sig):
+    // ext_op is an operator call (`integer` the Op, the operands in `b`),
+    // named ?column?; then the network and macaddr8 functions.
+    ext_op, inet_abbrev, set_masklen, hostmask, inet_merge, inet_same_family, macaddr8_set7bit, to_macaddr8, to_macaddr, mac_trunc };
 
 /// JSON_TABLE column flags (Node.integer of a json_table_column).
 pub const JsonTableColumn = struct {
@@ -217,6 +228,8 @@ pub fn immutableBuiltin(func: Func) bool {
         .overlaps, .aggregate_pair, .normalize, .is_normalized, .mysql_date_add => true,
         .array_constructor, .array_subscript, .array_any, .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper,
         .array_append, .array_prepend, .array_cat, .array_remove => true,
+        .array_position, .array_positions, .array_replace, .trim_array, .array_fill, .array_reverse, .array_sort, .string_to_array, .array_width_bucket, .array_set => true,
+        .ext_op, .inet_abbrev, .set_masklen, .hostmask, .inet_merge, .inet_same_family, .macaddr8_set7bit, .to_macaddr8, .to_macaddr, .mac_trunc => true,
         .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => true,
         .inet_host, .masklen, .inet_family, .inet_network, .broadcast, .netmask => true,
         .point_constructor, .box_constructor, .area, .center, .width, .height => true,
@@ -246,6 +259,8 @@ pub fn strictFunction(func: Func) bool {
         .extract, .extract_tz, .date_part, .date_part_tz, .date_trunc, .date_trunc_tz, .date_bin, .age, .age_tz, .justify_days, .justify_hours, .justify_interval, .make_date, .make_timestamp, .isfinite => true,
         .to_date, .to_number, .to_timestamp, .aggregate_pair, .normalize, .is_normalized => true,
         .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper => true,
+        .trim_array, .array_reverse, .array_sort, .array_sample, .array_shuffle => true,
+        .ext_op, .inet_abbrev, .set_masklen, .hostmask, .inet_merge, .inet_same_family, .macaddr8_set7bit, .to_macaddr8, .to_macaddr, .mac_trunc => true,
         .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => true,
         .inet_host, .masklen, .inet_family, .inet_network, .broadcast, .netmask => true,
         .point_constructor, .box_constructor, .area, .center, .width, .height => true,

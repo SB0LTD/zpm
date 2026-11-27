@@ -2011,6 +2011,8 @@ pub fn Database(comptime config: Config) type {
         notify: Sess.Notify = .{},
         ssi: SSI = .{},
         session_hook: value_module.SessionHook = undefined,
+        /// array_shuffle / array_sample state (B11 wave 4; 0: unseeded).
+        random_state: u64 = 0,
         param_values: [config.statement_parameters]Cell = undefined,
         active_params: ?*const B.Parameters = null,
         statement_implicit: bool = false,
@@ -12372,6 +12374,18 @@ pub fn Database(comptime config: Config) type {
                     self.locks.releaseAdvisoryAll(self.sessionState().id);
                     self.wake_epoch +%= 1;
                     return .{};
+                },
+                .random => {
+                    // splitmix64 over a state seeded from the wall clock.
+                    if (self.random_state == 0) {
+                        const now: i64 = if (self.session.clock) |clock| clock() orelse 0 else 0;
+                        self.random_state = @as(u64, @bitCast(now)) ^ 0x853c49e6748fea9b;
+                    }
+                    self.random_state +%= 0x9e3779b97f4a7c15;
+                    var z = self.random_state;
+                    z = (z ^ (z >> 30)) *% 0xbf58476d1ce4e5b9;
+                    z = (z ^ (z >> 27)) *% 0x94d049bb133111eb;
+                    return .{ .integer = @bitCast(z ^ (z >> 31)) };
                 },
                 .notify => {
                     // pg_notify(channel, payload): NOTIFY's queue entry, kept

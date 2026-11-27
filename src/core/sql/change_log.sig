@@ -413,6 +413,11 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     try writer.int(u8, 24);
                     try writer.bytes(value);
                 },
+                // B11 wave 4 (types-ext): value tag 46.
+                .macaddr8 => |*value| {
+                    try writer.int(u8, 46);
+                    try writer.bytes(value);
+                },
                 .xml => |*text| {
                     try writer.int(u8, 27);
                     try writer.int(u32, @intCast(text.len));
@@ -1307,6 +1312,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     break :blk .{ .inet = value };
                 },
                 24 => .{ .macaddr = (try reader.take(6))[0..6].* },
+                46 => .{ .macaddr8 = (try reader.take(8))[0..8].* },
                 30 => .{ .regtype = try reader.int(u32) },
                 31 => .{ .pg_internal_char = try reader.int(u8) },
                 32 => .{ .regproc = try reader.int(u32) },

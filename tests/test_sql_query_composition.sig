@@ -452,7 +452,8 @@ fn groupingSets() !void {
     try rejects("SELECT GROUPING(v) FROM tdd_a GROUP BY GROUPING SETS ((g))", error.GroupingError);
     try rejects("SELECT COUNT(*) FROM tdd_a GROUP BY GROUPING SETS ()", error.Syntax);
     try rejects("SELECT COUNT(*) FROM tdd_a GROUP BY ROLLUP(())", error.Syntax);
-    try rejects("SELECT g,COUNT(DISTINCT v+1) FROM tdd_a GROUP BY GROUPING SETS ((g),())", error.UnsupportedStatement);
+    // DISTINCT aggregates use the sorted grouping-set path (types-ext lane).
+    try expect("SELECT g,COUNT(DISTINCT v+1) FROM tdd_a GROUP BY GROUPING SETS ((g),()) ORDER BY GROUPING(g),g", "1|2;2|1;NULL|3");
     try rejects("SELECT g,COUNT(*) FROM tdd_a GROUP BY GROUPING SETS ((g),()) HAVING 1/(COUNT(*)-COUNT(*))>0", error.DivisionByZero);
     // 4096 sets exceed the statement's expression-node budget (54001).
     try rejects("SELECT COUNT(*) FROM tdd_a GROUP BY GROUPING SETS ((id),()),GROUPING SETS ((g),()),GROUPING SETS ((v),()),GROUPING SETS ((id+1),()),GROUPING SETS ((g+1),()),GROUPING SETS ((v+1),()),GROUPING SETS ((id+2),()),GROUPING SETS ((g+2),()),GROUPING SETS ((v+2),()),GROUPING SETS ((id+3),()),GROUPING SETS ((g+3),()),GROUPING SETS ((v+3),())", error.StatementTooComplex);
@@ -489,7 +490,7 @@ fn groupingCube() !void {
     try rejects("SELECT COUNT(*) FROM tdd_a GROUP BY CUBE(())", error.Syntax);
     try rejects("SELECT COUNT(*) FROM tdd_a GROUP BY CUBE(id,g,v,id+1,g+1,v+1,id+2,g+2,v+2,id+3,g+3,v+3,id+4)", error.ProgramLimitExceeded);
     try rejects("SELECT COUNT(*) FROM tdd_a GROUP BY CUBE(id,g,v,id+1,g+1,v+1,id+2,g+2,v+2,id+3,g+3,v+3)", error.StatementTooComplex);
-    try rejects("SELECT g,COUNT(DISTINCT v+1) FROM tdd_a GROUP BY CUBE(g)", error.UnsupportedStatement);
+    try expect("SELECT g,COUNT(DISTINCT v+1) FROM tdd_a GROUP BY CUBE(g) ORDER BY GROUPING(g),g", "1|2;2|1;NULL|3");
     try controlled("SELECT g,v,COUNT(*) FROM tdd_a GROUP BY CUBE(g,v) ORDER BY GROUPING(g,v),g NULLS LAST,v NULLS LAST",
         "1|10|1;1|20|1;2|30|1;2|NULL|1;1|NULL|2;2|NULL|2;NULL|10|1;NULL|20|1;NULL|30|1;NULL|NULL|1;NULL|NULL|4");
     if (small.execute("SELECT k,COUNT(*) FROM t GROUP BY CUBE(k)", &small_result)) |_| return error.ExpectedCapacity else |err| try check(err == error.WorkspaceCapacity);
