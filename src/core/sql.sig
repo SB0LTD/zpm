@@ -2049,6 +2049,8 @@ pub fn Database(comptime config: Config) type {
         /// current_user inside a running SECURITY DEFINER routine (its
         /// owner); installRole keeps it (B11 wave 4).
         routine_definer: ?u32 = null,
+        /// Running routines with SET clauses (transaction control is 2D000).
+        routine_configured: usize = 0,
         /// Write-set index where the running statement's writes begin (its
         /// AFTER ROW triggers read them); kept across a park.
         statement_start: usize = 0,
@@ -10636,6 +10638,7 @@ pub fn Database(comptime config: Config) type {
             self.routine_nested = 0;
             self.routine_diag.active = false;
             self.routine_definer = null;
+            self.routine_configured = 0;
             self.installRole();
         }
 
@@ -12526,6 +12529,18 @@ pub fn Database(comptime config: Config) type {
             self.routine_diag.active = false;
         }
 
+        /// COMMIT / ROLLBACK inside a procedure or DO block (B11 wave 4).
+        /// PostgreSQL forbids it (2D000) inside an explicit transaction
+        /// block, below a function or trigger, inside a block with an
+        /// EXCEPTION clause and in a SECURITY DEFINER routine. Where it is
+        /// allowed it ends the transaction in the middle of the CALL; the
+        /// change-record protocol commits once per statement, so that
+        /// case is 0A000 (docs/SQL_ROUTINES.md).
+        pub fn routineTransaction(self: *Self, atomic: bool) Error!void {
+            if (!self.statement_implicit or self.routine_nested != 0 or atomic or self.routine_definer != null or self.routine_configured != 0) return error.InvalidTransactionTermination;
+            return error.UnsupportedStatement;
+        }
+
         fn enterRoutine(self: *Self) Error!void {
             if (self.routine_depth >= config.routine_depth) return error.StackDepthExceeded;
             self.routine_depth += 1;
@@ -12568,6 +12583,8 @@ pub fn Database(comptime config: Config) type {
                 return 0;
             }
             var parsed = try P.parse(text, &self.workspace.nodes, .standard);
+            // Transaction control inside a routine statement (0A000).
+            if (parsed == .control) return error.UnsupportedStatement;
             frame.variables.node_low = 0;
             frame.variables.node_high = self.workspace.nodes.len;
             const rows = try self.subStatement(slot, text, &parsed, snap, capture);
@@ -13016,6 +13033,7 @@ pub fn Database(comptime config: Config) type {
                 try routineSettingValues(routine, &next);
                 state.values = next;
                 scope.settings = true;
+                self.routine_configured += 1;
             }
             scope.active = true;
             if (routine.security_definer) self.routine_definer = routine.owner;
@@ -13024,7 +13042,10 @@ pub fn Database(comptime config: Config) type {
 
         fn leaveScope(self: *Self, scope: *const RoutineScope) void {
             if (!scope.active) return;
-            if (scope.settings) self.sessionState().values = scope.values;
+            if (scope.settings) {
+                self.sessionState().values = scope.values;
+                self.routine_configured -= 1;
+            }
             self.routine_definer = scope.definer;
             self.installRole();
         }
@@ -13892,6 +13913,10 @@ pub fn Database(comptime config: Config) type {
             defer self.routine_depth -= 1;
             self.routine_nested += 1;
             defer self.routine_nested -= 1;
+            // SECURITY DEFINER and SET clauses of the trigger function.
+            var scope: RoutineScope = .{};
+            try self.enterScope(routine, &scope);
+            defer self.leaveScope(&scope);
             var frame: R.Frame = .{};
             try routineParameters(&frame, &.{}, &.{}, &.{}, routine.name, true);
             try triggerVariableNames(&frame);

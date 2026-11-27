@@ -1466,6 +1466,9 @@ pub fn Routines(comptime config: types.Config) type {
                 outputs: [config.routine_args]u8 = undefined,
                 output_count: usize = 0,
                 rows: ?Emit = null,
+                /// Blocks with an EXCEPTION clause around the running
+                /// statement (transaction control is 2D000 inside one).
+                atomic_depth: usize = 0,
 
                 /// Validates (`check`) or runs the routine body.
                 pub fn execute(self: *Self, mode: Mode) Error!void {
@@ -1551,7 +1554,7 @@ pub fn Routines(comptime config: types.Config) type {
                             return .normal;
                         }
                     }
-                    if (c.is("commit") or c.is("rollback")) return error.UnsupportedStatement;
+                    if (c.is("commit") or c.is("rollback")) return self.transactionStatement(mode);
                     if (sqlWord(c)) return self.sqlStatement(mode);
                     return self.assignment(mode);
                 }
@@ -1656,6 +1659,13 @@ pub fn Routines(comptime config: types.Config) type {
                     const mark = if (mode == .run) self.host.routineMark() else undefined;
                     var signal: Signal = .normal;
                     var caught: ?Error = null;
+                    // A block with handlers is a subtransaction: COMMIT and
+                    // ROLLBACK are not allowed inside it (PostgreSQL 2D000).
+                    const atomic = mode == .run and (self.purpose == .procedure or self.purpose == .do_block) and try self.hasHandlers();
+                    if (atomic) self.atomic_depth += 1;
+                    defer if (atomic) {
+                        self.atomic_depth -= 1;
+                    };
                     if (mode == .run) {
                         signal = self.statementList(.run) catch |err| blk: {
                             if (uncatchable(err)) return err;
@@ -2157,6 +2167,34 @@ pub fn Routines(comptime config: types.Config) type {
                     self.result = try D.store(&self.return_column, value, self.host.routineSession());
                     self.returned = true;
                     return .returned;
+                }
+
+                /// Whether the block at the cursor (after BEGIN) has an
+                /// EXCEPTION clause: its statements are scanned, not run.
+                fn hasHandlers(self: *Self) Error!bool {
+                    const saved = self.cursor;
+                    defer self.cursor = saved;
+                    _ = try self.statementList(.skip);
+                    return self.cursor.is("exception");
+                }
+
+                /// COMMIT / ROLLBACK [AND [NO] CHAIN] in a procedure or DO
+                /// block: the host decides (2D000 where PostgreSQL forbids
+                /// it; the allowed case needs a commit inside the running
+                /// statement, which the store does not offer: 0A000).
+                noinline fn transactionStatement(self: *Self, mode: Mode) Error!Signal {
+                    const c = &self.cursor;
+                    try c.advance();
+                    _ = try c.take("transaction") or try c.take("work");
+                    if (try c.take("and")) {
+                        _ = try c.take("no");
+                        try c.expect("chain");
+                    }
+                    try c.expectSymbol(.semicolon);
+                    if (mode != .run) return .normal;
+                    if (self.purpose != .procedure and self.purpose != .do_block) return error.InvalidTransactionTermination;
+                    try self.host.routineTransaction(self.atomic_depth != 0);
+                    return .normal;
                 }
 
                 /// RETURN NEXT [expression]: one more row of a set-returning

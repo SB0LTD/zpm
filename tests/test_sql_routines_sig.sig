@@ -576,11 +576,41 @@ fn setFunctions() !void {
     try sameState(&.{ "SELECT * FROM pairs(3) WITH ORDINALITY", "SELECT price_of(2), counted(), ret1(1), atom2(20)", "SELECT * FROM tab2(2)", "SELECT * FROM fio(2)" });
 }
 
+// ---- transaction control in procedures -----------------------------------
+
+fn transactionControl() !void {
+    try run("CREATE TABLE tc (v INT)");
+    // COMMIT / ROLLBACK [AND CHAIN] are accepted at CREATE (PostgreSQL).
+    try run("CREATE PROCEDURE tcp(n INT) LANGUAGE plpgsql AS $$BEGIN FOR i IN 1..n LOOP INSERT INTO tc VALUES (i); IF i % 2 = 0 THEN COMMIT; ELSE ROLLBACK AND NO CHAIN; END IF; END LOOP; END$$");
+    // Forbidden contexts (2D000): an explicit transaction block, a
+    // SECURITY DEFINER or SET procedure, a function.
+    const slot = try db.begin();
+    try statementFails(slot, "CALL tcp(2)", error.InvalidTransactionTermination);
+    db.abort(slot);
+    try run("CREATE PROCEDURE tcdef() LANGUAGE plpgsql SECURITY DEFINER AS $$BEGIN INSERT INTO tc VALUES (9); COMMIT; END$$");
+    try rejects("CALL tcdef()", error.InvalidTransactionTermination, "SELECT count(*) FROM tc", "0");
+    try run("CREATE PROCEDURE tcset() LANGUAGE plpgsql SET search_path = public AS $$BEGIN COMMIT; END$$");
+    try rejects("CALL tcset()", error.InvalidTransactionTermination, "SELECT count(*) FROM tc", "0");
+    try run("CREATE FUNCTION tcf2() RETURNS INT LANGUAGE plpgsql AS $$BEGIN COMMIT; RETURN 1; END$$");
+    try rejects("SELECT tcf2()", error.InvalidTransactionTermination, "SELECT count(*) FROM tc", "0");
+    // Inside a block with handlers the 2D000 is an ordinary error: the
+    // handler catches it and the block's writes roll back.
+    try run("CREATE PROCEDURE tcexc() LANGUAGE plpgsql AS $$BEGIN BEGIN INSERT INTO tc VALUES (400); COMMIT; EXCEPTION WHEN invalid_transaction_termination THEN INSERT INTO tc VALUES (401); END; END$$");
+    try run("CALL tcexc()");
+    try expect("SELECT v FROM tc", "401");
+    // Allowed by PostgreSQL at top level, but a commit inside a running
+    // statement needs a store protocol this engine lacks (0A000).
+    try rejects("CALL tcp(2)", error.UnsupportedStatement, "SELECT v FROM tc", "401");
+    try rejects("DO $$BEGIN INSERT INTO tc VALUES (200); COMMIT; END$$", error.UnsupportedStatement, "SELECT v FROM tc", "401");
+    try sameState(&.{"SELECT v FROM tc"});
+}
+
 pub fn main() !void {
     try diagnostics();
     try schemas();
     try parameters();
     try definers();
     try setFunctions();
+    try transactionControl();
     std.debug.print("routines-sig: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });
 }
