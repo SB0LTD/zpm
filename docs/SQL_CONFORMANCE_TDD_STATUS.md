@@ -18,6 +18,11 @@ PostgreSQL. Native PostgreSQL 18.3 independently confirms the _RETURN rule shape
 Debug/ReleaseSafe and stock PG16/18 CI qualification are pending; do not merge until
 all required evidence passes.
 
+An additional Windows diagnostic found a 4,698,600-byte frame in the existing
+changeRecords test, caused by two automatic complete DB fixtures. Its malformed
+WAL probes now reuse fixed caller-owned storage, retaining all assertions. The
+routine suite joins the 4 MiB Debug/ReleaseSafe CI gate; the gate is not increased.
+
 This does not implement arbitrary CREATE RULE actions. Named routine namespaces,
 broader search_path behavior, CREATE OR REPLACE VIEW and ALTER VIEW column rename
 also remain open. The last two forms explicitly reject with 0A000 in the current

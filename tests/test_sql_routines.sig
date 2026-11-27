@@ -20,6 +20,9 @@ const Small = sql.Database(.{ .tables = 2, .columns = 4, .rows_per_table = 8, .n
 var assertions: usize = 0;
 var db: DB = .{};
 var replica: DB = .{};
+/// Malformed-WAL target: fixed caller-owned storage, reused between probes.
+/// Two automatic DB values made changeRecords alone exceed a 4 MiB stack.
+var crafted_replay: DB = .{};
 var scratch: DB.ReplayScratch = .{};
 var record: [65536]u8 = undefined;
 var records_applied: usize = 0;
@@ -830,7 +833,8 @@ fn changeRecords() !void {
     @memcpy(good[0..used], record[0..used]);
     const length = used;
     try check(good[8] == 60);
-    var fresh: DB = .{};
+    const fresh = &crafted_replay;
+    fresh.* = .{};
     var copy: [512]u8 = undefined;
     // Truncated payload, flipped kind, bad language, unknown type OID.
     for ([_]usize{ 13, 14, 20 }) |cut| {
@@ -874,9 +878,9 @@ fn changeRecords() !void {
     try db.executeChanges("CREATE FUNCTION rt() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$", &result, &record, &used, null, null);
     used = 0;
     try db.executeChanges("CREATE TRIGGER rtt BEFORE INSERT ON tdd_a FOR EACH ROW EXECUTE FUNCTION rt()", &result, &record, &used, null, null);
-    var empty: DB = .{};
-    if (empty.applyChangeRecord(record[0..used], &scratch)) |_| try check(false) else |err| try check(err == error.ChangeRecordConflict);
-    try check(empty.tableCount() == 0 and empty.oid_counter == 0);
+    fresh.* = .{};
+    if (fresh.applyChangeRecord(record[0..used], &scratch)) |_| try check(false) else |err| try check(err == error.ChangeRecordConflict);
+    try check(fresh.tableCount() == 0 and fresh.oid_counter == 0);
 }
 
 fn triggerDefinitions() !void {
