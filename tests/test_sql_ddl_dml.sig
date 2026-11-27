@@ -739,6 +739,53 @@ fn rowLockStrength() !void {
     try sameState(&.{"SELECT COUNT(*) FROM lu"});
 }
 
+// ---- row security: families, SELECT policies on new rows, check order -----
+
+fn rowSecurity() !void {
+    reset();
+    try run("CREATE TABLE r (id INT PRIMARY KEY, owner TEXT, v INT CHECK (v > 0) NOT NULL)");
+    try run("CREATE TABLE rc (extra INT) INHERITS (r)");
+    try run("CREATE ROLE ru");
+    try run("GRANT SELECT, INSERT, UPDATE, DELETE ON r TO ru");
+    try run("GRANT SELECT, INSERT, UPDATE, DELETE ON rc TO ru");
+    try run("ALTER TABLE r ENABLE ROW LEVEL SECURITY");
+    try run("CREATE POLICY r_sel ON r FOR SELECT USING (owner = 'ru')");
+    try run("CREATE POLICY r_ins ON r FOR INSERT WITH CHECK (v < 100)");
+    try run("CREATE POLICY r_upd ON r FOR UPDATE USING (owner = 'ru') WITH CHECK (v < 50)");
+    try run("CREATE POLICY r_del ON r FOR DELETE USING (true)");
+    try run("INSERT INTO r VALUES (1, 'ru', 10), (2, 'x', 20)");
+    try run("INSERT INTO rc VALUES (3, 'ru', 30, 0), (4, 'x', 40, 0)");
+    const all = "SELECT id, owner, v FROM r ORDER BY id";
+    try run("SET ROLE ru");
+    // Reads through the parent filter every member's rows by the parent's
+    // policies; a child read on its own uses the child's (none here).
+    try expect("SELECT id FROM r ORDER BY id", "1;3");
+    try expect("SELECT id FROM ONLY r ORDER BY id", "1");
+    try expect("SELECT id FROM rc ORDER BY id", "3;4");
+    // WITH CHECK runs before NOT NULL and CHECK constraints (42501 first).
+    try rejects("INSERT INTO r VALUES (5, 'x', 200)", error.InsufficientPrivilege, "SELECT COUNT(*) FROM rc", "2");
+    try rejects("INSERT INTO r VALUES (5, 'x', -1)", error.CheckViolation, "SELECT COUNT(*) FROM rc", "2");
+    try rejects("INSERT INTO r VALUES (5, 'x', NULL)", error.InsufficientPrivilege, "SELECT COUNT(*) FROM rc", "2");
+    try run("INSERT INTO r VALUES (5, 'x', 5)");
+    // A new row the statement returns must also pass the SELECT policies.
+    try rejects("INSERT INTO r VALUES (6, 'x', 6) RETURNING id", error.InsufficientPrivilege, "SELECT COUNT(*) FROM rc", "2");
+    try affects("INSERT INTO r VALUES (6, 'ru', 6) RETURNING id", 1, "6");
+    try rejects("UPDATE r SET v = 60 WHERE id = 1", error.InsufficientPrivilege, "SELECT COUNT(*) FROM rc", "2");
+    try expect("SELECT id, v FROM r ORDER BY id", "1|10;3|30;6|6");
+    try rejects("UPDATE r SET v = -1 WHERE id = 1", error.CheckViolation, "SELECT COUNT(*) FROM rc", "2");
+    try expect("SELECT id, v FROM r ORDER BY id", "1|10;3|30;6|6");
+    // UPDATE / DELETE through the parent reach the visible child rows.
+    try affects("UPDATE r SET v = v + 1 WHERE id >= 1", 3, "");
+    try expect("SELECT id, v FROM r ORDER BY id", "1|11;3|31;6|7");
+    try rejects("UPDATE r SET owner = 'x' WHERE id = 3 RETURNING id", error.InsufficientPrivilege, "SELECT COUNT(*) FROM rc", "2");
+    try expect("SELECT id, v FROM r ORDER BY id", "1|11;3|31;6|7");
+    try affects("DELETE FROM r WHERE id = 3 RETURNING id", 1, "3");
+    try affects("DELETE FROM r WHERE id = 2", 0, "");
+    try run("RESET ROLE");
+    try expect(all, "1|ru|11;2|x|20;4|x|40;5|x|5;6|ru|7");
+    try sameState(&.{all});
+}
+
 pub fn main() !void {
     try truncateOnly();
     try familyWrites();
@@ -749,5 +796,6 @@ pub fn main() !void {
     try foreignKeyTiming();
     try constraintCommands();
     try rowLockStrength();
+    try rowSecurity();
     std.debug.print("ddl-dml: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });
 }

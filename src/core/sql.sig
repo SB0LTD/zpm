@@ -1224,7 +1224,7 @@ pub fn Database(comptime config: Config) type {
                     if (executes_query) try session.restricted_relation_kinds.check(found.kind);
                     // Items the statement names (not view or expansion texts).
                     if (!privileged and direct) {
-                        const secured = try secureItem(db, workspace, &length, source, role, session.row_security, found, snap);
+                        const secured = try secureItem(db, workspace, &length, source, role, session.row_security, found, item.only, snap);
                         if (secured != ast.none) {
                             item.query = secured;
                             item.view = true;
@@ -3661,6 +3661,8 @@ pub fn Database(comptime config: Config) type {
             const count = self.familyMembers(root, snap, &members);
             // PostgreSQL applies only the root's rules to the statement.
             for (members[1..count]) |member| if (self.anyRule(member, snap)) return error.UnsupportedStatement;
+            self.family_root = root;
+            defer self.family_root = null;
             var bound: B.Bound = undefined;
             _ = try self.bindFamily(original, mode, root, snap, &bound);
             const is_update = bound == .update;
@@ -3676,12 +3678,11 @@ pub fn Database(comptime config: Config) type {
                 return;
             }
             try self.statementTriggers(root, routine_catalog.tg_before, &.{event}, snap);
-            self.family_root = root;
-            defer self.family_root = null;
             var affected: usize = 0;
             for (members[0..count]) |member| {
                 if (self.tables[member].relkind == 'p') continue;
                 const source = try self.bindFamily(original, mode, member, snap, &bound);
+                try self.secureNewRows(&bound, source, snap);
                 try self.lockTable(slot, member, .row_exclusive);
                 try self.ssiRead(slot, member);
                 try self.lockSources(slot);
@@ -6591,9 +6592,9 @@ pub fn Database(comptime config: Config) type {
         fn secureTarget(self: *Self, statement_copy: *A.Statement, source: []const u8, original: []const u8, snap: Snapshot) Error![]const u8 {
             const role = self.session.role;
             if (self.privilegedRole(snap)) return source;
-            const goal: struct { schema: ?ast.Ident, table: ast.Ident, where: *u16, command: CO.Command, reads: bool } = switch (statement_copy.*) {
-                .update => |*update| .{ .schema = update.schema, .table = update.table, .where = &update.where, .command = .update, .reads = update.where != ast.none or update.returning.count != 0 },
-                .delete => |*delete| .{ .schema = delete.schema, .table = delete.table, .where = &delete.where, .command = .delete, .reads = delete.where != ast.none or delete.returning.count != 0 },
+            const goal: struct { schema: ?ast.Ident, table: ast.Ident, where: *u16, command: CO.Command, reads: bool, only: bool } = switch (statement_copy.*) {
+                .update => |*update| .{ .schema = update.schema, .table = update.table, .where = &update.where, .command = .update, .reads = update.where != ast.none or update.returning.count != 0, .only = update.only },
+                .delete => |*delete| .{ .schema = delete.schema, .table = delete.table, .where = &delete.where, .command = .delete, .reads = delete.where != ast.none or delete.returning.count != 0, .only = delete.only },
                 else => return source,
             };
             if (goal.schema == null and !self.session.public_schema_on_path) return source;
@@ -6603,7 +6604,9 @@ pub fn Database(comptime config: Config) type {
             if (found.kind != 'r' and found.kind != 'p') return source;
             const table = &self.tables[found.slot];
             if (!try self.checkRowSecurity(role, table.oid, self.session.row_security, snap)) return source;
-            if (table.relkind == 'p' or self.hasChildren(table.oid, snap)) return error.UnsupportedStatement;
+            // A family's UPDATE / DELETE runs per member (familyMutation)
+            // under the named table's policies.
+            if ((table.relkind == 'p' or self.hasChildren(table.oid, snap)) and self.family_root == null and !goal.only) return error.UnsupportedStatement;
             var length: usize = 0;
             try self.securedSource(source, original, &length);
             var text: CO.Appender = .{ .out = &self.workspace.expansion, .len = &length };
@@ -6627,9 +6630,11 @@ pub fn Database(comptime config: Config) type {
             self.workspace.security_check = ast.none;
             const role = self.session.role;
             if (self.privilegedRole(snap)) return;
-            const goal: struct { table: usize, command: CO.Command } = switch (bound.*) {
-                .insert => |*insert| .{ .table = insert.table, .command = .insert },
-                .update => |*update| .{ .table = update.table, .command = .update },
+            // A new row the statement also reads (RETURNING; an UPDATE's
+            // WHERE) must pass the SELECT policies too (ddl-dml, wave 4).
+            const goal: struct { table: usize, command: CO.Command, reads: bool } = switch (bound.*) {
+                .insert => |*insert| .{ .table = insert.table, .command = .insert, .reads = insert.returning.count != 0 },
+                .update => |*update| .{ .table = update.table, .command = .update, .reads = update.where != ast.none or update.returning.count != 0 },
                 .merge => |*merge| {
                     if (try self.checkRowSecurity(role, self.tables[merge.table].oid, self.session.row_security, snap)) return error.UnsupportedStatement;
                     return;
@@ -6648,13 +6653,19 @@ pub fn Database(comptime config: Config) type {
                 },
                 else => return,
             };
-            const oid = self.tables[goal.table].oid;
+            // A family member's new rows meet the named root's policies.
+            const oid = if (self.family_root) |root| self.tables[root].oid else self.tables[goal.table].oid;
             if (!try self.checkRowSecurity(role, oid, self.session.row_security, snap)) return;
             if (bound.* == .insert and bound.insert.conflict.action != .none) return error.UnsupportedStatement;
             var length: usize = 0;
             try self.securedSource(source, source, &length);
             const start = length;
             try self.catalog_objects.securityText(role, oid, goal.command, true, snap, &self.workspace.expansion, &length);
+            if (goal.reads) {
+                var text: CO.Appender = .{ .out = &self.workspace.expansion, .len = &length };
+                try text.add(" AND ");
+                try self.catalog_objects.securityText(role, oid, .select, false, snap, &self.workspace.expansion, &length);
+            }
             self.workspace.expansion_used = @max(self.workspace.expansion_used, length);
             const text = self.workspace.expansion[start..length];
             const context = self.bindContext(text, .standard, snap);
@@ -6662,6 +6673,12 @@ pub fn Database(comptime config: Config) type {
             self.workspace.security_start = start;
             self.workspace.security_len = length - start;
             self.workspace.security_table = goal.table;
+        }
+
+        /// Whether the running statement checks row security on new rows of
+        /// table `table_slot`.
+        fn securedTarget(self: *const Self, table_slot: usize) bool {
+            return self.workspace.security_check != ast.none and self.workspace.security_table == table_slot;
         }
 
         /// The new row of the statement's INSERT / UPDATE target passes its
@@ -6689,7 +6706,7 @@ pub fn Database(comptime config: Config) type {
         /// names (not one a view or an expansion introduced: those run with
         /// the view owner's rights, the bootstrap superuser). Returns the
         /// derived query replacing it under row security, or none.
-        fn secureItem(db: *const Self, workspace: *Workspace, length: *usize, source: []const u8, role: u32, row_security: bool, found: K.Found, snap: Snapshot) Error!u16 {
+        fn secureItem(db: *const Self, workspace: *Workspace, length: *usize, source: []const u8, role: u32, row_security: bool, found: K.Found, only: bool, snap: Snapshot) Error!u16 {
             if (found.kind == 'S') {
                 const seq = &db.seqs[found.slot];
                 const owner = if (seq.owner == 0) CO.bootstrap_role else db.catalog_objects.owner(seq.owner, snap);
@@ -6700,7 +6717,6 @@ pub fn Database(comptime config: Config) type {
             if (!db.catalog_objects.tablePrivileges(role, table.oid, CO.priv_select, snap)) return error.InsufficientPrivilege;
             if (table.relkind != 'r' and table.relkind != 'p') return ast.none;
             if (!try db.checkRowSecurity(role, table.oid, row_security, snap)) return ast.none;
-            if (table.relkind == 'p' or db.hasChildren(table.oid, snap)) return error.UnsupportedStatement;
             if (length.* == 0) {
                 if (source.len > workspace.expansion.len) return error.TextCapacity;
                 @memcpy(workspace.expansion[0..source.len], source);
@@ -6709,7 +6725,10 @@ pub fn Database(comptime config: Config) type {
             var text: CO.Appender = .{ .out = &workspace.expansion, .len = length };
             try text.add(" ");
             const start = length.*;
-            try text.add("SELECT * FROM ONLY ");
+            // A family read through the named table: its policies filter
+            // every member's rows (the expansion reads the members).
+            const family = !only and (table.relkind == 'p' or db.hasChildren(table.oid, snap));
+            try text.add(if (family) "SELECT * FROM " else "SELECT * FROM ONLY ");
             try text.quoted(db.namespaceName(table.namespace));
             try text.add(".");
             try text.quoted(table.name.slice());
@@ -10105,20 +10124,27 @@ pub fn Database(comptime config: Config) type {
             const hooked = self.insertHooks(insert.table, snap);
             const target_table = &self.tables[insert.table];
             const auto = mysqlAutoColumn(target_table);
+            // Row security checks the new row before NOT NULL and CHECK
+            // constraints (ddl-dml, wave 4).
+            const secured_row = self.securedTarget(insert.table);
             var cells = if (auto) |column| blk: {
                 const replacement = try self.mysqlInsertValue(slot, ctx, insert.table, column, values[column]);
                 break :blk try D.insertedRowWithValue(ctx, target_table, values, derived, replacement);
-            } else if (hooked) try D.insertedRowDeferred(ctx, target_table, values, derived) else try D.insertedRow(ctx, target_table, values, derived);
+            } else if (hooked or secured_row) try D.insertedRowDeferred(ctx, target_table, values, derived) else try D.insertedRow(ctx, target_table, values, derived);
             if (hooked and try self.ruleSkips(insert.table, '3', &cells, null, snap)) return 0;
             // A partitioned table routes the row to its partition.
             const table_index = try self.routeRow(slot, insert.table, &cells, snap);
             if (hooked) {
                 if (!try self.beforeRow(table_index, routine_catalog.tg_insert, &cells, null, null, snap)) return 0;
-                try D.finishRow(ctx, &self.tables[insert.table], derived, &cells);
+                if (!secured_row) try D.finishRow(ctx, &self.tables[insert.table], derived, &cells);
                 if (table_index != insert.table) try self.partitionBound(table_index, &cells, snap);
             }
             // Row security checks the row the triggers produced (B11 wave 3).
-            try self.securityCheck(ctx, insert.table, &cells);
+            if (secured_row and auto == null) {
+                try D.generatedRow(ctx, &self.tables[insert.table], derived, &cells);
+                try self.securityCheck(ctx, insert.table, &cells);
+                try D.constrainRow(ctx, &self.tables[insert.table], derived, &cells);
+            } else try self.securityCheck(ctx, insert.table, &cells);
             const table = &self.tables[table_index];
             const replaced = insert.replace and try self.replaceMysqlConflict(slot, table_index, &cells, snap);
             // ON CONFLICT: the arbiter is checked first (PostgreSQL's
@@ -11443,11 +11469,19 @@ pub fn Database(comptime config: Config) type {
             const movable = if (self.family_root) |root| self.tables[root].relkind == 'p' else false;
             var unchecked = derived;
             if (movable) unchecked.checks = null;
-            var cells = if (hooked) try D.updatedRowDeferred(ctx, table, &update.values, unchecked, old_cells) else try D.updatedRow(ctx, table, &update.values, unchecked, old_cells);
+            // Row security checks the new row before NOT NULL and CHECK
+            // constraints (ddl-dml, wave 4).
+            const secured_row = self.securedTarget(update.table);
+            var cells = if (hooked or secured_row) try D.updatedRowDeferred(ctx, table, &update.values, unchecked, old_cells) else try D.updatedRow(ctx, table, &update.values, unchecked, old_cells);
             if (hooked) {
                 if (try self.ruleSkips(update.table, '2', &cells, old_cells, snap)) return false;
                 if (!try self.beforeRow(update.table, routine_catalog.tg_update, &cells, old_cells, &update.values, snap)) return false;
-                try D.finishRow(ctx, table, unchecked, &cells);
+                if (!secured_row) try D.finishRow(ctx, table, unchecked, &cells);
+            }
+            if (secured_row) {
+                try D.generatedRow(ctx, table, unchecked, &cells);
+                try self.securityCheck(ctx, update.table, &cells);
+                try D.constrainRow(ctx, table, unchecked, &cells);
             }
             if (movable) {
                 self.partitionBound(update.table, &cells, snap) catch |err| {
@@ -13219,6 +13253,9 @@ pub fn Database(comptime config: Config) type {
             const saved_volatility = self.routine_volatility;
             const saved_params = self.active_params;
             const saved_session_params = self.session.params;
+            // A trigger's statements are not part of an outer family
+            // statement or routed ON CONFLICT (ddl-dml, wave 4).
+            const saved_family = .{ self.family_root, self.family_returning, self.conflict_routed };
             defer {
                 self.routine_snap = saved_snap;
                 self.routine_frame = saved_frame;
@@ -13228,7 +13265,11 @@ pub fn Database(comptime config: Config) type {
                 self.routine_volatility = saved_volatility;
                 self.active_params = saved_params;
                 self.session.params = saved_session_params;
+                self.family_root, self.family_returning, self.conflict_routed = saved_family;
             }
+            self.family_root = null;
+            self.family_returning = .none;
+            self.conflict_routed = false;
             self.routine_snap = snap;
             self.seq_snap = snap;
             self.routine_frame = frame;

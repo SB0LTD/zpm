@@ -713,7 +713,8 @@ fn locking() !void {
     // Errors.
     const t8 = try db.begin();
     try fails(t8, "LOCK TABLE missing", error.TableNotFound);
-    try fails(t8, "LOCK TABLE tdd_v", error.UnsupportedStatement);
+    // A view locks its base relations (ddl-dml, wave 4: contract-sql-ddl-dml).
+    try expect(t8, "LOCK TABLE tdd_v", "");
     try fails(t8, "LOCK TABLE nosuch.tdd_a", error.UndefinedSchema);
     try fails(t8, "LOCK TABLE tdd_a IN SHARE", error.Syntax);
     if (db.statement(t8, "LOCK TABLE tdd_a", &result, .{ .implicit = true })) |_| return error.InvalidStatementAccepted else |err| try check(err == error.NoActiveTransaction);
