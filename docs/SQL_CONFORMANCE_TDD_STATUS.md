@@ -1,54 +1,52 @@
 # SQL conformance TDD checkpoint
 
-## Routine catalog checkpoints — candidate, 27 November 2026
+## Routine catalog checkpoints and stock archives - qualified, 27 November 2026
 
-A regression first reproduced compact image export rejecting live routines with
-SnapshotUnsupportedState. RSBASE10 now adds bounded counts and checked frames for
-functions/procedures, triggers and rules. Roles, schemas, tables and default ACLs
-restore before routines; routines precede dependent triggers. Existing WAL codecs
-validate routine owners, ACL grantors/grantees, namespace and trigger/table links.
-RSBASE01–09 remain readable and retain their output encoding when applicable.
+RSBASE10 preserves live SQL/PLpgSQL functions, procedures, delegated EXECUTE ACLs,
+triggers and implemented DO NOTHING rules. Roles, schemas, tables and default ACLs
+restore before routines; routines precede dependent triggers. Checked WAL payloads
+validate owners, grantors/grantees, namespaces and trigger/table links. A routine-only
+image needs no dummy table. RSBASE01-09 remain readable and retain their output
+encoding when applicable. Other catalog classes/layouts still fail before export;
+this does not establish full catalog image parity.
 
-Local Debug initially passed 2,517 wide-cell checkpoint assertions and 156 base
-image assertions, including a function-only image without tables/catalog rows,
-delegated ACLs, body replacement via subsequent WAL, procedure/trigger/rule effects,
-invalid counts, unknown namespaces, truncation/trailing data and version mismatch.
-Orphan-trigger validation, Debug/ReleaseSafe and 4 MiB stack CI, live generation
-publication and stock PG16/18 archives are pending. Unsupported non-routine
-catalog classes still fail before output; this is not full catalog image parity.
+User-routine ALTER FUNCTION/PROCEDURE OWNER retains OIDs and remaps/coalesces ACL
+owner endpoints, including delegation, rollback, read-only rejection and replay.
+Rule/trigger discovery now has typed enable flags, public-qualified callbacks,
+search-path-aware names and caller-owned wide definition output. Typed default
+ACLs use the same checked writer for full 63-byte role names, without changing
+privilege sets or item order. Unknown rule OIDs return NULL. Synthetic view
+_RETURN rule deparsing and arbitrary rule actions remain open.
 
-The first PG18 run passed live routine checkpoint publication/reopen but exposed
-stock archive failures on ALTER FUNCTION OWNER and pg_get_ruledef. The candidate
-now implements function/procedure owner changes with preserved OIDs and remapped
-grant graphs, typed trigger enable flags, public-qualified trigger callback parsing,
-search-path-aware callback rendering and caller-owned wide definition output.
-Contracts cover owner transfer, delegation/revocation, rollback, read-only rejection,
-long definitions, byte-budget exhaustion and replay. Windows Debug passed 1,075
-routine assertions / 328 records, 2,521 wide-cell assertions and 158 base-image
-assertions on the corrected candidate.
+Thin value/arithmetic/call dispatch preserves evaluation order, NULL handling and
+checkpoints while avoiding unrelated wide-cell frames. Debug PDB frame sizes fell
+from 416,728 to 24,872 bytes for eval; arithmetic uses an 8,392-byte dispatcher plus
+82,840-byte handler instead of the old 441,552-byte dispatcher. Routine reads bypass
+the 974,792-byte scalar frame. These are stack measurements, not throughput claims.
+A Windows diagnostic changed only its PE stack reservation to 4 MiB.
 
-Linux Debug on a 4 MiB stack additionally exposed routine parameter evaluation
-entering the scalar dispatcher's unrelated wide-cell frame. Thin common-value,
-arithmetic and parameter/call dispatch now passes a Windows Debug diagnostic with
-a 4 MiB PE stack reservation (only the diagnostic copy's header was changed).
-Debug PDB frame sizes fell from 416,728 to 24,872 bytes for eval; arithmetic uses
-an 8,392-byte dispatcher and 82,840-byte handler instead of the old 441,552-byte
-binary dispatcher. Routine reads also bypass the 974,792-byte scalar frame.
-Evaluation order, NULL handling and checkpoints are unchanged. Linux CI and final
-ReleaseSafe qualification remain pending with the unchanged 4 MiB gate. The failed native
-and stack evidence remains recorded in RAMSQL CI 46008582900 and ZPM CI
-46008997236. None of this candidate is marked qualified or merged yet.
+[ZPM CI 46014717587](https://github.com/SB0LTD/zpm/actions/runs/46014717587)
+passed the complete library/transport/CLI workflow, Debug/ReleaseSafe wide-cell
+contracts on the unchanged 4 MiB stack, 1,078 routine assertions / 329 WAL records,
+158 base-image assertions and 1,761 security assertions / 432 records. Each wide-cell
+run passed 2,521 assertions. Regressions cover triggered rows without refiring,
+subsequent owner/body/revocation WAL, future defaults, malformed counts/namespaces,
+orphan triggers, truncation/trailing bytes, version mismatch and exhausted bytes.
 
-The corrected dispatcher passed Linux Debug/ReleaseSafe on the unchanged 4 MiB
-stack in CI 46012535883, and the strict 106-case inventory passed in RAMSQL
-CI 46012709718. PG16/18 inbound plain/custom routine archives now pass. Outbound
-discovery in CI 46012699753 exposed a separate fixed inline item in
-acldefault('f', owner) for 63-byte role names. All default ACL classes now share
-the checked caller-owned catalog writer without changing their privilege sets
-or item order. A text-128 / name-63 contract first reproduced TextCapacity, then
-passed with an indirect typed ACL and complete formatted output. Windows Debug
-now passes 1,078 assertions / 329 WAL records. Focused native requalification is
-pending before updating the product PR and starting its replacement matrix.
+[PG16/18 CI 46014842554](https://github.com/SB0LTD/ramsql/actions/runs/46014842554)
+passed 48 tooling, 10 large-object and 13 file/routine checks per lane. Plain/custom
+archives pass both directions with owned routines, delegated ACLs, procedure/trigger
+and rule effects and future defaults. Live rotation publishes a generation and
+reopens with the expected replacement body/privileges. The unchanged strict
+inventory passed 106/106 in
+[CI 46014847242](https://github.com/SB0LTD/ramsql/actions/runs/46014847242).
+Reports retain each independently compiled binary hash. Failed discovery, stack
+and long-owner regressions remain in runs 46008582900, 46008997236 and 46012699753.
+
+Other catalog images, non-public routine namespaces, broader routine signatures
+and execution, the 755-record applicability/closure review, native MySQL/T-SQL
+lanes and production qualification remain open. Full release/platform matrices
+are separate; no full PostgreSQL or universal performance claim follows.
 
 ## Per-schema routine default privileges — qualified, 27 November 2026
 
