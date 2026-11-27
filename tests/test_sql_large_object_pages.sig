@@ -701,6 +701,8 @@ var routine_default_db: DB = .{};
 var routine_default_copy: DB = .{};
 var routine_default_arena: Arena = .{};
 var routine_default_copy_arena: Arena = .{};
+var routine_image_copy: DB = .{};
+var routine_image_arena: Arena = .{};
 
 fn routineDefaultCheckpoint() !void {
     try routine_default_arena.bind(&routine_default_db);
@@ -732,10 +734,31 @@ fn routineDefaultCheckpoint() !void {
     try routine_default_copy.execute("SELECT restored_default()", &result);
     try expect(result.rows[0].cells[0].integer == 7);
     try routine_default_copy.execute("RESET ROLE", &result);
-    // The existing compact format still rejects live routines explicitly.
-    var unsupported: ImageBuffer = .{};
-    if (DB.BaseSnapshot.write(&routine_default_copy, &unsupported, &wal)) |_| return error.RoutineImageSilentlyDropped else |err| try expect(err == error.SnapshotUnsupportedState);
-    try expect(unsupported.used == 0);
+    // Live routines, their delegated ACLs and their dependents must survive
+    // a second compact checkpoint, not force retention of the whole WAL.
+    try routine_default_copy.execute("CREATE TABLE image_rows(id INT PRIMARY KEY,v INT)", &result);
+    try routine_default_copy.execute("CREATE FUNCTION image_trigger() RETURNS TRIGGER LANGUAGE plpgsql AS 'BEGIN NEW.v := NEW.v + 10; RETURN NEW; END'", &result);
+    try routine_default_copy.execute("CREATE TRIGGER image_before BEFORE INSERT ON image_rows FOR EACH ROW EXECUTE FUNCTION image_trigger()", &result);
+    try routine_default_copy.execute("CREATE RULE image_keep AS ON DELETE TO image_rows DO INSTEAD NOTHING", &result);
+    try routine_default_copy.execute("CREATE PROCEDURE image_proc() LANGUAGE SQL AS 'INSERT INTO image_rows VALUES (1,2)'", &result);
+    var live_image: ImageBuffer = .{};
+    try DB.BaseSnapshot.write(&routine_default_copy, &live_image, &wal);
+    try expect(std.mem.eql(u8, live_image.bytes[0..8], "RSBASE10"));
+    try routine_image_arena.bind(&routine_image_copy);
+    try DB.BaseSnapshot.restore(&routine_image_copy, &live_image, routine_default_copy.csn, &wal, &replay_scratch);
+    try routine_image_copy.execute("SET ROLE default_recipient", &result);
+    try routine_image_copy.execute("SELECT restored_default()", &result);
+    try expect(result.rows[0].cells[0].integer == 7);
+    try routine_image_copy.execute("RESET ROLE", &result);
+    try routine_image_copy.execute("CALL image_proc()", &result);
+    try routine_image_copy.execute("DELETE FROM image_rows", &result);
+    try routine_image_copy.execute("SELECT v FROM image_rows WHERE id=1", &result);
+    try expect(result.rows[0].cells[0].integer == 12);
+    try routine_image_copy.execute("CREATE FUNCTION after_image() RETURNS INT LANGUAGE SQL AS 'SELECT 8'", &result);
+    try routine_image_copy.execute("SET ROLE default_member", &result);
+    try routine_image_copy.execute("SELECT after_image()", &result);
+    try expect(result.rows[0].cells[0].integer == 8);
+    try routine_image_copy.execute("RESET ROLE", &result);
 }
 
 pub fn main(init: std.process.Init) !void {

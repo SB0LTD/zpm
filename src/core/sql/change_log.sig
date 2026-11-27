@@ -1880,6 +1880,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
             table_count: usize = 0,
             with_defaults: bool = false,
             with_schemas: bool = false,
+            with_routines: bool = false,
             catalog_kind: ?catalog_objects.Kind = null,
         };
 
@@ -2452,6 +2453,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 .create_table, .insert => if (image.bank >= config.tables) return error.InvalidChangeRecord,
                 .create_sequence => {},
                 .create_schema => if (!image.with_schemas) return error.InvalidChangeRecord,
+                .create_routine, .create_trigger, .create_rule => if (!image.with_routines) return error.InvalidChangeRecord,
                 .object_create => switch (image.catalog_kind orelse return error.InvalidChangeRecord) {
                     .role, .large_object, .large_object_acl, .large_object_default_acl, .builtin_routine_acl, .routine_default_acl, .comment => {},
                     else => return error.InvalidChangeRecord,
