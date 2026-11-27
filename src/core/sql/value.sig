@@ -35,6 +35,8 @@ const Error = types.Error;
 const Type = types.Type;
 
 /// The two relation kinds supported by PostgreSQL's session access guard.
+/// current_schemas(): schemas the search path lists (ddl-dml, wave 4).
+pub const schema_path_names = 10;
 pub const RestrictedRelationKinds = packed struct {
     view: bool = false,
     foreign_table: bool = false,
@@ -128,7 +130,7 @@ pub const SequenceHook = struct {
     /// Catalog-object text (B11 wave 3): a comment (obj_description,
     /// col_description, shobj_description) or a role name, written to `out`.
     catalog_text: ?*const fn (ptr: *anyopaque, kind: CatalogText, object: u32, classoid: u32, sub: i32, out: []u8) Error!?usize = null,
-    schema_path: ?*const fn (ptr: *anyopaque, implicit: bool, names: *[2][]const u8) usize = null,
+    schema_path: ?*const fn (ptr: *anyopaque, implicit: bool, names: *[schema_path_names][]const u8) usize = null,
     /// pg_get_serial_sequence(table, column): the qualified name of the
     /// sequence a column owns (SERIAL or identity) into `out`, null when it
     /// owns none (42P01 / 42703 for a missing table / column).

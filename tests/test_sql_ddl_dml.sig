@@ -798,6 +798,7 @@ pub fn main() !void {
     try rowLockStrength();
     try rowSecurity();
     try columnCommands();
+    try searchPath();
     std.debug.print("ddl-dml: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });
 }
 
@@ -898,4 +899,72 @@ fn columnCommands() !void {
     try rejects("CREATE SCHEMA s3 AUTHORIZATION public", error.UndefinedObject, owners, "s1|so;s2|ramsql;so|so");
     try rejects("CREATE SCHEMA s3 AUTHORIZATION nobody", error.UndefinedObject, owners, "s1|so;s2|ramsql;so|so");
     try sameState(&.{owners});
+}
+
+// ---- search_path over user schemas (the shared resolver) -------------------
+
+fn searchPath() !void {
+    reset();
+    try run("CREATE SCHEMA s1");
+    try run("CREATE SCHEMA s2");
+    try run("CREATE TABLE s1.t (a INT PRIMARY KEY)");
+    try run("CREATE TABLE s2.t (a INT)");
+    try run("CREATE TABLE public.t (a INT)");
+    try run("CREATE TABLE public.p (b INT)");
+    try run("INSERT INTO s1.t VALUES (1)");
+    try run("INSERT INTO s2.t VALUES (2)");
+    try run("INSERT INTO public.t VALUES (0)");
+    try run("INSERT INTO p VALUES (5)");
+    // Unqualified names resolve in the path's order; CREATE uses its first
+    // existing schema; missing schemas are skipped.
+    try run("SET search_path = s2, s1");
+    try expect("SHOW search_path", "s2, s1");
+    try expect("SELECT a FROM t", "2");
+    try affects("INSERT INTO t VALUES (22)", 1, "");
+    try affects("UPDATE t SET a = a + 100", 2, "");
+    try expect("SELECT a FROM s2.t ORDER BY a", "102;122");
+    try run("CREATE TABLE u (b INT)");
+    const homes = "SELECT tablename, schemaname FROM pg_tables WHERE tablename IN ('u', 'v1', 'w') ORDER BY 1";
+    try expect(homes, "u|s2");
+    try expect("SELECT current_schema(), current_schemas(false)", "s2|{s2,s1}");
+    try run("SET search_path = nosuch, s1");
+    try expect("SELECT a FROM t", "1");
+    try run("CREATE TABLE v1 (c INT)");
+    try expect(homes, "u|s2;v1|s1");
+    try run("SET search_path = nosuch");
+    try rejects("CREATE TABLE w (c INT)", error.UndefinedSchema, homes, "u|s2;v1|s1");
+    try rejects("SELECT a FROM t", error.TableNotFound, homes, "u|s2;v1|s1");
+    try expect("SELECT current_schema() IS NULL", "t");
+    // DDL, sequences, regclass and routines through the same path.
+    try run("SET search_path = s1, public");
+    try expect("SELECT t.a, p.b FROM t, p ORDER BY 1", "1|5");
+    try run("ALTER TABLE t ADD COLUMN c INT");
+    try expect("SELECT 't'::regclass::text, 'p'::regclass::text", "t|p");
+    try run("CREATE INDEX t_c ON t (c)");
+    try run("DROP INDEX t_c");
+    try run("CREATE SEQUENCE sq");
+    try expect("SELECT nextval('sq'), nextval('s1.sq')", "1|2");
+    try run("CREATE FUNCTION f() RETURNS INT LANGUAGE sql AS 'SELECT 42'");
+    try expect("SELECT f()", "42");
+    // A view stores its text: an unqualified name outside public must be
+    // written with its schema (0A000 otherwise).
+    try rejects("CREATE VIEW v AS SELECT a FROM t", error.UnsupportedStatement, homes, "u|s2;v1|s1");
+    try run("CREATE VIEW v2 AS SELECT a FROM s1.t");
+    try expect("SELECT * FROM v2", "1");
+    try run("TRUNCATE t");
+    try expect("SELECT COUNT(*) FROM t", "0");
+    const tx = try db.begin();
+    try statement(tx, "LOCK TABLE t");
+    try commit(tx);
+    try run("DROP TABLE t CASCADE");
+    try expect("SELECT a FROM t", "0");
+    try run("SET search_path TO DEFAULT");
+    try expect("SHOW search_path", "\"$user\", public");
+    try rejects("SELECT f()", error.UndefinedFunction, homes, "u|s2;v1|s1");
+    try expect("SELECT s1.f()", "42");
+    try run("SET SCHEMA 's1'");
+    try expect("SHOW search_path", "s1");
+    try expect("SELECT f()", "42");
+    try run("RESET search_path");
+    try sameState(&.{ homes, "SELECT a FROM s2.t ORDER BY a", "SELECT COUNT(*) FROM pg_tables WHERE schemaname = 's1'" });
 }

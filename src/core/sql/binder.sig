@@ -5327,8 +5327,32 @@ pub fn Binder(comptime config: types.Config) type {
         }
 
         fn specifiedNamespace(context: *const Context, schema: ?ast.Ident) Error!u32 {
-            const qualifier = schema orelse return if (context.session.public_schema_on_path) catalog.public_namespace else error.UndefinedSchema;
+            const qualifier = schema orelse {
+                // An unqualified CREATE: the search path's first existing
+                // schema (ddl-dml, wave 4; 3F000 with none).
+                if (context.routine_path_known) return if (context.routine_path.len != 0) context.routine_path[0] else error.UndefinedSchema;
+                return if (context.session.public_schema_on_path) catalog.public_namespace else error.UndefinedSchema;
+            };
             return namespaceOf(context, toName(context, qualifier).slice());
+        }
+
+        /// The schema an unqualified name of an existing relation resolves
+        /// to: the search path's first schema holding it (ddl-dml, wave 4);
+        /// names in stored view texts keep public. With no holder, the
+        /// creation schema (so the caller's lookup reports it missing).
+        fn relationPathNamespace(context: *const Context, schema: ?ast.Ident, name: ast.Ident) Error!u32 {
+            if (schema != null or !context.routine_path_known or
+                (context.stored_source_start != 0 and name.span.start >= context.stored_source_start)) return qualifierNamespace(context, schema);
+            const wanted = toName(context, name);
+            for (context.routine_path) |namespace| {
+                if (context.catalog.findIn(namespace, wanted.slice(), context.snapshot) == null) continue;
+                if (context.namespace_usage) |usage| usage.check(usage.ptr, context.session.role, namespace, context.snapshot) catch |err| {
+                    if (err == error.InsufficientPrivilege) continue;
+                    return err;
+                };
+                return namespace;
+            }
+            return if (context.routine_path.len != 0) context.routine_path[0] else error.TableNotFound;
         }
 
         fn qualifierNamespace(context: *const Context, schema: ?ast.Ident) Error!u32 {
@@ -5341,6 +5365,15 @@ pub fn Binder(comptime config: types.Config) type {
             return namespace;
         }
 
+        /// DROP INDEX name: the search path's first schema with an index of
+        /// that name (ddl-dml, wave 4).
+        fn indexPathNamespace(context: *const Context, schema: ?ast.Ident, name: ast.Ident) Error!u32 {
+            if (schema != null or !context.routine_path_known) return qualifierNamespace(context, schema);
+            const wanted = toName(context, name);
+            for (context.routine_path) |namespace| if (indexNameTaken(context, namespace, wanted.slice())) return namespace;
+            return if (context.routine_path.len != 0) context.routine_path[0] else error.UndefinedSchema;
+        }
+
         fn publicLookup(context: *const Context, ident: ast.Ident) bool {
             return context.session.public_schema_on_path or
                 (context.stored_source_start != 0 and ident.span.start >= context.stored_source_start);
@@ -5350,7 +5383,11 @@ pub fn Binder(comptime config: types.Config) type {
             // PostgreSQL reports a relation in a missing schema as 42P01.
             const namespace = if (schema != null) qualifierNamespace(context, schema) catch |err| {
                 return if (err == error.UndefinedSchema) error.TableNotFound else err;
-            } else if (publicLookup(context, name)) catalog.public_namespace else return error.TableNotFound;
+            } else if (context.stored_source_start != 0 and name.span.start >= context.stored_source_start)
+                catalog.public_namespace
+            else if (context.routine_path_known)
+                try relationPathNamespace(context, null, name)
+            else if (publicLookup(context, name)) catalog.public_namespace else return error.TableNotFound;
             const wanted = toName(context, name);
             return context.catalog.findIn(namespace, wanted.slice(), context.snapshot) orelse return error.TableNotFound;
         }
@@ -5568,7 +5605,7 @@ pub fn Binder(comptime config: types.Config) type {
         }
 
         fn bindDropIndex(context: *const Context, drop: *const Ast.Drop) Error!Bound {
-            const namespace = qualifierNamespace(context, drop.schema) catch |err| {
+            const namespace = indexPathNamespace(context, drop.schema, drop.name) catch |err| {
                 if (err == error.UndefinedSchema and drop.if_exists) return .{ .noop = .drop_index };
                 return err;
             };
@@ -5778,8 +5815,17 @@ pub fn Binder(comptime config: types.Config) type {
             if (n.kind != .cast or n.cast_type != .unknown) return null;
             if (context.dialect != .postgres) return error.UnsupportedStatement;
             const user_types = context.user_type_catalog orelse return error.UnsupportedStatement;
-            const namespace = try qualifierNamespace(context, if (n.qualifier.len == 0) null else n.qualifier);
             const name = toName(context, n.name);
+            // An unqualified type name: the search path's first schema with
+            // a user type of that name (ddl-dml, wave 4).
+            const namespace = if (n.qualifier.len == 0 and context.routine_path_known) blk: {
+                for (context.routine_path) |candidate| {
+                    if (user_types.byName(.domain, candidate, name.slice(), context.snapshot) != null or
+                        user_types.byName(.enum_type, candidate, name.slice(), context.snapshot) != null or
+                        user_types.byName(.composite_type, candidate, name.slice(), context.snapshot) != null) break :blk candidate;
+                }
+                break :blk catalog.public_namespace;
+            } else try qualifierNamespace(context, if (n.qualifier.len == 0) null else n.qualifier);
             if (user_types.byName(.domain, namespace, name.slice(), context.snapshot)) |index| {
                 const info = user_types.items[index].domain;
                 n.cast_type = info.base;
@@ -8966,7 +9012,7 @@ pub fn Binder(comptime config: types.Config) type {
                     const create = &statement.create_table;
                     const table_name = toName(context, create.name);
                     const postgres_acl = context.dialect == .postgres and context.namespace_create != null;
-                    const namespace = if (postgres_acl)
+                    const namespace = if (postgres_acl or create.schema == null)
                         try specifiedNamespace(context, create.schema)
                     else
                         try qualifierNamespace(context, create.schema);
@@ -9113,8 +9159,8 @@ pub fn Binder(comptime config: types.Config) type {
                 .drop_table => {
                     const drop = statement.drop_table;
                     const wanted = toName(context, drop.name);
-                    const namespace = qualifierNamespace(context, drop.schema) catch |err| {
-                        if (err == error.UndefinedSchema and drop.if_exists) return setBound(bound, .noop, .drop_table);
+                    const namespace = relationPathNamespace(context, drop.schema, drop.name) catch |err| {
+                        if ((err == error.UndefinedSchema or err == error.TableNotFound) and drop.if_exists) return setBound(bound, .noop, .drop_table);
                         return err;
                     };
                     const found = context.catalog.findIn(namespace, wanted.slice(), context.snapshot) orelse {
@@ -9608,8 +9654,8 @@ pub fn Binder(comptime config: types.Config) type {
 
         fn bindAlter(context: *const Context, alter: *const Ast.AlterTable) Error!Bound {
             const wanted = toName(context, alter.table.name);
-            const namespace = qualifierNamespace(context, alter.table.schema) catch |err| {
-                if (err == error.UndefinedSchema and alter.if_exists) return .{ .noop = .alter_table };
+            const namespace = relationPathNamespace(context, alter.table.schema, alter.table.name) catch |err| {
+                if ((err == error.UndefinedSchema or err == error.TableNotFound) and alter.if_exists) return .{ .noop = .alter_table };
                 return err;
             };
             const found = context.catalog.findIn(namespace, wanted.slice(), context.snapshot) orelse {
@@ -10472,7 +10518,8 @@ pub fn Binder(comptime config: types.Config) type {
             entry.on_delete = @enumFromInt(@intFromEnum(definition.on_delete));
             entry.on_update = @enumFromInt(@intFromEnum(definition.on_update));
             const referenced_name = toName(context, definition.ref_table.name);
-            const namespace = try qualifierNamespace(context, definition.ref_table.schema);
+            const namespace = if (definition.ref_table.schema == null and types.same(referenced_name.slice(), out.name.slice()) and
+                context.catalog.findIn(out.namespace, referenced_name.slice(), context.snapshot) == null) out.namespace else try relationPathNamespace(context, definition.ref_table.schema, definition.ref_table.name);
             const self_reference = namespace == out.namespace and types.same(referenced_name.slice(), out.name.slice());
             var parent_columns: []const V.Column = columns;
             var parent: ?*const S.Table = null;
@@ -10577,7 +10624,7 @@ pub fn Binder(comptime config: types.Config) type {
         /// statement expanded, added by the caller).
         fn bindCreateView(context: *const Context, create: *const Ast.CreateView) Error!Bound {
             const name = toName(context, create.name.name);
-            const namespace = try qualifierNamespace(context, create.name.schema);
+            const namespace = if (create.name.schema == null) try specifiedNamespace(context, null) else try qualifierNamespace(context, create.name.schema);
             if (namespace == catalog.catalog_namespace or namespace == catalog.information_namespace or namespace == catalog.toast_namespace) return error.UnsupportedStatement;
             const tag: types.CommandTag = if (create.materialized) .create_materialized_view else .create_view;
             if (relationNameTaken(context, namespace, name.slice())) {
@@ -10634,8 +10681,8 @@ pub fn Binder(comptime config: types.Config) type {
         /// DROP VIEW / DROP MATERIALIZED VIEW (42809 for another kind).
         fn bindDropView(context: *const Context, drop: *const Ast.Drop, materialized: bool) Error!Bound {
             const tag: types.CommandTag = if (materialized) .drop_materialized_view else .drop_view;
-            const namespace = qualifierNamespace(context, drop.schema) catch |err| {
-                if (err == error.UndefinedSchema and drop.if_exists) return .{ .noop = tag };
+            const namespace = relationPathNamespace(context, drop.schema, drop.name) catch |err| {
+                if ((err == error.UndefinedSchema or err == error.TableNotFound) and drop.if_exists) return .{ .noop = tag };
                 return err;
             };
             const wanted = toName(context, drop.name);
@@ -10980,6 +11027,12 @@ pub fn Binder(comptime config: types.Config) type {
                 return slot;
             }
             const wanted = toName(context, reference.name);
+            if (context.routine_path_known) {
+                const namespace = try relationPathNamespace(context, null, reference.name);
+                const found = context.catalog.findIn(namespace, wanted.slice(), context.snapshot) orelse return error.TableNotFound;
+                if (found.kind != 'r' and found.kind != 'p') return error.WrongObjectType;
+                return found.slot;
+            }
             if (!publicLookup(context, reference.name)) return error.TableNotFound;
             const found = context.catalog.find(wanted.slice(), context.snapshot) orelse return error.TableNotFound;
             if (found.kind != 'r' and found.kind != 'p') return error.WrongObjectType;

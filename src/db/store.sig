@@ -908,7 +908,10 @@ pub fn Store(comptime Raw: type) type {
                     self.settings.transaction_timeout_ms == 0 and !self.pending.active and !self.running_statement and self.read_context==null;
             }
             fn detachedIdentity(self: *const Connection) bool {
-                if (comptime has_engine_session) return self.engine_session.values.role == 0 and self.engine_session.sessionUser() == 10;
+                // A search_path over user schemas resolves names on the
+                // serialized path (ddl-dml, wave 4).
+                if (comptime has_engine_session) return self.engine_session.values.role == 0 and self.engine_session.sessionUser() == 10 and
+                    self.engine_session.values.simplePath();
                 return true;
             }
             /// No global Raw.session installation or mutable zone lookup hook.

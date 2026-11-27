@@ -1412,6 +1412,13 @@ pub fn Parser(comptime config: types.Config) type {
                     try self.finish();
                     return .{ .set = .{ .local = local, .name = .{ .special = .time_zone }, .value = value } };
                 }
+                // SET SCHEMA 'name': search_path (ddl-dml, wave 4).
+                if (self.rawWord("schema") and (try self.peek()).kind == .string) {
+                    try self.advance();
+                    const value = try self.settingValue();
+                    try self.finish();
+                    return .{ .set = .{ .local = local, .name = .{ .special = .schema }, .value = value } };
+                }
                 if (self.rawWord("xml") and wordIs(self.source, try self.peek(), "option")) {
                     try self.advance();
                     try self.advance();

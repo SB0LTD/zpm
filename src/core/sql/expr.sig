@@ -561,7 +561,7 @@ pub fn Eval(comptime config: types.Config) type {
         fn currentSchemas(ctx: *const Context, implicit: bool) Error!V.Cell {
             const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
             const read = hook.schema_path orelse return error.UnsupportedStatement;
-            var names: [2][]const u8 = undefined;
+            var names: [value_module.schema_path_names][]const u8 = undefined;
             const count = read(hook.ptr, implicit, &names);
             var result: V.Text = .{};
             var writer = try V.Arrays.Writer.begin(&result, &.{
@@ -587,7 +587,13 @@ pub fn Eval(comptime config: types.Config) type {
         fn catalogValue(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
             switch (n.func) {
                 .current_database => return textCell(ctx.session.database),
-                .current_schema => return if (ctx.session.public_schema_on_path) textCell("public") else .null_value,
+                // The first schema of the search path (ddl-dml, wave 4).
+                .current_schema => {
+                    const hook = ctx.session.sequences orelse return if (ctx.session.public_schema_on_path) textCell("public") else .null_value;
+                    const read = hook.schema_path orelse return if (ctx.session.public_schema_on_path) textCell("public") else .null_value;
+                    var names: [value_module.schema_path_names][]const u8 = undefined;
+                    return if (read(hook.ptr, false, &names) == 0) .null_value else textCell(names[0]);
+                },
                 else => {},
             }
             const first = try eval(ctx, n.b);

@@ -1206,7 +1206,7 @@ pub const Characteristics = struct {
 /// TIME ZONE, XML OPTION and TRANSACTION ISOLATION LEVEL.
 pub const SettingName = struct {
     ident: Ident = .{},
-    special: enum { none, time_zone, xml_option, transaction_isolation, session_authorization } = .none,
+    special: enum { none, time_zone, xml_option, transaction_isolation, session_authorization, schema } = .none,
 };
 
 /// SET value: DEFAULT, LOCAL (TIME ZONE LOCAL), a word, a string literal or

@@ -179,6 +179,9 @@ pub const Config = struct {
     /// Savepoint levels of one transaction that can change engine
     /// settings (each keeps the level's starting values).
     setting_snapshots: usize = 4,
+    /// Schemas the search path resolves (ddl-dml, wave 4): existing schemas
+    /// of search_path beyond this many are not searched.
+    search_path_schemas: usize = 8,
     /// LISTEN channels per session (also its pending LISTEN/UNLISTEN
     /// actions), listening sessions, committed notifications not yet read
     /// by every listener, uncommitted NOTIFY entries of all transactions

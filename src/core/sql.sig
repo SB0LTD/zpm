@@ -1173,7 +1173,6 @@ pub fn Database(comptime config: Config) type {
             };
             const tables = &db.tables;
             const catalog = &db.catalog;
-            const public_schema_on_path = session.public_schema_on_path;
             workspace.expanded_count = 0;
             const pool = &workspace.nodes;
             var length: usize = 0;
@@ -1181,7 +1180,7 @@ pub fn Database(comptime config: Config) type {
             if (bound_statement.* == .refresh_view) {
                 const refresh = &bound_statement.refresh_view;
                 const schema_name = if (refresh.name.schema) |qualifier| identName(source, qualifier) else Name{};
-                const namespace_oid = if (refresh.name.schema != null or public_schema_on_path) try db.namespaceForUsage(session.role, if (refresh.name.schema != null) schema_name.slice() else null, snap) else null;
+                const namespace_oid = if (refresh.name.schema != null) try db.namespaceForUsage(session.role, schema_name.slice(), snap) else try db.pathRelation(session.role, identName(source, refresh.name.name).slice(), snap);
                 if (namespace_oid) |namespace| {
                     if (catalog.findIn(namespace, identName(source, refresh.name.name).slice(), snap)) |found| {
                         if (found.kind == 'm') refresh.query = try appendQuery(workspace, &length, source, tables[found.slot].query.slice());
@@ -1214,12 +1213,21 @@ pub fn Database(comptime config: Config) type {
                         if (view == .pg_authid and !privileged) return error.InsufficientPrivilege;
                         continue;
                     }
-                    if (item.schema == null and !public_schema_on_path and direct) continue;
                     const qualified = if (item.schema != null) schema_name.slice() else null;
+                    // Names the statement writes resolve through the search
+                    // path; stored view texts through public (ddl-dml).
+                    // A detached read context resolves like the default path
+                    // (the store runs them only with such paths).
                     const namespace = if (direct)
-                        try db.namespaceForUsage(session.role, qualified, snap)
+                        (if (qualified != null) try db.namespaceForUsage(session.role, qualified, snap) else if (session == &db.session) try db.pathRelation(session.role, name.slice(), snap) else if (session.public_schema_on_path) try db.namespaceForUsage(session.role, null, snap) else null)
                     else
                         namespaceFor(catalog, qualified, snap);
+                    // A stored definition names its relations by text: one
+                    // outside public needs its schema written (ddl-dml).
+                    if (direct and qualified == null and namespace != null and namespace.? != catalog_module.public_namespace) switch (bound_statement.*) {
+                        .create_view => return error.UnsupportedStatement,
+                        else => {},
+                    };
                     const found = catalog.findIn(namespace orelse continue, name.slice(), snap) orelse continue;
                     if (executes_query) try session.restricted_relation_kinds.check(found.kind);
                     // Items the statement names (not view or expansion texts).
@@ -3631,7 +3639,7 @@ pub fn Database(comptime config: Config) type {
 
         /// Parses and binds `original` again with `member` as its target
         /// (the statement keeps naming the root). Returns the bound source.
-        fn bindFamily(self: *Self, original: []const u8, mode: ParseMode, member: usize, snap: Snapshot, bound: *B.Bound) Error![]const u8 {
+        noinline fn bindFamily(self: *Self, original: []const u8, mode: ParseMode, member: usize, snap: Snapshot, bound: *B.Bound) Error![]const u8 {
             const top = try P.parseTopWithOptions(original, &self.workspace.nodes, .{ .mode = mode, .dialect = self.dialect });
             var statement_copy = top.command;
             const expanded = try expandRelations(self, &self.workspace, original, snap, &statement_copy, self.session.role, &self.session);
@@ -3656,7 +3664,7 @@ pub fn Database(comptime config: Config) type {
         /// member's, and RETURNING evaluates the root's list over every
         /// member row the statement wrote. An UPDATE whose new row leaves
         /// its partition moves it (moveRow).
-        fn familyMutation(self: *Self, slot: u16, original: []const u8, root: usize, snap: Snapshot, result: *Result, mode: ParseMode) Error!void {
+        noinline fn familyMutation(self: *Self, slot: u16, original: []const u8, root: usize, snap: Snapshot, result: *Result, mode: ParseMode) Error!void {
             var members: [config.tables]usize = undefined;
             const count = self.familyMembers(root, snap, &members);
             // PostgreSQL applies only the root's rules to the statement.
@@ -3714,7 +3722,7 @@ pub fn Database(comptime config: Config) type {
         /// (23514). BEFORE ROW triggers or rules on either partition are
         /// outside the subset (0A000); AFTER ROW triggers fire for the
         /// delete and the insert, as PostgreSQL's do.
-        fn moveRow(self: *Self, slot: u16, ctx: *E.Context, update: *const B.Update, old: u32, old_cells: *const E.Row, cells: *E.Row, snap: Snapshot) Error!bool {
+        noinline fn moveRow(self: *Self, slot: u16, ctx: *E.Context, update: *const B.Update, old: u32, old_cells: *const E.Row, cells: *E.Row, snap: Snapshot) Error!bool {
             const root = self.family_root orelse return error.CheckViolation;
             try self.partitionBound(root, cells, snap);
             const destination = try self.routeRow(slot, root, cells, snap);
@@ -4433,9 +4441,8 @@ pub fn Database(comptime config: Config) type {
         /// A table, view or materialized view named by a catalog-object
         /// statement (42P01), locked in `mode`; null with IF EXISTS.
         fn objectTable(self: *Self, slot: u16, source: []const u8, name: CO.Qualified, mode: locks_module.TableMode, snap: Snapshot) Error!usize {
-            if (!name.has_schema and !self.session.public_schema_on_path) return error.TableNotFound;
             const schema_name = if (name.has_schema) objectName(source, name.schema) else Name{};
-            const namespace = (try self.namespaceForUsage(self.session.role, if (name.has_schema) schema_name.slice() else null, snap)) orelse return error.UndefinedSchema;
+            const namespace = (try self.relationNamespace(self.session.role, if (name.has_schema) schema_name.slice() else null, objectName(source, name.name).slice(), snap)) orelse return error.TableNotFound;
             const found = self.catalog.findIn(namespace, objectName(source, name.name).slice(), snap) orelse return error.TableNotFound;
             if (found.kind == 'S') return error.WrongObjectType;
             try self.lockTable(slot, found.slot, mode);
@@ -5428,9 +5435,23 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn typeNamespace(self: *const Self, source: []const u8, name: CO.Qualified, snap: Snapshot) Error!u32 {
-            if (!name.has_schema and !self.session.public_schema_on_path) return error.UndefinedSchema;
-            const schema = if (name.has_schema) objectName(source, name.schema) else Name{};
-            return (try self.namespaceForUsage(self.session.role, if (name.has_schema) schema.slice() else null, snap)) orelse error.UndefinedSchema;
+            if (!name.has_schema) {
+                // The search path's first schema holding a user type of that
+                // name, else its first schema (CREATE; 3F000 with none).
+                var path: [routine_path_capacity]u32 = undefined;
+                const count = self.routinePath(snap, &path);
+                const wanted = objectName(source, name.name);
+                for (path[0..count]) |namespace| {
+                    if (self.catalog_objects.byName(.domain, namespace, wanted.slice(), snap) != null or
+                        self.catalog_objects.byName(.enum_type, namespace, wanted.slice(), snap) != null or
+                        self.catalog_objects.byName(.composite_type, namespace, wanted.slice(), snap) != null) return namespace;
+                }
+                if (count == 0) return error.UndefinedSchema;
+                try self.checkNamespaceUsage(self.session.role, path[0], snap);
+                return path[0];
+            }
+            const schema = objectName(source, name.schema);
+            return (try self.namespaceForUsage(self.session.role, schema.slice(), snap)) orelse error.UndefinedSchema;
         }
 
         fn typeNameOccupied(self: *const Self, namespace: u32, name: []const u8, snap: Snapshot) bool {
@@ -6203,9 +6224,8 @@ pub fn Database(comptime config: Config) type {
                     }
                 },
                 .sequence => {
-                    if (!comment.object.has_schema and !self.session.public_schema_on_path) return error.TableNotFound;
                     const schema_name = if (comment.object.has_schema) objectName(source, comment.object.schema) else Name{};
-                    const namespace = (try self.namespaceForUsage(self.session.role, if (comment.object.has_schema) schema_name.slice() else null, snap)) orelse return error.UndefinedSchema;
+                    const namespace = (try self.relationNamespace(self.session.role, if (comment.object.has_schema) schema_name.slice() else null, objectName(source, comment.object.name).slice(), snap)) orelse return error.TableNotFound;
                     const found = self.catalog.findIn(namespace, objectName(source, comment.object.name).slice(), snap) orelse return error.TableNotFound;
                     if (found.kind != 'S') return error.WrongObjectType;
                     if (!privileged) return error.InsufficientPrivilege;
@@ -6606,9 +6626,8 @@ pub fn Database(comptime config: Config) type {
                 .delete => |*delete| .{ .schema = delete.schema, .table = delete.table, .where = &delete.where, .command = .delete, .reads = delete.where != ast.none or delete.returning.count != 0, .only = delete.only },
                 else => return source,
             };
-            if (goal.schema == null and !self.session.public_schema_on_path) return source;
             const schema_name = if (goal.schema) |qualifier| identName(source, qualifier) else Name{};
-            const namespace = (try self.namespaceForUsage(role, if (goal.schema != null) schema_name.slice() else null, snap)) orelse return source;
+            const namespace = (try self.relationNamespace(role, if (goal.schema != null) schema_name.slice() else null, identName(source, goal.table).slice(), snap)) orelse return source;
             const found = self.catalog.findIn(namespace, identName(source, goal.table).slice(), snap) orelse return source;
             if (found.kind != 'r' and found.kind != 'p') return source;
             const table = &self.tables[found.slot];
@@ -6903,26 +6922,34 @@ pub fn Database(comptime config: Config) type {
             return writer.len;
         }
 
-        fn catalogSchemaPath(ptr: *anyopaque, implicit: bool, names: *[2][]const u8) usize {
+        fn catalogSchemaPath(ptr: *anyopaque, implicit: bool, names: *[value_module.schema_path_names][]const u8) usize {
             const self: *Self = @ptrCast(@alignCast(ptr));
             const path = self.sessionState().values.search_path.slice();
             var items = std.mem.splitSequence(u8, path, ", ");
             var count: usize = 0;
             var catalog_seen = false;
-            var public_seen = false;
-            while (items.next()) |item| {
-                if (types.same(item, "pg_catalog") and !catalog_seen) {
-                    names[count] = "pg_catalog";
-                    count += 1;
-                    catalog_seen = true;
-                } else if (types.same(item, "public") and !public_seen) {
-                    names[count] = "public";
-                    count += 1;
-                    public_seen = true;
-                }
+            // Listed schemas that exist, in order (ddl-dml: user schemas too).
+            while (items.next()) |raw| {
+                var item = raw;
+                if (item.len >= 2 and item[0] == '"' and item[item.len - 1] == '"') item = item[1 .. item.len - 1];
+                if (count == names.len - 1) break;
+                const name: []const u8 = if (types.same(item, "pg_catalog")) "pg_catalog" else if (types.same(item, "public")) "public" else blk: {
+                    if (item.len == 0 or types.same(item, "pg_temp")) continue;
+                    const wanted = if (types.same(item, "$user")) (self.catalog_objects.roleName(self.session.role, self.seq_snap) orelse continue) else item;
+                    const found = self.catalog.findSchema(wanted, self.seq_snap) orelse continue;
+                    for (&self.schemas) |*schema| if (schema.live and schema.oid == found.oid) break :blk schema.name.slice();
+                    continue;
+                };
+                var seen = false;
+                for (names[0..count]) |previous| seen = seen or types.same(previous, name);
+                if (seen) continue;
+                catalog_seen = catalog_seen or types.same(name, "pg_catalog");
+                names[count] = name;
+                count += 1;
             }
             if (implicit and !catalog_seen) {
-                if (count != 0) names[1] = names[0];
+                var position = count;
+                while (position != 0) : (position -= 1) names[position] = names[position - 1];
                 names[0] = "pg_catalog";
                 count += 1;
             }
@@ -7342,8 +7369,10 @@ pub fn Database(comptime config: Config) type {
             }
             const name = namespaceIdentifier(std.mem.trim(u8, text, whitespace)) catch return missing;
             if (self.regclassIn(catalog_module.catalog_namespace, name.slice())) |oid| return oid;
-            if (!self.session.public_schema_on_path) return missing;
-            return if (self.regclassIn(catalog_module.public_namespace, name.slice())) |oid| oid else missing;
+            var path: [routine_path_capacity]u32 = undefined;
+            const count = self.routinePath(self.seq_snap, &path);
+            for (path[0..count]) |namespace| if (self.regclassIn(namespace, name.slice())) |oid| return oid;
+            return missing;
         }
 
         fn regclassIn(self: *const Self, namespace: u32, name: []const u8) ?u32 {
@@ -7592,9 +7621,15 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn inRelationSearchPath(self: *const Self, namespace: u32, name: []const u8) bool {
-            // The supported relation path resolves pg_catalog before public.
-            return namespace == catalog_module.catalog_namespace or
-                (self.session.public_schema_on_path and namespace == catalog_module.public_namespace and self.catalog.findSystemView(null, name) == null);
+            // pg_catalog first, then the search path's first holder.
+            if (namespace == catalog_module.catalog_namespace) return true;
+            if (self.catalog.findSystemView(null, name) != null) return false;
+            var path: [routine_path_capacity]u32 = undefined;
+            const count = self.routinePath(self.seq_snap, &path);
+            for (path[0..count]) |candidate| {
+                if (self.catalog.findIn(candidate, name, self.seq_snap) != null) return candidate == namespace;
+            }
+            return false;
         }
 
         fn relationVisible(ptr: *anyopaque, oid: u32) ?bool {
@@ -10087,7 +10122,7 @@ pub fn Database(comptime config: Config) type {
         /// partition: the bound SET list over the partition (same column
         /// layout) with the partition's CHECK constraints. A new row that
         /// would leave the partition is 0A000, as in PostgreSQL.
-        fn routedConflictUpdate(self: *Self, slot: u16, ctx: *E.Context, table_index: usize, update: *const B.Update, version: u32, proposed: *const E.Row, snap: Snapshot) Error!usize {
+        noinline fn routedConflictUpdate(self: *Self, slot: u16, ctx: *E.Context, table_index: usize, update: *const B.Update, version: u32, proposed: *const E.Row, snap: Snapshot) Error!usize {
             var routed = update.*;
             routed.table = table_index;
             routed.checks = @splat(ast.none);
@@ -12071,14 +12106,13 @@ pub fn Database(comptime config: Config) type {
                 }
                 if (expect and elements != 0) return error.InvalidSettingValue;
             }
-            if (!public) return error.UnsupportedStatement;
             try out.set(buffer[0..used]);
         }
 
         fn pathElement(name: []const u8, buffer: []u8, used: *usize, elements: *usize, public: *bool) Error!void {
-            if (types.same(name, "public")) {
-                public.* = true;
-            } else if (!(types.same(name, "$user") or types.same(name, "pg_catalog") or types.same(name, "pg_temp"))) return error.UnsupportedStatement;
+            // Any schema name: missing ones are skipped when names resolve
+            // (ddl-dml, wave 4).
+            if (types.same(name, "public")) public.* = true;
             if (elements.* != 0) {
                 if (buffer.len - used.* < 2) return error.SessionCapacity;
                 buffer[used.*] = ',';
@@ -12687,9 +12721,8 @@ pub fn Database(comptime config: Config) type {
                 .access_exclusive => .access_exclusive,
             };
             for (lock.tables[0..lock.count], lock.only[0..lock.count]) |reference, only| {
-                if (reference.schema == null and !self.session.public_schema_on_path) return error.TableNotFound;
                 const schema_name = if (reference.schema) |qualifier| identName(source, qualifier) else Name{};
-                const namespace = (try self.namespaceForUsage(self.session.role, if (reference.schema != null) schema_name.slice() else null, snap)) orelse return error.UndefinedSchema;
+                const namespace = (try self.relationNamespace(self.session.role, if (reference.schema != null) schema_name.slice() else null, identName(source, reference.name).slice(), snap)) orelse return error.TableNotFound;
                 const found = self.catalog.findIn(namespace, identName(source, reference.name).slice(), snap) orelse return error.TableNotFound;
                 switch (found.kind) {
                     'r', 'p', 'v' => {},
@@ -13146,7 +13179,9 @@ pub fn Database(comptime config: Config) type {
         /// order: `$user` (a schema named like current_user, when one
         /// exists), public and any other listed schema that exists. The
         /// binder matches pg_catalog's built-ins before user routines.
-        pub const routine_path_capacity = 4;
+        /// The shared search-path resolver (ddl-dml, wave 4): relations,
+        /// sequences, types and routines resolve through it.
+        pub const routine_path_capacity = config.search_path_schemas;
 
         fn routinePath(self: *const Self, snap: Snapshot, out: *[routine_path_capacity]u32) usize {
             const values = if (self.session_state) |state| &state.values else &self.default_session_state.values;
@@ -13167,6 +13202,30 @@ pub fn Database(comptime config: Config) type {
                 count += 1;
             }
             return count;
+        }
+
+        /// The first schema of the search path holding a relation (table,
+        /// view, sequence) named `name` that `role` may use (PostgreSQL
+        /// skips schemas without USAGE); null when none does.
+        fn pathRelation(self: *const Self, role: u32, name: []const u8, snap: Snapshot) Error!?u32 {
+            var path: [routine_path_capacity]u32 = undefined;
+            const count = self.routinePath(snap, &path);
+            for (path[0..count]) |namespace| {
+                if (self.catalog.findIn(namespace, name, snap) == null) continue;
+                self.checkNamespaceUsage(role, namespace, snap) catch |err| {
+                    if (err == error.InsufficientPrivilege) continue;
+                    return err;
+                };
+                return namespace;
+            }
+            return null;
+        }
+
+        /// A relation name: the named schema's (3F000 when missing, 42501
+        /// without USAGE), else the search path's first holder (null).
+        fn relationNamespace(self: *const Self, role: u32, schema: ?[]const u8, name: []const u8, snap: Snapshot) Error!?u32 {
+            if (schema) |named| return (try self.namespaceForUsage(role, named, snap)) orelse error.UndefinedSchema;
+            return self.pathRelation(role, name, snap);
         }
 
         /// The schema a routine is created in: the named one (3F000 when
@@ -15023,8 +15082,7 @@ pub fn Database(comptime config: Config) type {
 
         /// A table or view named by a trigger / rule statement.
         fn namedTable(self: *Self, name: *const R.TableName, snap: Snapshot) Error!usize {
-            if (name.schema.len == 0 and !self.session.public_schema_on_path) return error.TableNotFound;
-            const namespace = (try self.namespaceForUsage(self.session.role, if (name.schema.len != 0) name.schema.slice() else null, snap)) orelse return error.UndefinedSchema;
+            const namespace = (try self.relationNamespace(self.session.role, if (name.schema.len != 0) name.schema.slice() else null, name.name.slice(), snap)) orelse return error.TableNotFound;
             const found = self.catalog.findIn(namespace, name.name.slice(), snap) orelse return error.TableNotFound;
             if (found.kind == 'S') return error.WrongObjectType;
             return found.slot;
@@ -16644,6 +16702,7 @@ pub fn Database(comptime config: Config) type {
                 .xml_option => "xmloption",
                 .session_authorization => "session_authorization",
                 .transaction_isolation => "transaction_isolation",
+                .schema => "search_path",
             };
             out.len = special.len;
             @memcpy(out.bytes[0..special.len], special);
