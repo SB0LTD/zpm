@@ -235,7 +235,14 @@ pub fn genOf(t: device.Target) ?Gen {
 
 const NOV: u16 = 0xffff;
 
-const Cls = enum(u8) { none, r, p };
+/// A unit's register file: general, predicate, or uniform (a constant the
+/// warp holds once: uniformConsts).
+const Cls = enum(u8) { none, r, p, u };
+
+/// The uniform registers uniformConsts' units get (UR4 and UR5 hold the
+/// memory descriptor; UR63 is URZ).
+const UR_FIRST: u8 = 6;
+const UR_LAST: u8 = 62;
 
 /// A machine operand.
 const Opd = union(enum) {
@@ -425,6 +432,9 @@ pub const Stats = struct {
     nobar_collectives: u32 = 0,
     /// Units split off a temporary's first web (Ctx.webs).
     webs: u32 = 0,
+    /// Constants loaded into uniform registers (Ctx.uniformConsts), less
+    /// those the allocation had no uniform register for.
+    uconsts: u32 = 0,
 };
 
 /// How `compile` compiles.
@@ -597,6 +607,7 @@ fn compileTextOnce(k: *const kir.Kernel, caps: device.Caps, st: anytype, opts: O
     try c.analyze();
     try c.lower();
     c.dce();
+    c.uniformConsts();
     if (opts.schedule) c.schedule();
     c.webs();
     try c.liveness();
@@ -2742,7 +2753,7 @@ fn CtxOf(comptime St: type) type {
             var top: u8 = 0;
             for (0..w.nv) |vi| {
                 if (w.lead[vi] != vi or w.first[vi] == std.math.maxInt(u32)) continue;
-                if (w.cls[vi] == .p and !w.spilled[vi]) continue;
+                if ((w.cls[vi] == .p and !w.spilled[vi]) or w.cls[vi] == .u) continue;
                 const sz: u8 = if (w.cls[vi] == .p) 1 else w.size[vi];
                 top = @max(top, w.phys[vi] + sz - 1);
             }
@@ -3057,6 +3068,152 @@ fn CtxOf(comptime St: type) type {
             }
             for (0..n) |k| w.sched_tmp[k] = blk[w.sched_order[k]];
             @memcpy(blk, w.sched_tmp[0..n]);
+        }
+
+        // ── 4b'. Constants in uniform registers ─────────────────────────────
+        //
+        // sm_120's ALU instructions read no constant-buffer operand (nvdisasm
+        // calls those forms illegal): ptxas loads a constant with LDCU into a
+        // uniform register, which the warp holds once, and the ALU reads it
+        // there (form 6: b uniform; form 7: c uniform, for the ops that have
+        // it). So here: a 32-bit LDC whose every read can take a uniform
+        // register is an LDCU into a unit of class .u, one general register
+        // less while it lives (Superposition's lighting pass loads 273
+        // constants, mostly into FMUL, FFMA, FMNMX and FSETP). An instruction
+        // reads one uniform register at most; a constant in a's place of an
+        // op whose a and b commute is swapped into b's (LOP3 permutes its
+        // table). `allocate` gives the units UR_FIRST..UR_LAST and turns back
+        // into an LDC and a general register any it has no room for.
+
+        /// What an ALU op takes, for uniformConsts: whether its third source
+        /// is a general register (else none, or a predicate), whether that
+        /// one may be uniform (form 7), and how a and b swap.
+        const UShape = struct { c: bool = false, c_ureg: bool = false, swap: enum { none, plain, lop3 } = .none };
+
+        fn ushape(name: []const u8) ?UShape {
+            const eql = std.mem.eql;
+            const starts = std.mem.startsWith;
+            if (eql(u8, name, "FMUL") or eql(u8, name, "FMUL.FTZ") or eql(u8, name, "FADD") or eql(u8, name, "FADD.FTZ")) return .{ .swap = .plain };
+            if (eql(u8, name, "FMNMX") or eql(u8, name, "FMNMX.FTZ") or starts(u8, name, "VIMNMX.")) return .{ .swap = .plain };
+            if (eql(u8, name, "FFMA") or eql(u8, name, "FFMA.FTZ") or eql(u8, name, "IMAD")) return .{ .c = true, .c_ureg = true, .swap = .plain };
+            if (starts(u8, name, "SHF.")) return .{ .c = true, .c_ureg = true };
+            if (eql(u8, name, "LOP3.LUT")) return .{ .c = true, .swap = .lop3 };
+            if (starts(u8, name, "FSETP.") or starts(u8, name, "ISETP.") or eql(u8, name, "FSEL") or eql(u8, name, "SEL")) return .{};
+            return null;
+        }
+
+        /// The general registers an ALU source may be (RZ among them).
+        fn plainReg(o: Opd) bool {
+            return o == .rz or o == .reg;
+        }
+
+        fn unsigned(o: Opd) bool {
+            return o == .rz or (o == .reg and !o.reg.neg and !o.reg.abs and o.reg.half == 0);
+        }
+
+        /// The unit `m` defines when it is a plain 32-bit constant load
+        /// (LDC c[..][imm] into a register of its own, unguarded).
+        fn constLoad(c: *const Ctx, m: *const MI) ?u16 {
+            const w = c.w;
+            if (m.n != 2 or m.nd != 1 or m.guard != .none or !std.mem.eql(u8, m.op, "LDC")) return null;
+            const d = m.o[0];
+            if (d != .reg or m.o[1] != .cbuf or d.reg.v == NOV or d.reg.half != 0) return null;
+            const v = d.reg.v;
+            if (w.lead[v] != v or w.size[v] != 1 or w.cls[v] != .r) return null;
+            if (std.mem.indexOfScalar(u16, &w.outv, v) != null) return null;
+            return v;
+        }
+
+        /// Whether source `j` (0 a, 1 b, 2 c) of `m` may be a uniform
+        /// register, with nothing else of `m` changed but a and b swapped.
+        fn uniformSlot(m: *const MI, j: usize) bool {
+            const sh = ushape(m.op) orelse return false;
+            const s = m.o[m.nd..m.n];
+            if (s.len < 2) return false;
+            if (s[j] == .reg and s[j].reg.half != 0) return false;
+            const c_ok = !sh.c or (s.len > 2 and plainReg(s[2]));
+            return switch (j) {
+                1 => c_ok,
+                2 => sh.c and sh.c_ureg and plainReg(s[1]),
+                0 => switch (sh.swap) {
+                    .none => false,
+                    .plain => c_ok and unsigned(s[0]) and unsigned(s[1]),
+                    .lop3 => c_ok and s.len > 3 and s[3] == .imm and unsigned(s[0]) and unsigned(s[1]),
+                },
+                else => false,
+            };
+        }
+
+        fn uniformConsts(c: *Ctx) void {
+            if (c.gen.sm != 120) return;
+            const w = c.w;
+            const nv = w.nv;
+            const mis = w.mi[0..w.n_mi];
+            // (scratch, before the allocation sets them: spilled = a
+            // candidate, def_count = its definitions)
+            @memset(w.spilled[0..nv], false);
+            @memset(w.def_count[0..nv], 0);
+            var any = false;
+            for (mis) |*m| {
+                if (m.kind != .inst) continue;
+                for (m.o[0..m.nd]) |o| {
+                    if (o == .reg and o.reg.v != NOV) w.def_count[w.lead[o.reg.v]] +|= 1;
+                }
+                if (c.constLoad(m)) |v| {
+                    w.spilled[v] = true;
+                    any = true;
+                }
+            }
+            if (!any) return;
+            // every read fits a uniform register's place, one a candidate's in
+            // each instruction (a second candidate there, or the same one
+            // read twice, stays general: nothing dropped is ever undone, so
+            // a dropped one only costs what it would have saved)
+            for (mis) |*m| {
+                if (m.kind != .inst) continue;
+                const self = c.constLoad(m);
+                var hits: u8 = 0;
+                for (m.o[0..m.n], 0..) |o, k| {
+                    const v: u16 = switch (o) {
+                        .reg => |r| if (r.v != NOV) w.lead[r.v] else continue,
+                        .mem => |x| if (x.base != NOV) w.lead[x.base] else continue,
+                        else => continue,
+                    };
+                    if (!w.spilled[v]) continue;
+                    if (k < m.nd) {
+                        if (self != v or w.def_count[v] != 1) w.spilled[v] = false;
+                        continue;
+                    }
+                    if (o == .mem or w.def_count[v] != 1 or !uniformSlot(m, k - m.nd)) {
+                        w.spilled[v] = false;
+                        continue;
+                    }
+                    hits += 1;
+                    if (hits > 1) w.spilled[v] = false;
+                }
+            }
+            // the rewrite: a's constant into b's place, the loads to LDCU
+            var made: u32 = 0;
+            for (mis) |*m| {
+                if (m.kind != .inst) continue;
+                if (c.constLoad(m)) |v| {
+                    if (w.spilled[v]) {
+                        m.op = "LDCU";
+                        w.cls[v] = .u;
+                        made += 1;
+                    }
+                    continue;
+                }
+                if (m.n <= m.nd) continue;
+                const s = m.o[m.nd..m.n];
+                if (!(s[0] == .reg and s[0].reg.v != NOV and w.spilled[w.lead[s[0].reg.v]])) continue;
+                const t = s[0];
+                s[0] = s[1];
+                s[1] = t;
+                if (ushape(m.op).?.swap == .lop3) s[3] = .{ .imm = lutSwapAB(s[3].imm) };
+            }
+            @memset(w.spilled[0..nv], false);
+            w.stats.uconsts = made;
         }
 
         // ── 4c. Webs ────────────────────────────────────────────────────────
@@ -3550,6 +3707,38 @@ fn CtxOf(comptime St: type) type {
                 break;
             }
             w.npreds = preds;
+            // uniform registers (uniformConsts' constants): one with none
+            // free is loaded into a general register after all
+            {
+                var uactive: [UR_LAST - UR_FIRST + 1]u16 = undefined;
+                var n_u: usize = 0;
+                var uused: u64 = 0;
+                for (units) |u| {
+                    if (w.cls[u] != .u) continue;
+                    var i: usize = 0;
+                    while (i < n_u) {
+                        const a = uactive[i];
+                        if (w.last[a] < w.first[u] or (w.last[a] == w.first[u] and c.readAt(a, w.first[u]) and !c.writtenAt(a, w.first[u]))) {
+                            uused &= ~(@as(u64, 1) << @intCast(w.phys[a]));
+                            uactive[i] = uactive[n_u - 1];
+                            n_u -= 1;
+                        } else i += 1;
+                    }
+                    const free = ~uused & (((@as(u64, 1) << (UR_LAST + 1)) - 1) & ~((@as(u64, 1) << UR_FIRST) - 1));
+                    if (free == 0) {
+                        w.cls[u] = .r;
+                        for (w.mi[0..w.n_mi]) |*m| {
+                            if (m.kind == .inst and m.nd == 1 and m.o[0] == .reg and m.o[0].reg.v == u and std.mem.eql(u8, m.op, "LDCU")) m.op = "LDC";
+                        }
+                        w.stats.uconsts -= 1;
+                        continue;
+                    }
+                    w.phys[u] = @ctz(free);
+                    uused |= @as(u64, 1) << @intCast(w.phys[u]);
+                    uactive[n_u] = u;
+                    n_u += 1;
+                }
+            }
             // general registers: spilled predicates are homed in them
             var active: [MAX_GPR + 1]u16 = undefined;
             var n_active: usize = 0;
@@ -3564,7 +3753,7 @@ fn CtxOf(comptime St: type) type {
                 }
             }
             for (units) |u| {
-                if (w.cls[u] == .p and !w.spilled[u]) continue;
+                if ((w.cls[u] == .p and !w.spilled[u]) or w.cls[u] == .u) continue;
                 var i: usize = 0;
                 while (i < n_active) {
                     const a = active[i];
@@ -3826,7 +4015,7 @@ fn CtxOf(comptime St: type) type {
                 .reg => |r| {
                     if (r.neg) t.str("-");
                     if (r.abs) t.str("|");
-                    if (r.v == NOV) t.str("RZ") else t.reg("R", c.physOf(r.v));
+                    if (r.v == NOV) t.str("RZ") else t.reg(if (c.w.cls[c.w.lead[r.v]] == .u) "UR" else "R", c.physOf(r.v));
                     if (r.abs) t.str("|");
                     switch (r.half) {
                         1 => t.str(".H0_H0"),
@@ -3893,6 +4082,30 @@ fn argEql(a: kir.Arg, b: kir.Arg) bool {
         .reg => |x| b == .reg and b.reg == x,
         .imm => |x| b == .imm and b.imm == x,
     };
+}
+
+/// A LOP3 table with its a and b inputs swapped (a's bit is the index's
+/// 4s, b's its 2s: a = 0xf0, b = 0xcc, c = 0xaa).
+fn lutSwapAB(lut: u32) u32 {
+    var out: u32 = lut & ~@as(u32, 0xff);
+    for (0..8) |i| {
+        const a = (i >> 2) & 1;
+        const b = (i >> 1) & 1;
+        const cc = i & 1;
+        if ((lut >> @intCast(i)) & 1 == 1) out |= @as(u32, 1) << @intCast(b << 2 | a << 1 | cc);
+    }
+    return out;
+}
+
+test "lutSwapAB" {
+    try std.testing.expectEqual(@as(u32, 0xcc), lutSwapAB(0xf0));
+    try std.testing.expectEqual(@as(u32, 0xf0), lutSwapAB(0xcc));
+    try std.testing.expectEqual(@as(u32, 0xaa), lutSwapAB(0xaa));
+    // a & b, a | b, a ^ b commute; a & ~b becomes ~a & b
+    try std.testing.expectEqual(@as(u32, 0xc0), lutSwapAB(0xc0));
+    try std.testing.expectEqual(@as(u32, 0xfc), lutSwapAB(0xfc));
+    try std.testing.expectEqual(@as(u32, 0x3c), lutSwapAB(0x3c));
+    try std.testing.expectEqual(@as(u32, 0x0c), lutSwapAB(0x30));
 }
 
 fn negR(o: Opd) Opd {
@@ -4184,6 +4397,16 @@ fn schedUses(w: anytype, m: *const MI, counts: []u16, d: i32) void {
     }
 }
 
+/// A unit's weight in the scheduler's count of live general registers (a
+/// uniform one holds none).
+fn schedCost(w: anytype, u: u16) i32 {
+    return switch (w.cls[u]) {
+        .p => SCHED_PRED_COST,
+        .u => 0,
+        else => w.size[u],
+    };
+}
+
 /// Registers placing `m` starts, less those it frees (its sources' last
 /// reads: every read of theirs in this window, and defined once).
 fn schedDelta(w: anytype, m: *const MI) i32 {
@@ -4191,7 +4414,7 @@ fn schedDelta(w: anytype, m: *const MI) i32 {
     var wr = SchedOps{ .m = m, .lead = &w.lead, .writes = true };
     while (wr.next()) |u| {
         if (u >= w.nv) continue;
-        d += if (w.cls[u] == .p) SCHED_PRED_COST else w.size[u];
+        d += schedCost(w, u);
     }
     var rd = SchedOps{ .m = m, .lead = &w.lead, .writes = false };
     var seen: [16]u16 = undefined;
@@ -4211,7 +4434,7 @@ fn schedDelta(w: anytype, m: *const MI) i32 {
             if (x == u) mine += 1;
         }
         if (w.use_total[u] == w.use_win[u] and w.use_win[u] == mine and w.def_count[u] <= 1)
-            d -= if (w.cls[u] == .p) SCHED_PRED_COST else w.size[u];
+            d -= schedCost(w, u);
     }
     return d;
 }

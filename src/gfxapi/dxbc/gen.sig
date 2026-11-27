@@ -1287,7 +1287,13 @@ const Gen = struct {
             .mov => if (s[0].neg or s[0].abs) g.fsrc(&s[0], c) else asU32(k, g.bits(&s[0], c)),
             .add => r(k.op2(.fadd, .f32, g.fsrc(&s[0], c), g.fsrc(&s[1], c))),
             .mul => r(k.op2(.fmul, .f32, g.fsrc(&s[0], c), g.fsrc(&s[1], c))),
-            .div => r(k.div(g.fsrc(&s[0], c), g.fsrc(&s[1], c))),
+            // (Direct3D's div is within 2.5 ulp for divisors in 2^-126..2^126,
+            // as fxc and the drivers make it: a times rcp(b), rcp as Direct3D's
+            // own (within 1 ulp; MUFU.RCP on the RTX), x/0 infinite and x/inf
+            // 0 as Direct3D has them. KIR's fdiv is correctly rounded on every
+            // target, so expanded: about 80 instructions and two branches on
+            // the RTX, half of Superposition's ps1825.)
+            .div => r(k.op2(.fmul, .f32, g.fsrc(&s[0], c), r(k.op1(.frcp, .f32, g.fsrc(&s[1], c))))),
             .min => r(k.op2(.fmin, .f32, g.fsrc(&s[0], c), g.fsrc(&s[1], c))),
             .max => r(k.op2(.fmax, .f32, g.fsrc(&s[0], c), g.fsrc(&s[1], c))),
             .mad => r(k.op3(.fmad, .f32, g.fsrc(&s[0], c), g.fsrc(&s[1], c), g.fsrc(&s[2], c))),
