@@ -1,0 +1,31 @@
+{
+  "observed_utc": "2026-10-05T07:18:37.7945213Z",
+  "port": "COM9",
+  "processor": "ATmega328P",
+  "signature": "1E950F",
+  "bootloader_baud": 57600,
+  "firmware_language": "native Sig plus inline AVR startup assembly",
+  "image_bytes": 1790,
+  "static_sram_bytes": 241,
+  "image_sha256": "1DB2EC6EC142AF0861B816C6BBEC1070A53F0D83D7F00FE6872B24D6693DCEDB",
+  "original_flash_sha256": "25243102BA8B9ECF46AA313CF0AC02ACA643E533D245A669C1E419CB08D99DC9",
+  "flash_readback": "PASS - 32768 bytes, bootloader and untouched pages preserved",
+  "core_contracts": "PASS - 24",
+  "physical_tests": [
+    "identity and zero motor capability",
+    "LED off at boot",
+    "adaptive context rejects expired required telemetry",
+    "arm rejected as unsupported",
+    "heartbeat retains LED",
+    "500ms LED lease expires",
+    "CRC corruption rejected and counted",
+    "200 adaptive selections with command and UART telemetry acknowledgments",
+    "stop leaves LED off"
+  ],
+  "internal_adc_raw": 237,
+  "last_uptime_ms": 11639,
+  "full_galaxy_agent_connected": false,
+  "native_galaxy_ch340_transport_verified": false,
+  "external_actuator_feedback_verified": false,
+  "actuator_hardware_attached": false
+}

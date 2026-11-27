@@ -96,6 +96,16 @@ fn addContract(ctx: *sig_build.Build_Context, aggregate: sig_build.Step_Handle, 
 pub fn build(ctx: *sig_build.Build_Context) !void {
     const test_all = try ctx.addStep("test", "Run all ZPM unit and compliance tests", &noopStep);
 
+    // SlowWire: reusable zero-allocation device protocols and RP2040 board package.
+    _ = try ctx.addModule("slowwire", "slowwire.sig");
+    _ = try ctx.addModule("opencr", "opencr.sig");
+    const test_opencr = try ctx.addStep("test-opencr", "Run OpenCR pin, bus, sensor and storage contracts", &noopStep);
+    try ctx.addDependency(test_all, test_opencr);
+    _ = try addTest(ctx, test_opencr, "test-opencr-core", "opencr_tests.sig", &.{});
+    const test_slowwire = try ctx.addStep("test-slowwire", "Run SlowWire protocol, USB control and feedback contracts", &noopStep);
+    try ctx.addDependency(test_all, test_slowwire);
+    _ = try addTest(ctx, test_slowwire, "test-slowwire-core", "slowwire_tests.sig", &.{});
+
     // Core modules.
     _ = try ctx.addModule("math", "src/core/math.sig");
     _ = try ctx.addModule("sig_math", "src/core/sig_math.sig");
