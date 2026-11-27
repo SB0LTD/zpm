@@ -1,6 +1,6 @@
 # SQL conformance TDD checkpoint
 
-## Qualified routine resolution — 27 November 2026 candidate
+## Qualified routine resolution — 27 November 2026
 
 The failing contract reproduced `public`-qualified expression calls, CALL and
 DROP returning 0A000. Parsing now preserves an ordinary function's qualifier;
@@ -23,7 +23,27 @@ the existing window contract passes 9,971 assertions. The new sequence-argument
 case verifies that an immutable wrapper does not erase volatile argument effects.
 RAMSQL's PG16/18 stock fixture adds qualified calls, prepared parameters,
 same-name built-ins, empty-path failures and executable archive/recovery checks.
-CI qualification for this candidate is pending; it is not yet merged.
+Native Windows Debug and ReleaseSafe pass the routine contract. Linux CI passed
+both modes and the hard 4 MiB wide-cell contract. Both PG16 and PG18 passed 48
+stock tooling, 10 large-object archive/checkpoint and 11 file/routine checks in
+[CI 45928135880](https://github.com/SB0LTD/ramsql/actions/runs/45928135880).
+
+The unchanged strict inventory matched all **106 PostgreSQL smoke programs**
+against frozen PostgreSQL 18.3 in
+[CI 45929457438](https://github.com/SB0LTD/ramsql/actions/runs/45929457438).
+It covers 103 transaction/COPY programs plus database lifecycle, two-phase and
+maintenance scopes. The inventory binary SHA-256 matches the passing PG18 stock
+binary. The initial 105/106 run used a single-database server for CREATE DATABASE;
+the corrected harness uses the documented cluster profile for that case and
+records the actual profile per scope. Neither SQL nor comparison rules changed.
+
+This is smoke qualification, not feature-family closure. The 755 upstream
+records still require applicability review and closure evidence; six MySQL and
+six T-SQL programs need their own current native lanes. Routine default ACLs,
+schema-wide grants, non-public routine namespaces, SECURITY DEFINER, broader
+function bodies, OUT/INOUT/VARIADIC/default parameters and volatile-window demand
+semantics remain open. See the
+[machine-readable checkpoint](../tests/sql_conformance/checkpoint_20261127.json).
 [PostgreSQL routine volatility](https://www.postgresql.org/docs/18/xfunc-volatility.html)
 
 ## SQL routine EXECUTE delegation — 27 November 2026

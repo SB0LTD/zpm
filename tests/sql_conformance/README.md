@@ -8,13 +8,16 @@ PostgreSQL 18.3 is the frozen positive language oracle for this inventory;
 PostgreSQL wire compatibility is a separate contract. MySQL and T-SQL targets
 require their own versioned native oracles. See the
 [current TDD checkpoint](../../docs/SQL_CONFORMANCE_TDD_STATUS.md) and
-[latest recorded checkpoint](checkpoint_20261101.json).
+[current recorded checkpoint](checkpoint_20261127.json); the
+[November 1 checkpoint](checkpoint_20261101.json) is preserved as history.
 
 The November 1 counts and table entries are historical, not current feature
 absence claims. Subsequent semantic slices and their evidence are recorded in
-the TDD checkpoint. RAMSQL PR #130 adds a fresh native PostgreSQL 18.3 CI run of
-all 106 PostgreSQL smoke programs, including COPY, database, two-phase and
-maintenance scopes. Its strict comparator and manifest come from the exact
+the TDD checkpoint. [CI 45929457438](https://github.com/SB0LTD/ramsql/actions/runs/45929457438)
+passes all 106 PostgreSQL smoke programs on frozen PostgreSQL 18.3, including
+COPY, database, two-phase and maintenance scopes. The database case uses the
+documented cluster profile, not the default single-database profile.
+The strict comparator and manifest come from the exact
 ZPM dependency pin; failures and unexecuted cases block that smoke gate.
 The separate six MySQL and six T-SQL cases need their own native lanes.
 

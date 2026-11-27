@@ -180,7 +180,7 @@ P0002 (NoDataFound), P0003 (TooManyRows), 2F005 (FunctionExecutedNoReturn),
 - OUT / INOUT / VARIADIC parameters, DEFAULT arguments, named arguments,
   RETURNS SETOF / TABLE / record, RETURN NEXT / QUERY, polymorphic types,
   %TYPE / %ROWTYPE / record variables, cursors, FOREACH, FOR over queries,
-  dynamic EXECUTE, schema-qualified routine names, SECURITY DEFINER, SET.
+  dynamic EXECUTE, non-public routine namespaces, SECURITY DEFINER, SET.
 - Transaction control (COMMIT / ROLLBACK) inside procedures and DO blocks
   is 0A000 (PostgreSQL allows it outside a transaction block).
 - TG_ARGV (TG_NARGS is provided); REFERENCING transition tables;
