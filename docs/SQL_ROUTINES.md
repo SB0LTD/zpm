@@ -104,12 +104,15 @@ namespaces and ALL ROUTINES IN SCHEMA remain
 open. CREATE/DROP and privilege changes return 25006 in read-only transactions;
 read-only CALL/DO remain available.
 
-Global ALTER DEFAULT PRIVILEGES ON FUNCTIONS/ROUTINES supports EXECUTE,
-PUBLIC, grant options and FOR ROLE/USER lists for future functions/procedures.
+ALTER DEFAULT PRIVILEGES ON FUNCTIONS/ROUTINES supports global and IN SCHEMA
+EXECUTE grants, PUBLIC, grant options and FOR ROLE/USER lists for future routines.
 Defaults are taken from the actual creator, with committed catalog visibility
 and the creator's own prior changes. Existing objects and OR REPLACE keep their
-ACL. Per-schema defaults remain unsupported. The TDD checkpoint records current
-qualification and remaining privilege-family scope.
+ACL. Schema defaults add to global grants/options and merge duplicate grantees;
+schema REVOKE cannot remove global privileges. Namespace deletion removes its
+templates. RSBASE09 preserves scoped defaults and validates schema references.
+Other routine namespaces and default-privilege object classes remain open. The
+TDD checkpoint records qualification and remaining privilege-family scope.
 
 `pg_proc.proacl` is a typed ACL array rendered in grant-dependency order, using
 caller-owned value storage for ACLs larger than an inline cell. Every edge retains

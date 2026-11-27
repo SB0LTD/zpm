@@ -1,5 +1,34 @@
 # SQL conformance TDD checkpoint
 
+## Per-schema routine default privileges — qualified, 27 November 2026
+
+IN SCHEMA now resolves bounded, deduplicated schema lists and stores the namespace
+in the routine-default catalog key. Global defaults replace the built-in ACL;
+schema defaults add grants/options, merging duplicate grantees before checking
+the routine ACL budget. Schema REVOKE cannot remove global privileges. Existing
+routines retain their ACLs; effective built-in defaults retain a null proacl.
+
+Schema removal deletes its default ACLs and serializes against pending template
+edits. WAL validates the namespace and the matching scoped parent before
+publication. RSBASE09 restores named schemas before their default ACLs; no format
+change or heap allocation is needed. The contracts cover functions/procedures,
+namespace isolation, rollback, capacity, grant options, schema lists, schema-drop
+races and malformed WAL. Local Windows Debug and ReleaseSafe each passed 1,021
+routine assertions / 301 WAL records and 2,512 checkpoint assertions. Linux
+Debug/ReleaseSafe routine/security and 4 MiB stack contracts passed in
+[CI 46005857387](https://github.com/SB0LTD/zpm/actions/runs/46005857387).
+The unchanged strict inventory passed 106/106 PostgreSQL smoke programs in
+[CI 46005925696](https://github.com/SB0LTD/ramsql/actions/runs/46005925696).
+Stock PG16 and PG18 each passed 48 tooling, 10 large-object and 13 file/routine
+checks in [CI 46005923853](https://github.com/SB0LTD/ramsql/actions/runs/46005923853),
+including plain/custom archives both directions, future routine grants/options,
+concurrent committed defaults, schema deletion, rollback and crash/WAL recovery.
+The independently compiled stock and inventory reports record their own hashes.
+
+Routine creation in arbitrary namespaces and other default-privilege object
+classes remain open. Full SQL conformance and the broader release/platform matrix
+are separate gates; this slice does not close them.
+
 ## Global routine default privileges — 27 November 2026
 
 The failing contract reproduced ALTER DEFAULT PRIVILEGES rejecting EXECUTE on
