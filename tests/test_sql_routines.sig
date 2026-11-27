@@ -1093,7 +1093,7 @@ fn routineGrantCapacity() !void {
 }
 
 fn routineDefaultCapacity() !void {
-    const Defaults = sql.Database(.{ .tables = 1, .columns = 2, .rows_per_table = 1, .work_rows = 8, .result_rows = 1, .expr_nodes = 128, .catalog_objects = 16, .routines = 1, .routine_acl_entries = 1 });
+    const Defaults = sql.Database(.{ .tables = 1, .columns = 2, .rows_per_table = 1, .work_rows = 8, .result_rows = 1, .expr_nodes = 128, .catalog_objects = 16, .routines = 1, .routine_acl_entries = 1, .name_bytes = 63, .text_bytes = 128 });
     var limited_defaults: Defaults = .{};
     var result: Defaults.Result = .{};
     try limited_defaults.execute("CREATE ROLE default_a", &result);
@@ -1115,6 +1115,15 @@ fn routineDefaultCapacity() !void {
     const merged_before = limited_defaults.oid_counter;
     if (limited_defaults.execute("CREATE FUNCTION merged_overflow() RETURNS INT LANGUAGE SQL AS 'SELECT 1'", &result)) |_| return error.MergedDefaultCapacityIgnored else |err| try check(err == error.ProgramLimitExceeded);
     try check(limited_defaults.oid_counter == merged_before and limited_defaults.usage().transactions == 0);
+    const owner = "default_owner_" ++ ("a" ** 49);
+    try limited_defaults.execute("CREATE ROLE " ++ owner, &result);
+    var values: [Defaults.Result.value_bytes]u8 = undefined;
+    result.bindValueMemory(&values);
+    try limited_defaults.execute("SELECT acldefault('f',oid) FROM pg_roles WHERE rolname='" ++ owner ++ "'", &result);
+    try check(result.rows[0].cells[0].array.indirect());
+    var formatted: [512]u8 = undefined;
+    const shown = try Defaults.Io.format(&result.rows[0].cells[0], false, Defaults.Result.default_session, &formatted);
+    try same(shown, "{=X/" ++ owner ++ "," ++ owner ++ "=X/" ++ owner ++ "}");
 }
 
 fn routineReadOnly() !void {
@@ -1401,6 +1410,9 @@ fn routineOwnership() !void {
 
 fn ruleAndTriggerDiscovery() !void {
     reset();
+    const owner = "acl_owner_aaaaaaaaaaaaaaaaaaaaaa";
+    try run("CREATE ROLE " ++ owner);
+    try expect("SELECT pg_typeof(acldefault('f',oid))::text,acldefault('f',oid)::text FROM pg_roles WHERE rolname='" ++ owner ++ "'", "aclitem[]|{=X/" ++ owner ++ "," ++ owner ++ "=X/" ++ owner ++ "}");
     try expect("SELECT pg_get_ruledef(0::oid),pg_get_ruledef(NULL::oid)", "NULL|NULL");
     try run("CREATE TABLE metadata_table_aaaaaaaaaaaaaaaa(id INT,v INT)");
     try run("CREATE RULE metadata_rule_bbbbbbbbbbbbbbbbb AS ON DELETE TO metadata_table_aaaaaaaaaaaaaaaa WHERE (OLD.id>0) DO INSTEAD NOTHING");

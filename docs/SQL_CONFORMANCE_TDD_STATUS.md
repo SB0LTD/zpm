@@ -39,6 +39,17 @@ ReleaseSafe qualification remain pending with the unchanged 4 MiB gate. The fail
 and stack evidence remains recorded in RAMSQL CI 46008582900 and ZPM CI
 46008997236. None of this candidate is marked qualified or merged yet.
 
+The corrected dispatcher passed Linux Debug/ReleaseSafe on the unchanged 4 MiB
+stack in CI 46012535883, and the strict 106-case inventory passed in RAMSQL
+CI 46012709718. PG16/18 inbound plain/custom routine archives now pass. Outbound
+discovery in CI 46012699753 exposed a separate fixed inline item in
+acldefault('f', owner) for 63-byte role names. All default ACL classes now share
+the checked caller-owned catalog writer without changing their privilege sets
+or item order. A text-128 / name-63 contract first reproduced TextCapacity, then
+passed with an indirect typed ACL and complete formatted output. Windows Debug
+now passes 1,078 assertions / 329 WAL records. Focused native requalification is
+pending before updating the product PR and starting its replacement matrix.
+
 ## Per-schema routine default privileges — qualified, 27 November 2026
 
 IN SCHEMA now resolves bounded, deduplicated schema lists and stores the namespace
