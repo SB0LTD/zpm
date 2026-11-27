@@ -97,7 +97,10 @@ User-defined functions/procedures support EXECUTE grants with grant options,
 owner-rooted delegation, RESTRICT/CASCADE, PUBLIC, inherited roles, function and
 grantee lists, and GRANTED BY naming the current SQL user. ON ROUTINE accepts
 mixed function/procedure targets. CREATE accepts unqualified or public-qualified
-names. Other namespaces, ALL ROUTINES IN SCHEMA and routine default ACLs remain
+names, as do CALL, DROP and expression calls. An explicit public qualifier
+resolves user routines before built-in name classification. Empty search paths
+do not implicitly search public; explicit qualifiers still work. Other
+namespaces, ALL ROUTINES IN SCHEMA and routine default ACLs remain
 open. CREATE/DROP and privilege changes return 25006 in read-only transactions;
 read-only CALL/DO remain available.
 

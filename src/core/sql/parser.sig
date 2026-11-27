@@ -4994,7 +4994,6 @@ pub fn Parser(comptime config: types.Config) type {
                 if (self.mode == .standard and try self.takeSymbol(.star)) return self.pool.add(.{ .kind = .column, .star = true, .qualifier = name });
                 const column = try self.identifier();
                 if (self.mode == .standard and self.tokens.dialect == .postgres and self.isSymbol(.lparen)) {
-                    try self.requireCatalogQualifier(name);
                     const call = try self.functionCall(column);
                     self.pool.nodes[call].qualifier = name;
                     return call;

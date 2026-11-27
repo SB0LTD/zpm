@@ -1123,6 +1123,32 @@ fn routineReadOnly() !void {
     try sameState(&.{"SELECT proacl::text FROM pg_proc WHERE proname='read_fn'", "SELECT read_fn()"});
 }
 
+fn routineQualification() !void {
+    reset();
+    try run("CREATE FUNCTION public.abs(x INT) RETURNS INT LANGUAGE SQL AS 'SELECT x+10'");
+    try run("CREATE FUNCTION public.count(x INT) RETURNS INT LANGUAGE SQL AS 'SELECT x+20'");
+    try run("CREATE FUNCTION public.\"MiX\"(x INT) RETURNS INT LANGUAGE SQL AS 'SELECT x+30'");
+    try run("CREATE PROCEDURE public.qualified_proc() LANGUAGE SQL AS 'SELECT 1'");
+    try expect("SELECT public.abs(-1),pg_catalog.abs(-1),abs(-1),public.count(5),public.\"MiX\"(1)", "9|1|1|25|31");
+    try run("CALL public.qualified_proc()");
+    try expect("SELECT pg_catalog.set_config('search_path','',false)", "");
+    try expect("SELECT public.abs(1),public.count(1),public.\"MiX\"(1)", "11|21|31");
+    try run("CALL public.qualified_proc()");
+    try fails("CALL qualified_proc()", error.UndefinedFunction);
+    try fails("DROP PROCEDURE qualified_proc()", error.UndefinedFunction);
+    try fails("GRANT EXECUTE ON FUNCTION \"MiX\"(INT) TO PUBLIC", error.UndefinedFunction);
+    try run("GRANT EXECUTE ON FUNCTION public.abs(INT) TO PUBLIC");
+    try fails("CREATE FUNCTION no_path() RETURNS INT LANGUAGE SQL AS 'SELECT 1'", error.UndefinedSchema);
+    try run("RESET search_path");
+    try run("DROP PROCEDURE public.qualified_proc()");
+    try run("DROP FUNCTION public.\"MiX\"(INT)");
+    try run("DROP FUNCTION public.abs(INT)");
+    try run("DROP FUNCTION public.count(INT)");
+    try completes("DROP FUNCTION IF EXISTS public.abs(INT)", .drop_function, 0);
+    try expect("SELECT pg_catalog.abs(-1)", "1");
+    try sameState(&.{"SELECT count(*) FROM pg_proc WHERE pronamespace=2200"});
+}
+
 pub fn main() !void {
     try routineDiscovery();
     try executeLists();
@@ -1130,6 +1156,7 @@ pub fn main() !void {
     try routineGrantWalValidation();
     try routineGrantCapacity();
     try routineReadOnly();
+    try routineQualification();
     try bodyValidationSetting();
     try oraclePrograms();
     try sqlFunctions();

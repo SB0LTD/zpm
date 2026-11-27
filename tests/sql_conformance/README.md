@@ -1,6 +1,7 @@
 # SQL conformance inventory and closing plan
 
-Status: incomplete; reconciled 1 November 2026 against qualified ZPM main
+Status: incomplete. The tables below preserve the 1 November 2026 reconciliation
+against qualified ZPM main
 `69f75554b4e33d2421d20d389c13918d3ab3538f` (SQRT source `8d8e5c9`).
 The original TDD baseline was `53655a9a89a3ddff6f2f5829388b09a10c3d9c93`.
 PostgreSQL 18.3 is the frozen positive language oracle for this inventory;
@@ -8,6 +9,14 @@ PostgreSQL wire compatibility is a separate contract. MySQL and T-SQL targets
 require their own versioned native oracles. See the
 [current TDD checkpoint](../../docs/SQL_CONFORMANCE_TDD_STATUS.md) and
 [latest recorded checkpoint](checkpoint_20261101.json).
+
+The November 1 counts and table entries are historical, not current feature
+absence claims. Subsequent semantic slices and their evidence are recorded in
+the TDD checkpoint. RAMSQL PR #130 adds a fresh native PostgreSQL 18.3 CI run of
+all 106 PostgreSQL smoke programs, including COPY, database, two-phase and
+maintenance scopes. Its strict comparator and manifest come from the exact
+ZPM dependency pin; failures and unexecuted cases block that smoke gate.
+The separate six MySQL and six T-SQL cases need their own native lanes.
 
 ## What this inventory proves
 
@@ -28,7 +37,7 @@ Every closure needs result values and exact types; NULL/empty/duplicate/order ca
 
 No calendar promise or universal speedup is implied. A release claiming complete compatibility is blocked until the declared scope has closure evidence and all unresolved applicable upstream records have been adjudicated.
 
-## Concrete smoke specifications
+## Concrete smoke specifications (historical November 1 core snapshot)
 
 Historical core run on the older checkpoint: **12 smoke passes, 89 failures,
 17 unexecuted scopes/comparators**.
@@ -40,7 +49,7 @@ rejection of a server utility does not prove absence in the server layer.
 Some probes combine several features: their first failure does not mean every
 component is missing. The annotations below separate those cases.
 
-| ID | Feature | Core smoke status |
+| ID | Feature | Historical core smoke status |
 |---|---|---|
 | PG.PRED.DISTINCT | NULL-safe equality | pass; closure incomplete |
 | PG.PRED.QUANTIFIED | ANY/SOME/ALL, scalar subqueries with six ordinary comparison operators | pass; array/row/custom-operator forms and closure remain incomplete |

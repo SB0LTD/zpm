@@ -55,6 +55,7 @@ pub fn Routines(comptime config: types.Config) type {
         pub const CreateRoutine = struct {
             replace: bool = false,
             procedure: bool = false,
+            has_schema: bool = false,
             name: Name = .{},
             args: [config.routine_args]Arg = @splat(.{}),
             arg_count: usize = 0,
@@ -75,6 +76,7 @@ pub fn Routines(comptime config: types.Config) type {
         pub const DropRoutine = struct {
             procedure: bool = false,
             any_kind: bool = false,
+            has_schema: bool = false,
             if_exists: bool = false,
             cascade: bool = false,
             name: Name = .{},
@@ -86,6 +88,7 @@ pub fn Routines(comptime config: types.Config) type {
 
         pub const Call = struct {
             name: Name = .{},
+            has_schema: bool = false,
             args: [config.routine_args]Span = @splat(.{}),
             arg_count: usize = 0,
         };
@@ -352,11 +355,7 @@ pub fn Routines(comptime config: types.Config) type {
             }
             out.procedure = try cursor.take("procedure");
             if (!out.procedure) try cursor.expect("function");
-            out.name = try cursor.identifier();
-            if (try cursor.takeSymbol(.dot)) {
-                if (!types.same(out.name.slice(), "public")) return error.UnsupportedStatement;
-                out.name = try cursor.identifier();
-            }
+            out.name = try publicName(cursor, &out.has_schema);
             try cursor.expectSymbol(.lparen);
             if (!try cursor.takeSymbol(.rparen)) while (true) {
                 if (out.arg_count == config.routine_args) return error.ColumnCapacity;
@@ -463,8 +462,7 @@ pub fn Routines(comptime config: types.Config) type {
                 try cursor.expect("exists");
                 out.if_exists = true;
             }
-            out.name = try cursor.identifier();
-            if (cursor.symbol(.dot)) return error.UnsupportedStatement;
+            out.name = try publicName(cursor, &out.has_schema);
             try routineSignature(cursor, pool, out);
             if (cursor.symbol(.comma)) return error.UnsupportedStatement;
             if (try cursor.take("cascade")) out.cascade = true else _ = try cursor.take("restrict");
@@ -503,6 +501,7 @@ pub fn Routines(comptime config: types.Config) type {
                 target.routine.any_kind = any_kind;
                 target.routine.name = try cursor.identifier();
                 if (try cursor.takeSymbol(.dot)) {
+                    target.routine.has_schema = true;
                     target.schema = target.routine.name;
                     if (!types.same(target.schema.slice(), "public") and !types.same(target.schema.slice(), "pg_catalog")) return error.UnsupportedStatement;
                     target.routine.name = try cursor.identifier();
@@ -571,11 +570,20 @@ pub fn Routines(comptime config: types.Config) type {
             return error.Syntax;
         }
 
+        fn publicName(cursor: *Cursor, has_schema: *bool) Error!Name {
+            var name = try cursor.identifier();
+            if (try cursor.takeSymbol(.dot)) {
+                has_schema.* = true;
+                if (!types.same(name.slice(), "public")) return error.UnsupportedStatement;
+                name = try cursor.identifier();
+            }
+            return name;
+        }
+
         fn call(cursor: *Cursor, out: *Call) Error!void {
             out.* = .{};
             try cursor.expect("call");
-            out.name = try cursor.identifier();
-            if (cursor.symbol(.dot)) return error.UnsupportedStatement;
+            out.name = try publicName(cursor, &out.has_schema);
             try cursor.expectSymbol(.lparen);
             if (!try cursor.takeSymbol(.rparen)) while (true) {
                 if (out.arg_count == config.routine_args) return error.ColumnCapacity;
