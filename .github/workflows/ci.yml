@@ -12,7 +12,10 @@ permissions:
 jobs:
   native-sig:
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    # Run 46029049805 passed all 497 library contracts and the CLI tests,
+    # then reached the 50-minute deadline before argv forwarding completed.
+    # Keep every check; leave room for cold compilation and final CLI probes.
+    timeout-minutes: 75
     steps:
       - name: Free disk space
         run: |
