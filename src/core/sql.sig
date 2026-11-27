@@ -3708,8 +3708,8 @@ pub fn Database(comptime config: Config) type {
             self.family_returning = command;
             defer self.family_returning = .none;
             switch (bound) {
-                .update => |*update| try self.returnRows(slot, source, &update.returning, root, true, result.rows.len),
-                .delete => |*delete| try self.returnRows(slot, source, &delete.returning, root, true, result.rows.len),
+                .update => |*update| try self.returnRows(slot, source, &update.returning, root, true, result.rows.len, snap.cid),
+                .delete => |*delete| try self.returnRows(slot, source, &delete.returning, root, true, result.rows.len, snap.cid),
                 else => return error.UnsupportedStatement,
             }
         }

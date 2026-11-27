@@ -2496,8 +2496,6 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                 .drop_view => "DROP VIEW",
                 .drop_materialized_view => "DROP MATERIALIZED VIEW",
                 .drop_table => "drop",
-                .drop_view => "DROP VIEW",
-                .drop_materialized_view => "DROP MATERIALIZED VIEW",
                 .drop_index => "DROP INDEX",
                 .create_sequence => "create_sequence",
                 .drop_sequence => "drop_sequence",
