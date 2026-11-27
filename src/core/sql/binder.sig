@@ -7849,7 +7849,7 @@ pub fn Binder(comptime config: types.Config) type {
             }
             switch (n.cast_type) {
                 .json, .jsonb, .text, .varchar, .bpchar => {},
-                else => return error.TypeMismatch,
+                else => return error.CannotCoerce,
             }
             if (n.integer & 3 == 3) switch (context.node(n.b).ty) {
                 .json, .jsonb, .text, .varchar, .bpchar => {},

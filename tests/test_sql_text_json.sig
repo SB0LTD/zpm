@@ -1,6 +1,10 @@
 //! Text and JSON contract (B11 wave 4 "text-json" lane): regular
 //! expression positions, back references and BREs with the regexp_*
-//! functions and the regex forms of substring. Every section checks values
+//! functions and the regex forms of substring; the english text search
+//! configuration and default_text_search_config; non-ASCII case mapping;
+//! jsonpath like_regex and keyvalue(), jsonb_path_query; JSON_EXISTS,
+//! JSON_VALUE, JSON_QUERY, IS JSON, the SQL/JSON constructors and
+//! aggregates. Every section checks values
 //! in PostgreSQL text output, result metadata (type OID, typmod, column
 //! name), NULLs, exact errors (SQLSTATE through the error name) with
 //! statement atomicity, the statement work budget and cancellation points,
@@ -89,7 +93,11 @@ fn stateOf(err: anyerror) []const u8 {
         .{ "ProgramLimitExceeded", "54000" },     .{ "InvalidTextRepresentation", "22P02" }, .{ "Syntax", "42601" },
         .{ "UndefinedObject", "42704" },          .{ "TextCapacity", "54000" },              .{ "StatementTooComplex", "54001" },
         .{ "QueryWorkLimit", "54000" },           .{ "QueryCanceled", "57014" },             .{ "AmbiguousFunction", "42725" },
-        .{ "TypeMismatch", "42804" },             .{ "DivisionByZero", "22012" },
+        .{ "TypeMismatch", "42804" },             .{ "DivisionByZero", "22012" },            .{ "InvalidSettingValue", "22023" },
+        .{ "SqlJsonMemberNotFound", "2203A" },    .{ "SqlJsonObjectNotFound", "2203C" },     .{ "MoreThanOneSqlJsonItem", "22034" },
+        .{ "NoSqlJsonItem", "22035" },            .{ "SqlJsonScalarRequired", "2203F" },     .{ "CannotCoerce", "42846" },
+        .{ "NullValueNotAllowed", "22004" },      .{ "DuplicateJsonObjectKeyValue", "22030" }, .{ "SqlJsonArrayNotFound", "22039" },
+        .{ "ColumnNotFound", "42703" },           .{ "TableNotFound", "42P01" },
     };
     for (table) |entry| if (std.mem.eql(u8, entry[0], @errorName(err))) return entry[1];
     return @errorName(err);
@@ -344,8 +352,104 @@ fn regularExpressions() !void {
     }, &.{"rxr"}, "SELECT * FROM rxr ORDER BY id", "1|27|{a,b,\"\",c};2|xy|{x,y};3|z|{z,NULL}");
 }
 
+// ---- text search: english ------------------------------------------------
+
+fn textSearchEnglish() !void {
+    // The english configuration (Snowball stemmer, stop words), phrase gaps
+    // of stop words, default_text_search_config and the forms using it,
+    // text @@ tsquery and text @@ text.
+    try battery(&batteries.fts_english_battery);
+    try rows("SELECT to_tsvector('Fat Rats'), plainto_tsquery('rats'), 'a b' @@ 'b'", "'fat':1 'rat':2|'rat'|t");
+    try meta(0, "to_tsvector", 3614, -1);
+    try meta(1, "plainto_tsquery", 3615, -1);
+    try meta(2, "?column?", 16, -1);
+    try rows("SHOW default_text_search_config", "pg_catalog.english");
+    try meta(0, "default_text_search_config", 25, -1);
+    try rows("SELECT setting, vartype FROM pg_settings WHERE name = 'default_text_search_config'", "pg_catalog.english|string");
+    // An unknown configuration is 22023 and changes nothing; the other
+    // Snowball configurations are 0A000 here.
+    try rejects("SET default_text_search_config = 'nosuch'", error.InvalidSettingValue);
+    try rejects("SET default_text_search_config = 'french'", error.UnsupportedStatement);
+    try rows("SHOW default_text_search_config", "pg_catalog.english");
+    // The setting applies to later statements and RESET restores it.
+    try exec("SET default_text_search_config = 'simple'");
+    try rows("SELECT to_tsvector('The Rats')", "'rats':2 'the':1");
+    try exec("RESET default_text_search_config");
+    try rows("SELECT to_tsvector('The Rats')", "'rat':2");
+    // Stemming and parsing are budgeted and cancellable.
+    try controlled("SELECT to_tsvector('english', 'Generously generalized connections were relationally hopefully running') @@ to_tsquery('english', 'generous <-> generalize & connect')", "t");
+}
+
+// ---- case mapping -----------------------------------------------------------
+
+fn caseMapping() !void {
+    // upper / lower / initcap over every hundredth chunk of code points.
+    try battery(&batteries.case_mapping_battery);
+    try rows("SELECT upper('\xc3\xa9t\xc3\xa9'), lower('\xc3\x89T\xc3\x89'), initcap('\xc3\xa9l\xc3\xa8ve-\xc3\xa9COLE')", "\xc3\x89T\xc3\x89|\xc3\xa9t\xc3\xa9|\xc3\x89l\xc3\xa8ve-\xc3\x89cole");
+    try meta(0, "upper", 25, -1);
+    // A result beyond the text capacity is 54000 (two-byte to three-byte
+    // mappings grow the text).
+    try rejects("SELECT upper(repeat('\xc9\x90', 256))", error.TextCapacity);
+}
+
+// ---- jsonpath and SQL/JSON ----------------------------------------------------
+
+fn jsonFeatures() !void {
+    try battery(&batteries.jsonpath_battery);
+    try battery(&batteries.json_query_battery);
+    try battery(&batteries.is_json_battery);
+    try battery(&batteries.json_constructor_battery);
+    try battery(&batteries.contract_mixed_battery);
+
+    // Result metadata.
+    try rows("SELECT JSON_VALUE(jsonb '{\"a\": \"xy\"}', '$.a' RETURNING varchar(5)), JSON_QUERY(jsonb '[1]', '$'), JSON_EXISTS(jsonb '1', '$'), '1' IS JSON, JSON_OBJECT('k' VALUE 1), JSON_ARRAY(1 RETURNING jsonb), JSON_SCALAR(2), JSON_SERIALIZE('[]')", "xy|[1]|t|t|{\"k\" : 1}|[1]|2|[]");
+    try meta(0, "json_value", 1043, 9);
+    try meta(1, "json_query", 3802, -1);
+    try meta(2, "json_exists", 16, -1);
+    try meta(3, "?column?", 16, -1);
+    try meta(4, "json_object", 114, -1);
+    try meta(5, "json_array", 3802, -1);
+    try meta(6, "json_scalar", 114, -1);
+    try meta(7, "json_serialize", 25, -1);
+    try rows("SELECT * FROM jsonb_path_query('[1, 2]', '$[*]')", "1;2");
+    try meta(0, "jsonb_path_query", 3802, -1);
+    try rows("SELECT JSON_ARRAYAGG(v ORDER BY v), JSON_OBJECTAGG(k VALUE v RETURNING jsonb) FROM (VALUES ('a', 2), ('b', 1)) t(k, v)", "[1, 2]|{\"a\": 2, \"b\": 1}");
+    try meta(0, "json_arrayagg", 114, -1);
+    try meta(1, "json_objectagg", 3802, -1);
+
+    // Errors with statement atomicity.
+    try rejects("SELECT JSON_OBJECT(NULL VALUE 1)", error.NullValueNotAllowed);
+    try rejects("SELECT JSON_OBJECT('a' VALUE 1, 'a' VALUE 2 WITH UNIQUE KEYS)", error.DuplicateJsonObjectKeyValue);
+    try rejects("SELECT json_object_agg_unique(k, 1) FROM (VALUES ('x'), ('x')) v(k)", error.DuplicateJsonObjectKeyValue);
+    try rejects("SELECT JSON_VALUE(jsonb '{}', 'strict $.a' ERROR ON ERROR)", error.SqlJsonMemberNotFound);
+    try rejects("SELECT JSON_VALUE(1, '$')", error.CannotCoerce);
+    try rejects("SELECT 1 IS JSON", error.TypeMismatch);
+    try rejects("SELECT jsonb_path_query_first('1', '$.keyvalue()')", error.SqlJsonObjectNotFound);
+    try rejects("SELECT jsonb_path_exists('\"x\"', '$ ? (@ like_regex \"(\")')", error.InvalidRegularExpression);
+    try rejects("SELECT jsonb_path_query_first('\"2024-01-01\"', '$.date()')", error.UnsupportedStatement);
+    // JSON_ARRAYAGG / JSON_OBJECTAGG RETURNING a string type: 0A000 here.
+    try rejects("SELECT JSON_ARRAYAGG(1 RETURNING text)", error.UnsupportedStatement);
+
+    // Path evaluation, like_regex and constructors are budgeted.
+    try controlled("SELECT jsonb_path_query_array('[\"aab\", \"ab\", \"b\", \"aaab\"]', '$[*] ? (@ like_regex \"^(a|aa)*b$\")')", "[\"aab\", \"ab\", \"b\", \"aaab\"]");
+    try controlled("SELECT count(*) FROM jsonb_path_query('{\"a\": [1, 2, 3, 4, 5, 6]}', '$.a[*] ? (@ > 2)')", "4");
+    try controlled("SELECT JSON_VALUE(jsonb '{\"a\": [{\"b\": 7}]}', '$.a[0].b' RETURNING int) + JSON_QUERY(jsonb '{\"q\": 1}', '$.q' RETURNING int)", "8");
+
+    // Replay: SQL/JSON and text search results stored in jsonb, json,
+    // tsvector and text columns replicate exactly.
+    try replay(&.{
+        "CREATE TABLE jr(id INT PRIMARY KEY, doc JSONB, j JSON, v TSVECTOR, t TEXT)",
+        "INSERT INTO jr VALUES (1, JSON_OBJECT('a' VALUE 1 RETURNING jsonb), JSON_ARRAY(1, 'x'), to_tsvector('english', 'Running foxes'), JSON_VALUE(jsonb '{\"a\": \"q\"}', '$.a'))",
+        "INSERT INTO jr SELECT 1 + ordinality::int, jsonb_path_query, JSON_OBJECT('i' VALUE ordinality), to_tsvector('The quick fox'), upper('\xc3\xa9') FROM jsonb_path_query('[{\"k\": 1}, [2]]', '$[*]') WITH ORDINALITY",
+        "UPDATE jr SET t = JSON_QUERY(doc, '$.k' RETURNING text WITH WRAPPER) WHERE id = 2",
+    }, &.{"jr"}, "SELECT * FROM jr ORDER BY id", "1|{\"a\": 1}|[1, \"x\"]|'fox':2 'run':1|q;2|{\"k\": 1}|{\"i\" : 1}|'fox':3 'quick':2|[1];3|[2]|{\"i\" : 2}|'fox':3 'quick':2|\xc3\x89");
+}
+
 pub fn main(init: std.process.Init) !void {
     try regularExpressions();
+    try textSearchEnglish();
+    try caseMapping();
+    try jsonFeatures();
     var buffer: [256]u8 = undefined;
     const line = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-text-json\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, line);
