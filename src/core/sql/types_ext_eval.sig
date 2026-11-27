@@ -11,6 +11,9 @@ const value = @import("value.sig");
 const network = @import("network.sig");
 const geometry = @import("geometry.sig");
 const geometric = @import("geometric.sig");
+const multirange = @import("multirange.sig");
+const xml_publish = @import("xml_publish.sig");
+const lexer = @import("lexer.sig");
 const Error = types.Error;
 const none = ast.none;
 
@@ -42,14 +45,41 @@ pub fn TypesExt(comptime config: types.Config, comptime E: type) type {
         }
 
         pub fn call(ctx: *const E.Context, n: *const ast.Node) Error!V.Cell {
+            if (n.func == .multirange_constructor) return construct(ctx, n);
             const args = try arguments(ctx, n);
             // Every function here is strict.
             for (args.cells[0..args.count]) |*cell| if (cell.* == .null_value) return .null_value;
             const a = &args.cells[0];
             const b = &args.cells[1];
             return switch (n.func) {
-                .ext_op => if (a.* == .geo or b.* == .geo or a.* == .point or a.* == .box) geometryOperator(@enumFromInt(n.integer), a, b) else operator(@enumFromInt(n.integer), a, b, args.count, n.ty),
+                .ext_op => if (a.* == .multirange or b.* == .multirange) multirangeOperator(@enumFromInt(n.integer), a, b) else if (a.* == .geo or b.* == .geo or a.* == .point or a.* == .box) geometryOperator(@enumFromInt(n.integer), a, b) else operator(@enumFromInt(n.integer), a, b, args.count, n.ty),
                 .geo_call => geometryCall(@enumFromInt(n.integer), &args),
+                .multirange_of => value.Io(config).multirangeOf(a),
+                .range_merge => blk: {
+                    if (args.count == 2) {
+                        // The smallest range covering both (range_merge(r, r)).
+                        const x = R.decode(a.range.slice());
+                        const y = R.decode(b.range.slice());
+                        if (x.empty) break :blk b.*;
+                        if (y.empty) break :blk a.*;
+                        const lower = if (R.compareBounds(&x.lower, &y.lower) < 0) x.lower else y.lower;
+                        const upper = if (R.compareBounds(&x.upper, &y.upper) > 0) x.upper else y.upper;
+                        break :blk rangeCell(&(try R.make(x.subtype, lower, upper, false)));
+                    }
+                    break :blk rangeCell(&M.span(a.multirange.slice()));
+                },
+                .mr_call => blk: {
+                    const span = M.span(a.multirange.slice());
+                    break :blk switch (@as(ast.MultirangeFn, @enumFromInt(n.integer))) {
+                        .lower => if (span.empty or span.lower.infinite) .null_value else span.lower.value,
+                        .upper => if (span.empty or span.upper.infinite) .null_value else span.upper.value,
+                        .isempty => .{ .boolean = span.empty },
+                        .lower_inc => .{ .boolean = !span.empty and !span.lower.infinite and span.lower.inclusive },
+                        .upper_inc => .{ .boolean = !span.empty and !span.upper.infinite and span.upper.inclusive },
+                        .lower_inf => .{ .boolean = !span.empty and span.lower.infinite },
+                        .upper_inf => .{ .boolean = !span.empty and span.upper.infinite },
+                    };
+                },
                 .inet_abbrev => blk: {
                     var buffer: [64]u8 = undefined;
                     break :blk textCell(if (a.inet.cidr) network.abbrevCidr(&a.inet, &buffer) else network.format(&a.inet, false, &buffer));
@@ -71,6 +101,351 @@ pub fn TypesExt(comptime config: types.Config, comptime E: type) type {
                 },
                 else => error.UnsupportedStatement,
             };
+        }
+
+        const R = V.Ranges;
+        const M = V.Multiranges;
+        const Io = value.Io(config);
+        const P = xml_publish;
+
+        /// An identifier of the statement (folded unless quoted).
+        fn identText(ctx: *const E.Context, ident: ast.Ident, buffer: []u8) Error![]const u8 {
+            if (ident.len > buffer.len) return error.NameCapacity;
+            const len = ident.len;
+            if (ident.quoted) {
+                lexer.decodeQuotedIdentifier(ctx.source, .{ .start = ident.span.start, .end = ident.span.start + ident.span.len, .len = ident.len }, buffer);
+            } else for (ident.span.slice(ctx.source)[0..len], 0..) |byte, index| {
+                buffer[index] = types.lower(byte);
+            }
+            return buffer[0..len];
+        }
+
+        const base64_alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+        /// map_sql_value_to_xml_value: xml as is, booleans true/false,
+        /// timestamps in XML Schema form, bytea in base64, arrays as
+        /// <element> sequences, everything else its output text (escaped
+        /// when `escape`).
+        fn xmlValue(cell: *const V.Cell, escape: bool, session: *const value.Session, out: *P.Out) Error!void {
+            switch (cell.*) {
+                .null_value => {},
+                .xml => |*text| try out.add(text.slice()),
+                .boolean => |flag| try out.add(if (flag) "true" else "false"),
+                .bytea => |*bytes| {
+                    const data = bytes.slice();
+                    var index: usize = 0;
+                    while (index < data.len) : (index += 3) {
+                        const rest = data.len - index;
+                        const word: u32 = @as(u32, data[index]) << 16 | (if (rest > 1) @as(u32, data[index + 1]) << 8 else 0) | (if (rest > 2) @as(u32, data[index + 2]) else 0);
+                        try out.byte(base64_alphabet[word >> 18]);
+                        try out.byte(base64_alphabet[(word >> 12) & 63]);
+                        try out.byte(if (rest > 1) base64_alphabet[(word >> 6) & 63] else '=');
+                        try out.byte(if (rest > 2) base64_alphabet[word & 63] else '=');
+                    }
+                },
+                .array => |*items| {
+                    var reader = V.Arrays.Reader.init(items.slice());
+                    var element: V.Cell = undefined;
+                    while (reader.next(&element)) {
+                        if (element == .null_value) continue;
+                        try out.add("<element>");
+                        try xmlValue(&element, true, session, out);
+                        try out.add("</element>");
+                    }
+                },
+                else => {
+                    var buffer: [Io.format_bytes]u8 = undefined;
+                    var shown = try Io.format(cell, false, session, &buffer);
+                    if (cell.* == .timestamp or cell.* == .timestamptz) {
+                        // XML Schema dateTime: 'T' between date and time,
+                        // and a +hh offset as +hh:mm.
+                        for (buffer[0..shown.len]) |*c| if (c.* == ' ') {
+                            c.* = 'T';
+                        };
+                        if (cell.* == .timestamptz and shown.len >= 3 and (shown[shown.len - 3] == '+' or shown[shown.len - 3] == '-')) {
+                            buffer[shown.len] = ':';
+                            buffer[shown.len + 1] = '0';
+                            buffer[shown.len + 2] = '0';
+                            shown = buffer[0 .. shown.len + 3];
+                        }
+                    }
+                    if (escape) try P.text(shown, out) else try out.add(shown);
+                },
+            }
+        }
+
+        fn xmlCell(out: *const P.Out, text: *V.Text) V.Cell {
+            text.len = out.len;
+            return .{ .xml = text.* };
+        }
+
+        /// XMLELEMENT, XMLFOREST, XMLCONCAT, XMLCOMMENT, XMLPI, XMLROOT.
+        pub fn xmlCall(ctx: *const E.Context, n: *const ast.Node) Error!V.Cell {
+            var text: V.Text = .{};
+            var out: P.Out = .{ .bytes = &text.bytes };
+            var name_buffer: [256]u8 = undefined;
+            switch (n.func) {
+                .xmlelement => {
+                    const element = try identText(ctx, node(ctx, n.b).name, &name_buffer);
+                    try out.byte('<');
+                    const name_start = out.len;
+                    try P.name(element, &out);
+                    const name_end = out.len;
+                    var item = node(ctx, n.b).next;
+                    for (0..@as(usize, @intCast(n.integer))) |_| {
+                        const attribute = node(ctx, item);
+                        const cell = try E.eval(ctx, attribute.b);
+                        if (cell != .null_value) {
+                            try out.byte(' ');
+                            try P.name(try identText(ctx, attribute.name, &name_buffer), &out);
+                            try out.add("=\"");
+                            var value_text: V.Text = .{};
+                            var value_out: P.Out = .{ .bytes = &value_text.bytes };
+                            try xmlValue(&cell, false, ctx.session, &value_out);
+                            try P.attribute(value_out.slice(), &out);
+                            try out.byte('"');
+                        }
+                        item = attribute.next;
+                    }
+                    var content = false;
+                    while (item != none) : (item = node(ctx, item).next) {
+                        const cell = try E.eval(ctx, item);
+                        if (cell == .null_value) continue;
+                        if (!content) try out.byte('>');
+                        content = true;
+                        try xmlValue(&cell, true, ctx.session, &out);
+                    }
+                    if (!content) return blk: {
+                        try out.add("/>");
+                        break :blk xmlCell(&out, &text);
+                    };
+                    try out.add("</");
+                    var tag: [512]u8 = undefined;
+                    const tag_len = name_end - name_start;
+                    if (tag_len > tag.len) return error.TextCapacity;
+                    @memcpy(tag[0..tag_len], text.bytes[name_start..name_end]);
+                    try out.add(tag[0..tag_len]);
+                    try out.byte('>');
+                    return xmlCell(&out, &text);
+                },
+                .xmlforest => {
+                    var any = false;
+                    var item = n.b;
+                    while (item != none) : (item = node(ctx, item).next) {
+                        const attribute = node(ctx, item);
+                        const cell = try E.eval(ctx, attribute.b);
+                        if (cell == .null_value) continue;
+                        any = true;
+                        const tag = try identText(ctx, attribute.name, &name_buffer);
+                        try out.byte('<');
+                        try P.name(tag, &out);
+                        try out.byte('>');
+                        try xmlValue(&cell, true, ctx.session, &out);
+                        try out.add("</");
+                        try P.name(tag, &out);
+                        try out.byte('>');
+                    }
+                    return if (any) xmlCell(&out, &text) else .null_value;
+                },
+                .xmlconcat => {
+                    var any = false;
+                    var item = n.b;
+                    while (item != none) : (item = node(ctx, item).next) {
+                        const cell = try E.eval(ctx, item);
+                        if (cell == .null_value) continue;
+                        any = true;
+                        try out.add(cell.xml.slice());
+                    }
+                    return if (any) xmlCell(&out, &text) else .null_value;
+                },
+                .xmlcomment => {
+                    const cell = try E.eval(ctx, n.b);
+                    if (cell == .null_value) return .null_value;
+                    // xmltext(text) shares the node: its text, escaped.
+                    var called: [16]u8 = undefined;
+                    if (types.same(try identText(ctx, n.name, &called), "xmltext")) {
+                        try P.text(cell.text.slice(), &out);
+                        return xmlCell(&out, &text);
+                    }
+                    try P.comment(cell.text.slice(), &out);
+                    return xmlCell(&out, &text);
+                },
+                .xmlpi => {
+                    const target = try identText(ctx, node(ctx, n.b).name, &name_buffer);
+                    const content_id = node(ctx, n.b).next;
+                    var content: ?[]const u8 = null;
+                    var cell: V.Cell = .null_value;
+                    if (content_id != none) {
+                        cell = try E.eval(ctx, content_id);
+                        if (cell == .null_value) {
+                            // The target is still checked (2200T).
+                            if (types.keyword(target, "xml")) return error.InvalidXmlProcessingInstruction;
+                            return .null_value;
+                        }
+                        content = cell.text.slice();
+                    }
+                    try P.processingInstruction(target, content, &out);
+                    return xmlCell(&out, &text);
+                },
+                .xmlroot => {
+                    const cell = try E.eval(ctx, n.b);
+                    var version: ?[]const u8 = null;
+                    var version_cell: V.Cell = .null_value;
+                    if (n.integer & 1 != 0) {
+                        version_cell = try E.eval(ctx, node(ctx, n.b).next);
+                        if (version_cell != .null_value) version = version_cell.text.slice();
+                    }
+                    if (cell == .null_value) return .null_value;
+                    const standalone: ?bool = switch ((n.integer >> 1) & 3) {
+                        1 => true,
+                        2 => false,
+                        else => null,
+                    };
+                    try P.root(cell.xml.slice(), version, standalone, &out);
+                    return xmlCell(&out, &text);
+                },
+                else => return error.UnsupportedStatement,
+            }
+        }
+
+        /// XMLAGG: the concatenation of the non-NULL inputs.
+        pub fn xmlAggregate(cells: []const V.Cell, handles: []const u32, session: *const value.Session) Error!V.Cell {
+            if (handles.len == 0) return .null_value;
+            var text: V.Text = .{};
+            var out: P.Out = .{ .bytes = &text.bytes };
+            for (handles) |handle| {
+                try session.checkpoint();
+                try out.add(cells[handle].xml.slice());
+            }
+            return xmlCell(&out, &text);
+        }
+
+        fn rangeCell(range: *const R.Range) Error!V.Cell {
+            var text: V.Text = .{};
+            try R.encode(range, &text);
+            return .{ .range = text };
+        }
+
+        /// int4multirange(r1, r2, ...): not strict; one NULL argument gives
+        /// NULL, a NULL among several is 22004.
+        fn construct(ctx: *const E.Context, n: *const ast.Node) Error!V.Cell {
+            const range_type = multirange.rangeOf(types.dataTypeOf(n.ty)).?;
+            var set: V.Text = .{};
+            var scratch: V.Text = .{};
+            M.empty(range_type, &set);
+            var item = n.b;
+            while (item != none) : (item = node(ctx, item).next) {
+                const cell = try E.eval(ctx, item);
+                if (cell == .null_value) return if (n.integer == 1) .null_value else error.NullValueNotAllowed;
+                const range = R.decode(cell.range.slice());
+                try M.add(&set, &range, &scratch);
+            }
+            return .{ .multirange = set };
+        }
+
+        /// The ranges of a multirange as an array of its range type (unnest).
+        pub fn rangesArray(cell: *const V.Cell) Error!V.Cell {
+            const bytes = cell.multirange.slice();
+            const total = M.count(bytes);
+            var result: V.Text = .{};
+            var writer = try V.Arrays.Writer.begin(&result, &.{ .element = M.rangeType(bytes), .ndim = if (total == 0) 0 else 1, .dims = .{ @intCast(total), 0, 0, 0, 0, 0 } });
+            var it = M.iterate(bytes);
+            while (it.nextBytes()) |raw| {
+                const range_cell: V.Cell = .{ .range = V.Text.fromValueBytes(raw) };
+                try writer.append(&range_cell);
+            }
+            return .{ .array = result };
+        }
+
+        /// range_agg / range_intersect_agg over the collected non-NULL inputs.
+        pub fn rangeAggregate(cells: []const V.Cell, handles: []const u32, unite: bool, result: types.Type, session: *const value.Session) Error!V.Cell {
+            if (handles.len == 0) return .null_value;
+            var set: V.Text = .{};
+            var scratch: V.Text = .{};
+            var next: V.Text = .{};
+            if (types.isRange(result)) {
+                // range_intersect_agg(anyrange): a range.
+                var acc = R.decode(cells[handles[0]].range.slice());
+                for (handles[1..]) |handle| {
+                    try session.checkpoint();
+                    const range = R.decode(cells[handle].range.slice());
+                    acc = try R.intersect(&acc, &range);
+                }
+                return rangeCell(&acc);
+            }
+            const range_type = multirange.rangeOf(types.dataTypeOf(result)).?;
+            const first = &cells[handles[0]];
+            if (first.* == .range) {
+                M.empty(range_type, &set);
+                for (handles) |handle| {
+                    try session.checkpoint();
+                    const range = R.decode(cells[handle].range.slice());
+                    try M.add(&set, &range, &scratch);
+                }
+                return .{ .multirange = set };
+            }
+            const bytes = first.multirange.slice();
+            if (bytes.len > set.bytes.len) return error.TextCapacity;
+            @memcpy(set.bytes[0..bytes.len], bytes);
+            set.len = bytes.len;
+            for (handles[1..]) |handle| {
+                try session.checkpoint();
+                const other = cells[handle].multirange.slice();
+                if (unite) try M.unite(set.slice(), other, &next, &scratch) else try M.intersect(set.slice(), other, &next, &scratch);
+                set = next;
+            }
+            return .{ .multirange = set };
+        }
+
+        /// Multirange operators over non-NULL operands (bound signatures).
+        fn multirangeOperator(op: ast.Op, a: *const V.Cell, b: *const V.Cell) Error!V.Cell {
+            var out: V.Text = .{};
+            var scratch: V.Text = .{};
+            switch (op) {
+                .add, .sub, .mul => {
+                    const x = a.multirange.slice();
+                    const y = b.multirange.slice();
+                    switch (op) {
+                        .add => try M.unite(x, y, &out, &scratch),
+                        .sub => try M.subtract(x, y, &out, &scratch),
+                        else => try M.intersect(x, y, &out, &scratch),
+                    }
+                    return .{ .multirange = out };
+                },
+                .contains, .contained => {
+                    const outer = if (op == .contains) a else b;
+                    const inner = if (op == .contains) b else a;
+                    if (outer.* == .range) {
+                        // range @> multirange: the span must fit.
+                        const range = R.decode(outer.range.slice());
+                        const span = M.span(inner.multirange.slice());
+                        return .{ .boolean = R.contains(&range, &span) };
+                    }
+                    const set = outer.multirange.slice();
+                    return .{ .boolean = switch (inner.*) {
+                        .multirange => M.containsMultirange(set, inner.multirange.slice()),
+                        .range => M.containsRange(set, &R.decode(inner.range.slice())),
+                        else => M.containsElement(set, inner),
+                    } };
+                },
+                else => {},
+            }
+            // Span-based: && (any pair), << >> &< &> -|-.
+            const x = if (a.* == .multirange) M.span(a.multirange.slice()) else R.decode(a.range.slice());
+            const y = if (b.* == .multirange) M.span(b.multirange.slice()) else R.decode(b.range.slice());
+            return .{ .boolean = switch (op) {
+                .overlap => blk: {
+                    if (a.* == .multirange and b.* == .multirange) break :blk M.overlapsMultirange(a.multirange.slice(), b.multirange.slice());
+                    if (a.* == .multirange) break :blk M.overlapsRange(a.multirange.slice(), &y);
+                    break :blk M.overlapsRange(b.multirange.slice(), &x);
+                },
+                .shift_left => R.before(&x, &y),
+                .shift_right => R.before(&y, &x),
+                .over_left => R.overLeft(&x, &y),
+                .over_right => R.overRight(&x, &y),
+                .adjacent => try R.adjacent(&x, &y),
+                else => return error.UndefinedFunction,
+            } };
         }
 
         fn geoCell(bytes: []const u8) Error!V.Cell {

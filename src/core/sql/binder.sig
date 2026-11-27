@@ -25,6 +25,7 @@ const value = @import("value.sig");
 const sequence = @import("sequence.sig");
 const parser = @import("parser.sig");
 const array_module = @import("array.sig");
+const multirange_module = @import("multirange.sig");
 const routine_catalog = @import("routine_catalog.sig");
 const collation = @import("collation.sig");
 const catalog_objects = @import("catalog_objects.sig");
@@ -1457,6 +1458,17 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "isvertical", .func = .geo_call },       .{ .name = "isparallel", .func = .geo_call },
                 .{ .name = "isperp", .func = .geo_call },           .{ .name = "pt_contained_circle", .func = .geo_call },
                 .{ .name = "pt_contained_poly", .func = .geo_call },
+                // Multiranges (B11 wave 4).
+                .{ .name = "int4multirange", .func = .multirange_constructor },
+                .{ .name = "int8multirange", .func = .multirange_constructor },
+                .{ .name = "nummultirange", .func = .multirange_constructor },
+                .{ .name = "datemultirange", .func = .multirange_constructor },
+                .{ .name = "tsmultirange", .func = .multirange_constructor },
+                .{ .name = "tstzmultirange", .func = .multirange_constructor },
+                .{ .name = "multirange", .func = .multirange_of },   .{ .name = "range_merge", .func = .range_merge },
+                // SQL/XML publishing called by name (B11 wave 4).
+                .{ .name = "xmlconcat", .func = .xmlconcat },       .{ .name = "xmlcomment", .func = .xmlcomment },
+                .{ .name = "xmltext", .func = .xmlcomment },
                 // Geometric functions (B11 advanced types).
                 .{ .name = "point", .func = .point_constructor },   .{ .name = "box", .func = .box_constructor },
                 .{ .name = "area", .func = .area },                 .{ .name = "center", .func = .center },
@@ -1544,6 +1556,8 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "bit_xor", .agg = .bit_xor },
                 // B11 json-agg lane: collection, JSON and ordered-set aggregates.
                 .{ .name = "array_agg", .agg = .array_agg },        .{ .name = "string_agg", .agg = .string_agg },
+                .{ .name = "range_agg", .agg = .range_agg },        .{ .name = "range_intersect_agg", .agg = .range_intersect_agg },
+                .{ .name = "xmlagg", .agg = .xmlagg },
                 .{ .name = "json_agg", .agg = .json_agg },          .{ .name = "jsonb_agg", .agg = .jsonb_agg },
                 .{ .name = "json_object_agg", .agg = .json_object_agg }, .{ .name = "jsonb_object_agg", .agg = .jsonb_object_agg },
                 .{ .name = "percentile_cont", .agg = .percentile_cont }, .{ .name = "percentile_disc", .agg = .percentile_disc },
@@ -1581,6 +1595,19 @@ pub fn Binder(comptime config: types.Config) type {
                     if (first == .unknown) return error.TypeMismatch;
                     if (types.isArray(first)) return first;
                     return types.arrayType(first) orelse error.UndefinedFunction;
+                },
+                // range_agg(anyrange | anymultirange) -> anymultirange;
+                // range_intersect_agg keeps its input type (B11 wave 4).
+                .xmlagg => {
+                    if (first == .unknown) try coerce(context, args[0], .xml);
+                    if (context.node(args[0]).ty != .xml) return error.UndefinedFunction;
+                    return .xml;
+                },
+                .range_agg, .range_intersect_agg => {
+                    if (first == .unknown) return error.TypeMismatch;
+                    if (multirange_module.isMultirange(first)) return first;
+                    if (!types.isRange(first)) return error.UndefinedFunction;
+                    return if (kind == .range_agg) multirangeOfType(first).? else first;
                 },
                 .json_agg, .jsonb_agg => {
                     if (first == .unknown) return error.TypeMismatch;
@@ -1915,7 +1942,7 @@ pub fn Binder(comptime config: types.Config) type {
                 // Collection / ordered-set aggregates type elsewhere; as
                 // window functions they are not provided (0A000).
                 .array_agg, .string_agg, .json_agg, .jsonb_agg, .json_object_agg, .jsonb_object_agg,
-                .percentile_cont, .percentile_disc, .mode, .hypothetical_rank, .hypothetical_dense_rank, .hypothetical_percent_rank, .hypothetical_cume_dist => return error.UnsupportedStatement,
+                .percentile_cont, .percentile_disc, .mode, .hypothetical_rank, .hypothetical_dense_rank, .hypothetical_percent_rank, .hypothetical_cume_dist, .range_agg, .range_intersect_agg, .xmlagg => return error.UnsupportedStatement,
                 .none => unreachable,
             };
         }
@@ -2182,6 +2209,22 @@ pub fn Binder(comptime config: types.Config) type {
         }
 
         fn typeFunction(context: *const Context, scope: *const Scope, n: *ast.Node) Error!void {
+            // SQL/XML publishing parts (B11 wave 4): names, not calls.
+            if (n.func == .xml_name) {
+                n.ty = .text;
+                n.constant = true;
+                return;
+            }
+            if (n.func == .xml_attribute) {
+                try typeExpr(context, scope, n.b);
+                n.ty = context.node(n.b).ty;
+                if (n.ty == .unknown) {
+                    try coerce(context, n.b, .text);
+                    n.ty = .text;
+                }
+                n.constant = isConstant(context, n.b);
+                return;
+            }
             // An explicitly named schema never falls back to a built-in.
             // Resolve ordinary routines before name-based aggregate/window
             // classification (public.count, public.row_number, etc.).
@@ -2509,6 +2552,9 @@ pub fn Binder(comptime config: types.Config) type {
                 .ext_op => return,
                 .inet_abbrev, .set_masklen, .hostmask, .inet_merge, .inet_same_family, .macaddr8_set7bit, .to_macaddr8, .to_macaddr, .mac_trunc => try typeExtFunction(context, n, count),
                 .geo_call => try typeGeometryFunction(context, n, count),
+                .multirange_constructor, .multirange_of, .range_merge, .mr_call => try typeMultirangeFunction(context, n, count),
+                .xmlelement, .xmlforest, .xmlconcat, .xmlcomment, .xmlpi, .xmlroot => try typeXmlFunction(context, n),
+                .xml_name, .xml_attribute => unreachable,
                 .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => try typeRangeFunction(context, n, count),
                 .xmlparse => {
                     n.b = try convert(context, n.b, .text, -1, .implicit);
@@ -2678,6 +2724,23 @@ pub fn Binder(comptime config: types.Config) type {
             if (count == 0) return;
             const first = context.node(n.b).ty;
             if (n.func == .trunc and count == 1 and (first == .macaddr or first == .macaddr8)) n.func = .mac_trunc;
+            // The range accessors over a multirange.
+            if (count == 1 and multirange_module.isMultirange(first)) {
+                const which: ?ast.MultirangeFn = switch (n.func) {
+                    .lower, .range_lower => .lower,
+                    .upper, .range_upper => .upper,
+                    .isempty => .isempty,
+                    .lower_inc => .lower_inc,
+                    .upper_inc => .upper_inc,
+                    .lower_inf => .lower_inf,
+                    .upper_inf => .upper_inf,
+                    else => null,
+                };
+                if (which) |code| {
+                    n.func = .mr_call;
+                    n.integer = @intFromEnum(code);
+                }
+            }
             // area/center/length/point/box over the other geometric types.
             const geometric_argument = first == .lseg or first == .line or first == .path or first == .polygon or first == .circle;
             switch (n.func) {
@@ -2773,6 +2836,159 @@ pub fn Binder(comptime config: types.Config) type {
                 .pt_contained_circle => try bindSignature(context, n, &[_]T{ .point, .circle }, .boolean, true),
                 .pt_contained_poly => try bindSignature(context, n, &[_]T{ .point, .polygon }, .boolean, true),
             }
+        }
+
+        /// SQL/XML publishing: XMLCONCAT arguments are xml (untyped ones
+        /// read as xml; others 42804), XMLCOMMENT text, XMLPI content text,
+        /// XMLROOT (xml, text); attribute names of one element are unique
+        /// (42601). Every result is xml.
+        fn typeXmlFunction(context: *const Context, n: *ast.Node) Error!void {
+            switch (n.func) {
+                .xmlconcat => {
+                    if (n.b == none) return error.Syntax;
+                    var item = n.b;
+                    while (item != none) : (item = context.node(item).next) {
+                        if (context.node(item).ty == .unknown) try coerce(context, item, .xml);
+                        if (context.node(item).ty != .xml) return error.TypeMismatch;
+                    }
+                },
+                .xmlcomment => try bindSignature(context, n, &[_]ast.Type{.text}, .xml, true),
+                .xmlpi => {
+                    const content = context.node(n.b).next;
+                    if (content != none) {
+                        context.node(n.b).next = try convert(context, content, .text, -1, .implicit);
+                        if (context.node(context.node(n.b).next).ty != .text) return error.UndefinedFunction;
+                    }
+                },
+                .xmlroot => {
+                    if (context.node(n.b).ty == .unknown) try coerce(context, n.b, .xml);
+                    if (context.node(n.b).ty != .xml) return error.TypeMismatch;
+                    const version = context.node(n.b).next;
+                    if (version != none) {
+                        const converted = try convert(context, version, .text, -1, .implicit);
+                        context.node(n.b).next = converted;
+                        if (context.node(converted).ty != .text) return error.UndefinedFunction;
+                    }
+                },
+                .xmlelement, .xmlforest => {
+                    // Unique attribute names (XMLELEMENT only).
+                    const attributes: usize = if (n.func == .xmlelement) @intCast(n.integer) else 0;
+                    var outer = if (n.func == .xmlelement) context.node(n.b).next else none;
+                    for (0..attributes) |index| {
+                        var inner = context.node(outer).next;
+                        for (index + 1..attributes) |_| {
+                            if (types.same(toName(context, context.node(outer).name).slice(), toName(context, context.node(inner).name).slice())) return error.Syntax;
+                            inner = context.node(inner).next;
+                        }
+                        outer = context.node(outer).next;
+                    }
+                },
+                else => unreachable,
+            }
+            n.ty = .xml;
+            n.constant = false;
+        }
+
+        fn multirangeOfType(ty: ast.Type) ?ast.Type {
+            const data = multirange_module.ofRange(types.dataTypeOf(ty)) orelse return null;
+            return types.typeOfData(data);
+        }
+
+        fn rangeOfMultirange(ty: ast.Type) ast.Type {
+            return types.typeOfData(multirange_module.rangeOf(types.dataTypeOf(ty)).?);
+        }
+
+        /// Multirange constructors and functions.
+        fn typeMultirangeFunction(context: *const Context, n: *ast.Node, count: usize) Error!void {
+            switch (n.func) {
+                .multirange_constructor => {
+                    const name = toName(context, n.name);
+                    const data = types.typeByCatalogName(name.slice()) orelse return error.UndefinedFunction;
+                    const result = types.typeOfData(data);
+                    const range = rangeOfMultirange(result);
+                    var item = n.b;
+                    var previous: u16 = none;
+                    while (item != none) {
+                        const next = context.node(item).next;
+                        context.node(item).next = none;
+                        const ty = context.node(item).ty;
+                        if (ty != .unknown and ty != range) return error.UndefinedFunction;
+                        const converted = try convert(context, item, range, -1, .implicit);
+                        if (previous == none) n.b = converted else context.node(previous).next = converted;
+                        context.node(converted).next = next;
+                        previous = converted;
+                        item = next;
+                    }
+                    n.ty = result;
+                    n.integer = @intCast(count);
+                },
+                .multirange_of => {
+                    if (count != 1) return error.UndefinedFunction;
+                    const ty = context.node(n.b).ty;
+                    if (ty == .unknown) return error.TypeMismatch;
+                    n.ty = multirangeOfType(ty) orelse return error.UndefinedFunction;
+                },
+                .range_merge => {
+                    const ty = context.node(n.b).ty;
+                    if (count == 1) {
+                        if (!multirange_module.isMultirange(ty)) return error.UndefinedFunction;
+                        n.ty = rangeOfMultirange(ty);
+                    } else if (count == 2) {
+                        const other = context.node(context.node(n.b).next).ty;
+                        const range = if (ty != .unknown) ty else other;
+                        if (!types.isRange(range)) return error.UndefinedFunction;
+                        try bindSignature(context, n, &[_]ast.Type{ range, range }, range, true);
+                    } else return error.UndefinedFunction;
+                },
+                .mr_call => {
+                    const which: ast.MultirangeFn = @enumFromInt(n.integer);
+                    const ty = context.node(n.b).ty;
+                    n.ty = switch (which) {
+                        .lower, .upper => types.rangeSubtype(rangeOfMultirange(ty)).?,
+                        else => .boolean,
+                    };
+                },
+                else => unreachable,
+            }
+            n.constant = listConstant(context, n.b);
+        }
+
+        /// Multirange operators: @> <@ && << >> &< &> -|- with a multirange
+        /// on either side (a range or, for containment, an element on the
+        /// other) and + - * between multiranges of one type.
+        fn multirangeOperator(context: *const Context, n: *ast.Node) Error!bool {
+            var left = context.node(n.a).ty;
+            var right = context.node(n.b).ty;
+            const left_mr = multirange_module.isMultirange(left);
+            const right_mr = multirange_module.isMultirange(right);
+            if (!left_mr and !right_mr) return false;
+            const set = if (left_mr) left else right;
+            const range = rangeOfMultirange(set);
+            const subtype = types.rangeSubtype(range).?;
+            switch (n.op) {
+                .contains, .contained, .overlap, .shift_left, .shift_right, .over_left, .over_right, .adjacent, .add, .sub, .mul => {},
+                else => return false,
+            }
+            if (left == .unknown) {
+                try coerce(context, n.a, set);
+                left = set;
+            }
+            if (right == .unknown) {
+                try coerce(context, n.b, set);
+                right = set;
+            }
+            for ([_]ast.Type{ left, right }, [_]bool{ true, false }) |ty, is_left| {
+                if (ty == set or ty == range) continue;
+                // An element: @> on the right, <@ on the left.
+                const element_side = (n.op == .contains and !is_left) or (n.op == .contained and is_left);
+                if (element_side and (ty == subtype or value.castable(ty, subtype, .implicit))) continue;
+                return error.UndefinedFunction;
+            }
+            if ((n.op == .add or n.op == .sub or n.op == .mul) and (left != set or right != set)) return error.UndefinedFunction;
+            if (left != set and left != range) n.a = try convert(context, n.a, subtype, -1, .implicit);
+            if (right != set and right != range) n.b = try convert(context, n.b, subtype, -1, .implicit);
+            extOperatorCall(context, n, n.a, n.b, if (n.op == .add or n.op == .sub or n.op == .mul) set else .boolean);
+            return true;
         }
 
         fn newGeometry(ty: ast.Type) bool {
@@ -4577,6 +4793,7 @@ pub fn Binder(comptime config: types.Config) type {
                     n.constant = isConstant(context, n.a) and isConstant(context, n.b);
                     if (try extOperator(context, n)) return;
                     if (try geometryOperator(context, n)) return;
+                    if (try multirangeOperator(context, n)) return;
                     switch (n.op) {
                         .eq, .ne, .lt, .le, .gt, .ge, .is_distinct, .is_not_distinct => {
                             try comparable(context, &n.a, &n.b);
@@ -5008,6 +5225,7 @@ pub fn Binder(comptime config: types.Config) type {
                         .array_any => break :blk .{ .name = "?column?", .strength = 0 },
                         .jsonb_minus_op, .jsonb_delete_path_op, .jsonb_exists_any_op, .jsonb_exists_all_op, .jsonb_path_exists_op, .jsonb_path_match_op => break :blk .{ .name = "?column?", .strength = 0 },
                         .ext_op => break :blk .{ .name = "?column?", .strength = 0 },
+                        .xmlelement, .xmlforest, .xmlpi, .xmlroot => break :blk .{ .name = @tagName(n.func), .strength = 2 },
                         .inet_abbrev => break :blk .{ .name = "abbrev", .strength = 2 },
                         .to_macaddr8 => break :blk .{ .name = "macaddr8", .strength = 2 },
                         .to_macaddr => break :blk .{ .name = "macaddr", .strength = 2 },
@@ -7452,6 +7670,7 @@ pub fn Binder(comptime config: types.Config) type {
             try typeExpr(context, scope, call.b);
             const argument = context.node(call.b).ty;
             if (argument == .unknown) return error.AmbiguousFunction;
+            if (multirange_module.isMultirange(argument)) return rangeOfMultirange(argument);
             return types.elementType(argument) orelse error.UndefinedFunction;
         }
 
@@ -7466,7 +7685,7 @@ pub fn Binder(comptime config: types.Config) type {
                 try typeExpr(context, scope, arg);
                 const argument = context.node(arg).ty;
                 if (argument == .unknown) return error.AmbiguousFunction;
-                out[count] = types.elementType(argument) orelse return error.UndefinedFunction;
+                out[count] = if (multirange_module.isMultirange(argument)) rangeOfMultirange(argument) else types.elementType(argument) orelse return error.UndefinedFunction;
                 count += 1;
             }
             return count;

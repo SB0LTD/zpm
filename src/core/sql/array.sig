@@ -281,7 +281,7 @@ pub fn Arrays(comptime V: type) type {
                     else => try putInt(out, i64, value),
                 },
                 .boolean => |value| try put(out, &.{@intFromBool(value)}),
-                .text, .jsonb, .bpchar, .bytea, .range, .xml, .tsvector, .tsquery, .geo => |*text| try putText(out, text.slice()),
+                .text, .jsonb, .bpchar, .bytea, .range, .xml, .tsvector, .tsquery, .geo, .multirange => |*text| try putText(out, text.slice()),
                 .float4 => |value| try putInt(out, u32, @bitCast(value)),
                 .float8 => |value| try putInt(out, u64, @bitCast(value)),
                 .numeric => |*value| {
@@ -352,6 +352,7 @@ pub fn Arrays(comptime V: type) type {
                 .range => .{ .range = takeText(bytes, at) },
                 .xml => .{ .xml = takeText(bytes, at) },
                 .geo => .{ .geo = takeText(bytes, at) },
+                .multirange => .{ .multirange = takeText(bytes, at) },
                 .regtype => .{ .regtype = getInt(u32, bytes, at) },
                 .regproc => .{ .regproc = getInt(u32, bytes, at) },
                 .pg_internal_char => .{ .pg_internal_char = getInt(u8, bytes, at) },

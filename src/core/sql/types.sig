@@ -538,6 +538,10 @@ pub const Error = error{
     /// SQLSTATE 2D000: COMMIT / ROLLBACK inside a procedure where it is
     /// not allowed (a transaction block, or below a function call).
     InvalidTransactionTermination,
+    /// SQLSTATE 2200T: XMLPI target "xml" or content with "?>" (B11 wave 4).
+    InvalidXmlProcessingInstruction,
+    /// SQLSTATE 2200S: XMLCOMMENT text with "--" or a trailing "-".
+    InvalidXmlComment,
 };
 
 /// Caller-owned execution accounting and interrupt polling. This is independent
@@ -602,7 +606,8 @@ pub const DataType = enum(u8) { integer, integer32, boolean, text, smallint, num
     // B11 wave-4 types-ext: the void pseudo-type (function results only).
     void,
     macaddr8,
-    lseg, line, path, polygon, circle, _ };
+    lseg, line, path, polygon, circle,
+    int4multirange, int8multirange, nummultirange, datemultirange, tsmultirange, tstzmultirange, _ };
 
 /// Bound expression type. `unknown` is an untyped string or NULL literal
 /// that has not been resolved by context yet. Unnamed values are array
@@ -610,7 +615,8 @@ pub const DataType = enum(u8) { integer, integer32, boolean, text, smallint, num
 pub const Type = enum(u8) { unknown, int2, int4, int8, numeric, float4, float8, boolean, text, name, oid, date, timestamp, timestamptz, interval, json, jsonb, varchar, bpchar, uuid, bytea, time, timetz, bit, varbit, money, pg_lsn, xid8, int4range, int8range, numrange, daterange, tsrange, tstzrange, inet, cidr, macaddr, point, box, xml, jsonpath, regtype, tsvector, tsquery, mysql_bigint_unsigned, pg_internal_char, aclitem, xid, regproc,
     void,
     macaddr8,
-    lseg, line, path, polygon, circle, _ };
+    lseg, line, path, polygon, circle,
+    int4multirange, int8multirange, nummultirange, datemultirange, tsmultirange, tstzmultirange, _ };
 
 /// Array types set this bit over the element type's ordinal.
 pub const array_bit: u8 = 0x80;
@@ -752,6 +758,12 @@ pub fn dataTypeOf(ty: Type) DataType {
         .path => .path,
         .polygon => .polygon,
         .circle => .circle,
+        .int4multirange => .int4multirange,
+        .int8multirange => .int8multirange,
+        .nummultirange => .nummultirange,
+        .datemultirange => .datemultirange,
+        .tsmultirange => .tsmultirange,
+        .tstzmultirange => .tstzmultirange,
         _ => if (elementType(ty)) |element| arrayData(dataTypeOf(element)).? else .text,
     };
 }
@@ -814,6 +826,12 @@ pub fn typeOfData(data_type: DataType) Type {
         .path => .path,
         .polygon => .polygon,
         .circle => .circle,
+        .int4multirange => .int4multirange,
+        .int8multirange => .int8multirange,
+        .nummultirange => .nummultirange,
+        .datemultirange => .datemultirange,
+        .tsmultirange => .tsmultirange,
+        .tstzmultirange => .tstzmultirange,
         _ => if (elementData(data_type)) |element| arrayType(typeOfData(element)).? else .text,
     };
 }
@@ -932,6 +950,12 @@ fn baseInfo(data_type: DataType) TypeInfo {
         .path => .{ .oid = 602, .name = "path", .len = -1, .category = 'G', .array = 1019, .alignment = 'd' },
         .polygon => .{ .oid = 604, .name = "polygon", .len = -1, .category = 'G', .array = 1027, .alignment = 'd' },
         .circle => .{ .oid = 718, .name = "circle", .len = 24, .category = 'G', .array = 719, .alignment = 'd' },
+        .int4multirange => .{ .oid = 4451, .name = "int4multirange", .len = -1, .category = 'R', .array = 6150 },
+        .int8multirange => .{ .oid = 4536, .name = "int8multirange", .len = -1, .category = 'R', .array = 6157, .alignment = 'd' },
+        .nummultirange => .{ .oid = 4532, .name = "nummultirange", .len = -1, .category = 'R', .array = 6151 },
+        .datemultirange => .{ .oid = 4535, .name = "datemultirange", .len = -1, .category = 'R', .array = 6155 },
+        .tsmultirange => .{ .oid = 4533, .name = "tsmultirange", .len = -1, .category = 'R', .array = 6152, .alignment = 'd' },
+        .tstzmultirange => .{ .oid = 4534, .name = "tstzmultirange", .len = -1, .category = 'R', .array = 6153, .alignment = 'd' },
         _ => .{ .oid = 0, .name = "", .len = -1, .category = 'A', .array = 0 },
     };
 }
@@ -1022,6 +1046,12 @@ fn baseSqlName(data_type: DataType) []const u8 {
         .path => "path",
         .polygon => "polygon",
         .circle => "circle",
+        .int4multirange => "int4multirange",
+        .int8multirange => "int8multirange",
+        .nummultirange => "nummultirange",
+        .datemultirange => "datemultirange",
+        .tsmultirange => "tsmultirange",
+        .tstzmultirange => "tstzmultirange",
         _ => "",
     };
 }
@@ -1078,6 +1108,7 @@ pub fn typeInputName(data_type: DataType) []const u8 {
         .path => "path_in",
         .polygon => "poly_in",
         .circle => "circle_in",
+        .int4multirange, .int8multirange, .nummultirange, .datemultirange, .tsmultirange, .tstzmultirange => "multirange_in",
         _ => "array_in",
     };
 }
@@ -1351,7 +1382,7 @@ pub fn Values(comptime config: Config) type {
         /// compares/hashes without trailing spaces.
         pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar, uuid, bytea, time, timetz, bits, money, pg_lsn, xid8, array, range, inet, macaddr, point, box, xml, regtype, tsvector, tsquery, pg_internal_char, regproc,
             // B11 wave-4 types-ext.
-            macaddr8, geo };
+            macaddr8, geo, multirange };
 
         pub const Cell = union(CellTag) {
             null_value: void,
@@ -1404,6 +1435,8 @@ pub fn Values(comptime config: Config) type {
             macaddr8: network.Mac8,
             /// lseg, line, path, polygon and circle (geometry.sig layout).
             geo: Text,
+            /// Built-in multiranges (multirange.sig layout).
+            multirange: Text,
         };
 
         /// Range values of these cells (range.sig).
@@ -1411,6 +1444,9 @@ pub fn Values(comptime config: Config) type {
 
         /// Array values of these cells (array.sig).
         pub const Arrays = array_module.Arrays(@This());
+
+        /// Multirange values of these cells (multirange.sig).
+        pub const Multiranges = @import("multirange.sig").Multiranges(@This());
 
         pub const Row = struct {
             cells: [config.columns]Cell = @splat(.null_value),
@@ -1473,6 +1509,7 @@ pub fn Values(comptime config: Config) type {
                 .void => .text,
                 .macaddr8 => .macaddr8,
                 .lseg, .line, .path, .polygon, .circle => .geo,
+                .int4multirange, .int8multirange, .nummultirange, .datemultirange, .tsmultirange, .tstzmultirange => .multirange,
                 _ => .array,
             };
         }
@@ -1515,6 +1552,7 @@ pub fn Values(comptime config: Config) type {
                 .macaddr8 => |*value| bytesOrder(value, &right.macaddr8),
                 // No ordering operators (42883); bytes keep internal equality.
                 .geo => |*value| bytesOrder(value.slice(), right.geo.slice()),
+                .multirange => |*value| Multiranges.compare(value.slice(), right.multirange.slice()),
                 .point => |value| geometric.comparePoints(value, right.point),
                 .box => |value| geometric.compareBoxes(value, right.box),
                 .xml => |*value| bytesOrder(value.slice(), right.xml.slice()),
@@ -1607,6 +1645,7 @@ pub fn Values(comptime config: Config) type {
                     mix(&code, tag);
                     for (bytes.slice()) |byte| code = (code ^ byte) *% 1099511628211;
                 },
+                .multirange => |*set| return wordHash(Multiranges.hash(set.slice()), tag),
                 .point => |point| {
                     mix(&code, tag);
                     mix(&code, @bitCast(normalFloat(point.x)));

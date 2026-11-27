@@ -153,7 +153,22 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     // named ?column?; then the network and macaddr8 functions.
     ext_op, inet_abbrev, set_masklen, hostmask, inet_merge, inet_same_family, macaddr8_set7bit, to_macaddr8, to_macaddr, mac_trunc,
     // Geometric functions over the B11 wave-4 types (`integer` a GeoFn).
-    geo_call };
+    geo_call,
+    // Multiranges (B11 wave 4): the int4multirange(...) family (result
+    // type in the node), multirange(anyrange), range_merge, and the range
+    // accessors over a multirange (`integer` a MultirangeFn).
+    multirange_constructor, multirange_of, range_merge, mr_call,
+    // SQL/XML publishing (B11 wave 4, xml_publish.sig): XMLELEMENT (`b` an
+    // xml_name, then xml_attribute nodes, `integer` their count, then the
+    // content), XMLFOREST (xml_attribute nodes), XMLCONCAT, XMLCOMMENT,
+    // XMLPI (xml_name, optional content) and XMLROOT (`integer`: bit 0
+    // a version argument, bits 1-2 standalone 0 absent / 1 yes / 2 no /
+    // 3 no value). xml_name carries an identifier in `name`; an
+    // xml_attribute its name and value (`b`). Neither is a value.
+    xmlelement, xmlforest, xmlconcat, xmlcomment, xmlpi, xmlroot, xml_name, xml_attribute };
+
+/// mr_call variants: the range accessors applied to a multirange's span.
+pub const MultirangeFn = enum(u8) { lower, upper, isempty, lower_inc, upper_inc, lower_inf, upper_inf };
 
 /// geo_call variants (types_ext_eval.sig), chosen by name and arguments.
 pub const GeoFn = enum(u8) { area, center, length, npoints, radius, diameter, isclosed, isopen, pclose, popen, slope, diagonal, bound_box, box, circle, line, lseg, path, polygon, point, ishorizontal, isvertical, isparallel, isperp, pt_contained_circle, pt_contained_poly };
@@ -235,6 +250,7 @@ pub fn immutableBuiltin(func: Func) bool {
         .array_append, .array_prepend, .array_cat, .array_remove => true,
         .array_position, .array_positions, .array_replace, .trim_array, .array_fill, .array_reverse, .array_sort, .string_to_array, .array_width_bucket, .array_set => true,
         .ext_op, .inet_abbrev, .set_masklen, .hostmask, .inet_merge, .inet_same_family, .macaddr8_set7bit, .to_macaddr8, .to_macaddr, .mac_trunc, .geo_call => true,
+        .multirange_constructor, .multirange_of, .range_merge, .mr_call => true,
         .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => true,
         .inet_host, .masklen, .inet_family, .inet_network, .broadcast, .netmask => true,
         .point_constructor, .box_constructor, .area, .center, .width, .height => true,
@@ -266,6 +282,8 @@ pub fn strictFunction(func: Func) bool {
         .array_length, .cardinality, .array_ndims, .array_dims, .array_lower, .array_upper => true,
         .trim_array, .array_reverse, .array_sort, .array_sample, .array_shuffle => true,
         .ext_op, .inet_abbrev, .set_masklen, .hostmask, .inet_merge, .inet_same_family, .macaddr8_set7bit, .to_macaddr8, .to_macaddr, .mac_trunc, .geo_call => true,
+        .multirange_of, .range_merge, .mr_call => true,
+        .xmlcomment, .xmlpi => true,
         .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => true,
         .inet_host, .masklen, .inet_family, .inet_network, .broadcast, .netmask => true,
         .point_constructor, .box_constructor, .area, .center, .width, .height => true,
@@ -310,7 +328,11 @@ pub const Agg = enum { none, count, count_star, sum, avg, min, max, bool_and, bo
     // their ORDER BY / WITHIN GROUP keys) and so run only on the sorted
     // grouping operator; the other operators reject them with 0A000.
     array_agg, string_agg, json_agg, jsonb_agg, json_object_agg, jsonb_object_agg,
-    percentile_cont, percentile_disc, mode, hypothetical_rank, hypothetical_dense_rank, hypothetical_percent_rank, hypothetical_cume_dist };
+    percentile_cont, percentile_disc, mode, hypothetical_rank, hypothetical_dense_rank, hypothetical_percent_rank, hypothetical_cume_dist,
+    // Multirange aggregates (B11 wave 4): collecting, not ordered-set.
+    range_agg, range_intersect_agg,
+    // XMLAGG (B11 wave 4): collecting.
+    xmlagg };
 
 /// Aggregates that need their group's whole input (Exec.collectAggregate).
 pub fn collectingAggregate(agg: Agg) bool {
@@ -319,7 +341,7 @@ pub fn collectingAggregate(agg: Agg) bool {
 
 /// Ordered-set and hypothetical-set aggregates (WITHIN GROUP).
 pub fn orderedSetAggregate(agg: Agg) bool {
-    return @intFromEnum(agg) >= @intFromEnum(Agg.percentile_cont);
+    return @intFromEnum(agg) >= @intFromEnum(Agg.percentile_cont) and @intFromEnum(agg) <= @intFromEnum(Agg.hypothetical_cume_dist);
 }
 
 /// Two-argument (Y, X) aggregates; their argument is an aggregate_pair node.

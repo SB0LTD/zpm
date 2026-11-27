@@ -27,6 +27,7 @@ const range_text = @import("range_text.sig");
 const network = @import("network.sig");
 const geometric = @import("geometric.sig");
 const geometry = @import("geometry.sig");
+const multirange = @import("multirange.sig");
 const xml = @import("xml.sig");
 const jsonpath = @import("jsonpath.sig");
 const text_search = @import("text_search.sig");
@@ -343,6 +344,13 @@ fn extendedCast(from: Type, to: Type, context: Context) ?bool {
         if (stringType(from)) return context == .explicit;
         return false;
     }
+    if (multirange.isMultirange(from) or multirange.isMultirange(to)) {
+        // range -> its multirange explicitly (B11 wave 4); strings by I/O.
+        if (types.isRange(from) and multirange.ofRange(types.dataTypeOf(from)) == types.dataTypeOf(to)) return context == .explicit;
+        if (stringType(to)) return context != .implicit;
+        if (stringType(from)) return context == .explicit;
+        return false;
+    }
     if (types.isRange(from) or types.isRange(to)) {
         // Ranges have no pg_cast entries: strings by I/O conversion only.
         if (stringType(to)) return context != .implicit;
@@ -631,6 +639,7 @@ pub fn Io(comptime config: types.Config) type {
                 .macaddr => |*value| network.formatMac(value, buffer),
                 .macaddr8 => |*value| network.formatMac8(value, buffer),
                 .geo => |*value| geometry.format(value.slice(), session.extra_float_digits, buffer),
+                .multirange => |*value| try MultirangeText.format(value.slice(), session, buffer),
                 .point => |value| geometric.formatPoint(value, session.extra_float_digits, buffer),
                 .box => |value| geometric.formatBox(value, session.extra_float_digits, buffer),
                 .xml => |*value| xml.output(value.slice(), buffer),
@@ -658,6 +667,20 @@ pub fn Io(comptime config: types.Config) type {
 
         /// The lseg/line/path/polygon/circle layout (wire codecs).
         pub const Geometry = geometry;
+
+        /// Multirange text I/O (multirange.sig).
+        pub const MultirangeText = multirange.MultirangeText(config, @This());
+        pub const Multiranges = V.Multiranges;
+
+        /// multirange(range) and the range -> multirange cast.
+        pub fn multirangeOf(range_cell: *const V.Cell) Error!V.Cell {
+            var set: V.Text = .{};
+            var scratch: V.Text = .{};
+            const range = V.Ranges.decode(range_cell.range.slice());
+            V.Multiranges.empty(types.rangeOfData(range.subtype).?, &set);
+            try V.Multiranges.add(&set, &range, &scratch);
+            return .{ .multirange = set };
+        }
 
         fn geometryKind(ty: Type) geometry.Kind {
             return switch (ty) {
@@ -871,6 +894,7 @@ pub fn Io(comptime config: types.Config) type {
                 .inet, .cidr => .{ .inet = try network.parse(input, ty == .cidr) },
                 .macaddr => .{ .macaddr = try network.parseMac(input) },
                 .macaddr8 => .{ .macaddr8 = try network.parseMac8(input) },
+                .int4multirange, .int8multirange, .nummultirange, .datemultirange, .tsmultirange, .tstzmultirange => return MultirangeText.parse(ty, input, session),
                 .lseg, .line, .path, .polygon, .circle => blk: {
                     var text: V.Text = .{};
                     var writer: geometry.Writer = .{ .bytes = &text.bytes };
@@ -1330,6 +1354,12 @@ pub fn Io(comptime config: types.Config) type {
                 .cidr => switch (cell) {
                     .inet => |*value| V.Cell{ .inet = network.network(value) },
                     .text => |*value| try parse(.cidr, -1, value.slice(), session),
+                    else => return error.CannotCoerce,
+                },
+                .int4multirange, .int8multirange, .nummultirange, .datemultirange, .tsmultirange, .tstzmultirange => switch (cell) {
+                    .multirange => cell,
+                    .range => try multirangeOf(&cell),
+                    .text => |*value| try parse(to, -1, value.slice(), session),
                     else => return error.CannotCoerce,
                 },
                 .lseg, .line, .path, .polygon, .circle => switch (cell) {

@@ -8024,7 +8024,7 @@ pub fn Database(comptime config: Config) type {
                         const info = types.typeInfo(data_type);
                         const category: [1]u8 = .{info.category};
                         const type_collation = intCell(collation.typeCollation(types.typeOfData(data_type)));
-                        const kind: u8 = if (types.rangeSubtype(types.typeOfData(data_type)) != null) 'r' else 'b';
+                        const kind: u8 = if (types.rangeSubtype(types.typeOfData(data_type)) != null) 'r' else if (@import("sql/multirange.sig").rangeOf(data_type) != null) 'm' else 'b';
                         try sink.add(&.{ intCell(info.oid), nameCell(info.name), intCell(catalog_module.catalog_namespace), intCell(info.len), .{ .pg_internal_char = kind }, nameCell(&category), intCell(info.array), nameCell(","), nameCell(types.typeInputName(data_type)), intCell(0), intCell(0), intCell(CO.bootstrap_role), intCell(-1), boolCell(false), intCell(0), type_collation, .null_value, boolCell(true), .{ .pg_internal_char = types.typeStorage(data_type) } });
                         if (types.arrayData(data_type)) |array_type| {
                             const array_info = types.typeInfo(array_type);

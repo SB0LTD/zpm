@@ -17,6 +17,7 @@ const tablesample = @import("tablesample.sig");
 const collect_module = @import("aggregates_collect.sig");
 const array_module = @import("array.sig");
 const json_eval = @import("json_eval.sig");
+const types_ext_eval = @import("types_ext_eval.sig");
 const temporal = @import("temporal.sig");
 const builtin = @import("builtin");
 const Error = types.Error;
@@ -511,6 +512,7 @@ pub fn Exec(comptime config: types.Config) type {
                     const slot = try self.cells(1);
                     self.work.cells[slot] = try E.eval(ctx, arg);
                     arg = self.pool.nodes[arg].next;
+                    if (self.work.cells[slot] == .multirange) self.work.cells[slot] = try types_ext_eval.TypesExt(config, E).rangesArray(&self.work.cells[slot]);
                     const value = &self.work.cells[slot];
                     readers[column] = if (value.* == .null_value) .{ .bytes = &.{}, .element = .integer, .at = 0, .total = 0 } else V.Arrays.Reader.init(value.array.slice());
                     longest = @max(longest, readers[column].total);
@@ -1077,6 +1079,7 @@ pub fn Exec(comptime config: types.Config) type {
                     }
                     const slot = try self.cells(1);
                     self.work.cells[slot] = try E.eval(ctx, call.b);
+                    if (self.work.cells[slot] == .multirange) self.work.cells[slot] = try types_ext_eval.TypesExt(config, E).rangesArray(&self.work.cells[slot]);
                     const value = &self.work.cells[slot];
                     if (value.* != .null_value) states[column].reader = V.Arrays.Reader.init(value.array.slice());
                     longest = @max(longest, states[column].reader.total);
@@ -3557,7 +3560,7 @@ pub fn Exec(comptime config: types.Config) type {
                     // Collecting aggregates have no fixed-size transition
                     // state: other operators reject them (B11, 0A000).
                     .array_agg, .string_agg, .json_agg, .jsonb_agg, .json_object_agg, .jsonb_object_agg,
-                    .percentile_cont, .percentile_disc, .mode, .hypothetical_rank, .hypothetical_dense_rank, .hypothetical_percent_rank, .hypothetical_cume_dist => return error.UnsupportedStatement,
+                    .percentile_cont, .percentile_disc, .mode, .hypothetical_rank, .hypothetical_dense_rank, .hypothetical_percent_rank, .hypothetical_cume_dist, .range_agg, .range_intersect_agg, .xmlagg => return error.UnsupportedStatement,
                     .corr, .covar_pop, .covar_samp, .regr_sxx, .regr_syy, .regr_sxy, .regr_avgx, .regr_avgy, .regr_slope, .regr_intercept, .regr_r2 => {
                         if (comptime config.text_bytes < 16) {
                             return error.WorkspaceCapacity;
@@ -3779,6 +3782,8 @@ pub fn Exec(comptime config: types.Config) type {
                 switch (agg.kind) {
                     .array_agg => return C.arrayAgg(sorted, node_ty(self, members[0]), self.session),
                     .string_agg => return C.stringAgg(sorted, agg.ty == .bytea, self.session),
+                    .range_agg, .range_intersect_agg => return types_ext_eval.TypesExt(config, E).rangeAggregate(sorted.cells, sorted.handles, agg.kind == .range_agg, agg.ty, self.session),
+                    .xmlagg => return types_ext_eval.TypesExt(config, E).xmlAggregate(sorted.cells, sorted.handles, self.session),
                     .json_agg, .jsonb_agg => return C.jsonAgg(sorted, node_ty(self, members[0]), agg.kind == .jsonb_agg, self.session),
                     .json_object_agg, .jsonb_object_agg => return C.objectAgg(sorted, node_ty(self, members[0]), node_ty(self, members[1]), agg.kind == .jsonb_object_agg, self.session),
                     .percentile_cont, .percentile_disc => {

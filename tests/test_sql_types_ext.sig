@@ -133,6 +133,8 @@ fn sqlstate(err: anyerror, wanted: []const u8) !void {
         .{ .name = "WrongObjectType", .state = "42809" },
         .{ .name = "InvalidBinaryRepresentation", .state = "22P03" },
         .{ .name = "DatetimeFieldOverflow", .state = "22008" },
+        .{ .name = "InvalidXmlProcessingInstruction", .state = "2200T" },
+        .{ .name = "InvalidXmlComment", .state = "2200S" },
     };
     var state: []const u8 = "?";
     for (table) |entry| {
@@ -804,7 +806,7 @@ fn multiranges() !void {
     try rejects("SELECT '{[3,1)}'::int4multirange", error.DataException);
     try rows("SELECT typname, typlen, typtype, typcategory, typarray, typinput FROM pg_type WHERE oid IN (4451, 4532, 4533, 4534, 4535, 4536) ORDER BY oid",
         "int4multirange|-1|m|R|6150|multirange_in;nummultirange|-1|m|R|6151|multirange_in;tsmultirange|-1|m|R|6152|multirange_in;tstzmultirange|-1|m|R|6153|multirange_in;datemultirange|-1|m|R|6155|multirange_in;int8multirange|-1|m|R|6157|multirange_in");
-    try rows("SELECT pg_typeof('{}'::int4multirange), format_type(4451, -1), 4536::regtype", "int4multirange|int4multirange|int8multirange");
+    try rows("SELECT pg_typeof('{}'::int4multirange), format_type(4451, -1), 4536::regtype::text", "int4multirange|int4multirange|int8multirange");
     // Constructors and conversions.
     try rows("SELECT int4multirange(), int4multirange(int4range(1,3)), int4multirange(int4range(5,6), int4range(1,3), 'empty'), nummultirange(numrange(1,2), numrange(1.5,3)), int4multirange(NULL::int4range)", "{}|{[1,3)}|{[1,3),[5,6)}|{[1,3)}|NULL");
     try rejects("SELECT int4multirange(int4range(1,2), NULL)", error.NullValueNotAllowed);
@@ -869,10 +871,56 @@ fn multiranges() !void {
     try meta(1, 4451, -1);
 }
 
+// ---- XML publishing -----------------------------------------------------------
+
+fn xmlPublishing() !void {
+    db = .{};
+    try rows("SELECT xmlelement(name foo), xmlelement(name foo, 'a<b&c>d'), xmlelement(name foo, xmlattributes('x\"y<z&' as a, 1 as b, NULL as c)), xmlelement(name foo, NULL), xmlelement(name \"Foo Bar\", 'x'), xmlelement(name foo, xmlelement(name bar), 'txt', '<a/>'::xml)",
+        "<foo/>|<foo>a&lt;b&amp;c&gt;d</foo>|<foo a=\"x&quot;y&lt;z&amp;\" b=\"1\"/>|<foo/>|<Foo_x0020_Bar>x</Foo_x0020_Bar>|<foo><bar/>txt<a/></foo>");
+    try meta(0, 142, -1);
+    try named(0, "xmlelement");
+    try rows("SELECT xmlelement(name foo, true, 1.50, 2::int, '2026-01-02'::date, '2026-01-02 03:04:05.5'::timestamp, 'ab'::bytea, ARRAY[1,2])",
+        "<foo>true1.5022026-01-022026-01-02T03:04:05.5YWI=<element>1</element><element>2</element></foo>");
+    try rows("SELECT xmlforest('a' as x, NULL as y, 2 as \"Z z\", '<q/>'::xml as w), xmlforest(NULL as n)", "<x>a</x><Z_x0020_z>2</Z_x0020_z><w><q/></w>|NULL");
+    try named(0, "xmlforest");
+    try exec("CREATE TABLE xt(a INT, b TEXT)");
+    try exec("INSERT INTO xt VALUES(1, 'one'), (2, NULL)");
+    try rows("SELECT xmlforest(a, b) FROM xt ORDER BY a", "<a>1</a><b>one</b>;<a>2</a>");
+    try rows("SELECT xmlelement(name e, xmlattributes(a, b)) FROM xt ORDER BY a", "<e a=\"1\" b=\"one\"/>;<e a=\"2\"/>");
+    try rejects("SELECT xmlelement(name e, xmlattributes(1 + 1))", error.Syntax);
+    try rejects("SELECT xmlelement(name foo, xmlattributes(1 as a, 2 as a))", error.Syntax);
+    try sqlstate(error.Syntax, "42601");
+    try rows("SELECT xmlconcat('<a/>', '<b/>'), xmlconcat(NULL, '<b/>'), xmlconcat(NULL, NULL), pg_typeof(xmlconcat('<a/>'))", "<a/><b/>|<b/>|NULL|xml");
+    try rejects("SELECT xmlconcat(1)", error.TypeMismatch);
+    try rows("SELECT xmlagg(xmlelement(name x, a) ORDER BY a DESC), xmlagg(b::xml) FROM xt", "<x>2</x><x>1</x>|one");
+    try meta(0, 142, -1);
+    try rows("SELECT xmlagg(x) FROM (SELECT NULL::xml x) s", "NULL");
+    try rows("SELECT xmlpi(name php, 'echo \"hi\";'), xmlpi(name foo), xmlpi(name foo, NULL), xmlpi(name foo, '  lead')", "<?php echo \"hi\";?>|<?foo?>|NULL|<?foo lead?>");
+    try rejects("SELECT xmlpi(name xml, 'x')", error.InvalidXmlProcessingInstruction);
+    try rejects("SELECT xmlpi(name foo, 'a?>b')", error.InvalidXmlProcessingInstruction);
+    try sqlstate(error.InvalidXmlProcessingInstruction, "2200T");
+    try rows("SELECT xmlcomment('hello'), xmlcomment(NULL), xmlcomment('')", "<!--hello-->|NULL|<!---->");
+    try rejects("SELECT xmlcomment('a--b')", error.InvalidXmlComment);
+    try rejects("SELECT xmlcomment('a-')", error.InvalidXmlComment);
+    try sqlstate(error.InvalidXmlComment, "2200S");
+    try rows("SELECT xmlroot('<a/>', version '1.0', standalone yes), xmlroot('<a/>', version no value), xmlroot('<?xml version=\"1.1\"?><a/>', version '1.0', standalone no value), xmlroot(NULL, version '1.0'), xmlroot('<a/>', version NULL, standalone no)",
+        "<?xml version=\"1.0\" standalone=\"yes\"?><a/>|<a/>|<a/>|NULL|<?xml version=\"1.0\" standalone=\"no\"?><a/>");
+    try named(0, "xmlroot");
+    // Durability: published values store as ordinary xml (value tag 27).
+    try replay(&.{
+        "CREATE TABLE r(id INT PRIMARY KEY, x XML)",
+        "INSERT INTO r VALUES(1, xmlelement(name a, xmlattributes(1 AS n), xmlcomment('c'))), (2, xmlforest(2 AS b))",
+    }, &.{"r"}, "SELECT * FROM r ORDER BY id");
+    try shown("replica", "1|<a n=\"1\"><!--c--></a>;2|<b>2</b>");
+}
+
 pub fn main(init: std.process.Init) !void {
     try voidType();
     try arrays();
     try networkTypes();
+    try geometry();
+    try multiranges();
+    try xmlPublishing();
     var buffer: [256]u8 = undefined;
     const line = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-types-ext\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, line);

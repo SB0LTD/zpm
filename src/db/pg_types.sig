@@ -89,6 +89,38 @@ pub fn Types(comptime Result: type) type {
             return at;
         }
 
+        /// multirange_recv: int32 count, then per range an int32 length
+        /// and its range_send form; the result is rebuilt canonically.
+        fn receiveMultirange(bytes: []const u8, data_type: DataType) Error!Cell {
+            const range_type: DataType = switch (data_type) {
+                .int4multirange => .int4range,
+                .int8multirange => .int8range,
+                .nummultirange => .numrange,
+                .datemultirange => .daterange,
+                .tsmultirange => .tsrange,
+                else => .tstzrange,
+            };
+            if (bytes.len < 4) return error.ProtocolViolation;
+            const total = getInt(i32, bytes[0..4]);
+            if (total < 0) return error.ProtocolViolation;
+            var set: Io.Text = .{};
+            var scratch: Io.Text = .{};
+            Io.Multiranges.empty(range_type, &set);
+            var at: usize = 4;
+            for (0..@as(usize, @intCast(total))) |_| {
+                if (bytes.len - at < 4) return error.ProtocolViolation;
+                const size = getInt(i32, bytes[at..][0..4]);
+                at += 4;
+                if (size < 0 or bytes.len - at < @as(usize, @intCast(size))) return error.ProtocolViolation;
+                const cell = try decodeRange(bytes[at..][0..@intCast(size)], range_type);
+                at += @intCast(size);
+                const range = Io.Ranges.decode(cell.range.slice());
+                Io.Multiranges.add(&set, &range, &scratch) catch return error.BufferTooSmall;
+            }
+            if (at != bytes.len) return error.ProtocolViolation;
+            return .{ .multirange = set };
+        }
+
         /// lseg_recv / line_recv / circle_recv / path_recv / poly_recv,
         /// validated as their input functions validate (B11 wave 4).
         fn receiveGeometry(bytes: []const u8, data_type: DataType) Error!Cell {
@@ -186,6 +218,19 @@ pub fn Types(comptime Result: type) type {
                 },
                 .macaddr => |*value| try put(out, &at, value),
                 .macaddr8 => |*value| try put(out, &at, value),
+                .multirange => |*value| {
+                    const MR = Io.Multiranges;
+                    try putInt(i32, out, &at, @intCast(MR.count(value.slice())));
+                    var it = MR.iterate(value.slice());
+                    const range_type = MR.rangeType(value.slice());
+                    while (it.nextBytes()) |raw| {
+                        if (out.len - at < 4) return error.BufferTooSmall;
+                        const range_cell: Cell = .{ .range = Io.Text.fromValueBytes(raw) };
+                        const size = try sendBinary(&range_cell, range_type, session, out[at + 4 ..]);
+                        try putInt(i32, out, &at, @intCast(size));
+                        at += size;
+                    }
+                },
                 // lseg/line/circle: their float8 words; path: closed byte,
                 // int32 count, points; polygon: int32 count, points.
                 .geo => |*value| {
@@ -477,6 +522,7 @@ pub fn Types(comptime Result: type) type {
                     return .{ .macaddr = bytes[0..6].* };
                 },
                 .lseg, .line, .circle, .path, .polygon => return receiveGeometry(bytes, data_type),
+                .int4multirange, .int8multirange, .nummultirange, .datemultirange, .tsmultirange, .tstzmultirange => return receiveMultirange(bytes, data_type),
                 // macaddr8_recv also takes the six-byte form.
                 .macaddr8 => {
                     if (bytes.len == 6) return .{ .macaddr8 = .{ bytes[0], bytes[1], bytes[2], 0xff, 0xfe, bytes[3], bytes[4], bytes[5] } };
