@@ -6,14 +6,14 @@
  "totals": {
   "records": 755,
   "in_scope": 453,
-  "closed": 263,
-  "partial": 8,
-  "open": 182,
+  "closed": 326,
+  "partial": 4,
+  "open": 123,
   "not_applicable": 302
  },
  "probes": {
   "total": 434,
-  "passed": 253
+  "passed": 312
  },
  "features": {
   "B011": {
@@ -244,7 +244,7 @@
    "evidence": [
     "B128.routine_language_sql"
    ],
-   "note": "0/1 probes match; first gap: B128.routine_language_sql #1 `CREATE FUNCTION g(x INT) RETURNS INT LANGUAGE SQL RETURN x + 1` head: PostgreSQL 'C:CREATE FUNCTION;Z:I', ZPM 'E:0A000;Z:I'",
+   "note": "0/1 probes match; first gap: B128.routine_language_sql #4 `SELECT routine_name, routine_body FROM information_schema.routines WHERE routine_schema...` head: PostgreSQL 'T:routine_name/19/64/-1,routine_body/1043/-1/-1;C:SELECT 3;Z', ZPM 'E:42P01;Z:I'",
    "area": "bindings"
   },
   "B200": {
@@ -409,7 +409,7 @@
   "E021": {
    "name": "Character data types",
    "applicability": "in_scope",
-   "status": "partial",
+   "status": "closed",
    "evidence": [
     "E021-01.char",
     "E021-02.varchar",
@@ -424,7 +424,7 @@
     "E021-11.position",
     "E021-12.compare"
    ],
-   "note": "11/12 probes match; first gap: E021-08.upper_lower #0 `SELECT UPPER('abcÄé'), LOWER('ABCxyz'), UPPER(NULL)` rows: PostgreSQL 'ABCÄÉ|abcxyz|\\\\N', ZPM 'ABCÄé|abcxyz|\\\\N'",
+   "note": "12/12 probes match native PostgreSQL 18.7.",
    "area": "text"
   },
   "E021-01": {
@@ -500,11 +500,11 @@
   "E021-08": {
    "name": "Character string types: UPPER and LOWER functions",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "E021-08.upper_lower"
    ],
-   "note": "0/1 probes match; first gap: E021-08.upper_lower #0 `SELECT UPPER('abcÄé'), LOWER('ABCxyz'), UPPER(NULL)` rows: PostgreSQL 'ABCÄÉ|abcxyz|\\\\N', ZPM 'ABCÄé|abcxyz|\\\\N'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "text"
   },
   "E021-09": {
@@ -1244,7 +1244,7 @@
    "evidence": [
     "E121-08.close"
    ],
-   "note": "0/1 probes match; first gap: E121-08.close #8 `CLOSE ALL` head: PostgreSQL 'C:CLOSE CURSOR ALL;Z:T', ZPM 'C:CLOSE CURSOR;Z:T'",
+   "note": "0/1 probes match; first gap: E121-08.close #9 `SELECT count(*) FROM pg_cursors` head: PostgreSQL 'T:count/20/8/-1;C:SELECT 1;Z:T', ZPM 'E:42P01;Z:E'",
    "area": "cursors"
   },
   "E121-10": {
@@ -1280,7 +1280,7 @@
   "E141": {
    "name": "Basic integrity constraints",
    "applicability": "in_scope",
-   "status": "partial",
+   "status": "closed",
    "evidence": [
     "E141-01.not_null",
     "E141-02.unique_not_null",
@@ -1291,7 +1291,7 @@
     "E141-08.pk_not_null",
     "E141-10.fk_any_order"
    ],
-   "note": "7/8 probes match; first gap: E141-03.primary_key #8 `CREATE TABLE v(a INT PRIMARY KEY, b INT PRIMARY KEY)` head: PostgreSQL 'E:42P16;Z:I', ZPM 'E:42601;Z:I'",
+   "note": "8/8 probes match native PostgreSQL 18.7.",
    "area": "constraints_dml"
   },
   "E141-01": {
@@ -1317,11 +1317,11 @@
   "E141-03": {
    "name": "Basic integrity constraints: PRIMARY KEY constraints",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "E141-03.primary_key"
    ],
-   "note": "0/1 probes match; first gap: E141-03.primary_key #8 `CREATE TABLE v(a INT PRIMARY KEY, b INT PRIMARY KEY)` head: PostgreSQL 'E:42P16;Z:I', ZPM 'E:42601;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "constraints_dml"
   },
   "E141-04": {
@@ -1377,22 +1377,22 @@
   "E151": {
    "name": "Transaction support",
    "applicability": "in_scope",
-   "status": "partial",
+   "status": "closed",
    "evidence": [
     "E151-01.commit",
     "E151-02.rollback"
    ],
-   "note": "1/2 probes match; first gap: E151-01.commit #6 `START TRANSACTION` head: PostgreSQL 'C:START TRANSACTION;Z:T', ZPM 'C:BEGIN;Z:T'",
+   "note": "2/2 probes match native PostgreSQL 18.7.",
    "area": "transactions"
   },
   "E151-01": {
    "name": "Transaction support: COMMIT statement",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "E151-01.commit"
    ],
-   "note": "0/1 probes match; first gap: E151-01.commit #6 `START TRANSACTION` head: PostgreSQL 'C:START TRANSACTION;Z:T', ZPM 'C:BEGIN;Z:T'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "transactions"
   },
   "E151-02": {
@@ -1459,11 +1459,11 @@
   "E171": {
    "name": "SQLSTATE support",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "E171.sqlstate"
    ],
-   "note": "0/1 probes match; first gap: E171.sqlstate #6 `SELEC 1` head: PostgreSQL 'E:42601;Z:I', ZPM 'E:0A000;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "transactions"
   },
   "E182": {
@@ -1554,7 +1554,7 @@
   "F031": {
    "name": "Basic schema manipulation",
    "applicability": "in_scope",
-   "status": "partial",
+   "status": "closed",
    "evidence": [
     "F031-01.create_table",
     "F031-02.create_view",
@@ -1564,7 +1564,7 @@
     "F031-16.drop_view_restrict",
     "F031-19.revoke_restrict"
    ],
-   "note": "5/7 probes match; first gap: F031-13.drop_table_restrict #3 `DROP VIEW v` head: PostgreSQL 'C:DROP VIEW;Z:I', ZPM 'C:DROP TABLE;Z:I'",
+   "note": "7/7 probes match native PostgreSQL 18.7.",
    "area": "ddl"
   },
   "F031-01": {
@@ -1610,21 +1610,21 @@
   "F031-13": {
    "name": "Basic schema manipulation: DROP TABLE statement: RESTRICT clause",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "F031-13.drop_table_restrict"
    ],
-   "note": "0/1 probes match; first gap: F031-13.drop_table_restrict #3 `DROP VIEW v` head: PostgreSQL 'C:DROP VIEW;Z:I', ZPM 'C:DROP TABLE;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "ddl"
   },
   "F031-16": {
    "name": "Basic schema manipulation: DROP VIEW statement: RESTRICT clause",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "F031-16.drop_view_restrict"
    ],
-   "note": "0/1 probes match; first gap: F031-16.drop_view_restrict #4 `DROP VIEW w RESTRICT` head: PostgreSQL 'C:DROP VIEW;Z:I', ZPM 'C:DROP TABLE;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "ddl"
   },
   "F031-19": {
@@ -1940,11 +1940,11 @@
   "F112": {
    "name": "Isolation level READ UNCOMMITTED",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "F112.read_uncommitted"
    ],
-   "note": "0/1 probes match; first gap: F112.read_uncommitted #0 `START TRANSACTION ISOLATION LEVEL READ UNCOMMITTED` head: PostgreSQL 'C:START TRANSACTION;Z:T', ZPM 'C:BEGIN;Z:T'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "transactions"
   },
   "F113": {
@@ -2069,11 +2069,11 @@
   "F171": {
    "name": "Multiple schemas per user",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "F171.schemas"
    ],
-   "note": "0/1 probes match; first gap: F171.schemas #1 `CREATE SCHEMA s2 AUTHORIZATION CURRENT_USER` head: PostgreSQL 'C:CREATE SCHEMA;Z:I', ZPM 'E:0A000;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "ddl"
   },
   "F181": {
@@ -2097,11 +2097,11 @@
   "F200": {
    "name": "TRUNCATE TABLE statement",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "F200.truncate"
    ],
-   "note": "0/1 probes match; first gap: F200.truncate #12 `TRUNCATE p CASCADE` head: PostgreSQL 'C:TRUNCATE TABLE;Z:I', ZPM 'E:0A000;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "constraints_dml"
   },
   "F201": {
@@ -2475,31 +2475,31 @@
   "F384": {
    "name": "Drop identity property clause",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "F384.drop_identity"
    ],
-   "note": "0/1 probes match; first gap: F384.drop_identity #2 `ALTER TABLE t ALTER COLUMN id DROP IDENTITY` head: PostgreSQL 'C:ALTER TABLE;Z:I', ZPM 'E:0A000;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "ddl"
   },
   "F385": {
    "name": "Drop column generation expression clause",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "F385.drop_expression"
    ],
-   "note": "0/1 probes match; first gap: F385.drop_expression #2 `ALTER TABLE t ALTER COLUMN b DROP EXPRESSION` head: PostgreSQL 'C:ALTER TABLE;Z:I', ZPM 'E:0A000;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "ddl"
   },
   "F386": {
    "name": "Set identity column generation clause",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "F386.set_generation"
    ],
-   "note": "0/1 probes match; first gap: F386.set_generation #2 `ALTER TABLE t ALTER COLUMN id SET GENERATED BY DEFAULT` head: PostgreSQL 'C:ALTER TABLE;Z:I', ZPM 'E:0A000;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "ddl"
   },
   "F387": {
@@ -2796,11 +2796,11 @@
   "F492": {
    "name": "Optional table constraint enforcement",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "F492.not_enforced"
    ],
-   "note": "0/1 probes match; first gap: F492.not_enforced #0 `CREATE TABLE t(a INT, CONSTRAINT a_pos CHECK (a > 0) NOT ENFORCED)` head: PostgreSQL 'C:CREATE TABLE;Z:I', ZPM 'E:42601;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "constraints_dml"
   },
   "F501": {
@@ -3007,11 +3007,11 @@
   "F701": {
    "name": "Referential update actions",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "F701.update_actions"
    ],
-   "note": "0/1 probes match; first gap: F701.update_actions #14 `UPDATE p SET id = 20 WHERE id = 2` head: PostgreSQL 'E:23001;Z:I', ZPM 'E:23503;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "constraints_dml"
   },
   "F711": {
@@ -3065,7 +3065,7 @@
    "evidence": [
     "F761.session_management"
    ],
-   "note": "0/1 probes match; first gap: F761.session_management #6 `SET SCHEMA 's'` head: PostgreSQL 'C:SET;Z:I', ZPM 'E:42601;Z:I'",
+   "note": "0/1 probes match; first gap: F761.session_management #10 `SET TIME ZONE INTERVAL '+02:00' HOUR TO MINUTE` head: PostgreSQL 'C:SET;Z:I', ZPM 'E:42601;Z:I'",
    "area": "transactions"
   },
   "F762": {
@@ -3499,7 +3499,7 @@
    "evidence": [
     "S071.sql_paths"
    ],
-   "note": "0/1 probes match; first gap: S071.sql_paths #2 `CREATE FUNCTION s1.f() RETURNS TEXT LANGUAGE SQL AS $$SELECT 's1'$$` head: PostgreSQL 'C:CREATE FUNCTION;Z:I', ZPM 'E:0A000;Z:I'",
+   "note": "0/1 probes match; first gap: S071.sql_paths #7 `SELECT CAST(1 AS d), pg_typeof(CAST(1 AS d))` head: PostgreSQL 'T:d/23/4/-1,pg_typeof/2206/4/-1;C:SELECT 1;Z:I', ZPM 'E:0A000;Z:I'",
    "area": "routines"
   },
   "S081": {
@@ -3590,21 +3590,21 @@
   "S099": {
    "name": "Array expressions",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "S099.array_expressions"
    ],
-   "note": "0/1 probes match; first gap: S099.array_expressions #1 `SELECT (ARRAY[1, 2, 3, 4])[2:3], (ARRAY['a', 'b', 'c'])[:2], array_position(ARRAY['a', ...` head: PostgreSQL 'T:array/1007/-1/-1,array/1009/-1/-1,array_position/23/4/-1,a', ZPM 'E:42883;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "arrays"
   },
   "S111": {
    "name": "ONLY in query expressions",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "S111.only"
    ],
-   "note": "0/1 probes match; first gap: S111.only #6 `SELECT a FROM ONLY (parent)` head: PostgreSQL 'T:a/23/4/-1;C:SELECT 1;Z:I', ZPM 'E:42601;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "query"
   },
   "S151": {
@@ -3631,11 +3631,11 @@
   "S201": {
    "name": "SQL-invoked routines on arrays",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "S201.routines_on_arrays"
    ],
-   "note": "0/1 probes match; first gap: S201.routines_on_arrays #2 `SELECT total(ARRAY[1, 2, 3]), firsts(ARRAY['p', 'q']), total('{}')` head: PostgreSQL 'T:total/23/4/-1,firsts/25/-1/-1,total/23/4/-1;C:SELECT 1;Z:I', ZPM 'E:0A000;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "arrays"
   },
   "S202": {
@@ -3648,11 +3648,11 @@
   "S203": {
    "name": "Array parameters",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "S203.array_parameters"
    ],
-   "note": "0/1 probes match; first gap: S203.array_parameters #1 `CREATE PROCEDURE p(xs INT[], INOUT n INT) LANGUAGE plpgsql AS $$BEGIN n := cardinality(...` head: PostgreSQL 'C:CREATE PROCEDURE;Z:I', ZPM 'E:0A000;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "arrays"
   },
   "S204": {
@@ -3769,11 +3769,11 @@
   "S301": {
    "name": "Enhanced UNNEST",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "S301.enhanced_unnest"
    ],
-   "note": "0/1 probes match; first gap: S301.enhanced_unnest #0 `SELECT * FROM unnest(ARRAY[1, 2], ARRAY['a', 'b', 'c']) AS u(n, s)` head: PostgreSQL 'T:n/23/4/-1,s/25/-1/-1;C:SELECT 3;Z:I', ZPM 'E:42883;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "arrays"
   },
   "S401": {
@@ -3800,11 +3800,11 @@
   "S404": {
    "name": "TRIM_ARRAY",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "S404.trim_array"
    ],
-   "note": "0/1 probes match; first gap: S404.trim_array #0 `SELECT trim_array(ARRAY[1, 2, 3, 4], 2), trim_array(ARRAY['a', 'b'], 0), trim_array(ARR...` head: PostgreSQL 'T:trim_array/1007/-1/-1,trim_array/1009/-1/-1,trim_array/100', ZPM 'E:42883;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "arrays"
   },
   "T011": {
@@ -4185,11 +4185,11 @@
   "T178": {
    "name": "Identity columns: simple restart option",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "T178.identity_restart"
    ],
-   "note": "0/1 probes match; first gap: T178.identity_restart #2 `ALTER TABLE t ALTER COLUMN id RESTART` head: PostgreSQL 'C:ALTER TABLE;Z:I', ZPM 'E:0A000;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "ddl"
   },
   "T180": {
@@ -4213,7 +4213,7 @@
    "evidence": [
     "T191.restrict"
    ],
-   "note": "0/1 probes match; first gap: T191.restrict #4 `DELETE FROM p WHERE id = 1` head: PostgreSQL 'E:23001;Z:I', ZPM 'E:23503;Z:I'",
+   "note": "0/1 probes match; first gap: T191.restrict #8 `SELECT delete_rule, update_rule FROM information_schema.referential_constraints` head: PostgreSQL 'T:delete_rule/1043/-1/-1,update_rule/1043/-1/-1;C:SELECT 1;Z', ZPM 'E:42P01;Z:I'",
    "area": "constraints_dml"
   },
   "T200": {
@@ -4226,11 +4226,11 @@
   "T201": {
    "name": "Comparable data types for referential constraints",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "T201.comparable_fk_types"
    ],
-   "note": "0/1 probes match; first gap: T201.comparable_fk_types #1 `CREATE TABLE c(pid INT REFERENCES p, pcode TEXT REFERENCES p(code))` head: PostgreSQL 'C:CREATE TABLE;Z:I', ZPM 'E:42804;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "constraints_dml"
   },
   "T211": {
@@ -4253,11 +4253,11 @@
   "T213": {
    "name": "INSTEAD OF triggers",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "T213.instead_of"
    ],
-   "note": "0/1 probes match; first gap: T213.instead_of #3 `CREATE TRIGGER tr INSTEAD OF INSERT ON v FOR EACH ROW EXECUTE FUNCTION v_ins()` head: PostgreSQL 'C:CREATE TRIGGER;Z:I', ZPM 'E:0A000;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "triggers"
   },
   "T214": {
@@ -4273,21 +4273,21 @@
   "T215": {
    "name": "AFTER triggers",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "T215.after"
    ],
-   "note": "0/1 probes match; first gap: T215.after #4 `INSERT INTO t VALUES (1)` head: PostgreSQL 'C:INSERT 0 1;Z:I', ZPM 'E:0A000;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "triggers"
   },
   "T216": {
    "name": "Ability to require true search condition before trigger is invoked",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "T216.when"
    ],
-   "note": "0/1 probes match; first gap: T216.when #5 `INSERT INTO t VALUES (5), (15)` head: PostgreSQL 'C:INSERT 0 2;Z:I', ZPM 'E:0A000;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "triggers"
   },
   "T217": {
@@ -4317,11 +4317,11 @@
   "T241": {
    "name": "START TRANSACTION statement",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "T241.start_transaction"
    ],
-   "note": "0/1 probes match; first gap: T241.start_transaction #1 `START TRANSACTION` head: PostgreSQL 'C:START TRANSACTION;Z:T', ZPM 'C:BEGIN;Z:T'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "transactions"
   },
   "T251": {
@@ -4450,21 +4450,21 @@
   "T321-04": {
    "name": "Basic SQL-invoked routines: CALL statement",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "T321-04.call"
    ],
-   "note": "0/1 probes match; first gap: T321-04.call #1 `CREATE PROCEDURE p(x INT, INOUT y INT) LANGUAGE plpgsql AS $$BEGIN INSERT INTO t VALUES...` head: PostgreSQL 'C:CREATE PROCEDURE;Z:I', ZPM 'E:0A000;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "routines"
   },
   "T321-05": {
    "name": "Basic SQL-invoked routines: RETURN statement",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "T321-05.return"
    ],
-   "note": "0/1 probes match; first gap: T321-05.return #1 `CREATE FUNCTION r(x INT) RETURNS INT LANGUAGE SQL RETURN x * 3` head: PostgreSQL 'C:CREATE FUNCTION;Z:I', ZPM 'E:0A000;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "routines"
   },
   "T321-06": {
@@ -4484,7 +4484,7 @@
    "evidence": [
     "T321-07.parameters_view"
    ],
-   "note": "0/1 probes match; first gap: T321-07.parameters_view #0 `CREATE FUNCTION f1(a INT, INOUT b TEXT, OUT c DATE) LANGUAGE SQL AS $$SELECT b, CURRENT...` head: PostgreSQL 'C:CREATE FUNCTION;Z:I', ZPM 'E:0A000;Z:I'",
+   "note": "0/1 probes match; first gap: T321-07.parameters_view #1 `SELECT ordinal_position, parameter_mode, parameter_name, data_type FROM information_sch...` head: PostgreSQL 'T:ordinal_position/23/4/-1,parameter_mode/1043/-1/-1,paramet', ZPM 'E:42P01;Z:I'",
    "area": "catalog"
   },
   "T322": {
@@ -4501,7 +4501,7 @@
    "evidence": [
     "T323.external_security"
    ],
-   "note": "0/1 probes match; first gap: T323.external_security #3 `CREATE FUNCTION peek() RETURNS INT LANGUAGE plpgsql SECURITY DEFINER AS $$BEGIN RETURN ...` head: PostgreSQL 'C:CREATE FUNCTION;Z:I', ZPM 'E:0A000;Z:I'",
+   "note": "0/1 probes match; first gap: T323.external_security #9 `SELECT routine_name, security_type FROM information_schema.routines WHERE routine_name ...` head: PostgreSQL 'T:routine_name/19/64/-1,security_type/1043/-1/-1;C:SELECT 2;', ZPM 'E:42P01;Z:I'",
    "area": "routines"
   },
   "T324": {
@@ -4514,11 +4514,11 @@
   "T325": {
    "name": "Qualified SQL parameter references",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "T325.qualified_params"
    ],
-   "note": "0/1 probes match; first gap: T325.qualified_params #4 `SELECT f(2), g(5)` head: PostgreSQL 'T:f/20/8/-1,g/23/4/-1;C:SELECT 1;Z:I', ZPM 'E:0A000;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "routines"
   },
   "T326": {
@@ -4686,11 +4686,11 @@
   "T521": {
    "name": "Named arguments in CALL statement",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "T521.named_call_args"
    ],
-   "note": "0/1 probes match; first gap: T521.named_call_args #2 `CALL ins(y => 'b', x => 1)` head: PostgreSQL 'C:CALL;Z:I', ZPM 'E:42601;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "routines"
   },
   "T522": {
@@ -4703,31 +4703,31 @@
   "T523": {
    "name": "Default values for INOUT parameters of SQL-invoked procedures",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "T523.inout_defaults"
    ],
-   "note": "0/1 probes match; first gap: T523.inout_defaults #0 `CREATE PROCEDURE p(INOUT a INT DEFAULT 5, INOUT b INT DEFAULT 6) LANGUAGE plpgsql AS $$...` head: PostgreSQL 'C:CREATE PROCEDURE;Z:I', ZPM 'E:0A000;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "routines"
   },
   "T524": {
    "name": "Named arguments in routine invocations other than a CALL statement",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "T524.named_function_args"
    ],
-   "note": "0/1 probes match; first gap: T524.named_function_args #1 `SELECT f(b => 'x', a => 1), f(2, b => 'y'), f(a := 3, b := 'z')` head: PostgreSQL 'T:f/25/-1/-1,f/25/-1/-1,f/25/-1/-1;C:SELECT 1;Z:I', ZPM 'E:42601;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "routines"
   },
   "T525": {
    "name": "Default values for parameters of SQL-invoked functions",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "T525.function_defaults"
    ],
-   "note": "0/1 probes match; first gap: T525.function_defaults #0 `CREATE FUNCTION f(a INT, b INT DEFAULT 10, c TEXT DEFAULT 'd') RETURNS TEXT LANGUAGE SQ...` head: PostgreSQL 'C:CREATE FUNCTION;Z:I', ZPM 'E:0A000;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "routines"
   },
   "T551": {
@@ -4764,11 +4764,11 @@
   "T581": {
    "name": "Regular expression substring function",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "T581.regex_substring"
    ],
-   "note": "0/1 probes match; first gap: T581.regex_substring #0 `SELECT SUBSTRING('foobar' SIMILAR '%#\"o_b#\"%' ESCAPE '#'), SUBSTRING('foobar' FROM '%#\"...` head: PostgreSQL 'T:substring/25/-1/-1,substring/25/-1/-1,substring/25/-1/-1,s', ZPM 'E:42601;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "text"
   },
   "T591": {
@@ -5064,71 +5064,71 @@
   "T811": {
    "name": "Basic SQL/JSON constructor functions",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "T811.json_constructors"
    ],
-   "note": "0/1 probes match; first gap: T811.json_constructors #0 `SELECT JSON_OBJECT('a' VALUE 1, 'b' VALUE 'x'), JSON_ARRAY(1, 'two', NULL), JSON_ARRAY(...` head: PostgreSQL 'T:json_object/114/-1/-1,json_array/114/-1/-1,json_array/114/', ZPM 'E:42601;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "json"
   },
   "T812": {
    "name": "SQL/JSON: JSON_OBJECTAGG",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "T812.json_objectagg"
    ],
-   "note": "0/1 probes match; first gap: T812.json_objectagg #2 `SELECT JSON_OBJECTAGG(k VALUE v), JSON_OBJECTAGG(k VALUE v ABSENT ON NULL), JSON_OBJECT...` head: PostgreSQL 'T:json_objectagg/114/-1/-1,json_objectagg/114/-1/-1,json_obj', ZPM 'E:42601;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "json"
   },
   "T813": {
    "name": "SQL/JSON: JSON_ARRAYAGG with ORDER BY",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "T813.json_arrayagg_order"
    ],
-   "note": "0/1 probes match; first gap: T813.json_arrayagg_order #2 `SELECT JSON_ARRAYAGG(v ORDER BY v), JSON_ARRAYAGG(v ORDER BY v DESC NULL ON NULL), JSON...` head: PostgreSQL 'T:json_arrayagg/114/-1/-1,json_arrayagg/114/-1/-1,json_array', ZPM 'E:42601;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "json"
   },
   "T814": {
    "name": "Colon in JSON_OBJECT or JSON_OBJECTAGG",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "T814.json_colon"
    ],
-   "note": "0/1 probes match; first gap: T814.json_colon #2 `SELECT JSON_OBJECT('a' : 1, 'b' : 'c'), JSON_OBJECTAGG(k : v) FROM t` head: PostgreSQL 'T:json_object/114/-1/-1,json_objectagg/114/-1/-1;C:SELECT 1;', ZPM 'E:42601;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "json"
   },
   "T821": {
    "name": "Basic SQL/JSON query operators",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "T821.json_query_operators"
    ],
-   "note": "0/1 probes match; first gap: T821.json_query_operators #0 `SELECT JSON_EXISTS(jsonb '{\"a\": [1, 2]}', '$.a[1]'), JSON_EXISTS(jsonb '{\"a\": 1}', '$.b...` head: PostgreSQL 'T:json_exists/16/1/-1,json_exists/16/1/-1,json_value/25/-1/-', ZPM 'E:42601;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "json"
   },
   "T822": {
    "name": "SQL/JSON: IS JSON WITH UNIQUE KEYS predicate",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "T822.is_json_unique"
    ],
-   "note": "0/1 probes match; first gap: T822.is_json_unique #0 `SELECT '{\"a\":1,\"a\":2}' IS JSON, '{\"a\":1,\"a\":2}' IS JSON WITH UNIQUE KEYS, '{\"a\":1,\"b\":2...` head: PostgreSQL 'T:?column?/16/1/-1,?column?/16/1/-1,?column?/16/1/-1,?column', ZPM 'E:42601;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "json"
   },
   "T823": {
    "name": "SQL/JSON: PASSING clause",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "T823.passing"
    ],
-   "note": "0/1 probes match; first gap: T823.passing #0 `SELECT JSON_EXISTS(jsonb '{\"a\": 5}', '$.a ? (@ > $min)' PASSING 3 AS min), JSON_VALUE(j...` head: PostgreSQL 'T:json_exists/16/1/-1,json_value/25/-1/-1,json_query/3802/-1', ZPM 'E:42601;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "json"
   },
   "T824": {
@@ -5141,21 +5141,21 @@
   "T825": {
    "name": "SQL/JSON: ON EMPTY and ON ERROR clauses",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "T825.on_empty_on_error"
    ],
-   "note": "0/1 probes match; first gap: T825.on_empty_on_error #0 `SELECT JSON_VALUE(jsonb '{\"a\": 1}', '$.b' NULL ON EMPTY), JSON_VALUE(jsonb '{\"a\": \"x\"}'...` head: PostgreSQL 'T:json_value/25/-1/-1,json_value/23/4/-1,json_query/3802/-1/', ZPM 'E:42601;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "json"
   },
   "T826": {
    "name": "General value expression in ON ERROR or ON EMPTY clauses",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "T826.on_error_expressions"
    ],
-   "note": "0/1 probes match; first gap: T826.on_error_expressions #0 `SELECT JSON_VALUE(jsonb '{}', '$.a' DEFAULT 'none' ON EMPTY), JSON_VALUE(jsonb '{\"a\": \"...` head: PostgreSQL 'T:json_value/25/-1/-1,json_value/23/4/-1,json_value/23/4/-1;', ZPM 'E:42601;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "json"
   },
   "T827": {
@@ -5171,51 +5171,51 @@
   "T828": {
    "name": "JSON_QUERY",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "T828.json_query"
    ],
-   "note": "0/1 probes match; first gap: T828.json_query #0 `SELECT JSON_QUERY(jsonb '{\"a\": {\"b\": [1, 2]}}', '$.a'), JSON_QUERY(jsonb '[1, 2]', '$[0...` head: PostgreSQL 'T:json_query/3802/-1/-1,json_query/3802/-1/-1,json_query/380', ZPM 'E:42601;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "json"
   },
   "T829": {
    "name": "JSON_QUERY: array wrapper options",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "T829.array_wrapper"
    ],
-   "note": "0/1 probes match; first gap: T829.array_wrapper #0 `SELECT JSON_QUERY(jsonb '[1, 2, 3]', '$[*]' WITH WRAPPER), JSON_QUERY(jsonb '[1]', '$[0...` head: PostgreSQL 'T:json_query/3802/-1/-1,json_query/3802/-1/-1,json_query/380', ZPM 'E:42601;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "json"
   },
   "T830": {
    "name": "Enforcing unique keys in SQL/JSON constructor functions",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "T830.constructor_unique_keys"
    ],
-   "note": "0/1 probes match; first gap: T830.constructor_unique_keys #0 `SELECT JSON_OBJECT('a' VALUE 1, 'a' VALUE 2)` head: PostgreSQL 'T:json_object/114/-1/-1;C:SELECT 1;Z:I', ZPM 'E:42601;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "json"
   },
   "T831": {
    "name": "SQL/JSON path language: strict mode",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "T831.strict_mode"
    ],
-   "note": "0/1 probes match; first gap: T831.strict_mode #2 `SELECT jsonb_path_query_array('{\"a\": 1}', 'strict $.b', '{}', true), jsonb_path_exists(...` rows: PostgreSQL '[]|t', ZPM '\\\\N|t'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "json"
   },
   "T832": {
    "name": "SQL/JSON path language: item method",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "T832.item_methods"
    ],
-   "note": "0/1 probes match; first gap: T832.item_methods #0 `SELECT jsonb_path_query_first('[1, 2, 3]', '$.size()'), jsonb_path_query_first('\"x\"', '...` head: PostgreSQL 'T:jsonb_path_query_first/3802/-1/-1,jsonb_path_query_first/3', ZPM 'E:0A000;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "json"
   },
   "T833": {
@@ -5261,11 +5261,11 @@
   "T837": {
    "name": "SQL/JSON path language: regex_like predicate",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "T837.like_regex"
    ],
-   "note": "0/1 probes match; first gap: T837.like_regex #0 `SELECT jsonb_path_query_array('[\"abc\", \"ABD\", \"xyz\"]', '$[*] ? (@ like_regex \"^ab\")'), ...` head: PostgreSQL 'T:jsonb_path_query_array/3802/-1/-1,jsonb_path_query_array/3', ZPM 'E:0A000;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "json"
   },
   "T838": {
@@ -5295,11 +5295,11 @@
   "T851": {
    "name": "SQL/JSON: optional keywords for default syntax",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "T851.json_optional_keywords"
    ],
-   "note": "0/1 probes match; first gap: T851.json_optional_keywords #0 `SELECT JSON_OBJECT('a' VALUE 1 NULL ON NULL), JSON_OBJECT('a' VALUE 2 ABSENT ON NULL), ...` head: PostgreSQL 'T:json_object/114/-1/-1,json_object/114/-1/-1,json_array/114', ZPM 'E:42601;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "json"
   },
   "T860": {
@@ -5750,11 +5750,11 @@
   "X020": {
    "name": "XMLConcat",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "X020.xmlconcat"
    ],
-   "note": "0/1 probes match; first gap: X020.xmlconcat #0 `SELECT XMLCONCAT('<a/>', '<b>x</b>'), XMLCONCAT(NULL, '<c/>'), XMLCONCAT(NULL, NULL)` head: PostgreSQL 'T:xmlconcat/142/-1/-1,xmlconcat/142/-1/-1,xmlconcat/142/-1/-', ZPM 'E:42883;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "xml"
   },
   "X025": {
@@ -5774,21 +5774,21 @@
   "X031": {
    "name": "XMLElement",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "X031.xmlelement"
    ],
-   "note": "0/1 probes match; first gap: X031.xmlelement #0 `SELECT XMLELEMENT(NAME foo), XMLELEMENT(NAME foo, XMLATTRIBUTES(1 AS bar, 'x' AS \"Baz\")...` head: PostgreSQL 'T:xmlelement/142/-1/-1,xmlelement/142/-1/-1,xmlelement/142/-', ZPM 'E:42601;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "xml"
   },
   "X032": {
    "name": "XMLForest",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "X032.xmlforest"
    ],
-   "note": "0/1 probes match; first gap: X032.xmlforest #0 `SELECT XMLFOREST(1 AS a, 'x' AS b, NULL AS c)` head: PostgreSQL 'T:xmlforest/142/-1/-1;C:SELECT 1;Z:I', ZPM 'E:42601;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "xml"
   },
   "X034": {
@@ -5798,47 +5798,47 @@
    "evidence": [
     "X034.xmlagg"
    ],
-   "note": "0/1 probes match; first gap: X034.xmlagg #2 `SELECT XMLAGG(XMLELEMENT(NAME v, v) ORDER BY v) FROM t` head: PostgreSQL 'T:xmlagg/142/-1/-1;C:SELECT 1;Z:I', ZPM 'E:42601;Z:I'",
+   "note": "0/1 probes match; first gap: X034.xmlagg #3 `SELECT XMLAGG(XMLELEMENT(NAME v, v)) FROM t WHERE false` head: PostgreSQL 'T:xmlagg/142/-1/-1;C:SELECT 1;Z:I', ZPM 'E:42803;Z:I'",
    "area": "xml"
   },
   "X035": {
    "name": "XMLAgg: ORDER BY option",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "X035.xmlagg_order"
    ],
-   "note": "0/1 probes match; first gap: X035.xmlagg_order #2 `SELECT XMLAGG(XMLELEMENT(NAME n, v) ORDER BY v DESC) FROM t` head: PostgreSQL 'T:xmlagg/142/-1/-1;C:SELECT 1;Z:I', ZPM 'E:42601;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "xml"
   },
   "X036": {
    "name": "XMLComment",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "X036.xmlcomment"
    ],
-   "note": "0/1 probes match; first gap: X036.xmlcomment #0 `SELECT XMLCOMMENT('hello'), XMLCOMMENT(NULL)` head: PostgreSQL 'T:xmlcomment/142/-1/-1,xmlcomment/142/-1/-1;C:SELECT 1;Z:I', ZPM 'E:42883;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "xml"
   },
   "X037": {
    "name": "XMLPI",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "X037.xmlpi"
    ],
-   "note": "0/1 probes match; first gap: X037.xmlpi #0 `SELECT XMLPI(NAME php, 'echo 1;'), XMLPI(NAME foo)` head: PostgreSQL 'T:xmlpi/142/-1/-1,xmlpi/142/-1/-1;C:SELECT 1;Z:I', ZPM 'E:42601;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "xml"
   },
   "X038": {
    "name": "XMLText",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "X038.xmltext"
    ],
-   "note": "0/1 probes match; first gap: X038.xmltext #0 `SELECT XMLTEXT('a < b & c'), XMLTEXT(NULL)` head: PostgreSQL 'T:xmltext/142/-1/-1,xmltext/142/-1/-1;C:SELECT 1;Z:I', ZPM 'E:42883;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "xml"
   },
   "X040": {
@@ -6115,11 +6115,11 @@
   "X072": {
    "name": "XMLSerialize: character string serialization",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "X072.xmlserialize"
    ],
-   "note": "0/1 probes match; first gap: X072.xmlserialize #0 `SELECT XMLSERIALIZE(CONTENT XMLELEMENT(NAME e, 1) AS CHARACTER VARYING(30))` head: PostgreSQL 'T:xmlserialize/1043/-1/34;C:SELECT 1;Z:I', ZPM 'E:42601;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "xml"
   },
   "X073": {
@@ -6289,11 +6289,11 @@
   "X120": {
    "name": "XML parameters in SQL routines",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "X120.xml_params_sql_routines"
    ],
-   "note": "0/1 probes match; first gap: X120.xml_params_sql_routines #0 `CREATE FUNCTION wrap(x XML) RETURNS XML LANGUAGE SQL AS $$SELECT XMLELEMENT(NAME w, x)$$` head: PostgreSQL 'C:CREATE FUNCTION;Z:I', ZPM 'E:42601;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "xml"
   },
   "X121": {
@@ -6806,6 +6806,7 @@
    "E021-05.octet_length",
    "E021-06.substring",
    "E021-07.concat",
+   "E021-08.upper_lower",
    "E021-09.trim",
    "E021-10.implicit",
    "E021-11.position",
@@ -6864,19 +6865,24 @@
    "E131.nulls",
    "E141-01.not_null",
    "E141-02.unique_not_null",
+   "E141-03.primary_key",
    "E141-04.foreign_key",
    "E141-06.check",
    "E141-07.defaults",
    "E141-08.pk_not_null",
    "E141-10.fk_any_order",
+   "E151-01.commit",
    "E151-02.rollback",
    "E152-01.serializable",
    "E152-02.read_only",
    "E161.dash_comments",
+   "E171.sqlstate",
    "F031-01.create_table",
    "F031-02.create_view",
    "F031-03.grant",
    "F031-04.add_column",
+   "F031-13.drop_table_restrict",
+   "F031-16.drop_view_restrict",
    "F031-19.revoke_restrict",
    "F032.cascade",
    "F036.revoke_non_owner",
@@ -6896,6 +6902,7 @@
    "F053.overlaps",
    "F081.union_views",
    "F111.isolation_levels",
+   "F112.read_uncommitted",
    "F113.read_committed",
    "F114.repeatable_read",
    "F131-01.grouped_view_clauses",
@@ -6903,7 +6910,9 @@
    "F131-03.grouped_view_aggregate",
    "F131-04.grouped_view_subquery",
    "F131-05.grouped_view_single_row",
+   "F171.schemas",
    "F191.delete_actions",
+   "F200.truncate",
    "F201.cast",
    "F202.truncate_restart",
    "F221.explicit_defaults",
@@ -6928,6 +6937,9 @@
    "F361.subprograms",
    "F381.extended_schema",
    "F383.set_not_null",
+   "F384.drop_identity",
+   "F385.drop_expression",
+   "F386.set_generation",
    "F388.add_drop_constraint",
    "F393.unicode_literals",
    "F394.normal_form",
@@ -6947,11 +6959,13 @@
    "F441.extended_set_functions",
    "F442.mixed_columns_set_functions",
    "F481.expanded_null",
+   "F492.not_enforced",
    "F555.seconds_precision",
    "F561.full_value_expressions",
    "F571.truth_tests",
    "F591.derived_tables",
    "F661.simple_tables",
+   "F701.update_actions",
    "F791.insensitive_cursor",
    "F801.full_set_function",
    "F850.order_by_query_expression",
@@ -6971,7 +6985,13 @@
    "S095.array_by_query",
    "S096.optional_bounds",
    "S098.array_agg",
+   "S099.array_expressions",
+   "S111.only",
+   "S201.routines_on_arrays",
+   "S203.array_parameters",
    "S204.array_results",
+   "S301.enhanced_unnest",
+   "S404.trim_array",
    "T031.boolean",
    "T054.greatest_least",
    "T055.padding",
@@ -6991,13 +7011,22 @@
    "T173.extended_like",
    "T174.identity",
    "T177.sequence_restart",
+   "T178.identity_restart",
+   "T201.comparable_fk_types",
+   "T213.instead_of",
    "T214.before",
+   "T215.after",
+   "T216.when",
+   "T241.start_transaction",
    "T271.savepoints",
    "T285.derived_column_names",
    "T312.overlay",
    "T321-01.user_functions",
    "T321-02.procedures",
    "T321-03.invocation",
+   "T321-04.call",
+   "T321-05.return",
+   "T325.qualified_params",
    "T331.roles",
    "T341.overloading",
    "T351.bracketed_comments",
@@ -7009,7 +7038,12 @@
    "T461.symmetric_between",
    "T491.lateral",
    "T501.enhanced_exists",
+   "T521.named_call_args",
+   "T523.inout_defaults",
+   "T524.named_function_args",
+   "T525.function_defaults",
    "T551.optional_keywords",
+   "T581.regex_substring",
    "T591.unique_nullable",
    "T611.elementary_olap",
    "T612.advanced_olap",
@@ -7025,11 +7059,27 @@
    "T655.cyclic_routines",
    "T670.mixed_statements",
    "T803.json_type",
+   "T811.json_constructors",
+   "T812.json_objectagg",
+   "T813.json_arrayagg_order",
+   "T814.json_colon",
+   "T821.json_query_operators",
+   "T822.is_json_unique",
+   "T823.passing",
+   "T825.on_empty_on_error",
+   "T826.on_error_expressions",
+   "T828.json_query",
+   "T829.array_wrapper",
+   "T830.constructor_unique_keys",
+   "T831.strict_mode",
+   "T832.item_methods",
    "T833.multiple_subscripts",
    "T834.wildcard_member",
    "T835.filter_expressions",
    "T836.starts_with",
+   "T837.like_regex",
    "T840.path_hex_literals",
+   "T851.json_optional_keywords",
    "T865.bigint_method",
    "T866.boolean_method",
    "T868.decimal_method",
@@ -7041,14 +7091,22 @@
    "T880.json_grouping",
    "X010.xml_type",
    "X011.xml_arrays",
+   "X020.xmlconcat",
+   "X031.xmlelement",
+   "X032.xmlforest",
+   "X035.xmlagg_order",
+   "X036.xmlcomment",
+   "X037.xmlpi",
+   "X038.xmltext",
    "X060.xmlparse_content",
    "X061.xmlparse_document",
    "X070.xmlserialize_content",
-   "X071.xmlserialize_document"
+   "X071.xmlserialize_document",
+   "X072.xmlserialize",
+   "X120.xml_params_sql_routines"
   ],
   "fail": [
    "B128.routine_language_sql",
-   "E021-08.upper_lower",
    "E081-05.update_column_priv",
    "E081-06.references_priv",
    "E081-07.references_column_priv",
@@ -7057,10 +7115,7 @@
    "E121-06.positioned_update",
    "E121-07.positioned_delete",
    "E121-08.close",
-   "E141-03.primary_key",
-   "E151-01.commit",
    "E153.updatable_subquery",
-   "E171.sqlstate",
    "F021-01.columns",
    "F021-01.identity_columns",
    "F021-02.tables",
@@ -7068,8 +7123,6 @@
    "F021-04.table_constraints",
    "F021-05.referential_constraints",
    "F021-06.check_constraints",
-   "F031-13.drop_table_restrict",
-   "F031-16.drop_view_restrict",
    "F033.drop_column",
    "F034.extended_revoke",
    "F035.revoke_cascade",
@@ -7078,9 +7131,6 @@
    "F051-07.localtime",
    "F051-08.localtimestamp",
    "F052.intervals",
-   "F112.read_uncommitted",
-   "F171.schemas",
-   "F200.truncate",
    "F231.privilege_tables",
    "F251.domains",
    "F271.compound_literals",
@@ -7089,9 +7139,6 @@
    "F311-05.schema_grant",
    "F341.usage_tables",
    "F382.alter_type",
-   "F384.drop_identity",
-   "F385.drop_expression",
-   "F386.set_generation",
    "F387.alter_column",
    "F391.long_identifiers",
    "F392.unicode_identifiers",
@@ -7100,7 +7147,6 @@
    "F421.national_character",
    "F471.scalar_subquery",
    "F491.constraint_management",
-   "F492.not_enforced",
    "F501-01.sql_features",
    "F501-02.sql_sizing",
    "F502.documentation_tables",
@@ -7110,7 +7156,6 @@
    "F672.retrospective_check",
    "F690.collation",
    "F692.extended_collation",
-   "F701.update_actions",
    "F711.alter_domain",
    "F731.insert_column_privileges",
    "F751.view_check_enhancements",
@@ -7124,37 +7169,17 @@
    "F869.implementation_info",
    "S071.sql_paths",
    "S092.arrays_udt",
-   "S099.array_expressions",
-   "S111.only",
-   "S201.routines_on_arrays",
-   "S203.array_parameters",
    "S211.user_cast",
-   "S301.enhanced_unnest",
-   "S404.trim_array",
    "T133.cycle_marks",
-   "T178.identity_restart",
    "T191.restrict",
-   "T201.comparable_fk_types",
    "T212.statement_triggers",
-   "T213.instead_of",
-   "T215.after",
-   "T216.when",
    "T217.trigger_privilege",
-   "T241.start_transaction",
    "T261.chained",
    "T281.column_select_privilege",
-   "T321-04.call",
-   "T321-05.return",
    "T321-06.routines_view",
    "T321-07.parameters_view",
    "T323.external_security",
-   "T325.qualified_params",
    "T332.extended_roles",
-   "T521.named_call_args",
-   "T523.inout_defaults",
-   "T524.named_function_args",
-   "T525.function_defaults",
-   "T581.regex_substring",
    "T621.numeric_functions",
    "T622.trig",
    "T626.any_value",
@@ -7162,23 +7187,7 @@
    "T653.schema_statements_external",
    "T661.non_decimal_literals",
    "T662.underscores",
-   "T811.json_constructors",
-   "T812.json_objectagg",
-   "T813.json_arrayagg_order",
-   "T814.json_colon",
-   "T821.json_query_operators",
-   "T822.is_json_unique",
-   "T823.passing",
-   "T825.on_empty_on_error",
-   "T826.on_error_expressions",
    "T827.json_table_nested",
-   "T828.json_query",
-   "T829.array_wrapper",
-   "T830.constructor_unique_keys",
-   "T831.strict_mode",
-   "T832.item_methods",
-   "T837.like_regex",
-   "T851.json_optional_keywords",
    "T867.date_method",
    "T873.time_method",
    "T874.time_tz_method",
@@ -7188,14 +7197,7 @@
    "T878.timestamp_precision",
    "X014.xml_attributes",
    "X016.persistent_xml",
-   "X020.xmlconcat",
-   "X031.xmlelement",
-   "X032.xmlforest",
    "X034.xmlagg",
-   "X035.xmlagg_order",
-   "X036.xmlcomment",
-   "X037.xmlpi",
-   "X038.xmltext",
    "X040.table_mapping",
    "X041.table_mapping_null_absent",
    "X042.table_mapping_null_nil",
@@ -7217,9 +7219,7 @@
    "X058.advanced_base64",
    "X059.advanced_hex",
    "X069.xmlserialize_indent",
-   "X072.xmlserialize",
    "X090.document_predicate",
-   "X120.xml_params_sql_routines",
    "X121.xml_params_external",
    "X221.passing_by_value",
    "X301.xmltable_columns",

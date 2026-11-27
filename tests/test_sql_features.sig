@@ -470,7 +470,7 @@ const probes = [_]Probe{
 .{ .id = "E021-07.concat", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "SELECT 'ab' || 'cd', 'x' || NULL, 'a' || 1, 'ab'::char(4) || 'c'", .head = "T:?column?/25/-1/-1,?column?/25/-1/-1,?column?/25/-1/-1,?column?/25/-1/-1;C:SELECT 1;Z:I", .rows = &.{"abcd|\x5cN|a1|abc"} },
 } },
-.{ .id = "E021-08.upper_lower", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "E021-08.upper_lower", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "SELECT UPPER('abc\xc3\x84\xc3\xa9'), LOWER('ABCxyz'), UPPER(NULL)", .head = "T:upper/25/-1/-1,lower/25/-1/-1,upper/25/-1/-1;C:SELECT 1;Z:I", .rows = &.{"ABC\xc3\x84\xc3\x89|abcxyz|\x5cN"} },
 } },
 .{ .id = "E021-09.trim", .ordered = false, .closed = true, .statements = &.{
@@ -985,7 +985,7 @@ const probes = [_]Probe{
     .{ .source = "UPDATE t SET a = 1 WHERE a = 2", .head = "E:23505;Z:I", .rows = &.{} },
     .{ .source = "SELECT a, b, c FROM t", .head = "T:a/23/4/-1,b/23/4/-1,c/23/4/-1;C:SELECT 2;Z:I", .rows = &.{"1|1|1", "2|1|2"} },
 } },
-.{ .id = "E141-03.primary_key", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "E141-03.primary_key", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "CREATE TABLE t(a INT PRIMARY KEY, b INT)", .head = "C:CREATE TABLE;Z:I", .rows = &.{} },
     .{ .source = "CREATE TABLE u(a INT, b INT, PRIMARY KEY (a, b))", .head = "C:CREATE TABLE;Z:I", .rows = &.{} },
     .{ .source = "INSERT INTO t VALUES (1, 1)", .head = "C:INSERT 0 1;Z:I", .rows = &.{} },
@@ -1036,7 +1036,7 @@ const probes = [_]Probe{
     .{ .source = "INSERT INTO c VALUES (2, 1)", .head = "E:23503;Z:I", .rows = &.{} },
     .{ .source = "SELECT x, y FROM c", .head = "T:x/23/4/-1,y/23/4/-1;C:SELECT 1;Z:I", .rows = &.{"1|2"} },
 } },
-.{ .id = "E151-01.commit", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "E151-01.commit", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "CREATE TABLE t(a INT)", .head = "C:CREATE TABLE;Z:I", .rows = &.{} },
     .{ .source = "BEGIN", .head = "C:BEGIN;Z:T", .rows = &.{} },
     .{ .source = "INSERT INTO t VALUES (1)", .head = "C:INSERT 0 1;Z:T", .rows = &.{} },
@@ -1101,7 +1101,7 @@ const probes = [_]Probe{
     .{ .source = "SELECT 1 -- trailing comment\x0a + 2", .head = "T:?column?/23/4/-1;C:SELECT 1;Z:I", .rows = &.{"3"} },
     .{ .source = "-- a full-line comment inside a statement\x0aSELECT 'a--b' AS x", .head = "T:x/25/-1/-1;C:SELECT 1;Z:I", .rows = &.{"a--b"} },
 } },
-.{ .id = "E171.sqlstate", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "E171.sqlstate", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "SELECT 1/0", .head = "E:22012;Z:I", .rows = &.{} },
     .{ .source = "SELECT * FROM missing_table", .head = "E:42P01;Z:I", .rows = &.{} },
     .{ .source = "SELECT 'x'::int", .head = "E:22P02;Z:I", .rows = &.{} },
@@ -1179,7 +1179,7 @@ const probes = [_]Probe{
     .{ .source = "SELECT a, b, c FROM t", .head = "T:a/23/4/-1,b/23/4/-1,c/25/-1/-1;C:SELECT 1;Z:I", .rows = &.{"1|7|\x5cN"} },
     .{ .source = "ALTER TABLE t ADD COLUMN a INT", .head = "E:42701;Z:I", .rows = &.{} },
 } },
-.{ .id = "F031-13.drop_table_restrict", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "F031-13.drop_table_restrict", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "CREATE TABLE t(a INT)", .head = "C:CREATE TABLE;Z:I", .rows = &.{} },
     .{ .source = "CREATE VIEW v AS SELECT a FROM t", .head = "C:CREATE VIEW;Z:I", .rows = &.{} },
     .{ .source = "DROP TABLE t RESTRICT", .head = "E:2BP01;Z:I", .rows = &.{} },
@@ -1187,7 +1187,7 @@ const probes = [_]Probe{
     .{ .source = "DROP TABLE t RESTRICT", .head = "C:DROP TABLE;Z:I", .rows = &.{} },
     .{ .source = "SELECT count(*) FROM information_schema.tables WHERE table_name = 't'", .head = "T:count/20/8/-1;C:SELECT 1;Z:I", .rows = &.{"0"} },
 } },
-.{ .id = "F031-16.drop_view_restrict", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "F031-16.drop_view_restrict", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "CREATE TABLE t(a INT)", .head = "C:CREATE TABLE;Z:I", .rows = &.{} },
     .{ .source = "CREATE VIEW v AS SELECT a FROM t", .head = "C:CREATE VIEW;Z:I", .rows = &.{} },
     .{ .source = "CREATE VIEW w AS SELECT a FROM v", .head = "C:CREATE VIEW;Z:I", .rows = &.{} },
@@ -1419,7 +1419,7 @@ const probes = [_]Probe{
     .{ .source = "SHOW transaction_isolation", .head = "T:transaction_isolation/25/-1/-1;C:SHOW;Z:T", .rows = &.{"read uncommitted"} },
     .{ .source = "COMMIT", .head = "C:COMMIT;Z:I", .rows = &.{} },
 } },
-.{ .id = "F112.read_uncommitted", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "F112.read_uncommitted", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "START TRANSACTION ISOLATION LEVEL READ UNCOMMITTED", .head = "C:START TRANSACTION;Z:T", .rows = &.{} },
     .{ .source = "SHOW transaction_isolation", .head = "T:transaction_isolation/25/-1/-1;C:SHOW;Z:T", .rows = &.{"read uncommitted"} },
     .{ .source = "SELECT current_setting('transaction_isolation')", .head = "T:current_setting/25/-1/-1;C:SELECT 1;Z:T", .rows = &.{"read uncommitted"} },
@@ -1477,7 +1477,7 @@ const probes = [_]Probe{
     .{ .source = "SELECT s FROM gv WHERE g = 1", .head = "T:s/20/8/-1;C:SELECT 1;Z:I", .rows = &.{"30"} },
     .{ .source = "SELECT count(*) FROM gv GROUP BY s HAVING s = 30", .head = "T:count/20/8/-1;C:SELECT 1;Z:I", .rows = &.{"1"} },
 } },
-.{ .id = "F171.schemas", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "F171.schemas", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "CREATE SCHEMA s1", .head = "C:CREATE SCHEMA;Z:I", .rows = &.{} },
     .{ .source = "CREATE SCHEMA s2 AUTHORIZATION CURRENT_USER", .head = "C:CREATE SCHEMA;Z:I", .rows = &.{} },
     .{ .source = "CREATE TABLE s1.t(a INT)", .head = "C:CREATE TABLE;Z:I", .rows = &.{} },
@@ -1505,7 +1505,7 @@ const probes = [_]Probe{
     .{ .source = "SELECT id FROM c3", .head = "T:id/23/4/-1;C:SELECT 1;Z:I", .rows = &.{"\x5cN"} },
     .{ .source = "DELETE FROM p WHERE id = 3", .head = "E:23503;Z:I", .rows = &.{} },
 } },
-.{ .id = "F200.truncate", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "F200.truncate", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "CREATE TABLE t(a INT)", .head = "C:CREATE TABLE;Z:I", .rows = &.{} },
     .{ .source = "INSERT INTO t VALUES (1), (2)", .head = "C:INSERT 0 2;Z:I", .rows = &.{} },
     .{ .source = "TRUNCATE TABLE t", .head = "C:TRUNCATE TABLE;Z:I", .rows = &.{} },
@@ -1761,7 +1761,7 @@ const probes = [_]Probe{
     .{ .source = "INSERT INTO t VALUES (NULL, 1)", .head = "C:INSERT 0 1;Z:I", .rows = &.{} },
     .{ .source = "SELECT count(*) FROM t", .head = "T:count/20/8/-1;C:SELECT 1;Z:I", .rows = &.{"2"} },
 } },
-.{ .id = "F384.drop_identity", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "F384.drop_identity", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "CREATE TABLE t(id INT GENERATED BY DEFAULT AS IDENTITY, v INT)", .head = "C:CREATE TABLE;Z:I", .rows = &.{} },
     .{ .source = "INSERT INTO t(v) VALUES (1)", .head = "C:INSERT 0 1;Z:I", .rows = &.{} },
     .{ .source = "ALTER TABLE t ALTER COLUMN id DROP IDENTITY", .head = "C:ALTER TABLE;Z:I", .rows = &.{} },
@@ -1770,7 +1770,7 @@ const probes = [_]Probe{
     .{ .source = "ALTER TABLE t ALTER COLUMN id DROP IDENTITY IF EXISTS", .head = "C:ALTER TABLE;Z:I", .rows = &.{} },
     .{ .source = "SELECT id, v FROM t ORDER BY v", .head = "T:id/23/4/-1,v/23/4/-1;C:SELECT 1;Z:I", .rows = &.{"1|1"} },
 } },
-.{ .id = "F385.drop_expression", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "F385.drop_expression", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "CREATE TABLE t(a INT, b INT GENERATED ALWAYS AS (a * 2) STORED)", .head = "C:CREATE TABLE;Z:I", .rows = &.{} },
     .{ .source = "INSERT INTO t(a) VALUES (1)", .head = "C:INSERT 0 1;Z:I", .rows = &.{} },
     .{ .source = "ALTER TABLE t ALTER COLUMN b DROP EXPRESSION", .head = "C:ALTER TABLE;Z:I", .rows = &.{} },
@@ -1778,7 +1778,7 @@ const probes = [_]Probe{
     .{ .source = "UPDATE t SET a = 10 WHERE a = 1", .head = "C:UPDATE 1;Z:I", .rows = &.{} },
     .{ .source = "SELECT a, b FROM t ORDER BY a", .head = "T:a/23/4/-1,b/23/4/-1;C:SELECT 2;Z:I", .rows = &.{"2|5", "10|2"} },
 } },
-.{ .id = "F386.set_generation", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "F386.set_generation", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "CREATE TABLE t(id INT GENERATED ALWAYS AS IDENTITY, v INT)", .head = "C:CREATE TABLE;Z:I", .rows = &.{} },
     .{ .source = "INSERT INTO t(id, v) VALUES (100, 1)", .head = "E:428C9;Z:I", .rows = &.{} },
     .{ .source = "ALTER TABLE t ALTER COLUMN id SET GENERATED BY DEFAULT", .head = "C:ALTER TABLE;Z:I", .rows = &.{} },
@@ -2007,7 +2007,7 @@ const probes = [_]Probe{
     .{ .source = "ALTER TABLE t RENAME CONSTRAINT t_pk TO t_key", .head = "C:ALTER TABLE;Z:I", .rows = &.{} },
     .{ .source = "SELECT conname FROM pg_constraint WHERE conrelid = 't'::regclass AND contype = 'p'", .head = "T:conname/19/64/-1;C:SELECT 1;Z:I", .rows = &.{"t_key"} },
 } },
-.{ .id = "F492.not_enforced", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "F492.not_enforced", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "CREATE TABLE t(a INT, CONSTRAINT a_pos CHECK (a > 0) NOT ENFORCED)", .head = "C:CREATE TABLE;Z:I", .rows = &.{} },
     .{ .source = "INSERT INTO t VALUES (-1)", .head = "C:INSERT 0 1;Z:I", .rows = &.{} },
     .{ .source = "ALTER TABLE t ALTER CONSTRAINT a_pos ENFORCED", .head = "E:42809;Z:I", .rows = &.{} },
@@ -2120,7 +2120,7 @@ const probes = [_]Probe{
     .{ .source = "SELECT b FROM t ORDER BY b COLLATE mycoll", .head = "T:b/25/-1/-1;C:SELECT 2;Z:I", .rows = &.{"B", "a"} },
     .{ .source = "SELECT collation_name FROM information_schema.collations WHERE collation_name = 'mycoll'", .head = "T:collation_name/19/64/-1;C:SELECT 1;Z:I", .rows = &.{"mycoll"} },
 } },
-.{ .id = "F701.update_actions", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "F701.update_actions", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "CREATE TABLE p(id INT PRIMARY KEY)", .head = "C:CREATE TABLE;Z:I", .rows = &.{} },
     .{ .source = "CREATE TABLE c1(id INT REFERENCES p ON UPDATE CASCADE)", .head = "C:CREATE TABLE;Z:I", .rows = &.{} },
     .{ .source = "CREATE TABLE c2(id INT REFERENCES p ON UPDATE SET NULL)", .head = "C:CREATE TABLE;Z:I", .rows = &.{} },
@@ -2375,12 +2375,12 @@ const probes = [_]Probe{
     .{ .source = "SELECT array_agg(DISTINCT g) FROM t", .head = "T:array_agg/1007/-1/-1;C:SELECT 1;Z:I", .rows = &.{"{1\x5c,2}"} },
     .{ .source = "SELECT array_agg(v) FROM t WHERE false", .head = "T:array_agg/1007/-1/-1;C:SELECT 1;Z:I", .rows = &.{"\x5cN"} },
 } },
-.{ .id = "S099.array_expressions", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "S099.array_expressions", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "SELECT ARRAY[1, 2] || ARRAY[3], ARRAY[1, 2] || 3, 0 || ARRAY[1], cardinality(ARRAY[[1, 2], [3, 4]]), array_length(ARRAY[1, 2, 3], 1)", .head = "T:?column?/1007/-1/-1,?column?/1007/-1/-1,?column?/1007/-1/-1,cardinality/23/4/-1,array_length/23/4/-1;C:SELECT 1;Z:I", .rows = &.{"{1\x5c,2\x5c,3}|{1\x5c,2\x5c,3}|{0\x5c,1}|4|3"} },
     .{ .source = "SELECT (ARRAY[1, 2, 3, 4])[2:3], (ARRAY['a', 'b', 'c'])[:2], array_position(ARRAY['a', 'b'], 'b'), array_upper(ARRAY[1, 2], 1)", .head = "T:array/1007/-1/-1,array/1009/-1/-1,array_position/23/4/-1,array_upper/23/4/-1;C:SELECT 1;Z:I", .rows = &.{"{2\x5c,3}|{a\x5c,b}|2|2"} },
     .{ .source = "SELECT 2 = ANY (ARRAY[1, 2]), ARRAY[1, 2] @> ARRAY[2], ARRAY[1] && ARRAY[2]", .head = "T:?column?/16/1/-1,?column?/16/1/-1,?column?/16/1/-1;C:SELECT 1;Z:I", .rows = &.{"t|t|f"} },
 } },
-.{ .id = "S111.only", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "S111.only", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "CREATE TABLE parent(a INT)", .head = "C:CREATE TABLE;Z:I", .rows = &.{} },
     .{ .source = "CREATE TABLE child(b INT) INHERITS (parent)", .head = "C:CREATE TABLE;Z:I", .rows = &.{} },
     .{ .source = "INSERT INTO parent VALUES (1)", .head = "C:INSERT 0 1;Z:I", .rows = &.{} },
@@ -2393,12 +2393,12 @@ const probes = [_]Probe{
     .{ .source = "DELETE FROM ONLY parent", .head = "C:DELETE 1;Z:I", .rows = &.{} },
     .{ .source = "SELECT a FROM parent", .head = "T:a/23/4/-1;C:SELECT 1;Z:I", .rows = &.{"2"} },
 } },
-.{ .id = "S201.routines_on_arrays", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "S201.routines_on_arrays", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "CREATE FUNCTION total(xs INT[]) RETURNS INT LANGUAGE SQL AS $$SELECT sum(x)::int FROM unnest(xs) x$$", .head = "C:CREATE FUNCTION;Z:I", .rows = &.{} },
     .{ .source = "CREATE FUNCTION firsts(xs TEXT[]) RETURNS TEXT LANGUAGE SQL AS $$SELECT xs[1]$$", .head = "C:CREATE FUNCTION;Z:I", .rows = &.{} },
     .{ .source = "SELECT total(ARRAY[1, 2, 3]), firsts(ARRAY['p', 'q']), total('{}')", .head = "T:total/23/4/-1,firsts/25/-1/-1,total/23/4/-1;C:SELECT 1;Z:I", .rows = &.{"6|p|\x5cN"} },
 } },
-.{ .id = "S203.array_parameters", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "S203.array_parameters", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "CREATE FUNCTION lenof(xs INT[]) RETURNS INT LANGUAGE plpgsql AS $$BEGIN RETURN coalesce(array_length(xs, 1), 0); END$$", .head = "C:CREATE FUNCTION;Z:I", .rows = &.{} },
     .{ .source = "CREATE PROCEDURE p(xs INT[], INOUT n INT) LANGUAGE plpgsql AS $$BEGIN n := cardinality(xs); END$$", .head = "C:CREATE PROCEDURE;Z:I", .rows = &.{} },
     .{ .source = "SELECT lenof(ARRAY[4, 5]), lenof(NULL)", .head = "T:lenof/23/4/-1,lenof/23/4/-1;C:SELECT 1;Z:I", .rows = &.{"2|0"} },
@@ -2423,7 +2423,7 @@ const probes = [_]Probe{
     .{ .source = "DROP CAST (INT AS wrapper)", .head = "C:DROP CAST;Z:I", .rows = &.{} },
     .{ .source = "SELECT 5::wrapper", .head = "E:42846;Z:I", .rows = &.{} },
 } },
-.{ .id = "S301.enhanced_unnest", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "S301.enhanced_unnest", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "SELECT * FROM unnest(ARRAY[1, 2], ARRAY['a', 'b', 'c']) AS u(n, s)", .head = "T:n/23/4/-1,s/25/-1/-1;C:SELECT 3;Z:I", .rows = &.{"1|a", "2|b", "\x5cN|c"} },
     .{ .source = "SELECT * FROM unnest(ARRAY['x', 'y']) WITH ORDINALITY AS u(v, i)", .head = "T:v/25/-1/-1,i/20/8/-1;C:SELECT 2;Z:I", .rows = &.{"x|1", "y|2"} },
     .{ .source = "SELECT n FROM unnest(ARRAY[[1, 2], [3, 4]]) AS n", .head = "T:n/23/4/-1;C:SELECT 4;Z:I", .rows = &.{"1", "2", "3", "4"} },
@@ -2431,7 +2431,7 @@ const probes = [_]Probe{
     .{ .source = "INSERT INTO t VALUES (1, '{10,20}'), (2, '{30}')", .head = "C:INSERT 0 2;Z:I", .rows = &.{} },
     .{ .source = "SELECT id, x FROM t, unnest(xs) AS x", .head = "T:id/23/4/-1,x/23/4/-1;C:SELECT 3;Z:I", .rows = &.{"1|10", "1|20", "2|30"} },
 } },
-.{ .id = "S404.trim_array", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "S404.trim_array", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "SELECT trim_array(ARRAY[1, 2, 3, 4], 2), trim_array(ARRAY['a', 'b'], 0), trim_array(ARRAY[1], 1)", .head = "T:trim_array/1007/-1/-1,trim_array/1009/-1/-1,trim_array/1007/-1/-1;C:SELECT 1;Z:I", .rows = &.{"{1\x5c,2}|{a\x5c,b}|{}"} },
     .{ .source = "SELECT trim_array(ARRAY[1, 2], 3)", .head = "E:2202E;Z:I", .rows = &.{} },
 } },
@@ -2562,7 +2562,7 @@ const probes = [_]Probe{
     .{ .source = "ALTER SEQUENCE s RESTART WITH 100", .head = "C:ALTER SEQUENCE;Z:I", .rows = &.{} },
     .{ .source = "SELECT nextval('s')", .head = "T:nextval/20/8/-1;C:SELECT 1;Z:I", .rows = &.{"100"} },
 } },
-.{ .id = "T178.identity_restart", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "T178.identity_restart", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "CREATE TABLE t(id INT GENERATED ALWAYS AS IDENTITY, v INT)", .head = "C:CREATE TABLE;Z:I", .rows = &.{} },
     .{ .source = "INSERT INTO t(v) VALUES (1), (2)", .head = "C:INSERT 0 2;Z:I", .rows = &.{} },
     .{ .source = "ALTER TABLE t ALTER COLUMN id RESTART", .head = "C:ALTER TABLE;Z:I", .rows = &.{} },
@@ -2582,7 +2582,7 @@ const probes = [_]Probe{
     .{ .source = "SELECT id FROM p", .head = "T:id/23/4/-1;C:SELECT 1;Z:I", .rows = &.{"1"} },
     .{ .source = "SELECT delete_rule, update_rule FROM information_schema.referential_constraints", .head = "T:delete_rule/1043/-1/-1,update_rule/1043/-1/-1;C:SELECT 1;Z:I", .rows = &.{"RESTRICT|RESTRICT"} },
 } },
-.{ .id = "T201.comparable_fk_types", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "T201.comparable_fk_types", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "CREATE TABLE p(id BIGINT PRIMARY KEY, code VARCHAR(10) UNIQUE)", .head = "C:CREATE TABLE;Z:I", .rows = &.{} },
     .{ .source = "CREATE TABLE c(pid INT REFERENCES p, pcode TEXT REFERENCES p(code))", .head = "C:CREATE TABLE;Z:I", .rows = &.{} },
     .{ .source = "INSERT INTO p VALUES (1, 'a')", .head = "C:INSERT 0 1;Z:I", .rows = &.{} },
@@ -2601,7 +2601,7 @@ const probes = [_]Probe{
     .{ .source = "INSERT INTO t SELECT 1 WHERE false", .head = "C:INSERT 0 0;Z:I", .rows = &.{} },
     .{ .source = "SELECT n FROM log ORDER BY n", .head = "T:n/23/4/-1;C:SELECT 2;Z:I", .rows = &.{"0", "3"} },
 } },
-.{ .id = "T213.instead_of", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "T213.instead_of", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "CREATE TABLE t(a INT)", .head = "C:CREATE TABLE;Z:I", .rows = &.{} },
     .{ .source = "CREATE VIEW v AS SELECT a, a * 2 AS b FROM t", .head = "C:CREATE VIEW;Z:I", .rows = &.{} },
     .{ .source = "CREATE FUNCTION v_ins() RETURNS TRIGGER LANGUAGE plpgsql AS $$BEGIN INSERT INTO t VALUES (NEW.a + 100); RETURN NEW; END$$", .head = "C:CREATE FUNCTION;Z:I", .rows = &.{} },
@@ -2617,7 +2617,7 @@ const probes = [_]Probe{
     .{ .source = "UPDATE t SET b = 'z'", .head = "C:UPDATE 1;Z:I", .rows = &.{} },
     .{ .source = "SELECT a, b FROM t", .head = "T:a/23/4/-1,b/25/-1/-1;C:SELECT 1;Z:I", .rows = &.{"1|Z"} },
 } },
-.{ .id = "T215.after", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "T215.after", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "CREATE TABLE t(a INT)", .head = "C:CREATE TABLE;Z:I", .rows = &.{} },
     .{ .source = "CREATE TABLE audit(op TEXT, v INT)", .head = "C:CREATE TABLE;Z:I", .rows = &.{} },
     .{ .source = "CREATE FUNCTION aud() RETURNS TRIGGER LANGUAGE plpgsql AS $$BEGIN IF TG_OP = 'DELETE' THEN INSERT INTO audit VALUES (TG_OP, OLD.a); ELSE INSERT INTO audit VALUES (TG_OP, NEW.a); END IF; RETURN NULL; END$$", .head = "C:CREATE FUNCTION;Z:I", .rows = &.{} },
@@ -2627,7 +2627,7 @@ const probes = [_]Probe{
     .{ .source = "DELETE FROM t", .head = "C:DELETE 1;Z:I", .rows = &.{} },
     .{ .source = "SELECT op, v FROM audit ORDER BY op", .head = "T:op/25/-1/-1,v/23/4/-1;C:SELECT 3;Z:I", .rows = &.{"DELETE|2", "INSERT|1", "UPDATE|2"} },
 } },
-.{ .id = "T216.when", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "T216.when", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "CREATE TABLE t(a INT)", .head = "C:CREATE TABLE;Z:I", .rows = &.{} },
     .{ .source = "CREATE TABLE log(v INT)", .head = "C:CREATE TABLE;Z:I", .rows = &.{} },
     .{ .source = "CREATE FUNCTION lg() RETURNS TRIGGER LANGUAGE plpgsql AS $$BEGIN INSERT INTO log VALUES (NEW.a); RETURN NEW; END$$", .head = "C:CREATE FUNCTION;Z:I", .rows = &.{} },
@@ -2651,7 +2651,7 @@ const probes = [_]Probe{
     .{ .source = "CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION nothing()", .head = "C:CREATE TRIGGER;Z:I", .rows = &.{} },
     .{ .source = "RESET ROLE", .head = "C:RESET;Z:I", .rows = &.{} },
 } },
-.{ .id = "T241.start_transaction", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "T241.start_transaction", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "CREATE TABLE t(a INT)", .head = "C:CREATE TABLE;Z:I", .rows = &.{} },
     .{ .source = "START TRANSACTION", .head = "C:START TRANSACTION;Z:T", .rows = &.{} },
     .{ .source = "INSERT INTO t VALUES (1)", .head = "C:INSERT 0 1;Z:T", .rows = &.{} },
@@ -2748,7 +2748,7 @@ const probes = [_]Probe{
     .{ .source = "SELECT add(add(1, 2), 3)", .head = "T:add/23/4/-1;C:SELECT 1;Z:I", .rows = &.{"6"} },
     .{ .source = "SELECT add(1)", .head = "E:42883;Z:I", .rows = &.{} },
 } },
-.{ .id = "T321-04.call", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "T321-04.call", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "CREATE TABLE t(a INT)", .head = "C:CREATE TABLE;Z:I", .rows = &.{} },
     .{ .source = "CREATE PROCEDURE p(x INT, INOUT y INT) LANGUAGE plpgsql AS $$BEGIN INSERT INTO t VALUES (x); y := x * 10; END$$", .head = "C:CREATE PROCEDURE;Z:I", .rows = &.{} },
     .{ .source = "CALL p(3, NULL)", .head = "T:y/23/4/-1;C:CALL;Z:I", .rows = &.{"30"} },
@@ -2756,7 +2756,7 @@ const probes = [_]Probe{
     .{ .source = "SELECT a FROM t ORDER BY a", .head = "T:a/23/4/-1;C:SELECT 2;Z:I", .rows = &.{"3", "4"} },
     .{ .source = "CALL missing_proc()", .head = "E:42883;Z:I", .rows = &.{} },
 } },
-.{ .id = "T321-05.return", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "T321-05.return", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "CREATE FUNCTION sgn(x INT) RETURNS TEXT LANGUAGE plpgsql AS $$BEGIN IF x < 0 THEN RETURN 'neg'; END IF; RETURN 'nonneg'; END$$", .head = "C:CREATE FUNCTION;Z:I", .rows = &.{} },
     .{ .source = "CREATE FUNCTION r(x INT) RETURNS INT LANGUAGE SQL RETURN x * 3", .head = "C:CREATE FUNCTION;Z:I", .rows = &.{} },
     .{ .source = "CREATE PROCEDURE early(INOUT x INT) LANGUAGE plpgsql AS $$BEGIN x := 1; RETURN; x := 2; END$$", .head = "C:CREATE PROCEDURE;Z:I", .rows = &.{} },
@@ -2784,7 +2784,7 @@ const probes = [_]Probe{
     .{ .source = "RESET ROLE", .head = "C:RESET;Z:I", .rows = &.{} },
     .{ .source = "SELECT routine_name, security_type FROM information_schema.routines WHERE routine_name LIKE 'peek%' ORDER BY 1", .head = "T:routine_name/19/64/-1,security_type/1043/-1/-1;C:SELECT 2;Z:I", .rows = &.{"peek|DEFINER", "peek2|INVOKER"} },
 } },
-.{ .id = "T325.qualified_params", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "T325.qualified_params", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "CREATE TABLE t(x INT)", .head = "C:CREATE TABLE;Z:I", .rows = &.{} },
     .{ .source = "INSERT INTO t VALUES (1), (2)", .head = "C:INSERT 0 2;Z:I", .rows = &.{} },
     .{ .source = "CREATE FUNCTION f(x INT) RETURNS BIGINT LANGUAGE SQL AS $$SELECT count(*) FROM t WHERE t.x = f.x$$", .head = "C:CREATE FUNCTION;Z:I", .rows = &.{} },
@@ -2892,7 +2892,7 @@ const probes = [_]Probe{
     .{ .source = "SELECT EXISTS (SELECT a, b FROM t), EXISTS (SELECT 1 UNION SELECT 2), EXISTS (SELECT * FROM t WHERE a = 5 UNION ALL SELECT * FROM t WHERE b = 2)", .head = "T:exists/16/1/-1,exists/16/1/-1,exists/16/1/-1;C:SELECT 1;Z:I", .rows = &.{"t|t|t"} },
     .{ .source = "SELECT EXISTS (VALUES (1)), EXISTS (TABLE t)", .head = "T:exists/16/1/-1,exists/16/1/-1;C:SELECT 1;Z:I", .rows = &.{"t|t"} },
 } },
-.{ .id = "T521.named_call_args", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "T521.named_call_args", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "CREATE TABLE t(a INT, b TEXT)", .head = "C:CREATE TABLE;Z:I", .rows = &.{} },
     .{ .source = "CREATE PROCEDURE ins(x INT, y TEXT) LANGUAGE SQL AS $$INSERT INTO t VALUES (x, y)$$", .head = "C:CREATE PROCEDURE;Z:I", .rows = &.{} },
     .{ .source = "CALL ins(y => 'b', x => 1)", .head = "C:CALL;Z:I", .rows = &.{} },
@@ -2900,18 +2900,18 @@ const probes = [_]Probe{
     .{ .source = "CALL ins(x => 3, 'd')", .head = "E:42601;Z:I", .rows = &.{} },
     .{ .source = "SELECT a, b FROM t ORDER BY a", .head = "T:a/23/4/-1,b/25/-1/-1;C:SELECT 2;Z:I", .rows = &.{"1|b", "2|c"} },
 } },
-.{ .id = "T523.inout_defaults", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "T523.inout_defaults", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "CREATE PROCEDURE p(INOUT a INT DEFAULT 5, INOUT b INT DEFAULT 6) LANGUAGE plpgsql AS $$BEGIN a := a + 1; b := b + 1; END$$", .head = "C:CREATE PROCEDURE;Z:I", .rows = &.{} },
     .{ .source = "CALL p()", .head = "T:a/23/4/-1,b/23/4/-1;C:CALL;Z:I", .rows = &.{"6|7"} },
     .{ .source = "CALL p(10)", .head = "T:a/23/4/-1,b/23/4/-1;C:CALL;Z:I", .rows = &.{"11|7"} },
     .{ .source = "CALL p(b => 0)", .head = "T:a/23/4/-1,b/23/4/-1;C:CALL;Z:I", .rows = &.{"6|1"} },
 } },
-.{ .id = "T524.named_function_args", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "T524.named_function_args", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "CREATE FUNCTION f(a INT, b TEXT) RETURNS TEXT LANGUAGE SQL AS $$SELECT b || a$$", .head = "C:CREATE FUNCTION;Z:I", .rows = &.{} },
     .{ .source = "SELECT f(b => 'x', a => 1), f(2, b => 'y'), f(a := 3, b := 'z')", .head = "T:f/25/-1/-1,f/25/-1/-1,f/25/-1/-1;C:SELECT 1;Z:I", .rows = &.{"x1|y2|z3"} },
     .{ .source = "SELECT f(c => 1)", .head = "E:42883;Z:I", .rows = &.{} },
 } },
-.{ .id = "T525.function_defaults", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "T525.function_defaults", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "CREATE FUNCTION f(a INT, b INT DEFAULT 10, c TEXT DEFAULT 'd') RETURNS TEXT LANGUAGE SQL AS $$SELECT a + b || c$$", .head = "C:CREATE FUNCTION;Z:I", .rows = &.{} },
     .{ .source = "SELECT f(1), f(1, 2), f(1, 2, 'x'), f(1, c => 'y')", .head = "T:f/25/-1/-1,f/25/-1/-1,f/25/-1/-1,f/25/-1/-1;C:SELECT 1;Z:I", .rows = &.{"11d|3d|3x|11y"} },
 } },
@@ -2924,7 +2924,7 @@ const probes = [_]Probe{
     .{ .source = "SELECT a FROM t AS x LEFT OUTER JOIN (SELECT 1 AS k) AS y ON x.a = y.k ORDER BY a", .head = "T:a/23/4/-1;C:SELECT 2;Z:I", .rows = &.{"1", "2"} },
     .{ .source = "SELECT CAST(1 AS INTEGER), CAST('x' AS CHARACTER VARYING(3)), 2::DOUBLE PRECISION", .head = "T:int4/23/4/-1,varchar/1043/-1/7,float8/701/8/-1;C:SELECT 1;Z:I", .rows = &.{"1|x|2"} },
 } },
-.{ .id = "T581.regex_substring", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "T581.regex_substring", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "SELECT SUBSTRING('foobar' SIMILAR '%#\x22o_b#\x22%' ESCAPE '#'), SUBSTRING('foobar' FROM '%#\x22o_b#\x22%' FOR '#'), SUBSTRING('foobar' SIMILAR 'x#\x22y#\x22z' ESCAPE '#'), SUBSTRING('abc123' FROM '[0-9]+')", .head = "T:substring/25/-1/-1,substring/25/-1/-1,substring/25/-1/-1,substring/25/-1/-1;C:SELECT 1;Z:I", .rows = &.{"oob|oob|\x5cN|123"} },
 } },
 .{ .id = "T591.unique_nullable", .ordered = false, .closed = true, .statements = &.{
@@ -3052,65 +3052,65 @@ const probes = [_]Probe{
     .{ .source = "INSERT INTO t VALUES ('{\x22k\x22: \x22v\x22}')", .head = "C:INSERT 0 1;Z:I", .rows = &.{} },
     .{ .source = "SELECT j ->> 'k' FROM t", .head = "T:?column?/25/-1/-1;C:SELECT 1;Z:I", .rows = &.{"v"} },
 } },
-.{ .id = "T811.json_constructors", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "T811.json_constructors", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "SELECT JSON_OBJECT('a' VALUE 1, 'b' VALUE 'x'), JSON_ARRAY(1, 'two', NULL), JSON_ARRAY(1, NULL NULL ON NULL), JSON_OBJECT('a' VALUE NULL ABSENT ON NULL), JSON_OBJECT(), JSON_ARRAY()", .head = "T:json_object/114/-1/-1,json_array/114/-1/-1,json_array/114/-1/-1,json_object/114/-1/-1,json_object/114/-1/-1,json_array/114/-1/-1;C:SELECT 1;Z:I", .rows = &.{"{\x22a\x22 : 1\x5c, \x22b\x22 : \x22x\x22}|[1\x5c, \x22two\x22]|[1\x5c, null]|{}|{}|[]"} },
     .{ .source = "SELECT JSON_OBJECT('a' VALUE 1 RETURNING jsonb), pg_typeof(JSON_ARRAY(1 RETURNING jsonb))", .head = "T:json_object/3802/-1/-1,pg_typeof/2206/4/-1;C:SELECT 1;Z:I", .rows = &.{"{\x22a\x22: 1}|jsonb"} },
 } },
-.{ .id = "T812.json_objectagg", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "T812.json_objectagg", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "CREATE TABLE t(k TEXT, v INT)", .head = "C:CREATE TABLE;Z:I", .rows = &.{} },
     .{ .source = "INSERT INTO t VALUES ('a', 1), ('b', NULL)", .head = "C:INSERT 0 2;Z:I", .rows = &.{} },
     .{ .source = "SELECT JSON_OBJECTAGG(k VALUE v), JSON_OBJECTAGG(k VALUE v ABSENT ON NULL), JSON_OBJECTAGG(k VALUE v RETURNING jsonb) FROM t", .head = "T:json_objectagg/114/-1/-1,json_objectagg/114/-1/-1,json_objectagg/3802/-1/-1;C:SELECT 1;Z:I", .rows = &.{"{ \x22a\x22 : 1\x5c, \x22b\x22 : null }|{ \x22a\x22 : 1 }|{\x22a\x22: 1\x5c, \x22b\x22: null}"} },
 } },
-.{ .id = "T813.json_arrayagg_order", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "T813.json_arrayagg_order", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "CREATE TABLE t(v INT)", .head = "C:CREATE TABLE;Z:I", .rows = &.{} },
     .{ .source = "INSERT INTO t VALUES (3), (1), (NULL), (2)", .head = "C:INSERT 0 4;Z:I", .rows = &.{} },
     .{ .source = "SELECT JSON_ARRAYAGG(v ORDER BY v), JSON_ARRAYAGG(v ORDER BY v DESC NULL ON NULL), JSON_ARRAYAGG(v ORDER BY v RETURNING jsonb) FROM t", .head = "T:json_arrayagg/114/-1/-1,json_arrayagg/114/-1/-1,json_arrayagg/3802/-1/-1;C:SELECT 1;Z:I", .rows = &.{"[1\x5c, 2\x5c, 3]|[null\x5c, 3\x5c, 2\x5c, 1]|[1\x5c, 2\x5c, 3]"} },
 } },
-.{ .id = "T814.json_colon", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "T814.json_colon", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "CREATE TABLE t(k TEXT, v INT)", .head = "C:CREATE TABLE;Z:I", .rows = &.{} },
     .{ .source = "INSERT INTO t VALUES ('x', 1)", .head = "C:INSERT 0 1;Z:I", .rows = &.{} },
     .{ .source = "SELECT JSON_OBJECT('a' : 1, 'b' : 'c'), JSON_OBJECTAGG(k : v) FROM t", .head = "T:json_object/114/-1/-1,json_objectagg/114/-1/-1;C:SELECT 1;Z:I", .rows = &.{"{\x22a\x22 : 1\x5c, \x22b\x22 : \x22c\x22}|{ \x22x\x22 : 1 }"} },
 } },
-.{ .id = "T821.json_query_operators", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "T821.json_query_operators", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "SELECT JSON_EXISTS(jsonb '{\x22a\x22: [1, 2]}', '$.a[1]'), JSON_EXISTS(jsonb '{\x22a\x22: 1}', '$.b'), JSON_VALUE(jsonb '{\x22a\x22: {\x22b\x22: \x22x\x22}}', '$.a.b'), JSON_VALUE(jsonb '{\x22a\x22: 5}', '$.a' RETURNING INT) + 1, JSON_QUERY(jsonb '{\x22a\x22: [1, 2]}', '$.a')", .head = "T:json_exists/16/1/-1,json_exists/16/1/-1,json_value/25/-1/-1,?column?/23/4/-1,json_query/3802/-1/-1;C:SELECT 1;Z:I", .rows = &.{"t|f|x|6|[1\x5c, 2]"} },
     .{ .source = "SELECT * FROM JSON_TABLE(jsonb '[{\x22id\x22: 1, \x22n\x22: \x22x\x22}, {\x22id\x22: 2}]', '$[*]' COLUMNS (id INT PATH '$.id', n TEXT PATH '$.n')) jt", .head = "T:id/23/4/-1,n/25/-1/-1;C:SELECT 2;Z:I", .rows = &.{"1|x", "2|\x5cN"} },
 } },
-.{ .id = "T822.is_json_unique", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "T822.is_json_unique", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "SELECT '{\x22a\x22:1,\x22a\x22:2}' IS JSON, '{\x22a\x22:1,\x22a\x22:2}' IS JSON WITH UNIQUE KEYS, '{\x22a\x22:1,\x22b\x22:2}' IS JSON WITH UNIQUE KEYS, '[1]' IS JSON OBJECT, '[1]' IS JSON ARRAY, '1' IS JSON SCALAR, 'x' IS JSON, '{\x22a\x22:1}' IS JSON WITHOUT UNIQUE KEYS", .head = "T:?column?/16/1/-1,?column?/16/1/-1,?column?/16/1/-1,?column?/16/1/-1,?column?/16/1/-1,?column?/16/1/-1,?column?/16/1/-1,?column?/16/1/-1;C:SELECT 1;Z:I", .rows = &.{"t|f|t|f|t|t|f|t"} },
 } },
-.{ .id = "T823.passing", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "T823.passing", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "SELECT JSON_EXISTS(jsonb '{\x22a\x22: 5}', '$.a ? (@ > $min)' PASSING 3 AS min), JSON_VALUE(jsonb '[10, 20]', '$[$i]' PASSING 1 AS i), JSON_QUERY(jsonb '{\x22k\x22: [1]}', '$.k' PASSING 'x' AS unused)", .head = "T:json_exists/16/1/-1,json_value/25/-1/-1,json_query/3802/-1/-1;C:SELECT 1;Z:I", .rows = &.{"t|20|[1]"} },
 } },
-.{ .id = "T825.on_empty_on_error", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "T825.on_empty_on_error", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "SELECT JSON_VALUE(jsonb '{\x22a\x22: 1}', '$.b' NULL ON EMPTY), JSON_VALUE(jsonb '{\x22a\x22: \x22x\x22}', '$.a' RETURNING INT NULL ON ERROR), JSON_QUERY(jsonb '{}', '$.a' EMPTY ARRAY ON EMPTY), JSON_EXISTS(jsonb '{}', 'strict $.a' FALSE ON ERROR)", .head = "T:json_value/25/-1/-1,json_value/23/4/-1,json_query/3802/-1/-1,json_exists/16/1/-1;C:SELECT 1;Z:I", .rows = &.{"\x5cN|\x5cN|[]|f"} },
     .{ .source = "SELECT JSON_VALUE(jsonb '{\x22a\x22: \x22x\x22}', '$.a' RETURNING INT ERROR ON ERROR)", .head = "E:22P02;Z:I", .rows = &.{} },
     .{ .source = "SELECT JSON_VALUE(jsonb '{}', 'strict $.a' ERROR ON ERROR)", .head = "E:2203A;Z:I", .rows = &.{} },
 } },
-.{ .id = "T826.on_error_expressions", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "T826.on_error_expressions", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "SELECT JSON_VALUE(jsonb '{}', '$.a' DEFAULT 'none' ON EMPTY), JSON_VALUE(jsonb '{\x22a\x22: \x22x\x22}', '$.a' RETURNING INT DEFAULT -1 ON ERROR), JSON_VALUE(jsonb '{}', '$.a' RETURNING INT DEFAULT 2 + 3 ON EMPTY)", .head = "T:json_value/25/-1/-1,json_value/23/4/-1,json_value/23/4/-1;C:SELECT 1;Z:I", .rows = &.{"none|-1|5"} },
 } },
 .{ .id = "T827.json_table_nested", .ordered = false, .closed = false, .statements = &.{
     .{ .source = "SELECT * FROM JSON_TABLE(jsonb '{\x22a\x22: [1, 2], \x22b\x22: [\x22x\x22]}', '$' COLUMNS (NESTED PATH '$.a[*]' COLUMNS (a INT PATH '$'), NESTED PATH '$.b[*]' COLUMNS (b TEXT PATH '$'))) jt", .head = "T:a/23/4/-1,b/25/-1/-1;C:SELECT 3;Z:I", .rows = &.{"1|\x5cN", "2|\x5cN", "\x5cN|x"} },
 } },
-.{ .id = "T828.json_query", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "T828.json_query", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "SELECT JSON_QUERY(jsonb '{\x22a\x22: {\x22b\x22: [1, 2]}}', '$.a'), JSON_QUERY(jsonb '[1, 2]', '$[0]'), JSON_QUERY(jsonb '{\x22a\x22: \x22s\x22}', '$.a' OMIT QUOTES), JSON_QUERY(jsonb '{\x22a\x22: \x22s\x22}', '$.a' KEEP QUOTES), JSON_QUERY(jsonb '{\x22a\x22: [1]}', '$.a' RETURNING TEXT)", .head = "T:json_query/3802/-1/-1,json_query/3802/-1/-1,json_query/3802/-1/-1,json_query/3802/-1/-1,json_query/25/-1/-1;C:SELECT 1;Z:I", .rows = &.{"{\x22b\x22: [1\x5c, 2]}|1|\x5cN|\x22s\x22|[1]"} },
 } },
-.{ .id = "T829.array_wrapper", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "T829.array_wrapper", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "SELECT JSON_QUERY(jsonb '[1, 2, 3]', '$[*]' WITH WRAPPER), JSON_QUERY(jsonb '[1]', '$[0]' WITH CONDITIONAL WRAPPER), JSON_QUERY(jsonb '[[1]]', '$[0]' WITH CONDITIONAL WRAPPER), JSON_QUERY(jsonb '[1, 2]', '$[*]' WITHOUT WRAPPER NULL ON ERROR), JSON_QUERY(jsonb '[1]', '$[0]' WITH UNCONDITIONAL ARRAY WRAPPER)", .head = "T:json_query/3802/-1/-1,json_query/3802/-1/-1,json_query/3802/-1/-1,json_query/3802/-1/-1,json_query/3802/-1/-1;C:SELECT 1;Z:I", .rows = &.{"[1\x5c, 2\x5c, 3]|1|[1]|\x5cN|[1]"} },
     .{ .source = "SELECT JSON_QUERY(jsonb '[1, 2]', '$[*]' WITHOUT WRAPPER ERROR ON ERROR)", .head = "E:22034;Z:I", .rows = &.{} },
 } },
-.{ .id = "T830.constructor_unique_keys", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "T830.constructor_unique_keys", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "SELECT JSON_OBJECT('a' VALUE 1, 'a' VALUE 2)", .head = "T:json_object/114/-1/-1;C:SELECT 1;Z:I", .rows = &.{"{\x22a\x22 : 1\x5c, \x22a\x22 : 2}"} },
     .{ .source = "SELECT JSON_OBJECT('a' VALUE 1, 'a' VALUE 2 WITH UNIQUE KEYS)", .head = "E:22030;Z:I", .rows = &.{} },
     .{ .source = "SELECT JSON_OBJECT('a' VALUE 1, 'b' VALUE 2 WITH UNIQUE)", .head = "T:json_object/114/-1/-1;C:SELECT 1;Z:I", .rows = &.{"{\x22a\x22 : 1\x5c, \x22b\x22 : 2}"} },
     .{ .source = "SELECT JSON_OBJECTAGG(k VALUE 1 WITH UNIQUE KEYS) FROM (VALUES ('x'), ('x')) v(k)", .head = "E:22030;Z:I", .rows = &.{} },
 } },
-.{ .id = "T831.strict_mode", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "T831.strict_mode", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "SELECT jsonb_path_query_array('{\x22a\x22: [1, 2]}', 'lax $.a.b'), jsonb_path_exists('{\x22a\x22: 1}', 'lax $.b'), jsonb_path_query_array('[1, [2, 3]]', 'lax $[*][*]')", .head = "T:jsonb_path_query_array/3802/-1/-1,jsonb_path_exists/16/1/-1,jsonb_path_query_array/3802/-1/-1;C:SELECT 1;Z:I", .rows = &.{"[]|f|[1\x5c, 2\x5c, 3]"} },
     .{ .source = "SELECT jsonb_path_query_first('{\x22a\x22: 1}', 'strict $.b')", .head = "E:2203A;Z:I", .rows = &.{} },
     .{ .source = "SELECT jsonb_path_query_array('{\x22a\x22: 1}', 'strict $.b', '{}', true), jsonb_path_exists('{\x22a\x22: [1]}', 'strict $.a.size()')", .head = "T:jsonb_path_query_array/3802/-1/-1,jsonb_path_exists/16/1/-1;C:SELECT 1;Z:I", .rows = &.{"[]|t"} },
 } },
-.{ .id = "T832.item_methods", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "T832.item_methods", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "SELECT jsonb_path_query_first('[1, 2, 3]', '$.size()'), jsonb_path_query_first('\x22x\x22', '$.type()'), jsonb_path_query_first('\x221.5\x22', '$.double()'), jsonb_path_query_first('-2.5', '$.abs()'), jsonb_path_query_first('2.4', '$.ceiling()'), jsonb_path_query_first('2.6', '$.floor()'), jsonb_path_query_array('{\x22a\x22: 1}', '$.keyvalue()')", .head = "T:jsonb_path_query_first/3802/-1/-1,jsonb_path_query_first/3802/-1/-1,jsonb_path_query_first/3802/-1/-1,jsonb_path_query_first/3802/-1/-1,jsonb_path_query_first/3802/-1/-1,jsonb_path_query_first/3802/-1/-1,jsonb_path_query_array/3802/-1/-1;C:SELECT 1;Z:I", .rows = &.{"3|\x22string\x22|1.5|2.5|3|2|[{\x22id\x22: 0\x5c, \x22key\x22: \x22a\x22\x5c, \x22value\x22: 1}]"} },
 } },
 .{ .id = "T833.multiple_subscripts", .ordered = false, .closed = true, .statements = &.{
@@ -3125,13 +3125,13 @@ const probes = [_]Probe{
 .{ .id = "T836.starts_with", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "SELECT jsonb_path_query_array('[\x22apple\x22, \x22banana\x22, \x22avocado\x22]', '$[*] ? (@ starts with \x22a\x22)'), jsonb_path_exists('\x22hello\x22', '$ ? (@ starts with \x22he\x22)')", .head = "T:jsonb_path_query_array/3802/-1/-1,jsonb_path_exists/16/1/-1;C:SELECT 1;Z:I", .rows = &.{"[\x22apple\x22\x5c, \x22avocado\x22]|t"} },
 } },
-.{ .id = "T837.like_regex", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "T837.like_regex", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "SELECT jsonb_path_query_array('[\x22abc\x22, \x22ABD\x22, \x22xyz\x22]', '$[*] ? (@ like_regex \x22^ab\x22)'), jsonb_path_query_array('[\x22abc\x22, \x22ABD\x22]', '$[*] ? (@ like_regex \x22^ab\x22 flag \x22i\x22)')", .head = "T:jsonb_path_query_array/3802/-1/-1,jsonb_path_query_array/3802/-1/-1;C:SELECT 1;Z:I", .rows = &.{"[\x22abc\x22]|[\x22abc\x22\x5c, \x22ABD\x22]"} },
 } },
 .{ .id = "T840.path_hex_literals", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "SELECT jsonb_path_query_first('16', '$ ? (@ == 0x10)'), jsonb_path_query_first('{\x22a\x22: 9}', '$.a ? (@ == 0o11)'), jsonb_path_query_first('[5]', '$[0] ? (@ == 0b101)'), jsonb_path_query_first('1000', '$ ? (@ == 1_000)')", .head = "T:jsonb_path_query_first/3802/-1/-1,jsonb_path_query_first/3802/-1/-1,jsonb_path_query_first/3802/-1/-1,jsonb_path_query_first/3802/-1/-1;C:SELECT 1;Z:I", .rows = &.{"16|9|5|1000"} },
 } },
-.{ .id = "T851.json_optional_keywords", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "T851.json_optional_keywords", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "SELECT JSON_OBJECT('a' VALUE 1 NULL ON NULL), JSON_OBJECT('a' VALUE 2 ABSENT ON NULL), JSON_ARRAY('[1]' FORMAT JSON), JSON_QUERY(jsonb '{\x22a\x22: 1}', '$.a' WITHOUT ARRAY WRAPPER), JSON_EXISTS(jsonb '{}', '$.a' FALSE ON ERROR), JSON_VALUE(jsonb '{\x22a\x22: \x22x\x22}', '$.a' RETURNING TEXT NULL ON EMPTY NULL ON ERROR)", .head = "T:json_object/114/-1/-1,json_object/114/-1/-1,json_array/114/-1/-1,json_query/3802/-1/-1,json_exists/16/1/-1,json_value/25/-1/-1;C:SELECT 1;Z:I", .rows = &.{"{\x22a\x22 : 1}|{\x22a\x22 : 2}|[[1]]|1|f|x"} },
 } },
 .{ .id = "T865.bigint_method", .ordered = false, .closed = true, .statements = &.{
@@ -3219,13 +3219,13 @@ const probes = [_]Probe{
     .{ .source = "SELECT id, x FROM t", .head = "T:id/23/4/-1,x/142/-1/-1;C:SELECT 1;Z:I", .rows = &.{"1|<root><a>1<\x5c/a><\x5c/root>"} },
     .{ .source = "SELECT xpath('/root/a/text()', x) FROM t", .head = "T:xpath/143/-1/-1;C:SELECT 1;Z:I", .rows = &.{"{1}"} },
 } },
-.{ .id = "X020.xmlconcat", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "X020.xmlconcat", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "SELECT XMLCONCAT('<a/>', '<b>x</b>'), XMLCONCAT(NULL, '<c/>'), XMLCONCAT(NULL, NULL)", .head = "T:xmlconcat/142/-1/-1,xmlconcat/142/-1/-1,xmlconcat/142/-1/-1;C:SELECT 1;Z:I", .rows = &.{"<a\x5c/><b>x<\x5c/b>|<c\x5c/>|\x5cN"} },
 } },
-.{ .id = "X031.xmlelement", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "X031.xmlelement", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "SELECT XMLELEMENT(NAME foo), XMLELEMENT(NAME foo, XMLATTRIBUTES(1 AS bar, 'x' AS \x22Baz\x22), 'content', XMLELEMENT(NAME child)), XMLELEMENT(NAME e, 'a<b')", .head = "T:xmlelement/142/-1/-1,xmlelement/142/-1/-1,xmlelement/142/-1/-1;C:SELECT 1;Z:I", .rows = &.{"<foo\x5c/>|<foo bar=\x221\x22 Baz=\x22x\x22>content<child\x5c/><\x5c/foo>|<e>a&lt\x5c;b<\x5c/e>"} },
 } },
-.{ .id = "X032.xmlforest", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "X032.xmlforest", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "SELECT XMLFOREST(1 AS a, 'x' AS b, NULL AS c)", .head = "T:xmlforest/142/-1/-1;C:SELECT 1;Z:I", .rows = &.{"<a>1<\x5c/a><b>x<\x5c/b>"} },
     .{ .source = "CREATE TABLE t(id INT, name TEXT)", .head = "C:CREATE TABLE;Z:I", .rows = &.{} },
     .{ .source = "INSERT INTO t VALUES (1, 'n')", .head = "C:INSERT 0 1;Z:I", .rows = &.{} },
@@ -3237,20 +3237,20 @@ const probes = [_]Probe{
     .{ .source = "SELECT XMLAGG(XMLELEMENT(NAME v, v) ORDER BY v) FROM t", .head = "T:xmlagg/142/-1/-1;C:SELECT 1;Z:I", .rows = &.{"<v>a<\x5c/v><v>b<\x5c/v>"} },
     .{ .source = "SELECT XMLAGG(XMLELEMENT(NAME v, v)) FROM t WHERE false", .head = "T:xmlagg/142/-1/-1;C:SELECT 1;Z:I", .rows = &.{"\x5cN"} },
 } },
-.{ .id = "X035.xmlagg_order", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "X035.xmlagg_order", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "CREATE TABLE t(v INT)", .head = "C:CREATE TABLE;Z:I", .rows = &.{} },
     .{ .source = "INSERT INTO t VALUES (2), (1), (3)", .head = "C:INSERT 0 3;Z:I", .rows = &.{} },
     .{ .source = "SELECT XMLAGG(XMLELEMENT(NAME n, v) ORDER BY v DESC) FROM t", .head = "T:xmlagg/142/-1/-1;C:SELECT 1;Z:I", .rows = &.{"<n>3<\x5c/n><n>2<\x5c/n><n>1<\x5c/n>"} },
 } },
-.{ .id = "X036.xmlcomment", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "X036.xmlcomment", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "SELECT XMLCOMMENT('hello'), XMLCOMMENT(NULL)", .head = "T:xmlcomment/142/-1/-1,xmlcomment/142/-1/-1;C:SELECT 1;Z:I", .rows = &.{"<!--hello-->|\x5cN"} },
     .{ .source = "SELECT XMLCOMMENT('bad--comment')", .head = "E:2200S;Z:I", .rows = &.{} },
 } },
-.{ .id = "X037.xmlpi", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "X037.xmlpi", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "SELECT XMLPI(NAME php, 'echo 1;'), XMLPI(NAME foo)", .head = "T:xmlpi/142/-1/-1,xmlpi/142/-1/-1;C:SELECT 1;Z:I", .rows = &.{"<?php echo 1\x5c;?>|<?foo?>"} },
     .{ .source = "SELECT XMLPI(NAME xml, 'x')", .head = "E:2200T;Z:I", .rows = &.{} },
 } },
-.{ .id = "X038.xmltext", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "X038.xmltext", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "SELECT XMLTEXT('a < b & c'), XMLTEXT(NULL)", .head = "T:xmltext/142/-1/-1,xmltext/142/-1/-1;C:SELECT 1;Z:I", .rows = &.{"a &lt\x5c; b &amp\x5c; c|\x5cN"} },
 } },
 .{ .id = "X040.table_mapping", .ordered = false, .closed = false, .statements = &.{
@@ -3383,13 +3383,13 @@ const probes = [_]Probe{
     .{ .source = "SELECT XMLSERIALIZE(DOCUMENT '<r/>' AS TEXT)", .head = "T:xmlserialize/25/-1/-1;C:SELECT 1;Z:I", .rows = &.{"<r\x5c/>"} },
     .{ .source = "SELECT XMLSERIALIZE(DOCUMENT 'x<a/>' AS TEXT)", .head = "E:2200L;Z:I", .rows = &.{} },
 } },
-.{ .id = "X072.xmlserialize", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "X072.xmlserialize", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "SELECT XMLSERIALIZE(CONTENT XMLELEMENT(NAME e, 1) AS CHARACTER VARYING(30))", .head = "T:xmlserialize/1043/-1/34;C:SELECT 1;Z:I", .rows = &.{"<e>1<\x5c/e>"} },
 } },
 .{ .id = "X090.document_predicate", .ordered = false, .closed = false, .statements = &.{
     .{ .source = "SELECT '<a/>'::xml IS DOCUMENT, 'x<a/>'::xml IS DOCUMENT, '<a/>'::xml IS NOT DOCUMENT, NULL::xml IS DOCUMENT", .head = "T:?column?/16/1/-1,?column?/16/1/-1,?column?/16/1/-1,?column?/16/1/-1;C:SELECT 1;Z:I", .rows = &.{"t|f|f|\x5cN"} },
 } },
-.{ .id = "X120.xml_params_sql_routines", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "X120.xml_params_sql_routines", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "CREATE FUNCTION wrap(x XML) RETURNS XML LANGUAGE SQL AS $$SELECT XMLELEMENT(NAME w, x)$$", .head = "C:CREATE FUNCTION;Z:I", .rows = &.{} },
     .{ .source = "SELECT wrap('<i/>')", .head = "T:wrap/142/-1/-1;C:SELECT 1;Z:I", .rows = &.{"<w><i\x5c/><\x5c/w>"} },
 } },
