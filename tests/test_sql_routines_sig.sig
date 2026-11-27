@@ -13,7 +13,7 @@
 const std = @import("std");
 const sql = @import("sql");
 
-const DB = sql.Database(.{ .tables = 6, .columns = 8, .rows_per_table = 32, .name_bytes = 32, .text_bytes = 128, .nulls_first_ascending = false, .integer_bits = 32, .transactions = 4, .sequences = 2, .expr_nodes = 1024, .routines = 24, .triggers = 2, .rules = 1, .routine_args = 6, .routine_bytes = 768, .schemas = 4 });
+const DB = sql.Database(.{ .tables = 6, .columns = 8, .rows_per_table = 32, .name_bytes = 32, .text_bytes = 128, .nulls_first_ascending = false, .integer_bits = 32, .transactions = 4, .sequences = 2, .expr_nodes = 1024, .routines = 24, .triggers = 2, .rules = 1, .routine_args = 6, .routine_bytes = 768, .schemas = 4, .work_rows = 512 });
 
 var assertions: usize = 0;
 var db: DB = .{};
@@ -319,7 +319,80 @@ fn diagnostics() !void {
     try sameState(&.{ "SELECT id, v FROM log7 ORDER BY v", "SELECT diag(0), codes(3)" });
 }
 
+// ---- schema-qualified routines -----------------------------------------
+
+fn schemas() !void {
+    try run("CREATE SCHEMA s1");
+    try run("CREATE SCHEMA s2");
+    try run("CREATE TABLE s1.t (id INT)");
+    try run("INSERT INTO s1.t VALUES (1)");
+    try run("CREATE FUNCTION s1.f(a INT) RETURNS INT LANGUAGE sql AS 'SELECT a + 1'");
+    try run("CREATE FUNCTION s2.f(a INT) RETURNS INT LANGUAGE sql AS 'SELECT a + 2'");
+    try run("CREATE FUNCTION s2.f(a TEXT) RETURNS TEXT LANGUAGE sql AS $$SELECT a || '!'$$");
+    try expect("SELECT s1.f(1), s2.f(1), s2.f('x')", "2|3|x!");
+    // Neither schema is on the search path; a missing schema is 3F000.
+    try fails("SELECT f(1)", error.UndefinedFunction);
+    try fails("SELECT s9.f(1)", error.UndefinedSchema);
+    try fails("CREATE FUNCTION s3.f(a INT) RETURNS INT LANGUAGE sql AS 'SELECT 1'", error.UndefinedSchema);
+    try fails("CREATE FUNCTION s1.f(a INT) RETURNS INT LANGUAGE sql AS 'SELECT 0'", error.DuplicateFunction);
+    try run("CREATE OR REPLACE FUNCTION s1.f(a INT) RETURNS INT LANGUAGE sql AS 'SELECT a + 10'");
+    try expect("SELECT s1.f(1)", "11");
+    try run("CREATE PROCEDURE s2.p(x INT) LANGUAGE plpgsql AS $$BEGIN INSERT INTO s1.t VALUES (x); END$$");
+    try run("CALL s2.p(5)");
+    try fails("CALL p(1)", error.UndefinedFunction);
+    try fails("CALL s9.p(1)", error.UndefinedSchema);
+    try expect("SELECT id FROM s1.t ORDER BY id", "1;5");
+    try expect("SELECT (SELECT nspname FROM pg_namespace n WHERE n.oid = p.pronamespace), prokind FROM pg_proc p WHERE proname = 'f' ORDER BY 1, oid", "s1|f;s2|f;s2|f");
+    try expect("SELECT (SELECT nspname FROM pg_namespace n WHERE n.oid = p.pronamespace), prokind FROM pg_proc p WHERE proname = 'p'", "s2|p");
+    try sameState(&.{ "SELECT s1.f(1), s2.f(1), s2.f('x')", "SELECT id FROM s1.t ORDER BY id" });
+    // DROP with signatures, IF EXISTS and an ambiguous name.
+    try run("DROP FUNCTION s1.f(int)");
+    try fails("DROP FUNCTION s1.f(int)", error.UndefinedFunction);
+    try run("DROP FUNCTION IF EXISTS s1.f(int)");
+    try run("DROP FUNCTION IF EXISTS s9.f(int)");
+    try fails("DROP FUNCTION s9.f(int)", error.UndefinedSchema);
+    try fails("DROP FUNCTION s2.f", error.AmbiguousFunction);
+    try run("DROP FUNCTION s2.f(text)");
+    try run("DROP FUNCTION s2.f");
+    try fails("SELECT s2.f(1)", error.UndefinedFunction);
+    // DROP SCHEMA: RESTRICT keeps routines (2BP01), CASCADE drops them first.
+    try rejects("DROP SCHEMA s2", error.DependentObjects, "SELECT count(*) FROM pg_proc WHERE proname = 'p'", "1");
+    try run("DROP SCHEMA s2 CASCADE");
+    try expect("SELECT count(*) FROM pg_proc WHERE proname = 'f' OR proname = 'p'", "0");
+    try sameState(&.{"SELECT count(*) FROM pg_proc WHERE proname = 'f' OR proname = 'p'"});
+    // "$user" precedes public in the default search_path.
+    try run("CREATE FUNCTION k() RETURNS TEXT LANGUAGE sql AS $$SELECT 'public'$$");
+    try run("CREATE SCHEMA ramsql");
+    try expect("SELECT k()", "public");
+    try run("CREATE FUNCTION ramsql.k() RETURNS TEXT LANGUAGE sql AS $$SELECT 'user'$$");
+    try expect("SELECT k(), public.k(), ramsql.k()", "user|public|user");
+    try run("CREATE FUNCTION k2(a INT) RETURNS TEXT LANGUAGE sql AS $$SELECT 'k2'$$");
+    try expect("SELECT (SELECT nspname FROM pg_namespace n WHERE n.oid = p.pronamespace) FROM pg_proc p WHERE proname = 'k2'", "ramsql");
+    try run("DROP FUNCTION k");
+    try expect("SELECT k()", "public");
+    try run("DROP FUNCTION k");
+    try fails("SELECT k()", error.UndefinedFunction);
+    try run("DROP SCHEMA ramsql CASCADE");
+    try expect("SELECT count(*) FROM pg_proc WHERE proname = 'k' OR proname = 'k2'", "0");
+    // A trigger function in a schema; DROP SCHEMA CASCADE drops the trigger.
+    try run("CREATE SCHEMA s1b");
+    try run("CREATE TABLE tt (a INT)");
+    try run("CREATE FUNCTION s1b.tf() RETURNS TRIGGER LANGUAGE plpgsql AS $$BEGIN NEW.a := NEW.a * 2; RETURN NEW; END$$");
+    try run("CREATE TRIGGER tg BEFORE INSERT ON tt FOR EACH ROW EXECUTE FUNCTION s1b.tf()");
+    try run("INSERT INTO tt VALUES (4)");
+    try expect("SELECT a FROM tt", "8");
+    try rejects("DROP SCHEMA s1b", error.DependentObjects, "SELECT count(*) FROM pg_trigger", "1");
+    try run("DROP SCHEMA s1b CASCADE");
+    try run("INSERT INTO tt VALUES (4)");
+    try expect("SELECT a FROM tt ORDER BY a", "4;8");
+    try sameState(&.{ "SELECT a FROM tt ORDER BY a", "SELECT count(*) FROM pg_trigger", "SELECT count(*) FROM pg_proc WHERE proname = 'tf'" });
+    try run("DROP TABLE tt");
+    try run("DROP TABLE s1.t");
+    try run("DROP SCHEMA s1");
+}
+
 pub fn main() !void {
     try diagnostics();
+    try schemas();
     std.debug.print("routines-sig: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });
 }

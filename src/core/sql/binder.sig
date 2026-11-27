@@ -363,6 +363,11 @@ pub fn Binder(comptime config: types.Config) type {
             // Routines (B11 wave 3).
             /// User functions resolvable by name; null: none.
             routines: ?*const RC.Set = null,
+            /// Namespaces unqualified user routines resolve in, in
+            /// search_path order (B11 wave 4); without `routine_path_known`
+            /// public when it is on the path.
+            routine_path: []const u32 = &.{},
+            routine_path_known: bool = false,
             /// Variables of the running routine (parameters, PL/pgSQL
             /// variables, NEW/OLD): names that no column binds read them.
             variables: ?*const RoutineVariables = null,
@@ -5310,17 +5315,25 @@ pub fn Binder(comptime config: types.Config) type {
         /// Arguments are converted to the parameter types; the routine hook
         /// evaluates the body when the call runs.
         fn bindRoutineCall(context: *const Context, n: *ast.Node, count: usize) Error!void {
-            if (n.qualifier.len != 0) {
-                if (try qualifierNamespace(context, n.qualifier) != catalog.public_namespace) return error.UndefinedFunction;
-            } else if (!publicLookup(context, n.name)) return error.UndefinedFunction;
+            var single: [1]u32 = .{catalog.public_namespace};
+            const path: []const u32 = if (n.qualifier.len != 0) blk: {
+                single[0] = try qualifierNamespace(context, n.qualifier);
+                break :blk &single;
+            } else if (context.stored_source_start != 0 and n.name.span.start >= context.stored_source_start)
+                &single
+            else if (context.routine_path_known)
+                context.routine_path
+            else if (publicLookup(context, n.name)) &single else &.{};
+            if (path.len == 0) return error.UndefinedFunction;
             const set = context.routines orelse return error.UndefinedFunction;
             const name = toName(context, n.name);
             var best: ?usize = null;
             var best_exact: usize = 0;
             var ambiguous = false;
             for (&set.routines, 0..) |*routine, index| {
-                if (!routine.live or routine.namespace != catalog.public_namespace or !routine.stamp.visible(context.snapshot)) continue;
+                if (!routine.live or !routine.stamp.visible(context.snapshot)) continue;
                 if (!types.same(routine.name.slice(), name.slice()) or routine.arg_count != count) continue;
+                if (routineHidden(set, index, path, context.snapshot)) continue;
                 var exact: usize = 0;
                 var accepted = true;
                 var item = n.b;
@@ -5379,6 +5392,19 @@ pub fn Binder(comptime config: types.Config) type {
             n.ty = types.typeOfData(result);
             n.typmod = routine.return_typmod;
             n.constant = false;
+        }
+
+        /// A routine found through `path` is hidden by one with the same
+        /// input types in an earlier namespace (or is outside the path).
+        fn routineHidden(set: *const RC.Set, index: usize, path: []const u32, snap: storage.Snapshot) bool {
+            const routine = &set.routines[index];
+            const rank = std.mem.indexOfScalar(u32, path, routine.namespace) orelse return true;
+            for (&set.routines) |*other| {
+                if (!other.live or !other.stamp.visible(snap) or !types.same(other.name.slice(), routine.name.slice())) continue;
+                if (std.mem.indexOfScalar(u32, path[0..rank], other.namespace) == null) continue;
+                if (RC.sameArgs(other.args(), routine.args())) return true;
+            }
+            return false;
         }
 
         /// A column reference that names a routine variable: `name` (a

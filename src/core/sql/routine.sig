@@ -56,6 +56,7 @@ pub fn Routines(comptime config: types.Config) type {
             replace: bool = false,
             procedure: bool = false,
             has_schema: bool = false,
+            schema: Name = .{},
             name: Name = .{},
             args: [config.routine_args]Arg = @splat(.{}),
             arg_count: usize = 0,
@@ -77,6 +78,7 @@ pub fn Routines(comptime config: types.Config) type {
             procedure: bool = false,
             any_kind: bool = false,
             has_schema: bool = false,
+            schema: Name = .{},
             if_exists: bool = false,
             cascade: bool = false,
             name: Name = .{},
@@ -89,6 +91,7 @@ pub fn Routines(comptime config: types.Config) type {
         pub const Call = struct {
             name: Name = .{},
             has_schema: bool = false,
+            schema: Name = .{},
             args: [config.routine_args]Span = @splat(.{}),
             arg_count: usize = 0,
         };
@@ -117,6 +120,7 @@ pub fn Routines(comptime config: types.Config) type {
         pub const CreateTrigger = struct {
             replace: bool = false,
             has_function_schema: bool = false,
+            function_schema: Name = .{},
             name: Name = .{},
             tgtype: u8 = 0,
             columns: [config.columns]Name = @splat(.{}),
@@ -366,7 +370,7 @@ pub fn Routines(comptime config: types.Config) type {
             }
             out.procedure = try cursor.take("procedure");
             if (!out.procedure) try cursor.expect("function");
-            out.name = try publicName(cursor, &out.has_schema);
+            out.name = try qualifiedName(cursor, &out.has_schema, &out.schema);
             try cursor.expectSymbol(.lparen);
             if (!try cursor.takeSymbol(.rparen)) while (true) {
                 if (out.arg_count == config.routine_args) return error.ColumnCapacity;
@@ -473,7 +477,7 @@ pub fn Routines(comptime config: types.Config) type {
                 try cursor.expect("exists");
                 out.if_exists = true;
             }
-            out.name = try publicName(cursor, &out.has_schema);
+            out.name = try qualifiedName(cursor, &out.has_schema, &out.schema);
             try routineSignature(cursor, pool, out);
             if (cursor.symbol(.comma)) return error.UnsupportedStatement;
             if (try cursor.take("cascade")) out.cascade = true else _ = try cursor.take("restrict");
@@ -485,7 +489,7 @@ pub fn Routines(comptime config: types.Config) type {
             try cursor.expect("alter");
             out.routine.procedure = try cursor.take("procedure");
             if (!out.routine.procedure) try cursor.expect("function");
-            out.routine.name = try publicName(cursor, &out.routine.has_schema);
+            out.routine.name = try qualifiedName(cursor, &out.routine.has_schema, &out.routine.schema);
             try routineSignature(cursor, pool, &out.routine);
             if (!try cursor.take("owner")) return error.UnsupportedStatement;
             try cursor.expect("to");
@@ -527,6 +531,7 @@ pub fn Routines(comptime config: types.Config) type {
                 if (try cursor.takeSymbol(.dot)) {
                     target.routine.has_schema = true;
                     target.schema = target.routine.name;
+                    target.routine.schema = target.schema;
                     if (!types.same(target.schema.slice(), "public") and !types.same(target.schema.slice(), "pg_catalog")) return error.UnsupportedStatement;
                     target.routine.name = try cursor.identifier();
                 }
@@ -594,11 +599,12 @@ pub fn Routines(comptime config: types.Config) type {
             return error.Syntax;
         }
 
-        fn publicName(cursor: *Cursor, has_schema: *bool) Error!Name {
+        /// `[schema.]name`: the schema is resolved when the statement runs.
+        fn qualifiedName(cursor: *Cursor, has_schema: *bool, schema: *Name) Error!Name {
             var name = try cursor.identifier();
             if (try cursor.takeSymbol(.dot)) {
                 has_schema.* = true;
-                if (!types.same(name.slice(), "public")) return error.UnsupportedStatement;
+                schema.* = name;
                 name = try cursor.identifier();
             }
             return name;
@@ -607,7 +613,7 @@ pub fn Routines(comptime config: types.Config) type {
         fn call(cursor: *Cursor, out: *Call) Error!void {
             out.* = .{};
             try cursor.expect("call");
-            out.name = try publicName(cursor, &out.has_schema);
+            out.name = try qualifiedName(cursor, &out.has_schema, &out.schema);
             try cursor.expectSymbol(.lparen);
             if (!try cursor.takeSymbol(.rparen)) while (true) {
                 if (out.arg_count == config.routine_args) return error.ColumnCapacity;
@@ -725,7 +731,7 @@ pub fn Routines(comptime config: types.Config) type {
             if (try cursor.take("when")) out.when = try parenthesized(cursor);
             try cursor.expect("execute");
             if (!try cursor.take("function")) try cursor.expect("procedure");
-            out.function = try publicName(cursor, &out.has_function_schema);
+            out.function = try qualifiedName(cursor, &out.has_function_schema, &out.function_schema);
             if (cursor.symbol(.dot)) return error.UnsupportedStatement;
             try cursor.expectSymbol(.lparen);
             if (!try cursor.takeSymbol(.rparen)) while (true) {

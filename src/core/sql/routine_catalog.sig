@@ -766,6 +766,13 @@ pub fn Catalog(comptime config: types.Config) type {
             }
         }
 
+        /// A routine of the overlay lives in this namespace (DROP SCHEMA
+        /// records follow the drops of its routines).
+        pub fn overlayNamespaceUsed(overlay: *const Overlay, namespace: u32) bool {
+            for (&overlay.objects) |*object| if (object.live and object.class == .routine and object.namespace == namespace) return true;
+            return false;
+        }
+
         pub fn overlayHas(overlay: *const Overlay, oid: u32) bool {
             for (&overlay.objects) |*object| if (object.live and object.oid == oid) return true;
             return false;

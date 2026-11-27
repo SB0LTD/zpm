@@ -1948,6 +1948,10 @@ pub fn Database(comptime config: Config) type {
         /// The last RAISE / ASSERT description, until a handler takes it
         /// (B11 wave 4: SQLSTATE, SQLERRM, GET STACKED DIAGNOSTICS).
         routine_diag: R.Diagnostics = .{},
+        /// The routine search path of the statement being bound
+        /// (routinePath; B11 wave 4).
+        routine_path_items: [routine_path_capacity]u32 = @splat(0),
+        routine_path_len: usize = 0,
         /// Write-set index where the running statement's writes begin (its
         /// AFTER ROW triggers read them); kept across a park.
         statement_start: usize = 0,
@@ -3166,7 +3170,8 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn bindContext(self: *Self, source: []const u8, mode: ParseMode, snap: Snapshot) B.Context {
-            return .{ .source = source, .tables = &self.tables, .catalog = &self.catalog, .snapshot = snap, .pool = &self.workspace.nodes, .legacy = mode == .legacy_alpha, .dialect = self.dialect, .session = &self.session, .plans = &self.workspace.plans, .params = self.active_params,
+            self.routine_path_len = self.routinePath(snap, &self.routine_path_items);
+            return .{ .routine_path = self.routine_path_items[0..self.routine_path_len], .routine_path_known = true, .source = source, .tables = &self.tables, .catalog = &self.catalog, .snapshot = snap, .pool = &self.workspace.nodes, .legacy = mode == .legacy_alpha, .dialect = self.dialect, .session = &self.session, .plans = &self.workspace.plans, .params = self.active_params,
                 .routines = &self.objects, .variables = if (self.routine_frame) |frame| &frame.variables else null,
                 .namespace_usage = .{ .ptr = self, .check = &bindNamespaceUsage },
                 .namespace_create = .{ .ptr = self, .check = &bindNamespaceCreate } };
@@ -3769,6 +3774,13 @@ pub fn Database(comptime config: Config) type {
                 if (!drop.cascade) return error.DependentObjects;
                 type_count += 1;
             }
+            // Routines of the schema (B11 wave 4): RESTRICT keeps them
+            // (2BP01); CASCADE drops them below, before the schema.
+            for (&self.objects.routines) |*routine| {
+                if (!routine.live or routine.namespace != drop.oid) continue;
+                if (routine.stamp.creatorOther(snap) orelse routine.stamp.deleterOther(snap)) |other| return self.waitObject(slot, other);
+                if (routine.stamp.visible(current) and !drop.cascade) return error.DependentObjects;
+            }
             var relations: [K.relation_rows]K.Found = undefined;
             const count = self.catalog.visibleRelations(current, &relations);
             for (relations[0..count]) |found| {
@@ -3805,6 +3817,13 @@ pub fn Database(comptime config: Config) type {
                             self.visibleTableSlot(constraint.ref_oid, after) == null) return error.UnsupportedStatement;
                     }
                 }
+            }
+            for (&self.objects.routines, 0..) |*routine, index| {
+                if (!routine.live or routine.namespace != drop.oid or !routine.stamp.visible(current)) continue;
+                for (&self.objects.triggers, 0..) |*trigger, position| {
+                    if (trigger.live and trigger.function_oid == routine.oid and trigger.stamp.visible(current)) try self.dropObject(slot, .trigger, position, current);
+                }
+                try self.dropObject(slot, .routine, index, current);
             }
             try self.reserveWrites(slot, 2 + type_count);
             for (&self.catalog_objects.items, 0..) |*o, index| {
@@ -7029,11 +7048,16 @@ pub fn Database(comptime config: Config) type {
                     oid = op.function_oid;
                 }
             }
-            if ((namespace orelse catalog_module.public_namespace) != catalog_module.public_namespace) return oid;
-            if (namespace == null and !self.session.public_schema_on_path) return oid;
-            for (&self.objects.routines) |*routine| {
-                if (!routine.live or routine.namespace != catalog_module.public_namespace or
+            if (namespace != null and namespace.? == catalog_module.catalog_namespace) return oid;
+            var path: [routine_path_capacity]u32 = undefined;
+            const path_len = if (namespace) |explicit| blk: {
+                path[0] = explicit;
+                break :blk 1;
+            } else self.routinePath(self.seq_snap, &path);
+            for (&self.objects.routines, 0..) |*routine, index| {
+                if (!routine.live or std.mem.indexOfScalar(u32, path[0..path_len], routine.namespace) == null or
                     !routine.stamp.visible(self.seq_snap) or !types.same(routine.name.slice(), name)) continue;
+                if (self.routineHidden(index, path[0..path_len], self.seq_snap)) continue;
                 if (namespace == null and oid != null and builtinShadowsRoutine(routine)) continue;
                 if (oid != null) return error.AmbiguousFunction;
                 oid = routine.oid;
@@ -12321,6 +12345,73 @@ pub fn Database(comptime config: Config) type {
             self.wake_epoch +%= 1;
         }
 
+        /// Namespaces unqualified routine names search, in search_path
+        /// order: `$user` (a schema named like current_user, when one
+        /// exists), public and any other listed schema that exists. The
+        /// binder matches pg_catalog's built-ins before user routines.
+        pub const routine_path_capacity = 4;
+
+        fn routinePath(self: *const Self, snap: Snapshot, out: *[routine_path_capacity]u32) usize {
+            const values = if (self.session_state) |state| &state.values else &self.default_session_state.values;
+            var items = std.mem.splitSequence(u8, values.search_path.slice(), ", ");
+            var count: usize = 0;
+            while (items.next()) |raw| {
+                var item = raw;
+                if (item.len >= 2 and item[0] == '"' and item[item.len - 1] == '"') item = item[1 .. item.len - 1];
+                if (item.len == 0 or types.same(item, "pg_catalog") or types.same(item, "pg_temp")) continue;
+                const namespace: u32 = if (types.same(item, "public")) catalog_module.public_namespace else blk: {
+                    const name = if (types.same(item, "$user")) (self.catalog_objects.roleName(self.session.role, snap) orelse continue) else item;
+                    const found = self.catalog.findSchema(name, snap) orelse continue;
+                    break :blk found.oid;
+                };
+                if (std.mem.indexOfScalar(u32, out[0..count], namespace) != null) continue;
+                if (count == out.len) break;
+                out[count] = namespace;
+                count += 1;
+            }
+            return count;
+        }
+
+        /// The schema a routine is created in: the named one (3F000 when
+        /// missing; a user schema needs CREATE on it), else the first
+        /// existing schema of the search path (3F000 with none).
+        fn routineCreateNamespace(self: *Self, has_schema: bool, schema: V.Name, snap: Snapshot) Error!u32 {
+            var latest = snap;
+            latest.csn = self.csn;
+            const namespace = if (has_schema) namespaceFor(&self.catalog, schema.slice(), snap) orelse return error.UndefinedSchema else blk: {
+                var path: [routine_path_capacity]u32 = undefined;
+                if (self.routinePath(snap, &path) == 0) return error.UndefinedSchema;
+                break :blk path[0];
+            };
+            if (namespace == catalog_module.catalog_namespace or namespace == catalog_module.information_namespace or namespace == catalog_module.toast_namespace) return error.UnsupportedStatement;
+            if (namespace >= change_log.first_oid) try bindNamespaceCreate(self, self.session.role, namespace, latest, true);
+            return namespace;
+        }
+
+        /// The namespaces a routine reference searches: its schema (3F000
+        /// when missing, 42501 without USAGE), else the search path.
+        fn routineSearch(self: *const Self, has_schema: bool, schema: V.Name, snap: Snapshot, out: *[routine_path_capacity]u32) Error!usize {
+            if (has_schema) {
+                out[0] = (try self.namespaceForUsage(self.session.role, schema.slice(), snap)) orelse return error.UndefinedSchema;
+                return 1;
+            }
+            return self.routinePath(snap, out);
+        }
+
+        /// A routine `index` found through `path` is hidden by one with the
+        /// same input types in an earlier namespace of the path.
+        fn routineHidden(self: *const Self, index: usize, path: []const u32, snap: Snapshot) bool {
+            const routine = &self.objects.routines[index];
+            const rank = std.mem.indexOfScalar(u32, path, routine.namespace) orelse return true;
+            for (&self.objects.routines) |*other| {
+                if (!other.live or !other.stamp.visible(snap) or !types.same(other.name.slice(), routine.name.slice())) continue;
+                const other_rank = std.mem.indexOfScalar(u32, path[0..rank], other.namespace) orelse continue;
+                _ = other_rank;
+                if (RC.sameArgs(other.args(), routine.args())) return true;
+            }
+            return false;
+        }
+
         /// RAISE / ASSERT: the description of the error about to be raised.
         pub fn routineRaise(self: *Self, diag: *const R.Diagnostics) void {
             self.routine_diag = diag.*;
@@ -12644,10 +12735,9 @@ pub fn Database(comptime config: Config) type {
         /// CREATE [OR REPLACE] FUNCTION / PROCEDURE: validates the signature
         /// and optionally analyzes the quoted body before writing its version.
         fn createRoutine(self: *Self, slot: u16, definition: *const R.CreateRoutine, snap: Snapshot) Error!void {
-            if (!definition.has_schema and !self.session.public_schema_on_path) return error.UndefinedSchema;
+            const namespace = try self.routineCreateNamespace(definition.has_schema, definition.schema, snap);
             var oid_buffer: [config.routine_args]u32 = undefined;
             const args = definition.argOids(&oid_buffer);
-            const namespace = catalog_module.public_namespace;
             const name = definition.name.slice();
             if (self.objects.routineWriter(namespace, name, args, snap)) |other| return self.waitObject(slot, other);
             const existing = self.objects.findRoutine(namespace, name, args, snap);
@@ -12803,16 +12893,25 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn findRoutineTarget(self: *Self, slot: u16, drop: *const R.DropRoutine, snap: Snapshot) Error!?usize {
-            if (!drop.has_schema and !self.session.public_schema_on_path) return null;
-            const namespace = catalog_module.public_namespace;
+            var path: [routine_path_capacity]u32 = undefined;
+            // DROP ... IF EXISTS in a missing schema is a no-op (a notice).
+            const path_len = self.routineSearch(drop.has_schema, drop.schema, snap, &path) catch |err| {
+                if (err == error.UndefinedSchema and drop.if_exists) return null;
+                return err;
+            };
             const name = drop.name.slice();
             var found: ?usize = null;
             if (drop.has_args) {
-                if (self.objects.routineWriter(namespace, name, drop.args[0..drop.arg_count], snap)) |other| return self.waitObject(slot, other);
-                found = self.objects.findRoutine(namespace, name, drop.args[0..drop.arg_count], snap);
+                // The first namespace of the path with this signature.
+                for (path[0..path_len]) |namespace| {
+                    if (self.objects.routineWriter(namespace, name, drop.args[0..drop.arg_count], snap)) |other| return self.waitObject(slot, other);
+                    found = self.objects.findRoutine(namespace, name, drop.args[0..drop.arg_count], snap);
+                    if (found != null) break;
+                }
             } else {
                 for (&self.objects.routines, 0..) |*item, index| {
-                    if (!item.live or item.namespace != namespace or !item.stamp.visible(snap) or !types.same(item.name.slice(), name)) continue;
+                    if (!item.live or !item.stamp.visible(snap) or !types.same(item.name.slice(), name)) continue;
+                    if (self.routineHidden(index, path[0..path_len], snap)) continue;
                     if (found != null) return error.AmbiguousFunction;
                     found = index;
                 }
@@ -13109,8 +13208,9 @@ pub fn Database(comptime config: Config) type {
         /// CALL: the visible procedure whose parameters accept the
         /// arguments (42809 when only a function matches), then its body.
         fn callProcedure(self: *Self, slot: u16, source: []const u8, call: *const R.Call, snap: Snapshot) Error!void {
-            if (!call.has_schema and !self.session.public_schema_on_path) return error.UndefinedFunction;
             _ = slot;
+            var path: [routine_path_capacity]u32 = undefined;
+            const path_len = try self.routineSearch(call.has_schema, call.schema, snap, &path);
             var args: [config.routine_args]Argument = undefined;
             for (call.args[0..call.arg_count], 0..) |span, position| args[position] = try self.evaluateArgument(source, span);
             const name = call.name.slice();
@@ -13119,8 +13219,9 @@ pub fn Database(comptime config: Config) type {
             var ambiguous = false;
             var function = false;
             for (&self.objects.routines, 0..) |*routine, index| {
-                if (!routine.live or routine.namespace != catalog_module.public_namespace or !routine.stamp.visible(snap)) continue;
+                if (!routine.live or !routine.stamp.visible(snap)) continue;
                 if (!types.same(routine.name.slice(), name) or routine.arg_count != call.arg_count) continue;
+                if (self.routineHidden(index, path[0..path_len], snap)) continue;
                 if (routine.kind != 'p') {
                     function = true;
                     continue;
@@ -13466,11 +13567,13 @@ pub fn Database(comptime config: Config) type {
                 columns[position] = @intCast(found orelse return error.ColumnNotFound);
             }
             var function: ?usize = null;
+            var path: [routine_path_capacity]u32 = undefined;
+            const path_len = try self.routineSearch(definition.has_function_schema, definition.function_schema, snap, &path);
             for (&self.objects.routines, 0..) |*routine, index| {
-                if (!routine.live or !routine.stamp.visible(snap) or routine.arg_count != 0 or routine.namespace != catalog_module.public_namespace) continue;
-                if (types.same(routine.name.slice(), definition.function.slice())) function = index;
+                if (!routine.live or !routine.stamp.visible(snap) or routine.arg_count != 0) continue;
+                if (!types.same(routine.name.slice(), definition.function.slice()) or self.routineHidden(index, path[0..path_len], snap)) continue;
+                function = index;
             }
-            if (!definition.has_function_schema and !self.session.public_schema_on_path) return error.UndefinedFunction;
             const routine_index = function orelse return error.UndefinedFunction;
             const routine = &self.objects.routines[routine_index];
             if (routine.return_oid != tg.trigger_oid or routine.kind != 'f') return error.InvalidObjectDefinition;

@@ -2260,6 +2260,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     @intFromEnum(Op.drop_schema) => {
                         const index = try findVSchema(scratch, try reader.int(u32));
                         for (&scratch.tables) |*vt| if (vt.live and vt.namespace == scratch.schemas[index].oid) return error.ChangeRecordConflict;
+                        if (RC.overlayNamespaceUsed(&scratch.objects, scratch.schemas[index].oid)) return error.ChangeRecordConflict;
                         scratch.schemas[index].live = false;
                     },
                     @intFromEnum(Op.create_routine)...@intFromEnum(Op.drop_rule) => {
