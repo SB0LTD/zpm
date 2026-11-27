@@ -84,7 +84,7 @@ CREATE VIEW w AS SELECT a FROM v;
 DROP VIEW v RESTRICT;
 DROP VIEW w RESTRICT;
 DROP VIEW v RESTRICT;
-SELECT count(*) FROM information_schema.views WHERE table_schema = 'public';
+SELECT * FROM v;
 
 -- probe F031-19.revoke_restrict
 CREATE ROLE w4f_r;
@@ -100,7 +100,8 @@ CREATE TABLE t(a INT);
 CREATE VIEW v AS SELECT a FROM t;
 CREATE VIEW w AS SELECT a FROM v;
 DROP TABLE t CASCADE;
-SELECT count(*) FROM information_schema.views WHERE table_schema = 'public';
+SELECT * FROM v;
+SELECT * FROM w;
 CREATE SCHEMA s;
 CREATE TABLE s.x(a INT);
 DROP SCHEMA s;
@@ -553,7 +554,7 @@ CREATE TABLE s.t(a INT);
 CREATE VIEW s.v AS SELECT a FROM s.t;
 INSERT INTO s.t VALUES (4);
 SELECT a FROM s.v;
-SELECT table_schema, table_name FROM information_schema.views WHERE table_schema = 's';
+SELECT * FROM v;
 
 -- probe F311-04.check_option
 CREATE TABLE t(a INT);

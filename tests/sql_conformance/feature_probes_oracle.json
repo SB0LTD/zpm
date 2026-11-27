@@ -7,7 +7,7 @@
   "TimeZone": "UTC",
   "client_encoding": "UTF8"
  },
- "probes_sha256": "d97d408700d8cb6206b47da90da802c105bf8d95761f203b3cb646a5e866ee15",
+ "probes_sha256": "ec84d966c1fe6330e3cc37d4f1bbcb254f6a684602c9c7005e5c84381cfcf461",
  "canonical_form": "feature_probes.py",
  "probes": [
   {
@@ -3450,10 +3450,8 @@
      "rows": []
     },
     {
-     "head": "T:count/20/8/-1;C:SELECT 1;Z:I",
-     "rows": [
-      "0"
-     ]
+     "head": "E:42P01;Z:I",
+     "rows": []
     }
    ]
   },
@@ -3512,10 +3510,12 @@
      "rows": []
     },
     {
-     "head": "T:count/20/8/-1;C:SELECT 1;Z:I",
-     "rows": [
-      "0"
-     ]
+     "head": "E:42P01;Z:I",
+     "rows": []
+    },
+    {
+     "head": "E:42P01;Z:I",
+     "rows": []
     },
     {
      "head": "C:CREATE SCHEMA;Z:I",
@@ -5424,10 +5424,8 @@
      ]
     },
     {
-     "head": "T:table_schema/19/64/-1,table_name/19/64/-1;C:SELECT 1;Z:I",
-     "rows": [
-      "s|v"
-     ]
+     "head": "E:42P01;Z:I",
+     "rows": []
     }
    ]
   },

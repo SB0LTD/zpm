@@ -2,7 +2,7 @@
 //! tests/sql_conformance/features/*.sql, feature_probes_oracle.json (native
 //! PostgreSQL 18.7) and postgres18_feature_status.json. Do not edit by hand.
 //!
-//! Probes sha256: d97d408700d8cb6206b47da90da802c105bf8d95761f203b3cb646a5e866ee15
+//! Probes sha256: ec84d966c1fe6330e3cc37d4f1bbcb254f6a684602c9c7005e5c84381cfcf461
 //!
 //! SQL-standard feature probes (B11 wave 4, features lane). Every probe runs on
 //! a fresh database through the PostgreSQL wire session over a store
@@ -1194,7 +1194,7 @@ const probes = [_]Probe{
     .{ .source = "DROP VIEW v RESTRICT", .head = "E:2BP01;Z:I", .rows = &.{} },
     .{ .source = "DROP VIEW w RESTRICT", .head = "C:DROP VIEW;Z:I", .rows = &.{} },
     .{ .source = "DROP VIEW v RESTRICT", .head = "C:DROP VIEW;Z:I", .rows = &.{} },
-    .{ .source = "SELECT count(*) FROM information_schema.views WHERE table_schema = 'public'", .head = "T:count/20/8/-1;C:SELECT 1;Z:I", .rows = &.{"0"} },
+    .{ .source = "SELECT * FROM v", .head = "E:42P01;Z:I", .rows = &.{} },
 } },
 .{ .id = "F031-19.revoke_restrict", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "CREATE ROLE w4f_r", .head = "C:CREATE ROLE;Z:I", .rows = &.{} },
@@ -1205,12 +1205,13 @@ const probes = [_]Probe{
     .{ .source = "SELECT a FROM t", .head = "E:42501;Z:I", .rows = &.{} },
     .{ .source = "RESET ROLE", .head = "C:RESET;Z:I", .rows = &.{} },
 } },
-.{ .id = "F032.cascade", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "F032.cascade", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "CREATE TABLE t(a INT)", .head = "C:CREATE TABLE;Z:I", .rows = &.{} },
     .{ .source = "CREATE VIEW v AS SELECT a FROM t", .head = "C:CREATE VIEW;Z:I", .rows = &.{} },
     .{ .source = "CREATE VIEW w AS SELECT a FROM v", .head = "C:CREATE VIEW;Z:I", .rows = &.{} },
     .{ .source = "DROP TABLE t CASCADE", .head = "C:DROP TABLE;Z:I", .rows = &.{} },
-    .{ .source = "SELECT count(*) FROM information_schema.views WHERE table_schema = 'public'", .head = "T:count/20/8/-1;C:SELECT 1;Z:I", .rows = &.{"0"} },
+    .{ .source = "SELECT * FROM v", .head = "E:42P01;Z:I", .rows = &.{} },
+    .{ .source = "SELECT * FROM w", .head = "E:42P01;Z:I", .rows = &.{} },
     .{ .source = "CREATE SCHEMA s", .head = "C:CREATE SCHEMA;Z:I", .rows = &.{} },
     .{ .source = "CREATE TABLE s.x(a INT)", .head = "C:CREATE TABLE;Z:I", .rows = &.{} },
     .{ .source = "DROP SCHEMA s", .head = "E:2BP01;Z:I", .rows = &.{} },
@@ -1654,13 +1655,13 @@ const probes = [_]Probe{
     .{ .source = "INSERT INTO s.t VALUES (1)", .head = "C:INSERT 0 1;Z:I", .rows = &.{} },
     .{ .source = "SELECT table_schema, table_name FROM information_schema.tables WHERE table_schema = 's'", .head = "T:table_schema/19/64/-1,table_name/19/64/-1;C:SELECT 1;Z:I", .rows = &.{"s|t"} },
 } },
-.{ .id = "F311-03.schema_view", .ordered = false, .closed = false, .statements = &.{
+.{ .id = "F311-03.schema_view", .ordered = false, .closed = true, .statements = &.{
     .{ .source = "CREATE SCHEMA s", .head = "C:CREATE SCHEMA;Z:I", .rows = &.{} },
     .{ .source = "CREATE TABLE s.t(a INT)", .head = "C:CREATE TABLE;Z:I", .rows = &.{} },
     .{ .source = "CREATE VIEW s.v AS SELECT a FROM s.t", .head = "C:CREATE VIEW;Z:I", .rows = &.{} },
     .{ .source = "INSERT INTO s.t VALUES (4)", .head = "C:INSERT 0 1;Z:I", .rows = &.{} },
     .{ .source = "SELECT a FROM s.v", .head = "T:a/23/4/-1;C:SELECT 1;Z:I", .rows = &.{"4"} },
-    .{ .source = "SELECT table_schema, table_name FROM information_schema.views WHERE table_schema = 's'", .head = "T:table_schema/19/64/-1,table_name/19/64/-1;C:SELECT 1;Z:I", .rows = &.{"s|v"} },
+    .{ .source = "SELECT * FROM v", .head = "E:42P01;Z:I", .rows = &.{} },
 } },
 .{ .id = "F311-04.check_option", .ordered = false, .closed = false, .statements = &.{
     .{ .source = "CREATE TABLE t(a INT)", .head = "C:CREATE TABLE;Z:I", .rows = &.{} },

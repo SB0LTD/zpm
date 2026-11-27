@@ -12,10 +12,10 @@ The machine-readable form is `tests/sql_conformance/postgres18_feature_status.js
 ## Totals
 
 - In scope: **453** of 755 records (302 out of scope: 296 that PostgreSQL does not support, 6 reviewed deviations).
-- Closed: **261**
+- Closed: **263**
 - Partial: **8**
-- Open: **184**
-- Probes: 251 of 434 match native PostgreSQL 18.7.
+- Open: **182**
+- Probes: 253 of 434 match native PostgreSQL 18.7.
 
 ## Per family
 
@@ -23,7 +23,7 @@ The machine-readable form is `tests/sql_conformance/postgres18_feature_status.js
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | B | 44 | 2 | 1 | 0 | 1 | 42 |
 | E | 107 | 106 | 88 | 5 | 13 | 1 |
-| F | 199 | 162 | 95 | 3 | 64 | 37 |
+| F | 199 | 162 | 97 | 3 | 62 | 37 |
 | M | 25 | 0 | 0 | 0 | 0 | 25 |
 | R | 3 | 0 | 0 | 0 | 0 | 3 |
 | S | 50 | 14 | 5 | 0 | 9 | 36 |
@@ -75,18 +75,16 @@ mismatching probe statement, with the native PostgreSQL 18.7 response first.
 - `T191` Referential action RESTRICT (open). 0/1 probes match; first gap: T191.restrict #4 `DELETE FROM p WHERE id = 1` head: PostgreSQL 'E:23001;Z:I', ZPM 'E:23503;Z:I'
 - `T201` Comparable data types for referential constraints (open). 0/1 probes match; first gap: T201.comparable_fk_types #1 `CREATE TABLE c(pid INT REFERENCES p, pcode TEXT REFERENCES p(code))` head: PostgreSQL 'C:CREATE TABLE;Z:I', ZPM 'E:42804;Z:I'
 
-### DDL and schema objects: tables, views, schemas, ALTER, domains, collations (21)
+### DDL and schema objects: tables, views, schemas, ALTER, domains, collations (19)
 
 - `F031` Basic schema manipulation (partial). 5/7 probes match; first gap: F031-13.drop_table_restrict #3 `DROP VIEW v` head: PostgreSQL 'C:DROP VIEW;Z:I', ZPM 'C:DROP TABLE;Z:I'
-- `F311` Schema definition statement (partial). 1/5 probes match; first gap: F311-01.create_schema #3 `CREATE SCHEMA t2 CREATE TABLE x(a INT) CREATE VIEW y AS SELECT a FROM x` head: PostgreSQL 'C:CREATE SCHEMA;Z:I', ZPM 'E:0A000;Z:I'
+- `F311` Schema definition statement (partial). 2/5 probes match; first gap: F311-01.create_schema #3 `CREATE SCHEMA t2 CREATE TABLE x(a INT) CREATE VIEW y AS SELECT a FROM x` head: PostgreSQL 'C:CREATE SCHEMA;Z:I', ZPM 'E:0A000;Z:I'
 - `F031-13` Basic schema manipulation: DROP TABLE statement: RESTRICT clause (open). 0/1 probes match; first gap: F031-13.drop_table_restrict #3 `DROP VIEW v` head: PostgreSQL 'C:DROP VIEW;Z:I', ZPM 'C:DROP TABLE;Z:I'
 - `F031-16` Basic schema manipulation: DROP VIEW statement: RESTRICT clause (open). 0/1 probes match; first gap: F031-16.drop_view_restrict #4 `DROP VIEW w RESTRICT` head: PostgreSQL 'C:DROP VIEW;Z:I', ZPM 'C:DROP TABLE;Z:I'
-- `F032` CASCADE drop behavior (open). 0/1 probes match; first gap: F032.cascade #4 `SELECT count(*) FROM information_schema.views WHERE table_schema = 'public'` head: PostgreSQL 'T:count/20/8/-1;C:SELECT 1;Z:I', ZPM 'E:42P01;Z:I'
 - `F033` ALTER TABLE statement: DROP COLUMN clause (open). 0/1 probes match; first gap: F033.drop_column #8 `ALTER TABLE t DROP COLUMN c CASCADE` head: PostgreSQL 'C:ALTER TABLE;Z:I', ZPM 'E:2BP01;Z:I'
 - `F171` Multiple schemas per user (open). 0/1 probes match; first gap: F171.schemas #1 `CREATE SCHEMA s2 AUTHORIZATION CURRENT_USER` head: PostgreSQL 'C:CREATE SCHEMA;Z:I', ZPM 'E:0A000;Z:I'
 - `F251` Domain support (open). 0/1 probes match; first gap: F251.domains #1 `CREATE DOMAIN code AS VARCHAR(3) NOT NULL DEFAULT 'abc'` head: PostgreSQL 'C:CREATE DOMAIN;Z:I', ZPM 'E:0A000;Z:I'
 - `F311-01` Schema definition statement: CREATE SCHEMA (open). 0/1 probes match; first gap: F311-01.create_schema #3 `CREATE SCHEMA t2 CREATE TABLE x(a INT) CREATE VIEW y AS SELECT a FROM x` head: PostgreSQL 'C:CREATE SCHEMA;Z:I', ZPM 'E:0A000;Z:I'
-- `F311-03` Schema definition statement: CREATE VIEW (open). 0/1 probes match; first gap: F311-03.schema_view #5 `SELECT table_schema, table_name FROM information_schema.views WHERE table_schema = 's'` head: PostgreSQL 'T:table_schema/19/64/-1,table_name/19/64/-1;C:SELECT 1;Z:I', ZPM 'E:42P01;Z:I'
 - `F382` Alter column data type (open). 0/1 probes match; first gap: F382.alter_type #2 `ALTER TABLE t ALTER COLUMN a TYPE BIGINT` head: PostgreSQL 'C:ALTER TABLE;Z:I', ZPM 'E:0A000;Z:I'
 - `F384` Drop identity property clause (open). 0/1 probes match; first gap: F384.drop_identity #2 `ALTER TABLE t ALTER COLUMN id DROP IDENTITY` head: PostgreSQL 'C:ALTER TABLE;Z:I', ZPM 'E:0A000;Z:I'
 - `F385` Drop column generation expression clause (open). 0/1 probes match; first gap: F385.drop_expression #2 `ALTER TABLE t ALTER COLUMN b DROP EXPRESSION` head: PostgreSQL 'C:ALTER TABLE;Z:I', ZPM 'E:0A000;Z:I'

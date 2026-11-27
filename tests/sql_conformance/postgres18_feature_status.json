@@ -6,14 +6,14 @@
  "totals": {
   "records": 755,
   "in_scope": 453,
-  "closed": 261,
+  "closed": 263,
   "partial": 8,
-  "open": 184,
+  "open": 182,
   "not_applicable": 302
  },
  "probes": {
   "total": 434,
-  "passed": 251
+  "passed": 253
  },
  "features": {
   "B011": {
@@ -1640,11 +1640,11 @@
   "F032": {
    "name": "CASCADE drop behavior",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "F032.cascade"
    ],
-   "note": "0/1 probes match; first gap: F032.cascade #4 `SELECT count(*) FROM information_schema.views WHERE table_schema = 'public'` head: PostgreSQL 'T:count/20/8/-1;C:SELECT 1;Z:I', ZPM 'E:42P01;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "ddl"
   },
   "F033": {
@@ -2329,7 +2329,7 @@
     "F311-04.check_option",
     "F311-05.schema_grant"
    ],
-   "note": "1/5 probes match; first gap: F311-01.create_schema #3 `CREATE SCHEMA t2 CREATE TABLE x(a INT) CREATE VIEW y AS SELECT a FROM x` head: PostgreSQL 'C:CREATE SCHEMA;Z:I', ZPM 'E:0A000;Z:I'",
+   "note": "2/5 probes match; first gap: F311-01.create_schema #3 `CREATE SCHEMA t2 CREATE TABLE x(a INT) CREATE VIEW y AS SELECT a FROM x` head: PostgreSQL 'C:CREATE SCHEMA;Z:I', ZPM 'E:0A000;Z:I'",
    "area": "ddl"
   },
   "F311-01": {
@@ -2355,11 +2355,11 @@
   "F311-03": {
    "name": "Schema definition statement: CREATE VIEW",
    "applicability": "in_scope",
-   "status": "open",
+   "status": "closed",
    "evidence": [
     "F311-03.schema_view"
    ],
-   "note": "0/1 probes match; first gap: F311-03.schema_view #5 `SELECT table_schema, table_name FROM information_schema.views WHERE table_schema = 's'` head: PostgreSQL 'T:table_schema/19/64/-1,table_name/19/64/-1;C:SELECT 1;Z:I', ZPM 'E:42P01;Z:I'",
+   "note": "1/1 probes match native PostgreSQL 18.7.",
    "area": "ddl"
   },
   "F311-04": {
@@ -6878,6 +6878,7 @@
    "F031-03.grant",
    "F031-04.add_column",
    "F031-19.revoke_restrict",
+   "F032.cascade",
    "F036.revoke_non_owner",
    "F038.revoke_grantable",
    "F041-01.inner",
@@ -6919,6 +6920,7 @@
    "F304.except_all",
    "F305.intersect_all",
    "F311-02.schema_table",
+   "F311-03.schema_view",
    "F312.merge",
    "F313.enhanced_merge",
    "F314.merge_delete",
@@ -7068,7 +7070,6 @@
    "F021-06.check_constraints",
    "F031-13.drop_table_restrict",
    "F031-16.drop_view_restrict",
-   "F032.cascade",
    "F033.drop_column",
    "F034.extended_revoke",
    "F035.revoke_cascade",
@@ -7084,7 +7085,6 @@
    "F251.domains",
    "F271.compound_literals",
    "F311-01.create_schema",
-   "F311-03.schema_view",
    "F311-04.check_option",
    "F311-05.schema_grant",
    "F341.usage_tables",
