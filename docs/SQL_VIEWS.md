@@ -1,0 +1,42 @@
+# View replacement
+
+`CREATE OR REPLACE VIEW` creates an absent view or changes the SELECT of an
+existing ordinary view. The existing column prefix must keep its names, data
+types and typmods; incompatible replacements return 42P16. Another relation kind
+returns 42809. Quoted schema/view names and declared column aliases use the normal
+identifier binder. Temporary views, view options and automatic updatability are
+not implemented by this slice.
+
+Replacement uses the existing transactional definition rewrite, retaining the
+relation OID, owner, ACLs and existing column defaults. The old definition remains
+visible to other snapshots until publication. Rollback discards the replacement;
+WAL restores the new definition without a format change. The owner check and
+access-exclusive lock are the same checks used by other definition changes. New
+query dependencies take access-share locks before publication.
+Expanded view reads now also retain access-share locks on the view definition;
+locking only their underlying tables previously let replacement bypass readers.
+The expanded-view list is deduplicated before applying its caller-owned budget.
+
+PostgreSQL accepts circular view definitions and rejects their expansion on read
+with 42P17. Expansion now keeps a bounded ancestry per appended query block, so
+the same view in two sibling FROM items is legal while a repeated ancestor fails.
+Queries without views do not initialize ancestry storage. Ancestry uses bounded
+stack scratch sized by the caller's query-block capacity; no allocator is introduced.
+
+Appending columns is supported when no stored view depends on the replaced view.
+With dependent views it currently returns 0A000: stored stars are expanded again
+at read time and must first be frozen to their creation-time projection. This is
+an explicit compatibility gap. Transitive dependency lists can also retain old
+base-relation dependencies after a replacement. ALTER VIEW column rename,
+general search_path resolution, temporary views/options and complete dependency
+graph normalization remain open. Experimental heterogeneous packed banks retain
+the existing ALTER-definition restriction; this change does not qualify them.
+
+The routine contract tests replacement, unchanged OIDs, dependent reads, shape
+errors, quoted aliases, owner/ACL preservation, rollback, lock waits and WAL
+replay. Native PostgreSQL 18.3 independently checks values and SQLSTATEs.
+RamSQL's stock archive fixture exercises replacement and rollback on both native
+PostgreSQL and RamSQL, then checks plain/custom archives in both directions and
+deparsed return-rule actions. PG16 and PG18 CI must pass before merging.
+
+Reference: [PostgreSQL CREATE VIEW](https://www.postgresql.org/docs/18/sql-createview.html).

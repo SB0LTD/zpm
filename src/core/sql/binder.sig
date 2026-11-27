@@ -9218,9 +9218,11 @@ pub fn Binder(comptime config: types.Config) type {
             const namespace = try qualifierNamespace(context, create.name.schema);
             if (namespace == catalog.catalog_namespace or namespace == catalog.information_namespace or namespace == catalog.toast_namespace) return error.UnsupportedStatement;
             const tag: types.CommandTag = if (create.materialized) .create_materialized_view else .create_view;
+            const existing_view = context.catalog.findIn(namespace, name.slice(), context.snapshot);
             if (relationNameTaken(context, namespace, name.slice())) {
                 if (create.if_not_exists) return .{ .noop = tag };
-                return error.TableExists;
+                if (!create.replace) return error.TableExists;
+                if (existing_view == null or existing_view.?.kind != 'v') return error.WrongObjectType;
             }
             const plans = context.plans orelse return error.UnsupportedStatement;
             plans.reset();
@@ -9266,6 +9268,28 @@ pub fn Binder(comptime config: types.Config) type {
                 out.extras.populated = create.with_data;
                 if (create.with_data) out.plan = root;
             }
+            if (create.replace) if (existing_view) |found| {
+                const old = &context.tables[found.slot];
+                if (out.count < old.column_count) return error.InvalidTableDefinition;
+                for (old.columns[0..old.column_count], out.columns[0..old.column_count]) |*before, *after| {
+                    if (!types.same(before.name.slice(), after.name.slice()) or before.data_type != after.data_type or before.typmod != after.typmod)
+                        return error.InvalidTableDefinition;
+                }
+                // Stored stars are currently expanded at read time. Until
+                // their projections are frozen, an added column must not
+                // silently change an existing dependent view's row shape.
+                if (out.count != old.column_count and dependentViews(context, old.oid)) return error.UnsupportedStatement;
+                var replacement = alterOf(context, found.slot, .create_view);
+                replacement.extras.query = out.extras.query;
+                replacement.extras.depends = out.extras.depends;
+                replacement.extras.depend_count = out.extras.depend_count;
+                for (old.column_count..out.count) |index| {
+                    replacement.columns[index] = out.columns[index];
+                    replacement.sources[index] = 0xff;
+                }
+                replacement.count = out.count;
+                return .{ .alter_table = replacement };
+            };
             return .{ .create_table = out };
         }
 

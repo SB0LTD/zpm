@@ -652,6 +652,7 @@ pub fn Ast(comptime config: types.Config) type {
         /// [(columns)] AS query [WITH [NO] DATA].
         pub const CreateView = struct {
             materialized: bool = false,
+            replace: bool = false,
             if_not_exists: bool = false,
             name: TableRef = .{},
             columns: [config.columns]Ident = undefined,

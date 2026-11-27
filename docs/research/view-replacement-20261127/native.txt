@@ -1,0 +1,26 @@
+BEGIN
+CREATE SCHEMA
+SET
+CREATE TABLE
+INSERT 0 2
+CREATE VIEW
+SELECT 1
+CREATE VIEW
+CREATE VIEW
+DO
+CREATE VIEW
+DO
+CREATE VIEW
+CREATE VIEW
+DO
+CREATE VIEW
+SAVEPOINT
+CREATE VIEW
+{"during_rollback_probe" : [8,-2]}
+ROLLBACK
+DO
+DROP VIEW
+CREATE VIEW
+{"oracle" : "PostgreSQL 18.3 on x86_64-windows, compiled by msvc-19.44.35222, 64-bit", "oid_retained" : true, "rows" : [{"id":1,"v":7,"extra":8},
+ {"id":2,"v":-3,"extra":-2}], "sqlstates_verified" : ["42P16","42809","42P17"]}
+ROLLBACK

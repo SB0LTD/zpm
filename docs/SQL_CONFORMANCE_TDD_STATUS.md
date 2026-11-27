@@ -1,5 +1,22 @@
 # SQL conformance TDD checkpoint
 
+## View replacement — candidate, 27 November 2026
+
+The red contract reproduces 0A000 for CREATE OR REPLACE VIEW. The candidate uses
+the existing MVCC/WAL definition rewrite, preserving OIDs, ownership and ACLs.
+Existing column names/types/typmods must match; rollback, lock waits, quoted
+aliases and replay are covered. Native PostgreSQL 18.3 caught and corrected an
+initial assumption about recursion: circular definitions are accepted, then reads
+fail with 42P17. Bounded expansion ancestry distinguishes cycles from repeated
+sibling references without initializing storage for queries without views.
+
+Appending columns with dependent stored views remains explicitly 0A000 until
+creation-time star projections are frozen. Other view options/updatability,
+ALTER VIEW rename, normalized dependency graphs and experimental packed-bank
+definition rewrites remain open. See [scope and contracts](SQL_VIEWS.md).
+PG16/18 stock round trips, strict inventory and complete source CI are pending
+for this candidate; the qualified checkpoint below remains the release baseline.
+
 ## View _RETURN rule definitions — qualified, 27 November 2026
 
 The failing contract reproduced a non-null pg_rewrite row whose pg_get_ruledef
