@@ -1031,6 +1031,10 @@ pub fn Database(comptime config: Config) type {
             /// them as dependencies).
             expanded: [config.tables]u32 = undefined,
             expanded_count: usize = 0,
+            /// CREATE VIEW names resolved outside public (ddl-alter): the
+            /// stored text qualifies them.
+            view_qualifiers: [config.view_qualifiers]B.ViewQualifier = undefined,
+            view_qualifier_count: usize = 0,
             /// SQL routine bodies appended for inlining (B11 wave 4): one per
             /// call node and candidate routine (Config.subqueries), their
             /// text ranges in `expansion` and the expanded source length
@@ -1240,6 +1244,7 @@ pub fn Database(comptime config: Config) type {
             const catalog = &db.catalog;
             workspace.expanded_count = 0;
             workspace.column_reads = .{};
+            workspace.view_qualifier_count = 0;
             const pool = &workspace.nodes;
             // Each appended query remembers the view and parent that introduced
             // it. A repeated sibling is legal; a repeated ancestor is recursive
@@ -1295,9 +1300,14 @@ pub fn Database(comptime config: Config) type {
                     else
                         namespaceFor(catalog, qualified, snap);
                     // A stored definition names its relations by text: one
-                    // outside public needs its schema written (ddl-dml).
+                    // outside public is stored qualified (ddl-alter, wave 5).
                     if (direct and qualified == null and namespace != null and namespace.? != catalog_module.public_namespace) switch (bound_statement.*) {
-                        .create_view => return error.UnsupportedStatement,
+                        .create_view => if (catalog.findIn(namespace.?, name.slice(), snap) != null) {
+                            if (workspace.view_qualifier_count == config.view_qualifiers) return error.ProgramLimitExceeded;
+                            const start = item.name.span.start - @intFromBool(item.name.quoted);
+                            workspace.view_qualifiers[workspace.view_qualifier_count] = .{ .at = start, .schema = db.namespaceName(namespace.?) };
+                            workspace.view_qualifier_count += 1;
+                        },
                         else => {},
                     };
                     const found = catalog.findIn(namespace orelse continue, name.slice(), snap) orelse continue;
@@ -3649,6 +3659,7 @@ pub fn Database(comptime config: Config) type {
             var context = self.bindContext(source, mode, snap);
             context.stored_source_start = original.len;
             if (!self.privilegedRole(snap)) context.column_reads = &self.workspace.column_reads;
+            context.view_qualifiers = self.workspace.view_qualifiers[0..self.workspace.view_qualifier_count];
             if (explain) |options| context.describe_only = !options.analyze;
             // Domains resolve in any query (S071, B11 wave 5); enum and
             // composite values only as a simple SELECT's projected roots.
@@ -3826,6 +3837,7 @@ pub fn Database(comptime config: Config) type {
                 },
                 .create_schema => |*create| blk: {
                     try self.createSchema(slot, create.name, try self.createSchemaOwner(create, snap), snap);
+                    if (create.elements.len != 0) try self.schemaElements(slot, create.name, create.elements, result);
                     break :blk 0;
                 },
                 .drop_schema => |*drop| blk: {
@@ -4455,6 +4467,94 @@ pub fn Database(comptime config: Config) type {
             var changes: [K.max_changes]K.Change = undefined;
             const count = try self.catalog.createSchema(index, schema.oid, name.slice(), tx.ref(slot), snap.cid, 0, self.horizon(), &changes);
             for (changes[0..count]) |change| tx.push(.{ .kind = .catalog_insert, .table = @intFromEnum(change.relation), .new = change.version }) catch unreachable;
+        }
+
+        /// CREATE SCHEMA's elements (ddl-alter, wave 5), ordered as
+        /// PostgreSQL's transformCreateSchemaStmtElements: sequences, then
+        /// tables, views, indexes, triggers and grants, each kind in
+        /// statement order. Each runs as a command of its own (it sees the
+        /// earlier ones) with the new schema first in the search path, so
+        /// its objects are created there; naming another schema is 42P15
+        /// and any other element is 42601. GRANT runs as the privilege
+        /// statements run (that lane's hook).
+        fn schemaElements(self: *Self, slot: u16, schema: Name, text: []const u8, result: *Result) Error!void {
+            var starts: [config.schema_elements]usize = undefined;
+            var kinds: [config.schema_elements]u8 = undefined;
+            var count: usize = 0;
+            var tokens: lexer.Tokenizer = .{ .source = text, .text_limit = config.text_bytes, .dialect = .postgres };
+            var depth: usize = 0;
+            var after_create = false;
+            var after_or = false;
+            while (true) {
+                const token = try tokens.next();
+                if (token.kind == .end) break;
+                const word = token.kind == .word;
+                if (after_create or after_or) {
+                    const raw = token.raw(text);
+                    if (after_create and word and types.keyword(raw, "or")) {
+                        after_create = false;
+                        after_or = true;
+                        continue;
+                    }
+                    if (after_or and word and types.keyword(raw, "replace")) continue;
+                    const kind: u8 = if (!word) return error.Syntax else if (types.keyword(raw, "sequence")) 0 else if (types.keyword(raw, "table")) 1 else if (types.keyword(raw, "view") or types.keyword(raw, "recursive")) 2 else if (types.keyword(raw, "index") or types.keyword(raw, "unique")) 3 else if (types.keyword(raw, "trigger") or types.keyword(raw, "constraint")) 4 else return error.Syntax;
+                    if (after_or and kind != 2) return error.Syntax;
+                    kinds[count - 1] = kind;
+                    after_create = false;
+                    after_or = false;
+                }
+                if (token.kind == .symbol) {
+                    if (token.symbol == .lparen) depth += 1;
+                    if (token.symbol == .rparen and depth != 0) depth -= 1;
+                    continue;
+                }
+                if (depth != 0 or !word) continue;
+                const raw = token.raw(text);
+                const create = types.keyword(raw, "create");
+                if (!create and !types.keyword(raw, "grant")) continue;
+                if (count == config.schema_elements) return error.ProgramLimitExceeded;
+                starts[count] = token.start;
+                kinds[count] = 5;
+                count += 1;
+                after_create = create;
+            }
+            if (after_create or after_or) return error.Syntax;
+            const state = self.sessionState();
+            const saved = state.values.search_path;
+            defer state.values.search_path = saved;
+            var path: [config.setting_bytes]u8 = undefined;
+            var path_len: usize = 0;
+            const parts = [_][]const u8{ "\"", schema.slice(), "\", ", saved.slice() };
+            for (parts) |part| {
+                if (part.len > path.len - path_len) return error.SessionCapacity;
+                @memcpy(path[path_len..][0..part.len], part);
+                path_len += part.len;
+            }
+            try state.values.search_path.set(path[0..path_len]);
+            for (0..6) |kind| for (0..count) |index| {
+                if (kinds[index] != kind) continue;
+                const end = if (index + 1 < count) starts[index + 1] else text.len;
+                try self.schemaElement(slot, schema, std.mem.trim(u8, text[starts[index]..end], " \t\r\n"), result);
+            };
+        }
+
+        /// One schema element as its own command of the transaction.
+        fn schemaElement(self: *Self, slot: u16, schema: Name, element: []const u8, result: *Result) Error!void {
+            const snap = self.routineSnapshot(slot, true);
+            // CREATE TRIGGER runs through the routine catalog statements.
+            if (R.classify(element) != null) return self.routineBody(slot, element, snap, result);
+            var parsed = try P.parse(element, &self.workspace.nodes, .standard);
+            const qualifier: ?ast.Ident = switch (parsed) {
+                .create_table => |*create| create.schema,
+                .create_sequence => |*create| create.name.schema,
+                .create_view => |*create| create.name.schema,
+                .create_index => |*create| create.table.schema,
+                else => null,
+            };
+            if (qualifier) |ident| {
+                if (!types.same(identName(element, ident).slice(), schema.slice())) return error.InvalidSchemaDefinition;
+            }
+            try self.body(slot, element, &parsed, snap, result, .{ .mode = .standard });
         }
 
         /// DROP SCHEMA: RESTRICT refuses a schema that holds tables (2BP01);

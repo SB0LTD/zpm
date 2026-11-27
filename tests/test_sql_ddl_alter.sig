@@ -14,7 +14,7 @@
 const std = @import("std");
 const sql = @import("sql");
 
-const DB = sql.Database(.{ .tables = 16, .columns = 8, .rows_per_table = 32, .name_bytes = 32, .text_bytes = 128, .nulls_first_ascending = false, .integer_bits = 32, .transactions = 4, .sequences = 8, .expr_nodes = 1024 });
+const DB = sql.Database(.{ .tables = 16, .columns = 8, .rows_per_table = 32, .name_bytes = 32, .text_bytes = 128, .nulls_first_ascending = false, .integer_bits = 32, .transactions = 4, .sequences = 8, .schemas = 8, .expr_nodes = 1024 });
 
 var assertions: usize = 0;
 var db: DB = .{};
@@ -558,11 +558,67 @@ fn columnOptionsAndTiming() !void {
     try sameState(&.{ timing, "SELECT * FROM f" });
 }
 
+// ---- CREATE SCHEMA with schema elements ---------------------------------------
+
+const schema_probes = [_][]const u8{
+    "SELECT n.nspname, c.relname, c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname LIKE 's%' ORDER BY 1, 2",
+    "SELECT nspname FROM pg_namespace WHERE nspname LIKE 's%' ORDER BY 1",
+    "SELECT schemaname, viewname, definition FROM pg_views WHERE schemaname LIKE 's%' ORDER BY 1, 2",
+};
+
+fn schemaElements() !void {
+    reset();
+    // F311-01 probe.
+    try run("CREATE SCHEMA s");
+    try quiet("CREATE SCHEMA IF NOT EXISTS s");
+    try rejects("CREATE SCHEMA s", error.DuplicateSchema, schema_probes[1], "s");
+    try run("CREATE SCHEMA s2 CREATE TABLE x(a INT) CREATE VIEW y AS SELECT a FROM x");
+    try run("INSERT INTO s2.x VALUES (1)");
+    try expect("SELECT a FROM s2.y", "1");
+    // Views before tables, indexes and sequences: PostgreSQL's order
+    // (sequences, tables, views, indexes, triggers, grants).
+    try run("CREATE SCHEMA s3 CREATE VIEW v AS SELECT a FROM x CREATE TABLE x(a INT) CREATE INDEX ix ON x(a) CREATE SEQUENCE q");
+    try expect(schema_probes[0], "s2|x|r;s2|y|v;s3|ix|i;s3|q|S;s3|v|v;s3|x|r");
+    // The stored view text names its schema (resolved like PostgreSQL's
+    // stored parse tree), whatever the search path is later.
+    try expect(schema_probes[2], "s2|y|SELECT a FROM s2.x;s3|v|SELECT a FROM s3.x");
+    try run("CREATE TABLE x(a INT)");
+    try run("INSERT INTO x VALUES (99)");
+    try expect("SELECT a FROM s2.y", "1");
+    // The search path is the session's again afterwards.
+    try expect("SHOW search_path", "\"$user\", public");
+    // Tables in statement order: a reference to a later table is 42P01;
+    // another schema's name is 42P15; a duplicate is 42P07; CREATE DOMAIN
+    // is no schema element (42601); IF NOT EXISTS has none (0A000). Each
+    // failure leaves no schema behind.
+    try rejects("CREATE SCHEMA s4 CREATE TABLE a(v INT REFERENCES b) CREATE TABLE b(v INT PRIMARY KEY)", error.TableNotFound, schema_probes[1], "s;s2;s3");
+    try rejects("CREATE SCHEMA s4 CREATE TABLE other.a(v INT)", error.InvalidSchemaDefinition, schema_probes[1], "s;s2;s3");
+    try rejects("CREATE SCHEMA s4 CREATE TABLE a(v INT) CREATE TABLE a(w INT)", error.TableExists, schema_probes[1], "s;s2;s3");
+    try rejects("CREATE SCHEMA s4 CREATE DOMAIN d AS INT", error.Syntax, schema_probes[1], "s;s2;s3");
+    try rejects("CREATE SCHEMA IF NOT EXISTS s4 CREATE TABLE a(v INT)", error.UnsupportedStatement, schema_probes[1], "s;s2;s3");
+    try run("CREATE SCHEMA s4 CREATE TABLE s4.a(v INT PRIMARY KEY) CREATE TABLE b(w INT REFERENCES s4.a(v))");
+    try rejects("INSERT INTO s4.b VALUES (1)", error.ForeignKeyViolation, "SELECT count(*) FROM s4.b", "0");
+    // Triggers and grants run as their own statements do.
+    try run("CREATE FUNCTION tf() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.a := NEW.a + 1; RETURN NEW; END $$");
+    try run("CREATE SCHEMA s5 CREATE TABLE t(a INT) CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION public.tf() GRANT SELECT ON t TO PUBLIC");
+    try run("INSERT INTO s5.t VALUES (1)");
+    try expect("SELECT a FROM s5.t", "2");
+    try expect("SELECT tgname FROM pg_trigger WHERE tgrelid = 's5.t'::regclass", "tr");
+    // A CREATE VIEW outside CREATE SCHEMA qualifies names resolved through
+    // a schema other than public as well.
+    try run("SET search_path = s4, public");
+    try run("CREATE VIEW s4.av AS SELECT v FROM a");
+    try run("RESET search_path");
+    try expect("SELECT definition FROM pg_views WHERE viewname = 'av'", "SELECT v FROM s4.a");
+    try sameState(&.{ schema_probes[0], schema_probes[1], schema_probes[2], "SELECT a FROM s2.y", "SELECT a FROM s5.t" });
+}
+
 pub fn main() !void {
     try alterColumnType();
     try alterTypeTransactions();
     try craftedRewrites();
     try dropColumnCascade();
     try columnOptionsAndTiming();
+    try schemaElements();
     std.debug.print("contract-sql-ddl-alter: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });
 }

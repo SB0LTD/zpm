@@ -475,8 +475,20 @@ pub fn Parser(comptime config: types.Config) type {
                         // Without a name the schema is named after a named role.
                         if (!out.named) out.name = out.owner orelse return error.UnsupportedStatement;
                     } else if (!out.named) return error.Syntax;
-                    // Schema elements are outside the subset.
-                    if (self.current.kind != .end and !self.isSymbol(.semicolon)) return error.UnsupportedStatement;
+                    // Schema elements (ddl-alter, wave 5): CREATE TABLE /
+                    // VIEW / INDEX / SEQUENCE / TRIGGER and GRANT, split and
+                    // run by the engine. IF NOT EXISTS cannot have them (0A000).
+                    if (self.current.kind != .end and !self.isSymbol(.semicolon)) {
+                        if (!self.isWord("CREATE") and !self.rawWord("grant")) return error.Syntax;
+                        if (out.if_not_exists) return error.UnsupportedStatement;
+                        const start = self.tokenStart();
+                        var end = start;
+                        while (self.current.kind != .end and !self.isSymbol(.semicolon)) {
+                            end = self.current.end + self.current.suffix;
+                            try self.advance();
+                        }
+                        out.elements = .{ .start = start, .len = end - start };
+                    }
                     try self.finish();
                     return .{ .create_schema = out };
                 }

@@ -902,6 +902,9 @@ pub fn Ast(comptime config: types.Config) type {
             owner: ?Ident = null,
             owner_special: u8 = 0,
             named: bool = true,
+            /// Schema elements (ddl-alter, wave 5): the text after the name
+            /// and AUTHORIZATION clause, run by the engine.
+            elements: Span = .{},
         };
 
         /// DROP SCHEMA [IF EXISTS] name [CASCADE | RESTRICT].

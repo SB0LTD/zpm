@@ -196,6 +196,12 @@ pub const Config = struct {
     /// Schemas the search path resolves (ddl-dml, wave 4): existing schemas
     /// of search_path beyond this many are not searched.
     search_path_schemas: usize = 8,
+    /// Elements of one CREATE SCHEMA statement (ddl-alter, wave 5; more
+    /// is 54000).
+    schema_elements: usize = 16,
+    /// Relations a CREATE VIEW names unqualified that resolve outside
+    /// public: the stored text qualifies them (ddl-alter; more is 54000).
+    view_qualifiers: usize = 16,
     /// LISTEN channels per session (also its pending LISTEN/UNLISTEN
     /// actions), listening sessions, committed notifications not yet read
     /// by every listener, uncommitted NOTIFY entries of all transactions
@@ -617,6 +623,9 @@ pub const Error = error{
     /// SQLSTATE 42611: an invalid column definition, such as USING on a
     /// generated column's ALTER COLUMN TYPE (ddl-alter, wave 5).
     InvalidColumnDefinition,
+    /// SQLSTATE 42P15: a CREATE SCHEMA element names another schema
+    /// (ddl-alter, wave 5).
+    InvalidSchemaDefinition,
 };
 
 /// Caller-owned execution accounting and interrupt polling. This is independent

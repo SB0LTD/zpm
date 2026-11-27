@@ -348,7 +348,9 @@ pub fn Binder(comptime config: types.Config) type {
         };
 
         /// CREATE SCHEMA name [AUTHORIZATION role] (ddl-dml, wave 4).
-        pub const CreateSchema = struct { name: V.Name, owner: ?V.Name = null, owner_special: u8 = 0 };
+        /// `elements`: CREATE TABLE / VIEW / INDEX / SEQUENCE / TRIGGER and
+        /// GRANT text run in the new schema (ddl-alter, wave 5).
+        pub const CreateSchema = struct { name: V.Name, owner: ?V.Name = null, owner_special: u8 = 0, elements: []const u8 = "" };
 
         /// TRUNCATE targets: distinct table slots in statement order.
         pub const Truncate = struct { tables: [config.tables]u8 = undefined, count: usize = 0, restart_identity: bool = false };
@@ -367,9 +369,14 @@ pub fn Binder(comptime config: types.Config) type {
         /// (view dependencies of DROP COLUMN / ALTER COLUMN TYPE, ddl-alter).
         pub const ColumnUsage = struct { table: usize, used: [config.columns]bool = @splat(false) };
 
+        /// A relation CREATE VIEW names unqualified at source offset `at`
+        /// that resolves in schema `schema` (not public): stored qualified.
+        pub const ViewQualifier = struct { at: usize, schema: []const u8 };
+
         pub const Context = struct {
             /// Records column references of one base table (ddl-alter).
             column_usage: ?*ColumnUsage = null,
+            view_qualifiers: []const ViewQualifier = &.{},
             source: []const u8,
             tables: *const [config.tables]S.Table,
             catalog: *const K,
@@ -11643,7 +11650,7 @@ pub fn Binder(comptime config: types.Config) type {
                         if (create.if_not_exists) return setBound(bound, .noop, .create_schema);
                         return error.DuplicateSchema;
                     }
-                    return setBound(bound, .create_schema, .{ .name = name, .owner = if (create.owner) |ident| toName(context, ident) else null, .owner_special = create.owner_special });
+                    return setBound(bound, .create_schema, .{ .name = name, .owner = if (create.owner) |ident| toName(context, ident) else null, .owner_special = create.owner_special, .elements = create.elements.slice(context.source) });
                 },
                 .drop_schema => {
                     const drop = &statement.drop_schema;
@@ -13072,6 +13079,53 @@ pub fn Binder(comptime config: types.Config) type {
             }
         }
 
+        /// The view text with `schema.` before each relation recorded in
+        /// context.view_qualifiers (ddl-alter, wave 5).
+        fn qualifiedViewText(context: *const Context, span: ast.Span, out: []u8) Error!usize {
+            var length: usize = 0;
+            var at = span.start;
+            // Qualifiers at or after `search` are still to be written.
+            var search = span.start;
+            const end = span.start + span.len;
+            while (at < end) {
+                var next = end;
+                var qualifier: ?[]const u8 = null;
+                for (context.view_qualifiers) |item| if (item.at >= search and item.at < next) {
+                    next = item.at;
+                    qualifier = item.schema;
+                };
+                const plain = context.source[at..next];
+                if (plain.len > out.len - length) return error.TextCapacity;
+                @memcpy(out[length..][0..plain.len], plain);
+                length += plain.len;
+                at = next;
+                search = next + 1;
+                const schema = qualifier orelse break;
+                var simple = schema.len != 0 and !types.digit(schema[0]) and !lexer.reserved(lexer.classify(schema));
+                for (schema) |byte| simple = simple and ((byte >= 'a' and byte <= 'z') or types.digit(byte) or byte == '_');
+                if (schema.len * 2 + 3 > out.len - length) return error.TextCapacity;
+                if (!simple) {
+                    out[length] = '"';
+                    length += 1;
+                }
+                for (schema) |byte| {
+                    out[length] = byte;
+                    length += 1;
+                    if (!simple and byte == '"') {
+                        out[length] = '"';
+                        length += 1;
+                    }
+                }
+                if (!simple) {
+                    out[length] = '"';
+                    length += 1;
+                }
+                out[length] = '.';
+                length += 1;
+            }
+            return length;
+        }
+
         /// CREATE VIEW / CREATE MATERIALIZED VIEW: the query is bound now
         /// (its output columns become the relation's columns; a column list
         /// renames them) and stored as text, expanded again by each reader.
@@ -13121,7 +13175,9 @@ pub fn Binder(comptime config: types.Config) type {
             if (create.check_option != 0) try checkOptionUpdatable(context, create.query, plan);
             out.extras.check_option = create.check_option;
             out.extras.relkind = if (create.materialized) 'm' else 'v';
-            if (text.len > out.extras.query.bytes.len) {
+            if (context.view_qualifiers.len != 0) {
+                out.extras.query.len = try qualifiedViewText(context, create.text, &out.extras.query.bytes);
+            } else if (text.len > out.extras.query.bytes.len) {
                 out.extras.query.len = try lexer.compactDefinition(text, &out.extras.query.bytes);
             } else {
                 out.extras.query.len = text.len;
