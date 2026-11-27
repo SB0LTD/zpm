@@ -982,6 +982,14 @@ pub fn Database(comptime config: Config) type {
             /// them as dependencies).
             expanded: [config.tables]u32 = undefined,
             expanded_count: usize = 0,
+            /// SQL routine bodies appended for inlining (B11 wave 4): one per
+            /// call node and candidate routine (Config.subqueries), their
+            /// text ranges in `expansion` and the expanded source length
+            /// they belong to.
+            inline_calls: [config.subqueries]B.InlineCall = undefined,
+            inline_text: [config.subqueries][2]usize = undefined,
+            inline_count: usize = 0,
+            inline_source_len: usize = 0,
             /// Row-security WITH CHECK of the statement's INSERT / UPDATE
             /// target (B11 wave 3): bound over expansion[start..][0..len].
             security_check: u16 = ast.none,
@@ -1177,12 +1185,19 @@ pub fn Database(comptime config: Config) type {
                 }
             }
             var block: usize = 0;
-            while (block < pool.query_len) : (block += 1) {
+            workspace.inline_count = 0;
+            workspace.inline_source_len = 0;
+            var scanned: usize = 0;
+            while (true) : (block += 1) {
+                // SQL routine calls of every block expanded so far (B11 wave 4).
+                try inlineBodies(db, workspace, &length, source, snap, &scanned);
+                if (block >= pool.query_len) break;
                 const q = &pool.queries[block];
                 for (q.items[0..q.item_count]) |*item| {
                     if (item.query != ast.none) continue;
                     const text = if (length == 0) source else workspace.expansion[0..length];
                     const name = identName(text, item.name);
+                    const direct = item.name.span.start < source.len or inlineSpan(workspace, item.name.span.start);
                     if (item.schema == null) {
                         var cte = false;
                         for (pool.queries[0..pool.query_len]) |*other| for (other.ctes[0..other.cte_count]) |*definition| {
@@ -1195,16 +1210,16 @@ pub fn Database(comptime config: Config) type {
                         if (view == .pg_authid and !privileged) return error.InsufficientPrivilege;
                         continue;
                     }
-                    if (item.schema == null and !public_schema_on_path and item.name.span.start < source.len) continue;
+                    if (item.schema == null and !public_schema_on_path and direct) continue;
                     const qualified = if (item.schema != null) schema_name.slice() else null;
-                    const namespace = if (item.name.span.start < source.len)
+                    const namespace = if (direct)
                         try db.namespaceForUsage(session.role, qualified, snap)
                     else
                         namespaceFor(catalog, qualified, snap);
                     const found = catalog.findIn(namespace orelse continue, name.slice(), snap) orelse continue;
                     if (executes_query) try session.restricted_relation_kinds.check(found.kind);
                     // Items the statement names (not view or expansion texts).
-                    if (!privileged and item.name.span.start < source.len) {
+                    if (!privileged and direct) {
                         const secured = try secureItem(db, workspace, &length, source, role, session.row_security, found, snap);
                         if (secured != ast.none) {
                             item.query = secured;
@@ -1244,7 +1259,83 @@ pub fn Database(comptime config: Config) type {
                 const top = bound_statement.select;
                 bound_statement.* = .{ .query = top };
             }
+            if (workspace.inline_count != 0) workspace.inline_source_len = length;
             return workspace.expansion[0..length];
+        }
+
+        /// Items inside an inlined routine body are checked like the
+        /// statement's own items (the invoker's privileges).
+        fn inlineSpan(workspace: *const Workspace, at: usize) bool {
+            for (workspace.inline_text[0..workspace.inline_count]) |range| if (at >= range[0] and at < range[1]) return true;
+            return false;
+        }
+
+        /// Appends one parsed copy of a SQL routine's body for every call
+        /// node (from `scanned` on) that names a visible SQL routine whose
+        /// body is one read-only query beyond `SELECT expression` (or that
+        /// returns a set or a record), for the binder to inline. SECURITY
+        /// DEFINER and SET routines are not inlined (PostgreSQL neither).
+        fn inlineBodies(db: *const Self, workspace: *Workspace, length: *usize, source: []const u8, snap: Snapshot, scanned: *usize) Error!void {
+            const pool = &workspace.nodes;
+            while (scanned.* < pool.len) : (scanned.* += 1) {
+                const id = scanned.*;
+                const call = pool.nodes[id];
+                if (call.kind != .function or call.func != .none or call.name.len == 0) continue;
+                const text = if (length.* == 0) source else workspace.expansion[0..length.*];
+                const name = identName(text, call.name);
+                var path: [routine_path_capacity]u32 = undefined;
+                var path_len: usize = 0;
+                if (call.qualifier.len != 0) {
+                    path[0] = namespaceFor(&db.catalog, identName(text, call.qualifier).slice(), snap) orelse continue;
+                    path_len = 1;
+                } else path_len = db.routinePath(snap, &path);
+                for (&db.objects.routines, 0..) |*routine, index| {
+                    if (!routine.live or routine.language != 0 or !routine.stamp.visible(snap) or !types.same(routine.name.slice(), name.slice())) continue;
+                    if (std.mem.indexOfScalar(u32, path[0..path_len], routine.namespace) == null) continue;
+                    const body_text = inlineBody(routine) orelse continue;
+                    if (workspace.inline_count == workspace.inline_calls.len) return error.ProgramLimitExceeded;
+                    const low = pool.len;
+                    const start = @max(length.*, source.len) + 1;
+                    const query = try appendQuery(workspace, length, source, body_text);
+                    pool.complex = true;
+                    workspace.inline_calls[workspace.inline_count] = .{ .node = @intCast(id), .routine = @intCast(index), .query = query, .low = @intCast(low), .high = @intCast(pool.len) };
+                    workspace.inline_text[workspace.inline_count] = .{ start, length.* };
+                    workspace.inline_count += 1;
+                }
+            }
+        }
+
+        /// The body text to inline: one SELECT / WITH / VALUES / TABLE
+        /// statement, not a plain `SELECT expression` (those run through
+        /// the routine hook) unless the routine returns a set or a record.
+        fn inlineBody(routine: *const RC.Routine) ?[]const u8 {
+            if (routine.language != 0 or routine.security_definer or routine.setting_count != 0 or routine.kind != 'f') return null;
+            const text = routine.body.slice();
+            var statements: R.Statements = .{ .source = text };
+            const span = (statements.next() catch return null) orelse return null;
+            if ((statements.next() catch return null) != null) return null;
+            const statement_text = text[span.start..span.end];
+            var cursor = R.Cursor.init(statement_text, 0) catch return null;
+            if (!cursor.is("select") and !cursor.is("with") and !cursor.is("values") and !cursor.is("table")) return null;
+            if (routine.retset or routine.return_oid == routine_catalog.record_oid) return statement_text;
+            // A plain `SELECT expression`: no clause and one target.
+            if (!cursor.is("select")) return statement_text;
+            cursor.advance() catch return null;
+            var depth: usize = 0;
+            while (!cursor.atEnd()) {
+                if (cursor.symbol(.lparen) or cursor.symbol(.lbracket)) depth += 1;
+                if ((cursor.symbol(.rparen) or cursor.symbol(.rbracket)) and depth > 0) depth -= 1;
+                // A subquery needs the query engine too.
+                if (cursor.is("select") or cursor.is("values") or cursor.is("exists")) return statement_text;
+                if (depth == 0) {
+                    if (cursor.symbol(.comma)) return statement_text;
+                    inline for (.{ "from", "where", "group", "having", "order", "limit", "offset", "union", "intersect", "except", "window", "distinct", "fetch", "into" }) |word| {
+                        if (cursor.is(word)) return statement_text;
+                    }
+                }
+                cursor.advance() catch return null;
+            }
+            return null;
         }
         /// Independent parser/binder/executor state over shared immutable table
         /// storage. The caller excludes ALL database/schema mutations until the
@@ -3177,7 +3268,8 @@ pub fn Database(comptime config: Config) type {
 
         fn bindContext(self: *Self, source: []const u8, mode: ParseMode, snap: Snapshot) B.Context {
             self.routine_path_len = self.routinePath(snap, &self.routine_path_items);
-            return .{ .routine_path = self.routine_path_items[0..self.routine_path_len], .routine_path_known = true, .source = source, .tables = &self.tables, .catalog = &self.catalog, .snapshot = snap, .pool = &self.workspace.nodes, .legacy = mode == .legacy_alpha, .dialect = self.dialect, .session = &self.session, .plans = &self.workspace.plans, .params = self.active_params,
+            const inlined = self.workspace.inline_count != 0 and source.ptr == &self.workspace.expansion and source.len == self.workspace.inline_source_len;
+            return .{ .inline_calls = if (inlined) self.workspace.inline_calls[0..self.workspace.inline_count] else &.{}, .routine_path = self.routine_path_items[0..self.routine_path_len], .routine_path_known = true, .source = source, .tables = &self.tables, .catalog = &self.catalog, .snapshot = snap, .pool = &self.workspace.nodes, .legacy = mode == .legacy_alpha, .dialect = self.dialect, .session = &self.session, .plans = &self.workspace.plans, .params = self.active_params,
                 .routines = &self.objects, .variables = if (self.routine_frame) |frame| &frame.variables else null,
                 .namespace_usage = .{ .ptr = self, .check = &bindNamespaceUsage },
                 .namespace_create = .{ .ptr = self, .check = &bindNamespaceCreate } };
@@ -10534,7 +10626,7 @@ pub fn Database(comptime config: Config) type {
             self.workspace.query.views = .{ .ptr = self, .rows = &viewRows, .sequence_rows = &sequenceRows };
             self.session_hook = .{ .ptr = self, .call = &sessionCall };
             self.session.engine = &self.session_hook;
-            self.routine_hook = .{ .ptr = self, .call = &routineHookCall, .call_defaults = &routineHookDefaults };
+            self.routine_hook = .{ .ptr = self, .call = &routineHookCall, .call_defaults = &routineHookDefaults, .prepare = &routineHookPrepare, .rows = &routineHookRows };
             self.session.routines = &self.routine_hook;
             self.session.routine_frame = null;
             self.routine_slot = slot;
@@ -12978,7 +13070,8 @@ pub fn Database(comptime config: Config) type {
             if (plpgsql) {
                 const purpose: R.Purpose = if (definition.kind == 'p') .procedure else if (definition.return_oid == tg.trigger_oid) .trigger else .function;
                 if (purpose == .trigger) try triggerVariableNames(&frame);
-                var interpreter: Interp = .{ .host = self, .source = definition.body.slice(), .frame = &frame, .purpose = purpose, .void_result = definition.return_oid == tg.void_oid or definition.out_count != 0 };
+                var interpreter: Interp = .{ .host = self, .source = definition.body.slice(), .frame = &frame, .purpose = purpose, .void_result = definition.return_oid == tg.void_oid or definition.out_count != 0 or definition.retset, .retset = definition.retset };
+                interpreter.output_count = definition.out_count;
                 return interpreter.execute(.check);
             }
             return self.validateSql(definition, &frame, snap);
@@ -13571,6 +13664,86 @@ pub fn Database(comptime config: Config) type {
         /// STRICT gives NULL for a NULL argument; a SQL body is one SELECT
         /// of one expression without FROM (others are 0A000); PL/pgSQL runs
         /// without statements of its own.
+        /// Before an inlined SQL body runs: EXECUTE privilege, DEFAULTs
+        /// (filled into `args`); false when STRICT meets a NULL argument.
+        fn routineHookPrepare(ptr: *anyopaque, index: usize, args_ptr: *anyopaque, count: usize, defaulted: u64) Error!bool {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            const args: [*]V.Cell = @ptrCast(@alignCast(args_ptr));
+            if (index >= config.routines) return error.UndefinedFunction;
+            const routine = &self.objects.routines[index];
+            if (!self.canExecuteRoutine(routine, self.routine_snap)) return error.InsufficientPrivilege;
+            if (count != routine.arg_count) return error.UndefinedFunction;
+            for (0..count) |position| {
+                if (defaulted & (@as(u64, 1) << @intCast(position)) != 0) args[position] = try self.routineDefault(routine, position);
+            }
+            if (routine.strict) for (args[0..count]) |cell| if (cell == .null_value) return false;
+            return true;
+        }
+
+        /// The rows of a routine in FROM that is not inlined: PL/pgSQL
+        /// (RETURN NEXT; else one row of its OUT parameters or value) and
+        /// SQL bodies of one `SELECT expression, ...` (one row).
+        fn routineHookRows(ptr: *anyopaque, index: usize, args_ptr: *const anyopaque, count: usize, defaulted: u64, sink: *anyopaque, emit: *const fn (sink: *anyopaque, cells: *const anyopaque) Error!void) Error!void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            const given: [*]const V.Cell = @ptrCast(@alignCast(args_ptr));
+            if (index >= config.routines) return error.UndefinedFunction;
+            const routine = &self.objects.routines[index];
+            if (!self.canExecuteRoutine(routine, self.routine_snap)) return error.InsufficientPrivilege;
+            if (count != routine.arg_count) return error.UndefinedFunction;
+            var args: [config.routine_args]V.Cell = undefined;
+            for (0..count) |position| {
+                args[position] = if (defaulted & (@as(u64, 1) << @intCast(position)) != 0) try self.routineDefault(routine, position) else given[position];
+            }
+            var row: [config.routine_args]V.Cell = @splat(.null_value);
+            if (routine.strict) for (args[0..count]) |cell| if (cell == .null_value) {
+                if (!routine.retset) try emit(sink, &row);
+                return;
+            };
+            try self.enterRoutine();
+            defer self.routine_depth -= 1;
+            self.routine_nested += 1;
+            defer self.routine_nested -= 1;
+            var scope: RoutineScope = .{};
+            try self.enterScope(routine, &scope);
+            defer self.leaveScope(&scope);
+            var frame: R.Frame = .{};
+            try routineFrame(&frame, routine);
+            for (args[0..count], 0..) |cell, position| frame.cells[position] = cell;
+            const result_column = columnOfOid(routine.return_oid, routine.return_typmod);
+            const text_body = routine.body.slice();
+            if (routine.language == 1) {
+                var interpreter: Interp = .{ .host = self, .source = text_body, .frame = &frame, .purpose = .function, .return_column = result_column, .void_result = routine.out_count != 0 or routine.retset, .retset = routine.retset, .rows = .{ .ptr = sink, .call = emit } };
+                for (0..routine.out_count) |output| interpreter.outputs[output] = @intCast(outputVariable(routine, output));
+                interpreter.output_count = routine.out_count;
+                try interpreter.execute(.run);
+                if (routine.retset) return;
+                if (routine.out_count != 0) {
+                    for (0..routine.out_count) |output| row[output] = frame.cells[outputVariable(routine, output)];
+                } else row[0] = interpreter.result;
+                return emit(sink, &row);
+            }
+            // SQL: one `SELECT expression, ...` (other bodies are inlined).
+            var statements: R.Statements = .{ .source = text_body };
+            const span = (try statements.next()) orelse return error.UnsupportedStatement;
+            if ((try statements.next()) != null) return error.UnsupportedStatement;
+            const pool = &self.workspace.nodes;
+            const mark = poolMark(pool);
+            defer poolRestore(pool, mark);
+            const query_index = P.parseQueryAt(text_body, span.start, span.end, pool) catch return error.UnsupportedStatement;
+            const q = &pool.queries[query_index];
+            const columns: usize = if (routine.out_count != 0) routine.out_count else 1;
+            if (q.count != columns or q.item_count != 0 or q.from != null or q.where != ast.none or q.group_count != 0 or
+                q.having != ast.none or q.order_count != 0 or q.limit_present or q.offset_present or q.set_op != .none or q.cte_count != 0 or
+                q.distinct or q.values != ast.none or q.window_defs != ast.none or q.grouping_sets != ast.none) return error.UnsupportedStatement;
+            for (0..columns) |column| {
+                if (q.targets[column].star) return error.UnsupportedStatement;
+                const target_column = if (routine.out_count != 0) columnOfOid(routine.out_oids[column], routine.out_typmods[column]) else result_column;
+                const value = try self.routineValue(&frame, text_body, q.targets[column].expr, mark.len, &target_column);
+                row[column] = try D.store(&target_column, value, &self.session);
+            }
+            return emit(sink, &row);
+        }
+
         fn routineHookCall(ptr: *anyopaque, index: usize, args_ptr: *const anyopaque, count: usize, out_ptr: *anyopaque) Error!void {
             return routineHookDefaults(ptr, index, args_ptr, count, 0, out_ptr);
         }

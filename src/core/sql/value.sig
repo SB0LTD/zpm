@@ -188,6 +188,12 @@ pub const RoutineHook = struct {
     /// A call with DEFAULT arguments (B11 wave 4): bit p of `defaulted`
     /// marks input p as taking its DEFAULT expression.
     call_defaults: ?*const fn (ptr: *anyopaque, routine: usize, args: *const anyopaque, count: usize, defaulted: u64, out: *anyopaque) Error!void = null,
+    /// Before an inlined SQL body runs: EXECUTE privilege, DEFAULTs filled
+    /// into `args` in place; false when STRICT meets a NULL argument.
+    prepare: ?*const fn (ptr: *anyopaque, routine: usize, args: *anyopaque, count: usize, defaulted: u64) Error!bool = null,
+    /// Rows of a routine in FROM (set-returning or several OUT columns):
+    /// `emit(sink, cells)` once per row with the result columns.
+    rows: ?*const fn (ptr: *anyopaque, routine: usize, args: *const anyopaque, count: usize, defaulted: u64, sink: *anyopaque, emit: *const fn (sink: *anyopaque, cells: *const anyopaque) Error!void) Error!void = null,
 };
 
 pub const CatalogText = enum { description, shared_description, role_name, function_arguments, function_identity_arguments, function_result, function_sqlbody };

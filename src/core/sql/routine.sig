@@ -86,6 +86,8 @@ pub fn Routines(comptime config: types.Config) type {
             retset: bool = false,
             record: bool = false,
             security_definer: bool = false,
+            /// The body is SQL-standard (RETURN / BEGIN ATOMIC).
+            sql_body: bool = false,
             settings: [RC.arg_bytes]u8 = @splat(0),
             settings_len: usize = 0,
             setting_count: usize = 0,
@@ -605,15 +607,70 @@ pub fn Routines(comptime config: types.Config) type {
                     out.body.len = try cursor.string(&out.body.bytes);
                     // AS 'obj_file', 'link_symbol' (C functions) is outside the subset.
                     if (cursor.symbol(.comma)) return error.UnsupportedStatement;
-                } else if (cursor.is("return") or cursor.is("begin") or cursor.is("window") or cursor.is("transform") or cursor.is("support")) {
+                } else if (cursor.is("return") or cursor.is("begin")) {
+                    // SQL-standard bodies (B11 wave 4): RETURN expression,
+                    // kept as `SELECT expression`, and BEGIN ATOMIC
+                    // statements END, kept as the statements. Both close
+                    // the definition and imply LANGUAGE SQL.
+                    if (body) return error.Syntax;
+                    body = true;
+                    out.sql_body = true;
+                    try sqlBody(cursor, out);
+                    break;
+                } else if (cursor.is("window") or cursor.is("transform") or cursor.is("support")) {
                     return error.UnsupportedStatement;
                 } else return error.Syntax;
             }
             try finish(cursor);
             if (!body) return error.InvalidFunctionDefinition;
-            if (!language) return error.InvalidFunctionDefinition;
+            if (out.sql_body and language and out.language != 0) return error.InvalidFunctionDefinition;
+            if (!language and !out.sql_body) return error.InvalidFunctionDefinition;
             if (out.procedure and (volatility or strictness)) return error.InvalidFunctionDefinition;
             try validateSignature(out);
+        }
+
+        fn sqlBody(cursor: *Cursor, out: *CreateRoutine) Error!void {
+            if (try cursor.take("return")) {
+                const begin = cursor.start();
+                var end = begin;
+                while (!cursor.atEnd() and !cursor.symbol(.semicolon)) {
+                    end = cursor.after();
+                    try cursor.advance();
+                }
+                const expression = std.mem.trim(u8, cursor.source[begin..end], " \t\r\n");
+                if (expression.len == 0) return error.Syntax;
+                if (expression.len + 7 > out.body.bytes.len) return error.TextCapacity;
+                @memcpy(out.body.bytes[0..7], "SELECT ");
+                @memcpy(out.body.bytes[7..][0..expression.len], expression);
+                out.body.len = expression.len + 7;
+                return;
+            }
+            try cursor.expect("begin");
+            try cursor.expect("atomic");
+            const begin = cursor.start();
+            var end = begin;
+            var depth: usize = 0;
+            var cases: usize = 0;
+            while (true) {
+                if (cursor.atEnd()) return error.Syntax;
+                if (cursor.symbol(.lparen)) depth += 1;
+                if (cursor.symbol(.rparen) and depth > 0) depth -= 1;
+                if (cursor.is("case")) cases += 1;
+                if (cursor.is("end")) {
+                    if (cases > 0) {
+                        cases -= 1;
+                    } else if (depth == 0) {
+                        end = cursor.start();
+                        try cursor.advance();
+                        break;
+                    }
+                }
+                try cursor.advance();
+            }
+            const statements = std.mem.trim(u8, cursor.source[begin..end], " \t\r\n");
+            if (statements.len > out.body.bytes.len) return error.TextCapacity;
+            @memcpy(out.body.bytes[0..statements.len], statements);
+            out.body.len = statements.len;
         }
 
         /// `SET name { TO | = } value [, ...]` or `SET name FROM CURRENT`
@@ -1169,6 +1226,9 @@ pub fn Routines(comptime config: types.Config) type {
 
         pub const Mode = enum { check, run, skip };
 
+        /// Receives one result row (B11 wave 4: set-returning routines).
+        pub const Emit = struct { ptr: *anyopaque, call: *const fn (ptr: *anyopaque, cells: *const anyopaque) Error!void };
+
         pub const Purpose = enum { function, procedure, do_block, trigger };
 
         /// What RETURN produced in a trigger function.
@@ -1399,6 +1459,13 @@ pub fn Routines(comptime config: types.Config) type {
                 handling: ?Error = null,
                 /// Its description (GET STACKED DIAGNOSTICS, re-RAISE).
                 diag: ?*const Diagnostics = null,
+                /// A set-returning function (B11 wave 4): RETURN NEXT emits
+                /// a row through `rows` (the expression, or the OUT / TABLE
+                /// variables `outputs` in result-column order).
+                retset: bool = false,
+                outputs: [config.routine_args]u8 = undefined,
+                output_count: usize = 0,
+                rows: ?Emit = null,
 
                 /// Validates (`check`) or runs the routine body.
                 pub fn execute(self: *Self, mode: Mode) Error!void {
@@ -2057,7 +2124,8 @@ pub fn Routines(comptime config: types.Config) type {
                 fn returnStatement(self: *Self, mode: Mode) Error!Signal {
                     const c = &self.cursor;
                     try c.expect("return");
-                    if (c.is("next") or c.is("query")) return error.UnsupportedStatement;
+                    if (c.is("next")) return self.returnNext(mode);
+                    if (c.is("query")) return self.returnQuery(mode);
                     if (c.symbol(.semicolon)) {
                         try c.advance();
                         if (self.purpose == .function and !self.voidResult()) return error.Syntax;
@@ -2089,6 +2157,62 @@ pub fn Routines(comptime config: types.Config) type {
                     self.result = try D.store(&self.return_column, value, self.host.routineSession());
                     self.returned = true;
                     return .returned;
+                }
+
+                /// RETURN NEXT [expression]: one more row of a set-returning
+                /// function (42804 outside one, or with an expression beside
+                /// OUT parameters; 42601 without one and without them).
+                noinline fn returnNext(self: *Self, mode: Mode) Error!Signal {
+                    const c = &self.cursor;
+                    try c.expect("next");
+                    if (self.purpose != .function or !self.retset) return error.TypeMismatch;
+                    var row: [config.routine_args]V.Cell = undefined;
+                    if (c.symbol(.semicolon)) {
+                        try c.advance();
+                        if (self.output_count == 0) return error.Syntax;
+                        if (mode != .run) return .normal;
+                        for (self.outputs[0..self.output_count], 0..) |variable, column| row[column] = self.frame.cells[variable];
+                    } else {
+                        if (self.output_count != 0) return error.TypeMismatch;
+                        const span = try self.expression(.{});
+                        try c.expectSymbol(.semicolon);
+                        if (mode != .run) {
+                            _ = try self.evaluate(span, mode, null);
+                            return .normal;
+                        }
+                        const value = try self.evaluate(span, .run, &self.return_column);
+                        row[0] = try D.store(&self.return_column, value, self.host.routineSession());
+                    }
+                    const sink = self.rows orelse return error.UnsupportedStatement;
+                    try sink.call(sink.ptr, &row);
+                    return .normal;
+                }
+
+                /// RETURN QUERY runs a query inside the running statement:
+                /// checked at CREATE, 0A000 when run (nested statement
+                /// execution is not available to functions here).
+                noinline fn returnQuery(self: *Self, mode: Mode) Error!Signal {
+                    const c = &self.cursor;
+                    try c.expect("query");
+                    if (self.purpose != .function or !self.retset) return error.TypeMismatch;
+                    if (c.is("execute")) return error.UnsupportedStatement;
+                    const begin = c.start();
+                    var depth: usize = 0;
+                    while (!c.atEnd()) {
+                        if (c.symbol(.lparen)) depth += 1;
+                        if (c.symbol(.rparen) and depth > 0) depth -= 1;
+                        if (depth == 0 and c.symbol(.semicolon)) break;
+                        try c.advance();
+                    }
+                    if (c.atEnd()) return error.Syntax;
+                    const end = c.start();
+                    try c.expectSymbol(.semicolon);
+                    switch (mode) {
+                        .check => try self.host.routineCheckStatement(self.source[begin..end]),
+                        .run => return error.UnsupportedStatement,
+                        .skip => {},
+                    }
+                    return .normal;
                 }
 
                 noinline fn raiseStatement(self: *Self, mode: Mode) Error!Signal {

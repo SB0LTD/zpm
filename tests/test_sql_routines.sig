@@ -377,10 +377,10 @@ fn sqlFunctions() !void {
     try fails("CREATE OR REPLACE FUNCTION add1(x INT) RETURNS BIGINT LANGUAGE SQL AS 'SELECT 1'", error.InvalidFunctionDefinition);
     try fails("CREATE OR REPLACE FUNCTION add1(y INT) RETURNS INT LANGUAGE SQL AS 'SELECT y'", error.InvalidFunctionDefinition);
     try fails("CREATE OR REPLACE PROCEDURE add1(x INT) LANGUAGE SQL AS 'SELECT 1'", error.WrongObjectType);
-    // Bodies other than one SELECT of an expression are 0A000 when called
-    // from an expression (pending: general SQL function execution).
+    // A query body is inlined (B11 wave 4); writes and several statements
+    // stay 0A000 from an expression (tests/test_sql_routines_sig.sig).
     try run("CREATE FUNCTION counted() RETURNS BIGINT LANGUAGE SQL AS 'SELECT count(*) FROM tdd_a'");
-    try fails("SELECT counted()", error.UnsupportedStatement);
+    try expect("SELECT counted() = (SELECT count(*) FROM tdd_a)", "t");
     // Procedures are CALLed; functions are not.
     try run("CREATE PROCEDURE noop() LANGUAGE SQL AS 'SELECT 1'");
     try fails("SELECT noop()", error.WrongObjectType);

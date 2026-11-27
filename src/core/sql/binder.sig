@@ -368,6 +368,12 @@ pub fn Binder(comptime config: types.Config) type {
             /// public when it is on the path.
             routine_path: []const u32 = &.{},
             routine_path_known: bool = false,
+            /// The FROM item's call node bindTableFunction binds: it may be
+            /// a set-returning routine or return a record (B11 wave 4).
+            table_function: u16 = none,
+            /// Parsed copies of SQL routine bodies for inlining, one per
+            /// call node and candidate routine (Database.expandRelations).
+            inline_calls: []const InlineCall = &.{},
             /// Variables of the running routine (parameters, PL/pgSQL
             /// variables, NEW/OLD): names that no column binds read them.
             variables: ?*const RoutineVariables = null,
@@ -406,6 +412,11 @@ pub fn Binder(comptime config: types.Config) type {
 
         pub const no_cte: u8 = 0xff;
         pub const group_relation = ast.groupRelation(config);
+
+        /// A SQL routine body appended to the statement for call `node`
+        /// (B11 wave 4): `query` is its parsed SELECT over pool nodes
+        /// [low, high).
+        pub const InlineCall = struct { node: u16 = none, routine: u16 = 0, query: u16 = 0, low: u16 = 0, high: u16 = 0 };
 
         /// One routine variable visible to expressions (B11 wave 3).
         pub const RoutineVariable = struct { name: V.Name = .{}, ty: ast.Type = .int4, typmod: i32 = -1 };
@@ -541,7 +552,9 @@ pub fn Binder(comptime config: types.Config) type {
         /// FROM (one row).
         pub const Series = enum { none, integer, numeric, timestamp,
             // JSON_TABLE (B11 json-agg lane): `function` is the table node.
-            json_table, partition_ancestors, options_to_table, unnest };
+            json_table, partition_ancestors, options_to_table, unnest,
+            // A user routine in FROM (B11 wave 4): Exec.routineRows.
+            routine };
 
         /// A bound query block of the general engine (design §4.9). Its
         /// materialized rows are `width` cells: the `count` visible output
@@ -5399,10 +5412,12 @@ pub fn Binder(comptime config: types.Config) type {
             // A procedure is CALLed (42809); trigger functions only fire (0A000).
             if (routine.kind == 'p') return error.WrongObjectType;
             if (routine.return_oid == routine_catalog.trigger_oid) return error.UnsupportedStatement;
+            const node_id: u16 = @intCast((@intFromPtr(n) - @intFromPtr(&context.pool.nodes[0])) / @sizeOf(ast.Node));
+            const from = context.table_function == node_id;
             // A record (several OUT parameters) or a set has no scalar
             // value here; FROM binds them as table functions (0A000).
-            if (routine.retset or routine.return_oid == routine_catalog.record_oid) return error.UnsupportedStatement;
-            const result = types.typeFromOid(routine.return_oid) orelse return error.UnsupportedStatement;
+            if (!from and (routine.retset or routine.return_oid == routine_catalog.record_oid)) return error.UnsupportedStatement;
+            const result: types.DataType = if (routine.return_oid == routine_catalog.record_oid) .text else types.typeFromOid(routine.return_oid) orelse return error.UnsupportedStatement;
             // One bound argument per input, in parameter order: converted
             // values, a DEFAULT placeholder, or ARRAY[...] of the variadic
             // elements.
@@ -5435,6 +5450,55 @@ pub fn Binder(comptime config: types.Config) type {
             n.ty = types.typeOfData(result);
             n.typmod = routine.return_typmod;
             n.constant = false;
+            n.boolean = routine.retset;
+            n.c = none;
+            for (context.inline_calls) |entry| {
+                if (entry.node == node_id and entry.routine == chosen) {
+                    n.c = try bindInlineBody(context, routine, entry, from);
+                    break;
+                }
+            }
+        }
+
+        /// Binds an appended SQL body for call inlining: its parameters are
+        /// frame variables, it sees no FROM item of the caller, its columns
+        /// convert to the result columns and it is re-run per call (a
+        /// correlated plan); a scalar call takes its first row. Returns a
+        /// scalar_subquery node over the plan.
+        fn bindInlineBody(context: *const Context, routine: *const RC.Routine, entry: InlineCall, from: bool) Error!u16 {
+            var variables: RoutineVariables = .{};
+            for (0..routine.arg_count) |input| {
+                if (variables.count == variables.items.len) return error.ColumnCapacity;
+                variables.items[variables.count] = .{ .name = routine.arg_names[input], .ty = types.typeOfData(types.typeFromOid(routine.arg_oids[input]) orelse return error.UndefinedFunction), .typmod = routine.arg_typmods[input] };
+                variables.count += 1;
+            }
+            variables.parameters = variables.count;
+            variables.routine_name = routine.name;
+            variables.node_low = entry.low;
+            variables.node_high = entry.high;
+            var inner = context.*;
+            inner.variables = &variables;
+            inner.table_function = none;
+            const scope: Scope = .{};
+            const plan_id = try bindPlan(&inner, entry.query, &scope, null, false);
+            const plans = plansOf(context);
+            const plan = &plans.items[plan_id];
+            plan.correlated = true;
+            // The result columns: OUT / TABLE parameters, else the return type.
+            const wanted: usize = if (routine.out_count != 0) routine.out_count else 1;
+            if (plan.count != wanted) return error.InvalidFunctionDefinition;
+            for (0..wanted) |column| {
+                const oid = if (routine.out_count != 0) routine.out_oids[column] else routine.return_oid;
+                const target = types.typeOfData(types.typeFromOid(oid) orelse return error.UnsupportedStatement);
+                const ty = plan.tys[column];
+                if (ty != target and ty != .unknown and !value.castable(ty, target, .assignment) and !(value.integral(ty) and value.integral(target))) return error.InvalidFunctionDefinition;
+                if (ty != target and ty != .unknown and !(value.integral(ty) and value.integral(target))) {
+                    plan.targets[column] = try convert(context, plan.targets[column], target, -1, .assignment);
+                    plan.tys[column] = target;
+                } else try castColumn(context, plan_id, column, target);
+            }
+            if (!from) plan.limit = @min(plan.limit, 1);
+            return context.pool.add(.{ .kind = .scalar_subquery, .integer = plan_id, .ty = plan.tys[0], .typmod = plan.typmods[0], .constant = false });
         }
 
         fn namedArguments(context: *const Context, n: *const ast.Node) bool {
@@ -7008,9 +7072,15 @@ pub fn Binder(comptime config: types.Config) type {
                 ty = try bindUnnestArgument(context, &inner, call);
                 series = .unnest;
             } else {
-                try typeExpr(context, &inner, item.function);
+                var from_context = context.*;
+                from_context.table_function = item.function;
+                try typeExpr(&from_context, &inner, item.function);
                 ty = context.node(item.function).ty;
                 if (ty == .unknown) ty = .text;
+                if (call.func == .routine) {
+                    const routine = &context.routines.?.routines[@intCast(call.integer)];
+                    if (routine.retset or routine.out_count != 0 or call.c != none) return bindRoutineFrom(context, id, item, routine, name);
+                }
             }
             const p = &plans.items[id];
             p.function = item.function;
@@ -7039,6 +7109,38 @@ pub fn Binder(comptime config: types.Config) type {
                 p.names[column] = literalName("ordinality");
                 p.tys[column] = .int8;
                 p.typmods[column] = -1;
+                p.count += 1;
+            }
+            p.width = p.count;
+            return id;
+        }
+
+        /// A user routine's FROM plan (B11 wave 4): its result columns are
+        /// the OUT / TABLE parameters (named after them), else one column
+        /// named after the function (or the table alias); ORDINALITY adds
+        /// a bigint column.
+        fn bindRoutineFrom(context: *const Context, id: u16, item: *const Ast.FromItem, routine: *const RC.Routine, name: V.Name) Error!u16 {
+            const p = &plansOf(context).items[id];
+            p.function = item.function;
+            p.series = .routine;
+            p.ordinality = item.ordinality;
+            const columns: usize = if (routine.out_count != 0) routine.out_count else 1;
+            if (columns + @intFromBool(item.ordinality) > p.names.len) return error.ColumnCapacity;
+            for (0..columns) |column| {
+                const oid = if (routine.out_count != 0) routine.out_oids[column] else routine.return_oid;
+                const ty = types.typeOfData(types.typeFromOid(oid) orelse return error.UnsupportedStatement);
+                p.targets[column] = try context.pool.add(.{ .kind = .null_literal, .ty = ty, .constant = true });
+                p.tys[column] = ty;
+                p.typmods[column] = if (routine.out_count != 0) routine.out_typmods[column] else routine.return_typmod;
+                // One column takes the alias's name, else its parameter's or the function's.
+                p.names[column] = if (columns == 1 and item.alias != null) toName(context, item.alias.?) else if (routine.out_count != 0 and routine.out_names[column].len != 0) routine.out_names[column] else if (columns == 1) name else literalName("column");
+            }
+            p.count = columns;
+            if (item.ordinality) {
+                p.targets[columns] = try context.pool.add(.{ .kind = .null_literal, .ty = .int8, .constant = true });
+                p.names[columns] = literalName("ordinality");
+                p.tys[columns] = .int8;
+                p.typmods[columns] = -1;
                 p.count += 1;
             }
             p.width = p.count;

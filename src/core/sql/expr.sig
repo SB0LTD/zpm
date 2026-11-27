@@ -358,6 +358,17 @@ pub fn Eval(comptime config: types.Config) type {
                 count += 1;
             }
             var out: V.Cell = .null_value;
+            if (n.c != none) {
+                // An inlined SQL body (B11 wave 4): its plan runs as a
+                // correlated scalar subquery over the arguments' frame.
+                const prepare = hook.prepare orelse return error.UnsupportedStatement;
+                if (!try prepare(hook.ptr, @intCast(n.integer), &args, count, defaulted)) return .null_value;
+                const run = ctx.hook orelse return error.UnsupportedStatement;
+                const frame: Frame = .{ .cells = &args, .count = count };
+                var inner = ctx.*;
+                inner.frame = &frame;
+                return run.run(run.ptr, &inner, n.c);
+            }
             if (defaulted != 0) {
                 const call = hook.call_defaults orelse return error.UnsupportedStatement;
                 try call(hook.ptr, @intCast(n.integer), &args, count, defaulted, &out);

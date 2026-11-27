@@ -511,10 +511,76 @@ fn definers() !void {
     try sameState(&.{ "SELECT who, v FROM log5", "SELECT pathf(), setf()", "SELECT prosecdef FROM pg_proc WHERE proname = 'peekp'" });
 }
 
+// ---- set-returning routines and SQL bodies -------------------------------
+
+fn setFunctions() !void {
+    try run("CREATE TABLE items (id INT, name TEXT, price INT)");
+    try run("INSERT INTO items VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30)");
+    // SQL bodies with FROM are inlined: a set in FROM, a scalar's first row.
+    try run("CREATE FUNCTION names(lim INT) RETURNS SETOF TEXT LANGUAGE sql AS 'SELECT name FROM items WHERE price <= lim ORDER BY id'");
+    try run("CREATE FUNCTION pairs(n INT) RETURNS TABLE (k INT, sq INT) LANGUAGE sql AS 'SELECT g, g * g FROM generate_series(1, n) g'");
+    try run("CREATE FUNCTION price_of(i INT) RETURNS INT LANGUAGE sql AS 'SELECT price FROM items WHERE id = i'");
+    try run("CREATE FUNCTION first_name() RETURNS TEXT LANGUAGE sql AS 'SELECT name FROM items ORDER BY id DESC'");
+    try run("CREATE FUNCTION counted() RETURNS BIGINT LANGUAGE sql AS 'SELECT count(*) FROM items'");
+    try expectColumns("SELECT * FROM names(20)", "names", &.{25}, "a;b");
+    try expect("SELECT n FROM names(25) AS n", "a;b");
+    try expectColumns("SELECT * FROM pairs(3)", "k,sq", &.{ 23, 23 }, "1|1;2|4;3|9");
+    try expectColumns("SELECT * FROM pairs(3) WITH ORDINALITY", "k,sq,ordinality", &.{ 23, 23, 20 }, "1|1|1;2|4|2;3|9|3");
+    try expectColumns("SELECT * FROM pairs(2) AS p(x, y)", "x,y", &.{ 23, 23 }, "1|1;2|4");
+    try expectColumns("SELECT price_of(2), price_of(9), first_name(), counted()", "price_of,price_of,first_name,counted", &.{ 23, 23, 25, 20 }, "20|NULL|c|3");
+    try expect("SELECT id, price_of(id) FROM items ORDER BY id", "1|10;2|20;3|30");
+    // PL/pgSQL: RETURN NEXT rows, OUT / TABLE parameters as columns.
+    try run("CREATE FUNCTION evens(n INT) RETURNS SETOF INT LANGUAGE plpgsql AS $$BEGIN FOR i IN 1..n LOOP IF i % 2 = 0 THEN RETURN NEXT i; END IF; END LOOP; RETURN; END$$");
+    try run("CREATE FUNCTION tab2(n INT) RETURNS TABLE (a INT, b TEXT) LANGUAGE plpgsql AS $$BEGIN FOR i IN 1..n LOOP a := i; b := 'r' || i; RETURN NEXT; END LOOP; END$$");
+    try run("CREATE FUNCTION fo(a INT, OUT b INT, OUT c TEXT) LANGUAGE sql AS $$SELECT a + 1, 'x'$$");
+    try expectColumns("SELECT * FROM evens(7)", "evens", &.{23}, "2;4;6");
+    try expectColumns("SELECT * FROM evens(5) WITH ORDINALITY AS e(v, o)", "v,o", &.{ 23, 20 }, "2|1;4|2");
+    try expectColumns("SELECT * FROM tab2(2)", "a,b", &.{ 23, 25 }, "1|r1;2|r2");
+    try expectColumns("SELECT * FROM fo(1)", "b,c", &.{ 23, 25 }, "2|x");
+    try expectColumns("SELECT * FROM fio(2)", "a,b", &.{ 23, 23 }, "20|21");
+    try expect("SELECT b FROM fo(5)", "6");
+    try expect("SELECT x.k, y.v FROM pairs(2) x, LATERAL evens(x.k * 2) y(v) ORDER BY 1, 2", "1|2;2|2;2|4");
+    try run("CREATE FUNCTION strictset(a INT) RETURNS SETOF INT STRICT LANGUAGE sql AS 'SELECT 1'");
+    try expect("SELECT count(*) FROM strictset(NULL)", "0");
+    // SQL-standard bodies: RETURN expression and BEGIN ATOMIC.
+    try run("CREATE FUNCTION ret1(a INT) RETURNS INT RETURN a + 1");
+    try run("CREATE FUNCTION atom(a INT) RETURNS INT LANGUAGE sql BEGIN ATOMIC SELECT a * 2; END");
+    try run("CREATE FUNCTION atom2(lim INT) RETURNS BIGINT LANGUAGE sql BEGIN ATOMIC SELECT count(*) FROM items WHERE price <= lim; END");
+    try run("CREATE FUNCTION atomset(lim INT) RETURNS SETOF TEXT LANGUAGE sql BEGIN ATOMIC SELECT name FROM items WHERE price <= lim ORDER BY id; END");
+    try run("CREATE FUNCTION retplain() RETURNS INT LANGUAGE sql RETURN (SELECT max(price) FROM items)");
+    try expect("SELECT ret1(1), atom(4), atom2(20), retplain()", "2|8|2|30");
+    try expect("SELECT * FROM atomset(25)", "a;b");
+    try fails("CREATE FUNCTION atom3() RETURNS INT LANGUAGE plpgsql BEGIN ATOMIC SELECT 1; END", error.InvalidFunctionDefinition);
+    try fails("CREATE FUNCTION atom4() RETURNS INT LANGUAGE sql BEGIN ATOMIC SELECT nosuch FROM items; END", error.ColumnNotFound);
+    // Definition errors of set-returning PL/pgSQL.
+    try fails("CREATE FUNCTION bad1() RETURNS INT LANGUAGE plpgsql AS $$BEGIN RETURN NEXT 1; END$$", error.TypeMismatch);
+    try fails("CREATE FUNCTION bad2() RETURNS SETOF INT LANGUAGE plpgsql AS $$BEGIN RETURN 1; END$$", error.TypeMismatch);
+    try fails("CREATE FUNCTION bad3(OUT a INT) RETURNS SETOF INT LANGUAGE plpgsql AS $$BEGIN RETURN NEXT 1; END$$", error.TypeMismatch);
+    try fails("CREATE FUNCTION bad4() RETURNS SETOF INT LANGUAGE plpgsql AS $$BEGIN RETURN NEXT; END$$", error.Syntax);
+    // Not here (0A000): set-returning calls in the target list
+    // (ProjectSet), RETURN QUERY, multi-statement and data-modifying
+    // bodies called from an expression (nested statement execution).
+    try fails("SELECT names(20)", error.UnsupportedStatement);
+    try run("CREATE FUNCTION evq(n INT) RETURNS SETOF INT LANGUAGE plpgsql AS $$BEGIN RETURN QUERY SELECT g FROM generate_series(1, n) g; END$$");
+    try fails("SELECT * FROM evq(3)", error.UnsupportedStatement);
+    try run("CREATE FUNCTION sqlmulti(a INT) RETURNS INT LANGUAGE sql AS 'SELECT 1; SELECT a + 1'");
+    try fails("SELECT sqlmulti(1)", error.UnsupportedStatement);
+    try run("CREATE FUNCTION upd() RETURNS INT LANGUAGE sql AS 'UPDATE items SET price = price RETURNING 1'");
+    try fails("SELECT upd()", error.UnsupportedStatement);
+    // An inlined body reads with the caller's privileges.
+    try run("CREATE FUNCTION peek_secret() RETURNS INT LANGUAGE sql AS 'SELECT v FROM secret'");
+    try run("SET ROLE alice");
+    try fails("SELECT peek_secret()", error.InsufficientPrivilege);
+    try run("RESET ROLE");
+    try expect("SELECT peek_secret()", "42");
+    try sameState(&.{ "SELECT * FROM pairs(3) WITH ORDINALITY", "SELECT price_of(2), counted(), ret1(1), atom2(20)", "SELECT * FROM tab2(2)", "SELECT * FROM fio(2)" });
+}
+
 pub fn main() !void {
     try diagnostics();
     try schemas();
     try parameters();
     try definers();
+    try setFunctions();
     std.debug.print("routines-sig: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });
 }
