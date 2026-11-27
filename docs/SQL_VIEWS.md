@@ -9,6 +9,9 @@ updatability, INSTEAD OF triggers and rule actions are provided by the merged
 [nested statement implementation](SQL_NESTED_STATEMENTS.md). Replacement must
 retain their OID links; an integration contract checks trigger and rule effects
 after changing the SELECT to a computed projection.
+Trigger deparsing also retains INSTEAD OF timing; emitting AFTER instead made
+stock dumps invalid when restored to native PostgreSQL. Full/pretty definition
+and WAL contracts accompany the real archive round trip.
 
 Replacement uses the existing transactional definition rewrite, retaining the
 relation OID, owner, ACLs and existing column defaults. The old definition remains

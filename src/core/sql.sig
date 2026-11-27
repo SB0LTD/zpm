@@ -9074,7 +9074,7 @@ pub fn Database(comptime config: Config) type {
                 var text: CatalogTextWriter = .{ .out = out, .quote_all = self.session.quote_all_identifiers };
                 text.add("CREATE TRIGGER ");
                 text.ident(trigger.name.slice());
-                text.add(if (trigger.tgtype & tg.tg_before != 0) " BEFORE " else " AFTER ");
+                text.add(if (trigger.tgtype & tg.tg_before != 0) " BEFORE " else if (trigger.tgtype & tg.tg_instead != 0) " INSTEAD OF " else " AFTER ");
                 var preceding_event = false;
                 inline for (.{ .{ tg.tg_insert, "INSERT" }, .{ tg.tg_delete, "DELETE" }, .{ tg.tg_update, "UPDATE" }, .{ tg.tg_truncate, "TRUNCATE" } }) |event| {
                     if (trigger.tgtype & event[0] != 0) {

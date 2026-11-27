@@ -10,6 +10,12 @@ result lifetime and WAL replay. The existing 16-bit WAL length and configured
 query-expansion budget remain explicit bounds; compact base-image view support
 remains open. PG16/18 qualification is still required for this later candidate.
 
+The stronger native outbound restore then caught INSTEAD OF view triggers being
+deparsed as AFTER. The deparser now preserves the actual timing bit; regression
+contracts check full/pretty definitions, replacement and WAL replay. The failed
+native restore is retained, and real native restoration with the fixed binary
+is required in addition to the metadata assertions.
+
 The current candidate includes main b87c97a6: routine schemas/signatures and
 SECURITY DEFINER, nested SQL/updatable views/rule actions, extended types,
 regex/text-search/SQL-JSON, inheritance/partition DML, constraints, search_path

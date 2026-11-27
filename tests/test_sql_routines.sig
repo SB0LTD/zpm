@@ -1621,6 +1621,11 @@ fn viewReplacementWithHooks() !void {
     try run("CREATE VIEW hook_view AS SELECT id,v FROM hook_source");
     try run("CREATE FUNCTION view_hook() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN UPDATE hook_source SET v=NEW.v WHERE id=OLD.id; RETURN NEW; END$$");
     try run("CREATE TRIGGER replacement_hook INSTEAD OF UPDATE ON hook_view FOR EACH ROW EXECUTE FUNCTION view_hook()");
+    const trigger_definition = "SELECT pg_get_triggerdef(oid) FROM pg_trigger WHERE tgname='replacement_hook'";
+    const pretty_trigger = "SELECT pg_get_triggerdef(oid,true) FROM pg_trigger WHERE tgname='replacement_hook'";
+    try expect("SELECT tgtype FROM pg_trigger WHERE tgname='replacement_hook'", "81");
+    try expect(trigger_definition, "CREATE TRIGGER replacement_hook INSTEAD OF UPDATE ON public.hook_view FOR EACH ROW EXECUTE FUNCTION view_hook()");
+    try expect(pretty_trigger, "CREATE TRIGGER replacement_hook INSTEAD OF UPDATE ON hook_view FOR EACH ROW EXECUTE FUNCTION view_hook()");
     try run("CREATE OR REPLACE VIEW hook_view AS SELECT id,v+10 AS v FROM hook_source");
     try completes("UPDATE hook_view SET v=99 WHERE id=1", .update, 1);
     try expect("SELECT v FROM hook_source", "99");
@@ -1630,10 +1635,13 @@ fn viewReplacementWithHooks() !void {
     try completes("DELETE FROM hook_view", .delete, 0);
     try expect("SELECT v FROM hook_source", "99");
     try expect("SELECT v FROM hook_view", "198");
+    try expect(trigger_definition, "CREATE TRIGGER replacement_hook INSTEAD OF UPDATE ON public.hook_view FOR EACH ROW EXECUTE FUNCTION view_hook()");
     try sameState(&.{
         "SELECT v FROM hook_source",
         "SELECT v FROM hook_view",
         "SELECT tgname FROM pg_trigger WHERE tgrelid='hook_view'::regclass",
+        trigger_definition,
+        pretty_trigger,
         "SELECT rulename FROM pg_rewrite WHERE ev_class='hook_view'::regclass ORDER BY rulename",
     });
 }
