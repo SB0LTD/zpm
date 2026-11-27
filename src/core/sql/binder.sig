@@ -2875,7 +2875,7 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 .substring_regex, .substring_similar => try typeRegexFunction(context, n, count),
                 .tsvector_length, .ts_strip, .ts_setweight, .tsvector_to_array, .array_to_tsvector, .ts_delete, .ts_filter, .ts_numnode => try typeTextSearchUtility(context, n, count),
-                .json_query_function, .is_json, .json_constructor => unreachable, // bound before the arguments
+                .json_query_function, .is_json, .json_constructor => return error.UnsupportedStatement, // bound before the arguments
                 .jsonb_path_query => {
                     const seen = scope.set_calls orelse return error.UnsupportedStatement;
                     seen.* +|= 1;
