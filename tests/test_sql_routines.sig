@@ -1574,6 +1574,30 @@ fn viewReplacement() !void {
     try expect("SELECT id,v,extra FROM replace_me ORDER BY id", "1|107|8;2|97|-2");
 }
 
+fn viewReplacementWithHooks() !void {
+    reset();
+    try run("CREATE TABLE hook_source(id INT PRIMARY KEY,v INT)");
+    try run("INSERT INTO hook_source VALUES (1,5)");
+    try run("CREATE VIEW hook_view AS SELECT id,v FROM hook_source");
+    try run("CREATE FUNCTION view_hook() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN UPDATE hook_source SET v=NEW.v WHERE id=OLD.id; RETURN NEW; END$$");
+    try run("CREATE TRIGGER replacement_hook INSTEAD OF UPDATE ON hook_view FOR EACH ROW EXECUTE FUNCTION view_hook()");
+    try run("CREATE OR REPLACE VIEW hook_view AS SELECT id,v+10 AS v FROM hook_source");
+    try completes("UPDATE hook_view SET v=99 WHERE id=1", .update, 1);
+    try expect("SELECT v FROM hook_source", "99");
+    try expect("SELECT v FROM hook_view", "109");
+    try run("CREATE RULE keep_hook_rows AS ON DELETE TO hook_view DO INSTEAD NOTHING");
+    try run("CREATE OR REPLACE VIEW hook_view AS SELECT id,v*2 AS v FROM hook_source");
+    try completes("DELETE FROM hook_view", .delete, 0);
+    try expect("SELECT v FROM hook_source", "99");
+    try expect("SELECT v FROM hook_view", "198");
+    try sameState(&.{
+        "SELECT v FROM hook_source",
+        "SELECT v FROM hook_view",
+        "SELECT tgname FROM pg_trigger WHERE tgrelid='hook_view'::regclass",
+        "SELECT rulename FROM pg_rewrite WHERE ev_class='hook_view'::regclass ORDER BY rulename",
+    });
+}
+
 fn viewReturnRuleDiscovery() !void {
     reset();
     try run("CREATE SCHEMA \"Rule Space\"");
@@ -1626,6 +1650,7 @@ pub fn main() !void {
     try routineDefaultWalValidation();
     try routineOwnership();
     try viewReplacement();
+    try viewReplacementWithHooks();
     try viewReturnRuleDiscovery();
     try ruleAndTriggerDiscovery();
     try bodyValidationSetting();

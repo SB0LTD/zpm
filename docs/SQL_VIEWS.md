@@ -4,8 +4,11 @@
 existing ordinary view. The existing column prefix must keep its names, data
 types and typmods; incompatible replacements return 42P16. Another relation kind
 returns 42809. Quoted schema/view names and declared column aliases use the normal
-identifier binder. Temporary views, view options and automatic updatability are
-not implemented by this slice.
+identifier binder. Temporary views and view options remain open. Automatic
+updatability, INSTEAD OF triggers and rule actions are provided by the merged
+[nested statement implementation](SQL_NESTED_STATEMENTS.md). Replacement must
+retain their OID links; an integration contract checks trigger and rule effects
+after changing the SELECT to a computed projection.
 
 Replacement uses the existing transactional definition rewrite, retaining the
 relation OID, owner, ACLs and existing column defaults. The old definition remains
@@ -28,8 +31,11 @@ With dependent views it currently returns 0A000: stored stars are expanded again
 at read time and must first be frozen to their creation-time projection. This is
 an explicit compatibility gap. Transitive dependency lists can also retain old
 base-relation dependencies after a replacement. ALTER VIEW column rename,
-general search_path resolution, temporary views/options and complete dependency
-graph normalization remain open. Experimental heterogeneous packed banks retain
+stored references outside the supported public path, temporary views/options
+and complete dependency graph normalization remain open. General relation and
+routine search_path resolution is implemented by the merged wave-4 lanes;
+stored view text still has the restrictions in [DDL/DML](SQL_DDL_DML.md).
+Experimental heterogeneous packed banks retain
 the existing ALTER-definition restriction; this change does not qualify them.
 
 The routine contract tests replacement, unchanged OIDs, dependent reads, shape

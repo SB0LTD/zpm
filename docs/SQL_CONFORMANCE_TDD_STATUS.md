@@ -1,5 +1,24 @@
 # SQL conformance TDD checkpoint
 
+## Integrated wave-4 reassessment — qualification pending, 27 November 2026
+
+The current candidate includes main b87c97a6: routine schemas/signatures and
+SECURITY DEFINER, nested SQL/updatable views/rule actions, extended types,
+regex/text-search/SQL-JSON, inheritance/partition DML, constraints, search_path
+and the refreshed feature scoreboard. The scoreboard records 312/434 matching
+PostgreSQL 18.7 probes: 326 in-scope records classified closed by those probes,
+4 partial and 123 open, with 302 reviewed out-of-scope records. These finite
+probe classifications do not establish complete feature-family or production
+closure. See [the ranked remaining work](SQL_FEATURE_STATUS.md).
+
+View replacement is integrated with these changes and tests retention of the
+new INSTEAD OF trigger/non-SELECT rule behavior after its defining SELECT changes.
+The earlier standalone replacement revision 9c401778 passed full source and
+platform CI, strict 106/106 inventory, stock PG16/18 archives both directions and
+the full release matrix, publishing a 29-asset preview (run 46046582945). Those
+results remain evidence for that revision, not qualification of this combined
+candidate. Fresh source/4 MiB and PG16/18 CI is required before merging it.
+
 ## View replacement — candidate, 27 November 2026
 
 The red contract reproduces 0A000 for CREATE OR REPLACE VIEW. The candidate uses
@@ -11,8 +30,8 @@ fail with 42P17. Bounded expansion ancestry distinguishes cycles from repeated
 sibling references without initializing storage for queries without views.
 
 Appending columns with dependent stored views remains explicitly 0A000 until
-creation-time star projections are frozen. Other view options/updatability,
-ALTER VIEW rename, normalized dependency graphs and experimental packed-bank
+creation-time star projections are frozen. View options, ALTER VIEW rename,
+normalized dependency graphs and experimental packed-bank
 definition rewrites remain open. See [scope and contracts](SQL_VIEWS.md).
 PG16/18 stock round trips, strict inventory and complete source CI are pending
 for this candidate; the qualified checkpoint below remains the release baseline.
