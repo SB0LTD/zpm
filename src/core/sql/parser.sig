@@ -3909,6 +3909,27 @@ pub fn Parser(comptime config: types.Config) type {
                     left = try self.normalizedTail(left, negated);
                     continue;
                 }
+                if (self.mode == .standard and self.tokens.dialect == .postgres and try self.takeRaw("json")) {
+                    // IS [NOT] JSON [VALUE|ARRAY|OBJECT|SCALAR] [WITH|WITHOUT UNIQUE [KEYS]].
+                    var flags: i64 = if (negated) 8 else 0;
+                    if (try self.takeRaw("value")) {} else if (try self.takeRaw("array")) {
+                        flags |= 1;
+                    } else if (try self.takeRaw("object")) {
+                        flags |= 2;
+                    } else if (try self.takeRaw("scalar")) flags |= 3;
+                    if (try self.takeRaw("with")) {
+                        if (!try self.takeRaw("unique")) return error.Syntax;
+                        _ = try self.takeRaw("keys");
+                        flags |= 4;
+                    } else if (try self.takeRaw("without")) {
+                        if (!try self.takeRaw("unique")) return error.Syntax;
+                        _ = try self.takeRaw("keys");
+                    }
+                    const node = try self.pool.add(.{ .kind = .function, .func = .is_json, .b = left, .integer = flags });
+                    try self.pool.raise(node, left);
+                    left = node;
+                    continue;
+                }
                 const kind: ast.Test = if (try self.takeWord("NULL"))
                     (if (negated) .is_not_null else .is_null)
                 else if (try self.takeWord("TRUE"))

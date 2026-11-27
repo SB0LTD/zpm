@@ -179,7 +179,12 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     // context item, `b` -> next PASSING values (json_table_passing), `c`
     // a json_table_column describing the path, RETURNING type, wrapper,
     // quotes and ON EMPTY / ON ERROR; `integer` 0 EXISTS, 1 VALUE, 2 QUERY.
-    json_query_function };
+    json_query_function,
+    // expr IS [NOT] JSON [VALUE|ARRAY|OBJECT|SCALAR] [WITH|WITHOUT UNIQUE
+    // [KEYS]] (wave 4 text-json): `b` the operand, `integer` bits 0-1 the
+    // item type (value, array, object, scalar), bit 2 WITH UNIQUE KEYS,
+    // bit 3 NOT.
+    is_json };
 
 
 /// mr_call variants: the range accessors applied to a multirange's span.

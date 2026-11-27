@@ -1636,6 +1636,34 @@ pub fn Eval(comptime config: types.Config) type {
                 // A set-returning call reads the value exec is expanding.
                 .regexp_matches, .regexp_split_to_table, .jsonb_path_query => return if (ctx.set_value) |current| current.* else error.UnsupportedStatement,
                 .json_query_function => return json_eval.JsonEval(config, @This()).queryFunction(ctx, n),
+                .is_json => {
+                    // ExecEvalJsonIsPredicate: invalid text is false; jsonb
+                    // keys are always unique.
+                    const operand = try eval(ctx, n.b);
+                    if (operand == .null_value) return .null_value;
+                    // jsonb tags: 5 array, 6 object.
+                    var tag: u8 = undefined;
+                    var unique = true;
+                    if (operand == .jsonb) {
+                        tag = operand.jsonb.slice()[0];
+                    } else {
+                        const bytes = if (operand == .bpchar) operand.bpchar.slice() else operand.text.slice();
+                        const inspected = J.inspectJson(bytes, ctx.session.control) catch |err| switch (err) {
+                            error.InvalidTextRepresentation => return .{ .boolean = n.integer & 8 != 0 },
+                            else => return err,
+                        };
+                        tag = @intFromEnum(inspected.tag);
+                        unique = inspected.unique;
+                    }
+                    const kind_ok = switch (n.integer & 3) {
+                        0 => true,
+                        1 => tag == 5,
+                        2 => tag == 6,
+                        else => tag != 5 and tag != 6,
+                    };
+                    const holds = kind_ok and (n.integer & 4 == 0 or unique);
+                    return .{ .boolean = holds != (n.integer & 8 != 0) };
+                },
                 .range_constructor, .range_lower, .range_upper, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => return range_eval.RangeEval(config, @This()).call(ctx, n),
                 .current_setting, .set_config, .pg_try_advisory_lock, .pg_try_advisory_lock_shared, .pg_try_advisory_xact_lock, .pg_try_advisory_xact_lock_shared, .pg_advisory_unlock, .pg_advisory_unlock_shared, .pg_backend_pid, .pg_is_in_recovery => return sessionFunction(ctx, n),
                 .pg_notify, .pg_advisory_lock, .pg_advisory_lock_shared, .pg_advisory_xact_lock, .pg_advisory_xact_lock_shared, .pg_advisory_unlock_all => return sessionFunction(ctx, n),

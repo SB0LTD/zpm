@@ -420,6 +420,34 @@ pub fn Jsonb(comptime capacity: usize, comptime depth_limit: usize, comptime dig
             if (parser.at != text.len) return error.InvalidTextRepresentation;
         }
 
+        /// IS JSON over text (json_validate): the top-level tag of valid
+        /// JSON text, and whether every object has distinct keys; invalid
+        /// text is InvalidTextRepresentation.
+        pub fn inspectJson(text: []const u8, control: ?*types.ExecutionControl) Error!struct { tag: Tag, unique: bool } {
+            var raw: Buffer = .{};
+            var parser: Parser = .{ .text = text, .out = &raw, .control = control };
+            try parser.parseValue(true);
+            parser.skip();
+            if (parser.at != text.len) return error.InvalidTextRepresentation;
+            return .{ .tag = @enumFromInt(raw.bytes[0]), .unique = try uniqueKeys(raw.bytes[0..raw.len], 0, control) };
+        }
+
+        /// Whether the objects at and below `at` have distinct keys.
+        fn uniqueKeys(bytes: []const u8, at: usize, control: ?*types.ExecutionControl) Error!bool {
+            const tag: Tag = @enumFromInt(bytes[at]);
+            if (tag != .array and tag != .object) return true;
+            var members = Members.init(bytes, at);
+            while (members.next()) |member| {
+                if (control) |c| try c.checkpoint();
+                if (tag == .object) {
+                    var later = members;
+                    while (later.next()) |other| if (types.same(member.key, other.key)) return false;
+                }
+                if (!try uniqueKeys(bytes, member.value, control)) return false;
+            }
+            return true;
+        }
+
         /// Text to canonical JSONB.
         pub fn parse(text: []const u8, out: *Buffer) Error!void {
             return parseControlled(text, out, null);

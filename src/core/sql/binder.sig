@@ -2366,6 +2366,18 @@ pub fn Binder(comptime config: types.Config) type {
             // Built by linkAggregateInput with typed members (B11).
             if (n.func == .aggregate_input) return;
             if (n.func == .json_query_function) return bindJsonQueryFunction(context, scope, n);
+            if (n.func == .is_json) {
+                // IS JSON over a string or JSON value (42804 otherwise).
+                try typeExpr(context, scope, n.b);
+                if (context.node(n.b).ty == .unknown) try coerce(context, n.b, .text);
+                switch (context.node(n.b).ty) {
+                    .text, .varchar, .bpchar, .name, .json, .jsonb => {},
+                    else => return error.TypeMismatch,
+                }
+                n.ty = .boolean;
+                n.constant = isConstant(context, n.b);
+                return;
+            }
             // Named notation and VARIADIC reach user routines only (B11
             // wave 4; built-in functions have no parameter names here).
             if (n.func == .none and n.window == none and !n.within_group and n.order == none and namedArguments(context, n)) {
@@ -2798,7 +2810,7 @@ pub fn Binder(comptime config: types.Config) type {
                     try typeRegexFunction(context, n, count);
                 },
                 .substring_regex, .substring_similar => try typeRegexFunction(context, n, count),
-                .json_query_function => unreachable, // bindJsonQueryFunction
+                .json_query_function, .is_json => unreachable, // bound before the arguments
                 .jsonb_path_query => {
                     const seen = scope.set_calls orelse return error.UnsupportedStatement;
                     seen.* +|= 1;
@@ -5367,7 +5379,7 @@ pub fn Binder(comptime config: types.Config) type {
                         .array_constructor => break :blk .{ .name = "array", .strength = 2 },
                         .array_subscript => break :blk figure(context, n.b, buffer),
                         .array_any => break :blk .{ .name = "?column?", .strength = 0 },
-                        .jsonb_minus_op, .jsonb_delete_path_op, .jsonb_exists_any_op, .jsonb_exists_all_op, .jsonb_path_exists_op, .jsonb_path_match_op => break :blk .{ .name = "?column?", .strength = 0 },
+                        .jsonb_minus_op, .jsonb_delete_path_op, .jsonb_exists_any_op, .jsonb_exists_all_op, .jsonb_path_exists_op, .jsonb_path_match_op, .is_json => break :blk .{ .name = "?column?", .strength = 0 },
                         .ext_op => break :blk .{ .name = "?column?", .strength = 0 },
                         .xmlelement, .xmlforest, .xmlpi, .xmlroot => break :blk .{ .name = @tagName(n.func), .strength = 2 },
                         .inet_abbrev => break :blk .{ .name = "abbrev", .strength = 2 },
@@ -5739,7 +5751,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .column, .aggregate => n.typmod,
                 .cast => if (n.typmod == ast.mysql_integer_cast_typmod) -1 else n.typmod,
                 // A subscript keeps the array's typmod (reftypmod).
-                .function => if (n.func == .array_subscript or n.func == .xmlserialize or n.func == .mysql_date_add) n.typmod else -1,
+                .function => if (n.func == .array_subscript or n.func == .xmlserialize or n.func == .mysql_date_add or n.func == .json_query_function) n.typmod else -1,
                 else => -1,
             };
         }
