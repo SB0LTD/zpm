@@ -3354,6 +3354,10 @@ pub fn Database(comptime config: Config) type {
             const work_bounds = viewBounds(&self.workspace.query);
             defer restoreBounds(&self.workspace.query, work_bounds);
             if (self.dmlView(original, parsed, snap)) |view| {
+                // restrict_nonsystem_relation_kind applies to writes through a
+                // view as well as reads (55000), before any INSTEAD OF trigger,
+                // rule or automatic rewrite runs.
+                try self.session.restricted_relation_kinds.check(self.tables[view].relkind);
                 if (explain != null) return error.UnsupportedStatement;
                 const event = eventOf(parsed);
                 if (self.insteadTriggers(view, event, snap) or self.anyRuleFor(view, event, snap)) return self.viewModify(slot, original, parsed, snap, mode, view);
@@ -15498,6 +15502,8 @@ pub fn Database(comptime config: Config) type {
             var depth: usize = 0;
             while (true) : (depth += 1) {
                 if (depth == config.tables) return error.StackDepthExceeded;
+                // Every view on the way to the base relation is restricted.
+                try self.session.restricted_relation_kinds.check(self.tables[view].relkind);
                 // Privileges on the view itself belong to the user.
                 if (!self.privilegedRole(snap)) try self.needTable(view, switch (event) {
                     tg.tg_insert => CO.priv_insert,
