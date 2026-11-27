@@ -154,7 +154,7 @@ pub const constraint_identity_format_version: u16 = 4;
 pub const primary_index_identity_format_version: u16 = 5;
 pub const default_identity_format_version: u16 = 6;
 
-pub const Op = enum(u8) { create_table = 1, drop_table = 2, insert = 3, update = 4, delete = 5, catalog_counters = 6, create_sequence = 7, drop_sequence = 8, sequence = 9, truncate = 11, alter_table = 12, create_sequence_cached = 13, alter_sequence = 14, create_schema = 15, drop_schema = 16, catalog_counters_with_constraints = 17, create_owned_schema = 18, create_private_schema = 19, catalog_counters_with_defaults = 20, create_scoped_identity_sequence = 21, create_scoped_sequence = 22, alter_sequence_ownership = 23, create_scoped_serial_sequence = 24, create_routine = 60, drop_routine = 61, create_trigger = 62, drop_trigger = 63, create_rule = 64, drop_rule = 65, object_create = 70, object_drop = 71, large_object_page = 72 };
+pub const Op = enum(u8) { create_table = 1, drop_table = 2, insert = 3, update = 4, delete = 5, catalog_counters = 6, create_sequence = 7, drop_sequence = 8, sequence = 9, truncate = 11, alter_table = 12, create_sequence_cached = 13, alter_sequence = 14, create_schema = 15, drop_schema = 16, catalog_counters_with_constraints = 17, create_owned_schema = 18, create_private_schema = 19, catalog_counters_with_defaults = 20, create_scoped_identity_sequence = 21, create_scoped_sequence = 22, alter_sequence_ownership = 23, create_scoped_serial_sequence = 24, create_routine = 60, drop_routine = 61, create_trigger = 62, drop_trigger = 63, create_rule = 64, drop_rule = 65, object_create = 70, object_drop = 71, large_object_page = 72, create_routine_extended = 80 };
 
 fn Unsigned(comptime T: type) type {
     return switch (T) {
@@ -2260,9 +2260,10 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     @intFromEnum(Op.drop_schema) => {
                         const index = try findVSchema(scratch, try reader.int(u32));
                         for (&scratch.tables) |*vt| if (vt.live and vt.namespace == scratch.schemas[index].oid) return error.ChangeRecordConflict;
+                        if (RC.overlayNamespaceUsed(&scratch.objects, scratch.schemas[index].oid)) return error.ChangeRecordConflict;
                         scratch.schemas[index].live = false;
                     },
-                    @intFromEnum(Op.create_routine)...@intFromEnum(Op.drop_rule) => {
+                    @intFromEnum(Op.create_routine)...@intFromEnum(Op.drop_rule), @intFromEnum(Op.create_routine_extended) => {
                         const payload = try reader.take(try reader.int(u32));
                         const checks: ObjectChecks(@TypeOf(db)) = .{ .db = db, .scratch = scratch };
                         if (try RC.validateOp(&scratch.objects, tag, payload, checks)) |oid| next_oid = @max(next_oid, oid + 1);
@@ -2624,7 +2625,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                             break;
                         };
                     },
-                    @intFromEnum(Op.create_routine)...@intFromEnum(Op.drop_rule) => {
+                    @intFromEnum(Op.create_routine)...@intFromEnum(Op.drop_rule), @intFromEnum(Op.create_routine_extended) => {
                         const payload = try reader.take(try reader.int(u32));
                         try db.replayObject(tag, payload, csn);
                     },

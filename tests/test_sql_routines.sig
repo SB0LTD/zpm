@@ -365,9 +365,10 @@ fn sqlFunctions() !void {
     try fails("CREATE FUNCTION bad6() RETURNS INT LANGUAGE plperl AS 'return 1'", error.UndefinedObject);
     try fails("CREATE FUNCTION bad7() RETURNS trigger LANGUAGE SQL AS 'SELECT 1'", error.InvalidFunctionDefinition);
     try fails("CREATE FUNCTION bad8() RETURNS INT LANGUAGE SQL AS 'COMMIT'", error.UnsupportedStatement);
-    try fails("CREATE FUNCTION bad9(OUT x INT) LANGUAGE SQL AS 'SELECT 1'", error.UnsupportedStatement);
-    try fails("CREATE FUNCTION bad10(x INT DEFAULT 1) RETURNS INT LANGUAGE SQL AS 'SELECT x'", error.UnsupportedStatement);
-    try fails("CREATE FUNCTION bad11() RETURNS SETOF INT LANGUAGE SQL AS 'SELECT 1'", error.UnsupportedStatement);
+    // Parameter-list rules (B11 wave 4 supports OUT, DEFAULT and VARIADIC).
+    try fails("CREATE FUNCTION bad9(OUT x INT) RETURNS TEXT LANGUAGE SQL AS 'SELECT 1'", error.InvalidFunctionDefinition);
+    try fails("CREATE FUNCTION bad10(x INT DEFAULT 1, y INT) RETURNS INT LANGUAGE SQL AS 'SELECT x'", error.InvalidFunctionDefinition);
+    try fails("CREATE FUNCTION bad11(VARIADIC x INT) RETURNS INT LANGUAGE SQL AS 'SELECT 1'", error.InvalidFunctionDefinition);
     try fails("CREATE FUNCTION bad12() RETURNS INT LANGUAGE SQL STRICT STRICT AS 'SELECT 1'", error.Syntax);
     // OR REPLACE keeps the OID; the result type and names cannot change.
     try expect("SELECT oid FROM pg_proc WHERE proname = 'add1'", "16388");
@@ -376,10 +377,10 @@ fn sqlFunctions() !void {
     try fails("CREATE OR REPLACE FUNCTION add1(x INT) RETURNS BIGINT LANGUAGE SQL AS 'SELECT 1'", error.InvalidFunctionDefinition);
     try fails("CREATE OR REPLACE FUNCTION add1(y INT) RETURNS INT LANGUAGE SQL AS 'SELECT y'", error.InvalidFunctionDefinition);
     try fails("CREATE OR REPLACE PROCEDURE add1(x INT) LANGUAGE SQL AS 'SELECT 1'", error.WrongObjectType);
-    // Bodies other than one SELECT of an expression are 0A000 when called
-    // from an expression (pending: general SQL function execution).
+    // A query body is inlined (B11 wave 4); writes and several statements
+    // stay 0A000 from an expression (tests/test_sql_routines_sig.sig).
     try run("CREATE FUNCTION counted() RETURNS BIGINT LANGUAGE SQL AS 'SELECT count(*) FROM tdd_a'");
-    try fails("SELECT counted()", error.UnsupportedStatement);
+    try expect("SELECT counted() = (SELECT count(*) FROM tdd_a)", "t");
     // Procedures are CALLed; functions are not.
     try run("CREATE PROCEDURE noop() LANGUAGE SQL AS 'SELECT 1'");
     try fails("SELECT noop()", error.WrongObjectType);
@@ -477,7 +478,7 @@ fn plpgsqlFunctions() !void {
     try run("CREATE FUNCTION case_gap(x INT) RETURNS INT LANGUAGE plpgsql AS $$BEGIN CASE x WHEN 1 THEN RETURN 1; END CASE; RETURN 0; END$$");
     try fails("SELECT case_gap(2)", error.CaseNotFound);
     try run("CREATE FUNCTION asserted(x INT) RETURNS INT LANGUAGE plpgsql AS $$BEGIN ASSERT x > 0, 'positive'; RETURN x; END$$");
-    try fails("SELECT asserted(0)", error.RaiseException);
+    try fails("SELECT asserted(0)", error.AssertFailure);
     try run("CREATE FUNCTION raises(x INT) RETURNS INT LANGUAGE plpgsql AS $$BEGIN IF x = 1 THEN RAISE division_by_zero; END IF; RAISE NOTICE 'x is %', x; RAISE EXCEPTION USING ERRCODE = 'unique_violation'; END$$");
     try fails("SELECT raises(1)", error.DivisionByZero);
     try fails("SELECT raises(2)", error.PrimaryKeyViolation);

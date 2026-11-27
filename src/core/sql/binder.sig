@@ -363,6 +363,17 @@ pub fn Binder(comptime config: types.Config) type {
             // Routines (B11 wave 3).
             /// User functions resolvable by name; null: none.
             routines: ?*const RC.Set = null,
+            /// Namespaces unqualified user routines resolve in, in
+            /// search_path order (B11 wave 4); without `routine_path_known`
+            /// public when it is on the path.
+            routine_path: []const u32 = &.{},
+            routine_path_known: bool = false,
+            /// The FROM item's call node bindTableFunction binds: it may be
+            /// a set-returning routine or return a record (B11 wave 4).
+            table_function: u16 = none,
+            /// Parsed copies of SQL routine bodies for inlining, one per
+            /// call node and candidate routine (Database.expandRelations).
+            inline_calls: []const InlineCall = &.{},
             /// Variables of the running routine (parameters, PL/pgSQL
             /// variables, NEW/OLD): names that no column binds read them.
             variables: ?*const RoutineVariables = null,
@@ -401,6 +412,11 @@ pub fn Binder(comptime config: types.Config) type {
 
         pub const no_cte: u8 = 0xff;
         pub const group_relation = ast.groupRelation(config);
+
+        /// A SQL routine body appended to the statement for call `node`
+        /// (B11 wave 4): `query` is its parsed SELECT over pool nodes
+        /// [low, high).
+        pub const InlineCall = struct { node: u16 = none, routine: u16 = 0, query: u16 = 0, low: u16 = 0, high: u16 = 0 };
 
         /// One routine variable visible to expressions (B11 wave 3).
         pub const RoutineVariable = struct { name: V.Name = .{}, ty: ast.Type = .int4, typmod: i32 = -1 };
@@ -536,7 +552,9 @@ pub fn Binder(comptime config: types.Config) type {
         /// FROM (one row).
         pub const Series = enum { none, integer, numeric, timestamp,
             // JSON_TABLE (B11 json-agg lane): `function` is the table node.
-            json_table, partition_ancestors, options_to_table, unnest };
+            json_table, partition_ancestors, options_to_table, unnest,
+            // A user routine in FROM (B11 wave 4): Exec.routineRows.
+            routine };
 
         /// A bound query block of the general engine (design §4.9). Its
         /// materialized rows are `width` cells: the `count` visible output
@@ -2129,6 +2147,18 @@ pub fn Binder(comptime config: types.Config) type {
             }
             // Built by linkAggregateInput with typed members (B11).
             if (n.func == .aggregate_input) return;
+            // Named notation and VARIADIC reach user routines only (B11
+            // wave 4; built-in functions have no parameter names here).
+            if (n.func == .none and n.window == none and !n.within_group and n.order == none and namedArguments(context, n)) {
+                if (n.distinct or n.c != none or n.star) return error.UndefinedFunction;
+                var count: usize = 0;
+                var item = n.b;
+                while (item != none) : (item = context.node(item).next) {
+                    try typeExpr(context, scope, item);
+                    count += 1;
+                }
+                return bindRoutineCall(context, n, count);
+            }
             if (n.within_group) return typeOrderedSet(context, scope, n);
             if (n.order != none) {
                 // Aggregate ORDER BY is not implemented for window functions;
@@ -4033,6 +4063,15 @@ pub fn Binder(comptime config: types.Config) type {
                 .row_constructor => return error.UnsupportedStatement,
                 // Internal comparison lists have already bound every field.
                 .row_compare, .row_in => { n.ty = .boolean; n.constant = isConstant(context, n.a) and listConstant(context, n.b); },
+                // A named or VARIADIC call argument: typed through its value;
+                // bindRoutineCall unwraps it (B11 wave 4).
+                .named_argument => {
+                    try typeExpr(context, scope, n.a);
+                    const inner = context.node(n.a);
+                    n.ty = inner.ty;
+                    n.typmod = inner.typmod;
+                    n.constant = false;
+                },
                 .function => try typeFunction(context, scope, n),
                 .when_arm => unreachable,
                 .column => {
@@ -5310,48 +5349,62 @@ pub fn Binder(comptime config: types.Config) type {
         /// Arguments are converted to the parameter types; the routine hook
         /// evaluates the body when the call runs.
         fn bindRoutineCall(context: *const Context, n: *ast.Node, count: usize) Error!void {
-            if (n.qualifier.len != 0) {
-                if (try qualifierNamespace(context, n.qualifier) != catalog.public_namespace) return error.UndefinedFunction;
-            } else if (!publicLookup(context, n.name)) return error.UndefinedFunction;
+            var single: [1]u32 = .{catalog.public_namespace};
+            const path: []const u32 = if (n.qualifier.len != 0) blk: {
+                single[0] = try qualifierNamespace(context, n.qualifier);
+                break :blk &single;
+            } else if (context.stored_source_start != 0 and n.name.span.start >= context.stored_source_start)
+                &single
+            else if (context.routine_path_known)
+                context.routine_path
+            else if (publicLookup(context, n.name)) &single else &.{};
+            if (path.len == 0) return error.UndefinedFunction;
             const set = context.routines orelse return error.UndefinedFunction;
             const name = toName(context, n.name);
-            var best: ?usize = null;
-            var best_exact: usize = 0;
-            var ambiguous = false;
-            for (&set.routines, 0..) |*routine, index| {
-                if (!routine.live or routine.namespace != catalog.public_namespace or !routine.stamp.visible(context.snapshot)) continue;
-                if (!types.same(routine.name.slice(), name.slice()) or routine.arg_count != count) continue;
-                var exact: usize = 0;
-                var accepted = true;
-                var item = n.b;
-                var position: usize = 0;
-                while (item != none) : ({
-                    item = context.node(item).next;
-                    position += 1;
-                }) {
-                    const from = context.node(item).ty;
-                    const data = types.typeFromOid(routine.arg_oids[position]) orelse {
-                        accepted = false;
-                        break;
-                    };
-                    const to = types.typeOfData(data);
-                    // An exact type counts most; an untyped literal prefers
-                    // the string category's preferred type (text).
-                    if (from == to) {
-                        exact += 2;
-                    } else if (from == .unknown) {
-                        if (to == .text) exact += 1;
-                    } else if (!value.castable(from, to, .implicit)) {
-                        accepted = false;
-                        break;
+            // The supplied arguments (B11 wave 4: named notation, VARIADIC).
+            if (count > config.routine_args) return error.UndefinedFunction;
+            var supplied: [config.routine_args]RC.Supplied = undefined;
+            var values: [config.routine_args]u16 = undefined;
+            var variadic_call = false;
+            var item = n.b;
+            var position: usize = 0;
+            while (item != none) : ({
+                item = context.node(item).next;
+                position += 1;
+            }) {
+                const arg = context.node(item);
+                var value_id = item;
+                supplied[position] = .{};
+                if (arg.kind == .named_argument) {
+                    value_id = arg.a;
+                    if (arg.name.len != 0) {
+                        supplied[position].name = toName(context, arg.name);
+                        // `name => a, name => b` (42601).
+                        for (supplied[0..position]) |earlier| if (earlier.name.len != 0 and types.same(earlier.name.slice(), supplied[position].name.slice())) return error.Syntax;
                     }
+                    if (arg.integer == 1) variadic_call = true;
                 }
-                if (!accepted) continue;
-                if (best == null or exact > best_exact) {
+                values[position] = value_id;
+                const value_node = context.node(value_id);
+                supplied[position].ty = value_node.ty;
+                supplied[position].unknown = value_node.ty == .unknown;
+            }
+            var best: ?usize = null;
+            var best_match: RC.Match = .{};
+            var ambiguous = false;
+            var params: [config.routine_args]RC.Param = undefined;
+            var candidate: RC.Match = undefined;
+            for (&set.routines, 0..) |*routine, index| {
+                if (!routine.live or !routine.stamp.visible(context.snapshot)) continue;
+                if (!types.same(routine.name.slice(), name.slice())) continue;
+                if (routineHidden(set, index, path, context.snapshot)) continue;
+                const param_count = RC.callParams(routine, false, &params);
+                if (!RC.matchCall(params[0..param_count], supplied[0..count], variadic_call, &candidate)) continue;
+                if (best == null or RC.betterMatch(&candidate, &best_match)) {
                     best = index;
-                    best_exact = exact;
+                    best_match = candidate;
                     ambiguous = false;
-                } else if (exact == best_exact) ambiguous = true;
+                } else if (!RC.betterMatch(&best_match, &candidate)) ambiguous = true;
             }
             const chosen = best orelse return error.UndefinedFunction;
             if (ambiguous) return error.AmbiguousFunction;
@@ -5359,19 +5412,37 @@ pub fn Binder(comptime config: types.Config) type {
             // A procedure is CALLed (42809); trigger functions only fire (0A000).
             if (routine.kind == 'p') return error.WrongObjectType;
             if (routine.return_oid == routine_catalog.trigger_oid) return error.UnsupportedStatement;
-            const result = types.typeFromOid(routine.return_oid) orelse return error.UnsupportedStatement;
+            const node_id: u16 = @intCast((@intFromPtr(n) - @intFromPtr(&context.pool.nodes[0])) / @sizeOf(ast.Node));
+            const from = context.table_function == node_id;
+            // A record (several OUT parameters) or a set has no scalar
+            // value here; FROM binds them as table functions (0A000).
+            if (!from and (routine.retset or routine.return_oid == routine_catalog.record_oid)) return error.UnsupportedStatement;
+            const result: types.DataType = if (routine.return_oid == routine_catalog.record_oid) .text else types.typeFromOid(routine.return_oid) orelse return error.UnsupportedStatement;
+            // One bound argument per input, in parameter order: converted
+            // values, a DEFAULT placeholder, or ARRAY[...] of the variadic
+            // elements.
             var head: u16 = none;
             var tail: u16 = none;
-            var item = n.b;
-            var position: usize = 0;
-            while (item != none) : (position += 1) {
-                const next = context.node(item).next;
-                const to = types.typeOfData(types.typeFromOid(routine.arg_oids[position]) orelse return error.UndefinedFunction);
-                const converted = try convert(context, item, to, -1, .implicit);
-                context.node(converted).next = none;
-                if (tail == none) head = converted else context.node(tail).next = converted;
-                tail = converted;
-                item = next;
+            for (0..routine.arg_count) |input| {
+                const to = types.typeOfData(types.typeFromOid(routine.arg_oids[input]) orelse return error.UndefinedFunction);
+                const slot = best_match.slots[input];
+                const bound: u16 = if (slot == RC.default_slot)
+                    try context.pool.add(.{ .kind = .default_value, .ty = to, .constant = false })
+                else if (slot == RC.expanded_slot) blk: {
+                    const element = types.elementType(to) orelse return error.UndefinedFunction;
+                    const array = try context.pool.add(.{ .kind = .function, .func = .array_constructor, .name = n.name, .ty = to, .constant = false });
+                    var element_tail: u16 = none;
+                    for (values[best_match.expand_from..count]) |value_id| {
+                        const converted = try convert(context, value_id, element, -1, .implicit);
+                        context.node(converted).next = none;
+                        if (element_tail == none) context.node(array).b = converted else context.node(element_tail).next = converted;
+                        element_tail = converted;
+                    }
+                    break :blk array;
+                } else try convert(context, values[slot], to, -1, .implicit);
+                context.node(bound).next = none;
+                if (tail == none) head = bound else context.node(tail).next = bound;
+                tail = bound;
             }
             n.b = head;
             n.func = .routine;
@@ -5379,6 +5450,76 @@ pub fn Binder(comptime config: types.Config) type {
             n.ty = types.typeOfData(result);
             n.typmod = routine.return_typmod;
             n.constant = false;
+            n.boolean = routine.retset;
+            n.c = none;
+            for (context.inline_calls) |entry| {
+                if (entry.node == node_id and entry.routine == chosen) {
+                    n.c = try bindInlineBody(context, routine, entry, from);
+                    break;
+                }
+            }
+        }
+
+        /// Binds an appended SQL body for call inlining: its parameters are
+        /// frame variables, it sees no FROM item of the caller, its columns
+        /// convert to the result columns and it is re-run per call (a
+        /// correlated plan); a scalar call takes its first row. Returns a
+        /// scalar_subquery node over the plan.
+        fn bindInlineBody(context: *const Context, routine: *const RC.Routine, entry: InlineCall, from: bool) Error!u16 {
+            var variables: RoutineVariables = .{};
+            for (0..routine.arg_count) |input| {
+                if (variables.count == variables.items.len) return error.ColumnCapacity;
+                variables.items[variables.count] = .{ .name = routine.arg_names[input], .ty = types.typeOfData(types.typeFromOid(routine.arg_oids[input]) orelse return error.UndefinedFunction), .typmod = routine.arg_typmods[input] };
+                variables.count += 1;
+            }
+            variables.parameters = variables.count;
+            variables.routine_name = routine.name;
+            variables.node_low = entry.low;
+            variables.node_high = entry.high;
+            var inner = context.*;
+            inner.variables = &variables;
+            inner.table_function = none;
+            const scope: Scope = .{};
+            const plan_id = try bindPlan(&inner, entry.query, &scope, null, false);
+            const plans = plansOf(context);
+            const plan = &plans.items[plan_id];
+            plan.correlated = true;
+            // The result columns: OUT / TABLE parameters, else the return type.
+            const wanted: usize = if (routine.out_count != 0) routine.out_count else 1;
+            if (plan.count != wanted) return error.InvalidFunctionDefinition;
+            for (0..wanted) |column| {
+                const oid = if (routine.out_count != 0) routine.out_oids[column] else routine.return_oid;
+                const target = types.typeOfData(types.typeFromOid(oid) orelse return error.UnsupportedStatement);
+                const ty = plan.tys[column];
+                if (ty != target and ty != .unknown and !value.castable(ty, target, .assignment) and !(value.integral(ty) and value.integral(target))) return error.InvalidFunctionDefinition;
+                if (ty != target and ty != .unknown and !(value.integral(ty) and value.integral(target))) {
+                    plan.targets[column] = try convert(context, plan.targets[column], target, -1, .assignment);
+                    plan.tys[column] = target;
+                } else try castColumn(context, plan_id, column, target);
+            }
+            if (!from) plan.limit = @min(plan.limit, 1);
+            return context.pool.add(.{ .kind = .scalar_subquery, .integer = plan_id, .ty = plan.tys[0], .typmod = plan.typmods[0], .constant = false });
+        }
+
+        fn namedArguments(context: *const Context, n: *const ast.Node) bool {
+            var item = n.b;
+            while (item != none) : (item = context.node(item).next) {
+                if (context.node(item).kind == .named_argument) return true;
+            }
+            return false;
+        }
+
+        /// A routine found through `path` is hidden by one with the same
+        /// input types in an earlier namespace (or is outside the path).
+        fn routineHidden(set: *const RC.Set, index: usize, path: []const u32, snap: storage.Snapshot) bool {
+            const routine = &set.routines[index];
+            const rank = std.mem.indexOfScalar(u32, path, routine.namespace) orelse return true;
+            for (&set.routines) |*other| {
+                if (!other.live or !other.stamp.visible(snap) or !types.same(other.name.slice(), routine.name.slice())) continue;
+                if (std.mem.indexOfScalar(u32, path[0..rank], other.namespace) == null) continue;
+                if (RC.sameArgs(other.args(), routine.args())) return true;
+            }
+            return false;
         }
 
         /// A column reference that names a routine variable: `name` (a
@@ -6931,9 +7072,15 @@ pub fn Binder(comptime config: types.Config) type {
                 ty = try bindUnnestArgument(context, &inner, call);
                 series = .unnest;
             } else {
-                try typeExpr(context, &inner, item.function);
+                var from_context = context.*;
+                from_context.table_function = item.function;
+                try typeExpr(&from_context, &inner, item.function);
                 ty = context.node(item.function).ty;
                 if (ty == .unknown) ty = .text;
+                if (call.func == .routine) {
+                    const routine = &context.routines.?.routines[@intCast(call.integer)];
+                    if (routine.retset or routine.out_count != 0 or call.c != none) return bindRoutineFrom(context, id, item, routine, name);
+                }
             }
             const p = &plans.items[id];
             p.function = item.function;
@@ -6962,6 +7109,38 @@ pub fn Binder(comptime config: types.Config) type {
                 p.names[column] = literalName("ordinality");
                 p.tys[column] = .int8;
                 p.typmods[column] = -1;
+                p.count += 1;
+            }
+            p.width = p.count;
+            return id;
+        }
+
+        /// A user routine's FROM plan (B11 wave 4): its result columns are
+        /// the OUT / TABLE parameters (named after them), else one column
+        /// named after the function (or the table alias); ORDINALITY adds
+        /// a bigint column.
+        fn bindRoutineFrom(context: *const Context, id: u16, item: *const Ast.FromItem, routine: *const RC.Routine, name: V.Name) Error!u16 {
+            const p = &plansOf(context).items[id];
+            p.function = item.function;
+            p.series = .routine;
+            p.ordinality = item.ordinality;
+            const columns: usize = if (routine.out_count != 0) routine.out_count else 1;
+            if (columns + @intFromBool(item.ordinality) > p.names.len) return error.ColumnCapacity;
+            for (0..columns) |column| {
+                const oid = if (routine.out_count != 0) routine.out_oids[column] else routine.return_oid;
+                const ty = types.typeOfData(types.typeFromOid(oid) orelse return error.UnsupportedStatement);
+                p.targets[column] = try context.pool.add(.{ .kind = .null_literal, .ty = ty, .constant = true });
+                p.tys[column] = ty;
+                p.typmods[column] = if (routine.out_count != 0) routine.out_typmods[column] else routine.return_typmod;
+                // One column takes the alias's name, else its parameter's or the function's.
+                p.names[column] = if (columns == 1 and item.alias != null) toName(context, item.alias.?) else if (routine.out_count != 0 and routine.out_names[column].len != 0) routine.out_names[column] else if (columns == 1) name else literalName("column");
+            }
+            p.count = columns;
+            if (item.ordinality) {
+                p.targets[columns] = try context.pool.add(.{ .kind = .null_literal, .ty = .int8, .constant = true });
+                p.names[columns] = literalName("ordinality");
+                p.tys[columns] = .int8;
+                p.typmods[columns] = -1;
                 p.count += 1;
             }
             p.width = p.count;

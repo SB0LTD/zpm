@@ -530,6 +530,14 @@ pub const Error = error{
     /// SQLSTATE 2200C: more than two escape-double-quote separators in a
     /// SIMILAR TO pattern (B11 text).
     InvalidEscapeCharacterUse,
+    // Routines (B11 wave 4, routines-sig lane).
+    /// SQLSTATE P0004: a PL/pgSQL ASSERT whose condition is false or NULL.
+    AssertFailure,
+    /// SQLSTATE 0Z002: GET STACKED DIAGNOSTICS outside an exception handler.
+    StackedDiagnosticsAccessedWithoutActiveHandler,
+    /// SQLSTATE 2D000: COMMIT / ROLLBACK inside a procedure where it is
+    /// not allowed (a transaction block, or below a function call).
+    InvalidTransactionTermination,
 };
 
 /// Caller-owned execution accounting and interrupt polling. This is independent

@@ -34,9 +34,22 @@
 //!   64: oid u32, name, table OID u32, event u8 ('2' UPDATE, '3' INSERT,
 //!       '4' DELETE), instead u8, WHERE text (empty: unconditional).
 //!   61 / 63 / 65: oid u32.
+//!   80 (B11 wave 4): a routine with parameter modes, DEFAULT values,
+//!       RETURNS SETOF / TABLE, SECURITY DEFINER or SET clauses:
+//!       extension length u16, extension, then the op-60 payload. The
+//!       extension: version u8 (1), flags u8 (1 retset, 2 security
+//!       definer), parameter count u8 and every parameter's mode u8 in
+//!       declaration order ('i', 'o', 'b', 'v', 't'), then per 'o' / 't'
+//!       parameter: name (len u8, may be 0), type OID u32, typmod i32;
+//!       default count u8, defaults text (NUL-terminated expressions of the
+//!       last inputs); setting count u8, settings text (NUL-terminated
+//!       `name=value`). Routines without these features keep op 60 and
+//!       its bytes unchanged.
 //! Decoders validate every byte (bounded lengths, known type OIDs, flags,
 //! no trailing bytes) and never recurse.
+const std = @import("std");
 const types = @import("types.sig");
+const value_module = @import("value.sig");
 const privilege_graph = @import("privilege_graph.sig");
 const execute_privilege = @import("catalog_objects.sig").priv_execute;
 const storage = @import("storage.sig");
@@ -44,6 +57,10 @@ const Error = types.Error;
 
 pub const void_oid: u32 = 2278;
 pub const trigger_oid: u32 = 2279;
+/// pg_proc.prorettype of a routine with several OUT parameters.
+pub const record_oid: u32 = 2249;
+/// The extended creation op (B11 wave 4, routines-sig lane: ops 80-84).
+pub const create_routine_extended: u8 = 80;
 
 /// PostgreSQL pg_trigger.tgtype bits.
 pub const tg_row: u8 = 1;
@@ -139,7 +156,9 @@ pub fn Catalog(comptime config: types.Config) type {
         pub const Name = V.Name;
         pub const arg_bytes: usize = @max(config.routine_bytes / 4, 16);
         /// Largest object payload (a routine with every argument named).
-        pub const payload_bytes: usize = config.routine_bytes + arg_bytes + config.routine_args * (config.name_bytes + 10) + config.columns + 2 * config.name_bytes + 64 + 9 * @as(usize, config.routine_acl_entries);
+        pub const payload_bytes: usize = config.routine_bytes + arg_bytes + config.routine_args * (config.name_bytes + 10) + config.columns + 2 * config.name_bytes + 64 + 9 * @as(usize, config.routine_acl_entries) +
+            // The op-80 extension (B11 wave 4).
+            2 * arg_bytes + config.routine_args * (config.name_bytes + 10) + 16;
 
         /// Inline object text (bodies, WHEN conditions, rule qualifications).
         pub const Text = struct {
@@ -271,11 +290,85 @@ pub fn Catalog(comptime config: types.Config) type {
             return_oid: u32 = void_oid,
             return_typmod: i32 = -1,
             body: Text = .{},
+            // B11 wave 4 (op 80): parameter modes, defaults, set results,
+            // SECURITY DEFINER and SET clauses.
+            /// Every declared parameter's mode in declaration order ('i'
+            /// IN, 'o' OUT, 'b' INOUT, 'v' VARIADIC, 't' TABLE column);
+            /// empty when every parameter is IN.
+            param_count: usize = 0,
+            param_modes: [config.routine_args]u8 = @splat('i'),
+            /// Modes of the inputs (the `arg_*` list): 'i', 'b' or 'v'.
+            arg_modes: [config.routine_args]u8 = @splat('i'),
+            /// Result columns (OUT, INOUT and TABLE parameters) in
+            /// declaration order; an INOUT column's input index in
+            /// `out_inputs` (0xff for OUT / TABLE).
+            out_count: usize = 0,
+            out_names: [config.routine_args]Name = @splat(.{}),
+            out_oids: [config.routine_args]u32 = @splat(0),
+            out_typmods: [config.routine_args]i32 = @splat(-1),
+            out_inputs: [config.routine_args]u8 = @splat(0xff),
+            /// pronargdefaults: the last `default_count` inputs have DEFAULT
+            /// expressions (their SQL text, NUL-terminated in `defaults`).
+            default_count: usize = 0,
+            defaults: [arg_bytes]u8 = @splat(0),
+            defaults_len: usize = 0,
+            /// RETURNS SETOF / TABLE (proretset).
+            retset: bool = false,
+            security_definer: bool = false,
+            /// SET clauses (proconfig): NUL-terminated `name=value` entries.
+            setting_count: usize = 0,
+            settings: [arg_bytes]u8 = @splat(0),
+            settings_len: usize = 0,
 
             pub fn args(self: *const Routine) []const u32 {
                 return self.arg_oids[0..self.arg_count];
             }
+
+            /// Whether the routine needs the extended record (op 80).
+            pub fn extended(self: *const Routine) bool {
+                return self.param_count != 0 or self.default_count != 0 or self.retset or self.security_definer or self.setting_count != 0 or self.return_oid == record_oid;
+            }
+
+            /// The last input is VARIADIC (an array of its element type).
+            pub fn variadic(self: *const Routine) bool {
+                return self.arg_count != 0 and self.arg_modes[self.arg_count - 1] == 'v';
+            }
+
+            /// DEFAULT expression of input `index` (it must have one).
+            pub fn defaultText(self: *const Routine, index: usize) []const u8 {
+                return nulEntry(self.defaults[0..self.defaults_len], index - (self.arg_count - self.default_count));
+            }
+
+            pub fn setting(self: *const Routine, index: usize) []const u8 {
+                return nulEntry(self.settings[0..self.settings_len], index);
+            }
         };
+
+        /// Entry `index` of NUL-terminated strings.
+        pub fn nulEntry(bytes: []const u8, index: usize) []const u8 {
+            var start: usize = 0;
+            var seen: usize = 0;
+            for (bytes, 0..) |byte, at| {
+                if (byte != 0) continue;
+                if (seen == index) return bytes[start..at];
+                seen += 1;
+                start = at + 1;
+            }
+            return "";
+        }
+
+        fn nulCount(bytes: []const u8) ?usize {
+            var count: usize = 0;
+            var start: usize = 0;
+            for (bytes, 0..) |byte, at| {
+                if (byte != 0) continue;
+                if (at == start) return null;
+                count += 1;
+                start = at + 1;
+            }
+            if (start != bytes.len) return null;
+            return count;
+        }
 
         pub const Trigger = struct {
             live: bool = false,
@@ -473,6 +566,134 @@ pub fn Catalog(comptime config: types.Config) type {
             }
         };
 
+        // ---- call matching (B11 wave 4) ------------------------------------
+
+        /// One argument of a call: its name in named notation (else
+        /// empty), its type and whether it is an untyped literal or NULL.
+        pub const Supplied = struct { name: Name = .{}, ty: types.Type = .unknown, unknown: bool = false };
+
+        pub const default_slot: u8 = 0xff;
+        pub const expanded_slot: u8 = 0xfe;
+
+        /// How a call fills a routine's parameters: per parameter of the
+        /// call view (callParam) the supplied argument, `default_slot` or
+        /// `expanded_slot` (supplied[expand_from..] are the elements of the
+        /// VARIADIC parameter); `exact` scores the type match.
+        pub const Match = struct {
+            slots: [config.routine_args]u8 = @splat(default_slot),
+            count: usize = 0,
+            expand_from: usize = 0,
+            expanded: bool = false,
+            exact: usize = 0,
+        };
+
+        pub const Param = struct { name: Name = .{}, oid: u32 = 0, typmod: i32 = -1, mode: u8 = 'i', default: bool = false, input: u8 = default_slot };
+
+        /// The parameters a call fills: the inputs, or for CALL every
+        /// IN, INOUT, VARIADIC and OUT parameter in declaration order (an
+        /// OUT one takes a placeholder argument, as in PostgreSQL 14+).
+        pub fn callParams(item: *const Routine, with_outputs: bool, out: *[config.routine_args]Param) usize {
+            const first_default = item.arg_count - item.default_count;
+            if (!with_outputs or item.param_count == 0) {
+                for (0..item.arg_count) |index| out[index] = .{ .name = item.arg_names[index], .oid = item.arg_oids[index], .typmod = item.arg_typmods[index], .mode = item.arg_modes[index], .default = index >= first_default, .input = @intCast(index) };
+                return item.arg_count;
+            }
+            var count: usize = 0;
+            var input: usize = 0;
+            var output: usize = 0;
+            for (item.param_modes[0..item.param_count]) |mode| {
+                switch (mode) {
+                    'i', 'b', 'v' => {
+                        out[count] = .{ .name = item.arg_names[input], .oid = item.arg_oids[input], .typmod = item.arg_typmods[input], .mode = mode, .default = input >= first_default, .input = @intCast(input) };
+                        input += 1;
+                        count += 1;
+                        if (mode == 'b') output += 1;
+                    },
+                    'o' => {
+                        out[count] = .{ .name = item.out_names[output], .oid = item.out_oids[output], .typmod = item.out_typmods[output], .mode = mode };
+                        output += 1;
+                        count += 1;
+                    },
+                    else => output += 1,
+                }
+            }
+            return count;
+        }
+
+        /// PostgreSQL's argument matching (func_get_detail, simplified like
+        /// the wave-3 resolution): positional arguments first, then named
+        /// ones; a VARIADIC parameter takes the trailing positional
+        /// arguments as elements unless the call says VARIADIC (named
+        /// notation reaches it only with VARIADIC); unfilled parameters need
+        /// DEFAULTs. An exact type counts 2, an untyped literal 1 for text;
+        /// anything else needs an implicit cast. Null: not a candidate.
+        pub fn matchCall(params: []const Param, supplied: []const Supplied, variadic_call: bool, out: *Match) bool {
+            out.* = .{ .count = params.len };
+            var positional: usize = 0;
+            while (positional < supplied.len and supplied[positional].name.len == 0) positional += 1;
+            const last = params.len -% 1;
+            const variadic = params.len != 0 and params[last].mode == 'v';
+            if (variadic_call and !variadic) return false;
+            // Named notation reaches a variadic routine only with VARIADIC.
+            if (variadic and !variadic_call and positional != supplied.len) return false;
+            // Variadic expansion: positional arguments from the VARIADIC
+            // parameter's position on (at least one) are its elements.
+            const expand = variadic and !variadic_call and positional > last;
+            if (expand and positional != supplied.len) return false;
+            const direct = if (expand) last else positional;
+            if (direct > params.len) return false;
+            for (0..direct) |index| out.slots[index] = @intCast(index);
+            if (expand) {
+                out.slots[last] = expanded_slot;
+                out.expand_from = last;
+                out.expanded = true;
+            }
+            for (supplied[positional..], positional..) |arg, index| {
+                if (arg.name.len == 0) return false;
+                var found: ?usize = null;
+                for (params, 0..) |param, position| {
+                    if (param.name.len != 0 and types.same(param.name.slice(), arg.name.slice())) found = position;
+                }
+                const position = found orelse return false;
+                if (out.slots[position] != default_slot) return false;
+                if (params[position].mode == 'v' and !variadic_call) return false;
+                out.slots[position] = @intCast(index);
+            }
+            for (params, 0..) |param, position| {
+                if (out.slots[position] == default_slot and !param.default) return false;
+            }
+            // Types.
+            for (params, 0..) |param, position| {
+                const slot = out.slots[position];
+                if (slot == default_slot) continue;
+                const data = types.typeFromOid(param.oid) orelse return false;
+                const declared = types.typeOfData(data);
+                if (slot == expanded_slot) {
+                    const element = types.elementType(declared) orelse return false;
+                    for (supplied[out.expand_from..]) |arg| if (!accepts(arg, element, &out.exact)) return false;
+                } else if (!accepts(supplied[slot], declared, &out.exact)) return false;
+            }
+            return true;
+        }
+
+        /// More exact matches win; at a tie PostgreSQL prefers a candidate
+        /// that needs no variadic expansion (else the call is ambiguous).
+        pub fn betterMatch(a: *const Match, b: *const Match) bool {
+            return a.exact > b.exact or (a.exact == b.exact and !a.expanded and b.expanded);
+        }
+
+        fn accepts(arg: Supplied, to: types.Type, exact: *usize) bool {
+            if (arg.unknown or arg.ty == .unknown) {
+                if (to == .text) exact.* += 1;
+                return true;
+            }
+            if (arg.ty == to) {
+                exact.* += 2;
+                return true;
+            }
+            return value_module.castable(arg.ty, to, .implicit);
+        }
+
         pub fn sameArgs(a: []const u32, b: []const u32) bool {
             if (a.len != b.len) return false;
             for (a, b) |left, right| if (left != right) return false;
@@ -555,6 +776,32 @@ pub fn Catalog(comptime config: types.Config) type {
             }
         }
 
+        /// Op 80: the extension, then the op-60 payload.
+        pub fn encodeRoutineExtended(out: *Payload, item: *const Routine) Error!void {
+            const length_at = out.used;
+            try out.int(u16, 0);
+            const start = out.used;
+            try out.int(u8, 1);
+            try out.int(u8, @as(u8, @intFromBool(item.retset)) | (@as(u8, @intFromBool(item.security_definer)) << 1));
+            try out.int(u8, @intCast(item.param_count));
+            try out.bytes(item.param_modes[0..item.param_count]);
+            for (0..item.out_count) |index| {
+                if (item.out_inputs[index] != 0xff) continue;
+                try out.name(item.out_names[index].slice());
+                try out.int(u32, item.out_oids[index]);
+                try out.int(i32, item.out_typmods[index]);
+            }
+            try out.int(u8, @intCast(item.default_count));
+            try out.text(item.defaults[0..item.defaults_len]);
+            try out.int(u8, @intCast(item.setting_count));
+            try out.text(item.settings[0..item.settings_len]);
+            const length = out.used - start;
+            if (length > 0xffff) return error.TransactionLogCapacity;
+            out.buffer[length_at] = @truncate(length);
+            out.buffer[length_at + 1] = @truncate(length >> 8);
+            try encodeRoutine(out, item);
+        }
+
         pub fn encodeTrigger(out: *Payload, item: *const Trigger) Error!void {
             try out.int(u32, item.oid);
             try out.name(item.name.slice());
@@ -624,8 +871,9 @@ pub fn Catalog(comptime config: types.Config) type {
             }
             out.return_oid = try reader.int(u32);
             out.return_typmod = try reader.int(i32);
-            if (out.return_oid != void_oid and out.return_oid != trigger_oid and !knownType(out.return_oid)) return error.InvalidChangeRecord;
-            if (out.kind == 'p' and out.return_oid != void_oid) return error.InvalidChangeRecord;
+            // record needs the extension (several OUT parameters).
+            if (out.return_oid != void_oid and out.return_oid != trigger_oid and out.return_oid != record_oid and !knownType(out.return_oid)) return error.InvalidChangeRecord;
+            if (out.kind == 'p' and out.return_oid != void_oid and out.return_oid != record_oid) return error.InvalidChangeRecord;
             out.body.len = try readText(&reader, &out.body.bytes);
             if (!reader.finished()) {
                 out.owner = try reader.int(u32);
@@ -655,6 +903,85 @@ pub fn Catalog(comptime config: types.Config) type {
                 }
             }
             if (!reader.finished()) return error.InvalidChangeRecord;
+        }
+
+        /// Op 80: validates the extension against the base routine.
+        pub fn decodeRoutineExtended(payload: []const u8, out: *Routine) Error!void {
+            var reader = Reader{ .bytes = payload };
+            const length = try reader.int(u16);
+            const extension = try reader.take(length);
+            try decodeRoutine(payload[reader.position..], out);
+            var ext = Reader{ .bytes = extension };
+            if (try ext.int(u8) != 1) return error.InvalidChangeRecord;
+            const flags = try ext.int(u8);
+            if (flags & ~@as(u8, 3) != 0) return error.InvalidChangeRecord;
+            out.retset = flags & 1 != 0;
+            out.security_definer = flags & 2 != 0;
+            const count = try ext.int(u8);
+            if (count > config.routine_args or (count != 0 and count < out.arg_count)) return error.InvalidChangeRecord;
+            out.param_count = count;
+            // Every mode first, then the OUT / TABLE parameters' types.
+            const modes = try ext.take(count);
+            var input: usize = 0;
+            for (modes, 0..) |mode, index| {
+                out.param_modes[index] = mode;
+                switch (mode) {
+                    'i', 'b', 'v' => {
+                        if (input == out.arg_count) return error.InvalidChangeRecord;
+                        out.arg_modes[input] = mode;
+                        if (mode == 'b') {
+                            if (out.out_count == out.out_names.len) return error.InvalidChangeRecord;
+                            out.out_names[out.out_count] = out.arg_names[input];
+                            out.out_oids[out.out_count] = out.arg_oids[input];
+                            out.out_typmods[out.out_count] = out.arg_typmods[input];
+                            out.out_inputs[out.out_count] = @intCast(input);
+                            out.out_count += 1;
+                        }
+                        input += 1;
+                    },
+                    'o', 't' => {
+                        if (out.out_count == out.out_names.len) return error.InvalidChangeRecord;
+                        const name_len = try ext.int(u8);
+                        const name = try ext.take(name_len);
+                        if (name.len > config.name_bytes) return error.InvalidChangeRecord;
+                        for (name) |byte| if (byte == 0) return error.InvalidChangeRecord;
+                        out.out_names[out.out_count] = .{ .len = name.len };
+                        @memcpy(out.out_names[out.out_count].bytes[0..name.len], name);
+                        out.out_oids[out.out_count] = try ext.int(u32);
+                        out.out_typmods[out.out_count] = try ext.int(i32);
+                        if (!knownType(out.out_oids[out.out_count])) return error.InvalidChangeRecord;
+                        out.out_inputs[out.out_count] = 0xff;
+                        out.out_count += 1;
+                    },
+                    else => return error.InvalidChangeRecord,
+                }
+            }
+            if (count != 0 and input != out.arg_count) return error.InvalidChangeRecord;
+            // VARIADIC: only the last input, an array.
+            for (out.arg_modes[0..out.arg_count], 0..) |mode, index| {
+                if (mode != 'v') continue;
+                if (index + 1 != out.arg_count or types.typeFromOid(out.arg_oids[index]) == null or types.elementData(types.typeFromOid(out.arg_oids[index]).?) == null) return error.InvalidChangeRecord;
+            }
+            for (out.param_modes[0..count]) |mode| if (mode == 't' and !out.retset) return error.InvalidChangeRecord;
+            out.default_count = try ext.int(u8);
+            out.defaults_len = try readText(&ext, &out.defaults);
+            if (out.default_count > out.arg_count or (nulCount(out.defaults[0..out.defaults_len]) orelse return error.InvalidChangeRecord) != out.default_count) return error.InvalidChangeRecord;
+            out.setting_count = try ext.int(u8);
+            out.settings_len = try readText(&ext, &out.settings);
+            if ((nulCount(out.settings[0..out.settings_len]) orelse return error.InvalidChangeRecord) != out.setting_count) return error.InvalidChangeRecord;
+            for (0..out.setting_count) |index| {
+                const entry = nulEntry(out.settings[0..out.settings_len], index);
+                const eq = std.mem.indexOfScalar(u8, entry, '=') orelse return error.InvalidChangeRecord;
+                if (eq == 0) return error.InvalidChangeRecord;
+            }
+            if (!ext.finished()) return error.InvalidChangeRecord;
+            // The result type follows the outputs (one: its type; more: record).
+            if (out.kind == 'f' and out.out_count == 1 and out.return_oid != out.out_oids[0]) return error.InvalidChangeRecord;
+            if (out.out_count > 1 and out.return_oid != record_oid) return error.InvalidChangeRecord;
+            if (out.return_oid == record_oid and out.out_count < (if (out.kind == 'p') @as(usize, 1) else 2)) return error.InvalidChangeRecord;
+            if (out.kind == 'p' and out.out_count == 0 and out.return_oid != void_oid) return error.InvalidChangeRecord;
+            if (out.kind == 'p' and out.retset) return error.InvalidChangeRecord;
+            if (!out.extended()) return error.InvalidChangeRecord;
         }
 
         pub fn decodeTrigger(payload: []const u8, out: *Trigger) Error!void {
@@ -766,6 +1093,13 @@ pub fn Catalog(comptime config: types.Config) type {
             }
         }
 
+        /// A routine of the overlay lives in this namespace (DROP SCHEMA
+        /// records follow the drops of its routines).
+        pub fn overlayNamespaceUsed(overlay: *const Overlay, namespace: u32) bool {
+            for (&overlay.objects) |*object| if (object.live and object.class == .routine and object.namespace == namespace) return true;
+            return false;
+        }
+
         pub fn overlayHas(overlay: *const Overlay, oid: u32) bool {
             for (&overlay.objects) |*object| if (object.live and object.oid == oid) return true;
             return false;
@@ -793,9 +1127,9 @@ pub fn Catalog(comptime config: types.Config) type {
         /// record. Returns the created OID (the caller keeps the maximum).
         pub fn validateOp(overlay: *Overlay, tag: u8, payload: []const u8, context: anytype) Error!?u32 {
             switch (tag) {
-                @intFromEnum(Op.create_routine) => {
+                @intFromEnum(Op.create_routine), create_routine_extended => {
                     var item: Routine = undefined;
-                    try decodeRoutine(payload, &item);
+                    if (tag == create_routine_extended) try decodeRoutineExtended(payload, &item) else try decodeRoutine(payload, &item);
                     if (item.oid < 16384 or item.oid == 0xffffffff or overlayHas(overlay, item.oid) or context.oidTaken(item.oid)) return error.ChangeRecordConflict;
                     if (!context.namespaceKnown(item.namespace)) return error.ChangeRecordConflict;
                     for (&overlay.objects) |*object| {

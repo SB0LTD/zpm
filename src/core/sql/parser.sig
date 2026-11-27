@@ -4217,6 +4217,7 @@ pub fn Parser(comptime config: types.Config) type {
             }
             var first: u16 = none;
             var close_end = self.current.end;
+            var notation: CallNotation = .{};
             if (try self.takeSymbol(.star)) {
                 call.star = true;
                 close_end = self.current.end;
@@ -4225,14 +4226,14 @@ pub fn Parser(comptime config: types.Config) type {
                 if (self.mode == .standard and try self.takeWord("DISTINCT")) {
                     call.distinct = true;
                 } else if (self.mode == .standard) _ = try self.takeWord("ALL");
-                first = try self.expression();
+                first = try self.callArgument(&notation);
                 call.b = first;
             }
             const node = try self.pool.add(call);
             if (first != none) {
                 var last = first;
                 while (try self.takeSymbol(.comma)) {
-                    const item = try self.expression();
+                    const item = try self.callArgument(&notation);
                     self.pool.nodes[last].next = item;
                     try self.pool.raise(node, item);
                     last = item;
@@ -4276,6 +4277,45 @@ pub fn Parser(comptime config: types.Config) type {
             }
             if (n.distinct or n.c != none or self.aggregateName(name)) self.pool.complex = true;
             return node;
+        }
+
+        const CallNotation = struct { named: bool = false, variadic: bool = false };
+
+        /// One call argument: `[VARIADIC] [name => | name :=] expr` (B11
+        /// wave 4). Named and VARIADIC arguments are wrapped in a
+        /// named_argument node; a positional argument after a named one,
+        /// or any argument after VARIADIC, is 42601.
+        fn callArgument(self: *Self, notation: *CallNotation) Error!u16 {
+            if (self.mode != .standard or self.tokens.dialect != .postgres) return self.expression();
+            const variadic = self.rawWord("variadic");
+            if (notation.variadic) return error.Syntax;
+            if (variadic) {
+                try self.advance();
+                notation.variadic = true;
+            }
+            var name: ast.Ident = .{};
+            if (try self.namedArgumentAhead()) {
+                name = try self.identifier();
+                try self.advance();
+                try self.advance();
+                notation.named = true;
+            } else if (notation.named) return error.Syntax;
+            const value = try self.expression();
+            if (!variadic and name.len == 0) return value;
+            const node = try self.pool.add(.{ .kind = .named_argument, .name = name, .a = value, .integer = @intFromBool(variadic) });
+            try self.pool.raise(node, value);
+            return node;
+        }
+
+        /// `name =>` or `name :=` at the cursor (adjacent symbols).
+        fn namedArgumentAhead(self: *Self) Error!bool {
+            if (self.current.kind != .word and self.current.kind != .quoted_word) return false;
+            const next = try self.peek();
+            if (next.kind != .symbol or (next.symbol != .eq and next.symbol != .colon)) return false;
+            var copy = self.after_peek;
+            const third = try copy.next();
+            if (third.kind != .symbol or third.start != next.end) return false;
+            return (next.symbol == .eq and third.symbol == .gt) or (next.symbol == .colon and third.symbol == .eq);
         }
 
         fn tdsDateAdd(self: *Self, name: ast.Ident) Error!u16 {

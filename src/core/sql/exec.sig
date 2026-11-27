@@ -337,6 +337,7 @@ pub fn Exec(comptime config: types.Config) type {
                 if (p.series == .partition_ancestors) return self.partitionAncestorRows(p, &ctx);
                 if (p.series == .options_to_table) return self.optionRows(p, &ctx);
                 if (p.series == .unnest) return self.unnestRows(p, &ctx);
+                if (p.series == .routine) return self.routineRows(p, &ctx);
                 if (p.series == .none) {
                     const at = try self.cells(p.width);
                     self.work.cells[at] = try E.eval(&ctx, p.function);
@@ -370,7 +371,7 @@ pub fn Exec(comptime config: types.Config) type {
                         const zero: V.Cell = .{ .interval = .{} };
                         direction = V.compare(&step, &zero);
                     },
-                    .none, .json_table, .partition_ancestors, .options_to_table, .unnest => unreachable,
+                    .none, .json_table, .partition_ancestors, .options_to_table, .unnest, .routine => unreachable,
                 }
                 if (direction == 0) return error.InvalidParameterValue;
                 var current = args[0];
@@ -433,6 +434,70 @@ pub fn Exec(comptime config: types.Config) type {
                 }
                 return self.finish(p, rows);
             }
+
+            /// A user routine in FROM (B11 wave 4): an inlined SQL body
+            /// (`c` of the call: its plan) runs over the arguments' frame;
+            /// other routines emit their rows through the routine hook. A
+            /// STRICT routine with a NULL argument gives no row (a set) or
+            /// one NULL row. ORDINALITY numbers rows from 1.
+            fn routineRows(self: *Query, p: *const B.Plan, ctx: *const E.Context) Error!List {
+                const call = &self.pool.nodes[p.function];
+                const hook = self.session.routines orelse return error.UnsupportedStatement;
+                var args: [config.routine_args]V.Cell = undefined;
+                var count: usize = 0;
+                var defaulted: u64 = 0;
+                var item = call.b;
+                while (item != none) : (item = self.pool.nodes[item].next) {
+                    if (count == args.len or count == 64) return error.ColumnCapacity;
+                    if (self.pool.nodes[item].kind == .default_value) {
+                        defaulted |= @as(u64, 1) << @intCast(count);
+                        args[count] = .null_value;
+                    } else args[count] = try E.eval(ctx, item);
+                    count += 1;
+                }
+                const routine: usize = @intCast(call.integer);
+                const columns = p.count - @intFromBool(p.ordinality);
+                var sink: RoutineSink = .{ .query = self, .plan = p, .columns = columns, .list = .{ .start = @intCast(self.work.ref_low) } };
+                if (call.c != none) {
+                    const prepare = hook.prepare orelse return error.UnsupportedStatement;
+                    if (!try prepare(hook.ptr, routine, &args, count, defaulted)) {
+                        if (!call.boolean) {
+                            const nulls: [types.projectionColumns(config)]V.Cell = @splat(.null_value);
+                            try RoutineSink.emit(&sink, &nulls);
+                        }
+                        return self.finish(p, sink.list);
+                    }
+                    const frame: E.Frame = .{ .cells = &args, .count = count };
+                    var inner = ctx.*;
+                    inner.frame = &frame;
+                    const body = try self.run(@intCast(self.pool.nodes[call.c].integer), &inner);
+                    sink.list = .{ .start = @intCast(self.work.ref_low) };
+                    for (self.handles(body)) |handle| try RoutineSink.emit(&sink, self.row(handle));
+                    return self.finish(p, sink.list);
+                }
+                const rows = hook.rows orelse return error.UnsupportedStatement;
+                try rows(hook.ptr, routine, &args, count, defaulted, &sink, &RoutineSink.emitOpaque);
+                return self.finish(p, sink.list);
+            }
+
+            const RoutineSink = struct {
+                query: *Query,
+                plan: *const B.Plan,
+                columns: usize,
+                list: List,
+
+                fn emit(self: *RoutineSink, values: [*]const V.Cell) Error!void {
+                    const at = try self.query.cells(self.plan.width);
+                    @memcpy(self.query.work.cells[at..][0..self.columns], values[0..self.columns]);
+                    if (self.plan.ordinality) self.query.work.cells[at + self.columns] = .{ .integer = @as(i64, self.list.count) + 1 };
+                    try self.query.push(&self.list, at);
+                }
+
+                fn emitOpaque(ptr: *anyopaque, values: *const anyopaque) Error!void {
+                    const self: *RoutineSink = @ptrCast(@alignCast(ptr));
+                    return self.emit(@ptrCast(@alignCast(values)));
+                }
+            };
 
             fn unnestRows(self: *Query, p: *const B.Plan, ctx: *const E.Context) Error!List {
                 var rows: List = .{ .start = @intCast(self.work.ref_low) };
