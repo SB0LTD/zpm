@@ -89,7 +89,8 @@ parser and the PL/pgSQL interpreter); the Database executes them in
   unless CASCADE drops the triggers.
 - **Recursion.** Routine calls and trigger firings nest up to
   `Config.routine_depth`; deeper is 54001. Inside an expression or a
-  trigger, a routine cannot run SQL statements of its own (0A000).
+  trigger, a routine's SQL statements run as nested statements (wave 4,
+  docs/SQL_NESTED_STATEMENTS.md).
 
 ## Catalogs
 
@@ -291,13 +292,12 @@ before applying it. RSBASE10 images refuse such routines before writing
 
 ## Not covered (open)
 
-- INSTEAD OF triggers (views stay read-only; CREATE TRIGGER ... INSTEAD OF
-  is 0A000) and rule actions other than NOTHING (query rewriting) - both
-  need statements running inside a data-modifying statement.
-- SQL statements inside functions called from expressions and inside
-  trigger functions (0A000): data-modifying and multi-statement SQL
-  bodies called from an expression, RETURN QUERY, and CALL from a
-  function wait for nested statement execution (nested-stmts lane).
+- INSTEAD OF triggers, automatically updatable views, rule actions, SQL
+  in trigger functions and in functions called from expressions,
+  data-modifying and multi-statement SQL bodies called from an
+  expression, RETURN QUERY and CALL from a function run as nested
+  statements (wave 4 nested-stmts lane, docs/SQL_NESTED_STATEMENTS.md,
+  which lists what stays open).
 - Set-returning calls in the target list (ProjectSet) and record values
   (a function with several OUT parameters in an expression) are 0A000;
   RETURNS SETOF a table type, RETURNS record without OUT parameters,
@@ -308,7 +308,7 @@ before applying it. RSBASE10 images refuse such routines before writing
   routine's SET clauses (PostgreSQL applies them at CREATE).
 - A SQL function whose query body calls itself exceeds the inlining
   capacity (Config.subqueries, 54000).
-- TG_ARGV (TG_NARGS is provided); REFERENCING transition tables;
+- REFERENCING transition tables (TG_ARGV and TG_NARGS are provided);
   constraint triggers; referential actions and COPY FROM do not fire user
   triggers (AFTER ROW triggers do see rows a referential action wrote).
 - RAISE messages are not delivered to the client (no notice channel);
