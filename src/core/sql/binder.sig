@@ -1866,7 +1866,7 @@ pub fn Binder(comptime config: types.Config) type {
             if(id==none) return true;const n=context.node(id);
             if(n.planned_null) return true;
             switch(n.kind){
-                .function=>if(!ast.canRepeatFunction(n.func) and n.func!=.jsonb_typeof and n.func!=.jsonb_array_length) return false,
+                .function=>if(!ast.canRepeatFunction(n.func) and n.func!=.jsonb_typeof and n.func!=.jsonb_array_length and !immutableRoutine(context,n)) return false,
                 .scalar_subquery,.exists_subquery,.in_subquery=>return false,
                 else=>{},
             }
@@ -1874,6 +1874,14 @@ pub fn Binder(comptime config: types.Config) type {
             if(listOwner(n.kind)){var item=n.b;while(item!=none):(item=context.node(item).next) if(!repeatableWindowInput(context,item)) return false;}
             else if(!repeatableWindowInput(context,n.b)) return false;
             return true;
+        }
+
+        fn immutableRoutine(context: *const Context, n: *const ast.Node) bool {
+            if (n.func != .routine) return false;
+            const routines = context.routines orelse return false;
+            if (n.integer < 0 or n.integer >= routines.routines.len) return false;
+            const routine = &routines.routines[@intCast(n.integer)];
+            return routine.live and routine.stamp.visible(context.snapshot) and routine.volatility == 'i';
         }
 
         fn framePlanRepeatable(context:*const Context,id:u16,seen:*[config.subqueries]bool) bool {

@@ -13,10 +13,18 @@ Public-qualified CREATE/CALL/DROP and EXECUTE grants work with an empty explicit
 search path. Unqualified routine lookup does not silently use public in that
 state; unqualified CREATE returns 3F000. This extends the existing public/empty
 path subset, not arbitrary schema ordering or other routine namespaces.
-The native Windows Debug contract passes 886 assertions and 216 replayed records.
+An additional failing window query exposed missing repeatability classification
+for user routines. Window planning now recognizes visible IMMUTABLE routines,
+while checking every argument separately; volatile routines retain the existing
+demand restrictions. Qualified routines are tested within aggregates and full
+window aggregates, including scalar/aggregate/window built-in name collisions.
+The native Windows Debug contract passes 904 assertions and 224 replayed records;
+the existing window contract passes 9,971 assertions. The new sequence-argument
+case verifies that an immutable wrapper does not erase volatile argument effects.
 RAMSQL's PG16/18 stock fixture adds qualified calls, prepared parameters,
 same-name built-ins, empty-path failures and executable archive/recovery checks.
 CI qualification for this candidate is pending; it is not yet merged.
+[PostgreSQL routine volatility](https://www.postgresql.org/docs/18/xfunc-volatility.html)
 
 ## SQL routine EXECUTE delegation — 27 November 2026
 
