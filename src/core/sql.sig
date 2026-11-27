@@ -3282,6 +3282,16 @@ pub fn Database(comptime config: Config) type {
                 return legacy(options.mode, err);
             };
             const parsed = &top.command;
+            // `catalog.schema.name` names only the session's database
+            // (F651, B11 wave 5): another is PostgreSQL's 0A000.
+            if (!routine) for (self.workspace.nodes.catalog_refs[0..self.workspace.nodes.catalog_ref_len]) |ident| {
+                var name: ControlText = .{};
+                decodeIdent(source, ident, &name) catch {};
+                if (!std.mem.eql(u8, name.bytes[0..name.len], self.session.database)) {
+                    if (options.@"resume") self.dropStatement(slot);
+                    return error.UnsupportedStatement;
+                }
+            };
             var snap: Snapshot = undefined;
             if (options.@"resume") {
                 const pinned = tx.pin orelse return error.QueryCanceled;
@@ -10060,9 +10070,11 @@ pub fn Database(comptime config: Config) type {
             var ctx = self.evalContext(source);
             const derived: D.Derived = .{ .defaults = &insert.defaults, .generated = &insert.generated, .checks = &insert.checks };
             var position: usize = 0;
+            var queries: X.StatementQueries = .{};
             if (insert.plan != ast.none) {
                 const work = &self.workspace.query;
                 const rows = try X.queryRows(&self.tables, source, &self.workspace.nodes, &self.workspace.plans, insert.plan, snap, &self.session, work);
+                self.statementQueries(&queries, source, snap, false, &ctx);
                 for (0..rows.count) |index| {
                     if (position >= done) {
                         ctx.tuple[1] = X.rowAt(work, rows, index);
@@ -10071,8 +10083,10 @@ pub fn Database(comptime config: Config) type {
                     position += 1;
                 }
             } else if (insert.rows == ast.none) {
+                self.statementQueries(&queries, source, snap, true, &ctx);
                 if (done == 0) try self.insertProgress(slot, &ctx, insert, &insert.values, derived, snap, 0);
             } else {
+                self.statementQueries(&queries, source, snap, true, &ctx);
                 const nodes = &self.workspace.nodes.nodes;
                 var row = insert.rows;
                 while (row != ast.none) : (row = nodes[row].next) {
@@ -11541,6 +11555,19 @@ pub fn Database(comptime config: Config) type {
             return .{ .list = list, .offsets = offsets };
         }
 
+        /// Subqueries in the statement's own WHERE / SET / VALUES (B11 wave
+        /// 5, docs/SQL_DDL_DML.md): installed only when the bound statement
+        /// has one. `fresh` starts the query workspace; UPDATE FROM / DELETE
+        /// USING and INSERT ... SELECT rows already in it are kept.
+        fn statementQueries(self: *Self, queries: *X.StatementQueries, source: []const u8, snap: Snapshot, fresh: bool, ctx: *E.Context) void {
+            const pool = &self.workspace.nodes;
+            const any = for (pool.nodes[0..pool.len]) |*n| {
+                if (n.kind == .scalar_subquery or n.kind == .exists_subquery or n.kind == .in_subquery) break true;
+            } else false;
+            if (!any) return;
+            queries.install(&self.tables, source, pool, &self.workspace.plans, snap, &self.session, &self.workspace.query, fresh, ctx);
+        }
+
         /// WHERE over the target row and, with FROM/USING, the first joined
         /// source row that satisfies it (PostgreSQL updates or deletes a
         /// target row once, with one arbitrary matching source row). The
@@ -11565,6 +11592,8 @@ pub fn Database(comptime config: Config) type {
             var row_scratch: S.VersionRowScratch = undefined;
             var affected: usize = 0;
             const joined = try self.joinedRows(source, update.from, &update.offsets, snap);
+            var queries: X.StatementQueries = .{};
+            self.statementQueries(&queries, source, snap, joined == null, &ctx);
             switch (try X.candidates(&ctx, table, update.key, snap)) {
                 .empty => {},
                 .slot => |hit| affected += try self.updateSlot(slot, &ctx, &row_scratch, update, hit.row, snap, joined),
@@ -11677,6 +11706,8 @@ pub fn Database(comptime config: Config) type {
             var row_scratch: S.VersionRowScratch = undefined;
             var affected: usize = 0;
             const joined = try self.joinedRows(source, delete.using, &delete.offsets, snap);
+            var queries: X.StatementQueries = .{};
+            self.statementQueries(&queries, source, snap, joined == null, &ctx);
             switch (try X.candidates(&ctx, table, delete.key, snap)) {
                 .empty => {},
                 .slot => |hit| affected += try self.deleteSlot(slot, &ctx, &row_scratch, delete, hit.row, snap, joined),

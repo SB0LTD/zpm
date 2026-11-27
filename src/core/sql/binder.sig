@@ -492,6 +492,9 @@ pub fn Binder(comptime config: types.Config) type {
             /// Hidden identity also retained by a catalog column-alias wrapper.
             catalog_oid: u32 = 0,
             catalog_qualified_only: bool = false,
+            /// `JOIN this USING (...) AS alias` (F404): names only the
+            /// join's merged columns.
+            using_alias: ast.Ident = .{},
         };
 
         /// USING column merged from the relations joined before `right`.
@@ -4644,8 +4647,33 @@ pub fn Binder(comptime config: types.Config) type {
             row.constant = listConstant(context, row.b);
         }
 
+        /// `row op (SELECT ...)` (F641, B11 wave 5): the subquery's output
+        /// columns become the right row's fields, each a scalar_subquery
+        /// node over the same plan reading its own output column (`column`).
+        /// More than one row is 21000; no row compares as NULLs.
+        fn rowSubquery(context: *const Context, scope: *const Scope, id: u16) Error!u16 {
+            const plans = context.plans orelse return error.UnsupportedStatement;
+            const plan_id = try bindPlan(context, @intCast(context.node(id).integer), scope, scope.ctes, false);
+            var head: u16 = none;
+            var tail: u16 = none;
+            for (0..plans.items[plan_id].count) |column| {
+                if (plans.items[plan_id].tys[column] == .unknown) try castColumn(context, plan_id, column, .text);
+                const plan = &plans.items[plan_id];
+                const field = try context.pool.add(.{ .kind = .scalar_subquery, .integer = plan_id, .column = @intCast(column), .ty = plan.tys[column], .typmod = plan.typmods[column] });
+                if (head == none) head = field else context.node(tail).next = field;
+                tail = field;
+            }
+            return context.pool.add(.{ .kind = .row_constructor, .b = head });
+        }
+
         fn bindRowCompare(context: *const Context, scope: *const Scope, id: u16) Error!void {
             const n = context.node(id);
+            if (context.node(n.a).kind == .row_constructor and context.node(n.b).kind == .scalar_subquery and context.node(n.b).func != .array_subquery) {
+                // Only the ordering and equality operators take a row
+                // subquery; IS DISTINCT FROM reads a one-column one (42601).
+                switch (n.op) { .eq, .ne, .lt, .le, .gt, .ge => {}, else => return error.Syntax }
+                n.b = try rowSubquery(context, scope, n.b);
+            }
             if (context.node(n.a).kind != .row_constructor or context.node(n.b).kind != .row_constructor) return error.UndefinedFunction;
             switch (n.op) { .eq, .ne, .lt, .le, .gt, .ge, .is_distinct, .is_not_distinct => {}, else => return error.UndefinedFunction }
             try bindRowFields(context, scope, n.a);
@@ -6626,6 +6654,15 @@ pub fn Binder(comptime config: types.Config) type {
                     level += 1;
                 }
                 if (qualifier) |q| {
+                    // A USING join alias names the join's merged columns
+                    // only (F404): another column is 42703.
+                    for (s.rels[s.rel_first..s.rel_count], s.rel_first..) |*rel, item| {
+                        if (rel.using_alias.len == 0 or !types.same(toName(context, rel.using_alias).slice(), q.slice())) continue;
+                        for (s.using[0..s.using_count]) |*entry| {
+                            if (entry.item == item and types.same(entry.name.slice(), wanted.slice())) return bindUsing(context, scope, n, s, level, entry);
+                        }
+                        return error.ColumnNotFound;
+                    }
                     for (s.rels[s.rel_first..s.rel_count], s.rel_first..) |*rel, index| {
                         if (!types.same(rel.name.slice(), q.slice())) continue;
                         const column = selectableColumn(context, rel, wanted.slice(), true) orelse return error.ColumnNotFound;
@@ -8526,6 +8563,7 @@ pub fn Binder(comptime config: types.Config) type {
                     if (plans.items[rel.plan].correlated) plans.items[id].correlated = true;
                 }
                 if (item.column_aliases != none) try applyColumnAliases(context, item, &rel, &source);
+                if (item.using_alias) |alias| rel.using_alias = alias;
                 scope.rels[index] = rel;
                 scope.rel_count = index + 1;
                 plans.items[id].sources[index] = source;

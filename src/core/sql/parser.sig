@@ -521,6 +521,9 @@ pub fn Parser(comptime config: types.Config) type {
             }
             if (try self.takeWord("INSERT")) return .{ .insert = try self.insert() };
             if (self.isWord("SELECT") or (self.mode == .standard and (self.isWord("WITH") or self.isWord("VALUES") or self.isWord("TABLE")))) return self.topQuery();
+            // `(SELECT ... ORDER BY ...) UNION ...`: a parenthesized query
+            // expression as the statement (F855, B11 wave 5).
+            if (self.mode == .standard and self.isSymbol(.lparen) and try self.parenthesizedQuery(false)) return self.topQuery();
             if (try self.takeWord("UPDATE")) return .{ .update = try self.update() };
             if (try self.takeWord("DELETE")) return .{ .delete = try self.delete() };
             if (self.mode == .standard and self.rawWord("copy")) {
@@ -845,8 +848,21 @@ pub fn Parser(comptime config: types.Config) type {
             if (try self.takeSymbol(.dot)) {
                 out.schema = out.name;
                 out.name = try self.identifier();
+                try self.catalogTail(&out.schema, &out.name);
             }
             return out;
+        }
+
+        /// `catalog.schema.name` (F651, B11 wave 5): after `schema.name`, a
+        /// third part shifts the names. The catalog is recorded and checked
+        /// against the session's database before binding (another one is
+        /// 0A000, PostgreSQL's cross-database reference).
+        fn catalogTail(self: *Self, schema: *?ast.Ident, name: *ast.Ident) Error!void {
+            if (self.mode != .standard or !self.isSymbol(.dot)) return;
+            try self.advance();
+            try self.pool.addCatalog(schema.*.?);
+            schema.* = name.*;
+            name.* = try self.identifier();
         }
 
         fn ifExists(self: *Self) Error!bool {
@@ -2736,6 +2752,7 @@ pub fn Parser(comptime config: types.Config) type {
             if (self.mode == .standard and try self.takeSymbol(.dot)) {
                 out.schema = out.table;
                 out.table = try self.identifier();
+                try self.catalogTail(&out.schema, &out.table);
             }
             if (self.mode == .standard and try self.takeWord("AS")) out.alias = try self.identifier();
             if (try self.takeSymbol(.lparen)) {
@@ -2966,6 +2983,11 @@ pub fn Parser(comptime config: types.Config) type {
             }
             var limited = has_core_limit;
             var offset_seen = false;
+            // `(SELECT ... LIMIT n) LIMIT m`: the parenthesized block's own
+            // clauses cannot be given twice (42601, F856, B11 wave 5).
+            const inner_limit = self.mode == .standard and !has_core_limit and block.limit_present;
+            const inner_offset = self.mode == .standard and block.offset_present;
+            if ((inner_limit and (self.isWord("LIMIT") or self.isWord("FETCH"))) or (inner_offset and self.isWord("OFFSET"))) return error.Syntax;
             while (true) {
                 if (!limited and try self.takeWord("LIMIT")) {
                     limited = true;block.limit_present=true;
@@ -3129,6 +3151,40 @@ pub fn Parser(comptime config: types.Config) type {
             block.right = right;
             return index;
         }
+
+        /// At `(`: whether the first token past this and any further `(`
+        /// starts a query block, so the parentheses open a query expression
+        /// such as `((SELECT ...) UNION ...)` rather than a join group (F855,
+        /// B11 wave 5). Looks ahead without consuming.
+        /// In FROM (`in_from`), `((SELECT ...) alias JOIN ...)` is a join
+        /// group: the token after the `)` matching the current `(` decides
+        /// (`)`, a set operator or a query tail clause continue the query).
+        fn parenthesizedQuery(self: *Self, in_from: bool) Error!bool {
+            var copy = self.tokens;
+            var depth: usize = 1;
+            var token = try copy.next();
+            while (token.kind == .symbol and token.symbol == .lparen) : (token = try copy.next()) {
+                if (depth == max_paren_lookahead) return false;
+                depth += 1;
+            }
+            if (!(token.isWord("SELECT") or token.isWord("WITH") or token.isWord("VALUES") or token.isWord("TABLE"))) return false;
+            if (!in_from) return true;
+            // Scan to the `)` that closes the current `(` (depth 1).
+            while (true) {
+                if (token.kind == .end) return false;
+                if (token.kind == .symbol and token.symbol == .lparen) depth += 1;
+                if (token.kind == .symbol and token.symbol == .rparen) {
+                    depth -= 1;
+                    if (depth == 0) break;
+                }
+                token = try copy.next();
+            }
+            const after = try copy.next();
+            return (after.kind == .symbol and after.symbol == .rparen) or after.isWord("UNION") or after.isWord("INTERSECT") or
+                after.isWord("EXCEPT") or after.isWord("ORDER") or after.isWord("LIMIT") or after.isWord("OFFSET") or after.isWord("FETCH");
+        }
+
+        const max_paren_lookahead: usize = 64;
 
         /// A token that starts a query block: SELECT, WITH, VALUES, TABLE.
         fn queryWord(self: *const Self) bool {
@@ -3567,6 +3623,11 @@ pub fn Parser(comptime config: types.Config) type {
                     if (!try self.takeSymbol(.comma)) break;
                 }
                 try self.expectSymbol(.rparen);
+                // USING (...) AS alias (F404, B11 wave 5): AS is required.
+                if (self.mode == .standard and try self.takeWord("AS")) {
+                    item.using_alias = try self.identifier();
+                    self.pool.complex = true;
+                }
             } else return error.Syntax;
             return true;
         }
@@ -3593,7 +3654,7 @@ pub fn Parser(comptime config: types.Config) type {
                 self.pool.complex = true;
             }
             if (self.mode == .standard and try self.takeSymbol(.lparen)) {
-                if (!self.queryWord()) {
+                if (!self.queryWord() and !(self.isSymbol(.lparen) and try self.parenthesizedQuery(true))) {
                     if (item.lateral) return error.Syntax;
                     return self.joinGroup(out, kind);
                 }
@@ -3608,6 +3669,7 @@ pub fn Parser(comptime config: types.Config) type {
                 if (self.mode == .standard and try self.takeSymbol(.dot)) {
                     item.schema = item.name;
                     item.name = try self.identifier();
+                    try self.catalogTail(&item.schema, &item.name);
                 }
                 if (wrapped) try self.expectSymbol(.rparen);
                 // A function call in FROM (B11), implicitly LATERAL, with
@@ -3928,6 +3990,7 @@ pub fn Parser(comptime config: types.Config) type {
             if (self.mode == .standard and try self.takeSymbol(.dot)) {
                 out.schema = out.table;
                 out.table = try self.identifier();
+                try self.catalogTail(&out.schema, &out.table);
             }
             if (self.mode == .standard) out.alias = try self.targetAlias();
             try self.expectWord("SET");
@@ -3950,6 +4013,7 @@ pub fn Parser(comptime config: types.Config) type {
             if (self.mode == .standard and try self.takeSymbol(.dot)) {
                 out.schema = out.table;
                 out.table = try self.identifier();
+                try self.catalogTail(&out.schema, &out.table);
             }
             if (self.mode == .standard) out.alias = try self.targetAlias();
             try self.outputClause(&out.returning);
@@ -5583,13 +5647,29 @@ pub fn Parser(comptime config: types.Config) type {
             if (self.isSymbol(.lparen)) return self.functionCall(name);
             if (try self.takeSymbol(.dot)) {
                 if (self.mode == .standard and try self.takeSymbol(.star)) return self.pool.add(.{ .kind = .column, .star = true, .qualifier = name });
-                const column = try self.identifier();
+                var qualifier = name;
+                var column = try self.identifier();
                 if (self.mode == .standard and self.tokens.dialect == .postgres and self.isSymbol(.lparen)) {
                     const call = try self.functionCall(column);
                     self.pool.nodes[call].qualifier = name;
                     return call;
                 }
-                return self.subscriptTail(try self.pool.add(.{ .kind = .column, .name = column, .qualifier = name }));
+                // `schema.table.column` and `catalog.schema.table.column`
+                // (F651, B11 wave 5): the column's qualifier is the table.
+                if (self.mode == .standard and self.isSymbol(.dot)) {
+                    try self.advance();
+                    const third = try self.identifier();
+                    if (self.isSymbol(.dot)) {
+                        try self.advance();
+                        try self.pool.addCatalog(name);
+                        qualifier = third;
+                        column = try self.identifier();
+                    } else {
+                        qualifier = column;
+                        column = third;
+                    }
+                }
+                return self.subscriptTail(try self.pool.add(.{ .kind = .column, .name = column, .qualifier = qualifier }));
             }
             return self.subscriptTail(try self.pool.add(.{ .kind = .column, .name = name }));
         }

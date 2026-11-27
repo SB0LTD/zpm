@@ -556,6 +556,9 @@ pub const AggregateInput = struct {
     }
 };
 
+/// Catalog qualifiers one statement may write (`catalog.schema.name`).
+pub const catalog_ref_capacity: usize = 8;
+
 pub fn Ast(comptime config: types.Config) type {
     return struct {
         pub const Pool = struct {
@@ -573,6 +576,10 @@ pub fn Ast(comptime config: types.Config) type {
             /// Strict NULL record comparisons need a post-binding constant pass.
             discarded_row_constants: bool = false,
             planned_nulls: bool = false,
+            /// Catalog qualifiers of `catalog.schema.name` (F651, B11 wave
+            /// 5), checked against the session's database before binding.
+            catalog_refs: [catalog_ref_capacity]Ident = undefined,
+            catalog_ref_len: usize = 0,
 
             pub fn reset(self: *Pool) void {
                 self.window_len=0;
@@ -581,6 +588,14 @@ pub fn Ast(comptime config: types.Config) type {
                 self.complex = false;
                 self.discarded_row_constants = false;
                 self.planned_nulls = false;
+                self.catalog_ref_len = 0;
+            }
+
+            /// Records a catalog qualifier (54001 past the capacity).
+            pub fn addCatalog(self: *Pool, ident: Ident) Error!void {
+                if (self.catalog_ref_len == catalog_ref_capacity) return error.StatementTooComplex;
+                self.catalog_refs[self.catalog_ref_len] = ident;
+                self.catalog_ref_len += 1;
             }
 
             /// A new default query block, initialized in place (blocks are
@@ -934,6 +949,9 @@ pub fn Ast(comptime config: types.Config) type {
             sample_method: u8 = 0,
             sample_percent: u16 = none,
             sample_seed: u16 = none,
+            /// `JOIN ... USING (columns) AS alias` (F404, B11 wave 5): the
+            /// range variable naming the join's merged columns.
+            using_alias: ?Ident = null,
         };
 
         pub const Cte = struct {
