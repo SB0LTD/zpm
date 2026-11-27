@@ -2531,6 +2531,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
 
         fn writeVersion(db: anytype, table: *S.Table, slot: u32, older: u32, row: *const V.Row, csn: u64) Error!u32 {
             try S.ensureVersions(table, 1, csn);
+            try S.admitVersion(table, &row.cells);
             const version = S.createVersion(table, .{ .row = slot, .xmin = .{ .epoch = db.epoch }, .cid = db.cid, .csn = csn, .older = older }, &row.cells);
             S.indexKey(table, version);
             if (older == 0) {
@@ -2637,6 +2638,13 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         try resolveDefaultOids(&definition, table.columns[0..table.column_count], sources[0..definition.count], &db.next_default_oid);
                         const old_count = table.column_count;
                         if (!S.indexFits(table, definition.extras.index_count, 0)) return error.ChangeRecordConflict;
+                        // Existing rows must fit every ordered index entry
+                        // (a replica with a smaller index_key_bytes).
+                        var identity = definition.count == table.column_count;
+                        for (sources[0..definition.count], 0..) |origin, position| identity = identity and origin == position;
+                        if (identity) for (definition.extras.indexes[0..definition.extras.index_count]) |*index| {
+                            if (!S.keysFit(table, index)) return error.ChangeRecordConflict;
+                        };
                         S.redefine(table, definition.name, definition.columns[0..definition.count], definition.constraints[0..definition.constraint_count], &definition.extras, sources[0..definition.count], fills[0..definition.count]);
                         table.primary_constraint_oid = definition.primary_constraint_oid;
                         table.primary_index_oid = definition.primary_index_oid;
@@ -2674,6 +2682,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         for (0..columns) |index| row.cells[index] = (try decodeValue(&reader)).cell;
                         if (tag == @intFromEnum(Op.insert)) {
                             try S.ensureVersions(table, 1, csn);
+                            try S.admitVersion(table, &row.cells);
                             try S.ensureRowSlot(table, csn);
                             const slot = S.allocRow(table, rowid);
                             _ = try writeVersion(db, table, slot, 0, &row, csn);

@@ -680,6 +680,12 @@ pub fn Parser(comptime config: types.Config) type {
                     element.node = try self.expression();
                     element.expression = try self.storedSpan(start);
                     try self.expectSymbol(.rparen);
+                } else if (self.current.kind == .word and (try self.peek()).kind == .symbol and (try self.peek()).symbol == .lparen) {
+                    // index_elem's func_expr_windowless: `lower(t)` needs
+                    // no extra parentheses (B11 wave 5).
+                    const start = self.tokenStart();
+                    element.node = try self.expression();
+                    element.expression = try self.storedSpan(start);
                 } else {
                     element.column = try self.identifier();
                 }

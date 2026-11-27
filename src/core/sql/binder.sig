@@ -570,6 +570,13 @@ pub fn Binder(comptime config: types.Config) type {
             /// Expression over earlier items equal to this table's primary
             /// key (nested-loop index probe), or none.
             probe: u16 = none,
+            /// A column of an earlier item equal to the first key element of
+            /// ordered index `probe_index` of this table (B11 wave 5; only
+            /// without a primary-key `probe`): the nested loop walks the
+            /// index's equal keys per outer row. Paths that read `probe`
+            /// (primary keys) ignore it.
+            index_probe: u16 = none,
+            probe_index: u8 = no_index,
             // Query composition (B11).
             /// A LATERAL derived table / table function, re-run per left row.
             lateral: bool = false,
@@ -8572,6 +8579,46 @@ pub fn Binder(comptime config: types.Config) type {
             return none;
         }
 
+        const IndexProbe = struct { probe: u16 = none, which: u8 = no_index };
+
+        /// A top-level `item.col = expr(earlier items)` conjunct of ON whose
+        /// column leads an ordered index of the item (B11 wave 5): the
+        /// nested loop walks that index's equal keys per outer row. Unique
+        /// indexes first, then the first index; partial indexes are not
+        /// used (their predicate is not proven by ON).
+        fn joinIndexProbe(context: *const Context, table: usize, on: u16, index: usize) IndexProbe {
+            const entry = &context.tables[table];
+            if (on == none or entry.index_count == 0) return .{};
+            var terms: [index_conjuncts]u16 = undefined;
+            const count = collectConjuncts(context, on, &terms);
+            var best: IndexProbe = .{};
+            var best_unique = false;
+            for (entry.indexes[0..entry.index_count], 0..) |*definition, which| {
+                if (!S.hasIndexTree(entry, which) or definition.predicate.len != 0) continue;
+                const column = definition.keys[0];
+                if (column == S.expression_key) continue;
+                if (best.which != no_index and (best_unique or !definition.unique)) continue;
+                for (terms[0..count]) |term| {
+                    const n = context.node(term);
+                    if (n.kind != .binary or n.op != .eq) continue;
+                    const found: ?u16 = for ([2][2]u16{ .{ n.a, n.b }, .{ n.b, n.a } }) |pair| {
+                        // The outer side is a column (it cannot fail to
+                        // evaluate when the inner table has no rows).
+                        const key = context.node(pair[0]);
+                        const other = context.node(pair[1]);
+                        if (key.kind == .column and key.level == 0 and key.relation == index and key.column == column and
+                            other.kind == .column and (other.level != 0 or other.relation < index) and storedTag(entry, column, other.ty)) break pair[1];
+                    } else null;
+                    if (found) |probe| {
+                        best = .{ .probe = probe, .which = @intCast(which) };
+                        best_unique = definition.unique;
+                        break;
+                    }
+                }
+            }
+            return best;
+        }
+
         /// JSON_TABLE (B11 json-agg lane) as a plan of its own. The context
         /// item becomes jsonb (untyped, json and string inputs convert;
         /// others are 42804), the row and column paths jsonpath constants,
@@ -9264,6 +9311,11 @@ pub fn Binder(comptime config: types.Config) type {
             p.sources[k].on = on;
             if (p.sources[k].table) |table| if ((item.join == .inner or item.join == .left) and last == k and !p.general_join) {
                 p.sources[k].probe = joinProbe(context, table, on, k);
+                if (p.sources[k].probe == none) {
+                    const found = joinIndexProbe(context, table, on, k);
+                    p.sources[k].index_probe = found.probe;
+                    p.sources[k].probe_index = found.which;
+                }
             };
             // A SQL JOIN exposes only ordinary output columns unqualified.
             // Its constituent relation names still qualify their tableoid.

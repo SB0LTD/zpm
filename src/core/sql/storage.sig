@@ -1158,6 +1158,29 @@ pub fn Storage(comptime config: types.Config) type {
             };
         }
 
+        fn entryBytes(index: *const Index, cells: []const V.Cell) usize {
+            var bytes: usize = 0;
+            for (index.keyColumns()) |column| {
+                if (column != expression_key and column < cells.len) bytes += cellBytes(&cells[column]);
+            }
+            for (index.includes[0..index.include_count]) |column| {
+                if (column < cells.len) bytes += cellBytes(&cells[column]);
+            }
+            return bytes;
+        }
+
+        /// Whether every allocated version of `table` fits an ordered
+        /// index entry of `index` (CREATE INDEX over existing rows).
+        pub fn keysFit(table: *const Table, index: *const Index) bool {
+            if (index.hash) return true;
+            var row_scratch: VersionRowScratch = undefined;
+            for (0..table.version_high) |version| {
+                if (table.versions[version].rowLink() == 0) continue;
+                if (entryBytes(index, versionValues(table, version, &row_scratch)) > config.index_key_bytes) return false;
+            }
+            return true;
+        }
+
         /// Ordered index admission of a new version (before it is created):
         /// the entry's key and INCLUDE bytes stay within index_key_bytes and
         /// every tree can still split along a full path (IndexCapacity, 54000).
@@ -1165,14 +1188,7 @@ pub fn Storage(comptime config: types.Config) type {
             if (comptime !index_storage) return;
             for (table.indexes[0..table.index_count], 0..) |*index, which| {
                 if (index.hash) continue;
-                var bytes: usize = 0;
-                for (index.keyColumns()) |column| {
-                    if (column != expression_key and column < cells.len) bytes += cellBytes(&cells[column]);
-                }
-                for (index.includes[0..index.include_count]) |column| {
-                    if (column < cells.len) bytes += cellBytes(&cells[column]);
-                }
-                if (bytes > config.index_key_bytes) return error.IndexCapacity;
+                if (entryBytes(index, cells) > config.index_key_bytes) return error.IndexCapacity;
                 if (!hasIndexHash(table, which)) continue;
                 const run = runConst(table, which);
                 if (freeNodes(run) < nodeConst(run, 0)[meta_height] + 1) return error.IndexCapacity;

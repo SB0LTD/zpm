@@ -951,7 +951,11 @@ pub fn Exec(comptime config: types.Config) type {
                 const catalog_predicate = self.catalogJoinPredicate(p);
                 for (p.sources[0..p.source_count], 0..) |*source, stage| {
                     const last = stage + 1 == p.source_count;
-                    const probing = source.probe != none and stage != 0;
+                    // An ordered index probe (B11 wave 5) needs the index's
+                    // tree; without it the inner table is scanned.
+                    const index_probing = source.probe == none and source.index_probe != none and stage != 0 and
+                        S.hasIndexTree(&self.tables[source.table.?], source.probe_index);
+                    const probing = (source.probe != none and stage != 0) or index_probing;
                     const rows: List = if (probing) .{} else try self.sourceRows(source, outer, synchronizedProjection(p), stage, catalog_predicate);
                     const outer_join = source.join == .left or source.join == .full;
                     const tracks = source.join == .right or source.join == .full;
@@ -966,8 +970,25 @@ pub fn Exec(comptime config: types.Config) type {
                         var any = false;
                         if (probing) {
                             ctx.row = null;
-                            const key = try E.eval(&ctx, source.probe);
-                            if (key != .null_value) {
+                            const key = try E.eval(&ctx, if (index_probing) source.index_probe else source.probe);
+                            if (key != .null_value and index_probing) {
+                                // Equal keys of an ordered index, in heap
+                                // order (the tree's tie order), as a scan
+                                // of the inner table meets them.
+                                const table = &self.tables[source.table.?];
+                                self.work.stream_stats.index_probes += 1;
+                                var span: S.Span = .{ .eq = 1 };
+                                span.cells[0] = key;
+                                var scan = S.indexScan(table, source.probe_index, &span, false);
+                                while (S.scanNext(table, source.probe_index, &scan)) |version| {
+                                    try self.session.checkpoint();
+                                    if (S.visibleAt(table, table.versions[version].rowSlot(), self.snap) != version) continue;
+                                    ctx.tuple[stage] = S.borrowVersionRow(table, version, &tuple_rows[stage]);
+                                    if (source.on != none and (try E.truth(&ctx, source.on)) != true) continue;
+                                    any = true;
+                                    if (try self.joinKeep(&ctx, p.where, stage, last, early)) try self.emit(&next, current, index, version);
+                                }
+                            } else if (key != .null_value) {
                                 const table = &self.tables[source.table.?];
                                 if (S.lookupKeyAt(table, &key, self.snap)) |slot| if (S.visibleAt(table, slot, self.snap)) |version| {
                                     ctx.tuple[stage] = S.borrowVersionRow(table, version, &tuple_rows[stage]);
@@ -5033,6 +5054,7 @@ pub fn Exec(comptime config: types.Config) type {
                     };
                     return self.groupingRollup(p,outer);
                 }
+                if (try self.indexAggregates(p, outer)) |rows| return self.finish(p, rows);
                if (self.streamProjectionEligible(p, outer)) return self.streamProjection(p);
                 if(comptime config.factorized_aggregates and S.compact_enabled and config.relations>=2) if(self.repeatable()) {
                     const at=self.mark();const stats=self.work.stream_stats;
@@ -5064,6 +5086,62 @@ pub fn Exec(comptime config: types.Config) type {
 
             fn repeatable(self: *const Query) bool {
                 return repeatablePool(self.pool);
+            }
+
+            /// The ordered index (with a tree, not partial) whose first key
+            /// element is min / max's plain column argument (B11 wave 5).
+            fn extremeIndex(self: *const Query, table: *const S.Table, agg: *const B.Agg) ?u8 {
+                if ((agg.kind != .min and agg.kind != .max) or agg.distinct or agg.filter != none or agg.arg == none) return null;
+                const arg = &self.pool.nodes[agg.arg];
+                if (arg.kind != .column or arg.level != 0 or arg.relation != 0) return null;
+                for (table.indexes[0..table.index_count], 0..) |*index, which| {
+                    if (!S.hasIndexTree(table, which) or index.predicate.len != 0 or index.keys[0] != arg.column) continue;
+                    return @intCast(which);
+                }
+                return null;
+            }
+
+            /// min / max of an index's first element: the first visible
+            /// non-NULL entry from the end that holds it.
+            fn indexExtreme(self: *Query, table: *const S.Table, agg: *const B.Agg, which: u8) Error!V.Cell {
+                var row_scratch: S.VersionRowScratch = undefined;
+                const index = &table.indexes[which];
+                const descending = index.options[0] & 1 != 0;
+                const backward = (agg.kind == .max) != descending;
+                const span: S.Span = .{ .ranged = true };
+                var scan = S.indexScan(table, which, &span, backward);
+                self.work.stream_stats.index_probes += 1;
+                while (S.scanNext(table, which, &scan)) |version| {
+                    try self.session.checkpoint();
+                    if (S.visibleAt(table, table.versions[version].rowSlot(), self.snap) != version) continue;
+                    return S.borrowVersionRow(table, version, &row_scratch)[index.keys[0]];
+                }
+                return .null_value;
+            }
+
+            /// One ungrouped row of min() / max() calls over columns that
+            /// lead ordered indexes, without WHERE, FILTER or DISTINCT, read
+            /// from the indexes' ends (B11 wave 5). Null for other plans.
+            fn indexAggregates(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!?List {
+                if (!p.grouped or p.key_count != 0 or p.source_count != 1 or p.where != none or p.agg_count == 0 or p.general_join) return null;
+                const source = &p.sources[0];
+                const table_index = source.table orelse return null;
+                if (source.sample_method != 0) return null;
+                const table = &self.tables[table_index];
+                if (table.index_count == 0) return null;
+                for (p.aggs[0..p.agg_count], 0..) |*agg, index| {
+                    if (p.aggregate_required[index] and self.extremeIndex(table, agg) == null) return null;
+                }
+                var out: List = .{ .start = @intCast(self.work.ref_low) };
+                const group_row = try self.cells(p.key_count + p.agg_count);
+                for (p.aggs[0..p.agg_count], 0..) |*agg, index| {
+                    const which = if (p.aggregate_required[index]) self.extremeIndex(table, agg) else null;
+                    self.work.cells[group_row + index] = if (which) |found| try self.indexExtreme(table, agg, found) else .null_value;
+                }
+                var group_ctx = self.context(outer);
+                group_ctx.tuple[group_relation] = self.row(group_row);
+                if (try keep(&group_ctx, p.having, null)) try self.projectRow(p, &group_ctx, &out);
+                return out;
             }
 
             // ---- set operations and CTEs -------------------------------

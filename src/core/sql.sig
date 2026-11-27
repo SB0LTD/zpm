@@ -10117,6 +10117,11 @@ pub fn Database(comptime config: Config) type {
                 if (value != .null_value) fills[position] = try D.store(column, value, &self.session);
             }
             if (!S.indexFits(copy, alter.extras.index_count, source.version_used)) return error.IndexCapacity;
+            // CREATE INDEX over existing rows: every entry within
+            // index_key_bytes (PostgreSQL's index row size limit, 54000).
+            if (alter.command == .create_index and alter.extras.index_count != 0) {
+                if (!S.keysFit(source, &alter.extras.indexes[alter.extras.index_count - 1])) return error.IndexCapacity;
+            }
             S.reset(copy, source.oid, alter.name, alter.columns[0..alter.count]);
             copy.namespace = source.namespace;
             S.setConstraints(copy, alter.constraints[0..alter.constraint_count]);
@@ -10921,6 +10926,7 @@ pub fn Database(comptime config: Config) type {
             try checkPendingLatePrimary(table);
             try self.reserveWrites(slot, 1);
             try S.ensureVersions(table, 1, self.horizon());
+            try S.admitVersion(table, cells[0..]);
             const version = S.createVersion(table, .{ .row = row, .xmin = tx.ref(slot), .cid = snap.cid, .older = old + 1 }, cells);
             table.versions[old].markDeletion(tx.ref(slot), snap.cid);
             S.indexKey(table, version);
@@ -11282,6 +11288,7 @@ pub fn Database(comptime config: Config) type {
             try self.reserveWrites(slot, 1);
             const at = self.horizon();
             try S.ensureVersions(table, 1, at);
+            try S.admitVersion(table, cells[0..]);
             // A statement suspended under a nested one may be scanning this
             // table: its row slots must not move (B11 wave 4).
             if (self.nested_depth != 0 and table.row_high >= table.rows.len and self.suspendedTable(table_index)) return error.RowCapacity;

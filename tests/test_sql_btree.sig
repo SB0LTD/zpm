@@ -400,13 +400,203 @@ fn shapes() !void {
     try agree("SELECT id, a FROM s ORDER BY a DESC LIMIT 3");
     try check(with.workspace.query.read_stats.index_entries - before <= 32);
     for ([_][]const u8{ "SELECT id FROM s WHERE a = 3", "SELECT id FROM s WHERE a BETWEEN 2 AND 4 ORDER BY a, id", "SELECT b, t, a FROM s WHERE b = 1 AND t >= 'k3'", "SELECT id, a FROM s WHERE b = 2 ORDER BY t", "SELECT id, a FROM s ORDER BY a DESC LIMIT 7", "SELECT id, a, t FROM s ORDER BY a NULLS FIRST LIMIT 12" }) |source| try agree(source);
-    // Partial index: used only when the WHERE implies its predicate.
-    try explains(&with, "SELECT id FROM s WHERE a = 3 AND b > 1", "Bitmap Heap Scan");
-    try explains(&with, "SELECT id FROM s WHERE a = 3 AND b = 2", "Bitmap Heap Scan");
-    try agree("SELECT id FROM s WHERE a = 3 AND b > 1");
-    try agree("SELECT id FROM s WHERE a = 3 AND b = 2");
     try valid(&with, "s");
     try both("DROP TABLE s");
+    // Partial and expression indexes. Entries cover every row, so the
+    // planner may use a partial index only when the WHERE implies its
+    // predicate (PostgreSQL predicate_implied_by: equal conjuncts, IS NOT
+    // NULL by a strict comparison, narrower integer comparisons).
+    try both("CREATE TABLE q (id INT PRIMARY KEY, a INT, b INT, t TEXT)");
+    try both("INSERT INTO q SELECT g, g % 10, g % 4, CASE WHEN g % 9 = 0 THEN NULL ELSE 'T' || (g % 5) END FROM generate_series(1, 120) g");
+    try primary("CREATE INDEX q_p ON q (a) WHERE b > 1");
+    try primary("CREATE INDEX q_n ON q (b) WHERE t IS NOT NULL");
+    try primary("CREATE INDEX q_x ON q (lower(t))");
+    try primary("CREATE INDEX q_e ON q (id, (a + 1))");
+    for ([_][2][]const u8{
+        .{ "SELECT id FROM q WHERE a = 3 AND b > 1", "Bitmap Heap Scan" },
+        .{ "SELECT id FROM q WHERE a = 3 AND b = 2", "Bitmap Heap Scan" },
+        .{ "SELECT id FROM q WHERE a = 3 AND b >= 3", "Bitmap Heap Scan" },
+        .{ "SELECT id FROM q WHERE a = 3 AND b > 0", "Select Plan" },
+        .{ "SELECT id FROM q WHERE a = 3 AND b = 1", "Select Plan" },
+        .{ "SELECT id FROM q WHERE a = 3", "Select Plan" },
+        .{ "SELECT id FROM q WHERE b = 2 AND t = 'T1'", "Bitmap Heap Scan" },
+        .{ "SELECT id FROM q WHERE b = 2 AND t > 'T'", "Bitmap Heap Scan" },
+        .{ "SELECT id FROM q WHERE b = 2", "Select Plan" },
+        // Expression elements are outside the tree order: no lookup on them.
+        .{ "SELECT id FROM q WHERE lower(t) = 't1'", "Select Plan" },
+        .{ "SELECT id FROM q WHERE id > 100 AND a + 1 = 3", "Bitmap Heap Scan" },
+    }) |case| {
+        try explains(&with, case[0], case[1]);
+        try agree(case[0]);
+    }
+    try valid(&with, "q");
+    try both("DROP TABLE q");
+}
+
+// ---- min / max and joins ---------------------------------------------------
+
+fn streamProbes(target: anytype) usize {
+    return target.workspace.query.stream_stats.index_probes;
+}
+
+fn minMax() !void {
+    const cases = [_][]const u8{
+        "SELECT min(a), max(a) FROM r",
+        "SELECT max(t), min(t) FROM r",
+        "SELECT min(b), max(b) FROM r",
+        "SELECT max(a) FROM r HAVING max(a) > 3",
+        "SELECT max(a) FROM r HAVING max(a) > 300",
+        "SELECT min(a) + 1, max(t) || '!' FROM r",
+    };
+    for (cases) |source| {
+        try agree(source);
+        try check(streamProbes(&with) != 0);
+    }
+    // Not served: no index on c, a WHERE, DISTINCT, FILTER.
+    for ([_][]const u8{ "SELECT min(c) FROM r", "SELECT min(a) FROM r WHERE b = 1", "SELECT max(DISTINCT a) FROM r", "SELECT max(a) FILTER (WHERE b > 2) FROM r" }) |source| {
+        try agree(source);
+        try check(streamProbes(&with) == 0);
+    }
+    // An open deleter: other snapshots keep the old extreme, the deleter
+    // sees the next one.
+    const w1 = try with.begin();
+    const w2 = try without.begin();
+    var result: DB.Result = .{};
+    try with.statement(w1, "DELETE FROM r WHERE a >= 9 OR t >= 'z'", &result, .{});
+    try without.statement(w2, "DELETE FROM r WHERE a >= 9 OR t >= 'z'", &result, .{});
+    for (cases[0..3]) |source| try agree(source);
+    var left_result: DB.Result = .{};
+    var right_result: DB.Result = .{};
+    try with.statement(w1, cases[0], &left_result, .{});
+    try without.statement(w2, cases[0], &right_result, .{});
+    const left = try render(DB, &left_result, &text_buffer);
+    @memcpy(saved_buffer[0..left.len], left);
+    try same(try render(DB, &right_result, &text_buffer), saved_buffer[0..left.len]);
+    with.abort(w1);
+    without.abort(w2);
+    try both("CREATE TABLE e (id INT PRIMARY KEY, a INT)");
+    try primary("CREATE INDEX e_a ON e (a DESC)");
+    try agree("SELECT min(a), max(a) FROM e");
+    try both("INSERT INTO e VALUES (1, NULL), (2, NULL)");
+    try agree("SELECT min(a), max(a) FROM e");
+    try both("INSERT INTO e VALUES (3, 4), (4, -2), (5, NULL)");
+    try agree("SELECT min(a), max(a), count(*) FROM e");
+    try agree("SELECT min(a), max(a) FROM e");
+    try both("DROP TABLE e");
+}
+
+fn joins() !void {
+    try both("CREATE TABLE p (id INT PRIMARY KEY, k INT, v TEXT)");
+    try both("CREATE TABLE c (id INT PRIMARY KEY, pk INT, w INT)");
+    try both("INSERT INTO p SELECT g, g % 13, 'v' || g FROM generate_series(1, 60) g");
+    try both("INSERT INTO c SELECT g, (g * 7) % 70, g % 5 FROM generate_series(1, 140) g");
+    try both("INSERT INTO c VALUES (500, NULL, 1), (501, 3, NULL)");
+    try primary("CREATE INDEX c_pk ON c (pk)");
+    try primary("CREATE INDEX p_k ON p (k DESC)");
+    const cases = [_][]const u8{
+        "SELECT p.id, c.id, c.w FROM p JOIN c ON c.pk = p.id ORDER BY p.id, c.id",
+        "SELECT p.id, c.id FROM p JOIN c ON c.pk = p.id",
+        "SELECT p.id, c.id FROM p LEFT JOIN c ON c.pk = p.id AND c.w > 1",
+        "SELECT c.id, p.id FROM c JOIN p ON p.k = c.w WHERE c.id < 25",
+        "SELECT c.id, p.v FROM c LEFT JOIN p ON p.k = c.pk WHERE c.w < 3 AND c.id < 70",
+        "SELECT p.id, c.id, d.id FROM p JOIN c ON c.pk = p.id JOIN c d ON d.pk = c.w WHERE p.id < 20",
+        "SELECT p.id, count(c.id) FROM p LEFT JOIN c ON c.pk = p.id GROUP BY p.id ORDER BY 2 DESC, 1",
+    };
+    for (cases) |source| {
+        try agree(source);
+        try check(streamProbes(&with) != 0);
+    }
+    // A probe column that is not an index's first element scans.
+    try agree("SELECT p.id, c.id FROM p JOIN c ON c.w = p.id");
+    try check(streamProbes(&with) == 0);
+    try both("UPDATE c SET pk = pk + 1 WHERE id % 3 = 0");
+    try both("DELETE FROM p WHERE id % 4 = 1");
+    for (cases) |source| try agree(source);
+    try valid(&with, "c");
+    try valid(&with, "p");
+    try both("DROP TABLE c");
+    try both("DROP TABLE p");
+}
+
+// ---- UNIQUE through the btree ----------------------------------------------
+
+fn parks(slot: u16, source: []const u8) !void {
+    var result: DB.Result = .{};
+    if (with.statement(slot, source, &result, .{})) |_| return error.InvalidStatementAccepted else |err| try check(err == error.WouldBlock);
+    try check(with.parked(slot));
+}
+
+fn resumed(slot: u16, source: []const u8) ?anyerror {
+    var result: DB.Result = .{};
+    with.statement(slot, source, &result, .{ .@"resume" = true }) catch |err| return err;
+    return null;
+}
+
+fn statementOn(slot: u16, source: []const u8) !void {
+    var result: DB.Result = .{};
+    try with.statement(slot, source, &result, .{});
+}
+
+fn commitOn(slot: u16) !void {
+    if (!with.readOnly(slot)) {
+        const payload = try with.prepareCommit(slot, &record);
+        try replica.applyChangeRecord(payload, &replay_scratch);
+    }
+    with.publishCommit(slot);
+}
+
+fn uniqueness() !void {
+    try primary("CREATE TABLE u (id INT PRIMARY KEY, k INT, n TEXT)");
+    try primary("INSERT INTO u VALUES (1, 1, 'a'), (2, 2, 'b'), (3, 3, NULL), (4, 3, NULL)");
+    // Existing duplicates: 23505 and no index.
+    try rejects(&with, "CREATE UNIQUE INDEX u_k ON u (k)", error.PrimaryKeyViolation);
+    try expect(&with, "SELECT count(*) FROM pg_indexes WHERE tablename = 'u'", "1");
+    try primary("DELETE FROM u WHERE id = 4");
+    try primary("CREATE UNIQUE INDEX u_k ON u (k)");
+    try primary("CREATE UNIQUE INDEX u_n ON u (n) NULLS NOT DISTINCT");
+    try rejects(&with, "INSERT INTO u VALUES (5, 2, 'x')", error.PrimaryKeyViolation);
+    try rejects(&with, "UPDATE u SET k = 1 WHERE id = 3", error.PrimaryKeyViolation);
+    try rejects(&with, "INSERT INTO u VALUES (5, 5, NULL)", error.PrimaryKeyViolation);
+    try rejects(&with, "INSERT INTO u VALUES (5, 5, 'e'), (6, 5, 'f')", error.PrimaryKeyViolation);
+    try expect(&with, "SELECT id, k, n FROM u ORDER BY id", "1|1|a;2|2|b;3|3|NULL");
+    try primary("INSERT INTO u VALUES (5, NULL, 'e'), (6, NULL, 'f')");
+    try primary("UPDATE u SET k = 4 WHERE id = 3");
+    try primary("UPDATE u SET k = 3 WHERE id = 3");
+    // A concurrent inserter of the same key waits (dirty snapshot), then
+    // fails after the first commits or inserts after it aborts.
+    const first = try with.begin();
+    const second = try with.begin();
+    try statementOn(first, "INSERT INTO u VALUES (10, 10, 'j')");
+    try parks(second, "INSERT INTO u VALUES (11, 10, 'k')");
+    try commitOn(first);
+    const outcome = resumed(second, "INSERT INTO u VALUES (11, 10, 'k')");
+    try check(outcome != null and outcome.? == error.PrimaryKeyViolation);
+    with.abort(second);
+    const third = try with.begin();
+    const fourth = try with.begin();
+    try statementOn(third, "INSERT INTO u VALUES (12, 12, 'l')");
+    try parks(fourth, "INSERT INTO u VALUES (13, 12, 'm')");
+    with.abort(third);
+    try check(resumed(fourth, "INSERT INTO u VALUES (13, 12, 'm')") == null);
+    try commitOn(fourth);
+    // An uncommitted delete of the key: the inserter waits for it.
+    const deleter = try with.begin();
+    const inserter = try with.begin();
+    try statementOn(deleter, "DELETE FROM u WHERE k = 2");
+    try parks(inserter, "INSERT INTO u VALUES (14, 2, 'n')");
+    try commitOn(deleter);
+    try check(resumed(inserter, "INSERT INTO u VALUES (14, 2, 'n')") == null);
+    try commitOn(inserter);
+    // ON CONFLICT arbitrates through the unique btree.
+    try primary("INSERT INTO u VALUES (15, 3, 'o') ON CONFLICT (k) DO UPDATE SET n = 'conflict'");
+    try primary("INSERT INTO u VALUES (16, 16, 'p') ON CONFLICT (k) DO NOTHING");
+    const rows = "SELECT id, k, n FROM u ORDER BY id";
+    try expect(&with, rows, "1|1|a;3|3|conflict;5|NULL|e;6|NULL|f;10|10|j;13|12|m;14|2|n;16|16|p");
+    try replicated(rows);
+    try valid(&with, "u");
+    try valid(&replica, "u");
+    try explains(&with, "SELECT id FROM u WHERE k = 12", "Index Scan");
+    try primary("DROP TABLE u");
 }
 
 pub fn main() !void {
@@ -414,6 +604,9 @@ pub fn main() !void {
     try shapes();
     try randomized();
     try concurrent();
+    try minMax();
+    try joins();
+    try uniqueness();
     var buffer: [512]u8 = undefined;
     const report = try std.fmt.bufPrint(&buffer, "{{\"suite\":\"sql-btree\",\"pass\":true,\"assertions\":{d},\"statements\":{d}}}\n", .{ assertions, statements });
     std.debug.print("{s}", .{report});
