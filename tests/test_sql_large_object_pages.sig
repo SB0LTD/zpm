@@ -783,6 +783,23 @@ fn routineDefaultCheckpoint() !void {
     try expect(unsupported.used == 0);
 }
 
+// Exercise the view binder and transactional rewrite with 4 KiB cells on
+// the same 4 MiB stack as the other wide-cell contracts. This one-bank
+// fixture deliberately cannot reserve a second definition slot: failure
+// must leave the original view and its committed CSN intact.
+fn wideViewReplacementCapacity() !void {
+    copied = .{};
+    try copy_arena.bind(&copied);
+    var result: DB.Result = .{};
+    try copied.execute("CREATE OR REPLACE VIEW wide_view AS SELECT 1 AS n", &result);
+    const before = copied.csn;
+    if (copied.execute("CREATE OR REPLACE VIEW wide_view AS SELECT 2 AS n", &result)) |_| return error.ViewCapacityIgnored else |err|
+        try expect(err == error.TableCapacity);
+    try expect(copied.csn == before and copied.usage().transactions == 0);
+    try copied.execute("SELECT n FROM wide_view", &result);
+    try expect(result.row_count == 1 and result.rows[0].cells[0].integer == 1);
+}
+
 pub fn main(init: std.process.Init) !void {
     try snapshotAndSparseRead();
     try atomicCapacityFailure();
@@ -796,6 +813,7 @@ pub fn main(init: std.process.Init) !void {
     try fileExecuteGrants();
     try fileExecuteLists();
     try routineDefaultCheckpoint();
+    try wideViewReplacementCapacity();
     var line: [160]u8 = undefined;
     const report = try std.fmt.bufPrint(&line, "{{\"suite\":\"sql-large-object-pages\",\"pass\":true,\"assertions\":{d}}}\n", .{assertions});
     try std.Io.File.stdout().writeStreamingAll(init.io, report);

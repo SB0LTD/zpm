@@ -1,5 +1,61 @@
 # SQL conformance TDD checkpoint
 
+## Integrated wave-4 reassessment — qualification pending, 27 November 2026
+
+Stronger local plain/custom stock archive fixtures found stored view SQL tied
+to the 128-byte inline data-cell budget. The candidate separates owned query
+metadata from cells and returns long catalog definitions through caller-owned
+result memory. The regression covers ordinary/materialized views, replacement,
+result lifetime and WAL replay. The existing 16-bit WAL length and configured
+query-expansion budget remain explicit bounds; compact base-image view support
+remains open. PG16/18 qualification is still required for this later candidate.
+
+The stronger native outbound restore then caught INSTEAD OF view triggers being
+deparsed as AFTER. The deparser now preserves the actual timing bit; regression
+contracts check full/pretty definitions, replacement and WAL replay. The failed
+native restore is retained, and real native restoration with the fixed binary
+is required in addition to the metadata assertions.
+
+The current candidate includes main b87c97a6: routine schemas/signatures and
+SECURITY DEFINER, nested SQL/updatable views/rule actions, extended types,
+regex/text-search/SQL-JSON, inheritance/partition DML, constraints, search_path
+and the refreshed feature scoreboard. The scoreboard records 312/434 matching
+PostgreSQL 18.7 probes: 326 in-scope records classified closed by those probes,
+4 partial and 123 open, with 302 reviewed out-of-scope records. These finite
+probe classifications do not establish complete feature-family or production
+closure. See [the ranked remaining work](SQL_FEATURE_STATUS.md).
+
+View replacement is integrated with these changes and tests retention of the
+new INSTEAD OF trigger/non-SELECT rule behavior after its defining SELECT changes.
+The earlier standalone replacement revision 9c401778 passed full source and
+platform CI, strict 106/106 inventory, stock PG16/18 archives both directions and
+the full release matrix, publishing a 29-asset preview (run 46046582945). Those
+results remain evidence for that revision, not qualification of this combined
+candidate. Fresh source/4 MiB and PG16/18 CI is required before merging it.
+
+Native privilege verification found a missing namespace CREATE check: the
+candidate accepted replacement by a public-view owner without schema CREATE.
+The new red regression reproduces it. Replacement now uses the existing namespace
+authorization hook, with a positive owned-private-schema case and unchanged data
+after denial. General schema privilege GRANT/REVOKE remains open; this does not
+claim full namespace ACL support.
+
+## View replacement — candidate, 27 November 2026
+
+The red contract reproduces 0A000 for CREATE OR REPLACE VIEW. The candidate uses
+the existing MVCC/WAL definition rewrite, preserving OIDs, ownership and ACLs.
+Existing column names/types/typmods must match; rollback, lock waits, quoted
+aliases and replay are covered. Native PostgreSQL 18.3 caught and corrected an
+initial assumption about recursion: circular definitions are accepted, then reads
+fail with 42P17. Bounded expansion ancestry distinguishes cycles from repeated
+sibling references without initializing storage for queries without views.
+
+Appending columns with dependent stored views remains explicitly 0A000 until
+creation-time star projections are frozen. View options, ALTER VIEW rename,
+normalized dependency graphs and experimental packed-bank
+definition rewrites remain open. See [scope and contracts](SQL_VIEWS.md).
+PG16/18 stock round trips, strict inventory and complete source CI are pending
+for this candidate; the qualified checkpoint below remains the release baseline.
 ## Text and JSON (lane B11 wave 4, text-json) — 27 November 2026
 
 Branch `w4/text-json` closes most of the regular-expression, text-search

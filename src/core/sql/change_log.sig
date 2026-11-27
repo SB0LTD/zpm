@@ -1613,9 +1613,9 @@ pub fn ChangeLog(comptime config: types.Config) type {
             out.constraint_count = count;
         }
 
-        fn decodeText(reader: *Reader, out: *V.Text) Error!void {
+        fn decodeText(reader: *Reader, out: anytype) Error!void {
             const length = try reader.int(u16);
-            if (length > config.text_bytes) return error.ChangeRecordConflict;
+            if (length > out.bytes.len) return error.ChangeRecordConflict;
             const text = try reader.take(length);
             out.len = length;
             @memcpy(out.bytes[0..length], text);

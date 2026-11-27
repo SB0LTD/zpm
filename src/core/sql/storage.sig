@@ -97,6 +97,17 @@ pub fn Storage(comptime config: types.Config) type {
         pub const integral_enabled = split_versions and config.integral_external_versions;
         const compact_stamps = config.compact_external_version_stamps;
         pub const VersionRow = [config.columns]V.Cell;
+        /// Stored SQL belongs to the query-expansion budget, not to the
+        /// inline size of a user data cell. The existing WAL uses u16 bytes.
+        pub const query_capacity = @min(@max(config.text_bytes, config.expansion_bytes), 0xffff);
+        pub const QueryText = struct {
+            bytes: [query_capacity]u8 = @splat(0),
+            len: usize = 0,
+
+            pub fn slice(self: *const QueryText) []const u8 {
+                return self.bytes[0..self.len];
+            }
+        };
 
         pub fn presenceWords(rows:usize) Error!usize {
             const rounded=@addWithOverflow(rows,63);if(rounded[1]!=0) return error.InvalidParameterValue;
@@ -558,7 +569,7 @@ pub fn Storage(comptime config: types.Config) type {
             index_slots: IndexSlots = if (config.external_storage) &.{} else @splat(@splat(0)),
             scan_index_limit: if (config.external_storage) usize else void = if (config.external_storage) 0 else {},
             /// View / materialized view defining query (SELECT text).
-            query: V.Text = .{},
+            query: QueryText = .{},
             /// A materialized view created WITH NO DATA is unpopulated.
             populated: bool = true,
             /// OIDs of the relations a view reads (DROP dependency checks).
@@ -783,7 +794,7 @@ pub fn Storage(comptime config: types.Config) type {
             relkind: u8 = 'r',
             index_count: usize = 0,
             indexes: [index_capacity]Index = @splat(.{}),
-            query: V.Text = .{},
+            query: QueryText = .{},
             populated: bool = true,
             depend_count: usize = 0,
             depends: [config.tables]u32 = @splat(0),

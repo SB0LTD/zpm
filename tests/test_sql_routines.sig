@@ -1496,6 +1496,156 @@ fn routineDefaultWalValidation() !void {
     try sameState(&.{"SELECT defaclacl::text FROM pg_default_acl WHERE defaclobjtype='f'"});
 }
 
+fn viewReplacement() !void {
+    reset();
+    try run("CREATE TABLE view_source (id INT,v INT)");
+    try run("INSERT INTO view_source VALUES (1,7),(2,-3)");
+    // OR REPLACE also creates an absent view. An existing view keeps its OID.
+    try completes("CREATE OR REPLACE VIEW replace_me AS SELECT id,v FROM view_source", .create_view, 0);
+    var oid_result: DB.Result = .{};
+    try db.execute("SELECT 'replace_me'::regclass::oid", &oid_result);
+    const oid = oid_result.rows[0].cells[0].integer;
+    try run("CREATE VIEW replace_child AS SELECT id,v FROM replace_me");
+    try completes("CREATE OR REPLACE VIEW replace_me AS SELECT id,v*2 AS v FROM view_source WHERE v>0", .create_view, 0);
+    try expect("SELECT id,v FROM replace_me", "1|14");
+    try expect("SELECT id,v FROM replace_child", "1|14");
+    try db.execute("SELECT 'replace_me'::regclass::oid", &oid_result);
+    try check(oid_result.rows[0].cells[0].integer == oid);
+    try rejects("CREATE OR REPLACE VIEW replace_me AS SELECT id FROM view_source", error.InvalidTableDefinition, "SELECT id,v FROM replace_me", "1|14");
+    try rejects("CREATE OR REPLACE VIEW replace_me AS SELECT id,v AS renamed FROM view_source", error.InvalidTableDefinition, "SELECT id,v FROM replace_me", "1|14");
+    try rejects("CREATE OR REPLACE VIEW replace_me AS SELECT id,v::bigint AS v FROM view_source", error.InvalidTableDefinition, "SELECT id,v FROM replace_me", "1|14");
+    try rejects("CREATE OR REPLACE VIEW replace_me AS SELECT id,v,v+1 AS extra FROM view_source", error.UnsupportedStatement, "SELECT id,v FROM replace_me", "1|14");
+    try fails("CREATE OR REPLACE VIEW view_source AS SELECT 1 AS id", error.WrongObjectType);
+    try run("CREATE MATERIALIZED VIEW replace_mat AS SELECT 1 AS id");
+    try fails("CREATE OR REPLACE VIEW replace_mat AS SELECT 1 AS id", error.WrongObjectType);
+    try run("CREATE OR REPLACE VIEW replace_me AS SELECT id,v FROM replace_me");
+    try fails("SELECT * FROM replace_me", error.InvalidObjectDefinition);
+    try same(try query(&replica, "SELECT 1"), "1");
+    try run("CREATE OR REPLACE VIEW replace_me AS SELECT id,v*2 AS v FROM view_source WHERE v>0");
+    try run("CREATE OR REPLACE VIEW replace_me AS SELECT id,v FROM replace_child");
+    try fails("SELECT * FROM replace_child", error.InvalidObjectDefinition);
+    try run("CREATE OR REPLACE VIEW replace_me AS SELECT id,v*2 AS v FROM view_source WHERE v>0");
+    // Repeated siblings are not recursive expansion.
+    try expect("SELECT a.id,b.v FROM replace_me a JOIN replace_me b ON a.id=b.id", "1|14");
+    try run("CREATE ROLE view_reader");
+    try run("GRANT SELECT ON replace_me TO view_reader");
+    try run("SET ROLE view_reader");
+    try fails("CREATE OR REPLACE VIEW replace_me AS SELECT id,v FROM view_source", error.InsufficientPrivilege);
+    try run("RESET ROLE");
+    try run("CREATE ROLE view_owner");
+    try run("GRANT SELECT ON view_source TO view_owner");
+    try run("CREATE SCHEMA \"Owner Views\" AUTHORIZATION view_owner");
+    try run("CREATE VIEW \"Owner Views\".owned AS SELECT id,v FROM public.view_source");
+    try run("ALTER TABLE \"Owner Views\".owned OWNER TO view_owner");
+    try run("SET ROLE view_owner");
+    try run("CREATE OR REPLACE VIEW \"Owner Views\".owned AS SELECT id,v*2 AS v FROM public.view_source WHERE v>0");
+    try run("RESET ROLE");
+    try expect("SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid='\"Owner Views\".owned'::regclass", "view_owner");
+    try run("CREATE VIEW public_owned AS SELECT id,v FROM view_source");
+    try run("ALTER TABLE public_owned OWNER TO view_owner");
+    try run("SET ROLE view_owner");
+    try rejects("CREATE OR REPLACE VIEW public_owned AS SELECT id,v+20 AS v FROM view_source", error.InsufficientPrivilege, "SELECT id,v FROM public_owned ORDER BY id", "1|7;2|-3");
+    try run("RESET ROLE");
+    try run("DROP VIEW public_owned");
+    try run("SET ROLE view_reader");
+    try expect("SELECT id,v FROM replace_me", "1|14");
+    try run("RESET ROLE");
+    const transaction = try db.begin();
+    try statement(transaction, "CREATE OR REPLACE VIEW replace_me AS SELECT id,v+1 AS v FROM view_source");
+    try same(try rows(transaction, "SELECT id,v FROM replace_child ORDER BY id"), "1|8;2|-2");
+    db.abort(transaction);
+    try expect("SELECT id,v FROM replace_child", "1|14");
+    try run("CREATE SCHEMA \"View Space\"");
+    try run("CREATE OR REPLACE VIEW \"View Space\".\"Replacement View\" (\"Quoted ID\",\"Value\") AS SELECT id,v FROM public.view_source");
+    try run("CREATE OR REPLACE VIEW \"View Space\".\"Replacement View\" (\"Quoted ID\",\"Value\") AS SELECT id,v+10 FROM public.view_source");
+    try expect("SELECT \"Quoted ID\",\"Value\" FROM \"View Space\".\"Replacement View\" ORDER BY \"Quoted ID\"", "1|17;2|7");
+    try sameState(&.{
+        "SELECT 'replace_me'::regclass::oid",
+        "SELECT id,v FROM \"Owner Views\".owned",
+        "SELECT id,v FROM replace_child",
+        "SELECT \"Quoted ID\",\"Value\" FROM \"View Space\".\"Replacement View\" ORDER BY \"Quoted ID\"",
+        "SELECT pg_get_ruledef(oid) FROM pg_rewrite WHERE ev_class='replace_me'::regclass",
+    });
+    // Appending columns is safe without a dependent stored SELECT *.
+    try run("DROP VIEW replace_child");
+    try run("CREATE OR REPLACE VIEW replace_me AS SELECT id,v,v+1 AS extra FROM view_source");
+    try expect("SELECT id,v,extra FROM replace_me ORDER BY id", "1|7|8;2|-3|-2");
+    try sameState(&.{"SELECT id,v,extra FROM replace_me ORDER BY id"});
+    const reader = try db.begin();
+    const writer = try db.begin();
+    try statement(reader, "SELECT id,v,extra FROM replace_me");
+    const replacement = "CREATE OR REPLACE VIEW replace_me AS SELECT id,v+100 AS v,v+1 AS extra FROM view_source";
+    try parks(writer, replacement);
+    db.abort(reader);
+    _ = try resumed(writer, replacement);
+    try commit(writer);
+    try sameState(&.{"SELECT id,v,extra FROM replace_me ORDER BY id", "SELECT pg_get_userbyid(relowner) FROM pg_class WHERE relname='replace_me'"});
+    try expect("SELECT id,v,extra FROM replace_me ORDER BY id", "1|107|8;2|97|-2");
+}
+
+fn longViewDefinitions() !void {
+    reset();
+    try run("CREATE TABLE long_source(id INT,v INT)");
+    try run("INSERT INTO long_source VALUES (1,7),(2,-3)");
+    // This actual SELECT exceeds a default 128-byte data cell, without
+    // relying on removable comments or padding. Its metadata must own it.
+    try run("CREATE VIEW long_definition AS SELECT id,v FROM public.long_source WHERE long_source.id=1 OR long_source.id=2 OR long_source.id=3 OR long_source.id=4 OR long_source.id=5 OR long_source.id=6 OR long_source.id=7 OR long_source.id=8");
+    try expect("SELECT id,v FROM long_definition ORDER BY id", "1|7;2|-3");
+    try expect("SELECT length(pg_get_viewdef('long_definition'::regclass))>128", "t");
+    try expect("SELECT length(definition)>128 FROM pg_views WHERE viewname='long_definition'", "t");
+    var held: DB.Result = .{};
+    var held_values: [4096]u8 = undefined;
+    held.bindValueMemory(&held_values);
+    try db.execute("SELECT definition FROM pg_views WHERE viewname='long_definition'", &held);
+    try run("CREATE OR REPLACE VIEW long_definition AS SELECT id,v+1 AS v FROM public.long_source WHERE long_source.id=1 OR long_source.id=2 OR long_source.id=3 OR long_source.id=4 OR long_source.id=5 OR long_source.id=6 OR long_source.id=7 OR long_source.id=8");
+    try expect("SELECT id,v FROM long_definition ORDER BY id", "1|8;2|-2");
+    try run("CREATE MATERIALIZED VIEW long_materialized AS SELECT id,v*3 AS v FROM public.long_source WHERE long_source.id=1 OR long_source.id=2 OR long_source.id=3 OR long_source.id=4 OR long_source.id=5 OR long_source.id=6 OR long_source.id=7 OR long_source.id=8");
+    try expect("SELECT id,v FROM long_materialized ORDER BY id", "1|21;2|-9");
+    try expect("SELECT length(definition)>128 FROM pg_matviews WHERE matviewname='long_materialized'", "t");
+    try check(std.mem.startsWith(u8, held.rows[0].cells[0].text.slice(), "SELECT id,v FROM"));
+    var count: DB.Result = .{};
+    try db.execute("SELECT count(*) FROM pg_views", &count);
+    try check(count.rows[0].cells[0].integer == 1);
+    try sameState(&.{
+        "SELECT id,v FROM long_definition ORDER BY id",
+        "SELECT pg_get_viewdef('long_definition'::regclass)",
+        "SELECT pg_get_ruledef(oid) FROM pg_rewrite WHERE ev_class='long_definition'::regclass",
+        "SELECT id,v FROM long_materialized ORDER BY id",
+    });
+}
+
+fn viewReplacementWithHooks() !void {
+    reset();
+    try run("CREATE TABLE hook_source(id INT PRIMARY KEY,v INT)");
+    try run("INSERT INTO hook_source VALUES (1,5)");
+    try run("CREATE VIEW hook_view AS SELECT id,v FROM hook_source");
+    try run("CREATE FUNCTION view_hook() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN UPDATE hook_source SET v=NEW.v WHERE id=OLD.id; RETURN NEW; END$$");
+    try run("CREATE TRIGGER replacement_hook INSTEAD OF UPDATE ON hook_view FOR EACH ROW EXECUTE FUNCTION view_hook()");
+    const trigger_definition = "SELECT pg_get_triggerdef(oid) FROM pg_trigger WHERE tgname='replacement_hook'";
+    const pretty_trigger = "SELECT pg_get_triggerdef(oid,true) FROM pg_trigger WHERE tgname='replacement_hook'";
+    try expect("SELECT tgtype FROM pg_trigger WHERE tgname='replacement_hook'", "81");
+    try expect(trigger_definition, "CREATE TRIGGER replacement_hook INSTEAD OF UPDATE ON public.hook_view FOR EACH ROW EXECUTE FUNCTION view_hook()");
+    try expect(pretty_trigger, "CREATE TRIGGER replacement_hook INSTEAD OF UPDATE ON hook_view FOR EACH ROW EXECUTE FUNCTION view_hook()");
+    try run("CREATE OR REPLACE VIEW hook_view AS SELECT id,v+10 AS v FROM hook_source");
+    try completes("UPDATE hook_view SET v=99 WHERE id=1", .update, 1);
+    try expect("SELECT v FROM hook_source", "99");
+    try expect("SELECT v FROM hook_view", "109");
+    try run("CREATE RULE keep_hook_rows AS ON DELETE TO hook_view DO INSTEAD NOTHING");
+    try run("CREATE OR REPLACE VIEW hook_view AS SELECT id,v*2 AS v FROM hook_source");
+    try completes("DELETE FROM hook_view", .delete, 0);
+    try expect("SELECT v FROM hook_source", "99");
+    try expect("SELECT v FROM hook_view", "198");
+    try expect(trigger_definition, "CREATE TRIGGER replacement_hook INSTEAD OF UPDATE ON public.hook_view FOR EACH ROW EXECUTE FUNCTION view_hook()");
+    try sameState(&.{
+        "SELECT v FROM hook_source",
+        "SELECT v FROM hook_view",
+        "SELECT tgname FROM pg_trigger WHERE tgrelid='hook_view'::regclass",
+        trigger_definition,
+        pretty_trigger,
+        "SELECT rulename FROM pg_rewrite WHERE ev_class='hook_view'::regclass ORDER BY rulename",
+    });
+}
+
 fn viewReturnRuleDiscovery() !void {
     reset();
     try run("CREATE SCHEMA \"Rule Space\"");
@@ -1547,6 +1697,9 @@ pub fn main() !void {
     try routineDefaultCapacity();
     try routineDefaultWalValidation();
     try routineOwnership();
+    try viewReplacement();
+    try viewReplacementWithHooks();
+    try longViewDefinitions();
     try viewReturnRuleDiscovery();
     try ruleAndTriggerDiscovery();
     try bodyValidationSetting();

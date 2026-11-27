@@ -625,7 +625,15 @@ pub fn Parser(comptime config: types.Config) type {
         /// TEMP TABLE; null for the other CREATE forms (nothing consumed
         /// except a TEMP/TEMPORARY/UNLOGGED prefix, recorded for TABLE).
         fn schemaObject(self: *Self) Error!?Ast.Statement {
-            if (self.isWord("OR") and wordIs(self.source, try self.peek(), "replace")) return error.UnsupportedStatement;
+            if (try self.takeWord("OR")) {
+                if (!try self.takeRaw("replace")) return error.Syntax;
+                // Routine CREATE OR REPLACE is handled by catalog_objects.
+                // Do not accept OR REPLACE for unrelated schema objects.
+                if (!try self.takeRaw("view")) return error.UnsupportedStatement;
+                var view = try self.createView(false);
+                view.replace = true;
+                return .{ .create_view = view };
+            }
             if (try self.takeRaw("unique")) {
                 if (!try self.takeRaw("index")) return error.Syntax;
                 return .{ .create_index = try self.createIndex(true) };

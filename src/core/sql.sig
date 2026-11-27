@@ -1176,6 +1176,12 @@ pub fn Database(comptime config: Config) type {
             const catalog = &db.catalog;
             workspace.expanded_count = 0;
             const pool = &workspace.nodes;
+            // Each appended query remembers the view and parent that introduced
+            // it. A repeated sibling is legal; a repeated ancestor is recursive
+            // expansion (42P17), not generic query-workspace exhaustion.
+            var view_origins: [config.subqueries]u32 = undefined;
+            var view_parents: [config.subqueries]u16 = undefined;
+            var tracked_queries: usize = 0;
             var length: usize = 0;
             // REFRESH MATERIALIZED VIEW reads the stored query the same way.
             if (bound_statement.* == .refresh_view) {
@@ -1255,13 +1261,32 @@ pub fn Database(comptime config: Config) type {
                         continue;
                     }
                     const view = &tables[found.slot];
+                    // Queries without views pay no ancestry initialization.
+                    for (tracked_queries..pool.query_len) |untracked| {
+                        view_origins[untracked] = 0;
+                        view_parents[untracked] = ast.none;
+                    }
+                    var ancestor: u16 = @intCast(block);
+                    while (ancestor != ast.none) {
+                        if (view_origins[ancestor] == view.oid) return error.InvalidObjectDefinition;
+                        ancestor = view_parents[ancestor];
+                    }
+                    const first = pool.query_len;
                     item.query = try appendQuery(workspace, &length, source, view.query.slice());
+                    for (first..pool.query_len) |introduced| {
+                        view_origins[introduced] = view.oid;
+                        view_parents[introduced] = @intCast(block);
+                    }
+                    tracked_queries = pool.query_len;
                     item.view = true;
                     item.view_table = @intCast(found.slot);
                     if (item.alias == null) item.alias = item.name;
                     q.from = null;
                     pool.complex = true;
-                    if (workspace.expanded_count < workspace.expanded.len) {
+                    var known = false;
+                    for (workspace.expanded[0..workspace.expanded_count]) |expanded| known = known or expanded == view.oid;
+                    if (!known) {
+                        if (workspace.expanded_count == workspace.expanded.len) return error.TableCapacity;
                         workspace.expanded[workspace.expanded_count] = view.oid;
                         workspace.expanded_count += 1;
                     }
@@ -3440,6 +3465,11 @@ pub fn Database(comptime config: Config) type {
             } else try self.checkPrivileges(&bound, snap);
             self.noteScans(&bound);
             try self.secureNewRows(&bound, source, snap);
+            // Expanded plans read base tables, but the view definition itself
+            // must also survive until this transaction ends. Otherwise a view
+            // replacement can publish while an earlier reader still uses it.
+            for (self.workspace.expanded[0..self.workspace.expanded_count]) |oid|
+                try self.lockTable(slot, self.visibleTableSlot(oid, snap) orelse return error.TableNotFound, .access_share);
             if (explain) |options| return self.runExplain(slot, source, &bound, snap, result, options);
             switch (bound) {
                 .control => return error.UnsupportedStatement,
@@ -3562,7 +3592,21 @@ pub fn Database(comptime config: Config) type {
                     break :blk 0;
                 },
                 .alter_table => |*alter| blk: {
-                    try self.alterTable(slot, alter, snap);
+                    var definition = alter.*;
+                    if (definition.command == .create_view) {
+                        for (self.workspace.expanded[0..self.workspace.expanded_count]) |dependency| {
+                            var known = false;
+                            for (definition.extras.depends[0..definition.extras.depend_count]) |existing| known = known or existing == dependency;
+                            if (known) continue;
+                            if (definition.extras.depend_count == config.tables) return error.TableCapacity;
+                            definition.extras.depends[definition.extras.depend_count] = dependency;
+                            definition.extras.depend_count += 1;
+                        }
+                        for (definition.extras.depends[0..definition.extras.depend_count]) |dependency| {
+                            try self.lockTable(slot, self.visibleTableSlot(dependency, snap) orelse return error.TableNotFound, .access_share);
+                        }
+                    }
+                    try self.alterTable(slot, &definition, snap);
                     break :blk 0;
                 },
                 .legacy_attribute_options => |options| blk: {
@@ -7826,6 +7870,12 @@ pub fn Database(comptime config: Config) type {
             return .{ .text = text };
         }
 
+        fn definitionCell(bytes: []const u8, sink: *X.RowSink) Error!V.Cell {
+            if (bytes.len <= config.text_bytes) return nameCell(bytes);
+            const values = sink.valueBytes() orelse return error.WorkspaceCapacity;
+            return .{ .text = V.Text.fromValueBytes(try values.copy(bytes)) };
+        }
+
         fn intCell(value: i64) V.Cell {
             return .{ .integer = value };
         }
@@ -8544,10 +8594,12 @@ pub fn Database(comptime config: Config) type {
                             }
                         },
                         .pg_views => if (table.relkind == 'v') {
-                            try sink.add(&.{ nameCell(schema_name), nameCell(name), nameCell("ramsql"), nameCell(table.query.slice()) });
+                            const definition = if (sink.referencesColumn(3)) try definitionCell(table.query.slice(), sink) else V.Cell.null_value;
+                            try sink.add(&.{ nameCell(schema_name), nameCell(name), nameCell("ramsql"), definition });
                         },
                         .pg_matviews => if (table.relkind == 'm') {
-                            try sink.add(&.{ nameCell(schema_name), nameCell(name), nameCell("ramsql"), .null_value, boolCell(table.index_count != 0), boolCell(table.populated), nameCell(table.query.slice()) });
+                            const definition = if (sink.referencesColumn(6)) try definitionCell(table.query.slice(), sink) else V.Cell.null_value;
+                            try sink.add(&.{ nameCell(schema_name), nameCell(name), nameCell("ramsql"), .null_value, boolCell(table.index_count != 0), boolCell(table.populated), definition });
                         },
                         .pg_inherits => if (table.parent != 0) {
                             try sink.add(&.{ intCell(oid), intCell(table.parent), intCell(1), boolCell(false) });
@@ -8888,7 +8940,7 @@ pub fn Database(comptime config: Config) type {
             }
             const root = try P.parseQueryAt(source, 0, source.len, pool);
             const blocks = pool.queries[query_len..pool.query_len];
-            var changes: std.StaticBitSet(config.text_bytes + 1) = .empty;
+            var changes: std.StaticBitSet(S.query_capacity + 1) = .empty;
             for (blocks) |*block| for (block.items[0..block.item_count]) |*item| {
                 if (item.schema != null or item.query != ast.none or item.function != ast.none or item.name.len == 0) continue;
                 const name = identName(source, item.name);
@@ -9022,7 +9074,7 @@ pub fn Database(comptime config: Config) type {
                 var text: CatalogTextWriter = .{ .out = out, .quote_all = self.session.quote_all_identifiers };
                 text.add("CREATE TRIGGER ");
                 text.ident(trigger.name.slice());
-                text.add(if (trigger.tgtype & tg.tg_before != 0) " BEFORE " else " AFTER ");
+                text.add(if (trigger.tgtype & tg.tg_before != 0) " BEFORE " else if (trigger.tgtype & tg.tg_instead != 0) " INSTEAD OF " else " AFTER ");
                 var preceding_event = false;
                 inline for (.{ .{ tg.tg_insert, "INSERT" }, .{ tg.tg_delete, "DELETE" }, .{ tg.tg_update, "UPDATE" }, .{ tg.tg_truncate, "TRUNCATE" } }) |event| {
                     if (trigger.tgtype & event[0] != 0) {

@@ -1,0 +1,33 @@
+\set ON_ERROR_STOP on
+BEGIN;
+CREATE SCHEMA view_replace_oracle;
+SET LOCAL search_path=view_replace_oracle,pg_catalog;
+CREATE TABLE source(id int,v int);
+INSERT INTO source VALUES (1,7),(2,-3);
+CREATE OR REPLACE VIEW v AS SELECT id,v FROM source;
+CREATE TEMP TABLE saved_oid AS SELECT 'v'::regclass::oid AS oid;
+CREATE VIEW child AS SELECT id,v FROM v;
+CREATE OR REPLACE VIEW v AS SELECT id,v*2 AS v FROM source WHERE v>0;
+DO $$BEGIN
+ IF (SELECT array_agg(v) FROM child) != ARRAY[14] THEN RAISE EXCEPTION 'replacement body'; END IF;
+ IF (SELECT oid FROM saved_oid) != 'v'::regclass::oid THEN RAISE EXCEPTION 'OID changed'; END IF;
+ BEGIN EXECUTE 'CREATE OR REPLACE VIEW v AS SELECT id FROM source'; RAISE EXCEPTION 'drop accepted'; EXCEPTION WHEN invalid_table_definition THEN NULL; END;
+ BEGIN EXECUTE 'CREATE OR REPLACE VIEW v AS SELECT id,v AS renamed FROM source'; RAISE EXCEPTION 'rename accepted'; EXCEPTION WHEN invalid_table_definition THEN NULL; END;
+ BEGIN EXECUTE 'CREATE OR REPLACE VIEW v AS SELECT id,v::bigint AS v FROM source'; RAISE EXCEPTION 'type accepted'; EXCEPTION WHEN invalid_table_definition THEN NULL; END;
+ BEGIN EXECUTE 'CREATE OR REPLACE VIEW source AS SELECT 1 AS id'; RAISE EXCEPTION 'wrong type accepted'; EXCEPTION WHEN wrong_object_type THEN NULL; END;
+END$$;
+CREATE OR REPLACE VIEW v AS SELECT id,v FROM v;
+DO $$BEGIN BEGIN PERFORM * FROM v; RAISE EXCEPTION 'self query accepted'; EXCEPTION WHEN invalid_object_definition THEN NULL; END; END$$;
+CREATE OR REPLACE VIEW v AS SELECT id,v*2 AS v FROM source WHERE v>0;
+CREATE OR REPLACE VIEW v AS SELECT id,v FROM child;
+DO $$BEGIN BEGIN PERFORM * FROM child; RAISE EXCEPTION 'cycle query accepted'; EXCEPTION WHEN invalid_object_definition THEN NULL; END; END$$;
+CREATE OR REPLACE VIEW v AS SELECT id,v*2 AS v FROM source WHERE v>0;
+SAVEPOINT replacement;
+CREATE OR REPLACE VIEW v AS SELECT id,v+1 AS v FROM source;
+SELECT json_build_object('during_rollback_probe',array_agg(v ORDER BY id)) FROM child;
+ROLLBACK TO replacement;
+DO $$BEGIN IF (SELECT array_agg(v) FROM child) != ARRAY[14] THEN RAISE EXCEPTION 'rollback failed'; END IF; END$$;
+DROP VIEW child;
+CREATE OR REPLACE VIEW v AS SELECT id,v,v+1 AS extra FROM source;
+SELECT json_build_object('oracle',version(),'oid_retained',(SELECT oid FROM saved_oid)='v'::regclass::oid,'rows',json_agg(t ORDER BY id),'sqlstates_verified',ARRAY['42P16','42809','42P17']) FROM v t;
+ROLLBACK;
