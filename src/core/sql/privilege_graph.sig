@@ -1,4 +1,4 @@
-//! Per-object grants, rooted at the owner. Storage is owned by the caller.
+//! Owner-rooted privilege graphs. All storage is owned by the caller.
 pub const Edge = struct {
     grantor: u32,
     grantee: u32,

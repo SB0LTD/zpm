@@ -93,6 +93,19 @@ parser and the PL/pgSQL interpreter); the Database executes them in
 
 ## Catalogs
 
+User-defined functions/procedures support EXECUTE grants with grant options,
+owner-rooted delegation, RESTRICT/CASCADE, PUBLIC, inherited roles, function and
+grantee lists, and GRANTED BY naming the current SQL user. ON ROUTINE accepts
+mixed function/procedure targets. CREATE accepts unqualified or public-qualified
+names. Other namespaces, ALL ROUTINES IN SCHEMA and routine default ACLs remain
+open. CREATE/DROP and privilege changes return 25006 in read-only transactions;
+read-only CALL/DO remain available.
+
+`pg_proc.proacl` is a typed ACL array rendered in grant-dependency order, using
+caller-owned value storage for ACLs larger than an inline cell. Every edge retains
+its grantor, grantee and grant option. The shared `privilege_graph.sig` supplies
+support propagation, cycle checks and topological rendering without allocation.
+
 `pg_proc` (oid, proname, pronamespace, prokind, prolang as the language
 name, provolatile, proisstrict, pronargs, prorettype, proargtypes as text,
 prosrc), `pg_trigger` (oid, tgrelid, tgname, tgfoid, tgtype with
@@ -119,6 +132,12 @@ version bump). Replay validates every op against an overlay (names, OIDs,
 referenced tables and functions, capacities; InvalidChangeRecord for bad
 bytes, ChangeRecordConflict for conflicts) before applying anything.
 
+The optional routine ACL payload retains the old flags/count/grantee encoding
+for owner-issued ordinary grants. Flag 0x80 selects extended entries (grantee
+u32, grantor u32, option u8); flag 0x04 retains an explicit owner grant option.
+Older records remain readable. Replay rejects disconnected grant chains and
+invalid roles/options before changing the live catalog.
+
 ## Limits (Config, each with a default)
 
 | Constant | Default | Beyond |
@@ -130,6 +149,7 @@ bytes, ChangeRecordConflict for conflicts) before applying anything.
 | `routine_bytes` | 1024 (body, WHEN, rule qualification) | 54000 (TextCapacity) |
 | `routine_depth` | 16 | 54001 (StackDepthExceeded) |
 | `routine_variables` | 24 | 54000 (ColumnCapacity) |
+| `routine_acl_entries` | 16 grantor/grantee pairs, plus owner/PUBLIC markers | 54000 (ProgramLimitExceeded) |
 
 A replaced or dropped version keeps its slot until the reclamation horizon
 passes it, so OR REPLACE needs a free slot.

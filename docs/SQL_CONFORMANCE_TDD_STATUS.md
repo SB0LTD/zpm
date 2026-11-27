@@ -1,5 +1,40 @@
 # SQL conformance TDD checkpoint
 
+## SQL routine EXECUTE delegation — 27 November 2026
+
+User-defined SQL/PLpgSQL functions and procedures use the shared, caller-owned
+privilege graph for EXECUTE grants. Tests cover grant options, dependent
+RESTRICT/CASCADE revocation, circular-grant rejection, independent grant paths,
+PUBLIC grants issued by a delegate, and mixed FUNCTION/PROCEDURE targets through
+ON ROUTINE. Function and grantee lists and GRANTED BY retain the existing rules.
+CREATE FUNCTION/PROCEDURE accepts explicit `public` qualification, as emitted
+by stock archives. Other routine namespaces remain unsupported.
+
+Each routine version stores its grantor/grantee edges and options. WAL reads
+old owner-issued ACL records unchanged; records needing delegation use a flagged
+extension. Replay validates roles, duplicate pairs, option bits and the complete
+owner-rooted support graph before publication. Unsupported grantors and malformed
+options fail without advancing the replay CSN. Exhausting the configured ACL
+budget returns 54000 and rolls back the complete list statement. ACL rendering
+uses caller-owned value storage instead of requiring one inline text cell.
+
+A failing regression also exposed routine CREATE/DROP/GRANT/REVOKE in read-only
+transactions. These now return 25006. Read-only CALL/DO and scalar function reads
+continue to work; statements inside routines still enforce their own write rules.
+The routine contract passes 858 assertions with 205 committed records replayed
+in native Windows Debug. ZPM CI runs routine and catalog-security contracts in
+Debug and ReleaseSafe, alongside the hard 4 MiB wide-cell contract.
+
+RAMSQL's stock PG16/18 fixture now exercises SQL functions and procedures with
+delegated ACLs, actual execution by each role, rollback, forced-process recovery,
+and plain/custom archives in both directions. **Candidate: CI qualification is
+pending; this section does not claim merge or release qualification.** General
+built-in function ACLs, ALL FUNCTIONS/PROCEDURES IN SCHEMA, routine default ACLs,
+other routine namespaces and the wider routine-language inventory remain open.
+
+[PostgreSQL 18 GRANT](https://www.postgresql.org/docs/18/sql-grant.html) ·
+[PostgreSQL 18 read-only transactions](https://www.postgresql.org/docs/18/sql-set-transaction.html)
+
 ## PostgreSQL server-side large-object files
 
 `lo_import(text)`, `lo_import(text, oid)`, and `lo_export(oid, text)`
@@ -45,8 +80,8 @@ the contract parks, resumes and rolls back a list waiting on its last target.
 Lists use the existing eight-entry catalog statement budget per list;
 exceeding it returns 54000 without publishing any change. SQL bytes,
 catalog versions and transaction write budgets also apply. Lists and
-GRANTED BY work for existing SQL functions/procedures under their current
-owner-issued ACL model. Their grant-option delegation and generalized
+GRANTED BY work for SQL functions/procedures. The subsequent routine-delegation
+checkpoint above extends their former owner-issued ACL model. Generalized
 built-in function ACLs remain open.
 
 Compact checkpoint RSBASE08 carries these grants and accepts older

@@ -74,6 +74,7 @@ pub fn Routines(comptime config: types.Config) type {
 
         pub const DropRoutine = struct {
             procedure: bool = false,
+            any_kind: bool = false,
             if_exists: bool = false,
             cascade: bool = false,
             name: Name = .{},
@@ -277,7 +278,7 @@ pub fn Routines(comptime config: types.Config) type {
                 if (cursor.is("privileges")) cursor.advance() catch return null;
                 if (!cursor.is("on")) return null;
                 cursor.advance() catch return null;
-                if (!cursor.is("function") and !cursor.is("procedure")) return null;
+                if (!cursor.is("function") and !cursor.is("procedure") and !cursor.is("routine")) return null;
                 return if (grant) .grant_execute else .revoke_execute;
             }
             if (cursor.is("do")) {
@@ -352,8 +353,10 @@ pub fn Routines(comptime config: types.Config) type {
             out.procedure = try cursor.take("procedure");
             if (!out.procedure) try cursor.expect("function");
             out.name = try cursor.identifier();
-            // Schema-qualified routine names are outside the subset.
-            if (cursor.symbol(.dot)) return error.UnsupportedStatement;
+            if (try cursor.takeSymbol(.dot)) {
+                if (!types.same(out.name.slice(), "public")) return error.UnsupportedStatement;
+                out.name = try cursor.identifier();
+            }
             try cursor.expectSymbol(.lparen);
             if (!try cursor.takeSymbol(.rparen)) while (true) {
                 if (out.arg_count == config.routine_args) return error.ColumnCapacity;
@@ -490,12 +493,14 @@ pub fn Routines(comptime config: types.Config) type {
             }
             if (try cursor.take("all")) _ = try cursor.take("privileges") else try cursor.expect("execute");
             try cursor.expect("on");
-            const procedure = try cursor.take("procedure");
-            if (!procedure) try cursor.expect("function");
+            const any_kind = try cursor.take("routine");
+            const procedure = !any_kind and try cursor.take("procedure");
+            if (!procedure and !any_kind) try cursor.expect("function");
             while (true) {
                 if (out.target_count == out.targets.len) return error.ProgramLimitExceeded;
                 const target = &out.targets[out.target_count];
                 target.routine.procedure = procedure;
+                target.routine.any_kind = any_kind;
                 target.routine.name = try cursor.identifier();
                 if (try cursor.takeSymbol(.dot)) {
                     target.schema = target.routine.name;

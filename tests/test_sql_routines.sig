@@ -992,9 +992,144 @@ fn executeLists() !void {
     try sameState(&.{probe});
 }
 
+fn routineDelegation() !void {
+    reset();
+    try run("CREATE ROLE fn_a");
+    try run("CREATE ROLE fn_b");
+    try run("CREATE ROLE fn_c");
+    try run("CREATE FUNCTION exec_fn(x INT) RETURNS INT LANGUAGE SQL AS 'SELECT x+7'");
+    try run("CREATE PROCEDURE exec_proc() LANGUAGE SQL AS 'SELECT 1'");
+    try run("REVOKE EXECUTE ON FUNCTION exec_fn(INT) FROM PUBLIC");
+    try run("REVOKE EXECUTE ON PROCEDURE exec_proc() FROM PUBLIC");
+    try run("GRANT EXECUTE ON ROUTINE exec_fn(INT),exec_proc() TO fn_a WITH GRANT OPTION");
+    try run("SET ROLE fn_a");
+    try run("GRANT EXECUTE ON FUNCTION exec_fn(INT) TO fn_b WITH GRANT OPTION GRANTED BY CURRENT_USER");
+    try run("GRANT EXECUTE ON PROCEDURE exec_proc() TO fn_b GRANTED BY CURRENT_ROLE");
+    try run("RESET ROLE");
+    try run("SET ROLE fn_b");
+    try expect("SELECT exec_fn(1)", "8");
+    try run("CALL exec_proc()");
+    try run("GRANT EXECUTE ON FUNCTION exec_fn(INT) TO fn_c");
+    try run("RESET ROLE");
+    const probe = "SELECT proacl::text FROM pg_proc WHERE proname='exec_fn'";
+    const chain = "{ramsql=X/ramsql,fn_a=X*/ramsql,fn_b=X*/fn_a,fn_c=X/fn_b}";
+    try expect(probe, chain);
+    try rejects("REVOKE GRANT OPTION FOR EXECUTE ON FUNCTION exec_fn(INT) FROM fn_a RESTRICT", error.DependentObjects, probe, chain);
+    try run("SET ROLE fn_b");
+    try rejects("GRANT EXECUTE ON FUNCTION exec_fn(INT) TO fn_a WITH GRANT OPTION", error.InvalidGrantOperation, probe, chain);
+    try run("RESET ROLE");
+    try run("GRANT EXECUTE ON FUNCTION exec_fn(INT) TO fn_c");
+    try run("REVOKE GRANT OPTION FOR EXECUTE ON FUNCTION exec_fn(INT) FROM fn_a CASCADE");
+    const revoked = "{ramsql=X/ramsql,fn_a=X/ramsql,fn_c=X/ramsql}";
+    try expect(probe, revoked);
+    try run("SET ROLE fn_c");
+    try expect("SELECT exec_fn(3)", "10");
+    try run("RESET ROLE");
+    try run("SET ROLE fn_b");
+    try rejects("SELECT exec_fn(1)", error.InsufficientPrivilege, probe, revoked);
+    try run("RESET ROLE");
+    try sameState(&.{probe});
+}
+
+fn routineGrantWalValidation() !void {
+    reset();
+    try run("CREATE ROLE wal_a");
+    try run("CREATE ROLE wal_b");
+    try run("CREATE FUNCTION wal_fn() RETURNS INT LANGUAGE SQL AS 'SELECT 1'");
+    try run("REVOKE EXECUTE ON FUNCTION wal_fn() FROM PUBLIC");
+    var result: DB.Result = .{};
+    try db.execute("SELECT oid FROM pg_roles WHERE rolname='wal_a'", &result);
+    const recipient: u32 = @intCast(result.rows[0].cells[0].integer);
+    try db.execute("SELECT oid FROM pg_roles WHERE rolname='wal_b'", &result);
+    const unsupported_grantor: u32 = @intCast(result.rows[0].cells[0].integer);
+    var used: usize = 0;
+    try db.executeChanges("GRANT EXECUTE ON FUNCTION wal_fn() TO wal_a WITH GRANT OPTION", &result, &record, &used, null, null);
+    var entry: [9]u8 = undefined;
+    std.mem.writeInt(u32, entry[0..4], recipient, .little);
+    std.mem.writeInt(u32, entry[4..8], 10, .little);
+    entry[8] = 1;
+    try check(std.mem.count(u8, record[0..used], &entry) == 1);
+    const at = std.mem.indexOf(u8, record[0..used], &entry).?;
+    var bad: [65536]u8 = undefined;
+    const before = replica.csn;
+    @memcpy(bad[0..used], record[0..used]);
+    std.mem.writeInt(u32, bad[at + 4 ..][0..4], unsupported_grantor, .little);
+    if (replica.applyChangeRecord(bad[0..used], &scratch)) |_| return error.UnsupportedRoutineGrantAccepted else |err| try check(err == error.ChangeRecordConflict);
+    try check(replica.csn == before);
+    @memcpy(bad[0..used], record[0..used]);
+    bad[at + 8] = 2;
+    if (replica.applyChangeRecord(bad[0..used], &scratch)) |_| return error.InvalidRoutineOptionAccepted else |err| try check(err == error.InvalidChangeRecord);
+    try check(replica.csn == before);
+    try replica.applyChangeRecord(record[0..used], &scratch);
+    records_applied += 1;
+    try sameState(&.{"SELECT proacl::text FROM pg_proc WHERE proname='wal_fn'"});
+}
+
+fn routineGrantCapacity() !void {
+    var acl_limited: Small = .{};
+    var result: Small.Result = .{};
+    try acl_limited.execute("CREATE FUNCTION acl_fn() RETURNS INT LANGUAGE SQL AS 'SELECT 1'", &result);
+    try acl_limited.execute("REVOKE EXECUTE ON FUNCTION acl_fn() FROM PUBLIC", &result);
+    var text: [160]u8 = undefined;
+    for (0..17) |index| {
+        const create = try std.fmt.bufPrint(&text, "CREATE ROLE acl_{d}", .{index});
+        try acl_limited.execute(create, &result);
+        if (index < 15) {
+            const grant = try std.fmt.bufPrint(&text, "GRANT EXECUTE ON FUNCTION acl_fn() TO acl_{d}", .{index});
+            try acl_limited.execute(grant, &result);
+        }
+    }
+    if (acl_limited.execute("GRANT EXECUTE ON FUNCTION acl_fn() TO acl_15,acl_16", &result)) |_| return error.RoutineAclCapacityIgnored else |err| try check(err == error.ProgramLimitExceeded);
+    for ([_][]const u8{ "acl_15", "acl_16" }) |role| {
+        try acl_limited.execute(try std.fmt.bufPrint(&text, "SET ROLE {s}", .{role}), &result);
+        if (acl_limited.execute("SELECT acl_fn()", &result)) |_| return error.PartialRoutineAclPublished else |err| try check(err == error.InsufficientPrivilege);
+        try acl_limited.execute("RESET ROLE", &result);
+    }
+    try acl_limited.execute("SET ROLE acl_0", &result);
+    try acl_limited.execute("SELECT acl_fn()", &result);
+    try check(result.rows[0].cells[0].integer == 1);
+}
+
+fn routineReadOnly() !void {
+    reset();
+    try run("CREATE ROLE read_guest");
+    try run("CREATE TABLE read_table(id INT)");
+    try run("CREATE FUNCTION read_fn() RETURNS INT LANGUAGE SQL AS 'SELECT 1'");
+    try run("CREATE PROCEDURE read_proc() LANGUAGE SQL AS 'SELECT 1'");
+    const before = db.csn;
+    for ([_][]const u8{
+        "CREATE FUNCTION read_new() RETURNS INT LANGUAGE SQL AS 'SELECT 1'",
+        "CREATE OR REPLACE FUNCTION read_fn() RETURNS INT LANGUAGE SQL AS 'SELECT 2'",
+        "DROP FUNCTION read_fn()",
+        "CREATE PROCEDURE read_new() LANGUAGE SQL AS 'SELECT 1'",
+        "DROP PROCEDURE read_proc()",
+        "GRANT EXECUTE ON ROUTINE read_fn(),read_proc() TO read_guest",
+        "REVOKE EXECUTE ON ROUTINE read_fn(),read_proc() FROM PUBLIC",
+        "CREATE RULE read_rule AS ON INSERT TO read_table DO INSTEAD NOTHING",
+    }) |source| {
+        const slot = try db.begin();
+        try db.beginModes(slot, .{ .read_only = true });
+        try statementFails(slot, source, error.ReadOnlyTransaction);
+        db.abort(slot);
+        try check(db.csn == before);
+    }
+    const reader = try db.begin();
+    try db.beginModes(reader, .{ .read_only = true });
+    try same(try rows(reader, "SELECT read_fn()"), "1");
+    try statement(reader, "CALL read_proc()");
+    try statement(reader, "DO $$BEGIN PERFORM 1; END$$");
+    try commit(reader);
+    try check(db.csn == before);
+    try sameState(&.{"SELECT proacl::text FROM pg_proc WHERE proname='read_fn'", "SELECT read_fn()"});
+}
+
 pub fn main() !void {
     try routineDiscovery();
     try executeLists();
+    try routineDelegation();
+    try routineGrantWalValidation();
+    try routineGrantCapacity();
+    try routineReadOnly();
     try bodyValidationSetting();
     try oraclePrograms();
     try sqlFunctions();
