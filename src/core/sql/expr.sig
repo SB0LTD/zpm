@@ -346,14 +346,22 @@ pub fn Eval(comptime config: types.Config) type {
             const hook = ctx.session.routines orelse return error.UnsupportedStatement;
             var args: [config.routine_args]V.Cell = undefined;
             var count: usize = 0;
+            // Inputs taking their DEFAULT (B11 wave 4), evaluated by the hook.
+            var defaulted: u64 = 0;
             var item = n.b;
             while (item != none) : (item = node(ctx, item).next) {
-                if (count == args.len) return error.ColumnCapacity;
-                args[count] = try eval(ctx, item);
+                if (count == args.len or count == 64) return error.ColumnCapacity;
+                if (node(ctx, item).kind == .default_value) {
+                    defaulted |= @as(u64, 1) << @intCast(count);
+                    args[count] = .null_value;
+                } else args[count] = try eval(ctx, item);
                 count += 1;
             }
             var out: V.Cell = .null_value;
-            try hook.call(hook.ptr, @intCast(n.integer), &args, count, &out);
+            if (defaulted != 0) {
+                const call = hook.call_defaults orelse return error.UnsupportedStatement;
+                try call(hook.ptr, @intCast(n.integer), &args, count, defaulted, &out);
+            } else try hook.call(hook.ptr, @intCast(n.integer), &args, count, &out);
             return out;
         }
 
@@ -1705,6 +1713,8 @@ pub fn Eval(comptime config: types.Config) type {
                 .values_row, .default_value => return error.Syntax,
                 .row_constructor => return error.UnsupportedStatement,
                 .row_compare, .row_in => return boolCell(try truth(ctx, id)),
+                // Unwrapped by binding (only user routine calls accept one).
+                .named_argument => return error.UnsupportedStatement,
                 .and_op, .or_op, .not_op, .test_op, .between, .in_list, .like => return boolCell(try truth(ctx, id)),
                 .unary => {
                     const value = try eval(ctx, n.a);

@@ -366,6 +366,10 @@ pub const NodeKind = enum {
     /// Bound flat IN candidates: row_compare nodes in `b` -> next.
     /// Each owns a separate left expression, as PostgreSQL's OR expansion does.
     row_in,
+    /// A function-call argument in named notation (`name => a`, `name :=
+    /// a`) or marked VARIADIC (`integer` 1; `name` empty when positional).
+    /// Only user routine calls accept it; binding unwraps it (B11 wave 4).
+    named_argument,
 };
 
 /// Children by kind: unary/not/test/cast `a`; binary/and/or/nullif `a`,`b`;

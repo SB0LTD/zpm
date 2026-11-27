@@ -1952,6 +1952,12 @@ pub fn Database(comptime config: Config) type {
         /// (routinePath; B11 wave 4).
         routine_path_items: [routine_path_capacity]u32 = @splat(0),
         routine_path_len: usize = 0,
+        /// The output row of the CALL being run (its cells at the start
+        /// of the query workspace).
+        call_returned: Returned = .{},
+        /// current_user inside a running SECURITY DEFINER routine (its
+        /// owner); installRole keeps it (B11 wave 4).
+        routine_definer: ?u32 = null,
         /// Write-set index where the running statement's writes begin (its
         /// AFTER ROW triggers read them); kept across a park.
         statement_start: usize = 0,
@@ -10528,7 +10534,7 @@ pub fn Database(comptime config: Config) type {
             self.workspace.query.views = .{ .ptr = self, .rows = &viewRows, .sequence_rows = &sequenceRows };
             self.session_hook = .{ .ptr = self, .call = &sessionCall };
             self.session.engine = &self.session_hook;
-            self.routine_hook = .{ .ptr = self, .call = &routineHookCall };
+            self.routine_hook = .{ .ptr = self, .call = &routineHookCall, .call_defaults = &routineHookDefaults };
             self.session.routines = &self.routine_hook;
             self.session.routine_frame = null;
             self.routine_slot = slot;
@@ -10537,6 +10543,7 @@ pub fn Database(comptime config: Config) type {
             self.routine_depth = 0;
             self.routine_nested = 0;
             self.routine_diag.active = false;
+            self.routine_definer = null;
             self.installRole();
         }
 
@@ -11610,7 +11617,7 @@ pub fn Database(comptime config: Config) type {
         fn installRole(self: *Self) void {
             const state = self.session_state orelse &self.default_session_state;
             self.session.session_role = state.sessionUser();
-            self.session.role = effectiveRole(state);
+            self.session.role = self.routine_definer orelse effectiveRole(state);
             self.session.public_schema_on_path = state.values.publicSchemaOnPath();
             self.session.row_security = state.values.row_security;
             self.session.synchronize_seqscans = self.dialect == .postgres and state.values.synchronize_seqscans;
@@ -12554,7 +12561,7 @@ pub fn Database(comptime config: Config) type {
             defer self.routine_result = saved_result;
             self.routine_result = result;
             switch (statement_value) {
-                .create_function, .create_procedure => |*definition| try self.createRoutine(slot, definition, snap),
+                .create_function, .create_procedure => |*definition| try self.createRoutine(slot, source, definition, snap),
                 .drop_function, .drop_procedure => |*drop| try self.dropRoutine(slot, drop, snap),
                 .alter_function, .alter_procedure => |*change| try self.alterRoutineOwner(slot, source, change, snap),
                 .grant_execute, .revoke_execute => |*grant| try self.grantRoutine(slot, source, grant, kind == .grant_execute, snap),
@@ -12566,6 +12573,11 @@ pub fn Database(comptime config: Config) type {
                 .drop_rule => |*drop| try self.dropRule(slot, drop, snap),
             }
             self.outcome = .{ .affected = 0, .command = R.command(kind), .noop = kind == .call or kind == .do_block };
+            // A top-level CALL's output row (B11 wave 4).
+            if (kind == .call and self.call_returned.count != 0 and self.routine_frame == null) {
+                self.outcome.returning = self.call_returned;
+            }
+            self.call_returned.count = 0;
         }
 
         /// CALL and DO. A statement inside that must wait for a lock undoes
@@ -12734,63 +12746,239 @@ pub fn Database(comptime config: Config) type {
 
         /// CREATE [OR REPLACE] FUNCTION / PROCEDURE: validates the signature
         /// and optionally analyzes the quoted body before writing its version.
-        fn createRoutine(self: *Self, slot: u16, definition: *const R.CreateRoutine, snap: Snapshot) Error!void {
+        fn createRoutine(self: *Self, slot: u16, source: []const u8, definition: *const R.CreateRoutine, snap: Snapshot) Error!void {
             const namespace = try self.routineCreateNamespace(definition.has_schema, definition.schema, snap);
-            var oid_buffer: [config.routine_args]u32 = undefined;
-            const args = definition.argOids(&oid_buffer);
+            var built: RC.Routine = .{};
+            try routineFromDefinition(source, definition, &built);
+            const args = built.args();
             const name = definition.name.slice();
             if (self.objects.routineWriter(namespace, name, args, snap)) |other| return self.waitObject(slot, other);
             const existing = self.objects.findRoutine(namespace, name, args, snap);
-            const kind: u8 = if (definition.procedure) 'p' else 'f';
+            const kind = built.kind;
             if (existing) |index| {
                 if (!definition.replace) return error.DuplicateFunction;
                 const old = &self.objects.routines[index];
                 if (!self.ownsRoutine(old, snap)) return error.InsufficientPrivilege;
                 if (old.kind != kind) return error.WrongObjectType;
-                if (old.return_oid != definition.return_oid or old.return_typmod != definition.return_typmod) return error.InvalidFunctionDefinition;
-                for (0..old.arg_count) |position| {
-                    if (!types.same(old.arg_names[position].slice(), definition.args[position].name.slice())) return error.InvalidFunctionDefinition;
+                // PostgreSQL: the result type (OUT parameters included),
+                // input names and existing defaults stay (42P13).
+                if (old.return_oid != built.return_oid or old.return_typmod != built.return_typmod or old.retset != built.retset or old.out_count != built.out_count) return error.InvalidFunctionDefinition;
+                for (0..old.out_count) |position| {
+                    if (old.out_oids[position] != built.out_oids[position] or !types.same(old.out_names[position].slice(), built.out_names[position].slice())) return error.InvalidFunctionDefinition;
                 }
+                for (0..old.arg_count) |position| {
+                    if (!types.same(old.arg_names[position].slice(), built.arg_names[position].slice())) return error.InvalidFunctionDefinition;
+                }
+                if (built.default_count < old.default_count) return error.InvalidFunctionDefinition;
             }
             const owner = if (existing) |old| self.objects.routines[old].owner else self.session.role;
             try self.checkLargeAclRole(slot, owner, snap);
             var latest = snap;
             latest.csn = self.csn;
             if (self.catalog_objects.roleName(owner, latest) == null) return error.SerializationFailure;
-            if (definition.return_oid == tg.trigger_oid and (definition.language == 0 or definition.arg_count != 0)) return error.InvalidFunctionDefinition;
-            if (self.sessionState().values.check_function_bodies) try self.validateRoutine(definition, snap);
+            if (built.return_oid == tg.trigger_oid and (built.language == 0 or built.arg_count != 0 or built.out_count != 0)) return error.InvalidFunctionDefinition;
+            try self.validateDefaults(&built);
+            try self.validateSettings(&built);
+            if (self.sessionState().values.check_function_bodies) try self.validateRoutine(&built, snap);
             const acl: RC.ExecuteAcl = if (existing) |old| self.objects.routines[old].acl else try self.newRoutineAcl(slot, owner, namespace, snap);
             try self.reserveWrites(slot, 2);
             const index = try self.objectSlot(.routine);
             const oid = if (existing) |old| self.objects.routines[old].oid else try self.takeOid();
             if (existing) |old| try self.dropObject(slot, .routine, old, snap);
             const item = &self.objects.routines[index];
-            item.* = .{ .oid = oid, .namespace = namespace, .owner = owner, .acl = acl, .name = definition.name, .kind = kind, .language = definition.language, .volatility = definition.volatility, .strict = definition.strict, .arg_count = definition.arg_count, .return_oid = definition.return_oid, .return_typmod = definition.return_typmod, .body = definition.body };
-            for (definition.args[0..definition.arg_count], 0..) |arg, position| {
-                item.arg_names[position] = arg.name;
-                item.arg_oids[position] = arg.oid;
-                item.arg_typmods[position] = arg.typmod;
-            }
+            item.* = built;
+            item.oid = oid;
+            item.namespace = namespace;
+            item.owner = owner;
+            item.acl = acl;
             self.createdObject(slot, .routine, index, snap);
         }
 
-        fn validateRoutine(self: *Self, definition: *const R.CreateRoutine, snap: Snapshot) Error!void {
-            var frame: R.Frame = .{};
-            var names: [config.routine_args]V.Name = undefined;
-            var oids: [config.routine_args]u32 = undefined;
-            var typmods: [config.routine_args]i32 = undefined;
+        /// The catalog version of a parsed CREATE FUNCTION / PROCEDURE:
+        /// inputs (the signature), modes, result columns, DEFAULT texts
+        /// (from the statement source), RETURNS SETOF / TABLE, SECURITY
+        /// DEFINER and SET clauses.
+        fn routineFromDefinition(source: []const u8, definition: *const R.CreateRoutine, item: *RC.Routine) Error!void {
+            item.* = .{ .name = definition.name, .kind = if (definition.procedure) 'p' else 'f', .language = definition.language, .volatility = definition.volatility, .strict = definition.strict, .return_oid = definition.return_oid, .return_typmod = definition.return_typmod, .body = definition.body, .retset = definition.retset, .security_definer = definition.security_definer };
+            var plain = true;
             for (definition.args[0..definition.arg_count], 0..) |arg, position| {
-                names[position] = arg.name;
-                oids[position] = arg.oid;
-                typmods[position] = arg.typmod;
+                item.param_modes[position] = arg.mode;
+                if (arg.mode != 'i') plain = false;
+                if (R.inputMode(arg.mode)) {
+                    const input = item.arg_count;
+                    item.arg_names[input] = arg.name;
+                    item.arg_oids[input] = arg.oid;
+                    item.arg_typmods[input] = arg.typmod;
+                    item.arg_modes[input] = arg.mode;
+                    item.arg_count += 1;
+                    if (arg.default.end != 0) {
+                        const text = std.mem.trim(u8, source[arg.default.start..arg.default.end], " \t\r\n");
+                        if (item.defaults_len + text.len + 1 > item.defaults.len) return error.TextCapacity;
+                        for (text) |byte| if (byte == 0) return error.CharacterNotInRepertoire;
+                        @memcpy(item.defaults[item.defaults_len..][0..text.len], text);
+                        item.defaults[item.defaults_len + text.len] = 0;
+                        item.defaults_len += text.len + 1;
+                        item.default_count += 1;
+                    }
+                }
+                if (R.outputMode(arg.mode)) {
+                    const output = item.out_count;
+                    item.out_names[output] = arg.name;
+                    item.out_oids[output] = arg.oid;
+                    item.out_typmods[output] = arg.typmod;
+                    item.out_inputs[output] = if (arg.mode == 'b') @intCast(item.arg_count - 1) else 0xff;
+                    item.out_count += 1;
+                }
             }
-            const count = definition.arg_count;
+            item.param_count = if (plain) 0 else definition.arg_count;
+            @memcpy(item.settings[0..definition.settings_len], definition.settings[0..definition.settings_len]);
+            item.settings_len = definition.settings_len;
+            item.setting_count = definition.setting_count;
+        }
+
+        /// DEFAULT expressions are analyzed at CREATE as in PostgreSQL:
+        /// no column (42703), subquery (0A000) or aggregate (42803); the
+        /// value must convert to the parameter by assignment (42804), and
+        /// a constant one is evaluated now (22P02 and friends).
+        fn validateDefaults(self: *Self, item: *const RC.Routine) Error!void {
+            var frame: R.Frame = .{};
+            for (item.arg_count - item.default_count..item.arg_count) |input| {
+                const text = item.defaultText(input);
+                const column = columnOfOid(item.arg_oids[input], item.arg_typmods[input]);
+                const pool = &self.workspace.nodes;
+                const mark = poolMark(pool);
+                defer poolRestore(pool, mark);
+                const id = try P.parseExpressionAt(text, 0, text.len, pool);
+                frame.variables.node_low = mark.len;
+                frame.variables.node_high = pool.len;
+                var context = self.bindContext(text, .standard, self.routine_snap);
+                context.plans = null;
+                context.variables = &frame.variables;
+                const bound = B.bindRoutineExpression(&context, id, &column) catch |err| return switch (err) {
+                    error.CannotCoerce => error.TypeMismatch,
+                    else => err,
+                };
+                if (pool.nodes[bound].constant) {
+                    var ctx = self.evalContext(text);
+                    ctx.frame = frame.evalFrame();
+                    _ = try E.eval(&ctx, bound);
+                }
+            }
+        }
+
+        /// A routine's SET clauses applied to `into` (PostgreSQL's
+        /// proconfig): engine settings only; settings the caller (Store)
+        /// implements, SET ROLE and transaction modes are 0A000, unknown
+        /// names 42704, bad values 22023 (validated at CREATE).
+        fn routineSettingValues(routine: *const RC.Routine, into: *Sess.Values) Error!void {
+            for (0..routine.setting_count) |index| {
+                const entry = routine.setting(index);
+                const eq = std.mem.indexOfScalar(u8, entry, '=') orelse return error.InvalidChangeRecord;
+                const name = entry[0..eq];
+                const raw = entry[eq + 1 ..];
+                const which = settingKind(name) orelse return if (callerSetting(name)) error.UnsupportedStatement else error.UndefinedSetting;
+                switch (which) {
+                    .role, .session_authorization, .transaction_isolation, .transaction_read_only, .transaction_deferrable => return error.UnsupportedStatement,
+                    else => {},
+                }
+                var value: ControlText = .{};
+                var kind: SettingValueKind = .word;
+                if (raw.len >= 2 and raw[0] == '\'' and raw[raw.len - 1] == '\'') {
+                    var cursor = R.Cursor.init(raw, 0) catch return error.InvalidSettingValue;
+                    value.len = cursor.string(&value.bytes) catch return error.InvalidSettingValue;
+                    if (!cursor.atEnd()) return error.InvalidSettingValue;
+                    kind = .string;
+                } else {
+                    if (raw.len > value.bytes.len) return error.InvalidSettingValue;
+                    @memcpy(value.bytes[0..raw.len], raw);
+                    value.len = raw.len;
+                    if (raw.len != 0 and (types.digit(raw[0]) or raw[0] == '-')) kind = .number;
+                }
+                try assignSetting(into, which, name, kind, value.slice());
+            }
+        }
+
+        fn validateSettings(self: *Self, routine: *const RC.Routine) Error!void {
+            if (routine.setting_count == 0) return;
+            var scratch_values = self.sessionState().values;
+            try routineSettingValues(routine, &scratch_values);
+        }
+
+        /// SECURITY DEFINER and SET clauses of one call: current_user is
+        /// the owner and the SET values hold until leaveScope, which also
+        /// undoes settings the routine changed (PostgreSQL's GUC nesting).
+        const RoutineScope = struct {
+            active: bool = false,
+            settings: bool = false,
+            definer: ?u32 = null,
+            values: Sess.Values = undefined,
+        };
+
+        fn enterScope(self: *Self, routine: *const RC.Routine, scope: *RoutineScope) Error!void {
+            if (routine.setting_count == 0 and !routine.security_definer) return;
+            const state = self.sessionState();
+            scope.definer = self.routine_definer;
+            if (routine.setting_count != 0) {
+                scope.values = state.values;
+                var next = state.values;
+                try routineSettingValues(routine, &next);
+                state.values = next;
+                scope.settings = true;
+            }
+            scope.active = true;
+            if (routine.security_definer) self.routine_definer = routine.owner;
+            self.installRole();
+        }
+
+        fn leaveScope(self: *Self, scope: *const RoutineScope) void {
+            if (!scope.active) return;
+            if (scope.settings) self.sessionState().values = scope.values;
+            self.routine_definer = scope.definer;
+            self.installRole();
+        }
+
+        /// A routine's DEFAULT for input `input`, evaluated for a call.
+        fn routineDefault(self: *Self, routine: *const RC.Routine, input: usize) Error!V.Cell {
+            var frame: R.Frame = .{};
+            const text = routine.defaultText(input);
+            const column = columnOfOid(routine.arg_oids[input], routine.arg_typmods[input]);
+            const value = try self.routineEvaluate(&frame, text, 0, text.len, &column);
+            return D.store(&column, value, &self.session);
+        }
+
+        /// Frame variables of a routine: its inputs, then OUT / TABLE
+        /// parameters (NULL), then FOUND (PL/pgSQL).
+        fn routineFrame(frame: *R.Frame, routine: *const RC.Routine) Error!void {
+            for (routine.arg_names[0..routine.arg_count], routine.arg_oids[0..routine.arg_count], routine.arg_typmods[0..routine.arg_count]) |*name, oid, typmod| _ = try frame.declare(name.slice(), typeOfOid(oid), typmod);
+            for (0..routine.out_count) |output| {
+                if (routine.out_inputs[output] != 0xff) continue;
+                _ = try frame.declare(routine.out_names[output].slice(), typeOfOid(routine.out_oids[output]), routine.out_typmods[output]);
+            }
+            frame.variables.parameters = frame.variables.count;
+            frame.variables.routine_name = routine.name;
+            frame.variables.conflict_error = routine.language == 1;
+            if (routine.language == 1) {
+                frame.found = try frame.declare("found", .boolean, -1);
+                frame.cells[frame.found] = .{ .boolean = false };
+            }
+        }
+
+        /// The frame variable of result column `output`.
+        fn outputVariable(routine: *const RC.Routine, output: usize) usize {
+            if (routine.out_inputs[output] != 0xff) return routine.out_inputs[output];
+            var index = routine.arg_count;
+            for (0..output) |earlier| index += @intFromBool(routine.out_inputs[earlier] == 0xff);
+            return index;
+        }
+
+        fn validateRoutine(self: *Self, definition: *const RC.Routine, snap: Snapshot) Error!void {
+            var frame: R.Frame = .{};
             const plpgsql = definition.language == 1;
-            try routineParameters(&frame, names[0..count], oids[0..count], typmods[0..count], definition.name, plpgsql);
+            try routineFrame(&frame, definition);
             if (plpgsql) {
-                const purpose: R.Purpose = if (definition.procedure) .procedure else if (definition.return_oid == tg.trigger_oid) .trigger else .function;
+                const purpose: R.Purpose = if (definition.kind == 'p') .procedure else if (definition.return_oid == tg.trigger_oid) .trigger else .function;
                 if (purpose == .trigger) try triggerVariableNames(&frame);
-                var interpreter: Interp = .{ .host = self, .source = definition.body.slice(), .frame = &frame, .purpose = purpose, .void_result = definition.return_oid == tg.void_oid };
+                var interpreter: Interp = .{ .host = self, .source = definition.body.slice(), .frame = &frame, .purpose = purpose, .void_result = definition.return_oid == tg.void_oid or definition.out_count != 0 };
                 return interpreter.execute(.check);
             }
             return self.validateSql(definition, &frame, snap);
@@ -12798,11 +12986,12 @@ pub fn Database(comptime config: Config) type {
 
         /// The statements of a SQL routine body (PostgreSQL's
         /// check_function_bodies): analyzed until a utility statement.
-        fn validateSql(self: *Self, definition: *const R.CreateRoutine, frame: *R.Frame, snap: Snapshot) Error!void {
+        fn validateSql(self: *Self, definition: *const RC.Routine, frame: *R.Frame, snap: Snapshot) Error!void {
             const text_body = definition.body.slice();
             var statements: R.Statements = .{ .source = text_body };
             var analyzable = true;
             var final_type: ?types.Type = null;
+            var final_types: [config.routine_args]types.Type = @splat(.unknown);
             var final_count: usize = 0;
             var final_seen = false;
             const saved_frame = self.routine_frame;
@@ -12848,6 +13037,7 @@ pub fn Database(comptime config: Config) type {
                         const plan = &self.workspace.plans.items[root];
                         final_count = plan.count;
                         if (plan.count != 0) final_type = plan.tys[0];
+                        for (0..@min(plan.count, final_types.len)) |column| final_types[column] = plan.tys[column];
                     },
                     .insert => |*insert| if (insert.returning.count != 0) {
                         final_count = insert.returning.count;
@@ -12864,7 +13054,20 @@ pub fn Database(comptime config: Config) type {
                     else => {},
                 }
             }
-            if (definition.procedure or definition.return_oid == tg.void_oid) return;
+            if (definition.out_count > 1 or (definition.kind == 'p' and definition.out_count != 0)) {
+                // Several result columns (or a procedure's outputs): the
+                // final query returns one assignment-coercible column each.
+                if (!final_seen) return error.InvalidFunctionDefinition;
+                if (!analyzable) return;
+                if (final_count != definition.out_count or final_type == null) return error.InvalidFunctionDefinition;
+                for (final_types[0..final_count], definition.out_oids[0..final_count]) |result, oid| {
+                    const wanted = typeOfOid(oid);
+                    if (result != wanted and result != .unknown and !value_module.castable(result, wanted, .assignment) and !(value_module.integral(result) and value_module.integral(wanted)))
+                        return error.InvalidFunctionDefinition;
+                }
+                return;
+            }
+            if (definition.kind == 'p' or definition.return_oid == tg.void_oid) return;
             if (!final_seen) return error.InvalidFunctionDefinition;
             if (!analyzable) return;
             // The final statement returns one column of the result type
@@ -13212,67 +13415,144 @@ pub fn Database(comptime config: Config) type {
             var path: [routine_path_capacity]u32 = undefined;
             const path_len = try self.routineSearch(call.has_schema, call.schema, snap, &path);
             var args: [config.routine_args]Argument = undefined;
-            for (call.args[0..call.arg_count], 0..) |span, position| args[position] = try self.evaluateArgument(source, span);
+            var supplied: [config.routine_args]RC.Supplied = undefined;
+            for (call.args[0..call.arg_count], 0..) |span, position| {
+                args[position] = try self.evaluateArgument(source, span);
+                supplied[position] = .{ .name = call.names[position], .ty = args[position].ty, .unknown = args[position].unknown };
+                for (call.names[0..position]) |earlier| {
+                    if (earlier.len != 0 and types.same(earlier.slice(), call.names[position].slice())) return error.Syntax;
+                }
+            }
             const name = call.name.slice();
             var best: ?usize = null;
-            var best_exact: usize = 0;
+            var best_match: RC.Match = .{};
+            var candidate: RC.Match = undefined;
+            var params: [config.routine_args]RC.Param = undefined;
             var ambiguous = false;
             var function = false;
             for (&self.objects.routines, 0..) |*routine, index| {
                 if (!routine.live or !routine.stamp.visible(snap)) continue;
-                if (!types.same(routine.name.slice(), name) or routine.arg_count != call.arg_count) continue;
+                if (!types.same(routine.name.slice(), name)) continue;
                 if (self.routineHidden(index, path[0..path_len], snap)) continue;
+                // CALL fills OUT parameters too (PostgreSQL 14+).
+                const count = RC.callParams(routine, routine.kind == 'p', &params);
+                if (!RC.matchCall(params[0..count], supplied[0..call.arg_count], call.variadic, &candidate)) continue;
                 if (routine.kind != 'p') {
                     function = true;
                     continue;
                 }
-                var exact: usize = 0;
-                var accepted = true;
-                for (args[0..call.arg_count], routine.arg_oids[0..call.arg_count]) |arg, oid| {
-                    const to = typeOfOid(oid);
-                    // An unknown literal prefers the string category (text).
-                    if (arg.unknown) {
-                        if (to == .text) exact += 1;
-                        continue;
-                    }
-                    if (arg.ty == to) {
-                        exact += 2;
-                    } else if (!value_module.castable(arg.ty, to, .implicit)) accepted = false;
-                }
-                if (!accepted) continue;
-                if (best == null or exact > best_exact) {
+                if (best == null or RC.betterMatch(&candidate, &best_match)) {
                     best = index;
-                    best_exact = exact;
+                    best_match = candidate;
                     ambiguous = false;
-                } else if (exact == best_exact) ambiguous = true;
+                } else if (!RC.betterMatch(&best_match, &candidate)) ambiguous = true;
             }
             const chosen = best orelse return if (function) error.WrongObjectType else error.UndefinedFunction;
             if (ambiguous) return error.AmbiguousFunction;
             const routine = &self.objects.routines[chosen];
             if (!self.canExecuteRoutine(routine, snap)) return error.InsufficientPrivilege;
-            var cells: [config.routine_args]V.Cell = undefined;
-            for (args[0..call.arg_count], 0..) |arg, position| {
-                const to = typeOfOid(routine.arg_oids[position]);
-                cells[position] = arg.cell;
-                if (arg.cell == .null_value) continue;
-                const from: types.Type = if (arg.unknown) .text else arg.ty;
-                if (from != to) cells[position] = try E.cast(arg.cell, from, to, routine.arg_typmods[position], &self.session);
-            }
+            const param_count = RC.callParams(routine, true, &params);
+            // Output arguments of a CALL inside a routine must be
+            // variables: they receive the results (42601 otherwise).
+            const caller = self.routine_frame;
+            var targets: [config.routine_args]usize = @splat(0);
+            if (caller) |outer| if (routine.out_count != 0) {
+                var output: usize = 0;
+                for (params[0..param_count], 0..) |param, position| {
+                    if (!R.outputMode(param.mode)) continue;
+                    const slot_arg = best_match.slots[position];
+                    if (slot_arg == RC.default_slot or slot_arg == RC.expanded_slot) return error.Syntax;
+                    const span = call.args[slot_arg];
+                    targets[output] = callerVariable(outer, source[span.start..span.end]) orelse return error.Syntax;
+                    output += 1;
+                }
+            };
             try self.enterRoutine();
             defer self.routine_depth -= 1;
             var frame: R.Frame = .{};
-            try routineParameters(&frame, routine.arg_names[0..routine.arg_count], routine.arg_oids[0..routine.arg_count], routine.arg_typmods[0..routine.arg_count], routine.name, routine.language == 1);
-            for (cells[0..call.arg_count], 0..) |cell, position| frame.cells[position] = cell;
+            try routineFrame(&frame, routine);
+            // Arguments (and DEFAULTs) are evaluated as the caller.
+            var scope: RoutineScope = .{};
+            defer self.leaveScope(&scope);
+            for (params[0..param_count], 0..) |param, position| {
+                if (param.input == RC.default_slot) continue;
+                const slot_arg = best_match.slots[position];
+                const to = typeOfOid(param.oid);
+                frame.cells[param.input] = if (slot_arg == RC.default_slot)
+                    try self.routineDefault(routine, param.input)
+                else if (slot_arg == RC.expanded_slot)
+                    // Expanding VARIADIC elements in CALL is not supported here.
+                    return error.UnsupportedStatement
+                else blk: {
+                    const arg = args[slot_arg];
+                    if (arg.cell == .null_value) break :blk .null_value;
+                    const from: types.Type = if (arg.unknown) .text else arg.ty;
+                    break :blk if (from != to) try E.cast(arg.cell, from, to, param.typmod, &self.session) else arg.cell;
+                };
+            }
+            try self.enterScope(routine, &scope);
             const text_body = routine.body.slice();
             if (routine.language == 1) {
                 var interpreter: Interp = .{ .host = self, .source = text_body, .frame = &frame, .purpose = .procedure, .void_result = true };
-                return interpreter.execute(.run);
+                try interpreter.execute(.run);
+            } else {
+                var statements: R.Statements = .{ .source = text_body };
+                var capture: R.Capture = .{};
+                while (try statements.next()) |span| {
+                    try self.session.checkpoint();
+                    var ahead = statements;
+                    const last = (try ahead.next()) == null;
+                    // A SQL procedure's outputs come from its final query.
+                    const wanted = last and routine.out_count != 0;
+                    _ = try self.routineStatement(&frame, text_body[span.start..span.end], if (wanted) &capture else null);
+                    if (wanted) for (0..routine.out_count) |output| {
+                        const value: V.Cell = if (capture.rows == 0 or output >= capture.count) .null_value else capture.cells[output];
+                        frame.cells[outputVariable(routine, output)] = try self.castCell(value, if (output < capture.count) capture.tys[output] else .unknown, routine.out_oids[output], routine.out_typmods[output]);
+                    };
+                }
             }
-            var statements: R.Statements = .{ .source = text_body };
-            while (try statements.next()) |span| {
-                try self.session.checkpoint();
-                _ = try self.routineStatement(&frame, text_body[span.start..span.end], null);
+            if (routine.out_count == 0) return;
+            if (caller) |outer| {
+                for (0..routine.out_count) |output| {
+                    const variable = targets[output];
+                    const item = &outer.variables.items[variable];
+                    outer.cells[variable] = try self.castCell(frame.cells[outputVariable(routine, output)], typeOfOid(routine.out_oids[output]), types.typeOid(types.dataTypeOf(item.ty)), item.typmod);
+                }
+                return;
             }
+            // A top-level CALL returns one row of its outputs.
+            const returned = &self.call_returned;
+            returned.* = .{ .count = routine.out_count, .rows = 1, .base = 0 };
+            for (0..routine.out_count) |output| {
+                returned.names[output] = routine.out_names[output];
+                returned.types[output] = types.typeFromOid(routine.out_oids[output]) orelse .text;
+                returned.typmods[output] = routine.out_typmods[output];
+                self.workspace.query.cells[output] = frame.cells[outputVariable(routine, output)];
+            }
+        }
+
+        /// A value of type `from` converted to type OID `oid` (assignment).
+        fn castCell(self: *Self, value: V.Cell, from: types.Type, oid: u32, typmod: i32) Error!V.Cell {
+            const column = columnOfOid(oid, typmod);
+            var cell = value;
+            const to = typeOfOid(oid);
+            if (cell != .null_value and from != to and from != .unknown) {
+                if (!value_module.castable(from, to, .assignment) and !(value_module.integral(from) and value_module.integral(to))) return error.TypeMismatch;
+                cell = try E.cast(cell, from, to, typmod, &self.session);
+            } else if (cell != .null_value and from == .unknown and cell == .text and to != .text) {
+                cell = try E.cast(cell, .text, to, typmod, &self.session);
+            }
+            return D.store(&column, cell, &self.session);
+        }
+
+        /// The caller frame's variable a CALL argument names, if any.
+        fn callerVariable(frame: *R.Frame, text: []const u8) ?usize {
+            var cursor = R.Cursor.init(text, 0) catch return null;
+            const name = cursor.identifier() catch return null;
+            if (!cursor.atEnd()) return null;
+            const index = frame.variables.find(name.slice()) orelse return null;
+            if (frame.constant[index]) return null;
+            return index;
         }
 
         /// DO: the whole block is checked first, then run.
@@ -13292,12 +13572,23 @@ pub fn Database(comptime config: Config) type {
         /// of one expression without FROM (others are 0A000); PL/pgSQL runs
         /// without statements of its own.
         fn routineHookCall(ptr: *anyopaque, index: usize, args_ptr: *const anyopaque, count: usize, out_ptr: *anyopaque) Error!void {
+            return routineHookDefaults(ptr, index, args_ptr, count, 0, out_ptr);
+        }
+
+        /// The same with DEFAULT arguments: bit p of `defaulted` evaluates
+        /// input p's DEFAULT expression (in the caller's context).
+        fn routineHookDefaults(ptr: *anyopaque, index: usize, args_ptr: *const anyopaque, count: usize, defaulted: u64, out_ptr: *anyopaque) Error!void {
             const self: *Self = @ptrCast(@alignCast(ptr));
-            const args: [*]const V.Cell = @ptrCast(@alignCast(args_ptr));
+            const given: [*]const V.Cell = @ptrCast(@alignCast(args_ptr));
             const out: *V.Cell = @ptrCast(@alignCast(out_ptr));
             if (index >= config.routines) return error.UndefinedFunction;
             const routine = &self.objects.routines[index];
             if (!self.canExecuteRoutine(routine, self.routine_snap)) return error.InsufficientPrivilege;
+            if (count != routine.arg_count) return error.UndefinedFunction;
+            var args: [config.routine_args]V.Cell = undefined;
+            for (0..count) |position| {
+                args[position] = if (defaulted & (@as(u64, 1) << @intCast(position)) != 0) try self.routineDefault(routine, position) else given[position];
+            }
             if (routine.strict) for (args[0..count]) |*cell| {
                 if (cell.* == .null_value) {
                     out.* = .null_value;
@@ -13308,15 +13599,20 @@ pub fn Database(comptime config: Config) type {
             defer self.routine_depth -= 1;
             self.routine_nested += 1;
             defer self.routine_nested -= 1;
+            var scope: RoutineScope = .{};
+            try self.enterScope(routine, &scope);
+            defer self.leaveScope(&scope);
             var frame: R.Frame = .{};
-            try routineParameters(&frame, routine.arg_names[0..routine.arg_count], routine.arg_oids[0..routine.arg_count], routine.arg_typmods[0..routine.arg_count], routine.name, routine.language == 1);
+            try routineFrame(&frame, routine);
             for (args[0..count], 0..) |cell, position| frame.cells[position] = cell;
             const result_column = columnOfOid(routine.return_oid, routine.return_typmod);
             const text_body = routine.body.slice();
             if (routine.language == 1) {
-                var interpreter: Interp = .{ .host = self, .source = text_body, .frame = &frame, .purpose = .function, .return_column = result_column };
+                // A function with OUT parameters returns their final values.
+                const outputs = routine.out_count != 0;
+                var interpreter: Interp = .{ .host = self, .source = text_body, .frame = &frame, .purpose = .function, .return_column = result_column, .void_result = outputs };
                 try interpreter.execute(.run);
-                out.* = interpreter.result;
+                out.* = if (outputs) frame.cells[outputVariable(routine, 0)] else interpreter.result;
                 return;
             }
             var statements: R.Statements = .{ .source = text_body };
@@ -13779,13 +14075,14 @@ pub fn Database(comptime config: Config) type {
                 };
                 return C.encodeObject(writer, tag, buffer[0..payload.used]);
             }
+            const extended = class == .routine and self.objects.routines[index].extended();
             const tag: change_log.Op = switch (class) {
-                .routine => .create_routine,
+                .routine => if (extended) .create_routine_extended else .create_routine,
                 .trigger => .create_trigger,
                 .rule => .create_rule,
             };
             switch (class) {
-                .routine => try RC.encodeRoutine(&payload, &self.objects.routines[index]),
+                .routine => if (extended) try RC.encodeRoutineExtended(&payload, &self.objects.routines[index]) else try RC.encodeRoutine(&payload, &self.objects.routines[index]),
                 .trigger => try RC.encodeTrigger(&payload, &self.objects.triggers[index]),
                 .rule => try RC.encodeRule(&payload, &self.objects.rules[index]),
             }
@@ -13825,10 +14122,10 @@ pub fn Database(comptime config: Config) type {
             const stamp: tg.Stamp = .{ .xmin = .{ .epoch = self.epoch }, .xmin_cid = self.cid, .xmin_csn = csn };
             var oid: u32 = 0;
             switch (tag) {
-                @intFromEnum(change_log.Op.create_routine) => {
+                @intFromEnum(change_log.Op.create_routine), @intFromEnum(change_log.Op.create_routine_extended) => {
                     const index = try self.replaySlot(.routine);
                     const item = &self.objects.routines[index];
-                    try RC.decodeRoutine(payload, item);
+                    if (tag == @intFromEnum(change_log.Op.create_routine_extended)) try RC.decodeRoutineExtended(payload, item) else try RC.decodeRoutine(payload, item);
                     item.live = true;
                     item.stamp = stamp;
                     oid = item.oid;
@@ -13899,13 +14196,20 @@ pub fn Database(comptime config: Config) type {
 
         /// pg_proc, pg_trigger, pg_rewrite and pg_rules rows.
         fn procRow(sink: *X.RowSink, base: *const [13]Cell) Error!void {
+            return procRowWith(sink, base, false, false);
+        }
+
+        /// A user routine's row also reports RETURNS SETOF (proretset,
+        /// prorows 1000) and SECURITY DEFINER (B11 wave 4); proconfig
+        /// stays NULL.
+        fn procRowWith(sink: *X.RowSink, base: *const [13]Cell, retset: bool, definer: bool) Error!void {
             var cells: [23]Cell = undefined;
             @memcpy(cells[0..13], base);
-            // Supported routines return one value, run as invoker, have no
+            // Built-in routines return one value, run as invoker, have no
             // per-routine settings, transforms or planner support callback.
-            cells[13..].* = .{ boolCell(false), .null_value, boolCell(false), .null_value,
+            cells[13..].* = .{ boolCell(retset), .null_value, boolCell(definer), .null_value,
                 .{ .float4 = if (base[4].integer == operator_catalog.internal_language_oid) 1 else 100 },
-                .{ .float4 = 0 }, boolCell(false), .null_value, .{ .pg_internal_char = 'u' }, .{ .regproc = 0 } };
+                .{ .float4 = if (retset) 1000 else 0 }, boolCell(false), .null_value, .{ .pg_internal_char = 'u' }, .{ .regproc = 0 } };
             try sink.add(&cells);
         }
 
@@ -13976,7 +14280,7 @@ pub fn Database(comptime config: Config) type {
                         }
                         const language = if (routine.language == 0) catalog_module.sql_language_oid else catalog_module.plpgsql_language_oid;
                         const acl = if (sink.referencesColumn(12)) try self.routineAcl(routine, snapshot, sink.valueBytes()) else .null_value;
-                        try procRow(sink, &.{ intCell(routine.oid), nameCell(routine.name.slice()), intCell(routine.namespace), .{ .pg_internal_char = routine.kind }, intCell(language), .{ .pg_internal_char = routine.volatility }, boolCell(routine.strict), intCell(@intCast(routine.arg_count)), intCell(routine.return_oid), nameCell(argtypes[0..at]), nameCell(routine.body.slice()), intCell(routine.owner), acl });
+                        try procRowWith(sink, &.{ intCell(routine.oid), nameCell(routine.name.slice()), intCell(routine.namespace), .{ .pg_internal_char = routine.kind }, intCell(language), .{ .pg_internal_char = routine.volatility }, boolCell(routine.strict), intCell(@intCast(routine.arg_count)), intCell(routine.return_oid), nameCell(argtypes[0..at]), nameCell(routine.body.slice()), intCell(routine.owner), acl }, routine.retset, routine.security_definer);
                     }
                 },
                 .pg_trigger => for (&self.objects.triggers) |*trigger| {

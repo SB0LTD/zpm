@@ -185,6 +185,9 @@ pub const serial_name_bytes = 520;
 pub const RoutineHook = struct {
     ptr: *anyopaque,
     call: *const fn (ptr: *anyopaque, routine: usize, args: *const anyopaque, count: usize, out: *anyopaque) Error!void,
+    /// A call with DEFAULT arguments (B11 wave 4): bit p of `defaulted`
+    /// marks input p as taking its DEFAULT expression.
+    call_defaults: ?*const fn (ptr: *anyopaque, routine: usize, args: *const anyopaque, count: usize, defaulted: u64, out: *anyopaque) Error!void = null,
 };
 
 pub const CatalogText = enum { description, shared_description, role_name, function_arguments, function_identity_arguments, function_result, function_sqlbody };

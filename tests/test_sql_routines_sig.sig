@@ -13,7 +13,7 @@
 const std = @import("std");
 const sql = @import("sql");
 
-const DB = sql.Database(.{ .tables = 6, .columns = 8, .rows_per_table = 32, .name_bytes = 32, .text_bytes = 128, .nulls_first_ascending = false, .integer_bits = 32, .transactions = 4, .sequences = 2, .expr_nodes = 1024, .routines = 24, .triggers = 2, .rules = 1, .routine_args = 6, .routine_bytes = 768, .schemas = 4, .work_rows = 512 });
+const DB = sql.Database(.{ .tables = 6, .columns = 8, .rows_per_table = 32, .name_bytes = 32, .text_bytes = 128, .nulls_first_ascending = false, .integer_bits = 32, .transactions = 4, .sequences = 2, .expr_nodes = 1024, .routines = 64, .triggers = 2, .rules = 1, .routine_args = 6, .routine_bytes = 768, .schemas = 4, .work_rows = 512 });
 
 var assertions: usize = 0;
 var db: DB = .{};
@@ -75,14 +75,10 @@ fn expect(source: []const u8, wanted: []const u8) !void {
     try same(try query(&db, source), wanted);
 }
 
-/// Column names (`a,b`) and type OIDs of a query, then its rows.
+/// Column names (`a,b`) and type OIDs of a replicated statement, then
+/// its rows.
 fn expectColumns(source: []const u8, names: []const u8, oids: []const u32, wanted: []const u8) !void {
-    var result: DB.Result = .{};
-    result.bindValueMemory(&query_values);
-    db.execute(source, &result) catch |err| {
-        std.debug.print("{s}: {s}\n", .{ source, @errorName(err) });
-        return err;
-    };
+    const result = try replicate(source);
     var joined: [256]u8 = undefined;
     var at: usize = 0;
     for (0..result.column_count) |column| {
@@ -391,8 +387,134 @@ fn schemas() !void {
     try run("DROP SCHEMA s1");
 }
 
+// ---- parameter modes, DEFAULT values and named arguments ---------------
+
+fn parameters() !void {
+    try run("CREATE FUNCTION fd(a INT, b INT DEFAULT 10, c TEXT DEFAULT 'z') RETURNS TEXT LANGUAGE sql AS $$SELECT a || ':' || b || ':' || c$$");
+    try expect("SELECT fd(1), fd(1, 2), fd(1, 2, 'q')", "1:10:z|1:2:z|1:2:q");
+    try fails("SELECT fd()", error.UndefinedFunction);
+    // Named notation (=> and :=), mixed after positional arguments.
+    try expect("SELECT fd(a => 1, c => 'n'), fd(1, c := 'm'), fd(c => 'k', a => 3)", "1:10:n|1:10:m|3:10:k");
+    try fails("SELECT fd(a => 1, a => 2)", error.Syntax);
+    try fails("SELECT fd(b => 1)", error.UndefinedFunction);
+    try fails("SELECT fd(a => 1, 2)", error.Syntax);
+    try fails("SELECT fd(zz => 1)", error.UndefinedFunction);
+    try fails("SELECT abs(x => 1)", error.UndefinedFunction);
+    // VARIADIC: trailing arguments become the array; VARIADIC passes one.
+    try run("CREATE FUNCTION fv(VARIADIC xs INT[]) RETURNS INT LANGUAGE sql AS $$SELECT coalesce(array_length(xs, 1), 0)$$");
+    try expect("SELECT fv(1, 2, 3), fv(5), fv(VARIADIC ARRAY[1, 2]), fv(VARIADIC ARRAY[]::INT[])", "3|1|2|0");
+    try expect("SELECT fv(1, NULL), fv(VARIADIC NULL)", "2|0");
+    try fails("SELECT fv()", error.UndefinedFunction);
+    try fails("SELECT fv(ARRAY[1, 2])", error.UndefinedFunction);
+    try fails("SELECT fv(VARIADIC ARRAY[1], 2)", error.Syntax);
+    try run("CREATE FUNCTION fv2(a TEXT, VARIADIC xs INT[]) RETURNS TEXT LANGUAGE sql AS $$SELECT a || array_to_string(xs, ',')$$");
+    try expect("SELECT fv2('p', 1, 2)", "p1,2");
+    try run("CREATE FUNCTION x7(a INT, VARIADIC r TEXT[] DEFAULT '{}') RETURNS TEXT LANGUAGE sql AS $$SELECT a || ':' || array_to_string(r, ',')$$");
+    try expect("SELECT x7(1), x7(1, 'p', 'q'), x7(2, VARIADIC ARRAY['z']), x7(a => 3, VARIADIC r => '{m}'), x7(3, VARIADIC r => '{m}')", "1:|1:p,q|2:z|3:m|3:m");
+    // Named notation reaches a variadic function only with VARIADIC.
+    try fails("SELECT x7(a => 2)", error.UndefinedFunction);
+    try expect("SELECT x7(1, VARIADIC NULL)", "NULL");
+    // Overloads: defaults make two candidates equal (42725); a candidate
+    // without variadic expansion wins over one with it.
+    try run("CREATE FUNCTION amb(a INT) RETURNS INT LANGUAGE sql AS 'SELECT 1'");
+    try run("CREATE FUNCTION amb(a INT, b INT DEFAULT 0) RETURNS INT LANGUAGE sql AS 'SELECT 2'");
+    try fails("SELECT amb(1)", error.AmbiguousFunction);
+    try expect("SELECT amb(1, 2)", "2");
+    try run("CREATE FUNCTION y3(a INT, b INT) RETURNS TEXT LANGUAGE sql AS $$SELECT 'ii'$$");
+    try run("CREATE FUNCTION y3(a INT, VARIADIC b INT[]) RETURNS TEXT LANGUAGE sql AS $$SELECT 'iv'$$");
+    try expect("SELECT y3(1, 2), y3(1, 2, 3)", "ii|iv");
+    // OUT and INOUT: one result column is the function's value.
+    try run("CREATE FUNCTION fo2(a INT, OUT b INT) LANGUAGE sql AS $$SELECT a + 1$$");
+    try expectColumns("SELECT fo2(5)", "fo2", &.{23}, "6");
+    try run("CREATE FUNCTION fpo(x INT, OUT y INT) LANGUAGE plpgsql AS $$BEGIN y := x * 3; END$$");
+    try expect("SELECT fpo(4)", "12");
+    try run("CREATE FUNCTION x6(INOUT a INT, b INT DEFAULT 5) LANGUAGE sql AS 'SELECT a + b'");
+    try expect("SELECT x6(1), x6(1, 2), x6(b => 3, a => 1)", "6|3|4");
+    try run("CREATE FUNCTION x10(a INT, OUT a TEXT) LANGUAGE sql AS $$SELECT 'z'$$");
+    try expect("SELECT x10(1)", "z");
+    // Several OUT parameters return a record: no record values here.
+    try run("CREATE FUNCTION fio(INOUT a INT, OUT b INT) LANGUAGE plpgsql AS $$BEGIN a := a * 10; b := a + 1; END$$");
+    try fails("SELECT fio(2)", error.UnsupportedStatement);
+    // Definition rules (42P13) and DEFAULT analysis at CREATE.
+    try fails("CREATE FUNCTION fdup(a INT, a INT) RETURNS INT LANGUAGE sql AS 'SELECT 1'", error.InvalidFunctionDefinition);
+    try fails("CREATE FUNCTION x12(INOUT a INT, OUT a TEXT) LANGUAGE sql AS $$SELECT 1, 'z'$$", error.InvalidFunctionDefinition);
+    try fails("CREATE FUNCTION x9(VARIADIC a INT[], b INT) RETURNS INT LANGUAGE sql AS 'SELECT 1'", error.InvalidFunctionDefinition);
+    try fails("CREATE FUNCTION fvbad(VARIADIC xs INT) RETURNS INT LANGUAGE sql AS $$SELECT 1$$", error.InvalidFunctionDefinition);
+    try fails("CREATE FUNCTION x14(a INT DEFAULT 1, b INT) RETURNS INT LANGUAGE sql AS 'SELECT 1'", error.InvalidFunctionDefinition);
+    try fails("CREATE FUNCTION x15(OUT b INT DEFAULT 1) RETURNS INT LANGUAGE sql AS 'SELECT 1'", error.InvalidFunctionDefinition);
+    try fails("CREATE FUNCTION fbad(OUT b INT) RETURNS TEXT LANGUAGE sql AS $$SELECT 1$$", error.InvalidFunctionDefinition);
+    try fails("CREATE FUNCTION fbad2(OUT b INT, OUT c INT) RETURNS INT LANGUAGE sql AS $$SELECT 1, 2$$", error.InvalidFunctionDefinition);
+    try fails("CREATE FUNCTION x2(OUT a INT) LANGUAGE plpgsql AS $$BEGIN RETURN 1; END$$", error.TypeMismatch);
+    try fails("CREATE FUNCTION x1(a INT, b INT DEFAULT a) RETURNS INT LANGUAGE sql AS 'SELECT b'", error.ColumnNotFound);
+    try fails("CREATE FUNCTION fdt(a INT DEFAULT 'x') RETURNS INT LANGUAGE sql AS 'SELECT a'", error.InvalidTextRepresentation);
+    try fails("CREATE FUNCTION fdt2(a INT DEFAULT 'x'::TEXT) RETURNS INT LANGUAGE sql AS 'SELECT a'", error.TypeMismatch);
+    try fails("CREATE FUNCTION x18(a INT DEFAULT (SELECT 1)) RETURNS INT LANGUAGE sql AS 'SELECT a'", error.UnsupportedStatement);
+    try fails("CREATE FUNCTION x19(a INT DEFAULT sum(1)) RETURNS INT LANGUAGE sql AS 'SELECT a'", error.GroupingError);
+    try run("CREATE FUNCTION fdt3(a INT DEFAULT 1.5) RETURNS INT LANGUAGE sql AS 'SELECT a'");
+    try expect("SELECT fdt3()", "2");
+    // Procedures: OUT parameters take placeholders; CALL returns them.
+    try run("CREATE TABLE log2 (v INT)");
+    try run("CREATE PROCEDURE po(a INT, OUT b INT, INOUT c INT) LANGUAGE plpgsql AS $$BEGIN b := a + 1; c := c * 2; INSERT INTO log2 VALUES (a); END$$");
+    try expectColumns("CALL po(1, NULL, 5)", "b,c", &.{ 23, 23 }, "2|10");
+    try runRows("CALL po(a => 2, b => NULL, c => 3)", "3|6");
+    try fails("CALL po(1)", error.UndefinedFunction);
+    try run("CREATE PROCEDURE pd(a INT, b INT DEFAULT 2) LANGUAGE plpgsql AS $$BEGIN INSERT INTO log2 VALUES (a + b); END$$");
+    try run("CALL pd(1)");
+    try run("CALL pd(b => 5, a => 10)");
+    try run("CREATE PROCEDURE ps(a INT, OUT b INT) LANGUAGE sql AS $$INSERT INTO log2 VALUES (a); SELECT a * 100$$");
+    try runRows("CALL ps(7, NULL)", "700");
+    try expect("SELECT v FROM log2 ORDER BY v", "1;2;3;7;15");
+    // A CALL inside a procedure assigns the outputs to its variables.
+    try run("CREATE PROCEDURE nest(INOUT total INT) LANGUAGE plpgsql AS $$DECLARE r INT; BEGIN CALL po(total, r, total); total := total + r; END$$");
+    try runRows("CALL nest(4)", "13");
+    try run("CREATE PROCEDURE nest2() LANGUAGE plpgsql AS $$BEGIN CALL po(1, 5, 2); END$$");
+    try fails("CALL nest2()", error.Syntax);
+    // OR REPLACE keeps the result type and existing defaults; DROP and
+    // the signature use the input types (OUT parameters are ignored).
+    try fails("CREATE OR REPLACE FUNCTION fo2(a INT, OUT b TEXT) LANGUAGE sql AS $$SELECT 'x'$$", error.InvalidFunctionDefinition);
+    try fails("CREATE OR REPLACE FUNCTION fd(a INT, b INT, c TEXT) RETURNS TEXT LANGUAGE sql AS $$SELECT 'x'$$", error.InvalidFunctionDefinition);
+    try run("CREATE OR REPLACE FUNCTION fd(a INT, b INT DEFAULT 20, c TEXT DEFAULT 'y') RETURNS TEXT LANGUAGE sql AS $$SELECT a || '/' || b || '/' || c$$");
+    try expect("SELECT fd(1)", "1/20/y");
+    try run("DROP FUNCTION fo2(INT, OUT INT)");
+    try fails("SELECT fo2(5)", error.UndefinedFunction);
+    try sameState(&.{ "SELECT fd(1), fd(1, 2), fd(c => 'k', a => 3)", "SELECT fv(1, 2, 3), x7(1, 'p', 'q'), x6(b => 3, a => 1)", "SELECT fpo(4), fdt3(), y3(1, 2, 3)", "SELECT v FROM log2 ORDER BY v" });
+}
+
+// ---- SECURITY DEFINER and SET clauses -----------------------------------
+
+fn definers() !void {
+    try run("CREATE ROLE alice");
+    try run("CREATE TABLE secret (v INT)");
+    try run("INSERT INTO secret VALUES (42)");
+    try run("CREATE TABLE log5 (who TEXT, v INT)");
+    try run("GRANT INSERT, SELECT ON log5 TO alice");
+    try run("CREATE PROCEDURE peekp(OUT r INT) SECURITY DEFINER LANGUAGE plpgsql AS $$BEGIN SELECT v INTO r FROM secret; INSERT INTO log5 VALUES (current_user, r); END$$");
+    try run("CREATE PROCEDURE peekp_invoker(OUT r INT) LANGUAGE plpgsql AS $$BEGIN SELECT v INTO r FROM secret; END$$");
+    try run("CREATE FUNCTION who() RETURNS TEXT LANGUAGE sql AS 'SELECT current_user::TEXT'");
+    try run("CREATE FUNCTION whod() RETURNS TEXT LANGUAGE sql SECURITY DEFINER AS 'SELECT current_user::TEXT || ''/'' || session_user::TEXT'");
+    try expect("SELECT prosecdef FROM pg_proc WHERE proname = 'whod'", "t");
+    try run("SET ROLE alice");
+    try runRows("CALL peekp(NULL)", "42");
+    try fails("CALL peekp_invoker(NULL)", error.InsufficientPrivilege);
+    try expect("SELECT who(), whod(), current_user", "alice|ramsql/ramsql|alice");
+    try run("RESET ROLE");
+    try expect("SELECT who, v FROM log5", "ramsql|42");
+    // SET clauses hold for the call and are undone after it.
+    try run("CREATE FUNCTION pathf() RETURNS TEXT LANGUAGE sql SET search_path = '' AS $$SELECT current_setting('search_path')$$");
+    try expect("SELECT pathf(), current_setting('search_path')", "\"\"|\"$user\", public");
+    try run("CREATE FUNCTION setf() RETURNS TEXT LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$BEGIN PERFORM set_config('search_path', 'public', true); RETURN current_setting('search_path'); END$$");
+    try expect("SELECT setf(), current_setting('search_path')", "public|\"$user\", public");
+    try run("CREATE PROCEDURE tabp() LANGUAGE plpgsql SET search_path = '' AS $$BEGIN INSERT INTO log5 VALUES ('p', 1); END$$");
+    try fails("CALL tabp()", error.TableNotFound);
+    try fails("CREATE FUNCTION badset() RETURNS INT LANGUAGE sql SET no_such_setting = 1 AS 'SELECT 1'", error.UndefinedSetting);
+    try fails("CREATE FUNCTION badset2() RETURNS INT LANGUAGE sql SET row_security = maybe AS 'SELECT 1'", error.InvalidSettingValue);
+    try sameState(&.{ "SELECT who, v FROM log5", "SELECT pathf(), setf()", "SELECT prosecdef FROM pg_proc WHERE proname = 'peekp'" });
+}
+
 pub fn main() !void {
     try diagnostics();
     try schemas();
+    try parameters();
+    try definers();
     std.debug.print("routines-sig: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });
 }

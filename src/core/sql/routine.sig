@@ -20,6 +20,7 @@
 //! back) are supported. Every statement and loop iteration is a work-control
 //! checkpoint. Nothing allocates: frames, texts and captured rows are fixed
 //! arrays on the caller's stack.
+const std = @import("std");
 const types = @import("types.sig");
 const lexer = @import("lexer.sig");
 const ast = @import("ast.sig");
@@ -50,7 +51,17 @@ pub fn Routines(comptime config: types.Config) type {
         /// A byte range of the statement source.
         pub const Span = struct { start: usize = 0, end: usize = 0 };
 
-        pub const Arg = struct { name: Name = .{}, oid: u32 = 0, typmod: i32 = -1 };
+        /// A declared parameter: its mode ('i' IN, 'o' OUT, 'b' INOUT, 'v'
+        /// VARIADIC, 't' a RETURNS TABLE column) and DEFAULT text.
+        pub const Arg = struct { name: Name = .{}, oid: u32 = 0, typmod: i32 = -1, mode: u8 = 'i', default: Span = .{} };
+
+        pub fn inputMode(mode: u8) bool {
+            return mode == 'i' or mode == 'b' or mode == 'v';
+        }
+
+        pub fn outputMode(mode: u8) bool {
+            return mode == 'o' or mode == 'b' or mode == 't';
+        }
 
         pub const CreateRoutine = struct {
             replace: bool = false,
@@ -58,6 +69,7 @@ pub fn Routines(comptime config: types.Config) type {
             has_schema: bool = false,
             schema: Name = .{},
             name: Name = .{},
+            /// Every declared parameter (RETURNS TABLE columns last).
             args: [config.routine_args]Arg = @splat(.{}),
             arg_count: usize = 0,
             return_oid: u32 = routine_catalog.void_oid,
@@ -67,10 +79,32 @@ pub fn Routines(comptime config: types.Config) type {
             volatility: u8 = 'v',
             strict: bool = false,
             body: Text = .{},
+            /// B11 wave 4: RETURNS given, RETURNS SETOF / TABLE, RETURNS
+            /// record, SECURITY DEFINER and SET clauses (`name=value`,
+            /// NUL-terminated).
+            returns: bool = false,
+            retset: bool = false,
+            record: bool = false,
+            security_definer: bool = false,
+            settings: [RC.arg_bytes]u8 = @splat(0),
+            settings_len: usize = 0,
+            setting_count: usize = 0,
 
+            /// The input types (the routine's signature).
             pub fn argOids(self: *const CreateRoutine, out: *[config.routine_args]u32) []const u32 {
-                for (self.args[0..self.arg_count], 0..) |arg, index| out[index] = arg.oid;
-                return out[0..self.arg_count];
+                var count: usize = 0;
+                for (self.args[0..self.arg_count]) |arg| {
+                    if (!inputMode(arg.mode)) continue;
+                    out[count] = arg.oid;
+                    count += 1;
+                }
+                return out[0..count];
+            }
+
+            pub fn outputCount(self: *const CreateRoutine) usize {
+                var count: usize = 0;
+                for (self.args[0..self.arg_count]) |arg| count += @intFromBool(outputMode(arg.mode));
+                return count;
             }
         };
 
@@ -93,7 +127,11 @@ pub fn Routines(comptime config: types.Config) type {
             has_schema: bool = false,
             schema: Name = .{},
             args: [config.routine_args]Span = @splat(.{}),
+            /// Named notation (`name => value`); empty when positional.
+            names: [config.routine_args]Name = @splat(.{}),
             arg_count: usize = 0,
+            /// The last argument is marked VARIADIC.
+            variadic: bool = false,
         };
 
         pub const AlterOwner = struct { routine: DropRoutine = .{}, owner: catalog_objects.Grantee = .{} };
@@ -340,12 +378,16 @@ pub fn Routines(comptime config: types.Config) type {
             return cursor.current.kind == .word;
         }
 
-        /// `[IN] [name] type`; OUT / INOUT / VARIADIC and DEFAULT are 0A000.
-        fn argument(cursor: *Cursor, pool: anytype, named: bool) Error!Arg {
-            if (cursor.is("out") or cursor.is("inout") or cursor.is("variadic")) return error.UnsupportedStatement;
-            if (cursor.is("in")) {
+        /// `[IN | OUT | INOUT | VARIADIC] [name] type [{DEFAULT | =} expr]`
+        /// (a DEFAULT only where `defaults` allows it: CREATE).
+        fn argument(cursor: *Cursor, pool: anytype, named: bool, defaults: bool) Error!Arg {
+            var mode: u8 = 'i';
+            if (cursor.is("in") or cursor.is("out") or cursor.is("inout") or cursor.is("variadic")) {
                 const next = try cursor.peek();
-                if (next.kind == .word or next.kind == .quoted_word) try cursor.advance();
+                if (next.kind == .word or next.kind == .quoted_word) {
+                    mode = if (cursor.is("in")) 'i' else if (cursor.is("out")) 'o' else if (cursor.is("inout")) 'b' else 'v';
+                    try cursor.advance();
+                }
             }
             var name: Name = .{};
             if (named) {
@@ -357,8 +399,84 @@ pub fn Routines(comptime config: types.Config) type {
             }
             var out = try typeAt(cursor, pool);
             out.name = name;
-            if (cursor.is("default") or cursor.symbol(.eq)) return error.UnsupportedStatement;
+            out.mode = mode;
+            if (cursor.is("default") or cursor.symbol(.eq)) {
+                if (!defaults) return error.Syntax;
+                try cursor.advance();
+                const begin = cursor.start();
+                var depth: usize = 0;
+                while (!cursor.atEnd()) {
+                    if (cursor.symbol(.lparen) or cursor.symbol(.lbracket)) depth += 1;
+                    if (cursor.symbol(.rparen) or cursor.symbol(.rbracket)) {
+                        if (depth == 0) break;
+                        depth -= 1;
+                    }
+                    if (depth == 0 and cursor.symbol(.comma)) break;
+                    try cursor.advance();
+                }
+                const end = cursor.start();
+                if (cursor.atEnd() or end == begin) return error.Syntax;
+                out.default = .{ .start = begin, .end = end };
+            }
             return out;
+        }
+
+        /// PostgreSQL's parameter-list rules (42P13): unique input names
+        /// and unique output names, one VARIADIC array as the last input,
+        /// DEFAULT only on inputs and on every input after the first one,
+        /// and a result type that agrees with the OUT parameters.
+        fn validateSignature(out: *CreateRoutine) Error!void {
+            const params = out.args[0..out.arg_count];
+            var seen_default = false;
+            var inputs: usize = 0;
+            var last_input: usize = 0;
+            for (params, 0..) |arg, index| {
+                if (inputMode(arg.mode)) {
+                    inputs += 1;
+                    last_input = index;
+                    if (arg.default.end != 0) seen_default = true else if (seen_default) return error.InvalidFunctionDefinition;
+                } else if (arg.default.end != 0) return error.InvalidFunctionDefinition;
+                if (arg.name.len != 0) for (params[0..index]) |other| {
+                    if (!types.same(other.name.slice(), arg.name.slice())) continue;
+                    if ((inputMode(arg.mode) and inputMode(other.mode)) or (outputMode(arg.mode) and outputMode(other.mode))) return error.InvalidFunctionDefinition;
+                };
+            }
+            for (params, 0..) |arg, index| {
+                if (arg.mode != 'v') continue;
+                if (index != last_input) return error.InvalidFunctionDefinition;
+                const data = types.typeFromOid(arg.oid) orelse return error.InvalidFunctionDefinition;
+                if (types.elementData(data) == null) return error.InvalidFunctionDefinition;
+            }
+            const outputs = out.outputCount();
+            if (out.procedure) {
+                if (outputs != 0) out.return_oid = routine_catalog.record_oid;
+                return;
+            }
+            var table = false;
+            for (params) |arg| table = table or arg.mode == 't';
+            if (table) {
+                for (params) |arg| if (arg.mode == 'o' or arg.mode == 'b') return error.InvalidFunctionDefinition;
+            }
+            if (outputs == 0) {
+                // RETURNS record needs OUT parameters (or a column list).
+                if (out.record) return error.UnsupportedStatement;
+                if (!out.returns) return error.InvalidFunctionDefinition;
+                return;
+            }
+            var first: Arg = .{};
+            for (params) |arg| if (outputMode(arg.mode)) {
+                first = arg;
+                break;
+            };
+            if (outputs == 1) {
+                if (out.returns and !table and (out.record or out.return_oid != first.oid)) return error.InvalidFunctionDefinition;
+                out.return_oid = first.oid;
+                out.return_typmod = first.typmod;
+            } else {
+                if (out.returns and !table and !out.record) return error.InvalidFunctionDefinition;
+                out.return_oid = routine_catalog.record_oid;
+                out.return_typmod = -1;
+            }
         }
 
         fn createRoutine(cursor: *Cursor, pool: anytype, out: *CreateRoutine) Error!void {
@@ -374,7 +492,7 @@ pub fn Routines(comptime config: types.Config) type {
             try cursor.expectSymbol(.lparen);
             if (!try cursor.takeSymbol(.rparen)) while (true) {
                 if (out.arg_count == config.routine_args) return error.ColumnCapacity;
-                out.args[out.arg_count] = try argument(cursor, pool, true);
+                out.args[out.arg_count] = try argument(cursor, pool, true, true);
                 out.arg_count += 1;
                 if (try cursor.takeSymbol(.rparen)) break;
                 try cursor.expectSymbol(.comma);
@@ -399,12 +517,33 @@ pub fn Routines(comptime config: types.Config) type {
                     }
                     if (returns or out.procedure) return error.Syntax;
                     returns = true;
+                    out.returns = true;
+                    if (try cursor.take("table")) {
+                        // RETURNS TABLE (name type, ...): TABLE columns.
+                        out.retset = true;
+                        try cursor.expectSymbol(.lparen);
+                        while (true) {
+                            if (out.arg_count == config.routine_args) return error.ColumnCapacity;
+                            var column: Arg = .{ .mode = 't', .name = try cursor.identifier() };
+                            const typed = try typeAt(cursor, pool);
+                            column.oid = typed.oid;
+                            column.typmod = typed.typmod;
+                            out.args[out.arg_count] = column;
+                            out.arg_count += 1;
+                            if (try cursor.takeSymbol(.rparen)) break;
+                            try cursor.expectSymbol(.comma);
+                        }
+                        continue;
+                    }
+                    if (try cursor.take("setof")) out.retset = true;
                     if (try cursor.take("trigger")) {
+                        if (out.retset) return error.InvalidFunctionDefinition;
                         out.return_oid = routine_catalog.trigger_oid;
                     } else if (try cursor.take("void")) {
                         out.return_oid = routine_catalog.void_oid;
-                    } else if (cursor.is("setof") or cursor.is("table") or cursor.is("record")) {
-                        return error.UnsupportedStatement;
+                    } else if (try cursor.take("record")) {
+                        out.record = true;
+                        out.return_oid = routine_catalog.record_oid;
                     } else {
                         const ret = try typeAt(cursor, pool);
                         out.return_oid = ret.oid;
@@ -442,8 +581,18 @@ pub fn Routines(comptime config: types.Config) type {
                     _ = try cursor.take("not");
                     try cursor.expect("leakproof");
                 } else if (try cursor.take("security")) {
-                    if (try cursor.take("definer")) return error.UnsupportedStatement;
-                    try cursor.expect("invoker");
+                    if (try cursor.take("definer")) {
+                        out.security_definer = true;
+                    } else try cursor.expect("invoker");
+                } else if (cursor.is("external")) {
+                    // [EXTERNAL] SECURITY { DEFINER | INVOKER }.
+                    try cursor.advance();
+                    try cursor.expect("security");
+                    if (try cursor.take("definer")) {
+                        out.security_definer = true;
+                    } else try cursor.expect("invoker");
+                } else if (try cursor.take("set")) {
+                    try settingClause(cursor, out);
                 } else if (try cursor.take("parallel")) {
                     if (!(try cursor.take("safe") or try cursor.take("unsafe") or try cursor.take("restricted"))) return error.Syntax;
                 } else if (cursor.is("cost") or cursor.is("rows")) {
@@ -456,15 +605,42 @@ pub fn Routines(comptime config: types.Config) type {
                     out.body.len = try cursor.string(&out.body.bytes);
                     // AS 'obj_file', 'link_symbol' (C functions) is outside the subset.
                     if (cursor.symbol(.comma)) return error.UnsupportedStatement;
-                } else if (cursor.is("return") or cursor.is("begin") or cursor.is("set") or cursor.is("window") or cursor.is("transform") or cursor.is("support")) {
+                } else if (cursor.is("return") or cursor.is("begin") or cursor.is("window") or cursor.is("transform") or cursor.is("support")) {
                     return error.UnsupportedStatement;
                 } else return error.Syntax;
             }
             try finish(cursor);
             if (!body) return error.InvalidFunctionDefinition;
             if (!language) return error.InvalidFunctionDefinition;
-            if (!out.procedure and !returns) return error.InvalidFunctionDefinition;
             if (out.procedure and (volatility or strictness)) return error.InvalidFunctionDefinition;
+            try validateSignature(out);
+        }
+
+        /// `SET name { TO | = } value [, ...]` or `SET name FROM CURRENT`
+        /// (0A000): kept as `name=value`, the value's source text.
+        fn settingClause(cursor: *Cursor, out: *CreateRoutine) Error!void {
+            const name = try cursor.anyIdentifier();
+            if (cursor.is("from")) return error.UnsupportedStatement;
+            if (!try cursor.take("to")) try cursor.expectSymbol(.eq);
+            const begin = cursor.start();
+            var end = begin;
+            while (true) {
+                _ = try cursor.takeSymbol(.minus);
+                const kind = cursor.current.kind;
+                if (kind != .word and kind != .quoted_word and kind != .string and kind != .integer and kind != .decimal) return error.Syntax;
+                end = cursor.after();
+                try cursor.advance();
+                if (!try cursor.takeSymbol(.comma)) break;
+            }
+            const value = std.mem.trim(u8, cursor.source[begin..end], " \t\r\n");
+            const length = name.len + 1 + value.len + 1;
+            if (out.settings_len + length > out.settings.len or out.setting_count == 255) return error.TextCapacity;
+            @memcpy(out.settings[out.settings_len..][0..name.len], name.slice());
+            out.settings[out.settings_len + name.len] = '=';
+            @memcpy(out.settings[out.settings_len + name.len + 1 ..][0..value.len], value);
+            out.settings[out.settings_len + length - 1] = 0;
+            out.settings_len += length;
+            out.setting_count += 1;
         }
 
         fn dropRoutine(cursor: *Cursor, pool: anytype, out: *DropRoutine) Error!void {
@@ -502,7 +678,14 @@ pub fn Routines(comptime config: types.Config) type {
                 out.has_args = true;
                 if (!try cursor.takeSymbol(.rparen)) while (true) {
                     if (out.arg_count == config.routine_args) return error.ColumnCapacity;
-                    out.args[out.arg_count] = (try argument(cursor, pool, true)).oid;
+                    // Only inputs identify a routine (OUT ones are skipped).
+                    const arg = try argument(cursor, pool, true, false);
+                    if (!inputMode(arg.mode)) {
+                        if (try cursor.takeSymbol(.rparen)) break;
+                        try cursor.expectSymbol(.comma);
+                        continue;
+                    }
+                    out.args[out.arg_count] = arg.oid;
                     out.arg_count += 1;
                     if (try cursor.takeSymbol(.rparen)) break;
                     try cursor.expectSymbol(.comma);
@@ -615,8 +798,22 @@ pub fn Routines(comptime config: types.Config) type {
             try cursor.expect("call");
             out.name = try qualifiedName(cursor, &out.has_schema, &out.schema);
             try cursor.expectSymbol(.lparen);
+            var named = false;
             if (!try cursor.takeSymbol(.rparen)) while (true) {
                 if (out.arg_count == config.routine_args) return error.ColumnCapacity;
+                // VARIADIC only on the last argument; no positional one
+                // after a named one (42601).
+                if (out.variadic) return error.Syntax;
+                if (cursor.is("variadic")) {
+                    try cursor.advance();
+                    out.variadic = true;
+                }
+                if (try namedAhead(cursor)) {
+                    out.names[out.arg_count] = try cursor.identifier();
+                    try cursor.advance();
+                    try cursor.advance();
+                    named = true;
+                } else if (named) return error.Syntax;
                 const begin = cursor.start();
                 if (cursor.symbol(.comma) or cursor.symbol(.rparen)) return error.Syntax;
                 const end = try argumentEnd(cursor);
@@ -626,6 +823,17 @@ pub fn Routines(comptime config: types.Config) type {
                 try cursor.expectSymbol(.comma);
             };
             try finish(cursor);
+        }
+
+        /// `name =>` or `name :=` (adjacent symbols) at the cursor.
+        fn namedAhead(cursor: *const Cursor) Error!bool {
+            if (cursor.current.kind != .word and cursor.current.kind != .quoted_word) return false;
+            var copy = cursor.tokens;
+            const second = try copy.next();
+            if (second.kind != .symbol or (second.symbol != .eq and second.symbol != .colon)) return false;
+            const third = try copy.next();
+            if (third.kind != .symbol or third.start != second.end) return false;
+            return (second.symbol == .eq and third.symbol == .gt) or (second.symbol == .colon and third.symbol == .eq);
         }
 
         fn doBlock(cursor: *Cursor, out: *DoBlock) Error!void {

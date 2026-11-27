@@ -2134,6 +2134,18 @@ pub fn Binder(comptime config: types.Config) type {
             }
             // Built by linkAggregateInput with typed members (B11).
             if (n.func == .aggregate_input) return;
+            // Named notation and VARIADIC reach user routines only (B11
+            // wave 4; built-in functions have no parameter names here).
+            if (n.func == .none and n.window == none and !n.within_group and n.order == none and namedArguments(context, n)) {
+                if (n.distinct or n.c != none or n.star) return error.UndefinedFunction;
+                var count: usize = 0;
+                var item = n.b;
+                while (item != none) : (item = context.node(item).next) {
+                    try typeExpr(context, scope, item);
+                    count += 1;
+                }
+                return bindRoutineCall(context, n, count);
+            }
             if (n.within_group) return typeOrderedSet(context, scope, n);
             if (n.order != none) {
                 // Aggregate ORDER BY is not implemented for window functions;
@@ -4038,6 +4050,15 @@ pub fn Binder(comptime config: types.Config) type {
                 .row_constructor => return error.UnsupportedStatement,
                 // Internal comparison lists have already bound every field.
                 .row_compare, .row_in => { n.ty = .boolean; n.constant = isConstant(context, n.a) and listConstant(context, n.b); },
+                // A named or VARIADIC call argument: typed through its value;
+                // bindRoutineCall unwraps it (B11 wave 4).
+                .named_argument => {
+                    try typeExpr(context, scope, n.a);
+                    const inner = context.node(n.a);
+                    n.ty = inner.ty;
+                    n.typmod = inner.typmod;
+                    n.constant = false;
+                },
                 .function => try typeFunction(context, scope, n),
                 .when_arm => unreachable,
                 .column => {
@@ -5327,44 +5348,50 @@ pub fn Binder(comptime config: types.Config) type {
             if (path.len == 0) return error.UndefinedFunction;
             const set = context.routines orelse return error.UndefinedFunction;
             const name = toName(context, n.name);
+            // The supplied arguments (B11 wave 4: named notation, VARIADIC).
+            if (count > config.routine_args) return error.UndefinedFunction;
+            var supplied: [config.routine_args]RC.Supplied = undefined;
+            var values: [config.routine_args]u16 = undefined;
+            var variadic_call = false;
+            var item = n.b;
+            var position: usize = 0;
+            while (item != none) : ({
+                item = context.node(item).next;
+                position += 1;
+            }) {
+                const arg = context.node(item);
+                var value_id = item;
+                supplied[position] = .{};
+                if (arg.kind == .named_argument) {
+                    value_id = arg.a;
+                    if (arg.name.len != 0) {
+                        supplied[position].name = toName(context, arg.name);
+                        // `name => a, name => b` (42601).
+                        for (supplied[0..position]) |earlier| if (earlier.name.len != 0 and types.same(earlier.name.slice(), supplied[position].name.slice())) return error.Syntax;
+                    }
+                    if (arg.integer == 1) variadic_call = true;
+                }
+                values[position] = value_id;
+                const value_node = context.node(value_id);
+                supplied[position].ty = value_node.ty;
+                supplied[position].unknown = value_node.ty == .unknown;
+            }
             var best: ?usize = null;
-            var best_exact: usize = 0;
+            var best_match: RC.Match = .{};
             var ambiguous = false;
+            var params: [config.routine_args]RC.Param = undefined;
+            var candidate: RC.Match = undefined;
             for (&set.routines, 0..) |*routine, index| {
                 if (!routine.live or !routine.stamp.visible(context.snapshot)) continue;
-                if (!types.same(routine.name.slice(), name.slice()) or routine.arg_count != count) continue;
+                if (!types.same(routine.name.slice(), name.slice())) continue;
                 if (routineHidden(set, index, path, context.snapshot)) continue;
-                var exact: usize = 0;
-                var accepted = true;
-                var item = n.b;
-                var position: usize = 0;
-                while (item != none) : ({
-                    item = context.node(item).next;
-                    position += 1;
-                }) {
-                    const from = context.node(item).ty;
-                    const data = types.typeFromOid(routine.arg_oids[position]) orelse {
-                        accepted = false;
-                        break;
-                    };
-                    const to = types.typeOfData(data);
-                    // An exact type counts most; an untyped literal prefers
-                    // the string category's preferred type (text).
-                    if (from == to) {
-                        exact += 2;
-                    } else if (from == .unknown) {
-                        if (to == .text) exact += 1;
-                    } else if (!value.castable(from, to, .implicit)) {
-                        accepted = false;
-                        break;
-                    }
-                }
-                if (!accepted) continue;
-                if (best == null or exact > best_exact) {
+                const param_count = RC.callParams(routine, false, &params);
+                if (!RC.matchCall(params[0..param_count], supplied[0..count], variadic_call, &candidate)) continue;
+                if (best == null or RC.betterMatch(&candidate, &best_match)) {
                     best = index;
-                    best_exact = exact;
+                    best_match = candidate;
                     ambiguous = false;
-                } else if (exact == best_exact) ambiguous = true;
+                } else if (!RC.betterMatch(&best_match, &candidate)) ambiguous = true;
             }
             const chosen = best orelse return error.UndefinedFunction;
             if (ambiguous) return error.AmbiguousFunction;
@@ -5372,19 +5399,35 @@ pub fn Binder(comptime config: types.Config) type {
             // A procedure is CALLed (42809); trigger functions only fire (0A000).
             if (routine.kind == 'p') return error.WrongObjectType;
             if (routine.return_oid == routine_catalog.trigger_oid) return error.UnsupportedStatement;
+            // A record (several OUT parameters) or a set has no scalar
+            // value here; FROM binds them as table functions (0A000).
+            if (routine.retset or routine.return_oid == routine_catalog.record_oid) return error.UnsupportedStatement;
             const result = types.typeFromOid(routine.return_oid) orelse return error.UnsupportedStatement;
+            // One bound argument per input, in parameter order: converted
+            // values, a DEFAULT placeholder, or ARRAY[...] of the variadic
+            // elements.
             var head: u16 = none;
             var tail: u16 = none;
-            var item = n.b;
-            var position: usize = 0;
-            while (item != none) : (position += 1) {
-                const next = context.node(item).next;
-                const to = types.typeOfData(types.typeFromOid(routine.arg_oids[position]) orelse return error.UndefinedFunction);
-                const converted = try convert(context, item, to, -1, .implicit);
-                context.node(converted).next = none;
-                if (tail == none) head = converted else context.node(tail).next = converted;
-                tail = converted;
-                item = next;
+            for (0..routine.arg_count) |input| {
+                const to = types.typeOfData(types.typeFromOid(routine.arg_oids[input]) orelse return error.UndefinedFunction);
+                const slot = best_match.slots[input];
+                const bound: u16 = if (slot == RC.default_slot)
+                    try context.pool.add(.{ .kind = .default_value, .ty = to, .constant = false })
+                else if (slot == RC.expanded_slot) blk: {
+                    const element = types.elementType(to) orelse return error.UndefinedFunction;
+                    const array = try context.pool.add(.{ .kind = .function, .func = .array_constructor, .name = n.name, .ty = to, .constant = false });
+                    var element_tail: u16 = none;
+                    for (values[best_match.expand_from..count]) |value_id| {
+                        const converted = try convert(context, value_id, element, -1, .implicit);
+                        context.node(converted).next = none;
+                        if (element_tail == none) context.node(array).b = converted else context.node(element_tail).next = converted;
+                        element_tail = converted;
+                    }
+                    break :blk array;
+                } else try convert(context, values[slot], to, -1, .implicit);
+                context.node(bound).next = none;
+                if (tail == none) head = bound else context.node(tail).next = bound;
+                tail = bound;
             }
             n.b = head;
             n.func = .routine;
@@ -5392,6 +5435,14 @@ pub fn Binder(comptime config: types.Config) type {
             n.ty = types.typeOfData(result);
             n.typmod = routine.return_typmod;
             n.constant = false;
+        }
+
+        fn namedArguments(context: *const Context, n: *const ast.Node) bool {
+            var item = n.b;
+            while (item != none) : (item = context.node(item).next) {
+                if (context.node(item).kind == .named_argument) return true;
+            }
+            return false;
         }
 
         /// A routine found through `path` is hidden by one with the same

@@ -365,9 +365,10 @@ fn sqlFunctions() !void {
     try fails("CREATE FUNCTION bad6() RETURNS INT LANGUAGE plperl AS 'return 1'", error.UndefinedObject);
     try fails("CREATE FUNCTION bad7() RETURNS trigger LANGUAGE SQL AS 'SELECT 1'", error.InvalidFunctionDefinition);
     try fails("CREATE FUNCTION bad8() RETURNS INT LANGUAGE SQL AS 'COMMIT'", error.UnsupportedStatement);
-    try fails("CREATE FUNCTION bad9(OUT x INT) LANGUAGE SQL AS 'SELECT 1'", error.UnsupportedStatement);
-    try fails("CREATE FUNCTION bad10(x INT DEFAULT 1) RETURNS INT LANGUAGE SQL AS 'SELECT x'", error.UnsupportedStatement);
-    try fails("CREATE FUNCTION bad11() RETURNS SETOF INT LANGUAGE SQL AS 'SELECT 1'", error.UnsupportedStatement);
+    // Parameter-list rules (B11 wave 4 supports OUT, DEFAULT and VARIADIC).
+    try fails("CREATE FUNCTION bad9(OUT x INT) RETURNS TEXT LANGUAGE SQL AS 'SELECT 1'", error.InvalidFunctionDefinition);
+    try fails("CREATE FUNCTION bad10(x INT DEFAULT 1, y INT) RETURNS INT LANGUAGE SQL AS 'SELECT x'", error.InvalidFunctionDefinition);
+    try fails("CREATE FUNCTION bad11(VARIADIC x INT) RETURNS INT LANGUAGE SQL AS 'SELECT 1'", error.InvalidFunctionDefinition);
     try fails("CREATE FUNCTION bad12() RETURNS INT LANGUAGE SQL STRICT STRICT AS 'SELECT 1'", error.Syntax);
     // OR REPLACE keeps the OID; the result type and names cannot change.
     try expect("SELECT oid FROM pg_proc WHERE proname = 'add1'", "16388");
