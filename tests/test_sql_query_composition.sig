@@ -526,6 +526,8 @@ fn cteMaterialization() !void {
 // ---- PG.JOIN.LATERAL ------------------------------------------------------
 
 fn lateralJoins() !void {
+    // With forced-copy storage, the sorter must keep left and right keys live independently.
+    try expect("SELECT id,v+1 FROM tdd_a WHERE id>0 ORDER BY g DESC,v+1 ASC NULLS LAST,id DESC LIMIT 4", "3|31;4|NULL;1|11;2|21");
     // oracle
     try expectTyped("SELECT a.id,x.v FROM tdd_a a CROSS JOIN LATERAL (SELECT a.id+1 AS v) x ORDER BY a.id", "id:23,v:23", "1|2;2|3;3|4;4|5");
     try expect("SELECT a.id,x.c FROM tdd_a a, LATERAL (SELECT COUNT(*) AS c FROM tdd_b b WHERE b.id<=a.id) x ORDER BY a.id", "1|1;2|1;3|2;4|2");

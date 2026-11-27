@@ -40,6 +40,8 @@ pub fn Exec(comptime config: types.Config) type {
         pub const List = struct { start: u32 = 0, count: u32 = 0 };
 
         const Tuples = struct { start: u32, count: u32, width: u32 };
+        // A tuple keeps its sources live together while expressions evaluate.
+        const TupleRows = [config.relations]S.VersionRowScratch;
 
         const CteRun = struct {
             state: enum { idle, iterating, done } = .idle,
@@ -452,16 +454,16 @@ pub fn Exec(comptime config: types.Config) type {
                 return list;
             }
 
-            fn rowOf(self: *const Query, source: *const B.Source, handle: u32) [*]const V.Cell {
-                if (source.table) |index| return &self.tables[index].versions[handle].cells;
+            fn rowOf(self: *const Query, source: *const B.Source, handle: u32, scratch: *S.VersionRowScratch) [*]const V.Cell {
+                if (source.table) |index| return S.borrowVersionRow(&self.tables[index], handle, scratch);
                 return self.row(handle);
             }
 
-            fn setTuple(self: *const Query, p: *const B.Plan, ctx: *E.Context, tuples: Tuples, index: usize) void {
+            fn setTuple(self: *const Query, p: *const B.Plan, ctx: *E.Context, rows: *TupleRows, tuples: Tuples, index: usize) void {
                 const base = tuples.start + index * tuples.width;
                 for (0..tuples.width) |position| {
                     const handle = self.work.refs[base + position];
-                    ctx.tuple[position] = if (handle == absent) null else self.rowOf(&p.sources[position], handle);
+                    ctx.tuple[position] = if (handle == absent) null else self.rowOf(&p.sources[position], handle, &rows[position]);
                 }
             }
 
@@ -527,6 +529,7 @@ pub fn Exec(comptime config: types.Config) type {
             fn join(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!Tuples {
                 if (p.general_join) return self.joinGeneral(p, outer);
                 var ctx = self.context(outer);
+                var tuple_rows: TupleRows = undefined;
                 if (p.source_count == 0) {
                     const kept = try keep(&ctx, p.where, null);
                     return .{ .start = @intCast(self.work.ref_low), .count = @intFromBool(kept), .width = 0 };
@@ -547,7 +550,7 @@ pub fn Exec(comptime config: types.Config) type {
                     }
                     var next: Tuples = .{ .start = @intCast(self.work.ref_low), .count = 0, .width = @intCast(stage + 1) };
                     for (0..current.count) |index| {
-                        self.setTuple(p, &ctx, current, index);
+                        self.setTuple(p, &ctx, &tuple_rows, current, index);
                         var any = false;
                         if (probing) {
                             ctx.row = null;
@@ -555,7 +558,7 @@ pub fn Exec(comptime config: types.Config) type {
                             if (key != .null_value) {
                                 const table = &self.tables[source.table.?];
                                 if (S.lookupKeyAt(table, &key, self.snap)) |slot| if (S.visibleAt(table, slot, self.snap)) |version| {
-                                    ctx.tuple[stage] = &table.versions[version].cells;
+                                    ctx.tuple[stage] = S.borrowVersionRow(table, version, &tuple_rows[stage]);
                                     if (source.on == none or (try E.truth(&ctx, source.on)) == true) {
                                         any = true;
                                         if (try self.joinKeep(&ctx, p.where, stage, last, early)) try self.emit(&next, current, index, version);
@@ -564,7 +567,7 @@ pub fn Exec(comptime config: types.Config) type {
                             }
                         } else for (self.handles(rows), 0..) |handle, position| {
                             try self.session.checkpoint();
-                            ctx.tuple[stage] = self.rowOf(source, handle);
+                            ctx.tuple[stage] = self.rowOf(source, handle, &tuple_rows[stage]);
                             if (stage != 0 and source.on != none and (try E.truth(&ctx, source.on)) != true) continue;
                             any = true;
                             if (tracks) self.work.refs[matched + position] = 1;
@@ -579,7 +582,7 @@ pub fn Exec(comptime config: types.Config) type {
                         for (self.handles(rows), 0..) |handle, position| {
                             if (self.work.refs[matched + position] != 0) continue;
                             for (0..stage) |slot| ctx.tuple[slot] = null;
-                            ctx.tuple[stage] = self.rowOf(source, handle);
+                            ctx.tuple[stage] = self.rowOf(source, handle, &tuple_rows[stage]);
                             if (try self.joinKeep(&ctx, p.where, stage, last, early)) try self.emit(&next, current, null, handle);
                         }
                     }
@@ -598,12 +601,13 @@ pub fn Exec(comptime config: types.Config) type {
             /// tree. No probe, early filter or streamed path applies.
             fn joinGeneral(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!Tuples {
                 var ctx = self.context(outer);
-                const tree = try self.joinRange(p, &ctx, outer, 0, p.source_count - 1);
+                var tuple_rows: TupleRows = undefined;
+                const tree = try self.joinRange(p, &ctx, &tuple_rows, outer, 0, p.source_count - 1);
                 if (p.where == none) return tree;
                 var out: Tuples = .{ .start = @intCast(self.work.ref_low), .count = 0, .width = tree.width };
                 for (0..tree.count) |index| {
                     try self.session.checkpoint();
-                    self.setTuple(p, &ctx, tree, index);
+                    self.setTuple(p, &ctx, &tuple_rows, tree, index);
                     if (try keep(&ctx, p.where, null)) try self.emitPair(&out, tree, index, tree, null, tree.width);
                 }
                 return out;
@@ -611,13 +615,13 @@ pub fn Exec(comptime config: types.Config) type {
 
             /// Items first..last joined left-deep; each later operand is one
             /// item or a parenthesized group (Source.group_end).
-            fn joinRange(self: *Query, p: *const B.Plan, ctx: *E.Context, outer: ?*const E.Context, first: usize, last: usize) Error!Tuples {
+            fn joinRange(self: *Query, p: *const B.Plan, ctx: *E.Context, tuple_rows: *TupleRows, outer: ?*const E.Context, first: usize, last: usize) Error!Tuples {
                 var current = try self.leafTuples(p, first, try self.sourceRows(&p.sources[first], outer));
                 var next = first + 1;
                 while (next <= last) {
                     const end: usize = if (p.sources[next].group_end != none) p.sources[next].group_end else next;
                     if (end < next or end > last) return error.UnsupportedStatement;
-                    current = try self.joinStep(p, ctx, outer, current, next, end);
+                    current = try self.joinStep(p, ctx, tuple_rows, outer, current, next, end);
                     next = end + 1;
                 }
                 return current;
@@ -652,17 +656,17 @@ pub fn Exec(comptime config: types.Config) type {
                 out.count += 1;
             }
 
-            fn setSlots(self: *const Query, p: *const B.Plan, ctx: *E.Context, tuples: Tuples, index: usize, first: usize, last: usize) void {
+            fn setSlots(self: *const Query, p: *const B.Plan, ctx: *E.Context, rows: *TupleRows, tuples: Tuples, index: usize, first: usize, last: usize) void {
                 const base = tuples.start + index * tuples.width;
                 for (first..last + 1) |slot| {
                     const handle = self.work.refs[base + slot];
-                    ctx.tuple[slot] = if (handle == absent) null else self.rowOf(&p.sources[slot], handle);
+                    ctx.tuple[slot] = if (handle == absent) null else self.rowOf(&p.sources[slot], handle, &rows[slot]);
                 }
             }
 
             /// Joins the operand of items j..end (the item's join kind and
             /// condition) to `left`.
-            fn joinStep(self: *Query, p: *const B.Plan, ctx: *E.Context, outer: ?*const E.Context, left: Tuples, j: usize, end: usize) Error!Tuples {
+            fn joinStep(self: *Query, p: *const B.Plan, ctx: *E.Context, tuple_rows: *TupleRows, outer: ?*const E.Context, left: Tuples, j: usize, end: usize) Error!Tuples {
                 const source = &p.sources[j];
                 const width: u32 = @intCast(p.source_count);
                 const lateral = source.lateral and end == j;
@@ -673,14 +677,14 @@ pub fn Exec(comptime config: types.Config) type {
                 if (lateral) {
                     lists = try self.refs(@as(usize, left.count) * 2);
                     for (0..left.count) |index| {
-                        self.setTuple(p, ctx, left, index);
+                        self.setTuple(p, ctx, tuple_rows, left, index);
                         const rows = try self.run(source.plan, ctx);
                         self.work.refs[lists + index * 2] = rows.start;
                         self.work.refs[lists + index * 2 + 1] = rows.count;
                     }
                 } else if (end == j) {
                     right = try self.leafTuples(p, j, try self.sourceRows(source, outer));
-                } else right = try self.joinRange(p, ctx, outer, j, end);
+                } else right = try self.joinRange(p, ctx, tuple_rows, outer, j, end);
                 const tracks = source.join == .right or source.join == .full;
                 if (lateral and tracks) return error.InvalidColumnReference;
                 const outer_join = source.join == .left or source.join == .full;
@@ -696,8 +700,8 @@ pub fn Exec(comptime config: types.Config) type {
                         const rows: List = .{ .start = self.work.refs[lists + li * 2], .count = self.work.refs[lists + li * 2 + 1] };
                         for (self.handles(rows)) |handle| {
                             try self.session.checkpoint();
-                            self.setTuple(p, ctx, left, li);
-                            ctx.tuple[j] = self.rowOf(source, handle);
+                            self.setTuple(p, ctx, tuple_rows, left, li);
+                            ctx.tuple[j] = self.rowOf(source, handle, &tuple_rows[j]);
                             if (source.on != none and (try E.truth(ctx, source.on)) != true) continue;
                             any = true;
                             try self.emitPair(&out, left, li, left, null, width);
@@ -705,8 +709,8 @@ pub fn Exec(comptime config: types.Config) type {
                         }
                     } else for (0..right.count) |ri| {
                         try self.session.checkpoint();
-                        self.setTuple(p, ctx, left, li);
-                        self.setSlots(p, ctx, right, ri, j, end);
+                        self.setTuple(p, ctx, tuple_rows, left, li);
+                        self.setSlots(p, ctx, tuple_rows, right, ri, j, end);
                         if (source.on != none and (try E.truth(ctx, source.on)) != true) continue;
                         any = true;
                         if (tracks) self.work.refs[matched + ri] = 1;
@@ -733,13 +737,14 @@ pub fn Exec(comptime config: types.Config) type {
 
             fn project(self: *Query, p: *const B.Plan, tuples: Tuples, outer: ?*const E.Context) Error!List {
                 var ctx = self.context(outer);
+                var tuple_rows: TupleRows = undefined;
                 var out: List = .{ .start = @intCast(self.work.ref_low) };
                 // Without sorting, stop once OFFSET + LIMIT rows exist.
                 const lazy = p.order_count == 0 and p.distinct == .none;
                 const wanted: u64 = if (p.limit > 0xffffffffffffffff - p.offset) 0xffffffffffffffff else p.offset + p.limit;
                 for (0..tuples.count) |index| {
                     if (lazy and out.count >= wanted) break;
-                    self.setTuple(p, &ctx, tuples, index);
+                    self.setTuple(p, &ctx, &tuple_rows, tuples, index);
                     try self.projectRow(p, &ctx, &out);
                 }
                 return out;
@@ -775,11 +780,12 @@ pub fn Exec(comptime config: types.Config) type {
             /// one group, even over no rows.
             fn group(self: *Query, p: *const B.Plan, tuples: Tuples, outer: ?*const E.Context) Error!List {
                 var ctx = self.context(outer);
+                var tuple_rows: TupleRows = undefined;
                 const n = tuples.count;
                 const key_width: u32 = @intCast(p.key_count);
                 const keys = try self.cells(@as(usize, n) * key_width);
                 for (0..n) |index| {
-                    self.setTuple(p, &ctx, tuples, index);
+                    self.setTuple(p, &ctx, &tuple_rows, tuples, index);
                     for (p.keys[0..p.key_count], 0..) |key, column| self.work.cells[keys + index * key_width + column] = try E.eval(&ctx, key);
                 }
                 const order = try self.refs(n);
@@ -1150,11 +1156,12 @@ pub fn Exec(comptime config: types.Config) type {
                 var tickets: u32 = undefined;
                 var transitions: [config.columns]Transition = undefined;
                 const prepared = self.prepareTransitions(p, transitions[0..p.agg_count]);
+                var version_row: S.VersionRowScratch = undefined;
                 for (0..table.row_high) |slot| {
                     try self.session.checkpoint();
                     const version = S.visibleAt(table, slot, self.snap) orelse continue;
                     self.work.stream_stats.rows += 1;
-                    const source_cells = &table.versions[version].cells;
+                    const source_cells = S.borrowVersionRow(table, version, &version_row);
                     ctx.tuple[0] = source_cells;
                     if (!try keep(&ctx, p.where, null)) continue;
                     if (groups == 0) {
@@ -1438,6 +1445,7 @@ pub fn Exec(comptime config: types.Config) type {
             /// Consume visible base-table versions directly. State grows with
             /// groups, not scanned rows. All output remains private until the
             const StreamCursor=struct {
+                version_rows: TupleRows = undefined,
                 next:usize=0,
                 high:usize=0,
                 columns:?u64=null,
@@ -1634,7 +1642,7 @@ pub fn Exec(comptime config: types.Config) type {
                     return &cursor.row;
                 };
                 const version=S.visibleAt(table,slot,self.snap) orelse return null;
-                return &table.versions[version].cells;
+                return S.borrowVersionRow(table, version, &cursor.version_rows[0]);
             }
 
             /// Scan one fact row and resolve unique-key inner dimensions using
@@ -1696,7 +1704,7 @@ pub fn Exec(comptime config: types.Config) type {
                         const dimension=&self.tables[source.table.?];
                         self.work.stream_stats.dimension_probes+=1;
                         const visible=S.lookupVersionAt(dimension,key,self.snap) orelse continue :scan;
-                        ctx.tuple[stage]=&dimension.versions[visible].cells;
+                        ctx.tuple[stage]=S.borrowVersionRow(dimension,visible,&cursor.version_rows[stage]);
                         if(source.on!=none and (try E.truth(ctx,source.on))!=true) continue :scan;
                         if(stage+1<p.source_count and early and !try self.earlyKeep(ctx,p.where,stage)) continue :scan;
                     }
@@ -1810,6 +1818,7 @@ pub fn Exec(comptime config: types.Config) type {
                     }
                 }
                 var ctx=self.context(outer);var fact:[config.columns]V.Cell=undefined;
+                var tuple_rows: TupleRows = undefined;
                 var key_cells:[config.columns]*const V.Cell=undefined;
                 for(0..span) |key_index| {
                     const input=partial+key_index*stride;if(factorRows(input).*==0) continue;
@@ -1823,7 +1832,7 @@ pub fn Exec(comptime config: types.Config) type {
                         self.work.stream_stats.dimension_probes+=1;
                         const dimension=&self.tables[source.table.?];
                         const visible=S.lookupVersionAt(dimension,key,self.snap) orelse {matched=false;break;};
-                        ctx.tuple[stage]=&dimension.versions[visible].cells;
+                        ctx.tuple[stage]=S.borrowVersionRow(dimension,visible,&tuple_rows[stage]);
                         if(source.on!=none and (try E.truth(&ctx,source.on))!=true) {matched=false;break;}
                     }
                     if(!matched) continue;
@@ -2009,6 +2018,7 @@ pub fn Exec(comptime config: types.Config) type {
                     }
                 }
                 var ctx=self.context(outer);var producer_cells:[config.columns]V.Cell=undefined;var key_cells:[config.columns]*const V.Cell=undefined;
+                var dimension_row: S.VersionRowScratch = undefined;
                 for(partial,0..) |*value,index| {
                     if(value.rows==0) continue;try self.session.checkpoint();self.work.stream_stats.nested_factor_keys+=1;
                     const key_value:i64=@intCast(@as(i128,bounds.low)+index);var keep_key=true;
@@ -2021,7 +2031,7 @@ pub fn Exec(comptime config: types.Config) type {
                     producer_cells[probe.column]=.{.integer=key_value};ctx.row=null;ctx.tuple[0]=&producer_cells;
                     self.work.stream_stats.dimension_probes+=1;
                     const visible=S.lookupVersionAt(dimension,&producer_cells[probe.column],self.snap) orelse continue;
-                    ctx.tuple[1]=&dimension.versions[visible].cells;
+                    ctx.tuple[1]=S.borrowVersionRow(dimension,visible,&dimension_row);
                     if(p.sources[1].on!=none and (try E.truth(&ctx,p.sources[1].on))!=true) continue;
                     var hash:usize=2166136261;
                     for(p.keys[0..p.key_count],0..) |id,column| {key_cells[column]=E.columnRef(&ctx,&self.pool.nodes[id]);hash=(hash^(if(key_cells[column].*==.null_value) @as(usize,0x9e3779b9) else V.hash(key_cells[column])))*%16777619;}
@@ -2255,6 +2265,7 @@ pub fn Exec(comptime config: types.Config) type {
                 const buckets=try self.refs(slots);@memset(self.work.refs[buckets..][0..slots],absent);
                 const dictionary=try self.refs(capacity);var group_ids:usize=0;
                 var ctx=self.context(null);var fact:[config.columns]V.Cell=undefined;ctx.row=null;ctx.tuple[0]=&fact;
+                var tuple_rows: TupleRows = undefined;
                 const label=self.pool.nodes[label_id];
                 for(0..key_span) |index| {
                     try self.session.checkpoint();self.work.stream_stats.dimension_group_keys+=1;
@@ -2267,7 +2278,7 @@ pub fn Exec(comptime config: types.Config) type {
                         self.work.stream_stats.dimension_probes+=1;
                         const dimension=&self.tables[source.table.?];
                         const visible=S.lookupVersionAt(dimension,key,self.snap) orelse {matched=false;break;};
-                        ctx.tuple[stage]=&dimension.versions[visible].cells;
+                        ctx.tuple[stage]=S.borrowVersionRow(dimension,visible,&tuple_rows[stage]);
                         if(source.on!=none and (try E.truth(&ctx,source.on))!=true) {matched=false;break;}
                     }
                     if(!matched) continue;
@@ -2836,6 +2847,7 @@ pub fn Exec(comptime config: types.Config) type {
             /// DISTINCT runs collapsed, and the fold runs in order.
             fn collectAggregate(self: *Query, p: *const B.Plan, agg: *const B.Agg, tuples: Tuples, order: u32, first: usize, end: usize, outer: ?*const E.Context) Error!V.Cell {
                 var ctx = self.context(outer);
+                var tuple_rows: TupleRows = undefined;
                 const at = self.mark();
                 defer self.release(at);
                 var members: [28]u16 = undefined;
@@ -2856,14 +2868,14 @@ pub fn Exec(comptime config: types.Config) type {
                 const key_base = if (ordered_set) 0 else layout.values;
                 var direct_values: [24]V.Cell = undefined;
                 if (ordered_set) {
-                    if (first < end) self.setTuple(p, &ctx, tuples, self.work.refs[order + first]);
+                    if (first < end) self.setTuple(p, &ctx, &tuple_rows, tuples, self.work.refs[order + first]);
                     for (members[0..direct], 0..) |id, index| direct_values[index] = try E.eval(&ctx, id);
                 }
                 const C = collect_module.Collect(config);
                 const hypothetical = @intFromEnum(agg.kind) >= @intFromEnum(ast.Agg.hypothetical_rank);
                 var rows: List = .{ .start = @intCast(self.work.ref_low) };
                 for (first..end) |position| {
-                    self.setTuple(p, &ctx, tuples, self.work.refs[order + position]);
+                    self.setTuple(p, &ctx, &tuple_rows, tuples, self.work.refs[order + position]);
                     if (agg.filter != none and (try E.truth(&ctx, agg.filter)) != true) continue;
                     const slot = try self.cells(width);
                     for (members[direct..][0..width], 0..) |id, column| self.work.cells[slot + column] = try E.eval(&ctx, id);
@@ -2960,12 +2972,13 @@ pub fn Exec(comptime config: types.Config) type {
             fn aggregate(self: *Query, p: *const B.Plan, agg: *const B.Agg, tuples: Tuples, order: u32, first: usize, end: usize, outer: ?*const E.Context) Error!V.Cell {
                 if (ast.collectingAggregate(agg.kind) or self.inputNode(agg.arg)) return self.collectAggregate(p, agg, tuples, order, first, end, outer);
                 var ctx = self.context(outer);
+                var tuple_rows: TupleRows = undefined;
                 var acc: Accumulator = .{};
                 const at = self.mark();
                 defer self.release(at);
                 var values: List = .{ .start = @intCast(self.work.ref_low) };
                 for (first..end) |position| {
-                    self.setTuple(p, &ctx, tuples, self.work.refs[order + position]);
+                    self.setTuple(p, &ctx, &tuple_rows, tuples, self.work.refs[order + position]);
                     if (agg.filter != none and (try E.truth(&ctx, agg.filter)) != true) continue;
                     if (agg.kind == .count_star) {
                         acc.count += 1;
@@ -3138,7 +3151,7 @@ pub fn Exec(comptime config: types.Config) type {
                 if(streamed) self.prepareStreamCursor(p,&cursor,early);
                 while(true) {
                     if(streamed) {if(!try self.nextStreamTuple(p,&ctx,&cursor,early)) break;}
-                    else {if(row_index==tuples.count) break;try self.session.checkpoint();self.setTuple(p,&ctx,tuples,row_index);row_index+=1;}
+                    else {if(row_index==tuples.count) break;try self.session.checkpoint();self.setTuple(p,&ctx,&cursor.version_rows,tuples,row_index);row_index+=1;}
                     for(p.keys[0..p.key_count],0..) |id,index| keys[index]=try E.eval(&ctx,id);
                     var values:[config.columns]V.Cell=undefined;var allowed:[config.columns]bool=@splat(false);
                     for(p.aggs[0..p.agg_count],0..) |agg,index| {
@@ -3262,9 +3275,10 @@ pub fn Exec(comptime config: types.Config) type {
                     if (mask == 0) _ = try self.groupingSetRecord(p, keys[0..p.key_count], set, 0, buckets, slots, tickets, &groups, capacity, record_cells, ordinary_cells, &distinct);
                 }
                 var ctx = self.context(outer);
+                var tuple_rows: TupleRows = undefined;
                 for (0..tuples.count) |row_index| {
                     try self.session.checkpoint();
-                    self.setTuple(p, &ctx, tuples, row_index);
+                    self.setTuple(p, &ctx, &tuple_rows, tuples, row_index);
                     for (p.keys[0..p.key_count], 0..) |id, index| keys[index] = try E.eval(&ctx, id);
                     var values: [config.columns]V.Cell = undefined;
                     var allowed: [config.columns]bool = @splat(false);
@@ -4223,6 +4237,7 @@ pub fn Exec(comptime config: types.Config) type {
             ctx: *E.Context,
             table: *const S.Table,
             query: *const B.Select,
+            row_scratch: *S.VersionRowScratch,
 
             pub fn order(self: *const Sorter, left: u32, right: u32) Error!i8 {
                 try self.ctx.session.checkpoint();
@@ -4230,13 +4245,13 @@ pub fn Exec(comptime config: types.Config) type {
                     const node = &self.ctx.pool.nodes[key.expr];
                     var av: V.Cell = undefined;
                     var bv: V.Cell = undefined;
-                    const a: *const V.Cell = if (node.kind == .column) &self.table.versions[left].cells[node.column] else blk: {
-                        self.ctx.row = &self.table.versions[left].cells;
+                    const a: *const V.Cell = if (node.kind == .column) S.borrowVersionCell(self.table, left, node.column, &av) else blk: {
+                        self.ctx.row = S.borrowVersionRow(self.table, left, self.row_scratch);
                         av = try E.eval(self.ctx, key.expr);
                         break :blk &av;
                     };
-                    const b: *const V.Cell = if (node.kind == .column) &self.table.versions[right].cells[node.column] else blk: {
-                        self.ctx.row = &self.table.versions[right].cells;
+                    const b: *const V.Cell = if (node.kind == .column) S.borrowVersionCell(self.table, right, node.column, &bv) else blk: {
+                        self.ctx.row = S.borrowVersionRow(self.table, right, self.row_scratch);
                         bv = try E.eval(self.ctx, key.expr);
                         break :blk &bv;
                     };
@@ -4308,7 +4323,7 @@ pub fn Exec(comptime config: types.Config) type {
         /// cached ranks. The heap moves only slot IDs; one spare key slot is
         /// recycled on rejection/replacement. NULL placement and stable row-slot
         /// order match Sorter/StableSorter. Keep this stack frame off point reads.
-        noinline fn integerTopK(ctx: *E.Context, table: *const S.Table, query: *const B.Select, snap: storage.Snapshot, indices: []u32, committed_only: bool, stats: *ReadStats) Error!usize {
+        noinline fn integerTopK(ctx: *E.Context, table: *const S.Table, row_scratch: *S.VersionRowScratch, query: *const B.Select, snap: storage.Snapshot, indices: []u32, committed_only: bool, stats: *ReadStats) Error!usize {
             var entries: [integer_topk_capacity + 1]IntegerEntry = undefined;
             var keys: [config.columns]IntegerOrder = undefined;
             const current = committed_only and table.summary.valid and table.summary.csn <= snap.csn;
@@ -4327,7 +4342,7 @@ pub fn Exec(comptime config: types.Config) type {
             rows: for (0..table.row_high) |slot| {
                 try ctx.session.checkpoint();
                 const version = S.visibleAt(table, slot, snap) orelse continue;
-                if (!try keep(ctx, query.where, &table.versions[version].cells)) continue;
+                if (!try keep(ctx, query.where, S.borrowVersionRow(table, version, row_scratch))) continue;
                 const candidate: u32 = if (used < count) @intCast(used) else spare;
                 const entry = &entries[candidate];
                 entry.version = version;
@@ -4335,7 +4350,8 @@ pub fn Exec(comptime config: types.Config) type {
                 const full = used == count;
                 var relation: i8 = 0;
                 for (keys[0..query.order_count], 0..) |key, column| {
-                    const value = &table.versions[version].cells[key.column];
+                    var temporary: V.Cell = undefined;
+                    const value = S.borrowVersionCell(table, version, key.column, &temporary);
                     const is_null = !key.nonnull and value.* == .null_value;
                     var rank: u64 = if (is_null) 0 else @as(u64, @bitCast(value.integer)) ^ 0x8000000000000000;
                     if (!is_null and key.descending) rank = ~rank;
@@ -4399,7 +4415,7 @@ pub fn Exec(comptime config: types.Config) type {
         /// density, regardless of physical layout. Probe in ORDER BY direction.
         /// A bounded failed speculation retries the ordinary scan, charging all
         /// work already done. Only repeatable plans may take this path.
-        noinline fn densePrimaryScan(ctx: *E.Context, table: *const S.Table, query: *const B.Select, snap: storage.Snapshot, indices: []u32, committed_only: bool, stats: *ReadStats) Error!?usize {
+        noinline fn densePrimaryScan(ctx: *E.Context, table: *const S.Table, row_scratch: *S.VersionRowScratch, query: *const B.Select, snap: storage.Snapshot, indices: []u32, committed_only: bool, stats: *ReadStats) Error!?usize {
             if (config.ordered_probe_rows == 0 or !committed_only or !table.summary.valid or table.summary.csn > snap.csn) return null;
             const column = table.primary_column orelse return null;
             const key = &ctx.pool.nodes[query.order[0].expr];
@@ -4423,7 +4439,7 @@ pub fn Exec(comptime config: types.Config) type {
                 probes += 1;stats.key_probes += 1;
                 const value: V.Cell = .{ .integer = @intCast(current) };
                 const version = S.lookupVersionAt(table, &value, snap) orelse { stats.key_fallbacks += 1; return null; };
-                if (!try keep(ctx, query.where, &table.versions[version].cells)) continue;
+                if (!try keep(ctx, query.where, S.borrowVersionRow(table, version, row_scratch))) continue;
                 indices[found] = version;found += 1;
                 if (found >= query.limit) break;
             }
@@ -4514,13 +4530,14 @@ pub fn Exec(comptime config: types.Config) type {
             const layout_reverse: ?bool = if (!locking and column_order and query.order_count != 0 and query.limit <= indices.len) layoutOrder(table, pool, query) else null;
             var ordered = layout_reverse != null;
             const top_k = !locking and column_order and query.order_count != 0 and query.limit <= indices.len and (query.limit < table.row_high / 2 or table.row_high > indices.len);
-            const sorter: Sorter = .{ .ctx = &ctx, .table = table, .query = query };
+            var row_scratch: S.VersionRowScratch = undefined;
+            const sorter: Sorter = .{ .ctx = &ctx, .table = table, .query = query, .row_scratch = &row_scratch };
             const stable: StableSorter = .{ .base = &sorter };
             if (query.limit != 0) switch (try candidates(&ctx, table, query.key, snap)) {
                 .empty => {},
                 .slot => |hit| {
                     const version = hit.version;
-                    if (try keep(&ctx, query.where, &table.versions[version].cells)) {
+                    if (try keep(&ctx, query.where, S.borrowVersionRow(table, version, &row_scratch))) {
                         indices[0] = version;
                         found = 1;
                     }
@@ -4532,7 +4549,7 @@ pub fn Exec(comptime config: types.Config) type {
                         try session.checkpoint();
                         const slot = if (reverse) table.row_high - 1 - offset else offset;
                         const version = S.visibleAt(table, slot, snap) orelse continue;
-                        if (!try keep(&ctx, query.where, &table.versions[version].cells)) continue;
+                        if (!try keep(&ctx, query.where, S.borrowVersionRow(table, version, &row_scratch))) continue;
                         if (found == indices.len) return error.WorkspaceCapacity;
                         indices[found] = version;
                         found += 1;
@@ -4541,7 +4558,7 @@ pub fn Exec(comptime config: types.Config) type {
                     break :scan;
                   }
                   if (!locking and column_order and query.order_count != 0 and query.limit <= indices.len) {
-                    if (try densePrimaryScan(&ctx, table, query, snap, indices, committed_only, stats)) |count| {
+                    if (try densePrimaryScan(&ctx, table, &row_scratch, query, snap, indices, committed_only, stats)) |count| {
                         found = count;ordered = true;break :scan;
                     }
                   }
@@ -4549,11 +4566,11 @@ pub fn Exec(comptime config: types.Config) type {
                     found=count;break :scan;
                   };
                   if (top_k and query.limit <= integer_topk_capacity and integerOrder(pool, query)) {
-                    found = try integerTopK(&ctx, table, query, snap, indices, committed_only, stats);
+                    found = try integerTopK(&ctx, table, &row_scratch, query, snap, indices, committed_only, stats);
                   } else for (0..table.row_high) |slot| {
                     try session.checkpoint();
                     const version = S.visibleAt(table, slot, snap) orelse continue;
-                    if (!try keep(&ctx, query.where, &table.versions[version].cells)) continue;
+                    if (!try keep(&ctx, query.where, S.borrowVersionRow(table, version, &row_scratch))) continue;
                     if (top_k) {
                         try sort_module.offerTopK(indices[0..@intCast(query.limit)], &found, version, &stable);
                     } else {
@@ -4570,7 +4587,7 @@ pub fn Exec(comptime config: types.Config) type {
                 // erroring key fails even when one row (or none) is compared.
                 for (query.order[0..query.order_count]) |*key| if (!simple(pool, key.expr)) {
                     for (indices[0..found]) |version| {
-                        ctx.row = &table.versions[version].cells;
+                        ctx.row = S.borrowVersionRow(table, version, &row_scratch);
                         _ = try E.eval(&ctx, key.expr);
                     }
                 };
@@ -4589,7 +4606,7 @@ pub fn Exec(comptime config: types.Config) type {
                     if (kept >= query.limit) break;
                     const version = indices[position];
                     const newest = (try locker.lock(table_index, version)) orelse continue;
-                    if (newest != version and !try keep(&ctx, query.where, &table.versions[newest].cells)) continue;
+                    if (newest != version and !try keep(&ctx, query.where, S.borrowVersionRow(table, newest, &row_scratch))) continue;
                     indices[kept] = newest;
                     kept += 1;
                 }
@@ -4600,7 +4617,7 @@ pub fn Exec(comptime config: types.Config) type {
             if (!plain) {
                 // Validation pass: projections may fail; the result is untouched.
                 for (indices[0..rows]) |version| {
-                    ctx.row = &table.versions[version].cells;
+                    ctx.row = S.borrowVersionRow(table, version, &row_scratch);
                     for (query.targets[0..query.count]) |id| _ = try E.eval(&ctx, id);
                 }
             }
@@ -4612,7 +4629,7 @@ pub fn Exec(comptime config: types.Config) type {
             writeHeader(query, result);
             result.row_count = rows;
             for (0..rows) |row_index| {
-                const cells = &table.versions[indices[row_index]].cells;
+                const cells = S.borrowVersionRow(table, indices[row_index], &row_scratch);
                 ctx.row = cells;
                 for (query.targets[0..query.count], 0..) |id, column| {
                     const n = &pool.nodes[id];

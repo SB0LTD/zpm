@@ -112,6 +112,9 @@ pub fn Storage(comptime config: types.Config) type {
             older: u32 = 0,
         };
 
+        /// Temporary test: make every executor borrow use caller scratch.
+        pub const VersionRowScratch = [config.columns]V.Cell;
+
         /// Stable reference to a directory slot. Resolves only while the slot
         /// still holds the same row (same generation).
         pub const RowRef = struct { slot: u32, generation: u32 };
@@ -1036,6 +1039,19 @@ pub fn Storage(comptime config: types.Config) type {
 
         inline fn versionCell(table: *const Table, version: usize, column: usize) *const V.Cell {
             return &table.versions[version].cells[column];
+        }
+
+        /// The view can borrow the arena or the caller's scratch. Use one
+        /// scratch per live row and keep it in scope until the last read.
+        pub inline fn borrowVersionRow(table: *const Table, version: usize, scratch: *VersionRowScratch) *const [config.columns]V.Cell {
+            scratch.* = table.versions[version].cells;
+            return scratch;
+        }
+
+        /// A single logical cell, valid until its scratch is reused.
+        pub inline fn borrowVersionCell(table: *const Table, version: usize, column: usize, scratch: *V.Cell) *const V.Cell {
+            scratch.* = versionCell(table, version, column).*;
+            return scratch;
         }
 
         /// Logical values in storage column order, excluding dense padding.
