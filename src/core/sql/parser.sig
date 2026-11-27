@@ -477,8 +477,8 @@ pub fn Parser(comptime config: types.Config) type {
                     const index = try self.takeRaw("index");
                     const materialized = !index and try self.takeRaw("materialized");
                     if (!index and !try self.takeRaw("view")) return error.Syntax;
-                    if (index) _ = try self.takeRaw("concurrently");
-                    var drop: Ast.Drop = .{ .if_exists = try self.ifExists(), .name = undefined };
+                    const concurrently = index and try self.takeRaw("concurrently");
+                    var drop: Ast.Drop = .{ .if_exists = try self.ifExists(), .name = undefined, .concurrently = concurrently };
                     const reference = try self.qualifiedName();
                     drop.name = reference.name;
                     drop.schema = reference.schema;
@@ -624,7 +624,7 @@ pub fn Parser(comptime config: types.Config) type {
 
         fn createIndex(self: *Self, unique: bool) Error!Ast.CreateIndex {
             var out: Ast.CreateIndex = .{ .unique = unique };
-            if (try self.takeRaw("concurrently")) return error.UnsupportedStatement;
+            out.concurrently = try self.takeRaw("concurrently");
             out.if_not_exists = try self.ifNotExists();
             if (!self.isWord("ON")) out.name = try self.identifier();
             if (out.if_not_exists and out.name == null) return error.Syntax;
@@ -865,8 +865,11 @@ pub fn Parser(comptime config: types.Config) type {
             if (try self.takeRaw("rename")) {
                 if (try self.takeWord("TO")) {
                     try pushAction(&out, .{ .rename_table = try self.identifier() });
+                } else if (try self.takeWord("CONSTRAINT")) {
+                    const from = try self.identifier();
+                    try self.expectWord("TO");
+                    try pushAction(&out, .{ .rename_constraint = .{ .from = from, .to = try self.identifier() } });
                 } else {
-                    if (self.isWord("CONSTRAINT")) return error.UnsupportedStatement;
                     _ = try self.takeRaw("column");
                     const from = try self.identifier();
                     try self.expectWord("TO");
@@ -890,6 +893,9 @@ pub fn Parser(comptime config: types.Config) type {
                         try pushAction(&out, .{ .add_column = .{ .column = column, .if_not_exists = conditional } });
                         for (constraints[0..constraint_count]) |constraint| try pushAction(&out, .{ .add_constraint = constraint });
                     }
+                } else if (self.mode == .standard and try self.takeRaw("validate")) {
+                    try self.expectWord("CONSTRAINT");
+                    try pushAction(&out, .{ .validate_constraint = try self.identifier() });
                 } else if (try self.takeWord("DROP")) {
                     if (try self.takeWord("CONSTRAINT")) {
                         const conditional = try self.ifExists();
@@ -2210,7 +2216,18 @@ pub fn Parser(comptime config: types.Config) type {
         /// A table constraint element ([CONSTRAINT name] CHECK (...) |
         /// UNIQUE [NULLS [NOT] DISTINCT] (...) | PRIMARY KEY (...)), or null
         /// when the element is a column definition.
+        /// A table constraint, then NOT VALID (ddl-dml, wave 4).
         fn tableConstraint(self: *Self) Error!?Ast.ConstraintDef {
+            var out = (try self.tableConstraintBody()) orelse return null;
+            if (self.isWord("NOT") and wordIs(self.source, try self.peek(), "valid")) {
+                try self.advance();
+                try self.advance();
+                out.not_valid = true;
+            }
+            return out;
+        }
+
+        fn tableConstraintBody(self: *Self) Error!?Ast.ConstraintDef {
             if (self.mode != .standard) return null;
             var name: ?ast.Ident = null;
             if (try self.takeWord("CONSTRAINT")) {

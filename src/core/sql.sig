@@ -3358,6 +3358,14 @@ pub fn Database(comptime config: Config) type {
                 if (self.txs[slot].read_only) return error.ReadOnlyTransaction;
                 return self.catalogObject(slot, original, &parsed.catalog_object, snap);
             }
+            // CREATE / DROP INDEX CONCURRENTLY build like the plain forms
+            // (under their stronger lock) and, as PostgreSQL, never run
+            // inside a transaction block (25001).
+            switch (parsed.*) {
+                .create_index => |*create| if (create.concurrently and !self.statement_implicit) return error.ActiveSqlTransaction,
+                .drop_index => |*drop| if (drop.concurrently and !self.statement_implicit) return error.ActiveSqlTransaction,
+                else => {},
+            }
             var statement_copy = parsed.*;
             // INSERT / UPDATE / DELETE on a view (B11 wave 4): its INSTEAD
             // OF triggers, or the same statement on its base relation.
@@ -8631,11 +8639,12 @@ pub fn Database(comptime config: Config) type {
             const label = switch (kind) { .check => "c", .unique => "u", .primary => "p", .foreign => "f", .exclusion => "x" };
             const deferrable = if (constraint) |item| item.deferrable else false;
             const deferred = if (constraint) |item| item.initially_deferred else false;
+            const validated = if (constraint) |item| !item.not_valid else true;
             const foreign = if (kind == .foreign) constraint else null;
             const index = if (kind == .primary) S.primaryIndexOid(table) else if (foreign) |item| self.referencedConstraintIndex(item, snapshot) else 0;
             try sink.add(&.{
                 intCell(oid), nameCell(name), intCell(table.namespace), nameCell(label),
-                boolCell(deferrable), boolCell(deferred), boolCell(true), boolCell(true),
+                boolCell(deferrable), boolCell(deferred), boolCell(true), boolCell(validated),
                 intCell(table.oid), intCell(0), intCell(index), intCell(0),
                 intCell(if (foreign) |item| item.ref_oid else 0),
                 nameCell(if (foreign) |item| foreignActionCode(item.on_update) else " "),
@@ -9035,6 +9044,7 @@ pub fn Database(comptime config: Config) type {
             if (constraint) |item| {
                 if (item.deferrable) text.add(" DEFERRABLE");
                 if (item.initially_deferred) text.add(" INITIALLY DEFERRED");
+                if (item.not_valid) text.add(" NOT VALID");
             }
             if (text.shortened) return error.TextCapacity;
             return text.len;
@@ -9279,16 +9289,58 @@ pub fn Database(comptime config: Config) type {
                     if (snap.own(deletion.tx)) {
                         // Changed by a statement this one's triggers or
                         // functions ran (PostgreSQL TM_SelfModified with a
-                        // later command id): 27000 for UPDATE / DELETE.
-                        if (deletion.cid > snap.cid and mode == .write and self.nested_ran) return error.TriggeredDataChangeViolation;
+                        // later command id): 27000 for UPDATE / DELETE (an
+                        // UPDATE takes FOR NO KEY UPDATE strength, ddl-dml).
+                        if (deletion.cid > snap.cid and (mode == .write or mode == .no_key_update) and self.nested_ran) return error.TriggeredDataChangeViolation;
                         return if (deletion.cid == snap.cid) .authored else .skip;
                     }
-                    waits.add(deletion.tx.slot);
+                    // FOR KEY SHARE does not conflict with an UPDATE that
+                    // keeps every key column (FOR NO KEY UPDATE strength).
+                    if (mode != .key_share or !keysKept(table, current)) waits.add(deletion.tx.slot);
                 }
                 self.locks.rowHolders(table_index, table.rows[entry.rowSlot()].rowid, slot, mode, waits);
                 if (waits.any()) return .wait;
                 return .{ .ready = current };
             }
+        }
+
+        /// Whether `column` is a key column of `table` (PostgreSQL's
+        /// INDEX_ATTR_BITMAP_KEY): in the primary key, a non-deferrable
+        /// UNIQUE constraint or a unique index over plain columns without a
+        /// predicate (ddl-dml, wave 4).
+        fn keyColumn(table: *const S.Table, column: usize) bool {
+            if (table.primary_column == column) return true;
+            for (table.constraints[0..table.constraint_count]) |*constraint| {
+                if ((constraint.kind != .primary and constraint.kind != .unique) or constraint.deferrable) continue;
+                for (constraint.keyColumns()) |key| if (key == column) return true;
+            }
+            for (table.indexes[0..table.index_count]) |*index| {
+                if (!index.unique or index.predicate.len != 0) continue;
+                var plain = true;
+                for (index.keyColumns()) |key| plain = plain and key != S.expression_key;
+                if (!plain) continue;
+                for (index.keyColumns()) |key| if (key == column) return true;
+            }
+            return false;
+        }
+
+        /// Whether two rows of `table` agree on every key column.
+        fn sameKeys(table: *const S.Table, old: *const E.Row, new: *const E.Row) bool {
+            for (0..table.column_count) |column| {
+                if (!keyColumn(table, column)) continue;
+                if (@as(V.CellTag, old[column]) != @as(V.CellTag, new[column]) or V.compare(&old[column], &new[column]) != 0) return false;
+            }
+            return true;
+        }
+
+        /// A version another transaction is updating: whether its new
+        /// version keeps every key column (a NO KEY UPDATE; a DELETE has no
+        /// successor).
+        fn keysKept(table: *const S.Table, version: u32) bool {
+            const next = S.successor(table, version) orelse return false;
+            var old_scratch: S.VersionRowScratch = undefined;
+            var new_scratch: S.VersionRowScratch = undefined;
+            return sameKeys(table, S.borrowVersionRow(table, version, &old_scratch), S.borrowVersionRow(table, next, &new_scratch));
         }
 
         const RowLocker = struct {
@@ -10200,6 +10252,9 @@ pub fn Database(comptime config: Config) type {
                 if (!version.hasDeletion()) return .{ .found = @intCast(index) };
                 const deletion = version.pendingDeletion() orelse continue;
                 if (snap.own(deletion.tx)) continue;
+                // An UPDATE in progress that keeps the keys (NO KEY UPDATE)
+                // leaves the row referenced: FOR KEY SHARE does not wait.
+                if (keysKept(table, @intCast(index))) return .{ .found = @intCast(index) };
                 if (waiting == null) waiting = deletion.tx.slot;
             }
             return if (waiting) |slot| .{ .wait = slot } else .missing;
@@ -10255,9 +10310,10 @@ pub fn Database(comptime config: Config) type {
                     if (parent.versions[version].creationCsn() == 0) return;
                     const rowid = parent.rows[parent.versions[version].rowSlot()].rowid;
                     var waits: L.Set = .{};
-                    self.locks.rowHolders(parent_index, rowid, slot, .share, &waits);
+                    // FOR KEY SHARE, as PostgreSQL's RI check (ddl-dml).
+                    self.locks.rowHolders(parent_index, rowid, slot, .key_share, &waits);
                     if (waits.any()) return self.park(slot, waits);
-                    if (try self.locks.grantRow(parent_index, rowid, slot, .share)) |granted| try M.recordLock(self, slot, granted);
+                    if (try self.locks.grantRow(parent_index, rowid, slot, .key_share)) |granted| try M.recordLock(self, slot, granted);
                 },
             }
         }
@@ -11358,7 +11414,9 @@ pub fn Database(comptime config: Config) type {
             if (table.rows[row].newest == 0) return 0;
             const version = S.visibleAt(table, row, snap) orelse return 0;
             var waits: L.Set = .{};
-            const plan = try self.target(slot, update.table, version, snap, .write, &waits);
+            // FOR NO KEY UPDATE strength; updateOne waits for FOR KEY SHARE
+            // holders when the row's keys change.
+            const plan = try self.target(slot, update.table, version, snap, .no_key_update, &waits);
             if (plan == .authored) return 1;
             var old_cells = S.borrowVersionRow(table, version, row_scratch);
             if (!try self.keepJoined(ctx, update.where, joined, old_cells)) return 0;
@@ -11397,6 +11455,13 @@ pub fn Database(comptime config: Config) type {
                     return self.moveRow(slot, ctx, update, old, old_cells, &cells, snap);
                 };
                 try D.checkRow(ctx, table, &update.checks, &cells);
+            }
+            // A key change is FOR UPDATE strength: FOR KEY SHARE holders
+            // of the row are waited for.
+            if (!sameKeys(table, old_cells, &cells)) {
+                var waits: L.Set = .{};
+                self.locks.rowHolders(update.table, table.rows[row].rowid, slot, .write, &waits);
+                if (waits.any()) return self.park(slot, waits);
             }
             try self.securityCheck(ctx, update.table, &cells);
             self.partitionBound(update.table, &cells, snap) catch |err| {
@@ -12564,14 +12629,30 @@ pub fn Database(comptime config: Config) type {
                 const namespace = (try self.namespaceForUsage(self.session.role, if (reference.schema != null) schema_name.slice() else null, snap)) orelse return error.UndefinedSchema;
                 const found = self.catalog.findIn(namespace, identName(source, reference.name).slice(), snap) orelse return error.TableNotFound;
                 switch (found.kind) {
-                    'r', 'p' => {},
-                    'v', 'm' => return error.UnsupportedStatement,
+                    'r', 'p', 'v' => {},
                     else => return error.WrongObjectType,
                 }
                 var members: [config.tables]usize = undefined;
                 members[0] = found.slot;
                 var count: usize = 1;
-                if (!only) {
+                // A view locks every relation its query reads, recursively
+                // (and their children), in the same mode (ddl-dml, wave 4).
+                if (found.kind == 'v') {
+                    var next: usize = 0;
+                    while (next < count) : (next += 1) {
+                        const member = &self.tables[members[next]];
+                        if (member.relkind != 'v') continue;
+                        for (member.depends[0..member.depend_count]) |oid| {
+                            const base = self.visibleTableSlot(oid, snap) orelse continue;
+                            var known = false;
+                            for (members[0..count]) |existing| known = known or existing == base;
+                            if (known or count == members.len) continue;
+                            members[count] = base;
+                            count += 1;
+                        }
+                    }
+                }
+                if (!only or found.kind == 'v') {
                     var relations: [K.relation_rows]K.Found = undefined;
                     const relation_count = self.catalog.visibleRelations(snap, &relations);
                     var next: usize = 0;

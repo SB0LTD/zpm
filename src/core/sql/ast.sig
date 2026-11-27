@@ -628,6 +628,9 @@ pub fn Ast(comptime config: types.Config) type {
             on_update: ForeignAction = .no_action,
             /// EXCLUDE: operator per element (1 `=`, 2 `&&`).
             operators: [config.columns]u8 = undefined,
+            /// NOT VALID (ddl-dml, wave 4): ALTER TABLE ADD skips the
+            /// existing rows of a CHECK or FOREIGN KEY constraint.
+            not_valid: bool = false,
         };
 
         /// LIKE source [INCLUDING | EXCLUDING option ...] inside CREATE TABLE:
@@ -686,6 +689,9 @@ pub fn Ast(comptime config: types.Config) type {
         pub const IndexElement = struct { column: ?Ident = null, expression: Span = .{}, node: u16 = none, descending: bool = false, nulls_first: ?bool = null };
         pub const CreateIndex = struct {
             unique: bool = false,
+            /// CREATE INDEX CONCURRENTLY (ddl-dml, wave 4): never inside a
+            /// transaction block (25001).
+            concurrently: bool = false,
             if_not_exists: bool = false,
             name: ?Ident = null,
             table: TableRef = .{},
@@ -755,7 +761,7 @@ pub fn Ast(comptime config: types.Config) type {
             options: sequence.Options = .{},
         };
 
-        pub const Drop = struct { name: Ident, if_exists: bool = false, schema: ?Ident = null, cascade: bool = false };
+        pub const Drop = struct { name: Ident, if_exists: bool = false, schema: ?Ident = null, cascade: bool = false, concurrently: bool = false };
 
         /// CREATE SCHEMA [IF NOT EXISTS] name.
         pub const CreateSchema = struct { name: Ident = .{}, if_not_exists: bool = false };
@@ -1048,6 +1054,8 @@ pub fn Ast(comptime config: types.Config) type {
             // ddl-dml (wave 4): ALTER TABLE parent ATTACH / DETACH PARTITION.
             attach_partition: struct { table: TableRef, bound: PartitionBound },
             detach_partition: struct { table: TableRef, concurrently: bool = false },
+            rename_constraint: struct { from: Ident, to: Ident },
+            validate_constraint: Ident,
         };
 
         /// ALTER TABLE [IF EXISTS] [ONLY] name action [, ...] | RENAME ...

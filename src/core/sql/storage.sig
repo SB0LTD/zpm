@@ -448,6 +448,10 @@ pub fn Storage(comptime config: types.Config) type {
             on_update: ForeignAction = .no_action,
             /// EXCLUDE: operator of each key column.
             operators: [config.columns]ExclusionOperator = @splat(.equal),
+            /// ADD ... NOT VALID CHECK / FOREIGN KEY whose existing rows
+            /// were not checked (pg_constraint.convalidated false) until
+            /// VALIDATE CONSTRAINT (ddl-dml, wave 4).
+            not_valid: bool = false,
 
             pub fn keyColumns(self: *const Constraint) []const u8 {
                 return self.columns[0..self.column_count];

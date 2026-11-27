@@ -598,6 +598,147 @@ fn foreignKeyTiming() !void {
     try sameState(&.{ "SELECT id, v FROM p ORDER BY id", "SELECT pid FROM c", "SELECT pid FROM cr", "SELECT id, ref FROM s" });
 }
 
+// ---- NOT VALID / VALIDATE, RENAME CONSTRAINT, INDEX CONCURRENTLY ---------
+
+fn constraintCommands() !void {
+    reset();
+    try run("CREATE TABLE nvt (id INT PRIMARY KEY, a INT, b INT CONSTRAINT nvt_b_key UNIQUE)");
+    try run("INSERT INTO nvt VALUES (1, -1, 5), (2, 3, 6)");
+    const checks = "SELECT conname, convalidated, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'nvt'::regclass AND contype = 'c' ORDER BY 1";
+    try rejects("ALTER TABLE nvt ADD CONSTRAINT a_pos CHECK (a > 0)", error.CheckViolation, checks, "");
+    // NOT VALID skips the existing rows (definition format 7 on the WAL):
+    // a crafted later version or a NOT VALID key fails closed.
+    var result: DB.Result = .{};
+    var used: usize = 0;
+    try db.executeChanges("ALTER TABLE nvt ADD CONSTRAINT a_pos CHECK (a > 0) NOT VALID", &result, &record, &used, null, null);
+    const valid = record[0..used];
+    const version_at = (std.mem.indexOf(u8, valid, &[_]u8{ 3, 'n', 'v', 't', 7, 0 }) orelse return error.DefinitionVersionNotFound) + 4;
+    @memcpy(crafted[0..used], valid);
+    crafted[version_at] = 8;
+    try check(replica.applyChangeRecord(crafted[0..used], &scratch) == error.UnsupportedLogVersion);
+    const unique_at = (std.mem.indexOf(u8, valid, &[_]u8{ 2, 9, 'n', 'v', 't', '_', 'b', '_', 'k', 'e', 'y' }) orelse return error.ConstraintNotFound) + 11;
+    @memcpy(crafted[0..used], valid);
+    crafted[unique_at] |= 8;
+    try check(replica.applyChangeRecord(crafted[0..used], &scratch) == error.InvalidChangeRecord);
+    try replica.applyChangeRecord(valid, &scratch);
+    records_applied += 1;
+    try expect(checks, "a_pos|f|CHECK ((a > 0)) NOT VALID");
+    try rejects("INSERT INTO nvt VALUES (3, -5, 1)", error.CheckViolation, "SELECT COUNT(*) FROM nvt", "2");
+    try run("INSERT INTO nvt VALUES (3, 5, 1)");
+    // An UPDATE checks the whole new row, also an unchanged invalid value.
+    try rejects("UPDATE nvt SET b = 7 WHERE id = 1", error.CheckViolation, "SELECT id, a, b FROM nvt ORDER BY id", "1|-1|5;2|3|6;3|5|1");
+    try rejects("ALTER TABLE nvt VALIDATE CONSTRAINT a_pos", error.CheckViolation, checks, "a_pos|f|CHECK ((a > 0)) NOT VALID");
+    try run("UPDATE nvt SET a = 1 WHERE id = 1");
+    try run("ALTER TABLE nvt VALIDATE CONSTRAINT a_pos");
+    try expect(checks, "a_pos|t|CHECK ((a > 0))");
+    try run("ALTER TABLE nvt VALIDATE CONSTRAINT a_pos");
+    try rejects("ALTER TABLE nvt VALIDATE CONSTRAINT nope", error.UndefinedObject, checks, "a_pos|t|CHECK ((a > 0))");
+    try rejects("ALTER TABLE nvt VALIDATE CONSTRAINT nvt_pkey", error.WrongObjectType, checks, "a_pos|t|CHECK ((a > 0))");
+    try rejects("ALTER TABLE nvt ADD CONSTRAINT b_u UNIQUE (b) NOT VALID", error.UnsupportedStatement, checks, "a_pos|t|CHECK ((a > 0))");
+    // FOREIGN KEY NOT VALID; NOT VALID in CREATE TABLE is ignored.
+    try run("CREATE TABLE nvp (id INT PRIMARY KEY)");
+    try run("INSERT INTO nvp VALUES (5), (6)");
+    try run("CREATE TABLE nvc (pid INT, x INT)");
+    try run("INSERT INTO nvc VALUES (9, 1)");
+    try run("ALTER TABLE nvc ADD CONSTRAINT nvc_fk FOREIGN KEY (pid) REFERENCES nvp NOT VALID");
+    const fk = "SELECT conname, convalidated, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'nvc'::regclass";
+    try expect(fk, "nvc_fk|f|FOREIGN KEY (pid) REFERENCES nvp(id) NOT VALID");
+    try rejects("INSERT INTO nvc VALUES (8, 1)", error.ForeignKeyViolation, "SELECT pid FROM nvc", "9");
+    try run("UPDATE nvc SET x = 2");
+    try rejects("ALTER TABLE nvc VALIDATE CONSTRAINT nvc_fk", error.ForeignKeyViolation, fk, "nvc_fk|f|FOREIGN KEY (pid) REFERENCES nvp(id) NOT VALID");
+    try run("DELETE FROM nvc WHERE pid = 9");
+    try run("ALTER TABLE nvc VALIDATE CONSTRAINT nvc_fk");
+    try expect(fk, "nvc_fk|t|FOREIGN KEY (pid) REFERENCES nvp(id)");
+    try run("CREATE TABLE nvn (a INT, CONSTRAINT nvn_chk CHECK (a > 0) NOT VALID)");
+    try expect("SELECT convalidated FROM pg_constraint WHERE conname = 'nvn_chk'", "t");
+    try sameState(&.{ checks, fk, "SELECT id, a, b FROM nvt ORDER BY id" });
+    // RENAME CONSTRAINT: 42704, 42710, and 42P07 for an index-backed
+    // constraint whose new name is a relation; indexes follow the name.
+    try run("CREATE TABLE other (x INT)");
+    try run("CREATE INDEX other_idx ON other (x)");
+    const names = "SELECT conname, contype FROM pg_constraint WHERE conrelid = 'nvt'::regclass AND contype <> 'n' ORDER BY 1";
+    try run("ALTER TABLE nvt RENAME CONSTRAINT a_pos TO a_positive");
+    try rejects("ALTER TABLE nvt RENAME CONSTRAINT nope TO x", error.UndefinedObject, names, "a_positive|c;nvt_b_key|u;nvt_pkey|p");
+    try rejects("ALTER TABLE nvt RENAME CONSTRAINT a_positive TO nvt_b_key", error.DuplicateObject, names, "a_positive|c;nvt_b_key|u;nvt_pkey|p");
+    try rejects("ALTER TABLE nvt RENAME CONSTRAINT nvt_b_key TO other_idx", error.TableExists, names, "a_positive|c;nvt_b_key|u;nvt_pkey|p");
+    try run("ALTER TABLE nvt RENAME CONSTRAINT nvt_b_key TO b_unique");
+    try run("ALTER TABLE nvt RENAME CONSTRAINT nvt_pkey TO nvt_key");
+    try expect(names, "a_positive|c;b_unique|u;nvt_key|p");
+    const index_names = "SELECT indexname FROM pg_indexes WHERE tablename = 'nvt' ORDER BY 1";
+    try expect(index_names, "b_unique;nvt_key");
+    try rejects("INSERT INTO nvt VALUES (3, 1, 6)", error.PrimaryKeyViolation, "SELECT COUNT(*) FROM nvt", "3");
+    try sameState(&.{ names, index_names });
+    // CREATE / DROP INDEX CONCURRENTLY: never inside a transaction block.
+    const tx = try db.begin();
+    try statementFails(tx, "CREATE INDEX CONCURRENTLY nvt_a ON nvt (a)", error.ActiveSqlTransaction);
+    db.abort(tx);
+    try run("CREATE INDEX CONCURRENTLY nvt_a ON nvt (a)");
+    try expect("SELECT indexdef FROM pg_indexes WHERE indexname = 'nvt_a'", "CREATE INDEX nvt_a ON public.nvt USING btree (a)");
+    const drop = try db.begin();
+    try statementFails(drop, "DROP INDEX CONCURRENTLY nvt_a", error.ActiveSqlTransaction);
+    db.abort(drop);
+    try run("DROP INDEX CONCURRENTLY nvt_a");
+    try expect("SELECT COUNT(*) FROM pg_indexes WHERE indexname = 'nvt_a'", "0");
+    try sameState(&.{index_names});
+}
+
+var crafted: [65536]u8 = undefined;
+
+// ---- row lock strength: NO KEY UPDATE, FOR KEY SHARE; LOCK on views -------
+
+fn rowLockStrength() !void {
+    reset();
+    try run("CREATE TABLE p (id INT PRIMARY KEY, note TEXT, u INT UNIQUE)");
+    try run("CREATE TABLE c (pid INT REFERENCES p)");
+    try run("INSERT INTO p VALUES (1, 'a', 10), (2, 'b', 20)");
+    // An UPDATE that keeps every key column is FOR NO KEY UPDATE: FOR KEY
+    // SHARE (and a foreign key check) does not wait for it; FOR SHARE does.
+    const updater = try db.begin();
+    try statement(updater, "UPDATE p SET note = 'x' WHERE id = 1");
+    const sharer = try db.begin();
+    try same(try rows(sharer, "SELECT id, note FROM p WHERE id = 1 FOR KEY SHARE"), "1|a");
+    try statement(sharer, "INSERT INTO c VALUES (1)");
+    try parks(sharer, "SELECT id FROM p WHERE id = 1 FOR SHARE");
+    try commit(updater);
+    const shared = try resumed(sharer, "SELECT id FROM p WHERE id = 1 FOR SHARE");
+    try same(try render(&shared), "1");
+    try commit(sharer);
+    // A key change is FOR UPDATE strength: it waits for FOR KEY SHARE.
+    const holder = try db.begin();
+    try same(try rows(holder, "SELECT id FROM p WHERE id = 2 FOR KEY SHARE"), "2");
+    const writer = try db.begin();
+    try statement(writer, "UPDATE p SET note = 'y' WHERE id = 2");
+    try parks(writer, "UPDATE p SET u = 21 WHERE id = 2");
+    try commit(holder);
+    try check((try resumed(writer, "UPDATE p SET u = 21 WHERE id = 2")).affected_rows == 1);
+    try commit(writer);
+    // A referencing row's FOR KEY SHARE holds off a DELETE of its key.
+    const inserter = try db.begin();
+    try statement(inserter, "INSERT INTO c VALUES (2)");
+    const remover = try db.begin();
+    try parks(remover, "DELETE FROM p WHERE id = 2");
+    db.abort(remover);
+    try commit(inserter);
+    try expect("SELECT id, note, u FROM p ORDER BY id", "1|x|10;2|y|21");
+    try sameState(&.{ "SELECT id, note, u FROM p ORDER BY id", "SELECT pid FROM c ORDER BY pid" });
+    // LOCK on a view locks the relations its query reads, recursively.
+    try run("CREATE TABLE lt (id INT)");
+    try run("CREATE TABLE lu (id INT)");
+    try run("CREATE VIEW lv AS SELECT lt.id FROM lt JOIN lu USING (id)");
+    try run("CREATE VIEW lvv AS SELECT * FROM lv");
+    try run("CREATE MATERIALIZED VIEW lm AS SELECT * FROM lt");
+    const locker = try db.begin();
+    try statement(locker, "LOCK TABLE ONLY lvv IN EXCLUSIVE MODE");
+    const blocked = try db.begin();
+    try parks(blocked, "INSERT INTO lu VALUES (1)");
+    try commit(locker);
+    _ = try resumed(blocked, "INSERT INTO lu VALUES (1)");
+    try statementFails(blocked, "LOCK TABLE lm", error.WrongObjectType);
+    try commit(blocked);
+    try expect("SELECT COUNT(*) FROM lu", "1");
+    try sameState(&.{"SELECT COUNT(*) FROM lu"});
+}
+
 pub fn main() !void {
     try truncateOnly();
     try familyWrites();
@@ -606,5 +747,7 @@ pub fn main() !void {
     try attachDetach();
     try partitionKeys();
     try foreignKeyTiming();
+    try constraintCommands();
+    try rowLockStrength();
     std.debug.print("ddl-dml: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });
 }

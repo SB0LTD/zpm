@@ -9855,7 +9855,13 @@ pub fn Binder(comptime config: types.Config) type {
                     }
                     out.columns = staged.columns;
                     out.constraints = staged.constraints;
-                    out.check_constraint[out.constraint_count] = true;
+                    // NOT VALID: existing rows are not checked (CHECK and
+                    // FOREIGN KEY only, 0A000 otherwise; ddl-dml, wave 4).
+                    if (definition.not_valid) {
+                        if (definition.kind != .check and definition.kind != .foreign) return error.UnsupportedStatement;
+                        out.constraints[out.constraint_count].not_valid = true;
+                    }
+                    out.check_constraint[out.constraint_count] = !definition.not_valid;
                     out.constraint_count += 1;
                 },
                 .drop_constraint => |*drop| {
@@ -9901,6 +9907,68 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 // Parsed alone (bindAttach / bindDetach above).
                 .attach_partition, .detach_partition => return error.Syntax,
+                .validate_constraint => |ident| {
+                    // ddl-dml (wave 4): 42704 when missing, 42809 for a kind
+                    // other than CHECK / FOREIGN KEY; a validated constraint
+                    // is left alone. A parent's CHECK validates through its
+                    // children in PostgreSQL (outside the subset, 0A000).
+                    const name = toName(context, ident);
+                    var named = false;
+                    for (out.constraints[0..out.constraint_count], 0..) |*constraint, at| {
+                        if (!types.same(constraint.name.slice(), name.slice())) continue;
+                        named = true;
+                        if (constraint.kind != .check and constraint.kind != .foreign) return error.WrongObjectType;
+                        if (!constraint.not_valid) break;
+                        if (constraint.kind == .check and hasChildren(context, entry.oid)) return error.UnsupportedStatement;
+                        constraint.not_valid = false;
+                        out.check_constraint[at] = true;
+                        break;
+                    }
+                    if (!named) {
+                        const pkey = objectName(out.name.slice(), "", "pkey");
+                        if (entry.primary_column != null and types.same(pkey.slice(), name.slice())) return error.WrongObjectType;
+                        return error.UndefinedObject;
+                    }
+                },
+                .rename_constraint => |*rename| {
+                    // ddl-dml (wave 4): 42704 when missing, 42710 when the
+                    // table has the new name, 42P07 when an index-backed
+                    // constraint's new name is a relation. Inherited CHECK
+                    // constraints rename through the family in PostgreSQL;
+                    // a parent or child table is outside the subset (0A000).
+                    if (entry.parent != 0 or hasChildren(context, entry.oid)) return error.UnsupportedStatement;
+                    const from = toName(context, rename.from);
+                    const to = toName(context, rename.to);
+                    // The implicit single-column primary key `<table>_pkey`.
+                    var position: ?usize = null;
+                    for (out.constraints[0..out.constraint_count], 0..) |*constraint, at| {
+                        if (types.same(constraint.name.slice(), from.slice())) position = at;
+                    }
+                    if (position == null) {
+                        var primary_column: ?usize = null;
+                        for (out.columns[0..out.count], 0..) |*column, at| if (column.primary_key) {
+                            primary_column = at;
+                        };
+                        const pkey = objectName(out.name.slice(), "", "pkey");
+                        if (primary_column != null and S.primaryConstraint(entry) == null and types.same(pkey.slice(), from.slice())) {
+                            if (out.constraint_count == config.table_constraints) return error.ColumnCapacity;
+                            var constraint: S.Constraint = .{ .kind = .primary, .name = pkey, .column_count = 1 };
+                            constraint.columns[0] = @intCast(primary_column.?);
+                            out.constraints[out.constraint_count] = constraint;
+                            position = out.constraint_count;
+                            out.constraint_count += 1;
+                        }
+                    }
+                    const at = position orelse return error.UndefinedObject;
+                    for (out.constraints[0..out.constraint_count]) |*constraint| {
+                        if (types.same(constraint.name.slice(), to.slice())) return error.DuplicateObject;
+                    }
+                    switch (out.constraints[at].kind) {
+                        .unique, .primary, .exclusion => if (relationNameTaken(context, entry.namespace, to.slice())) return error.TableExists,
+                        else => {},
+                    }
+                    out.constraints[at].name = to;
+                },
             };
             if (has_legacy_options) try checkLegacyAttributeColumns(context, alter, out.columns[0..out.count]);
             return .{ .alter_table = out };
