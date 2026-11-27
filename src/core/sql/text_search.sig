@@ -13,13 +13,18 @@
 //! The parser's state tables are a mechanical translation of
 //! wparser_def.c (PostgreSQL 18.3). Character classes follow this
 //! database's C ctype under UTF-8 (TParser's pgwstr path): non-ASCII
-//! characters are letters and alphanumerics and nothing else. Only the
-//! `simple` configuration exists here: every token type except blank,
-//! tag, protocol and entity maps to the simple dictionary, which folds
-//! ASCII letters to lower case. The other built-in configurations
-//! (english, ... with Snowball stemmers) are 0A000; unknown names 42704.
+//! characters are letters and alphanumerics and nothing else. Two
+//! configurations exist: `simple` (every token type except blank, tag,
+//! protocol and entity maps to the simple dictionary, which folds ASCII
+//! letters to lower case) and `english` (wave 4 text-json lane: the word
+//! token types map to english_stem, the Snowball English stemmer with the
+//! english stop-word list, snowball_english.sig; the others to simple).
+//! The other built-in Snowball configurations are 0A000; unknown names
+//! 42704. default_text_search_config selects the configuration of the
+//! one-argument forms.
 const std = @import("std");
 const types = @import("types.sig");
+const snowball_english = @import("snowball_english.sig");
 const Error = types.Error;
 
 // ---- default parser ----------------------------------------------------------
@@ -981,11 +986,41 @@ fn actions(state: State) []const Item {
 
 // ---- configurations ----------------------------------------------------------
 
-pub const Config = enum { simple };
+pub const Config = enum(u8) { simple, english };
+
+/// pg_ts_config OIDs of the supported configurations (PostgreSQL 18).
+pub fn configOid(config: Config) u32 {
+    return switch (config) {
+        .simple => 3748,
+        .english => 13228,
+    };
+}
+
+/// The canonical default_text_search_config text of a configuration.
+pub fn settingText(config: Config) []const u8 {
+    return switch (config) {
+        .simple => "pg_catalog.simple",
+        .english => "pg_catalog.english",
+    };
+}
+
+/// The configuration a default_text_search_config value names (the
+/// canonical text this module writes; english for anything else).
+pub fn settingConfig(text: []const u8) Config {
+    return if (types.same(text, "pg_catalog.simple")) .simple else .english;
+}
+
+/// default_text_search_config assignment: the canonical value, 22023 for
+/// a name that is no configuration, 0A000 for an unsupported one.
+pub fn settingValue(input: []const u8) Error![]const u8 {
+    const config = configByNameImpl(input) catch |err| return if (err == error.UndefinedObject) error.InvalidSettingValue else err;
+    return settingText(config);
+}
 
 /// regconfigin: an identifier list (surrounding spaces allowed, unquoted
-/// parts folded to lower case) naming `simple`, optionally qualified by
-/// pg_catalog. Snowball configurations are 0A000; anything else 42704.
+/// parts folded to lower case) naming `simple` or `english`, optionally
+/// qualified by pg_catalog. Other Snowball configurations are 0A000;
+/// anything else 42704.
 pub fn configByNameImpl(input: []const u8) Error!Config {
     var parts: [2][64]u8 = undefined;
     var lengths: [2]usize = .{ 0, 0 };
@@ -1032,7 +1067,8 @@ pub fn configByNameImpl(input: []const u8) Error!Config {
     if (count == 2 and !types.same(parts[0][0..lengths[0]], "pg_catalog")) return error.UndefinedObject;
     const name = parts[count - 1][0..lengths[count - 1]];
     if (types.same(name, "simple")) return .simple;
-    const snowball = [_][]const u8{ "arabic", "armenian", "basque", "catalan", "danish", "dutch", "english", "finnish", "french", "german", "greek", "hindi", "hungarian", "indonesian", "irish", "italian", "lithuanian", "nepali", "norwegian", "portuguese", "romanian", "russian", "serbian", "spanish", "swedish", "tamil", "turkish", "yiddish" };
+    if (types.same(name, "english")) return .english;
+    const snowball = [_][]const u8{ "arabic", "armenian", "basque", "catalan", "danish", "dutch", "finnish", "french", "german", "greek", "hindi", "hungarian", "indonesian", "irish", "italian", "lithuanian", "nepali", "norwegian", "portuguese", "romanian", "russian", "serbian", "spanish", "swedish", "tamil", "turkish", "yiddish" };
     for (snowball) |candidate| if (types.same(candidate, name)) return error.UnsupportedStatement;
     return error.UndefinedObject;
 }
@@ -1400,18 +1436,42 @@ pub fn TextSearch(comptime text_bytes: usize, comptime depth_limit: usize) type 
             return buffer[0..word.len];
         }
 
-        /// parsetext with `simple`: each indexed token is one lexeme at the
-        /// next position.
-        fn parseText(text: []const u8, vector: *Vector, control: ?*types.ExecutionControl) Error!void {
+        /// english_stem (dict_snowball): the lower-cased word, nothing for
+        /// a stop word, else its Snowball stem (words over 1000 bytes are
+        /// only lower-cased).
+        fn englishLexize(word: []const u8, buffer: []u8, stemmed: []u8) ?[]const u8 {
+            const lower = simpleLexize(word, buffer);
+            if (lower.len > snowball_english.max_word) return lower;
+            if (lower.len == 0) return null;
+            for (snowball_english.stop_words) |stop| if (std.mem.eql(u8, stop, lower)) return null;
+            return snowball_english.stem(lower, stemmed);
+        }
+
+        /// The english configuration's english_stem token types.
+        fn englishStemmed(kind: u8) bool {
+            return switch (kind) {
+                1, 2, 10, 11, 16, 17 => true,
+                else => false,
+            };
+        }
+
+        /// parsetext: each indexed token takes the next position; its
+        /// lexeme (none for a stop word) comes from the configuration's
+        /// dictionary for its type.
+        fn parseText(text: []const u8, vector: *Vector, control: ?*types.ExecutionControl, config: Config) Error!void {
             var parser = Parser.init(text);
             var position: usize = 0;
             var buffer: [text_bytes]u8 = undefined;
+            var stemmed: [@max(text_bytes, snowball_english.max_word) + 8]u8 = undefined;
             while (try parser.next()) |token| {
                 if (control) |active| try active.checkpoint();
                 if (!simpleIndexes(token.kind)) continue;
                 if (token.bytes.len >= max_word) continue;
                 position += 1;
-                const lexeme = simpleLexize(token.bytes, &buffer);
+                const lexeme = if (config == .english and englishStemmed(token.kind))
+                    englishLexize(token.bytes, &buffer, &stemmed) orelse continue
+                else
+                    simpleLexize(token.bytes, &buffer);
                 const entry = try vector.add(lexeme);
                 // Positions beyond 16383 are recorded as 16383.
                 try vector.addPosition(entry, @intCast(@min(position, max_position)));
@@ -1419,9 +1479,9 @@ pub fn TextSearch(comptime text_bytes: usize, comptime depth_limit: usize) type 
         }
 
         /// to_tsvector(config, text).
-        pub fn toVector(text: []const u8, out: *Out, control: ?*types.ExecutionControl) Error!void {
+        pub fn toVector(text: []const u8, config: Config, out: *Out, control: ?*types.ExecutionControl) Error!void {
             var vector: Vector = .{};
-            try parseText(text, &vector, control);
+            try parseText(text, &vector, control, config);
             // uniqueWORD keeps at most MAXNUMPOS - 1 positions per word.
             try writeVector(&vector, out, max_positions_per_lexeme - 1);
         }
@@ -1437,6 +1497,8 @@ pub fn TextSearch(comptime text_bytes: usize, comptime depth_limit: usize) type 
             bytes: [text_bytes]u8 = undefined,
             bytes_len: usize = 0,
             root: ?u16 = null,
+            /// The configuration that turns operands into lexemes.
+            config: Config = .simple,
 
             fn node(self: *Query, value: Node) Error!u16 {
                 if (self.count == max_nodes) return error.TextCapacity;
@@ -1472,17 +1534,28 @@ pub fn TextSearch(comptime text_bytes: usize, comptime depth_limit: usize) type 
 
         /// An operand: as written, or each indexed word of it joined by
         /// `morph`'s operator (pushval_morph: words of one operand are
-        /// left-nested); one without words is a stop-word placeholder that
-        /// cleanup() removes.
+        /// left-nested, and positions of stop words between them become
+        /// placeholders joined the same way); one without words is a
+        /// stop-word placeholder. cleanup() removes placeholders.
         fn pushOperand(query: *Query, text: []const u8, weight: u8, prefix: bool, morph: Morph) Error!u16 {
             if (morph == .as_is) return try query.operand(text, weight, prefix);
             var vector: Vector = .{};
-            try parseText(text, &vector, null);
+            try parseText(text, &vector, null, query.config);
             if (vector.count == 0) return query.node(.{ .kind = .void });
+            const kind: Kind = if (morph == .@"and") .@"and" else .phrase;
             var result: ?u16 = null;
+            var previous: u16 = 0;
             for (vector.entries[0..vector.count]) |entry| {
+                const position = vector.positionsOf(entry)[0];
+                if (previous > 0) {
+                    while (previous + 1 < position) : (previous += 1) {
+                        const stop = try query.node(.{ .kind = .void });
+                        result = try query.node(.{ .kind = kind, .left = result.?, .right = stop, .distance = 1 });
+                    }
+                }
+                previous = position;
                 const id = try query.operand(vector.lexeme(entry), weight, prefix);
-                result = if (result) |left| try query.node(.{ .kind = if (morph == .@"and") .@"and" else .phrase, .left = left, .right = id, .distance = 1 }) else id;
+                result = if (result) |left| try query.node(.{ .kind = kind, .left = left, .right = id, .distance = 1 }) else id;
             }
             return result.?;
         }
@@ -1729,8 +1802,8 @@ pub fn TextSearch(comptime text_bytes: usize, comptime depth_limit: usize) type 
 
         /// to_tsquery (phrase), plainto_tsquery (and: the whole text is one
         /// operand) and phraseto_tsquery (phrase: one operand).
-        pub fn toQuery(text: []const u8, which: enum { to, plain, phrase }, out: *Out) Error!void {
-            var query: Query = .{};
+        pub fn toQuery(text: []const u8, which: enum { to, plain, phrase }, config: Config, out: *Out) Error!void {
+            var query: Query = .{ .config = config };
             switch (which) {
                 .to => try readQuery(text, &query, .phrase),
                 .plain, .phrase => {
@@ -2029,6 +2102,7 @@ pub fn TextSearch(comptime text_bytes: usize, comptime depth_limit: usize) type 
         }
 
         pub const configByName = configByNameImpl;
+        pub const Configuration = Config;
 
         pub fn canonicalQuery(text: []const u8) bool {
             var out: Out = .{};

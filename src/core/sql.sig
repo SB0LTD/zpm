@@ -125,6 +125,7 @@ const CO = @import("sql/catalog_objects.sig");
 const operator_catalog = @import("sql/operator_catalog.sig");
 const index_operator_catalog = @import("sql/index_operator_catalog.sig");
 const array_module = @import("sql/array.sig");
+const text_search_module = @import("sql/text_search.sig");
 
 /// The canonical SQL tokenizer, also used by wire parameter binding.
 /// Source and token spans remain caller-owned; tokenization allocates nothing.
@@ -11425,7 +11426,7 @@ pub fn Database(comptime config: Config) type {
             tx.deferrable = deferrable;
         }
 
-        const SettingKind = enum { search_path, check_function_bodies, row_security, synchronize_seqscans, restrict_nonsystem_relation_kind, default_transaction_isolation, default_transaction_read_only, default_transaction_deferrable, transaction_isolation, transaction_read_only, transaction_deferrable, custom, role, session_authorization, quote_all_identifiers };
+        const SettingKind = enum { search_path, check_function_bodies, row_security, synchronize_seqscans, restrict_nonsystem_relation_kind, default_transaction_isolation, default_transaction_read_only, default_transaction_deferrable, transaction_isolation, transaction_read_only, transaction_deferrable, custom, role, session_authorization, quote_all_identifiers, default_text_search_config };
 
         const SettingDescriptor = struct {
             kind: SettingKind,
@@ -11442,6 +11443,7 @@ pub fn Database(comptime config: Config) type {
             .{ .kind = .quote_all_identifiers, .vartype = "bool", .description = "When generating SQL fragments, quote all identifiers.", .category = "Version and Platform Compatibility / Previous PostgreSQL Versions" },
             .{ .kind = .restrict_nonsystem_relation_kind, .vartype = "string", .description = "Disallow access to selected kinds of non-system relations." },
             .{ .kind = .search_path, .vartype = "string", .description = "Schema search order for unqualified names." },
+            .{ .kind = .default_text_search_config, .vartype = "string", .description = "Sets default text search configuration.", .category = "Client Connection Defaults / Locale and Formatting" },
         };
 
         fn settingOriginBit(kind: SettingKind) u8 {
@@ -11454,6 +11456,7 @@ pub fn Database(comptime config: Config) type {
         fn engineSettingValue(values: *const Sess.Values, kind: SettingKind) ?[]const u8 {
             return switch (kind) {
                 .search_path => values.search_path.slice(),
+                .default_text_search_config => values.text_search_config.slice(),
                 .check_function_bodies => onOff(values.check_function_bodies),
                 .quote_all_identifiers => onOff(values.quote_all_identifiers),
                 .restrict_nonsystem_relation_kind => values.restriction_text.slice(),
@@ -11664,6 +11667,7 @@ pub fn Database(comptime config: Config) type {
         fn assignSetting(into: *Sess.Values, which: SettingKind, name: []const u8, kind: SettingValueKind, value: []const u8) Error!void {
             switch (which) {
                 .search_path => try searchPath(value, kind, &into.search_path),
+                .default_text_search_config => try into.text_search_config.set(try text_search_module.settingValue(value)),
                 .check_function_bodies => into.check_function_bodies = parseBool(value) orelse return error.InvalidSettingValue,
                 .row_security => into.row_security = parseBool(value) orelse return error.InvalidSettingValue,
                 .synchronize_seqscans => into.synchronize_seqscans = parseBool(value) orelse return error.InvalidSettingValue,
@@ -11693,6 +11697,7 @@ pub fn Database(comptime config: Config) type {
         fn copySetting(into: *Sess.Values, source: *const Sess.Values, which: SettingKind, name: []const u8) Error!void {
             switch (which) {
                 .search_path => into.search_path = source.search_path,
+                .default_text_search_config => into.text_search_config = source.text_search_config,
                 .check_function_bodies => into.check_function_bodies = source.check_function_bodies,
                 .row_security => into.row_security = source.row_security,
                 .synchronize_seqscans => into.synchronize_seqscans = source.synchronize_seqscans,
@@ -11844,6 +11849,7 @@ pub fn Database(comptime config: Config) type {
             self.session.row_security = state.values.row_security;
             self.session.synchronize_seqscans = self.dialect == .postgres and state.values.synchronize_seqscans;
             self.session.quote_all_identifiers = state.values.quote_all_identifiers;
+            self.session.text_search_config = @intFromEnum(text_search_module.settingConfig(state.values.text_search_config.slice()));
             self.session.restricted_relation_kinds = state.values.restricted_relation_kinds;
         }
 

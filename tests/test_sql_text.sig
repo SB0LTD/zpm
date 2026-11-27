@@ -1288,13 +1288,15 @@ fn textSearch() !void {
     try meta(1, "tsquery", 3615, -1);
     for (fts_battery) |case| try single(case[0], case[1]);
 
-    // Not here (0A000): the Snowball configurations, and the forms that
-    // use default_text_search_config (pg_catalog.english).
-    for ([_][]const u8{
-        "SELECT to_tsvector('english', 'x')",     "SELECT to_tsvector('x')",
-        "SELECT to_tsquery('x')",                 "SELECT plainto_tsquery('x')",
-        "SELECT 'a' @@ to_tsquery('simple', 'a')",
-    }) |source| try rejects(source, error.UnsupportedStatement);
+    // english and the forms that use default_text_search_config
+    // (pg_catalog.english; wave 4 text-json, checked against native
+    // PostgreSQL 18.7). The other Snowball configurations are 0A000.
+    for ([_][2][]const u8{
+        .{ "SELECT to_tsvector('english', 'x')", "'x':1" }, .{ "SELECT to_tsvector('x')", "'x':1" },
+        .{ "SELECT to_tsquery('x')", "'x'" },               .{ "SELECT plainto_tsquery('x')", "'x'" },
+        .{ "SELECT 'a' @@ to_tsquery('simple', 'a')", "f" },
+    }) |case| try single(case[0], case[1]);
+    try rejects("SELECT to_tsvector('french', 'x')", error.UnsupportedStatement);
     try rejects("SELECT to_tsvector('nope', 'x')", error.UndefinedObject);
     try rejects("SELECT 'a <16385> b'::tsquery", error.InvalidParameterValue);
     try rejects("SELECT 'a:0'::tsvector", error.Syntax);
