@@ -2514,7 +2514,7 @@ pub fn Objects(comptime config: types.Config) type {
             /// A frame or sealed base image must leave every delegated grant
             /// supported by an unbroken grant-option path from the owner.
             pub fn verifyLargeObjectGrants(self: *const Overlay) Error!void {
-                const acl = @import("large_object_acl.sig");
+                const acl = @import("privilege_graph.sig");
                 for (&self.items, 0..) |*entry, index| {
                     if (!entry.live or (entry.kind != .large_object_acl and entry.kind != .builtin_routine_acl) or entry.sub == 0) continue;
                     for (self.items[0..index]) |*prior| {

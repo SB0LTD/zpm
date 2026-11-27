@@ -4641,7 +4641,7 @@ pub fn Database(comptime config: Config) type {
             }
         }
 
-        const LoAcl = @import("sql/large_object_acl.sig");
+        const LoAcl = @import("sql/privilege_graph.sig");
 
         fn largeObjectGrantGraph(self: *const Self, object: *const O.Object, snap: Snapshot, edges: []LoAcl.Edge) LoAcl.Graph {
             var graph: LoAcl.Graph = .{ .edges = edges, .owner = object.owner, .privileges = CO.large_object_privileges };
@@ -5267,7 +5267,11 @@ pub fn Database(comptime config: Config) type {
                 latest.csn = self.csn;
                 for (&self.objects.routines) |*routine| {
                     if (!routine.live) continue;
-                    if (routine.owner != oid and std.mem.indexOfScalar(u32, routine.acl.roles(), oid) == null) continue;
+                    var referenced = routine.owner == oid;
+                    for (routine.acl.roles(), 0..) |role, index| {
+                        referenced = referenced or role == oid or routine.acl.grantor(index, routine.owner) == oid;
+                    }
+                    if (!referenced) continue;
                     if (routine.stamp.creatorOther(snap) orelse routine.stamp.deleterOther(snap)) |other| return self.objectPark(slot, other);
                     if (routine.stamp.visible(snap) != routine.stamp.visible(latest)) return error.SerializationFailure;
                     if (routine.stamp.visible(snap)) return error.DependentObjects;
@@ -12345,6 +12349,7 @@ pub fn Database(comptime config: Config) type {
             var statement_value: R.Statement = undefined;
             try R.parse(source, &self.workspace.nodes, &statement_value);
             const kind: R.Kind = statement_value;
+            if (self.txs[slot].read_only and kind != .call and kind != .do_block) return error.ReadOnlyTransaction;
             const saved_result = self.routine_result;
             defer self.routine_result = saved_result;
             self.routine_result = result;
@@ -12626,7 +12631,7 @@ pub fn Database(comptime config: Config) type {
             if (routine.acl.public or self.catalog_objects.superuser(self.session.role, snap)) return true;
             if (routine.acl.owner and self.catalog_objects.memberOf(self.session.role, routine.owner, true, snap)) return true;
             for (routine.acl.roles()) |role| {
-                if (self.catalog_objects.memberOf(self.session.role, role, true, snap)) return true;
+                if (role == CO.public_role or self.catalog_objects.memberOf(self.session.role, role, true, snap)) return true;
             }
             return false;
         }
@@ -12647,7 +12652,7 @@ pub fn Database(comptime config: Config) type {
                 if (found) |index| if (self.objects.routines[index].stamp.deleterOther(snap)) |other| return self.waitObject(slot, other);
             }
             if (found) |index| {
-                if ((self.objects.routines[index].kind == 'p') != drop.procedure) return error.WrongObjectType;
+                if (!drop.any_kind and (self.objects.routines[index].kind == 'p') != drop.procedure) return error.WrongObjectType;
             }
             return found;
         }
@@ -12677,11 +12682,8 @@ pub fn Database(comptime config: Config) type {
             }
         }
 
-        fn grantBuiltinRoutine(self: *Self, slot: u16, oid: u32, grant: *const R.ExecuteGrant, roles: []const u32, allow: bool, snap: Snapshot) Error!void {
-            var edges: [O.capacity + CO.list_capacity + 1]LoAcl.Edge = undefined;
-            var support: [edges.len]LoAcl.Graph.State = undefined;
-            var graph = self.builtinRoutineGraph(oid, snap, &edges);
-            const issuer = self.largeObjectGrantor(graph, CO.priv_execute, snap);
+        fn applyExecuteGrants(self: *Self, graph: *LoAcl.Graph, support: []LoAcl.Graph.State, grant: *const R.ExecuteGrant, roles: []const u32, allow: bool, snap: Snapshot) Error!bool {
+            const issuer = self.largeObjectGrantor(graph.*, CO.priv_execute, snap);
             if (issuer.options == 0) {
                 var accessible = false;
                 for (graph.edges[0..graph.len]) |edge| {
@@ -12689,14 +12691,14 @@ pub fn Database(comptime config: Config) type {
                 }
                 if (!accessible) return error.InsufficientPrivilege;
                 self.largeObjectGrantWarning(!allow, false);
-                return;
+                return false;
             }
             for (roles) |role| {
                 const existing = graph.find(issuer.role, role);
                 const held_options = if (existing) |index| graph.edges[index].options else 0;
                 if (allow and grant.option and held_options == 0 and issuer.role != graph.owner and role != graph.owner) {
-                    graph.support(&support, role);
-                    if (graph.supportedOptions(issuer.role, &support) & CO.priv_execute == 0) return error.InvalidGrantOperation;
+                    graph.support(support, role);
+                    if (graph.supportedOptions(issuer.role, support) & CO.priv_execute == 0) return error.InvalidGrantOperation;
                 }
                 const item = existing orelse blk: {
                     // Keep the owner marker even when its privileges are empty.
@@ -12717,7 +12719,7 @@ pub fn Database(comptime config: Config) type {
                 }
             }
             if (!allow) {
-                graph.support(&support, null);
+                graph.support(support, null);
                 for (graph.edges[0..graph.len], support[0..graph.len]) |*dependent, state| {
                     if (dependent.flags & ~state.available == 0) continue;
                     if (!grant.cascade) return error.DependentObjects;
@@ -12725,6 +12727,14 @@ pub fn Database(comptime config: Config) type {
                     dependent.options &= state.available;
                 }
             }
+            return true;
+        }
+
+        fn grantBuiltinRoutine(self: *Self, slot: u16, oid: u32, grant: *const R.ExecuteGrant, roles: []const u32, allow: bool, snap: Snapshot) Error!void {
+            var edges: [O.capacity + CO.list_capacity + 1]LoAcl.Edge = undefined;
+            var support: [edges.len]LoAcl.Graph.State = undefined;
+            var graph = self.builtinRoutineGraph(oid, snap, &edges);
+            if (!try self.applyExecuteGrants(&graph, &support, grant, roles, allow, snap)) return;
             // Replace the common owner marker to serialize edits to this
             // function's graph, including changes to different grantees.
             var writes: usize = 0;
@@ -12752,8 +12762,12 @@ pub fn Database(comptime config: Config) type {
         fn builtinRoutineAcl(self: *const Self, oid: u32, snapshot: Snapshot, values: ?*types.ValueBytes) Error!Cell {
             var edges: [O.capacity + 1]LoAcl.Edge = undefined;
             const graph = self.builtinRoutineGraph(oid, snapshot, &edges);
-            var emitted: [edges.len]LoAcl.Graph.State = undefined;
-            var steps: [edges.len]LoAcl.Graph.Step = undefined;
+            return self.executeAclCell(edges.len, graph, snapshot, values);
+        }
+
+        fn executeAclCell(self: *const Self, comptime capacity: usize, graph: LoAcl.Graph, snapshot: Snapshot, values: ?*types.ValueBytes) Error!Cell {
+            var emitted: [capacity]LoAcl.Graph.State = undefined;
+            var steps: [capacity]LoAcl.Graph.Step = undefined;
             graph.start(&emitted);
             var count: usize = 0;
             while (graph.next(&emitted)) |step| {
@@ -12764,7 +12778,7 @@ pub fn Database(comptime config: Config) type {
             var inline_buffer: [config.text_bytes]u8 = undefined;
             var writer = try Acl.CatalogWriter.start(&inline_buffer, values, @intCast(count));
             for (steps[0..count]) |step| {
-                const entry = edges[step.index];
+                const entry = graph.edges[step.index];
                 const grantee = if (entry.grantee == CO.public_role) "" else self.catalog_objects.roleName(entry.grantee, snapshot) orelse return error.UndefinedObject;
                 const grantor = self.catalog_objects.roleName(entry.grantor, snapshot) orelse return error.UndefinedObject;
                 try writer.add(grantee, if (entry.options != 0) "X*" else "X", grantor);
@@ -12811,12 +12825,7 @@ pub fn Database(comptime config: Config) type {
                     }
                 } else false;
                 if (duplicate) continue;
-                if (execute_target == .routine) {
-                    if (grant.option or grant.cascade) return error.UnsupportedStatement;
-                    if (!self.ownsRoutine(&self.objects.routines[execute_target.routine], snap)) return error.InsufficientPrivilege;
-                } else {
-                    try self.checkBuiltinRoutineWriter(slot, execute_target.builtin, snap);
-                }
+                if (execute_target == .builtin) try self.checkBuiltinRoutineWriter(slot, execute_target.builtin, snap);
                 targets[target_count] = execute_target;
                 target_count += 1;
             }
@@ -12842,8 +12851,12 @@ pub fn Database(comptime config: Config) type {
                 .builtin => |oid| try self.grantBuiltinRoutine(slot, oid, grant, roles[0..role_count], allow, snap),
                 .routine => |index| {
                     const old = &self.objects.routines[index];
+                    var edges: [@as(usize, config.routine_acl_entries) + CO.list_capacity + 2]LoAcl.Edge = undefined;
+                    var support: [edges.len]LoAcl.Graph.State = undefined;
+                    var graph = old.acl.graph(old.owner, &edges);
+                    if (!try self.applyExecuteGrants(&graph, &support, grant, roles[0..role_count], allow, snap)) continue;
                     var acl = old.acl;
-                    for (roles[0..role_count]) |role| try acl.set(role, old.owner, allow);
+                    try acl.assignGraph(graph);
                     try self.reserveWrites(slot, 2);
                     const next = try self.objectSlot(.routine);
                     try self.dropObject(slot, .routine, index, snap);
@@ -13573,21 +13586,11 @@ pub fn Database(comptime config: Config) type {
 
         // ---- catalogs ---------------------------------------------------------
 
-        fn routineAcl(self: *const Self, routine: *const RC.Routine, snapshot: Snapshot) Error!Cell {
-            const acl = &routine.acl;
-            if (!acl.explicit) return .null_value;
-            const owner = self.catalog_objects.roleName(routine.owner, snapshot) orelse return error.UndefinedObject;
-            const Acl = @import("sql/catalog_acl.sig").Acl(V);
-            var output: Text = .{};
-            const count = @as(u32, acl.count) + @intFromBool(acl.public) + @intFromBool(acl.owner);
-            var writer = try Acl.begin(&output, count);
-            if (acl.public) try Acl.append(&writer, "", "X", owner);
-            if (acl.owner) try Acl.append(&writer, owner, "X", owner);
-            for (acl.roles()) |role| {
-                const name = self.catalog_objects.roleName(role, snapshot) orelse return error.UndefinedObject;
-                try Acl.append(&writer, name, "X", owner);
-            }
-            return .{ .array = output };
+        fn routineAcl(self: *const Self, routine: *const RC.Routine, snapshot: Snapshot, values: ?*types.ValueBytes) Error!Cell {
+            if (!routine.acl.explicit) return .null_value;
+            var edges: [@as(usize, config.routine_acl_entries) + 2]LoAcl.Edge = undefined;
+            const graph = routine.acl.graph(routine.owner, &edges);
+            return self.executeAclCell(edges.len, graph, snapshot, values);
         }
 
         /// pg_proc, pg_trigger, pg_rewrite and pg_rules rows.
@@ -13668,7 +13671,8 @@ pub fn Database(comptime config: Config) type {
                             at += length;
                         }
                         const language = if (routine.language == 0) catalog_module.sql_language_oid else catalog_module.plpgsql_language_oid;
-                        try procRow(sink, &.{ intCell(routine.oid), nameCell(routine.name.slice()), intCell(routine.namespace), .{ .pg_internal_char = routine.kind }, intCell(language), .{ .pg_internal_char = routine.volatility }, boolCell(routine.strict), intCell(@intCast(routine.arg_count)), intCell(routine.return_oid), nameCell(argtypes[0..at]), nameCell(routine.body.slice()), intCell(routine.owner), try self.routineAcl(routine, snapshot) });
+                        const acl = if (sink.referencesColumn(12)) try self.routineAcl(routine, snapshot, sink.valueBytes()) else .null_value;
+                        try procRow(sink, &.{ intCell(routine.oid), nameCell(routine.name.slice()), intCell(routine.namespace), .{ .pg_internal_char = routine.kind }, intCell(language), .{ .pg_internal_char = routine.volatility }, boolCell(routine.strict), intCell(@intCast(routine.arg_count)), intCell(routine.return_oid), nameCell(argtypes[0..at]), nameCell(routine.body.slice()), intCell(routine.owner), acl });
                     }
                 },
                 .pg_trigger => for (&self.objects.triggers) |*trigger| {

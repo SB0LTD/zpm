@@ -22,7 +22,10 @@
 //!       strict u8, arg_count u8, per argument: name, type OID u32, typmod
 //!       i32; return type OID u32 (2278 void, 2279 trigger), return typmod
 //!       i32, body text, optional owner OID u32, and optional EXECUTE ACL
-//!       (owner/PUBLIC flags u8, count u8, grantee OIDs u32).
+//!       (owner/PUBLIC flags u8, count u8, grantee OIDs u32). Extended ACLs
+//!       set flag 0x80 and encode (grantee u32, grantor u32, option u8) per
+//!       entry; flag 0x04 retains an explicit owner grant option. Legacy
+//!       owner-issued records retain their original encoding.
 //!   62: oid u32, name, table OID u32, function OID u32, tgtype u8
 //!       (PostgreSQL's bits: 1 ROW, 2 BEFORE, 4 INSERT, 8 DELETE, 16 UPDATE,
 //!       32 TRUNCATE, 64 INSTEAD), column_count u8 + column indexes u8
@@ -34,6 +37,8 @@
 //! Decoders validate every byte (bounded lengths, known type OIDs, flags,
 //! no trailing bytes) and never recurse.
 const types = @import("types.sig");
+const privilege_graph = @import("privilege_graph.sig");
+const execute_privilege = @import("catalog_objects.sig").priv_execute;
 const storage = @import("storage.sig");
 const Error = types.Error;
 
@@ -134,7 +139,7 @@ pub fn Catalog(comptime config: types.Config) type {
         pub const Name = V.Name;
         pub const arg_bytes: usize = @max(config.routine_bytes / 4, 16);
         /// Largest object payload (a routine with every argument named).
-        pub const payload_bytes: usize = config.routine_bytes + arg_bytes + config.routine_args * (config.name_bytes + 10) + config.columns + 2 * config.name_bytes + 64 + 4 * @as(usize, config.routine_acl_entries);
+        pub const payload_bytes: usize = config.routine_bytes + arg_bytes + config.routine_args * (config.name_bytes + 10) + config.columns + 2 * config.name_bytes + 64 + 9 * @as(usize, config.routine_acl_entries);
 
         /// Inline object text (bodies, WHEN conditions, rule qualifications).
         pub const Text = struct {
@@ -155,18 +160,66 @@ pub fn Catalog(comptime config: types.Config) type {
         pub const ExecuteAcl = struct {
             explicit: bool = false,
             owner: bool = true,
+            owner_option: bool = false,
             public: bool = true,
             count: u8 = 0,
             grantees: [config.routine_acl_entries]u32 = @splat(0),
+            /// Zero denotes the owner, preserving owner-issued ACL constructors.
+            grantors: [config.routine_acl_entries]u32 = @splat(0),
+            options: [config.routine_acl_entries]bool = @splat(false),
 
             pub fn roles(self: *const ExecuteAcl) []const u32 {
                 return self.grantees[0..self.count];
+            }
+
+            pub fn grantor(self: *const ExecuteAcl, index: usize, owner: u32) u32 {
+                return if (self.grantors[index] == 0) owner else self.grantors[index];
+            }
+
+            pub fn extended(self: *const ExecuteAcl, owner: u32) bool {
+                if (self.owner_option) return true;
+                for (0..self.count) |index| {
+                    if (self.options[index] or self.grantor(index, owner) != owner) return true;
+                }
+                return false;
+            }
+
+            pub fn graph(self: *const ExecuteAcl, owner: u32, edges: []privilege_graph.Edge) privilege_graph.Graph {
+                var result: privilege_graph.Graph = .{ .edges = edges, .owner = owner, .privileges = execute_privilege };
+                result.add(.{ .grantor = owner, .grantee = 0, .flags = if (self.public) execute_privilege else 0, .options = 0 });
+                result.add(.{ .grantor = owner, .grantee = owner, .flags = if (self.owner) execute_privilege else 0,
+                    .options = if (self.owner_option) execute_privilege else 0 });
+                for (self.roles(), 0..) |role, index| result.add(.{
+                    .grantor = self.grantor(index, owner), .grantee = role, .flags = execute_privilege,
+                    .options = if (self.options[index]) execute_privilege else 0,
+                });
+                return result;
+            }
+
+            pub fn assignGraph(self: *ExecuteAcl, grants: privilege_graph.Graph) Error!void {
+                self.* = .{ .explicit = true, .owner = false, .public = false };
+                for (grants.edges[0..grants.len]) |edge| {
+                    if (edge.flags == 0) continue;
+                    if (edge.grantor == grants.owner and edge.grantee == grants.owner) {
+                        self.owner = true;
+                        self.owner_option = edge.options != 0;
+                    } else if (edge.grantor == grants.owner and edge.grantee == 0) {
+                        self.public = true;
+                    } else {
+                        if (self.count == self.grantees.len) return error.ProgramLimitExceeded;
+                        self.grantees[self.count] = edge.grantee;
+                        self.grantors[self.count] = if (edge.grantor == grants.owner) 0 else edge.grantor;
+                        self.options[self.count] = edge.options != 0;
+                        self.count += 1;
+                    }
+                }
             }
 
             pub fn set(self: *ExecuteAcl, role: u32, owner: u32, allow: bool) Error!void {
                 self.explicit = true;
                 if (role == owner) {
                     self.owner = allow;
+                    if (!allow) self.owner_option = false;
                     return;
                 }
                 if (role == 0) {
@@ -174,10 +227,14 @@ pub fn Catalog(comptime config: types.Config) type {
                     return;
                 }
                 for (self.roles(), 0..) |grantee, index| {
-                    if (grantee != role) continue;
+                    if (grantee != role or self.grantor(index, owner) != owner) continue;
                     if (!allow) {
                         const count = self.count - 1;
-                        for (index..count) |i| self.grantees[i] = self.grantees[i + 1];
+                        for (index..count) |i| {
+                            self.grantees[i] = self.grantees[i + 1];
+                            self.grantors[i] = self.grantors[i + 1];
+                            self.options[i] = self.options[i + 1];
+                        }
                         self.count = count;
                     }
                     return;
@@ -185,6 +242,8 @@ pub fn Catalog(comptime config: types.Config) type {
                 if (!allow) return;
                 if (self.count == self.grantees.len) return error.ProgramLimitExceeded;
                 self.grantees[self.count] = role;
+                self.grantors[self.count] = 0;
+                self.options[self.count] = false;
                 self.count += 1;
             }
         };
@@ -481,10 +540,18 @@ pub fn Catalog(comptime config: types.Config) type {
             // Older routine records end after the body and imply the bootstrap owner.
             if (item.owner != @import("catalog_objects.sig").bootstrap_role or item.acl.explicit) try out.int(u32, item.owner);
             if (item.acl.explicit) {
-                const flags = @as(u8, @intFromBool(item.acl.owner)) | (@as(u8, @intFromBool(item.acl.public)) << 1);
+                const extended = item.acl.extended(item.owner);
+                const flags = @as(u8, @intFromBool(item.acl.owner)) | (@as(u8, @intFromBool(item.acl.public)) << 1) |
+                    (@as(u8, @intFromBool(item.acl.owner_option)) << 2) | (if (extended) @as(u8, 0x80) else 0);
                 try out.int(u8, flags);
                 try out.int(u8, item.acl.count);
-                for (item.acl.roles()) |role| try out.int(u32, role);
+                for (item.acl.roles(), 0..) |role, index| {
+                    try out.int(u32, role);
+                    if (extended) {
+                        try out.int(u32, item.acl.grantor(index, item.owner));
+                        try out.int(u8, @intFromBool(item.acl.options[index]));
+                    }
+                }
             }
         }
 
@@ -567,13 +634,24 @@ pub fn Catalog(comptime config: types.Config) type {
             if (!reader.finished()) {
                 const flags = try reader.int(u8);
                 const count_acl = try reader.int(u8);
-                if (flags > 3 or count_acl > config.routine_acl_entries) return error.InvalidChangeRecord;
-                out.acl = .{ .explicit = true, .owner = flags & 1 != 0, .public = flags & 2 != 0 };
+                const extended = flags & 0x80 != 0;
+                if (flags & ~@as(u8, 0x87) != 0 or count_acl > config.routine_acl_entries or
+                    (flags & 4 != 0 and (!extended or flags & 1 == 0))) return error.InvalidChangeRecord;
+                out.acl = .{ .explicit = true, .owner = flags & 1 != 0, .owner_option = flags & 4 != 0, .public = flags & 2 != 0 };
                 for (0..count_acl) |_| {
                     const role = try reader.int(u32);
-                    if (role == 0 or role == out.owner) return error.InvalidChangeRecord;
-                    for (out.acl.roles()) |existing| if (role == existing) return error.InvalidChangeRecord;
-                    try out.acl.set(role, out.owner, true);
+                    const grantor = if (extended) try reader.int(u32) else out.owner;
+                    const option = if (extended) try reader.int(u8) else 0;
+                    if (grantor == 0 or option > 1 or
+                        (grantor == out.owner and (role == 0 or role == out.owner)) or
+                        (option != 0 and (role == 0 or role == grantor))) return error.InvalidChangeRecord;
+                    for (out.acl.roles(), 0..) |existing, index| {
+                        if (role == existing and grantor == out.acl.grantor(index, out.owner)) return error.InvalidChangeRecord;
+                    }
+                    out.acl.grantees[out.acl.count] = role;
+                    out.acl.grantors[out.acl.count] = if (grantor == out.owner) 0 else grantor;
+                    out.acl.options[out.acl.count] = option != 0;
+                    out.acl.count += 1;
                 }
             }
             if (!reader.finished()) return error.InvalidChangeRecord;
@@ -774,7 +852,16 @@ pub fn Catalog(comptime config: types.Config) type {
                 switch (object.class) {
                     .routine => {
                         if (!roles.roleExists(object.owner)) return error.ChangeRecordConflict;
-                        for (object.acl.roles()) |role| if (!roles.roleExists(role)) return error.ChangeRecordConflict;
+                        for (object.acl.roles(), 0..) |role, index| {
+                            if ((role != 0 and !roles.roleExists(role)) or !roles.roleExists(object.acl.grantor(index, object.owner))) return error.ChangeRecordConflict;
+                        }
+                        var edges: [@as(usize, config.routine_acl_entries) + 2]privilege_graph.Edge = undefined;
+                        var support: [edges.len]privilege_graph.Graph.State = undefined;
+                        const graph = object.acl.graph(object.owner, &edges);
+                        graph.support(&support, null);
+                        for (graph.edges[0..graph.len], support[0..graph.len]) |edge, state| {
+                            if (edge.flags & ~state.available != 0) return error.ChangeRecordConflict;
+                        }
                     },
                     .trigger => {
                         const function = overlayFind(overlay, .routine, object.function_oid) orelse return error.ChangeRecordConflict;

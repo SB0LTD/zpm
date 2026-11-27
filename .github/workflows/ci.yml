@@ -61,6 +61,14 @@ jobs:
             )
           done
 
+      - name: Test routine privileges in Debug and ReleaseSafe
+        run: |
+          set -euo pipefail
+          for optimize in Debug ReleaseSafe; do
+            "$SIG" build run-contract-sql-routines run-contract-sql-catalog-security \
+              -Doptimize="$optimize" -j2 --Sig-lib-dir "$SIG_LIB_DIR"
+          done
+
       - name: Test ZPM library and transport graph with Sig
         run: |
           "$SIG" build test \
