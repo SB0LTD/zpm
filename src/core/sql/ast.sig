@@ -165,7 +165,38 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     // a version argument, bits 1-2 standalone 0 absent / 1 yes / 2 no /
     // 3 no value). xml_name carries an identifier in `name`; an
     // xml_attribute its name and value (`b`). Neither is a value.
-    xmlelement, xmlforest, xmlconcat, xmlcomment, xmlpi, xmlroot, xml_name, xml_attribute };
+    xmlelement, xmlforest, xmlconcat, xmlcomment, xmlpi, xmlroot, xml_name, xml_attribute,
+    // Regular-expression functions (wave 4 text-json lane, regex_eval.sig):
+    // substring_regex is substring(text, text) and substring_similar
+    // substring(text, text, text) (SIMILAR ... ESCAPE). regexp_matches and
+    // regexp_split_to_table return sets (FROM items or one target).
+    regexp_match, regexp_matches, regexp_replace, regexp_split_to_array, regexp_split_to_table, regexp_count, regexp_instr, regexp_substr,
+    substring_regex, substring_similar,
+    // jsonb_path_query (and jsonb_path_query_tz): the items of a path as a
+    // set (wave 4 text-json; json_eval.sig rows).
+    jsonb_path_query,
+    // JSON_EXISTS / JSON_VALUE / JSON_QUERY (wave 4 text-json): `a` the
+    // context item, `b` -> next PASSING values (json_table_passing), `c`
+    // a json_table_column describing the path, RETURNING type, wrapper,
+    // quotes and ON EMPTY / ON ERROR; `integer` 0 EXISTS, 1 VALUE, 2 QUERY.
+    json_query_function,
+    // expr IS [NOT] JSON [VALUE|ARRAY|OBJECT|SCALAR] [WITH|WITHOUT UNIQUE
+    // [KEYS]] (wave 4 text-json): `b` the operand, `integer` bits 0-1 the
+    // item type (value, array, object, scalar), bit 2 WITH UNIQUE KEYS,
+    // bit 3 NOT.
+    is_json,
+    // JSON_OBJECT / JSON_ARRAY / JSON_SCALAR / JSON_SERIALIZE (wave 4
+    // text-json): `b` -> next the arguments (object: key, value pairs);
+    // `integer` bits 0-1 the form (0 object, 1 array, 2 scalar, 3
+    // serialize), bit 2 ABSENT ON NULL, bit 3 WITH UNIQUE KEYS; the
+    // RETURNING type in cast_type / typmod.
+    json_constructor,
+    // tsvector / tsquery utilities (wave 4 text-json, text_search.sig):
+    // length(tsvector), strip, setweight (2 or 3 arguments),
+    // tsvector_to_array, array_to_tsvector, ts_delete (text or text[]),
+    // ts_filter and numnode.
+    tsvector_length, ts_strip, ts_setweight, tsvector_to_array, array_to_tsvector, ts_delete, ts_filter, ts_numnode };
+
 
 /// mr_call variants: the range accessors applied to a multirange's span.
 pub const MultirangeFn = enum(u8) { lower, upper, isempty, lower_inc, upper_inc, lower_inf, upper_inf };
@@ -258,6 +289,8 @@ pub fn immutableBuiltin(func: Func) bool {
         // to_json / to_jsonb are STABLE (timestamptz output).
         .to_json, .to_jsonb => false,
         .regexp_like, .similar_to_escape => true,
+        .regexp_match, .regexp_replace, .regexp_split_to_array, .regexp_count, .regexp_instr, .regexp_substr, .substring_regex, .substring_similar => true,
+        .tsvector_length, .ts_strip, .ts_setweight, .tsvector_to_array, .array_to_tsvector, .ts_delete, .ts_filter, .ts_numnode => true,
         .to_tsvector, .to_tsquery, .plainto_tsquery, .phraseto_tsquery => true,
         else => jsonFunction(func),
     };
@@ -292,9 +325,17 @@ pub fn strictFunction(func: Func) bool {
         .jsonb_set_lax => false,
         .pg_get_serial_sequence, .pg_table_is_visible, .pg_get_indexdef, .pg_get_constraintdef, .pg_get_triggerdef, .pg_get_ruledef, .pg_get_viewdef, .pg_partition_ancestors, .pg_get_statisticsobjdef_columns, .pg_relation_is_publishable, .pg_get_partkeydef => true,
         .regexp_like, .similar_to_escape => true,
+        .regexp_match, .regexp_matches, .regexp_replace, .regexp_split_to_array, .regexp_split_to_table, .regexp_count, .regexp_instr, .regexp_substr, .substring_regex, .substring_similar => true,
+        .tsvector_length, .ts_strip, .ts_setweight, .tsvector_to_array, .array_to_tsvector, .ts_delete, .ts_filter, .ts_numnode => true,
         .to_tsvector, .to_tsquery, .plainto_tsquery, .phraseto_tsquery => true,
         else => jsonFunction(func),
     };
+}
+
+/// Set-returning built-ins (wave 4 text-json): bound only as a FROM item
+/// or inside one target of a select list.
+pub fn setFunction(func: Func) bool {
+    return func == .regexp_matches or func == .regexp_split_to_table or func == .jsonb_path_query;
 }
 
 /// Cast typmods marking `::regclass` / `::regtype` (OID-valued casts).

@@ -555,6 +555,12 @@ pub const Error = error{
     /// SQLSTATE 44000: a new row of an auto-updatable view violates its
     /// WITH CHECK OPTION (B11 wave 4).
     WithCheckOptionViolation,
+    /// SQLSTATE 22030: a duplicate key where JSON object keys must be
+    /// unique (wave 4 text-json).
+    DuplicateJsonObjectKeyValue,
+    /// SQLSTATE 2200F: an empty string where one is not allowed
+    /// (array_to_tsvector lexemes; wave 4 text-json).
+    ZeroLengthCharacterString,
 };
 
 /// Caller-owned execution accounting and interrupt polling. This is independent
