@@ -16,9 +16,9 @@ contents, retains their mode, and survives SQL rollback. Import observes
 read-only transactions and statement rollback.
 
 The built-in signatures default to owner-only EXECUTE ACLs. GRANT and
-REVOKE EXECUTE (or ALL) support one signature and grantee per statement,
-including pg_catalog qualification, PUBLIC, inherited roles, WITH GRANT
-OPTION, REVOKE GRANT OPTION FOR, and RESTRICT/CASCADE. The existing
+REVOKE EXECUTE (or ALL) support function and grantee lists, including
+pg_catalog qualification, PUBLIC, inherited roles, WITH GRANT OPTION,
+REVOKE GRANT OPTION FOR, and RESTRICT/CASCADE. The existing
 owner-rooted grant graph rejects circular delegation and preserves
 independently supported grants. Export also requires SELECT on its large
 object; import creates objects owned by the effective caller.
@@ -30,9 +30,27 @@ Function discovery exposes invoker, scalar-result, cost, parallel-safety
 and empty configuration/transform/support metadata. The function argument,
 identity-argument and result renderers use registered signatures; supported
 quoted SQL bodies have no SQL-standard body expression tree.
+GRANTED BY accepts the current SQL user, written as a role name,
+CURRENT_USER, CURRENT_ROLE or SESSION_USER when it denotes that user.
+Like PG16 and PG18, a different grantor returns 0A000; PUBLIC as grantor
+returns 42704. The clause does not impersonate another role or override
+the inherited grant-option selection used to record the actual grantor.
+Grantee lists also accept those user aliases, GROUP and quoted names.
+Duplicate function identities and grantees are applied once. All targets
+and roles are resolved before edits; a later RESTRICT or capacity failure
+rolls back the entire statement, including earlier function edits.
+Pending writers on any listed function are checked before the first edit;
+the contract parks, resumes and rolls back a list waiting on its last target.
+
+Lists use the existing eight-entry catalog statement budget per list;
+exceeding it returns 54000 without publishing any change. SQL bytes,
+catalog versions and transaction write budgets also apply. Lists and
+GRANTED BY work for existing SQL functions/procedures under their current
+owner-issued ACL model. Their grant-option delegation and generalized
+built-in function ACLs remain open.
+
 Compact checkpoint RSBASE08 carries these grants and accepts older
-formats. Function lists, grantee lists, GRANTED BY and generalized
-built-in function ACLs remain outside this increment. Embedded callers
+formats. Embedded callers
 install their provider explicitly. RAMSQL installs ZPM's native file
 provider for its server.
 
@@ -43,8 +61,14 @@ checkpoint recovery. The stock PG16/18 file qualification checks
 OS permissions, binary transfers, rollback, forced-process restart, and
 plain and custom archives in both directions with ACLs enabled. It checks
 delegated file transfers, revoked access and uncommitted ACL rollback
-after a forced process kill. CI qualification is required before merge.
+after a forced process kill. List tests cover grantor rejection, aliases,
+quoted recipients, duplicate entries, independent delegation chains and
+rollback when a later function fails. WAL and checkpoint tests preserve
+the list grants and discard uncommitted list grants and revocations.
+CI qualification is required before merge.
 [PostgreSQL server-side functions](https://www.postgresql.org/docs/18/lo-funcs.html)
+[PostgreSQL 16 GRANT](https://www.postgresql.org/docs/16/sql-grant.html)
+[PostgreSQL 18 GRANT](https://www.postgresql.org/docs/18/sql-grant.html)
 
 ## Wide-cell SQL binding on a 4 MiB stack
 

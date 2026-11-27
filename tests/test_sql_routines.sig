@@ -956,8 +956,45 @@ fn bodyValidationSetting() !void {
     try same(try query(&replica, "SELECT value FROM body_dependency"), "31");
 }
 
+fn executeLists() !void {
+    reset();
+    try run("CREATE ROLE grant_a");
+    try run("CREATE ROLE grant_b");
+    try run("CREATE ROLE \"PUBLIC\"");
+    try run("CREATE ROLE \"current_user\"");
+    try run("CREATE FUNCTION list_a(x INT) RETURNS INT LANGUAGE SQL AS 'SELECT x+1'");
+    try run("CREATE FUNCTION list_b(x INT) RETURNS INT LANGUAGE SQL AS 'SELECT x+2'");
+    try run("REVOKE EXECUTE ON FUNCTION list_a(INT),public.list_b(INT) FROM PUBLIC GRANTED BY SESSION_USER");
+    const probe = "SELECT proacl::text FROM pg_proc WHERE proname='list_a'";
+    try expect(probe, "{ramsql=X/ramsql}");
+    try run("GRANT ALL ON FUNCTION list_a(INT),list_b(INT),public.list_a(INT) TO grant_a,GROUP grant_b,grant_a GRANTED BY CURRENT_USER");
+    const granted = "{ramsql=X/ramsql,grant_a=X/ramsql,grant_b=X/ramsql}";
+    try expect(probe, granted);
+    try run("SET ROLE grant_a");
+    try expect("SELECT list_a(3),list_b(3)", "4|5");
+    try run("RESET ROLE");
+    try rejects("REVOKE EXECUTE ON FUNCTION list_a(INT),missing_function() FROM grant_a", error.UndefinedFunction, probe, granted);
+    try rejects("REVOKE EXECUTE ON FUNCTION list_a(INT),list_b(INT) FROM grant_a,missing_role", error.UndefinedObject, probe, granted);
+    try rejects("REVOKE EXECUTE ON FUNCTION list_a(INT),list_b(INT) FROM grant_a GRANTED BY grant_b", error.UnsupportedStatement, probe, granted);
+    try rejects("GRANT EXECUTE ON FUNCTION list_a(INT) TO grant_b GRANTED BY PUBLIC", error.UndefinedObject, probe, granted);
+    try rejects("GRANT EXECUTE ON FUNCTION list_a(INT) TO grant_a,grant_a,grant_a,grant_a,grant_a,grant_a,grant_a,grant_a,grant_a", error.ProgramLimitExceeded, probe, granted);
+    try run("REVOKE ALL PRIVILEGES ON FUNCTION list_a(INT),list_b(INT) FROM grant_a,grant_b GRANTED BY CURRENT_ROLE RESTRICT");
+    try expect(probe, "{ramsql=X/ramsql}");
+    try run("GRANT EXECUTE ON FUNCTION list_a(INT),list_b(INT) TO CURRENT_ROLE,SESSION_USER,CURRENT_USER GRANTED BY ramsql");
+    try expect(probe, "{ramsql=X/ramsql}");
+    try run("GRANT EXECUTE ON FUNCTION list_a(INT),list_b(INT) TO \"current_user\",GROUP \"PUBLIC\" GRANTED BY SESSION_USER");
+    try run("SET ROLE \"PUBLIC\"");
+    try expect("SELECT list_a(3),list_b(3)", "4|5");
+    try run("RESET ROLE");
+    try run("SET ROLE \"current_user\"");
+    try expect("SELECT list_a(3),list_b(3)", "4|5");
+    try run("RESET ROLE");
+    try sameState(&.{probe});
+}
+
 pub fn main() !void {
     try routineDiscovery();
+    try executeLists();
     try bodyValidationSetting();
     try oraclePrograms();
     try sqlFunctions();

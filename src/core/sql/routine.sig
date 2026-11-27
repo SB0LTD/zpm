@@ -28,6 +28,7 @@ const binder = @import("binder.sig");
 const expr = @import("expr.sig");
 const dml = @import("dml.sig");
 const routine_catalog = @import("routine_catalog.sig");
+const catalog_objects = @import("catalog_objects.sig");
 const value_module = @import("value.sig");
 const Error = types.Error;
 const Token = lexer.Token;
@@ -88,11 +89,17 @@ pub fn Routines(comptime config: types.Config) type {
             arg_count: usize = 0,
         };
 
-        pub const ExecuteGrant = struct {
+        pub const ExecuteTarget = struct {
             routine: DropRoutine = .{},
             schema: Name = .{},
-            /// An empty name denotes the PUBLIC keyword.
-            grantee: Name = .{},
+        };
+
+        pub const ExecuteGrant = struct {
+            targets: [catalog_objects.list_capacity]ExecuteTarget = @splat(.{}),
+            target_count: usize = 0,
+            grantees: [catalog_objects.list_capacity]catalog_objects.Grantee = @splat(.{}),
+            grantee_count: usize = 0,
+            grantor: ?catalog_objects.Grantee = null,
             option: bool = false,
             cascade: bool = false,
         };
@@ -483,28 +490,64 @@ pub fn Routines(comptime config: types.Config) type {
             }
             if (try cursor.take("all")) _ = try cursor.take("privileges") else try cursor.expect("execute");
             try cursor.expect("on");
-            out.routine.procedure = try cursor.take("procedure");
-            if (!out.routine.procedure) try cursor.expect("function");
-            out.routine.name = try cursor.identifier();
-            if (try cursor.takeSymbol(.dot)) {
-                out.schema = out.routine.name;
-                if (!types.same(out.schema.slice(), "public") and !types.same(out.schema.slice(), "pg_catalog")) return error.UnsupportedStatement;
-                out.routine.name = try cursor.identifier();
+            const procedure = try cursor.take("procedure");
+            if (!procedure) try cursor.expect("function");
+            while (true) {
+                if (out.target_count == out.targets.len) return error.ProgramLimitExceeded;
+                const target = &out.targets[out.target_count];
+                target.routine.procedure = procedure;
+                target.routine.name = try cursor.identifier();
+                if (try cursor.takeSymbol(.dot)) {
+                    target.schema = target.routine.name;
+                    if (!types.same(target.schema.slice(), "public") and !types.same(target.schema.slice(), "pg_catalog")) return error.UnsupportedStatement;
+                    target.routine.name = try cursor.identifier();
+                }
+                try routineSignature(cursor, pool, &target.routine);
+                out.target_count += 1;
+                if (!try cursor.takeSymbol(.comma)) break;
             }
-            try routineSignature(cursor, pool, &out.routine);
             try cursor.expect(if (revoke) "from" else "to");
-            if (!try cursor.take("public")) out.grantee = try cursor.identifier();
+            while (true) {
+                if (out.grantee_count == out.grantees.len) return error.ProgramLimitExceeded;
+                out.grantees[out.grantee_count] = try executeRole(cursor);
+                out.grantee_count += 1;
+                if (!try cursor.takeSymbol(.comma)) break;
+            }
             if (!revoke and try cursor.take("with")) {
                 try cursor.expect("grant");
                 try cursor.expect("option");
                 out.option = true;
             }
+            if (try cursor.take("granted")) {
+                try cursor.expect("by");
+                out.grantor = try executeRole(cursor);
+            }
             if (revoke) {
                 out.cascade = try cursor.take("cascade");
                 if (!out.cascade) _ = try cursor.take("restrict");
             }
-            if (cursor.is("granted") or cursor.symbol(.comma)) return error.UnsupportedStatement;
             try finish(cursor);
+        }
+
+        fn executeRole(cursor: *Cursor) Error!catalog_objects.Grantee {
+            if (cursor.current.kind == .word) {
+                const kind: ?catalog_objects.GranteeKind = if (cursor.is("public")) .public
+                    else if (cursor.is("current_user")) .current_user
+                    else if (cursor.is("current_role")) .current_role
+                    else if (cursor.is("session_user")) .session_user else null;
+                if (kind) |special| {
+                    try cursor.advance();
+                    return .{ .kind = special };
+                }
+                _ = try cursor.take("group");
+                if (cursor.is("user") or cursor.is("none")) return error.Syntax;
+            }
+            const token = cursor.current;
+            _ = try cursor.identifier();
+            return .{ .name = .{
+                .span = .{ .start = token.start, .len = token.end - token.start },
+                .quoted = token.kind == .quoted_word, .len = token.len,
+            } };
         }
 
         /// The end of an expression starting at the cursor: the first `,`
