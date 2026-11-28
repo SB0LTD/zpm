@@ -2150,6 +2150,10 @@ pub fn Database(comptime config: Config) type {
         context_overflow: bool = false,
         context_bytes: [config.text_bytes]u8 = undefined,
         context_bytes_len: usize = 0,
+        /// Windows of the firing triggers with transition tables (B11
+        /// wave 5), innermost last.
+        transition_windows: [config.routine_depth]TransitionWindow = undefined,
+        transition_len: usize = 0,
         routine_volatility: u8 = 0,
         /// PostgreSQL's errdetail of the last view error (lastErrorDetail).
         error_detail: []const u8 = "",
@@ -2644,6 +2648,7 @@ pub fn Database(comptime config: Config) type {
             self.nested_use = @splat(0);
             self.context_len = 0;
             self.context_captured = false;
+            self.transition_len = 0;
             self.row_staging = null;
             self.xml_region = .{};
             self.routine_definer = null;
@@ -2780,7 +2785,12 @@ pub fn Database(comptime config: Config) type {
                 self.abort(slot);
                 return err;
             };
-            // Deferred constraints are checked as the transaction commits.
+            // Deferred constraint triggers fire, then deferred constraints
+            // are checked, as the transaction commits.
+            self.fireDeferredTriggers(slot, result) catch |err| {
+                self.abort(slot);
+                return err;
+            };
             self.deferredViolation(slot) catch |err| {
                 self.abort(slot);
                 return err;
@@ -2855,6 +2865,7 @@ pub fn Database(comptime config: Config) type {
                 tx.statement_checks = false;
                 tx.constraints_all = null;
                 tx.constraint_mode_count = 0;
+                tx.trigger_handled = @splat(0);
                 tx.isolation = .read_committed;
                 tx.read_only = false;
                 tx.deferrable = false;
@@ -9234,7 +9245,7 @@ pub fn Database(comptime config: Config) type {
                 const routine_slot = self.objects.routineByOid(trigger.function_oid, snapshot) orelse return null;
                 const routine = &self.objects.routines[routine_slot];
                 var text: CatalogTextWriter = .{ .out = out, .quote_all = self.session.quote_all_identifiers };
-                text.add("CREATE TRIGGER ");
+                text.add(if (trigger.constraint) "CREATE CONSTRAINT TRIGGER " else "CREATE TRIGGER ");
                 text.ident(trigger.name.slice());
                 text.add(if (trigger.tgtype & tg.tg_before != 0) " BEFORE " else if (trigger.tgtype & tg.tg_instead != 0) " INSTEAD OF " else " AFTER ");
                 var preceding_event = false;
@@ -9259,7 +9270,37 @@ pub fn Database(comptime config: Config) type {
                     text.add(".");
                 }
                 text.ident(table.name.slice());
-                text.add(if (trigger.tgtype & tg.tg_row != 0) " FOR EACH ROW " else " FOR EACH STATEMENT ");
+                text.add(" ");
+                // pg_get_triggerdef: FROM, deferral and REFERENCING (B11 wave 5).
+                if (trigger.constraint) {
+                    if (trigger.constraint_relid != 0) {
+                        const from_slot = self.visibleTableSlot(trigger.constraint_relid, snapshot) orelse return null;
+                        const from = &self.tables[from_slot];
+                        text.add("FROM ");
+                        if (!self.inRelationSearchPath(from.namespace, from.name.slice())) {
+                            text.ident(self.namespaceName(from.namespace));
+                            text.add(".");
+                        }
+                        text.ident(from.name.slice());
+                        text.add(" ");
+                    }
+                    if (!trigger.deferrable) text.add("NOT ");
+                    text.add(if (trigger.initially_deferred) "DEFERRABLE INITIALLY DEFERRED " else "DEFERRABLE INITIALLY IMMEDIATE ");
+                }
+                if (trigger.transitions()) {
+                    text.add("REFERENCING ");
+                    if (trigger.old_table.len != 0) {
+                        text.add("OLD TABLE AS ");
+                        text.ident(trigger.old_table.slice());
+                        text.add(" ");
+                    }
+                    if (trigger.new_table.len != 0) {
+                        text.add("NEW TABLE AS ");
+                        text.ident(trigger.new_table.slice());
+                        text.add(" ");
+                    }
+                }
+                text.add(if (trigger.tgtype & tg.tg_row != 0) "FOR EACH ROW " else "FOR EACH STATEMENT ");
                 if (trigger.when.len != 0) {
                     text.add("WHEN (");
                     text.add(trigger.when.slice());
@@ -10855,7 +10896,10 @@ pub fn Database(comptime config: Config) type {
                     tx.constraint_mode_count += 1;
                 }
             }
-            if (!set.deferred) try self.deferredCheck(slot, 0, true, false);
+            if (!set.deferred) {
+                try self.firePendingTriggers(slot, self.routine_snap);
+                try self.deferredCheck(slot, 0, true, false);
+            }
         }
 
         /// The deferred checks of a transaction (COMMIT, SET CONSTRAINTS
@@ -11477,7 +11521,7 @@ pub fn Database(comptime config: Config) type {
             self.workspace.query.views = .{ .ptr = self, .rows = &viewRows, .sequence_rows = &sequenceRows };
             self.session_hook = .{ .ptr = self, .call = &sessionCall };
             self.session.engine = &self.session_hook;
-            self.routine_hook = .{ .ptr = self, .call = &routineHookCall, .call_defaults = &routineHookDefaults, .prepare = &routineHookPrepare, .rows = &routineHookRows };
+            self.routine_hook = .{ .ptr = self, .call = &routineHookCall, .call_defaults = &routineHookDefaults, .prepare = &routineHookPrepare, .rows = &routineHookRows, .transition = &routineHookTransition };
             self.session.routines = &self.routine_hook;
             self.session.routine_frame = null;
             self.routine_slot = slot;
@@ -11499,6 +11543,7 @@ pub fn Database(comptime config: Config) type {
             self.nested_use = @splat(0);
             self.context_len = 0;
             self.context_captured = false;
+            self.transition_len = 0;
             self.installRole();
         }
 
@@ -15567,9 +15612,69 @@ pub fn Database(comptime config: Config) type {
             frame.cells[first + 7] = textValue(self.namespaceName(table.namespace));
             frame.cells[first + 8] = .{ .integer = @intCast(trigger.nargs) };
             frame.cells[first + 9] = try self.triggerArguments(trigger);
+            // REFERENCING transition tables of an AFTER trigger: its
+            // statement's rows of the trigger's table (T212, B11 wave 5).
+            if (trigger.transitions() and timing == 0) {
+                if (self.transition_len == self.transition_windows.len) return error.StackDepthExceeded;
+                const owner = self.visibleTableSlot(trigger.table_oid, snap) orelse table_index;
+                self.transition_windows[self.transition_len] = .{ .table = owner, .slot = snap.slot, .start = self.statement_start, .end = self.txs[snap.slot].write_len, .cid = snap.cid, .event = event };
+                frame.variables.transition_old = trigger.old_table;
+                frame.variables.transition_new = trigger.new_table;
+                frame.variables.transition = self.transition_len;
+                frame.variables.transition_table = &self.tables[owner];
+                self.transition_len += 1;
+            }
+            defer if (trigger.transitions() and timing == 0) {
+                self.transition_len -= 1;
+            };
             var interpreter: Interp = .{ .host = self, .source = routine.body.slice(), .frame = &frame, .purpose = .trigger, .routine_index = function, .routine_oid = routine.oid };
             try interpreter.execute(.run);
             return interpreter.record;
+        }
+
+        /// The window of a firing trigger with transition tables: the
+        /// statement's write-set slice, command id and event.
+        pub const TransitionWindow = struct { table: usize = 0, slot: u16 = 0, start: usize = 0, end: usize = 0, cid: u32 = 0, event: u8 = 0 };
+
+        /// A transition table's rows: the row versions the statement wrote
+        /// for the trigger's table (or its partitions), in write order; OLD
+        /// TABLE reads the versions an UPDATE or DELETE replaced.
+        fn routineHookTransition(ptr: *anyopaque, code: u64, sink: *anyopaque, emit: *const fn (sink: *anyopaque, cells: *const anyopaque) Error!void) Error!void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            const index: usize = @intCast(code / 2);
+            const old = code % 2 == 1;
+            if (index >= self.transition_len) return error.TableNotFound;
+            const window = self.transition_windows[index];
+            const tx = &self.txs[window.slot];
+            const owner = &self.tables[window.table];
+            var row: E.Row = undefined;
+            var cells: [config.columns]V.Cell = @splat(.null_value);
+            var position = window.start;
+            while (position < @min(window.end, tx.write_len)) : (position += 1) {
+                const entry = tx.writes[position];
+                const wanted = switch (entry.kind) {
+                    .insert => window.event == tg.tg_insert and !old,
+                    .update => window.event == tg.tg_update,
+                    .delete => window.event == tg.tg_delete and old,
+                    else => false,
+                };
+                if (!wanted) continue;
+                if (entry.table != window.table and !self.descends(entry.table, window.table)) continue;
+                if (self.writeCid(entry) != window.cid) continue;
+                try self.session.checkpoint();
+                const table = &self.tables[entry.table];
+                S.copyVersionRow(table, if (old) entry.old else entry.new, &row);
+                if (entry.table == window.table) {
+                    for (0..owner.column_count) |column| cells[column] = row[column];
+                } else for (owner.columns[0..owner.column_count], 0..) |*column, at| {
+                    // A partition's columns by name (its layout may differ).
+                    cells[at] = .null_value;
+                    for (table.columns[0..table.column_count], 0..) |*own, own_at| {
+                        if (types.same(own.name.slice(), column.name.slice())) cells[at] = row[own_at];
+                    }
+                }
+                try emit(sink, &cells);
+            }
         }
 
         fn anyTrigger(self: *const Self, timing: u8, row: bool, event: u8, snap: Snapshot) bool {
@@ -15652,9 +15757,126 @@ pub fn Database(comptime config: Config) type {
                     try self.session.checkpoint();
                     const trigger = &self.objects.triggers[position];
                     if (!triggerMatches(trigger, 0, true, event)) continue;
+                    // A deferred constraint trigger fires at COMMIT or SET
+                    // CONSTRAINTS ... IMMEDIATE (B11 wave 5).
+                    if (self.triggerDeferred(slot, trigger)) continue;
                     if (!updateOfFires(trigger, event, assigned, new, old)) continue;
                     if (!try self.triggerWhen(trigger, entry.table, new, old)) continue;
                     _ = try self.callTrigger(trigger, entry.table, 0, true, event, new, old, snap);
+                }
+            }
+            // The immediate constraint triggers handled everything so far.
+            for (&self.objects.triggers, 0..) |*trigger, trigger_index| {
+                if (trigger.live and trigger.constraint and !self.triggerDeferred(slot, trigger)) tx.trigger_handled[trigger_index] = @intCast(tx.write_len);
+            }
+        }
+
+        /// Whether a constraint trigger is deferred now in transaction
+        /// `slot`: SET CONSTRAINTS by name, else ALL, else INITIALLY.
+        fn triggerDeferred(self: *const Self, slot: u16, trigger: *const RC.Trigger) bool {
+            if (!trigger.constraint or !trigger.deferrable) return false;
+            const tx = &self.txs[slot];
+            for (tx.constraint_modes[0..tx.constraint_mode_count]) |mode| {
+                if (mode.oid == trigger.table_oid and types.same(mode.name.slice(), trigger.name.slice())) return mode.deferred;
+            }
+            if (tx.constraints_all) |deferred| return deferred;
+            return trigger.initially_deferred;
+        }
+
+        /// A deferred constraint trigger has events left (COMMIT fires
+        /// them first).
+        pub fn deferredTriggersPending(self: *const Self, slot: u16) bool {
+            if (!self.active(slot)) return false;
+            const tx = &self.txs[slot];
+            for (&self.objects.triggers, 0..) |*trigger, index| {
+                if (!trigger.live or !trigger.constraint or !trigger.deferrable) continue;
+                var position: usize = @min(tx.trigger_handled[index], tx.write_len);
+                while (position < tx.write_len) : (position += 1) {
+                    const entry = tx.writes[position];
+                    const event: u8 = switch (entry.kind) {
+                        .insert => tg.tg_insert,
+                        .update => tg.tg_update,
+                        .delete => tg.tg_delete,
+                        else => continue,
+                    };
+                    if (trigger.tgtype & event == 0) continue;
+                    if (self.tables[entry.table].oid == trigger.table_oid) return true;
+                    for (&self.tables, 0..) |*table, table_index| {
+                        if (table.live and table.oid == trigger.table_oid and self.descends(entry.table, table_index)) return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        /// COMMIT (and PREPARE TRANSACTION) first fire the deferred
+        /// constraint triggers' events, as SET CONSTRAINTS ALL IMMEDIATE
+        /// does, inside the transaction (an error rolls it back); `result`
+        /// is caller-owned statement storage the trigger statements may use.
+        pub fn fireDeferredTriggers(self: *Self, slot: u16, result: *Result) Error!void {
+            if (!self.deferredTriggersPending(slot)) return;
+            const saved = self.outcome;
+            defer self.outcome = saved;
+            try self.statement(slot, "SET CONSTRAINTS ALL IMMEDIATE", result, .{ .hold_result = true });
+        }
+
+        /// The events of the constraint triggers that are immediate now and
+        /// were not handled: in write order, each row's triggers in name
+        /// order (PostgreSQL's after-trigger queue); new writes they make
+        /// are handled by their own statements.
+        fn firePendingTriggers(self: *Self, slot: u16, snap: Snapshot) Error!void {
+            const tx = &self.txs[slot];
+            var order: [config.triggers]u8 = undefined;
+            var count: usize = 0;
+            for (&self.objects.triggers, 0..) |*trigger, index| {
+                if (!trigger.live or !trigger.constraint or !trigger.stamp.visible(snap) or self.triggerDeferred(slot, trigger)) continue;
+                var at = count;
+                while (at > 0 and types.bytesOrder(self.objects.triggers[order[at - 1]].name.slice(), trigger.name.slice()) > 0) : (at -= 1) order[at] = order[at - 1];
+                order[at] = @intCast(index);
+                count += 1;
+            }
+            if (count == 0) return;
+            var marks: [config.triggers]u32 = undefined;
+            while (true) {
+                const end = tx.write_len;
+                var low: usize = end;
+                for (order[0..count]) |index| {
+                    marks[index] = @min(tx.trigger_handled[index], @as(u32, @intCast(end)));
+                    low = @min(low, marks[index]);
+                    tx.trigger_handled[index] = @intCast(end);
+                }
+                if (low >= end) return;
+                var position = low;
+                while (position < end) : (position += 1) {
+                    const entry = tx.writes[position];
+                    const event: u8 = switch (entry.kind) {
+                        .insert => tg.tg_insert,
+                        .update => tg.tg_update,
+                        .delete => tg.tg_delete,
+                        else => continue,
+                    };
+                    const table = &self.tables[entry.table];
+                    var new_row: E.Row = undefined;
+                    var old_row: E.Row = undefined;
+                    var loaded = false;
+                    for (order[0..count]) |index| {
+                        if (position < marks[index]) continue;
+                        const trigger = &self.objects.triggers[index];
+                        if (trigger.tgtype & event == 0) continue;
+                        const owner = self.visibleTableSlot(trigger.table_oid, snap) orelse continue;
+                        if (entry.table != owner and !self.descends(entry.table, owner)) continue;
+                        try self.session.checkpoint();
+                        if (!loaded) {
+                            if (entry.kind != .delete) S.copyVersionRow(table, entry.new, &new_row);
+                            if (entry.kind != .insert) S.copyVersionRow(table, entry.old, &old_row);
+                            loaded = true;
+                        }
+                        const new: ?*E.Row = if (entry.kind != .delete) &new_row else null;
+                        const old: ?*E.Row = if (entry.kind != .insert) &old_row else null;
+                        if (!updateOfFires(trigger, event, null, new, old)) continue;
+                        if (!try self.triggerWhen(trigger, entry.table, new, old)) continue;
+                        _ = try self.callTrigger(trigger, entry.table, 0, true, event, new, old, snap);
+                    }
                 }
             }
         }
@@ -15681,6 +15903,30 @@ pub fn Database(comptime config: Config) type {
             const kind = definition.tgtype;
             const row = kind & tg.tg_row != 0;
             if (table.relkind == 'm' or table.relkind == 'S') return error.WrongObjectType;
+            // REFERENCING transition tables (T212, B11 wave 5): PostgreSQL's
+            // checks in its order.
+            const transitions = definition.old_table.len != 0 or definition.new_table.len != 0;
+            if (transitions) {
+                if (table.relkind == 'v') return error.WrongObjectType;
+                if (row and table.parent != 0) return error.UnsupportedStatement;
+                if (kind & (tg.tg_before | tg.tg_instead) != 0) return error.InvalidObjectDefinition;
+                if (kind & tg.tg_truncate != 0) return error.UnsupportedStatement;
+                const events = kind & (tg.tg_insert | tg.tg_delete | tg.tg_update);
+                if (@popCount(events) > 1) return error.UnsupportedStatement;
+                if (definition.column_count != 0) return error.UnsupportedStatement;
+                if (definition.row_variable) return error.UnsupportedStatement;
+                if (definition.old_table.len != 0 and events & (tg.tg_delete | tg.tg_update) == 0) return error.InvalidObjectDefinition;
+                if (definition.new_table.len != 0 and events & (tg.tg_insert | tg.tg_update) == 0) return error.InvalidObjectDefinition;
+                if (definition.repeated != 0) return error.InvalidObjectDefinition;
+                if (definition.old_table.len != 0 and definition.new_table.len != 0 and types.same(definition.old_table.slice(), definition.new_table.slice())) return error.InvalidObjectDefinition;
+            }
+            // A constraint trigger's FROM table (tgconstrrelid).
+            var constraint_relid: u32 = 0;
+            if (definition.has_from) {
+                const from_index = try self.namedTable(&definition.from, snap);
+                try self.lockTable(slot, from_index, .access_share);
+                constraint_relid = self.tables[from_index].oid;
+            }
             // INSTEAD OF triggers are row triggers of views without column
             // lists or WHEN (B11 wave 4); views have no BEFORE / AFTER row
             // triggers (42809, 0A000 as PostgreSQL).
@@ -15718,12 +15964,17 @@ pub fn Database(comptime config: Config) type {
             try self.reserveWrites(slot, 2);
             const index = try self.objectSlot(.trigger);
             const oid = try self.takeOid();
+            const constraint_oid = if (definition.constraint) try self.takeOid() else 0;
             if (existing) |old| try self.dropObject(slot, .trigger, old, snap);
             const item = &self.objects.triggers[index];
-            item.* = .{ .oid = oid, .name = definition.name, .table_oid = table.oid, .function_oid = routine.oid, .tgtype = kind, .column_count = definition.column_count, .nargs = definition.nargs, .args_len = definition.args_len };
+            item.* = .{ .oid = oid, .name = definition.name, .table_oid = table.oid, .function_oid = routine.oid, .tgtype = kind, .column_count = definition.column_count, .nargs = definition.nargs, .args_len = definition.args_len,
+                .old_table = definition.old_table, .new_table = definition.new_table, .constraint = definition.constraint, .deferrable = definition.deferrable,
+                .initially_deferred = definition.initially_deferred, .constraint_oid = constraint_oid, .constraint_relid = constraint_relid };
             @memcpy(item.columns[0..definition.column_count], columns[0..definition.column_count]);
             @memcpy(item.args[0..definition.args_len], definition.args[0..definition.args_len]);
             try item.when.set(when);
+            // Writes before the trigger existed are not its events.
+            self.txs[slot].trigger_handled[index] = @intCast(self.txs[slot].write_len);
             self.createdObject(slot, .trigger, index, snap);
         }
 
@@ -17262,14 +17513,15 @@ pub fn Database(comptime config: Config) type {
             }
             const extended = class == .routine and self.objects.routines[index].extended();
             const action = class == .rule and self.objects.rules[index].action.len != 0;
+            const trigger_extended = class == .trigger and self.objects.triggers[index].extended();
             const tag: change_log.Op = switch (class) {
                 .routine => if (extended) .create_routine_extended else .create_routine,
-                .trigger => .create_trigger,
+                .trigger => if (trigger_extended) .create_trigger_extended else .create_trigger,
                 .rule => if (action) .create_rule_action else .create_rule,
             };
             switch (class) {
                 .routine => if (extended) try RC.encodeRoutineExtended(&payload, &self.objects.routines[index]) else try RC.encodeRoutine(&payload, &self.objects.routines[index]),
-                .trigger => try RC.encodeTrigger(&payload, &self.objects.triggers[index]),
+                .trigger => if (trigger_extended) try RC.encodeTriggerExtended(&payload, &self.objects.triggers[index]) else try RC.encodeTrigger(&payload, &self.objects.triggers[index]),
                 .rule => if (action) try RC.encodeRuleAction(&payload, &self.objects.rules[index]) else try RC.encodeRule(&payload, &self.objects.rules[index]),
             }
             return C.encodeObject(writer, tag, buffer[0..payload.used]);
@@ -17316,13 +17568,13 @@ pub fn Database(comptime config: Config) type {
                     item.stamp = stamp;
                     oid = item.oid;
                 },
-                @intFromEnum(change_log.Op.create_trigger) => {
+                @intFromEnum(change_log.Op.create_trigger), @intFromEnum(change_log.Op.create_trigger_extended) => {
                     const index = try self.replaySlot(.trigger);
                     const item = &self.objects.triggers[index];
-                    try RC.decodeTrigger(payload, item);
+                    if (tag == @intFromEnum(change_log.Op.create_trigger_extended)) try RC.decodeTriggerExtended(payload, item) else try RC.decodeTrigger(payload, item);
                     item.live = true;
                     item.stamp = stamp;
-                    oid = item.oid;
+                    oid = @max(item.oid, item.constraint_oid);
                 },
                 @intFromEnum(change_log.Op.create_rule), @intFromEnum(change_log.Op.create_rule_action) => {
                     const index = try self.replaySlot(.rule);
@@ -17471,7 +17723,9 @@ pub fn Database(comptime config: Config) type {
                 },
                 .pg_trigger => for (&self.objects.triggers) |*trigger| {
                     if (!trigger.live or !trigger.stamp.visible(snapshot)) continue;
-                    try sink.add(&.{ intCell(trigger.oid), intCell(trigger.table_oid), nameCell(trigger.name.slice()), intCell(trigger.function_oid), intCell(trigger.tgtype), .{ .pg_internal_char = 'O' }, boolCell(false), intCell(@intCast(trigger.nargs)), intCell(0) });
+                    try sink.add(&.{ intCell(trigger.oid), intCell(trigger.table_oid), nameCell(trigger.name.slice()), intCell(trigger.function_oid), intCell(trigger.tgtype), .{ .pg_internal_char = 'O' }, boolCell(false), intCell(@intCast(trigger.nargs)), intCell(0),
+                        intCell(trigger.constraint_relid), intCell(trigger.constraint_oid), boolCell(trigger.deferrable), boolCell(trigger.initially_deferred),
+                        if (trigger.old_table.len != 0) nameCell(trigger.old_table.slice()) else .null_value, if (trigger.new_table.len != 0) nameCell(trigger.new_table.slice()) else .null_value });
                 },
                 .pg_rewrite => {
                     for (&self.objects.rules) |*rule| {

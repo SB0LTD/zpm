@@ -172,6 +172,19 @@ pub fn Routines(comptime config: types.Config) type {
             args: [RC.arg_bytes]u8 = @splat(0),
             args_len: usize = 0,
             nargs: usize = 0,
+            /// B11 wave 5: REFERENCING transition tables (`old_row` /
+            /// `new_row`: a ROW variable was named, 0A000), CREATE CONSTRAINT
+            /// TRIGGER with FROM and its deferral; `repeated` names the
+            /// transition listed twice (1 OLD, 2 NEW; 42P17).
+            old_table: Name = .{},
+            new_table: Name = .{},
+            row_variable: bool = false,
+            repeated: u8 = 0,
+            constraint: bool = false,
+            deferrable: bool = false,
+            initially_deferred: bool = false,
+            has_from: bool = false,
+            from: TableName = .{},
         };
 
         pub const DropObject = struct { if_exists: bool = false, cascade: bool = false, name: Name = .{}, table: TableName = .{} };
@@ -980,10 +993,15 @@ pub fn Routines(comptime config: types.Config) type {
                 try cursor.expect("replace");
                 out.replace = true;
             }
-            if (cursor.is("constraint")) return error.UnsupportedStatement;
+            // CREATE OR REPLACE CONSTRAINT TRIGGER is 0A000 in PostgreSQL.
+            if (out.replace and cursor.is("constraint")) return error.UnsupportedStatement;
+            out.constraint = try cursor.take("constraint");
             try cursor.expect("trigger");
             out.name = try cursor.identifier();
-            if (try cursor.take("before")) {
+            if (out.constraint) {
+                // A constraint trigger is AFTER ... FOR EACH ROW (grammar).
+                try cursor.expect("after");
+            } else if (try cursor.take("before")) {
                 out.tgtype |= routine_catalog.tg_before;
             } else if (try cursor.take("instead")) {
                 try cursor.expect("of");
@@ -1007,12 +1025,54 @@ pub fn Routines(comptime config: types.Config) type {
             }
             try cursor.expect("on");
             out.table = try tableName(cursor);
-            if (cursor.is("from") or cursor.is("referencing") or cursor.is("deferrable") or cursor.is("initially") or cursor.is("not")) return error.UnsupportedStatement;
-            if (try cursor.take("for")) {
+            if (out.constraint) {
+                if (try cursor.take("from")) {
+                    out.from = try tableName(cursor);
+                    out.has_from = true;
+                }
+                // [NOT] DEFERRABLE and INITIALLY IMMEDIATE / DEFERRED, in
+                // any order; INITIALLY DEFERRED alone is DEFERRABLE.
+                var not_deferrable = false;
+                var said_deferrable = false;
+                while (true) {
+                    if (try cursor.take("deferrable")) {
+                        said_deferrable = true;
+                    } else if (cursor.is("not")) {
+                        try cursor.advance();
+                        try cursor.expect("deferrable");
+                        not_deferrable = true;
+                    } else if (try cursor.take("initially")) {
+                        if (try cursor.take("deferred")) {
+                            out.initially_deferred = true;
+                        } else try cursor.expect("immediate");
+                    } else break;
+                }
+                if (not_deferrable and (said_deferrable or out.initially_deferred)) return error.Syntax;
+                out.deferrable = said_deferrable or out.initially_deferred;
+                try cursor.expect("for");
                 _ = try cursor.take("each");
-                if (try cursor.take("row")) {
-                    out.tgtype |= routine_catalog.tg_row;
-                } else try cursor.expect("statement");
+                try cursor.expect("row");
+                out.tgtype |= routine_catalog.tg_row;
+            } else {
+                if (try cursor.take("referencing")) while (true) {
+                    const new = try cursor.take("new");
+                    if (!new) try cursor.expect("old");
+                    if (try cursor.take("row")) {
+                        out.row_variable = true;
+                    } else try cursor.expect("table");
+                    _ = try cursor.take("as");
+                    const name = try cursor.identifier();
+                    const slot = if (new) &out.new_table else &out.old_table;
+                    if (slot.len != 0 and out.repeated == 0) out.repeated = if (new) 2 else 1;
+                    if (slot.len == 0) slot.* = name;
+                    if (!cursor.is("old") and !cursor.is("new")) break;
+                };
+                if (try cursor.take("for")) {
+                    _ = try cursor.take("each");
+                    if (try cursor.take("row")) {
+                        out.tgtype |= routine_catalog.tg_row;
+                    } else try cursor.expect("statement");
+                }
             }
             if (try cursor.take("when")) out.when = try parenthesized(cursor);
             try cursor.expect("execute");
@@ -2871,6 +2931,11 @@ pub fn Routines(comptime config: types.Config) type {
                         frame.cells[index] = value;
                     }
                     frame.variables.parameters = frame.variables.count;
+                    // A trigger's transition tables stay visible (SPI).
+                    frame.variables.transition_old = self.frame.variables.transition_old;
+                    frame.variables.transition_new = self.frame.variables.transition_new;
+                    frame.variables.transition = self.frame.variables.transition;
+                    frame.variables.transition_table = self.frame.variables.transition_table;
                 }
 
                 /// EXECUTE command [INTO [STRICT] targets] [USING values]

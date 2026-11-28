@@ -232,6 +232,9 @@ pub const RoutineHook = struct {
     /// Rows of a routine in FROM (set-returning or several OUT columns):
     /// `emit(sink, cells)` once per row with the result columns.
     rows: ?*const fn (ptr: *anyopaque, routine: usize, args: *const anyopaque, count: usize, defaulted: u64, sink: *anyopaque, emit: *const fn (sink: *anyopaque, cells: *const anyopaque) Error!void) Error!void = null,
+    /// Rows of a REFERENCING transition table (B11 wave 5): `code` is the
+    /// firing trigger's window * 2 + 1 for OLD TABLE (+ 0 for NEW TABLE).
+    transition: ?*const fn (ptr: *anyopaque, code: u64, sink: *anyopaque, emit: *const fn (sink: *anyopaque, cells: *const anyopaque) Error!void) Error!void = null,
 };
 
 pub const CatalogText = enum { description, shared_description, role_name, function_arguments, function_identity_arguments, function_result, function_sqlbody };

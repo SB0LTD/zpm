@@ -466,6 +466,13 @@ pub fn Binder(comptime config: types.Config) type {
             routine_name: V.Name = .{},
             /// Parameters of the routine (the first `parameters` items).
             parameters: usize = 0,
+            /// REFERENCING transition tables of the firing trigger (T212,
+            /// B11 wave 5): FROM names reading its statement's rows through
+            /// the trigger's window (Database.transition_windows).
+            transition_old: V.Name = .{},
+            transition_new: V.Name = .{},
+            transition: usize = 0,
+            transition_table: ?*const S.Table = null,
             /// Only nodes in pool[node_low..node_high] (the routine's own
             /// statement or expression) see the variables; view texts and
             /// stored expressions bound with it never do.
@@ -604,7 +611,10 @@ pub fn Binder(comptime config: types.Config) type {
             // `function` is the call (regexp_matches, regexp_split_to_table).
             set_function,
             // XMLTABLE (B11 wave 5 xml lane): `function` is the table node.
-            xml_table };
+            xml_table,
+            // A REFERENCING transition table (B11 wave 5): `function` is an
+            // integer node holding the trigger window's code.
+            transition };
 
         /// A bound query block of the general engine (design §4.9). Its
         /// materialized rows are `width` cells: the `count` visible output
@@ -6858,6 +6868,50 @@ pub fn Binder(comptime config: types.Config) type {
             n.constant = false;
         }
 
+        /// A FROM name of the firing trigger's own statement that is one of
+        /// its REFERENCING transition tables (after CTE names, before
+        /// relations, as PostgreSQL's ephemeral named relations).
+        fn transitionOf(context: *const Context, item: *const Ast.FromItem) ?u64 {
+            const variables = context.variables orelse return null;
+            if (item.schema != null or (variables.transition_old.len == 0 and variables.transition_new.len == 0)) return null;
+            if (context.stored_source_start != 0 and item.name.span.start >= context.stored_source_start) return null;
+            const name = toName(context, item.name);
+            if (variables.transition_old.len != 0 and types.same(name.slice(), variables.transition_old.slice())) return variables.transition * 2 + 1;
+            if (variables.transition_new.len != 0 and types.same(name.slice(), variables.transition_new.slice())) return variables.transition * 2;
+            return null;
+        }
+
+        /// A transition table's rows: the trigger table's columns.
+        fn bindTransition(context: *const Context, code: u64) Error!u16 {
+            const table = context.variables.?.transition_table orelse return error.TableNotFound;
+            const plans = plansOf(context);
+            const id = try plans.add();
+            const p = &plans.items[id];
+            if (table.column_count > p.names.len) return error.ColumnCapacity;
+            p.series = .transition;
+            p.function = try context.pool.add(.{ .kind = .int_literal, .integer = @intCast(code), .ty = .int8, .constant = true });
+            for (table.columns[0..table.column_count], 0..) |*column, index| {
+                const ty = types.typeOfData(column.data_type);
+                p.targets[index] = try context.pool.add(.{ .kind = .null_literal, .ty = ty, .constant = true });
+                p.tys[index] = ty;
+                p.typmods[index] = column.typmod;
+                p.names[index] = column.name;
+            }
+            p.count = table.column_count;
+            p.width = p.count;
+            return id;
+        }
+
+        /// A transition table cannot be modified (0A000, PostgreSQL's
+        /// "cannot be the target of a modifying statement").
+        fn notTransition(context: *const Context, schema: ?ast.Ident, name: ast.Ident) Error!void {
+            const variables = context.variables orelse return;
+            if (schema != null) return;
+            const wanted = toName(context, name);
+            if ((variables.transition_old.len != 0 and types.same(wanted.slice(), variables.transition_old.slice())) or
+                (variables.transition_new.len != 0 and types.same(wanted.slice(), variables.transition_new.slice()))) return error.UnsupportedStatement;
+        }
+
         fn lookupCte(context: *const Context, env: ?*const CteEnv, ident: ast.Ident) ?u8 {
             const wanted = toName(context, ident);
             const plans = plansOf(context);
@@ -8799,6 +8853,10 @@ pub fn Binder(comptime config: types.Config) type {
                     // PostgreSQL: WITH query "x" does not have a RETURNING clause.
                     if (plans.ctes[cte].dml != no_dml and !plans.ctes[cte].returning) return error.UnsupportedStatement;
                     if (plans.items[rel.plan].correlated) plans.items[id].correlated = true;
+                } else if (transitionOf(context, item)) |code| {
+                    rel.plan = try bindTransition(context, code);
+                    rel.name = toName(context, item.name);
+                    source.plan = rel.plan;
                 } else if (viewOf(context, item.schema, item.name)) |view| {
                     rel.view = view;
                     if (context.dialect == .postgres) rel.catalog_oid = catalog.bootstrapRelationOid(view) orelse 0;
@@ -9832,6 +9890,7 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 .insert => {
                     const insert = &statement.insert;
+                    try notTransition(context, insert.schema, insert.table);
                     const index = try modifyingTable(context, try resolveQualified(context, insert.schema, insert.table), true);
                     const entry = &context.tables[index];
                     var mapping: [config.columns]usize = @splat(0);
@@ -9913,6 +9972,7 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 .update => {
                     const update = &statement.update;
+                    try notTransition(context, update.schema, update.table);
                     const family = context.family_target != null;
                     const index = try modifyingTable(context, context.family_target orelse try resolveQualified(context, update.schema, update.table), family);
                     const entry = &context.tables[index];
@@ -9952,6 +10012,7 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 .delete => {
                     const delete = &statement.delete;
+                    try notTransition(context, delete.schema, delete.table);
                     const family = context.family_target != null;
                     const index = try modifyingTable(context, context.family_target orelse try resolveQualified(context, delete.schema, delete.table), family);
                     var scope = tableScope(context, index);
@@ -11639,6 +11700,15 @@ pub fn Binder(comptime config: types.Config) type {
                         found = true;
                     }
                 }
+                // Constraint triggers are constraints too (B11 wave 5).
+                if (context.routines) |objects| for (&objects.triggers) |*trigger| {
+                    if (!trigger.live or !trigger.constraint or !trigger.stamp.visible(context.snapshot) or !types.same(trigger.name.slice(), name.slice())) continue;
+                    if (!trigger.deferrable) return error.WrongObjectType;
+                    if (out.count == out.names.len) return error.TableCapacity;
+                    out.names[out.count] = .{ .oid = trigger.table_oid, .name = name };
+                    out.count += 1;
+                    found = true;
+                };
                 if (!found) return error.UndefinedObject;
             }
             return .{ .set_constraints = out };

@@ -496,6 +496,168 @@ fn sqlPaths() !void {
     try idle();
 }
 
+// ---- T212: transition tables and constraint triggers ----------------------------
+
+/// REFERENCING OLD / NEW TABLE: the statement's rows (also none) in AFTER
+/// statement and row triggers, read like relations by the trigger
+/// function's own statements and its EXECUTE, not by functions it calls;
+/// they cannot be modified (0A000). PostgreSQL's CREATE TRIGGER checks,
+/// pg_trigger, pg_get_triggerdef, partitioned tables, atomicity and replay
+/// (op 120).
+fn transitionTables() !void {
+    reset();
+    try run("CREATE TABLE t(a INT, b TEXT)");
+    try run("CREATE TABLE log(what TEXT)");
+    try run("CREATE FUNCTION ins_stmt() RETURNS TRIGGER LANGUAGE plpgsql AS $$BEGIN INSERT INTO log SELECT 'ins:' || count(*) || ':' || coalesce(sum(a), 0) FROM newrows; RETURN NULL; END$$");
+    try run("CREATE TRIGGER ti AFTER INSERT ON t REFERENCING NEW TABLE AS newrows FOR EACH STATEMENT EXECUTE FUNCTION ins_stmt()");
+    try completes("INSERT INTO t VALUES (1,'a'), (2,'b'), (3,'c')", .insert, 3);
+    try completes("INSERT INTO t SELECT 1, 'x' WHERE false", .insert, 0);
+    try run("CREATE FUNCTION upd_stmt() RETURNS TRIGGER LANGUAGE plpgsql AS $$DECLARE r TEXT; BEGIN SELECT string_agg(o.a || '>' || n.a, ',' ORDER BY o.a) INTO r FROM oldt o JOIN newt n ON o.b = n.b; INSERT INTO log VALUES ('upd:' || r); RETURN NULL; END$$");
+    try run("CREATE TRIGGER tu AFTER UPDATE ON t REFERENCING OLD TABLE AS oldt NEW TABLE AS newt FOR EACH STATEMENT EXECUTE FUNCTION upd_stmt()");
+    try completes("UPDATE t SET a = a * 10 WHERE a >= 2", .update, 2);
+    try run("CREATE FUNCTION del_row() RETURNS TRIGGER LANGUAGE plpgsql AS $$BEGIN INSERT INTO log SELECT 'delrow:' || OLD.a || ':' || count(*) FROM gone; RETURN NULL; END$$");
+    try run("CREATE TRIGGER td AFTER DELETE ON t REFERENCING OLD TABLE AS gone FOR EACH ROW EXECUTE FUNCTION del_row()");
+    try completes("DELETE FROM t WHERE a > 5", .delete, 2);
+    try expect("SELECT what FROM log ORDER BY what", "delrow:20:2;delrow:30:2;ins:0:0;ins:3:6;upd:2>20,3>30");
+    try expect("SELECT tgname, tgoldtable, tgnewtable FROM pg_trigger ORDER BY 1", "td|gone|NULL;ti|NULL|newrows;tu|oldt|newt");
+    try expect("SELECT pg_get_triggerdef(oid) FROM pg_trigger ORDER BY tgname", "CREATE TRIGGER td AFTER DELETE ON public.t REFERENCING OLD TABLE AS gone FOR EACH ROW EXECUTE FUNCTION del_row();" ++
+        "CREATE TRIGGER ti AFTER INSERT ON public.t REFERENCING NEW TABLE AS newrows FOR EACH STATEMENT EXECUTE FUNCTION ins_stmt();" ++
+        "CREATE TRIGGER tu AFTER UPDATE ON public.t REFERENCING OLD TABLE AS oldt NEW TABLE AS newt FOR EACH STATEMENT EXECUTE FUNCTION upd_stmt()");
+    // CREATE TRIGGER checks (PostgreSQL's order and SQLSTATEs).
+    const triggers = "SELECT count(*) FROM pg_trigger";
+    try rejects("CREATE TRIGGER bad1 BEFORE INSERT ON t REFERENCING NEW TABLE AS n FOR EACH STATEMENT EXECUTE FUNCTION ins_stmt()", error.InvalidObjectDefinition, triggers, "3");
+    try rejects("CREATE TRIGGER bad2 AFTER INSERT ON t REFERENCING OLD TABLE AS o FOR EACH STATEMENT EXECUTE FUNCTION ins_stmt()", error.InvalidObjectDefinition, triggers, "3");
+    try rejects("CREATE TRIGGER bad3 AFTER DELETE ON t REFERENCING NEW TABLE AS n FOR EACH STATEMENT EXECUTE FUNCTION ins_stmt()", error.InvalidObjectDefinition, triggers, "3");
+    try rejects("CREATE TRIGGER bad4 AFTER INSERT OR UPDATE ON t REFERENCING NEW TABLE AS n FOR EACH STATEMENT EXECUTE FUNCTION ins_stmt()", error.UnsupportedStatement, triggers, "3");
+    try rejects("CREATE TRIGGER bad5 AFTER UPDATE OF a ON t REFERENCING NEW TABLE AS n FOR EACH STATEMENT EXECUTE FUNCTION ins_stmt()", error.UnsupportedStatement, triggers, "3");
+    try rejects("CREATE TRIGGER bad6 AFTER UPDATE ON t REFERENCING OLD TABLE AS x NEW TABLE AS x FOR EACH STATEMENT EXECUTE FUNCTION ins_stmt()", error.InvalidObjectDefinition, triggers, "3");
+    try rejects("CREATE TRIGGER bad7 AFTER INSERT ON t REFERENCING NEW ROW AS r FOR EACH ROW EXECUTE FUNCTION ins_stmt()", error.UnsupportedStatement, triggers, "3");
+    try rejects("CREATE TRIGGER bad8 AFTER INSERT ON t REFERENCING NEW TABLE AS n NEW TABLE AS m FOR EACH STATEMENT EXECUTE FUNCTION ins_stmt()", error.InvalidObjectDefinition, triggers, "3");
+    try run("CREATE VIEW v AS SELECT * FROM t");
+    try rejects("CREATE TRIGGER bad9 INSTEAD OF INSERT ON v REFERENCING NEW TABLE AS n FOR EACH ROW EXECUTE FUNCTION ins_stmt()", error.WrongObjectType, triggers, "3");
+    try rejects("CREATE TRIGGER bad10 AFTER TRUNCATE ON t REFERENCING OLD TABLE AS n FOR EACH STATEMENT EXECUTE FUNCTION ins_stmt()", error.UnsupportedStatement, triggers, "3");
+    // Only the trigger function's own statements see them (and EXECUTE).
+    try fails("CREATE FUNCTION nested() RETURNS INT LANGUAGE SQL AS $$SELECT count(*)::int FROM newrows$$", error.TableNotFound);
+    try run("CREATE FUNCTION dyn() RETURNS TRIGGER LANGUAGE plpgsql AS $$DECLARE n INT; BEGIN EXECUTE 'SELECT count(*) FROM nr' INTO n; INSERT INTO log VALUES ('dyn:' || n); RETURN NULL; END$$");
+    try run("CREATE TABLE t3(a INT)");
+    try run("CREATE TRIGGER t3i AFTER INSERT ON t3 REFERENCING NEW TABLE AS nr FOR EACH STATEMENT EXECUTE FUNCTION dyn()");
+    try run("INSERT INTO t3 VALUES (1), (2)");
+    try expect("SELECT what FROM log WHERE what LIKE 'dyn%'", "dyn:2");
+    try run("CREATE FUNCTION modt() RETURNS TRIGGER LANGUAGE plpgsql AS $$BEGIN INSERT INTO nr VALUES (5); RETURN NULL; END$$");
+    try run("CREATE TABLE t4(a INT)");
+    try run("CREATE TRIGGER t4i AFTER INSERT ON t4 REFERENCING NEW TABLE AS nr FOR EACH STATEMENT EXECUTE FUNCTION modt()");
+    try rejects("INSERT INTO t4 VALUES (1)", error.UnsupportedStatement, "SELECT count(*) FROM t4", "0");
+    // A raising trigger undoes the statement; row triggers see every row.
+    try run("CREATE FUNCTION boom() RETURNS TRIGGER LANGUAGE plpgsql AS $$BEGIN IF (SELECT count(*) FROM nt) > 1 THEN RAISE EXCEPTION 'too many'; END IF; RETURN NULL; END$$");
+    try run("CREATE TABLE q(a INT)");
+    try run("CREATE TRIGGER qb AFTER INSERT ON q REFERENCING NEW TABLE AS nt FOR EACH STATEMENT EXECUTE FUNCTION boom()");
+    try run("INSERT INTO q VALUES (1)");
+    try rejects("INSERT INTO q VALUES (2), (3)", error.RaiseException, "SELECT string_agg(a::text, ',') FROM q", "1");
+    try run("CREATE FUNCTION both_rows() RETURNS TRIGGER LANGUAGE plpgsql AS $$BEGIN INSERT INTO log SELECT 'row ' || NEW.a || ' sees ' || count(*) FROM nt; RETURN NULL; END$$");
+    try run("CREATE TABLE r(a INT)");
+    try run("CREATE TRIGGER rr AFTER INSERT ON r REFERENCING NEW TABLE AS nt FOR EACH ROW EXECUTE FUNCTION both_rows()");
+    try run("INSERT INTO r VALUES (1), (2)");
+    try expect("SELECT what FROM log WHERE what LIKE 'row%' ORDER BY what", "row 1 sees 2;row 2 sees 2");
+    try sameState(&.{ "SELECT what FROM log ORDER BY what", triggers, "SELECT pg_get_triggerdef(oid) FROM pg_trigger ORDER BY tgname" });
+    // Partitioned tables and ON CONFLICT DO UPDATE.
+    reset();
+    try run("CREATE TABLE p(k INT, v TEXT) PARTITION BY RANGE (k)");
+    try run("CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (0) TO (10)");
+    try run("CREATE TABLE p2 PARTITION OF p FOR VALUES FROM (10) TO (20)");
+    try run("CREATE TABLE log(what TEXT)");
+    try run("CREATE FUNCTION pst() RETURNS TRIGGER LANGUAGE plpgsql AS $$BEGIN INSERT INTO log SELECT TG_TABLE_NAME || ':' || string_agg(k::text || v, ',' ORDER BY k) FROM nt; RETURN NULL; END$$");
+    try run("CREATE TRIGGER ps AFTER INSERT ON p REFERENCING NEW TABLE AS nt FOR EACH STATEMENT EXECUTE FUNCTION pst()");
+    try run("INSERT INTO p VALUES (1,'a'), (15,'b'), (2,'c')");
+    try run("INSERT INTO p1 VALUES (3, 'd')");
+    try expect("SELECT what FROM log ORDER BY what", "p:1a,2c,15b");
+    try fails("CREATE TRIGGER pr AFTER INSERT ON p1 REFERENCING NEW TABLE AS nt FOR EACH ROW EXECUTE FUNCTION pst()", error.UnsupportedStatement);
+    try run("CREATE TABLE s(a INT PRIMARY KEY, b INT)");
+    try run("INSERT INTO s VALUES (1, 1), (2, 2)");
+    try run("CREATE FUNCTION ups() RETURNS TRIGGER LANGUAGE plpgsql AS $$BEGIN INSERT INTO log SELECT TG_OP || ' ' || string_agg(a::text || '=' || b, ',' ORDER BY a) FROM nt; RETURN NULL; END$$");
+    try run("CREATE TRIGGER si AFTER INSERT ON s REFERENCING NEW TABLE AS nt FOR EACH STATEMENT EXECUTE FUNCTION ups()");
+    try run("CREATE TRIGGER su AFTER UPDATE ON s REFERENCING NEW TABLE AS nt FOR EACH STATEMENT EXECUTE FUNCTION ups()");
+    try completes("INSERT INTO s VALUES (2, 20), (3, 30) ON CONFLICT (a) DO UPDATE SET b = excluded.b", .insert, 2);
+    try expect("SELECT what FROM log WHERE what LIKE 'INSERT%' OR what LIKE 'UPDATE%' ORDER BY what", "INSERT 3=30;UPDATE 2=20");
+    try sameState(&.{ "SELECT what FROM log ORDER BY what", "SELECT tgname, tgnewtable FROM pg_trigger ORDER BY 1" });
+    try idle();
+}
+
+/// COMMIT (or SET CONSTRAINTS ... IMMEDIATE) fires a deferred constraint
+/// trigger's events in write order; an immediate one fires at statement
+/// end like an AFTER ROW trigger.
+fn commitDeferred(slot: u16) !void {
+    db.fireDeferredTriggers(slot, &other_slot) catch |err| {
+        db.abort(slot);
+        return err;
+    };
+    try commit(slot);
+}
+
+/// CREATE CONSTRAINT TRIGGER (FROM, [NOT] DEFERRABLE, INITIALLY): events
+/// of deferred ones fire at COMMIT (a raise there rolls the transaction
+/// back) or at SET CONSTRAINTS name | ALL IMMEDIATE; autocommit statements
+/// fire them before committing; pg_trigger, pg_get_triggerdef and replay.
+fn constraintTriggers() !void {
+    reset();
+    try run("CREATE TABLE t(a INT)");
+    try run("CREATE TABLE log(what TEXT, n INT)");
+    try run("CREATE FUNCTION ct() RETURNS TRIGGER LANGUAGE plpgsql AS $$BEGIN INSERT INTO log SELECT TG_NAME || ':' || TG_OP || ':' || NEW.a, count(*) FROM t; RETURN NULL; END$$");
+    try run("CREATE CONSTRAINT TRIGGER cdef AFTER INSERT ON t DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION ct()");
+    try run("CREATE CONSTRAINT TRIGGER cimm AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION ct()");
+    const slot = try db.begin();
+    try statement(slot, "INSERT INTO t VALUES (1)");
+    try statement(slot, "INSERT INTO t VALUES (2)");
+    try same(try rows(slot, "SELECT what, n FROM log ORDER BY what"), "cimm:INSERT:1|1;cimm:INSERT:2|2");
+    try commitDeferred(slot);
+    try expect("SELECT what, n FROM log ORDER BY what", "cdef:INSERT:1|2;cdef:INSERT:2|2;cimm:INSERT:1|1;cimm:INSERT:2|2");
+    try expect("SELECT tgname, tgtype, tgconstraint <> 0, tgdeferrable, tginitdeferred FROM pg_trigger ORDER BY 1", "cdef|5|t|t|t;cimm|5|t|f|f");
+    try expect("SELECT pg_get_triggerdef(oid) FROM pg_trigger ORDER BY tgname", "CREATE CONSTRAINT TRIGGER cdef AFTER INSERT ON public.t DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION ct();" ++
+        "CREATE CONSTRAINT TRIGGER cimm AFTER INSERT ON public.t NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION ct()");
+    // SET CONSTRAINTS name IMMEDIATE fires the pending events now.
+    try run("DELETE FROM log");
+    const second = try db.begin();
+    try statement(second, "INSERT INTO t VALUES (3)");
+    try statement(second, "SET CONSTRAINTS cdef IMMEDIATE");
+    try same(try rows(second, "SELECT what, n FROM log ORDER BY what"), "cdef:INSERT:3|3;cimm:INSERT:3|3");
+    try statement(second, "INSERT INTO t VALUES (4)");
+    try same(try rows(second, "SELECT what, n FROM log ORDER BY what"), "cdef:INSERT:3|3;cdef:INSERT:4|4;cimm:INSERT:3|3;cimm:INSERT:4|4");
+    try statementFails(second, "SET CONSTRAINTS cimm DEFERRED", error.WrongObjectType);
+    db.abort(second);
+    try expect("SELECT count(*) FROM log", "0");
+    // Autocommit statements fire their deferred events before committing.
+    try run("INSERT INTO t VALUES (5)");
+    try expect("SELECT what, n FROM log ORDER BY what", "cdef:INSERT:5|3;cimm:INSERT:5|3");
+    // A deferred raise rolls the whole transaction back at COMMIT.
+    try run("DELETE FROM log");
+    try run("CREATE FUNCTION fail() RETURNS TRIGGER LANGUAGE plpgsql AS $$BEGIN IF NEW.a < 0 THEN RAISE EXCEPTION 'negative %', NEW.a; END IF; RETURN NULL; END$$");
+    try run("CREATE CONSTRAINT TRIGGER chk AFTER INSERT OR UPDATE ON t DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fail()");
+    const third = try db.begin();
+    try statement(third, "INSERT INTO t VALUES (-1)");
+    try statement(third, "UPDATE t SET a = 5 WHERE a = -1");
+    if (commitDeferred(third)) |_| return error.InvalidStatementAccepted else |err| try check(err == error.RaiseException);
+    try expect("SELECT count(*) FROM t", "3");
+    try idle();
+    // SET CONSTRAINTS ALL IMMEDIATE inside the transaction raises there.
+    const fourth = try db.begin();
+    try statement(fourth, "INSERT INTO t VALUES (-2)");
+    try statementFails(fourth, "SET CONSTRAINTS ALL IMMEDIATE", error.RaiseException);
+    db.abort(fourth);
+    try idle();
+    // Grammar and FROM (tgconstrrelid).
+    try fails("CREATE CONSTRAINT TRIGGER bad1 BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION ct()", error.Syntax);
+    try fails("CREATE CONSTRAINT TRIGGER bad2 AFTER INSERT ON t FOR EACH STATEMENT EXECUTE FUNCTION ct()", error.Syntax);
+    try fails("CREATE CONSTRAINT TRIGGER bad3 AFTER INSERT ON t NOT DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION ct()", error.Syntax);
+    try fails("CREATE CONSTRAINT TRIGGER bad4 AFTER INSERT ON t REFERENCING NEW TABLE AS n FOR EACH ROW EXECUTE FUNCTION ct()", error.Syntax);
+    try fails("CREATE OR REPLACE CONSTRAINT TRIGGER bad5 AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION ct()", error.UnsupportedStatement);
+    try run("CREATE TABLE r(id INT PRIMARY KEY)");
+    try run("CREATE CONSTRAINT TRIGGER cfrom AFTER INSERT ON t FROM r DEFERRABLE FOR EACH ROW EXECUTE FUNCTION ct()");
+    try expect("SELECT c.relname, g.tginitdeferred FROM pg_trigger g JOIN pg_class c ON c.oid = g.tgconstrrelid WHERE g.tgname = 'cfrom'", "r|f");
+    try expect("SELECT pg_get_triggerdef(oid) FROM pg_trigger WHERE tgname = 'cfrom'", "CREATE CONSTRAINT TRIGGER cfrom AFTER INSERT ON public.t FROM r DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION ct()");
+    try run("DROP TRIGGER cdef ON t");
+    try sameState(&.{ "SELECT tgname, tgdeferrable, tginitdeferred, tgconstraint <> 0 FROM pg_trigger ORDER BY 1", "SELECT what, n FROM log ORDER BY what", "SELECT a FROM t ORDER BY a" });
+    try idle();
+}
+
 pub fn main() !void {
     try schemaStatements();
     try dynamicStatements();
@@ -503,5 +665,7 @@ pub fn main() !void {
     try routineContext();
     try routineConfig();
     try sqlPaths();
+    try transitionTables();
+    try constraintTriggers();
     std.debug.print("routines-trig: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });
 }

@@ -352,6 +352,7 @@ pub fn Exec(comptime config: types.Config) type {
                 if (p.series == .routine) return self.routineRows(p, &ctx);
                 if (p.series == .subscripts) return self.subscriptRows(p, &ctx);
                 if (p.series == .set_function) return self.setFunctionRows(p, &ctx);
+                if (p.series == .transition) return self.transitionRows(p);
                 if (p.series == .none) {
                     const at = try self.cells(p.width);
                     self.work.cells[at] = try E.eval(&ctx, p.function);
@@ -385,7 +386,7 @@ pub fn Exec(comptime config: types.Config) type {
                         const zero: V.Cell = .{ .interval = .{} };
                         direction = V.compare(&step, &zero);
                     },
-                    .none, .json_table, .partition_ancestors, .options_to_table, .unnest, .routine, .subscripts, .set_function, .xml_table => unreachable,
+                    .none, .json_table, .partition_ancestors, .options_to_table, .unnest, .routine, .subscripts, .set_function, .xml_table, .transition => unreachable,
                 }
                 if (direction == 0) return error.InvalidParameterValue;
                 var current = args[0];
@@ -491,6 +492,17 @@ pub fn Exec(comptime config: types.Config) type {
                 }
                 const rows = hook.rows orelse return error.UnsupportedStatement;
                 try rows(hook.ptr, routine, &args, count, defaulted, &sink, &RoutineSink.emitOpaque);
+                return self.finish(p, sink.list);
+            }
+
+            /// A REFERENCING transition table (B11 wave 5): the rows of the
+            /// firing trigger's statement, from the routine hook.
+            fn transitionRows(self: *Query, p: *const B.Plan) Error!List {
+                const hook = self.session.routines orelse return error.UnsupportedStatement;
+                const transition = hook.transition orelse return error.UnsupportedStatement;
+                const code: u64 = @intCast(self.pool.nodes[p.function].integer);
+                var sink: RoutineSink = .{ .query = self, .plan = p, .columns = p.count - @intFromBool(p.ordinality), .list = .{ .start = @intCast(self.work.ref_low) } };
+                try transition(hook.ptr, code, &sink, &RoutineSink.emitOpaque);
                 return self.finish(p, sink.list);
             }
 

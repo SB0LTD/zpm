@@ -424,7 +424,9 @@ pub const binary_casts = [_]struct { oid: u32, source: types.DataType, target: t
     .{ .oid = 10183, .source = .bit, .target = .varbit },
     .{ .oid = 10184, .source = .varbit, .target = .bit },
 };
-const pg_trigger_columns = [_]ViewColumn{ col("oid", .oid), col("tgrelid", .oid), col("tgname", .name), col("tgfoid", .oid), col("tgtype", .int2), col("tgenabled", .pg_internal_char), col("tgisinternal", .boolean), col("tgnargs", .int2), col("tgparentid", .oid) };
+const pg_trigger_columns = [_]ViewColumn{ col("oid", .oid), col("tgrelid", .oid), col("tgname", .name), col("tgfoid", .oid), col("tgtype", .int2), col("tgenabled", .pg_internal_char), col("tgisinternal", .boolean), col("tgnargs", .int2), col("tgparentid", .oid),
+    // B11 wave 5: constraint triggers and transition tables.
+    col("tgconstrrelid", .oid), col("tgconstraint", .oid), col("tgdeferrable", .boolean), col("tginitdeferred", .boolean), col("tgoldtable", .name), col("tgnewtable", .name) };
 pub const rewrite_catalog: u32 = 2618;
 const pg_rewrite_columns = [_]ViewColumn{ col("oid", .oid), col("rulename", .name), col("ev_class", .oid), col("ev_type", .pg_internal_char), col("ev_enabled", .pg_internal_char), col("is_instead", .boolean) };
 const pg_rules_columns = [_]ViewColumn{ col("schemaname", .name), col("tablename", .name), col("rulename", .name), col("definition", .text) };
