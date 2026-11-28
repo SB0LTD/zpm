@@ -46,6 +46,10 @@ pub fn Routines(comptime config: types.Config) type {
         pub const Text = RC.Text;
         pub const Name = V.Name;
 
+        /// CreateRoutine.language of a LANGUAGE C routine while it parses
+        /// (B11 wave 5; never stored: it is 58P01).
+        const c_language: u8 = 2;
+
         pub const Kind = enum { create_function, create_procedure, drop_function, drop_procedure, call, do_block, create_trigger, drop_trigger, create_rule, drop_rule, grant_execute, revoke_execute, alter_function, alter_procedure };
 
         /// A byte range of the statement source.
@@ -527,6 +531,7 @@ pub fn Routines(comptime config: types.Config) type {
             var volatility = false;
             var strictness = false;
             var body = false;
+            var c_symbol = false;
             while (!cursor.atEnd() and !cursor.symbol(.semicolon)) {
                 if (try cursor.take("returns")) {
                     if (cursor.is("null")) {
@@ -595,7 +600,9 @@ pub fn Routines(comptime config: types.Config) type {
                         raw = cursor.lexeme();
                         try cursor.advance();
                     } else return error.Syntax;
-                    if (types.keyword(raw, "sql")) out.language = 0 else if (types.keyword(raw, "plpgsql")) out.language = 1 else return error.UndefinedObject;
+                    // C (B11 wave 5): no library can be loaded here, so a C
+                    // routine fails as PostgreSQL's does for a missing file.
+                    if (types.keyword(raw, "sql")) out.language = 0 else if (types.keyword(raw, "plpgsql")) out.language = 1 else if (types.keyword(raw, "c")) out.language = c_language else return error.UndefinedObject;
                 } else if (cursor.is("immutable") or cursor.is("stable") or cursor.is("volatile")) {
                     if (volatility) return error.Syntax;
                     volatility = true;
@@ -637,8 +644,12 @@ pub fn Routines(comptime config: types.Config) type {
                     if (body) return error.Syntax;
                     body = true;
                     out.body.len = try cursor.string(&out.body.bytes);
-                    // AS 'obj_file', 'link_symbol' (C functions) is outside the subset.
-                    if (cursor.symbol(.comma)) return error.UnsupportedStatement;
+                    // AS 'obj_file', 'link_symbol' (C functions).
+                    if (try cursor.takeSymbol(.comma)) {
+                        var symbol: [RC.arg_bytes]u8 = undefined;
+                        _ = try cursor.string(&symbol);
+                        c_symbol = true;
+                    }
                 } else if (cursor.is("return") or cursor.is("begin")) {
                     // SQL-standard bodies (B11 wave 4): RETURN expression,
                     // kept as `SELECT expression`, and BEGIN ATOMIC
@@ -655,6 +666,10 @@ pub fn Routines(comptime config: types.Config) type {
             }
             try finish(cursor);
             if (!body) return error.InvalidFunctionDefinition;
+            // LANGUAGE C: the object file cannot be accessed (58P01, as
+            // PostgreSQL for a missing library); a link symbol needs C.
+            if (language and out.language == c_language) return error.UndefinedFile;
+            if (c_symbol) return error.InvalidFunctionDefinition;
             if (out.sql_body and language and out.language != 0) return error.InvalidFunctionDefinition;
             if (!language and !out.sql_body) return error.InvalidFunctionDefinition;
             if (out.procedure and (volatility or strictness)) return error.InvalidFunctionDefinition;

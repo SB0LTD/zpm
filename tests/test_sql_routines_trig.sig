@@ -271,6 +271,11 @@ fn schemaStatements() !void {
     // A non-volatile function runs no DDL (0A000).
     try run("CREATE FUNCTION smk() RETURNS INT STABLE LANGUAGE plpgsql AS $$BEGIN CREATE TABLE s(a INT); RETURN 1; END$$");
     try fails("SELECT smk()", error.UnsupportedStatement);
+    // External routines (T653): no C library can be loaded here, so a C
+    // routine fails as PostgreSQL's does for a missing object file.
+    try fails("CREATE FUNCTION cf() RETURNS INT LANGUAGE C AS 'nosuchlib', 'cf'", error.UndefinedFile);
+    try fails("CREATE FUNCTION cf3() RETURNS INT LANGUAGE C AS 'cf'", error.UndefinedFile);
+    try fails("CREATE FUNCTION cf6() RETURNS INT LANGUAGE plperl AS 'return 1'", error.UndefinedObject);
     try sameState(&.{ "SELECT a, b FROM u ORDER BY a", "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public'", "SELECT inner1()" });
     try idle();
 }
