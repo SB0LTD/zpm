@@ -79,7 +79,7 @@ pub fn Types(comptime Result: type) type {
         pub fn sendText(cell: *const Cell, session: *const Session, out: []u8) Error!usize {
             if (comptime @hasDecl(Io.Text, "indirect")) {
                 if ((cell.* == .array and cell.array.indirect()) or (cell.* == .text and cell.text.indirect()) or
-                    (cell.* == .bpchar and cell.bpchar.indirect()))
+                    (cell.* == .bpchar and cell.bpchar.indirect()) or (cell.* == .xml and cell.xml.indirect()))
                     return (Io.format(cell, false, session, out) catch return error.BufferTooSmall).len;
             }
             var buffer: [Io.format_bytes]u8 = undefined;

@@ -112,10 +112,16 @@ pub fn XmlEval(comptime config: types.Config, comptime E: type) type {
         /// formed document whose namespaces resolve, else 2200M.
         fn document(ctx: *const E.Context, s: Scratch, text: []const u8) Error!tree.Tree {
             if (!xml.validDocument(text)) return error.InvalidXmlDocument;
-            var parsed: tree.Tree = .{ .source = text, .nodes = try s.take(tree.Node, config.xml_nodes), .text = try s.take(u8, text.len + 64), .control = ctx.session.control };
+            var parsed: tree.Tree = .{ .source = text, .nodes = try s.take(tree.Node, nodeCapacity(text)), .text = try s.take(u8, text.len + 64), .control = ctx.session.control };
             try tree.parse(&parsed, .{});
             if (parsed.namespace_error) return error.InvalidXmlDocument;
             return parsed;
+        }
+
+        /// Node storage for a document: what it can need, at most
+        /// Config.xml_nodes (nested uses then share the region).
+        fn nodeCapacity(text: []const u8) usize {
+            return @min(config.xml_nodes, tree.nodeBound(text));
         }
 
         /// xmlXPathCtxtCompile into scratch (the unused node slots are
@@ -274,7 +280,7 @@ pub fn XmlEval(comptime config: types.Config, comptime E: type) type {
             const s = try scratch(ctx);
             const mark = s.mark();
             defer s.release(mark);
-            var parsed: tree.Tree = .{ .source = text, .nodes = try s.take(tree.Node, config.xml_nodes), .text = try s.take(u8, text.len + 64), .control = ctx.session.control };
+            var parsed: tree.Tree = .{ .source = text, .nodes = try s.take(tree.Node, nodeCapacity(text)), .text = try s.take(u8, text.len + 64), .control = ctx.session.control };
             try tree.parse(&parsed, .{ .mode = if (as_document) .document else .content, .keep_blanks = false, .replace_entities = true });
             var out: tree.Out = .{ .bytes = s.rest() };
             const version = if (decl.version_len == 0) "1.0" else text[decl.version_start..][0..decl.version_len];
@@ -376,8 +382,15 @@ pub fn XmlEval(comptime config: types.Config, comptime E: type) type {
             const row_text = textArgument(&row_cell);
             if (row_text.len == 0) return error.InvalidArgumentForXquery;
             const row_path = try compile(s, row_text, bindings);
-            // Column paths.
-            var columns: [config.columns]Column = @splat(.{});
+            // Column paths (column-sized storage lives in scratch).
+            var declared: usize = 0;
+            member = table.b;
+            while (member != none) : (member = node(ctx, member).next) {
+                if (node(ctx, member).func == .xmltable_column) declared += 1;
+            }
+            const columns = try s.take(Column, declared);
+            for (columns) |*column| column.* = .{};
+            const cells = try s.take(V.Cell, declared);
             var column_count: usize = 0;
             member = table.b;
             while (member != none) : (member = node(ctx, member).next) {
@@ -420,7 +433,6 @@ pub fn XmlEval(comptime config: types.Config, comptime E: type) type {
             var ordinal: i64 = 1;
             for (row_nodes) |row_node| {
                 try ctx.session.checkpoint();
-                var cells: [config.columns]V.Cell = undefined;
                 var column_index: usize = 0;
                 member = table.b;
                 while (member != none) : (member = node(ctx, member).next) {
@@ -670,7 +682,9 @@ pub fn XmlEval(comptime config: types.Config, comptime E: type) type {
             try w.add(data[start..]);
         }
 
-        /// Query results passed to the mapping writers.
+        /// Query results passed to the mapping writers. Column names are
+        /// mapped per cell (the hook's names stay valid while its rows
+        /// arrive), so nothing column-sized lives on the stack.
         const Collector = struct {
             ctx: *const E.Context,
             w: *Writer,
@@ -679,27 +693,17 @@ pub fn XmlEval(comptime config: types.Config, comptime E: type) type {
             /// "table".
             table_name: ?[]const u8,
             top_level: bool,
-            /// Columns (names mapped when they arrive).
             count: usize = 0,
-            names: [config.columns][]const u8 = undefined,
-            name_bytes: [config.columns * 128]u8 = undefined,
-            tys: [config.columns]types.Type = undefined,
-            typmods: [config.columns]i32 = undefined,
+            names: [*]const V.Name = undefined,
 
-            fn columns(raw: *anyopaque, count: usize, names_raw: *const anyopaque, tys: [*]const types.Type, typmods: [*]const i32) Error!void {
+            fn columns(raw: *anyopaque, count: usize, names_raw: *const anyopaque, _: [*]const types.Type, _: [*]const i32) Error!void {
                 const self: *Collector = @ptrCast(@alignCast(raw));
-                if (count > config.columns) return error.ColumnCapacity;
-                const names: [*]const V.Name = @ptrCast(@alignCast(names_raw));
-                var used: usize = 0;
-                for (0..count) |index| {
-                    var out: tree.Out = .{ .bytes = self.name_bytes[used..] };
-                    try mapName(names[index].slice(), true, false, &out);
-                    self.names[index] = self.name_bytes[used..][0..out.len];
-                    used += out.len;
-                    self.tys[index] = tys[index];
-                    self.typmods[index] = typmods[index];
-                }
+                self.names = @ptrCast(@alignCast(names_raw));
                 self.count = count;
+            }
+
+            fn column(self: *Collector, index: usize) Error!void {
+                try self.w.name(self.names[index].slice(), true, false);
             }
 
             /// SPI_sql_row_to_xmlelement.
@@ -717,17 +721,17 @@ pub fn XmlEval(comptime config: types.Config, comptime E: type) type {
                     if (cell.* == .null_value) {
                         if (self.options.nulls) {
                             try w.add("  <");
-                            try w.add(self.names[index]);
+                            try self.column(index);
                             try w.add(" xsi:nil=\"true\"/>\n");
                         }
                         continue;
                     }
                     try w.add("  <");
-                    try w.add(self.names[index]);
+                    try self.column(index);
                     try w.add(">");
                     try mapValue(self.ctx, cell, w);
                     try w.add("</");
-                    try w.add(self.names[index]);
+                    try self.column(index);
                     try w.add(">\n");
                 }
                 if (self.options.tableforest) {
@@ -771,21 +775,20 @@ pub fn XmlEval(comptime config: types.Config, comptime E: type) type {
             return sequences;
         }
 
+        fn query(ctx: *const E.Context, text: []const u8, sink: value.XmlQuerySink) Error!void {
+            const sequences = try hook(ctx);
+            try sequences.xml_query.?(sequences.ptr, text, &sink);
+        }
+
         fn cursorRows(ctx: *const E.Context, name: []const u8, count: i64, fetch: bool, sink: value.XmlQuerySink) Error!void {
             const sequences = ctx.session.sequences orelse return error.UnsupportedStatement;
             const cursor = sequences.xml_cursor orelse return error.UnsupportedStatement;
             try cursor(sequences.ptr, name, count, fetch, &sink);
         }
 
-        fn runQuery(ctx: *const E.Context, query: []const u8, collector: *Collector) Error!void {
-            const sequences = try hook(ctx);
-            const sink: value.XmlQuerySink = .{ .context = collector, .columns = &Collector.columns, .row = &Collector.row };
-            try sequences.xml_query.?(sequences.ptr, query, &sink);
-        }
-
         /// query_to_xml_internal: the root element (unless a table forest),
         /// an XML Schema when given, then a row element per row.
-        fn queryToXml(ctx: *const E.Context, w: *Writer, query: []const u8, table_name: ?[]const u8, xmlschema: ?[]const u8, options: Options, top_level: bool) Error!void {
+        fn queryToXml(ctx: *const E.Context, w: *Writer, text: []const u8, table_name: ?[]const u8, xmlschema: ?[]const u8, options: Options, top_level: bool) Error!void {
             var name_buffer: [1024]u8 = undefined;
             var element: []const u8 = "table";
             if (table_name) |raw| {
@@ -802,7 +805,7 @@ pub fn XmlEval(comptime config: types.Config, comptime E: type) type {
                 try w.add("\n\n");
             }
             var collector: Collector = .{ .ctx = ctx, .w = w, .options = options, .table_name = if (table_name != null) element else null, .top_level = top_level };
-            try runQuery(ctx, query, &collector);
+            try query(ctx, text, .{ .context = &collector, .columns = &Collector.columns, .row = &Collector.row });
             if (!options.tableforest) try rootEnd(w, element);
         }
 
@@ -826,24 +829,19 @@ pub fn XmlEval(comptime config: types.Config, comptime E: type) type {
             fn displaySlice(self: *const Relation) []const u8 {
                 return self.display[0..self.display_len];
             }
-        };
-
-        const RelationSink = struct {
-            relation: *Relation,
 
             fn columns(_: *anyopaque, _: usize, _: *const anyopaque, _: [*]const types.Type, _: [*]const i32) Error!void {}
 
             fn row(raw: *anyopaque, cells_raw: *const anyopaque) Error!void {
-                const self: *RelationSink = @ptrCast(@alignCast(raw));
+                const self: *Relation = @ptrCast(@alignCast(raw));
                 const cells: [*]const V.Cell = @ptrCast(@alignCast(cells_raw));
-                const r = self.relation;
-                r.found = true;
+                self.found = true;
                 inline for (.{ .{ "name", "name_len" }, .{ "schema", "schema_len" }, .{ "display", "display_len" } }, 0..) |field, index| {
                     const text = textArgument(&cells[index]);
-                    const target = &@field(r, field[0]);
+                    const target = &@field(self, field[0]);
                     if (text.len > target.len) return error.NameCapacity;
                     @memcpy(target[0..text.len], text);
-                    @field(r, field[1]) = text.len;
+                    @field(self, field[1]) = text.len;
                 }
             }
         };
@@ -868,18 +866,14 @@ pub fn XmlEval(comptime config: types.Config, comptime E: type) type {
         fn relation(ctx: *const E.Context, oid: i64) Error!Relation {
             var query_buffer: [400]u8 = undefined;
             var number_buffer: [24]u8 = undefined;
-            const query = std.fmt.bufPrint(&query_buffer, "SELECT c.relname::text, n.nspname::text, c.oid::regclass::text FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = {s}", .{integerText(oid, &number_buffer)}) catch return error.TextCapacity;
+            const text = std.fmt.bufPrint(&query_buffer, "SELECT c.relname::text, n.nspname::text, c.oid::regclass::text FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = {s}", .{integerText(oid, &number_buffer)}) catch return error.TextCapacity;
             var result: Relation = .{};
-            var sink_state: RelationSink = .{ .relation = &result };
-            const sequences = try hook(ctx);
-            const sink: value.XmlQuerySink = .{ .context = &sink_state, .columns = &RelationSink.columns, .row = &RelationSink.row };
-            try sequences.xml_query.?(sequences.ptr, query, &sink);
+            try query(ctx, text, .{ .context = &result, .columns = &Relation.columns, .row = &Relation.row });
             if (!result.found) return error.TableNotFound;
             return result;
         }
 
-        /// The relations of a schema (relkind r, m and v, by name) or of
-        /// the database's visible schemas, as OIDs.
+        /// OIDs a catalog query returns (first column).
         const OidSink = struct {
             oids: []u32,
             count: usize = 0,
@@ -895,12 +889,10 @@ pub fn XmlEval(comptime config: types.Config, comptime E: type) type {
             }
         };
 
-        fn oidQuery(ctx: *const E.Context, query: []const u8, oids: []u32) Error!usize {
+        fn oidQuery(ctx: *const E.Context, text: []const u8, oids: []u32) Error![]u32 {
             var sink_state: OidSink = .{ .oids = oids };
-            const sequences = try hook(ctx);
-            const sink: value.XmlQuerySink = .{ .context = &sink_state, .columns = &OidSink.columns, .row = &OidSink.row };
-            try sequences.xml_query.?(sequences.ptr, query, &sink);
-            return sink_state.count;
+            try query(ctx, text, .{ .context = &sink_state, .columns = &OidSink.columns, .row = &OidSink.row });
+            return oids[0..sink_state.count];
         }
 
         /// A string literal of `text` in SQL (quotes doubled).
@@ -925,15 +917,15 @@ pub fn XmlEval(comptime config: types.Config, comptime E: type) type {
             try out.add("SELECT n.oid FROM pg_catalog.pg_namespace n WHERE n.nspname = ");
             try literal(name, &out);
             var oids: [1]u32 = undefined;
-            if (try oidQuery(ctx, out.slice(), &oids) == 0) return error.UndefinedSchema;
+            if ((try oidQuery(ctx, out.slice(), &oids)).len == 0) return error.UndefinedSchema;
             return oids[0];
         }
 
-        fn schemaTables(ctx: *const E.Context, nsp: u32, oids: []u32) Error!usize {
+        fn schemaTables(ctx: *const E.Context, nsp: u32, oids: []u32) Error![]u32 {
             var buffer: [256]u8 = undefined;
             var number_buffer: [24]u8 = undefined;
-            const query = std.fmt.bufPrint(&buffer, schema_tables_query, .{integerText(nsp, &number_buffer)}) catch return error.TextCapacity;
-            return oidQuery(ctx, query, oids);
+            const text = std.fmt.bufPrint(&buffer, schema_tables_query, .{integerText(nsp, &number_buffer)}) catch return error.TextCapacity;
+            return oidQuery(ctx, text, oids);
         }
 
         const NameSink = struct {
@@ -955,24 +947,35 @@ pub fn XmlEval(comptime config: types.Config, comptime E: type) type {
         fn schemaName(ctx: *const E.Context, nsp: u32, out: []u8) Error![]const u8 {
             var buffer: [160]u8 = undefined;
             var number_buffer: [24]u8 = undefined;
-            const query = std.fmt.bufPrint(&buffer, "SELECT n.nspname::text FROM pg_catalog.pg_namespace n WHERE n.oid = {s}", .{integerText(nsp, &number_buffer)}) catch return error.TextCapacity;
+            const text = std.fmt.bufPrint(&buffer, "SELECT n.nspname::text FROM pg_catalog.pg_namespace n WHERE n.oid = {s}", .{integerText(nsp, &number_buffer)}) catch return error.TextCapacity;
             var sink_state: NameSink = .{ .out = out };
-            const sequences = try hook(ctx);
-            const sink: value.XmlQuerySink = .{ .context = &sink_state, .columns = &NameSink.columns, .row = &NameSink.row };
-            try sequences.xml_query.?(sequences.ptr, query, &sink);
+            try query(ctx, text, .{ .context = &sink_state, .columns = &NameSink.columns, .row = &NameSink.row });
             return out[0..sink_state.len];
         }
 
-        /// table_to_xml_internal: SELECT * FROM the relation's regclass text.
+        /// `SELECT * FROM` a relation's regclass text.
+        fn selectAll(rel: *const Relation, buffer: []u8) Error![]const u8 {
+            return std.fmt.bufPrint(buffer, "SELECT * FROM {s}", .{rel.displaySlice()}) catch error.TextCapacity;
+        }
+
+        /// table_to_xml_internal.
         fn tableToXml(ctx: *const E.Context, w: *Writer, oid: i64, xmlschema: ?[]const u8, options: Options, top_level: bool) Error!void {
             const rel = try relation(ctx, oid);
             var buffer: [400]u8 = undefined;
-            const query = std.fmt.bufPrint(&buffer, "SELECT * FROM {s}", .{rel.displaySlice()}) catch return error.TextCapacity;
-            try queryToXml(ctx, w, query, rel.nameSlice(), xmlschema, options, top_level);
+            try queryToXml(ctx, w, try selectAll(&rel, &buffer), rel.nameSlice(), xmlschema, options, top_level);
         }
 
+        /// Working storage of a mapping call, taken from scratch before its
+        /// output starts (relation lists bounded by Config.tables and
+        /// Config.schemas, one query shape).
+        const Work = struct {
+            oids: []u32,
+            schemas: []u32,
+            shape: *ShapeSink,
+        };
+
         /// schema_to_xml_internal.
-        fn schemaToXml(ctx: *const E.Context, w: *Writer, nsp: u32, xmlschema: ?[]const u8, options: Options, top_level: bool) Error!void {
+        fn schemaToXml(ctx: *const E.Context, w: *Writer, work: *const Work, nsp: u32, xmlschema: ?[]const u8, options: Options, top_level: bool) Error!void {
             var name_buffer: [128]u8 = undefined;
             const schema = try schemaName(ctx, nsp, &name_buffer);
             var element_buffer: [1024]u8 = undefined;
@@ -984,9 +987,7 @@ pub fn XmlEval(comptime config: types.Config, comptime E: type) type {
                 try w.add(schema_text);
                 try w.add("\n\n");
             }
-            var oids: [config.tables]u32 = undefined;
-            const count = try schemaTables(ctx, nsp, &oids);
-            for (oids[0..count]) |oid| {
+            for (try schemaTables(ctx, nsp, work.oids)) |oid| {
                 try tableToXml(ctx, w, oid, null, options, false);
                 try w.add("\n");
             }
@@ -994,7 +995,7 @@ pub fn XmlEval(comptime config: types.Config, comptime E: type) type {
         }
 
         /// database_to_xml_internal.
-        fn databaseToXml(ctx: *const E.Context, w: *Writer, xmlschema: ?[]const u8, options: Options) Error!void {
+        fn databaseToXml(ctx: *const E.Context, w: *Writer, work: *const Work, xmlschema: ?[]const u8, options: Options) Error!void {
             var element_buffer: [1024]u8 = undefined;
             var element: tree.Out = .{ .bytes = &element_buffer };
             try mapName(ctx.session.database, true, false, &element);
@@ -1004,10 +1005,8 @@ pub fn XmlEval(comptime config: types.Config, comptime E: type) type {
                 try w.add(schema_text);
                 try w.add("\n\n");
             }
-            var schemas: [config.schemas + 4]u32 = undefined;
-            const count = try oidQuery(ctx, visible_schemas_query, &schemas);
-            for (schemas[0..count]) |nsp| {
-                try schemaToXml(ctx, w, nsp, null, options, false);
+            for (try oidQuery(ctx, visible_schemas_query, work.schemas)) |nsp| {
+                try schemaToXml(ctx, w, work, nsp, null, options, false);
                 try w.add("\n");
             }
             try rootEnd(w, element.slice());
@@ -1092,18 +1091,17 @@ pub fn XmlEval(comptime config: types.Config, comptime E: type) type {
         }
 
         /// map_sql_typecoll_to_xmlschema_types: each distinct column type
-        /// once, in order of first use.
-        fn typeCollection(ctx: *const E.Context, w: *Writer, tys: []const types.Type) Error!void {
-            for (tys, 0..) |ty, index| {
-                var seen = false;
-                for (tys[0..index]) |earlier| seen = seen or earlier == ty;
-                if (seen) continue;
+        /// once, in order of first use (`seen` carries over across tables).
+        fn typeCollection(ctx: *const E.Context, w: *Writer, tys: []const types.Type, seen: *[256]bool) Error!void {
+            for (tys) |ty| {
+                if (seen[@intFromEnum(ty)]) continue;
+                seen[@intFromEnum(ty)] = true;
                 try schemaType(ctx, w, ty);
                 try w.add("\n");
             }
         }
 
-        /// Column names and types of a query (no rows).
+        /// Column names and types of a query (no rows), in scratch.
         const ShapeSink = struct {
             count: usize = 0,
             names: [config.columns]V.Name = undefined,
@@ -1123,22 +1121,25 @@ pub fn XmlEval(comptime config: types.Config, comptime E: type) type {
             fn row(_: *anyopaque, _: *const anyopaque) Error!void {}
         };
 
-        fn queryShape(ctx: *const E.Context, query: []const u8, shape: *ShapeSink) Error!void {
-            const sequences = try hook(ctx);
-            const sink: value.XmlQuerySink = .{ .context = shape, .columns = &ShapeSink.columns, .row = &ShapeSink.row };
-            try sequences.xml_query.?(sequences.ptr, query, &sink);
+        fn queryShape(ctx: *const E.Context, text: []const u8, shape: *ShapeSink) Error!void {
+            shape.count = 0;
+            try query(ctx, text, .{ .context = shape, .columns = &ShapeSink.columns, .row = &ShapeSink.row });
         }
 
-        /// map_sql_table_to_xmlschema (`rel` null for a query).
+        /// map_sql_table_to_xmlschema (`rel` null for a query or cursor).
         fn tableSchema(ctx: *const E.Context, w: *Writer, shape: *const ShapeSink, rel: ?*const Relation, options: Options) Error!void {
             try xsdStart(w, options.targetns);
-            try typeCollection(ctx, w, shape.tys[0..shape.count]);
-            const row_start = w.s.region.used;
-            if (rel) |r| try multipart(w, &.{ "RowType", ctx.session.database, r.schemaSlice(), r.nameSlice() }) else try w.add("RowType");
-            const row_type = try copyOut(w, row_start);
-            const table_start = w.s.region.used;
-            if (rel) |r| try multipart(w, &.{ "TableType", ctx.session.database, r.schemaSlice(), r.nameSlice() }) else try w.add("TableType");
-            const table_type = try copyOut(w, table_start);
+            var seen: [256]bool = @splat(false);
+            try typeCollection(ctx, w, shape.tys[0..shape.count], &seen);
+            var row_type: Small = .{};
+            var table_type: Small = .{};
+            if (rel) |r| {
+                try row_type.multipart(&.{ "RowType", ctx.session.database, r.schemaSlice(), r.nameSlice() });
+                try table_type.multipart(&.{ "TableType", ctx.session.database, r.schemaSlice(), r.nameSlice() });
+            } else {
+                try row_type.multipart(&.{"RowType"});
+                try table_type.multipart(&.{"TableType"});
+            }
             var element_buffer: [1024]u8 = undefined;
             var element: tree.Out = .{ .bytes = &element_buffer };
             if (rel) |r| try mapName(r.nameSlice(), true, false, &element) else try element.add(if (options.tableforest) "row" else "table");
@@ -1174,32 +1175,43 @@ pub fn XmlEval(comptime config: types.Config, comptime E: type) type {
             try w.add("</xsd:schema>");
         }
 
-        /// Moves the bytes written since `start` into a small buffer (they
-        /// are names inside the output being built) and drops them.
+        /// A mapped multipart name kept apart from the output.
         const Small = struct {
             bytes: [1024]u8 = undefined,
             len: usize = 0,
+
             fn slice(self: *const Small) []const u8 {
                 return self.bytes[0..self.len];
             }
+
+            fn multipart(self: *Small, parts: []const []const u8) Error!void {
+                var writer: tree.Out = .{ .bytes = &self.bytes };
+                for (parts, 0..) |part, index| {
+                    if (index != 0) try writer.byte('.');
+                    try mapName(part, true, true, &writer);
+                }
+                self.len = writer.len;
+            }
         };
 
-        fn copyOut(w: *Writer, start: usize) Error!Small {
-            var out: Small = .{};
-            const written = w.s.region.bytes[start..w.s.region.used];
-            if (written.len > out.bytes.len) return error.NameCapacity;
-            @memcpy(out.bytes[0..written.len], written);
-            out.len = written.len;
-            w.s.region.used = start;
-            return out;
+        /// The type collection of every relation in `oids` (one query shape
+        /// at a time).
+        fn relationsTypes(ctx: *const E.Context, w: *Writer, work: *const Work, oids: []const u32, seen: *[256]bool) Error!void {
+            for (oids) |oid| {
+                const rel = try relation(ctx, oid);
+                var buffer: [400]u8 = undefined;
+                try queryShape(ctx, try selectAll(&rel, &buffer), work.shape);
+                try typeCollection(ctx, w, work.shape.tys[0..work.shape.count], seen);
+            }
         }
 
         /// map_sql_schema_to_xmlschema_types.
-        fn schemaTypes(ctx: *const E.Context, w: *Writer, schema: []const u8, tables: []const Relation, options: Options) Error!void {
+        fn schemaTypes(ctx: *const E.Context, w: *Writer, schema: []const u8, oids: []const u32, options: Options) Error!void {
             try w.add("<xsd:complexType name=\"");
             try multipart(w, &.{ "SchemaType", ctx.session.database, schema });
             try w.add(if (!options.tableforest) "\">\n  <xsd:all>\n" else "\">\n  <xsd:sequence>\n");
-            for (tables) |*rel| {
+            for (oids) |oid| {
+                const rel = try relation(ctx, oid);
                 try w.add("    <xsd:element name=\"");
                 try w.name(rel.nameSlice(), true, false);
                 try w.add("\" type=\"");
@@ -1214,55 +1226,27 @@ pub fn XmlEval(comptime config: types.Config, comptime E: type) type {
             try w.add("\"/>\n\n");
         }
 
-        /// The column types of the given relations, in order (for the type
-        /// collection of schema and database schemas).
-        fn relationTypes(ctx: *const E.Context, oids: []const u32, rels: []Relation, tys: []types.Type) Error!usize {
-            var count: usize = 0;
-            for (oids, 0..) |oid, index| {
-                rels[index] = try relation(ctx, oid);
-                var buffer: [400]u8 = undefined;
-                const query = std.fmt.bufPrint(&buffer, "SELECT * FROM {s}", .{rels[index].displaySlice()}) catch return error.TextCapacity;
-                var shape: ShapeSink = .{};
-                try queryShape(ctx, query, &shape);
-                for (shape.tys[0..shape.count]) |ty| {
-                    if (count == tys.len) return error.ProgramLimitExceeded;
-                    tys[count] = ty;
-                    count += 1;
-                }
-            }
-            return count;
-        }
-
         /// schema_to_xmlschema_internal.
-        fn schemaSchema(ctx: *const E.Context, w: *Writer, schema: []const u8, options: Options) Error!void {
+        fn schemaSchema(ctx: *const E.Context, w: *Writer, work: *const Work, schema: []const u8, options: Options) Error!void {
             const nsp = try schemaOid(ctx, schema);
             try xsdStart(w, options.targetns);
-            var oids: [config.tables]u32 = undefined;
-            const count = try schemaTables(ctx, nsp, &oids);
-            var rels: [config.tables]Relation = undefined;
-            var tys: [config.tables * config.columns]types.Type = undefined;
-            const type_count = try relationTypes(ctx, oids[0..count], rels[0..count], &tys);
-            try typeCollection(ctx, w, tys[0..type_count]);
-            try schemaTypes(ctx, w, schema, rels[0..count], options);
+            const oids = try schemaTables(ctx, nsp, work.oids);
+            var seen: [256]bool = @splat(false);
+            try relationsTypes(ctx, w, work, oids, &seen);
+            try schemaTypes(ctx, w, schema, oids, options);
             try w.add("</xsd:schema>");
         }
 
         /// database_to_xmlschema_internal.
-        fn databaseSchema(ctx: *const E.Context, w: *Writer, options: Options) Error!void {
+        fn databaseSchema(ctx: *const E.Context, w: *Writer, work: *const Work, options: Options) Error!void {
             try xsdStart(w, options.targetns);
-            var oids: [config.tables]u32 = undefined;
-            const count = try oidQuery(ctx, database_tables_query, &oids);
-            var rels: [config.tables]Relation = undefined;
-            var tys: [config.tables * config.columns]types.Type = undefined;
-            const type_count = try relationTypes(ctx, oids[0..count], rels[0..count], &tys);
-            try typeCollection(ctx, w, tys[0..type_count]);
+            var seen: [256]bool = @splat(false);
+            try relationsTypes(ctx, w, work, try oidQuery(ctx, database_tables_query, work.oids), &seen);
             // map_sql_catalog_to_xmlschema_types.
             try w.add("<xsd:complexType name=\"");
             try multipart(w, &.{ "CatalogType", ctx.session.database });
             try w.add("\">\n  <xsd:all>\n");
-            var schemas: [config.schemas + 4]u32 = undefined;
-            const schema_count = try oidQuery(ctx, visible_schemas_query, &schemas);
-            for (schemas[0..schema_count]) |nsp| {
+            for (try oidQuery(ctx, visible_schemas_query, work.schemas)) |nsp| {
                 var name_buffer: [128]u8 = undefined;
                 const schema = try schemaName(ctx, nsp, &name_buffer);
                 try w.add("    <xsd:element name=\"");
@@ -1291,6 +1275,9 @@ pub fn XmlEval(comptime config: types.Config, comptime E: type) type {
             const s = try scratch(ctx);
             const mark = s.mark();
             defer s.release(mark);
+            const shape = try s.take(ShapeSink, 1);
+            shape[0] = .{};
+            const work: Work = .{ .oids = try s.take(u32, config.tables), .schemas = try s.take(u32, config.schemas + 4), .shape = &shape[0] };
             var w: Writer = .{ .s = s, .start = s.region.used };
             const database = which == .database_to_xml or which == .database_to_xmlschema or which == .database_to_xml_and_xmlschema;
             const first: usize = if (database) 0 else if (which == .cursor_to_xml) 2 else 1;
@@ -1298,51 +1285,6 @@ pub fn XmlEval(comptime config: types.Config, comptime E: type) type {
             switch (which) {
                 .table_to_xml => try tableToXml(ctx, &w, args[0].integer, null, options, true),
                 .query_to_xml => try queryToXml(ctx, &w, textArgument(&args[0]), null, null, options, true),
-                .table_to_xmlschema, .table_to_xml_and_xmlschema => {
-                    const rel = try relation(ctx, args[0].integer);
-                    var buffer: [400]u8 = undefined;
-                    const query = std.fmt.bufPrint(&buffer, "SELECT * FROM {s}", .{rel.displaySlice()}) catch return error.TextCapacity;
-                    var shape: ShapeSink = .{};
-                    try queryShape(ctx, query, &shape);
-                    try tableSchema(ctx, &w, &shape, &rel, options);
-                    if (which == .table_to_xml_and_xmlschema) {
-                        const schema_text = w.slice();
-                        var data: Writer = .{ .s = s, .start = s.region.used };
-                        try tableToXml(ctx, &data, args[0].integer, schema_text, options, true);
-                        return wideCell(ctx, .xml, data.slice());
-                    }
-                },
-                .query_to_xmlschema, .query_to_xml_and_xmlschema => {
-                    var shape: ShapeSink = .{};
-                    try queryShape(ctx, textArgument(&args[0]), &shape);
-                    try tableSchema(ctx, &w, &shape, null, options);
-                    if (which == .query_to_xml_and_xmlschema) {
-                        const schema_text = w.slice();
-                        var data: Writer = .{ .s = s, .start = s.region.used };
-                        try queryToXml(ctx, &data, textArgument(&args[0]), null, schema_text, options, true);
-                        return wideCell(ctx, .xml, data.slice());
-                    }
-                },
-                .schema_to_xml => try schemaToXml(ctx, &w, try schemaOid(ctx, textArgument(&args[0])), null, options, true),
-                .schema_to_xmlschema, .schema_to_xml_and_xmlschema => {
-                    try schemaSchema(ctx, &w, textArgument(&args[0]), options);
-                    if (which == .schema_to_xml_and_xmlschema) {
-                        const schema_text = w.slice();
-                        var data: Writer = .{ .s = s, .start = s.region.used };
-                        try schemaToXml(ctx, &data, try schemaOid(ctx, textArgument(&args[0])), schema_text, options, true);
-                        return wideCell(ctx, .xml, data.slice());
-                    }
-                },
-                .database_to_xml => try databaseToXml(ctx, &w, null, options),
-                .database_to_xmlschema, .database_to_xml_and_xmlschema => {
-                    try databaseSchema(ctx, &w, options);
-                    if (which == .database_to_xml_and_xmlschema) {
-                        const schema_text = w.slice();
-                        var data: Writer = .{ .s = s, .start = s.region.used };
-                        try databaseToXml(ctx, &data, schema_text, options);
-                        return wideCell(ctx, .xml, data.slice());
-                    }
-                },
                 .cursor_to_xml => {
                     if (!options.tableforest) {
                         try rootStart(&w, "table", null, options.targetns, true);
@@ -1353,9 +1295,50 @@ pub fn XmlEval(comptime config: types.Config, comptime E: type) type {
                     if (!options.tableforest) try rootEnd(&w, "table");
                 },
                 .cursor_to_xmlschema => {
-                    var shape: ShapeSink = .{};
-                    try cursorRows(ctx, textArgument(&args[0]), 0, false, .{ .context = &shape, .columns = &ShapeSink.columns, .row = &ShapeSink.row });
-                    try tableSchema(ctx, &w, &shape, null, options);
+                    try cursorRows(ctx, textArgument(&args[0]), 0, false, .{ .context = work.shape, .columns = &ShapeSink.columns, .row = &ShapeSink.row });
+                    try tableSchema(ctx, &w, work.shape, null, options);
+                },
+                .table_to_xmlschema, .table_to_xml_and_xmlschema => {
+                    const rel = try relation(ctx, args[0].integer);
+                    var buffer: [400]u8 = undefined;
+                    try queryShape(ctx, try selectAll(&rel, &buffer), work.shape);
+                    try tableSchema(ctx, &w, work.shape, &rel, options);
+                    if (which == .table_to_xml_and_xmlschema) {
+                        const schema_text = w.slice();
+                        var data: Writer = .{ .s = s, .start = s.region.used };
+                        try tableToXml(ctx, &data, args[0].integer, schema_text, options, true);
+                        return wideCell(ctx, .xml, data.slice());
+                    }
+                },
+                .query_to_xmlschema, .query_to_xml_and_xmlschema => {
+                    try queryShape(ctx, textArgument(&args[0]), work.shape);
+                    try tableSchema(ctx, &w, work.shape, null, options);
+                    if (which == .query_to_xml_and_xmlschema) {
+                        const schema_text = w.slice();
+                        var data: Writer = .{ .s = s, .start = s.region.used };
+                        try queryToXml(ctx, &data, textArgument(&args[0]), null, schema_text, options, true);
+                        return wideCell(ctx, .xml, data.slice());
+                    }
+                },
+                .schema_to_xml => try schemaToXml(ctx, &w, &work, try schemaOid(ctx, textArgument(&args[0])), null, options, true),
+                .schema_to_xmlschema, .schema_to_xml_and_xmlschema => {
+                    try schemaSchema(ctx, &w, &work, textArgument(&args[0]), options);
+                    if (which == .schema_to_xml_and_xmlschema) {
+                        const schema_text = w.slice();
+                        var data: Writer = .{ .s = s, .start = s.region.used };
+                        try schemaToXml(ctx, &data, &work, try schemaOid(ctx, textArgument(&args[0])), schema_text, options, true);
+                        return wideCell(ctx, .xml, data.slice());
+                    }
+                },
+                .database_to_xml => try databaseToXml(ctx, &w, &work, null, options),
+                .database_to_xmlschema, .database_to_xml_and_xmlschema => {
+                    try databaseSchema(ctx, &w, &work, options);
+                    if (which == .database_to_xml_and_xmlschema) {
+                        const schema_text = w.slice();
+                        var data: Writer = .{ .s = s, .start = s.region.used };
+                        try databaseToXml(ctx, &data, &work, schema_text, options);
+                        return wideCell(ctx, .xml, data.slice());
+                    }
                 },
                 else => unreachable,
             }

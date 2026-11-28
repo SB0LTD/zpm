@@ -354,10 +354,12 @@ pub fn validDocument(text: []const u8) bool {
     return elements == 1;
 }
 
-/// xml_out into `buffer` (at least text.len + 64 bytes): the declaration
-/// as print_xml_decl rebuilds it, or none (and the newline after the
-/// original one) when it says nothing beyond version 1.0.
-pub fn output(text: []const u8, buffer: []u8) []const u8 {
+/// xml_out into `buffer`: the declaration as print_xml_decl rebuilds it,
+/// or none (and the newline after the original one) when it says nothing
+/// beyond version 1.0. A buffer shorter than text.len + 64 bytes is
+/// TextCapacity.
+pub fn output(text: []const u8, buffer: []u8) types.Error![]const u8 {
+    if (buffer.len < text.len + 64) return error.TextCapacity;
     const decl = declaration(text) orelse Declaration{};
     var at: usize = 0;
     var skip = decl.len;

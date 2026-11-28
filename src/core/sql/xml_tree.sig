@@ -646,6 +646,32 @@ const Builder = struct {
     }
 };
 
+/// An upper bound of the nodes parse and the namespace axis create for
+/// `text`: every '<' (a node or an end tag), every '=' (an attribute or a
+/// declaration), every character run after '>', the document and the xml
+/// declaration, plus one namespace node per element and in-scope
+/// declaration (the xml namespace and each xmlns).
+pub fn nodeBound(text: []const u8) usize {
+    var markup: usize = 0;
+    var equals: usize = 0;
+    var runs: usize = 1;
+    var declarations: usize = 0;
+    for (text, 0..) |c, index| {
+        switch (c) {
+            '<' => markup += 1,
+            '=' => equals += 1,
+            '>' => if (index + 1 < text.len and text[index + 1] != '<') {
+                runs += 1;
+            },
+            'x' => if (index + 5 <= text.len and types.same(text[index..][0..5], "xmlns")) {
+                declarations += 1;
+            },
+            else => {},
+        }
+    }
+    return markup + equals + runs + 2 + markup * (declarations + 1);
+}
+
 pub const Options = struct {
     mode: Mode = .document,
     /// false: libxml2's XML_PARSE_NOBLANKS heuristic.

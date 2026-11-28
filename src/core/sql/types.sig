@@ -1407,7 +1407,8 @@ pub fn Values(comptime config: Config) type {
 
         pub fn largeBytes(value: *const Cell) ?[]const u8 {
             return switch (value.*) {
-                .text, .array, .bpchar => |*text| if (text.indirect()) text.slice() else null,
+                // xml: wide SQL/XML results (B11 wave 5 xml lane).
+                .text, .array, .bpchar, .xml => |*text| if (text.indirect()) text.slice() else null,
                 else => null,
             };
         }
@@ -1418,6 +1419,7 @@ pub fn Values(comptime config: Config) type {
                 .text => .{ .text = text },
                 .array => .{ .array = text },
                 .bpchar => .{ .bpchar = text },
+                .xml => .{ .xml = text },
                 else => unreachable,
             };
         }

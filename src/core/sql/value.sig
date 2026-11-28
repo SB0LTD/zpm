@@ -673,7 +673,7 @@ pub fn Io(comptime config: types.Config) type {
                 .multirange => |*value| try MultirangeText.format(value.slice(), session, buffer),
                 .point => |value| geometric.formatPoint(value, session.extra_float_digits, buffer),
                 .box => |value| geometric.formatBox(value, session.extra_float_digits, buffer),
-                .xml => |*value| xml.output(value.slice(), buffer),
+                .xml => |*value| try xml.output(value.slice(), buffer),
                 // regtypeout: the type's SQL name, or the number.
                 .regtype => |oid| if (types.regtypeName(oid)) |name| copy(buffer, name) else integerText(oid, buffer),
                 .regproc => |oid| blk: {
@@ -1143,8 +1143,10 @@ pub fn Io(comptime config: types.Config) type {
                 return cast(try textCell(try format(&cell, true, session, &buffer)), .text, to, typmod, session);
             }
             if (cell == .xml and to != .xml) {
-                // xml -> text is binary coercible: the stored text.
+                // xml -> text is binary coercible: the stored text (a wide
+                // SQL/XML result keeps pointing at its bytes).
                 if (!characterType(to)) return error.CannotCoerce;
+                if (cell.xml.indirect()) return cast(.{ .text = cell.xml }, .text, to, typmod, session);
                 return cast(try textCell(cell.xml.slice()), .text, to, typmod, session);
             }
             if ((cell == .regtype and to != .regtype) or (cell == .regproc and to != .regproc)) {
