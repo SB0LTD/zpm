@@ -1222,7 +1222,7 @@ pub fn Ast(comptime config: types.Config) type {
             /// ALTER [COLUMN] c [SET DATA] TYPE t [COLLATE n] [USING expr]
             /// (ddl-alter, wave 5). `collation` is a collation.lookup value
             /// (0: no clause); `using` is the expression's source span.
-            alter_type: struct { column: Ident, type_name: TypeName, typmod: i32 = -1, collation: u8 = 0, using: Span = .{} },
+            alter_type: struct { column: Ident, type_name: TypeName, typmod: i32 = -1, collation: u8 = 0, using: Span = .{}, user_type: Ident = .{}, user_type_schema: Ident = .{} },
             /// ALTER [COLUMN] c SET STATISTICS n / SET STORAGE s / SET
             /// COMPRESSION m (ddl-alter): checked, nothing is stored.
             column_option: struct { column: Ident, option: ColumnOption, value: i64 = 0 },

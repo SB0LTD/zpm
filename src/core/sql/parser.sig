@@ -1124,9 +1124,20 @@ pub fn Parser(comptime config: types.Config) type {
         /// After `ALTER [COLUMN] c [SET DATA] TYPE`: the type, an optional
         /// COLLATE and an optional USING expression (ddl-alter, wave 5).
         fn alterColumnType(self: *Self, column: ast.Ident) Error!Ast.AlterAction {
-            // Domains, enums and composite types are not column types here.
+            // A user type: binding resolves a composite type (domain and
+            // enum columns stay 0A000), as CREATE TABLE's columnDef does.
             if (!typeWord(self.current) and !(try self.catalogTypeAhead()) and
-                (self.current.kind == .quoted_word or (self.current.kind == .word and !lexer.reserved(self.current.keyword)))) return error.UnsupportedStatement;
+                (self.current.kind == .quoted_word or (self.current.kind == .word and !lexer.reserved(self.current.keyword)))) {
+                const named = try self.qualifiedName();
+                if (self.isSymbol(.lbracket) or self.isSymbol(.lparen) or self.rawWord("array")) return error.UnsupportedStatement;
+                var action: Ast.AlterAction = .{ .alter_type = .{ .column = column, .type_name = .record, .user_type = named.name, .user_type_schema = named.schema orelse .{} } };
+                if (try self.takeRaw("using")) {
+                    const start = self.tokenStart();
+                    _ = try self.expression();
+                    action.alter_type.using = try self.storedSpan(start);
+                }
+                return action;
+            }
             const spec = try self.typeName();
             if (spec.typmod < -1) return error.UnsupportedStatement;
             if (spec.ty == .void) return error.InvalidTableDefinition;

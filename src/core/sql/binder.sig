@@ -11999,11 +11999,12 @@ pub fn Binder(comptime config: types.Config) type {
                 const seen = try textColumns(context, other.expression.slice(), out.columns[0..out.count]);
                 if (seen[position]) return error.UnsupportedStatement;
             }
-            var definition: Ast.ColumnDef = .{ .type_name = change.type_name, .typmod = change.typmod };
-            if (change.type_name == .int4) definition.type_name = .int4;
+            var definition: Ast.ColumnDef = .{ .type_name = change.type_name, .typmod = change.typmod, .user_type = change.user_type, .user_type_schema = change.user_type_schema };
             var target = column.*;
             target.data_type = columnType(context, &definition);
             target.typmod = change.typmod;
+            // A composite type: its OID is the column typmod (composite lane).
+            if (target.data_type == .record) target.typmod = try compositeColumnTypmod(context, &definition);
             // COLLATE, else the new type's default collation.
             target.collation = if (change.collation != collation.none and change.collation != collation.database_default) collation.oidOf(change.collation) else 0;
             if (target.data_type == .mysql_bigint_unsigned) return error.UnsupportedStatement;

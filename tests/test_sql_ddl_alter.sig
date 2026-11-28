@@ -310,6 +310,33 @@ fn alterColumnType() !void {
     try expect("SELECT a, c FROM w", "1|3c");
     try sameState(&.{ "SELECT a, b, c, pg_typeof(c) FROM w", "SELECT * FROM wv" });
 
+    // Composite columns (checked against native 18.7): to text by I/O
+    // conversion, back with USING, to int only with USING (42804 without).
+    try run("CREATE TYPE pt AS (x INT, y INT)");
+    try run("CREATE TABLE cp(id INT, p pt)");
+    try run("INSERT INTO cp VALUES (1, ROW(1, 2))");
+    try run("ALTER TABLE cp ALTER COLUMN p TYPE TEXT");
+    try expect("SELECT p FROM cp", "(1,2)");
+    try run("ALTER TABLE cp ALTER COLUMN p TYPE pt USING p::pt");
+    try expect("SELECT (p).y FROM cp", "2");
+    try rejects("ALTER TABLE cp ALTER COLUMN p TYPE INT", error.TypeMismatch, "SELECT (p).x FROM cp", "1");
+    try rejects("ALTER TABLE cp ALTER COLUMN id TYPE pt", error.TypeMismatch, "SELECT (p).x FROM cp", "1");
+    try run("ALTER TABLE cp ALTER COLUMN p TYPE INT USING (p).x");
+    try expect("SELECT p FROM cp", "1");
+    // User casts: an assignment cast converts without USING, an explicit
+    // one does not (42804).
+    try run("CREATE FUNCTION d2i(date) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT extract(year from $1)::int'");
+    try run("CREATE CAST (date AS int) WITH FUNCTION d2i(date) AS ASSIGNMENT");
+    try run("CREATE FUNCTION t2b(text) RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT length($1) > 2'");
+    try run("CREATE CAST (text AS boolean) WITH FUNCTION t2b(text)");
+    try run("CREATE TABLE uc(d DATE, s TEXT)");
+    try run("INSERT INTO uc VALUES ('2024-01-01', 'abc')");
+    try run("ALTER TABLE uc ALTER COLUMN d TYPE INT");
+    try rejects("ALTER TABLE uc ALTER COLUMN s TYPE BOOLEAN", error.TypeMismatch, "SELECT d, s FROM uc", "2024|abc");
+    try run("ALTER TABLE uc ALTER COLUMN s TYPE BOOLEAN USING s::boolean");
+    try expect("SELECT d, s FROM uc", "2024|t");
+    try sameState(&.{ "SELECT p FROM cp", "SELECT d, s FROM uc" });
+
     // xml in and out (X410).
     try run("CREATE TABLE x(v TEXT)");
     try run("INSERT INTO x VALUES ('<a/>')");
