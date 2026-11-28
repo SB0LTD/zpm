@@ -1581,7 +1581,7 @@ pub fn Store(comptime Raw: type) type {
                         const failed = self.failed;
                         const modes = self.db().chainCharacteristics(self.tx.?, failed);
                         const committing = command == .commit_chain;
-                        if (committing) try self.commitTransaction() else try self.rollbackTransaction();
+                        if (committing) try self.commitTransactionWith(result) else try self.rollbackTransaction();
                         try self.beginTransaction();
                         if (modes) |chained| try self.db().beginModes(self.tx.?, chained);
                         result.clear(0);
