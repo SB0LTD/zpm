@@ -205,6 +205,17 @@ pub fn Image(comptime config: types.Config, comptime Database: type) type {
                 for (&@field(db.objects, class.field)) |*item|
                     if (item.live and item.stamp.visible(snap)) { image.routines[index] += 1; };
             }
+            // RSBASE10 has no layout for user casts (B11 wave 5).
+            for (&db.objects.casts) |*item| {
+                if (item.live and item.stamp.visible(snap)) return error.SnapshotUnsupportedState;
+            }
+            // Nor for routines naming composite types.
+            for (&db.objects.routines) |*item| {
+                if (!item.live or !item.stamp.visible(snap)) continue;
+                if (RC.userTypeOid(item.return_oid)) return error.SnapshotUnsupportedState;
+                for (item.arg_oids[0..item.arg_count]) |oid| if (RC.userTypeOid(oid)) return error.SnapshotUnsupportedState;
+                for (item.out_oids[0..item.out_count]) |oid| if (RC.userTypeOid(oid)) return error.SnapshotUnsupportedState;
+            }
             // RSBASE10 has no layout for parameter modes, defaults, set
             // results, SECURITY DEFINER or SET clauses (B11 wave 4).
             for (&db.objects.routines) |*item| {

@@ -1,5 +1,5 @@
 //! Composite values, user casts and set-returning select lists
-//! (conformance lane B11, wave 5, composite lane; docs/SQL_COMPOSITE.md):
+//! (conformance lane B11, wave 5, composite lane; docs/SQL_ROUTINES.md):
 //! ROW values and composite types (record_in / record_out, field
 //! selection, (x).*, comparisons, NULL tests), composite table columns,
 //! composite routine parameters and results, OUT-parameter records,
