@@ -592,6 +592,29 @@ fn commitChecks() !void {
         .{ "SELECT nextval('s')", "T:nextval;4 C:SELECT 1" },
     });
     try sameOnReplica("SELECT pid FROM child ORDER BY pid");
+    // Deferred constraint triggers (T212): each COMMIT inside the CALL
+    // fires the pending events first, in the transaction it ends; ROLLBACK
+    // drops them; a raise fails the CALL and that transaction only.
+    try steps(0, &.{
+        .{ "CREATE TABLE dt(a INT)", "C:CREATE TABLE" },
+        .{ "CREATE TABLE dlog(what TEXT, n INT)", "C:CREATE TABLE" },
+    });
+    probe = "SELECT what, n FROM dlog ORDER BY what, n";
+    try steps(0, &.{
+        .{ "CREATE FUNCTION dct() RETURNS TRIGGER LANGUAGE plpgsql AS $$BEGIN INSERT INTO dlog SELECT TG_NAME || ':' || NEW.a, count(*) FROM dt; RETURN NULL; END$$", "C:CREATE FUNCTION" },
+        .{ "CREATE CONSTRAINT TRIGGER dcdef AFTER INSERT ON dt DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION dct()", "C:CREATE TRIGGER" },
+        .{ "CREATE PROCEDURE pdt() LANGUAGE plpgsql AS $$ BEGIN INSERT INTO dt VALUES (1); INSERT INTO dt VALUES (2); INSERT INTO dlog VALUES ('before', (SELECT count(*) FROM dlog)); COMMIT; " ++
+            "INSERT INTO dlog VALUES ('after', (SELECT count(*) FROM dlog)); INSERT INTO dt VALUES (3); ROLLBACK; INSERT INTO dt VALUES (4); END $$", "C:CREATE PROCEDURE" },
+        .{ "CALL pdt()", "C:CALL" },
+        .{ "SELECT what, n FROM dlog ORDER BY what, n", "T:what,n;before|0;dcdef:1|2;dcdef:2|2;dcdef:4|3 C:SELECT 4" },
+        .{ "CREATE FUNCTION dfail() RETURNS TRIGGER LANGUAGE plpgsql AS $$BEGIN IF NEW.a < 0 THEN RAISE EXCEPTION 'negative %', NEW.a; END IF; RETURN NULL; END$$", "C:CREATE FUNCTION" },
+        .{ "CREATE CONSTRAINT TRIGGER dchk AFTER INSERT ON dt DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION dfail()", "C:CREATE TRIGGER" },
+        .{ "CREATE PROCEDURE pdf() LANGUAGE plpgsql AS $$ BEGIN INSERT INTO dt VALUES (10); COMMIT; INSERT INTO dt VALUES (-1); COMMIT; INSERT INTO dt VALUES (11); END $$", "C:CREATE PROCEDURE" },
+        .{ "CALL pdf()", "E:P0001" },
+        .{ "SELECT a FROM dt ORDER BY a", "T:a;1;2;4;10 C:SELECT 4" },
+        .{ "SELECT what, n FROM dlog WHERE what LIKE '%10' OR what LIKE '%-1'", "T:what,n;dcdef:10|4 C:SELECT 1" },
+    });
+    try sameOnReplica("SELECT a FROM dt ORDER BY a");
 }
 
 /// A wall clock that moves 1 ms per reading.
