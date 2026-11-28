@@ -562,3 +562,27 @@ RESET ROLE;
 DROP VIEW v;
 DROP TABLE t;
 DROP ROLE w5p_r;
+
+-- program xml_mapping_visibility
+CREATE ROLE w5p_r;
+CREATE TABLE t1(a INT);
+CREATE TABLE t2(b INT);
+INSERT INTO t1 VALUES (1);
+INSERT INTO t2 VALUES (2);
+CREATE SCHEMA hidden;
+CREATE TABLE hidden.h(x INT);
+GRANT SELECT ON t1 TO w5p_r;
+GRANT SELECT ON hidden.h TO w5p_r;
+SET ROLE w5p_r;
+SELECT schema_to_xml('public', true, false, '');
+SELECT database_to_xml(true, false, '');
+RESET ROLE;
+GRANT USAGE ON SCHEMA hidden TO w5p_r;
+SET ROLE w5p_r;
+SELECT database_to_xml(true, false, '');
+RESET ROLE;
+DROP TABLE hidden.h;
+DROP SCHEMA hidden;
+DROP TABLE t1;
+DROP TABLE t2;
+DROP ROLE w5p_r;

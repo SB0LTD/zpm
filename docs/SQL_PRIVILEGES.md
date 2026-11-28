@@ -96,6 +96,10 @@ schema), pg_write_all_data (INSERT, UPDATE, DELETE, USAGE), pg_maintain
 bootstrap role). SET SESSION AUTHORIZATION resets SET ROLE; an unknown
 role is 22023.
 
+schema_to_xml, database_to_xml and their XML Schema forms list only the
+relations the user may SELECT, in schemas it may use (PostgreSQL's
+schema_get_xml_visible_tables / XML_VISIBLE_SCHEMAS).
+
 Inquiry functions: has_table_privilege, has_column_privilege,
 has_any_column_privilege, has_schema_privilege, has_sequence_privilege,
 has_type_privilege and pg_has_role with an optional user and names or
