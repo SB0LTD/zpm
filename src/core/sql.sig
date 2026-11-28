@@ -14283,6 +14283,21 @@ pub fn Database(comptime config: Config) type {
         /// CREATE [OR REPLACE] FUNCTION / PROCEDURE: validates the signature
         /// and optionally analyzes the quoted body before writing its version.
         fn createRoutine(self: *Self, slot: u16, source: []const u8, definition: *const R.CreateRoutine, snap: Snapshot) Error!void {
+            if (definition.has_setof_table) return self.createSetofRoutine(slot, source, definition, snap);
+            return self.createRoutineFrom(slot, source, definition, snap);
+        }
+
+        /// RETURNS SETOF table: its columns are the TABLE columns, as of
+        /// CREATE (B11 wave 5; PostgreSQL keeps the row type, whose pg_type
+        /// this catalog does not have, so prorettype is record).
+        noinline fn createSetofRoutine(self: *Self, slot: u16, source: []const u8, given: *const R.CreateRoutine, snap: Snapshot) Error!void {
+            var widened = given.*;
+            try self.setofTableColumns(&widened, snap);
+            widened.has_setof_table = false;
+            return self.createRoutineFrom(slot, source, &widened, snap);
+        }
+
+        fn createRoutineFrom(self: *Self, slot: u16, source: []const u8, definition: *const R.CreateRoutine, snap: Snapshot) Error!void {
             const namespace = try self.routineCreateNamespace(definition.has_schema, definition.schema, snap);
             var built: RC.Routine = .{};
             try routineFromDefinition(source, definition, &built);
@@ -14335,8 +14350,30 @@ pub fn Database(comptime config: Config) type {
         /// inputs (the signature), modes, result columns, DEFAULT texts
         /// (from the statement source), RETURNS SETOF / TABLE, SECURITY
         /// DEFINER and SET clauses.
+        /// The table (or view) RETURNS SETOF names: its columns become
+        /// TABLE columns (42704 when no relation has that name; a routine
+        /// with OUT parameters is 42P13).
+        fn setofTableColumns(self: *Self, definition: *R.CreateRoutine, snap: Snapshot) Error!void {
+            const table_index = self.namedTable(&definition.setof_table, snap) catch |err| return if (err == error.TableNotFound) error.UndefinedObject else err;
+            const table = &self.tables[table_index];
+            for (definition.args[0..definition.arg_count]) |arg| if (R.outputMode(arg.mode)) return error.InvalidFunctionDefinition;
+            if (definition.arg_count + table.column_count > config.routine_args) return error.ColumnCapacity;
+            for (table.columns[0..table.column_count]) |*column| {
+                definition.args[definition.arg_count] = .{ .mode = 't', .name = column.name, .oid = types.typeOid(column.data_type), .typmod = column.typmod };
+                definition.arg_count += 1;
+            }
+            definition.rowtype = true;
+            if (table.column_count == 1) {
+                definition.return_oid = types.typeOid(table.columns[0].data_type);
+                definition.return_typmod = table.columns[0].typmod;
+            } else {
+                definition.return_oid = tg.record_oid;
+                definition.return_typmod = -1;
+            }
+        }
+
         fn routineFromDefinition(source: []const u8, definition: *const R.CreateRoutine, item: *RC.Routine) Error!void {
-            item.* = .{ .name = definition.name, .kind = if (definition.procedure) 'p' else 'f', .language = definition.language, .volatility = definition.volatility, .strict = definition.strict, .return_oid = definition.return_oid, .return_typmod = definition.return_typmod, .body = definition.body, .retset = definition.retset, .security_definer = definition.security_definer };
+            item.* = .{ .name = definition.name, .kind = if (definition.procedure) 'p' else 'f', .language = definition.language, .volatility = definition.volatility, .strict = definition.strict, .return_oid = definition.return_oid, .return_typmod = definition.return_typmod, .body = definition.body, .retset = definition.retset, .security_definer = definition.security_definer, .rowtype = definition.rowtype };
             var plain = true;
             for (definition.args[0..definition.arg_count], 0..) |arg, position| {
                 item.param_modes[position] = arg.mode;
@@ -14586,7 +14623,8 @@ pub fn Database(comptime config: Config) type {
             for (routine.arg_names[0..routine.arg_count], routine.arg_oids[0..routine.arg_count], routine.arg_typmods[0..routine.arg_count]) |*name, oid, typmod| _ = try frame.declare(name.slice(), typeOfOid(oid), typmod);
             for (0..routine.out_count) |output| {
                 if (routine.out_inputs[output] != 0xff) continue;
-                _ = try frame.declare(routine.out_names[output].slice(), typeOfOid(routine.out_oids[output]), routine.out_typmods[output]);
+                // A row type's columns are no variables (no name binds them).
+                _ = try frame.declare(if (routine.rowtype) "" else routine.out_names[output].slice(), typeOfOid(routine.out_oids[output]), routine.out_typmods[output]);
             }
             frame.variables.parameters = frame.variables.count;
             frame.variables.routine_name = routine.name;

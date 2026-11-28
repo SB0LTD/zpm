@@ -1323,7 +1323,7 @@ pub fn Binder(comptime config: types.Config) type {
             const n = context.node(id);
             switch (n.kind) {
                 .function => {
-                    if (ast.setFunction(n.func)) return id;
+                    if (ast.setFunction(n.func) or (n.func == .routine and n.boolean)) return id;
                     if (n.window != none) return none;
                     var item = n.b;
                     while (item != none) : (item = context.node(item).next) {
@@ -2458,9 +2458,21 @@ pub fn Binder(comptime config: types.Config) type {
                 var item = n.b;
                 while (item != none) : (item = context.node(item).next) count += 1;
                 n.func = .none;
-                return bindRoutineCall(context, n, count);
+                try bindRoutineCall(context, n, count);
+                return setReturningCall(context, scope, n);
             };
             try catalogPlacement(context, n);
+            try setReturningCall(context, scope, n);
+        }
+
+        /// A user set-returning call outside FROM: only one select-list
+        /// target may hold it (ProjectSet, B11 wave 5); elsewhere 0A000.
+        fn setReturningCall(context: *const Context, scope: *const Scope, n: *ast.Node) Error!void {
+            if (n.kind != .function or n.func != .routine or !n.boolean) return;
+            const node_id: u16 = @intCast((@intFromPtr(n) - @intFromPtr(&context.pool.nodes[0])) / @sizeOf(ast.Node));
+            if (context.table_function == node_id) return;
+            const seen = scope.set_calls orelse return error.UnsupportedStatement;
+            seen.* +|= 1;
         }
 
         /// A visible user routine of the call's name on the search path.
@@ -6571,9 +6583,11 @@ pub fn Binder(comptime config: types.Config) type {
             if (routine.return_oid == routine_catalog.trigger_oid) return error.UnsupportedStatement;
             const node_id: u16 = @intCast((@intFromPtr(n) - @intFromPtr(&context.pool.nodes[0])) / @sizeOf(ast.Node));
             const from = context.table_function == node_id;
-            // A record (several OUT parameters) or a set has no scalar
-            // value here; FROM binds them as table functions (0A000).
-            if (!from and (routine.retset or routine.return_oid == routine_catalog.record_oid)) return error.UnsupportedStatement;
+            // A record (several OUT parameters) has no scalar value here;
+            // FROM binds it as a table function (0A000). A set of one
+            // column is a select-list set-returning call (B11 wave 5,
+            // ProjectSet; typeFunction admits it there only).
+            if (!from and (routine.return_oid == routine_catalog.record_oid or (routine.retset and routine.out_count > 1))) return error.UnsupportedStatement;
             const result: types.DataType = if (routine.return_oid == routine_catalog.record_oid) .text else types.typeFromOid(routine.return_oid) orelse return error.UnsupportedStatement;
             // A void routine's value is the void type (B11 wave 5): NULL from
             // a SQL body, an empty value from PL/pgSQL, as in PostgreSQL.
@@ -6611,6 +6625,8 @@ pub fn Binder(comptime config: types.Config) type {
             n.constant = false;
             n.boolean = routine.retset;
             n.c = none;
+            // A select-list set-returning call runs through the routine hook.
+            if (!from and routine.retset) return;
             for (context.inline_calls) |entry| {
                 if (entry.node == node_id and entry.routine == chosen) {
                     n.c = try bindInlineBody(context, routine, entry, from);

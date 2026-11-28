@@ -44,7 +44,8 @@
 //!       RETURNS SETOF / TABLE, SECURITY DEFINER or SET clauses:
 //!       extension length u16, extension, then the op-60 payload. The
 //!       extension: version u8 (1), flags u8 (1 retset, 2 security
-//!       definer), parameter count u8 and every parameter's mode u8 in
+//!       definer, 4 SETOF a table's row type: its TABLE columns are no
+//!       routine variables, B11 wave 5), parameter count u8 and every parameter's mode u8 in
 //!       declaration order ('i', 'o', 'b', 'v', 't'), then per 'o' / 't'
 //!       parameter: name (len u8, may be 0), type OID u32, typmod i32;
 //!       default count u8, defaults text (NUL-terminated expressions of the
@@ -328,6 +329,9 @@ pub fn Catalog(comptime config: types.Config) type {
             defaults_len: usize = 0,
             /// RETURNS SETOF / TABLE (proretset).
             retset: bool = false,
+            /// RETURNS SETOF a table's row type (B11 wave 5): the TABLE
+            /// columns are its columns, not PL/pgSQL variables.
+            rowtype: bool = false,
             security_definer: bool = false,
             /// SET clauses (proconfig): NUL-terminated `name=value` entries.
             setting_count: usize = 0,
@@ -818,7 +822,7 @@ pub fn Catalog(comptime config: types.Config) type {
             try out.int(u16, 0);
             const start = out.used;
             try out.int(u8, 1);
-            try out.int(u8, @as(u8, @intFromBool(item.retset)) | (@as(u8, @intFromBool(item.security_definer)) << 1));
+            try out.int(u8, @as(u8, @intFromBool(item.retset)) | (@as(u8, @intFromBool(item.security_definer)) << 1) | (@as(u8, @intFromBool(item.rowtype)) << 2));
             try out.int(u8, @intCast(item.param_count));
             try out.bytes(item.param_modes[0..item.param_count]);
             for (0..item.out_count) |index| {
@@ -992,9 +996,11 @@ pub fn Catalog(comptime config: types.Config) type {
             var ext = Reader{ .bytes = extension };
             if (try ext.int(u8) != 1) return error.InvalidChangeRecord;
             const flags = try ext.int(u8);
-            if (flags & ~@as(u8, 3) != 0) return error.InvalidChangeRecord;
+            if (flags & ~@as(u8, 7) != 0) return error.InvalidChangeRecord;
             out.retset = flags & 1 != 0;
             out.security_definer = flags & 2 != 0;
+            out.rowtype = flags & 4 != 0;
+            if (out.rowtype and !out.retset) return error.InvalidChangeRecord;
             const count = try ext.int(u8);
             if (count > config.routine_args or (count != 0 and count < out.arg_count)) return error.InvalidChangeRecord;
             out.param_count = count;

@@ -749,6 +749,57 @@ fn copyTriggers() !void {
     try idle();
 }
 
+// ---- set-returning calls in the select list, RETURNS SETOF table ------------------
+
+/// One user set-returning call of one column in a select-list target:
+/// the target is evaluated per row it returns (PostgreSQL's ProjectSet),
+/// no row for an empty set; elsewhere 0A000. RETURNS SETOF a table gives
+/// the table's columns (PL/pgSQL sees no variables of them).
+fn setReturning() !void {
+    reset();
+    try run("CREATE FUNCTION srf(n INT) RETURNS SETOF INT LANGUAGE SQL AS $$SELECT g FROM generate_series(1, n) g$$");
+    try run("CREATE FUNCTION psrf(n INT) RETURNS SETOF TEXT LANGUAGE plpgsql AS $$BEGIN FOR i IN 1..n LOOP RETURN NEXT 'r' || i; END LOOP; END$$");
+    try run("CREATE FUNCTION tsrf(n INT) RETURNS TABLE(x INT) LANGUAGE SQL STABLE AS $$SELECT g * 10 FROM generate_series(1, n) g$$");
+    try returns("SELECT srf(3)", "1;2;3");
+    try returns("SELECT srf(2) + 1 AS v, 'k' AS k", "2|k;3|k");
+    try returns("SELECT psrf(2)", "r1;r2");
+    try returns("SELECT tsrf(2)", "10;20");
+    try run("CREATE TABLE t(id INT)");
+    try run("INSERT INTO t VALUES (1), (2), (3)");
+    try returns("SELECT id, srf(id) FROM t ORDER BY id, 2", "1|1;2|1;2|2;3|1;3|2;3|3");
+    try returns("SELECT id, psrf(id - 1) FROM t ORDER BY id, 2", "2|r1;3|r1;3|r2");
+    try returns("SELECT count(*) FROM (SELECT srf(4)) s", "4");
+    try fails("SELECT id FROM t WHERE srf(id) > 1", error.UnsupportedStatement);
+    try returns("SELECT srf(0)", "");
+    try returns("SELECT srf(NULL)", "");
+    try run("CREATE FUNCTION ssrf(n INT) RETURNS SETOF INT STRICT LANGUAGE plpgsql AS $$BEGIN RETURN NEXT n; END$$");
+    try returns("SELECT ssrf(NULL), 1", "");
+    try returns("SELECT srf(2) LIMIT 1", "1");
+    try returns("SELECT DISTINCT srf(2) ORDER BY 1 DESC", "2;1");
+    // Writes made by a set-returning function in the select list.
+    try run("CREATE TABLE log(n INT)");
+    try run("CREATE FUNCTION wsrf(n INT) RETURNS SETOF INT LANGUAGE plpgsql AS $$BEGIN FOR i IN 1..n LOOP INSERT INTO log VALUES (i); RETURN NEXT i * i; END LOOP; END$$");
+    try returns("SELECT wsrf(3)", "1;4;9");
+    try expect("SELECT string_agg(n::text, ',' ORDER BY n) FROM log", "1,2,3");
+    // RETURNS SETOF a table: its columns.
+    try run("CREATE TABLE tt(a INT, b TEXT)");
+    try run("INSERT INTO tt VALUES (1, 'a'), (2, 'b')");
+    try run("CREATE FUNCTION allt() RETURNS SETOF tt LANGUAGE SQL AS $$SELECT * FROM tt ORDER BY a$$");
+    try returns("SELECT * FROM allt()", "1|a;2|b");
+    try returns("SELECT b, a FROM allt() WHERE a > 1", "b|2");
+    try returns("SELECT x.a FROM allt() AS x", "1;2");
+    try run("CREATE FUNCTION pallt() RETURNS SETOF tt LANGUAGE plpgsql AS $$BEGIN RETURN QUERY SELECT * FROM tt WHERE a = 2; END$$");
+    try returns("SELECT * FROM pallt()", "2|b");
+    try run("CREATE TABLE one(v INT)");
+    try run("INSERT INTO one VALUES (5)");
+    try run("CREATE FUNCTION allone() RETURNS SETOF one LANGUAGE SQL AS $$SELECT * FROM one$$");
+    try returns("SELECT * FROM allone()", "5");
+    try fails("CREATE FUNCTION nosuch() RETURNS SETOF nosuch LANGUAGE SQL AS $$SELECT 1$$", error.UndefinedObject);
+    try expect("SELECT proretset, pronargs FROM pg_proc WHERE oid >= 16384 AND proname = 'allt'", "t|0");
+    try sameState(&.{ "SELECT * FROM allt()", "SELECT * FROM pallt()", "SELECT string_agg(n::text, ',' ORDER BY n) FROM log" });
+    try idle();
+}
+
 pub fn main() !void {
     try schemaStatements();
     try dynamicStatements();
@@ -760,5 +811,6 @@ pub fn main() !void {
     try constraintTriggers();
     try referentialTriggers();
     try copyTriggers();
+    try setReturning();
     std.debug.print("routines-trig: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });
 }

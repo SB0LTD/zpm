@@ -1600,6 +1600,12 @@ pub fn Store(comptime Raw: type) type {
                                     result.command = .rollback;
                                     return;
                                 }
+                                // Deferred constraint triggers fire first (B11 wave 5).
+                                if (comptime @hasDecl(Raw, "fireDeferredTriggers")) self.db().fireDeferredTriggers(slot, result) catch |err| {
+                                    self.db().abort(slot);
+                                    self.endTransaction(false);
+                                    return err;
+                                };
                                 self.store.prepareTransaction(slot, prepared.gid orelse {
                                     self.db().abort(slot);
                                     self.endTransaction(false);

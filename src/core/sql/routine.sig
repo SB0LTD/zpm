@@ -91,6 +91,12 @@ pub fn Routines(comptime config: types.Config) type {
             settings: [RC.arg_bytes]u8 = @splat(0),
             settings_len: usize = 0,
             setting_count: usize = 0,
+            /// RETURNS SETOF a table's row type (B11 wave 5): the host adds
+            /// the table's columns as TABLE columns at CREATE.
+            has_setof_table: bool = false,
+            setof_table: TableName = .{},
+            /// The TABLE columns came from that table (not variables).
+            rowtype: bool = false,
 
             /// The input types (the routine's signature).
             pub fn argOids(self: *const CreateRoutine, out: *[config.routine_args]u32) []const u32 {
@@ -564,9 +570,18 @@ pub fn Routines(comptime config: types.Config) type {
                         out.record = true;
                         out.return_oid = routine_catalog.record_oid;
                     } else {
-                        const ret = try typeAt(cursor, pool);
-                        out.return_oid = ret.oid;
-                        out.return_typmod = ret.typmod;
+                        const before = cursor.*;
+                        if (typeAt(cursor, pool)) |ret| {
+                            out.return_oid = ret.oid;
+                            out.return_typmod = ret.typmod;
+                        } else |err| {
+                            // SETOF a relation's row type (resolved at CREATE).
+                            if (!out.retset or (before.current.kind != .word and before.current.kind != .quoted_word)) return err;
+                            cursor.* = before;
+                            out.setof_table = try tableName(cursor);
+                            out.has_setof_table = true;
+                            out.return_oid = routine_catalog.record_oid;
+                        }
                     }
                 } else if (try cursor.take("language")) {
                     if (language) return error.Syntax;
