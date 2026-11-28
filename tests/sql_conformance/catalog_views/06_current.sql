@@ -37,3 +37,6 @@ SELECT version(1);
 CREATE TABLE kp(id INT PRIMARY KEY, u INT UNIQUE, name TEXT NOT NULL, c INT CHECK (c > id AND u IS NOT NULL));
 CREATE TABLE kf(x INT CONSTRAINT kf_fk REFERENCES kp ON DELETE CASCADE, y INT, CONSTRAINT kf_u UNIQUE (y, x), CONSTRAINT kf_fk2 FOREIGN KEY (y) REFERENCES kp (u));
 SELECT conname, contype, conkey, confkey FROM pg_constraint WHERE conrelid IN ('kp'::regclass, 'kf'::regclass) AND contype <> 'n' ORDER BY conname;
+SELECT pg_catalog.pg_class.relname, pg_catalog.pg_class.relkind FROM pg_catalog.pg_class JOIN pg_catalog.pg_namespace ON pg_catalog.pg_namespace.oid = pg_catalog.pg_class.relnamespace WHERE pg_catalog.pg_class.relname IN ('kp', 'kf') AND pg_catalog.pg_table_is_visible(pg_catalog.pg_class.oid) AND pg_catalog.pg_namespace.nspname != 'pg_catalog' ORDER BY 1;
+SELECT information_schema.tables.table_name, information_schema.tables.table_type FROM information_schema.tables WHERE information_schema.tables.table_name = 'kp';
+SELECT k.conname, array_agg(CAST(a.attname AS TEXT) ORDER BY a.attnum) FROM pg_catalog.pg_constraint k JOIN pg_catalog.pg_attribute a ON a.attrelid = k.conrelid AND a.attnum = ANY (k.conkey) WHERE k.conrelid = 'kf'::regclass AND k.contype IN ('u', 'f') GROUP BY k.conname ORDER BY 1;

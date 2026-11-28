@@ -395,7 +395,7 @@ pub fn Rows(comptime config: types.Config) type {
                 /// the longer part is cut until the name fits 63 bytes.
                 fn notNullName(table: []const u8, column: []const u8, out: *[max_identifier + 1]u8) []const u8 {
                     const label = "not_null";
-                    const room = @min(max_identifier, config.name_bytes) - label.len - 2;
+                    const room = @min(max_identifier, config.name_bytes) -| (label.len + 2);
                     var first = table.len;
                     var second = column.len;
                     while (first + second > room) {
@@ -1039,7 +1039,7 @@ pub fn Rows(comptime config: types.Config) type {
 
                 /// `<domain>_<label>`, the domain part cut to fit.
                 fn domainConstraintName(domain: []const u8, label: []const u8, out: *[max_identifier + 1]u8) []const u8 {
-                    const keep = clipUtf8(domain, @min(domain.len, @min(max_identifier, config.name_bytes) - label.len - 1));
+                    const keep = clipUtf8(domain, @min(domain.len, @min(max_identifier, config.name_bytes) -| (label.len + 1)));
                     @memcpy(out[0..keep], domain[0..keep]);
                     out[keep] = '_';
                     @memcpy(out[keep + 1 ..][0..label.len], label);
