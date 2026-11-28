@@ -316,10 +316,13 @@ pub fn Eval(comptime config: types.Config) type {
             /// Routine frame (B11 wave 3) read by routine_param nodes; the
             /// innermost context with one wins, else Session.routine_frame.
             frame: ?*const Frame = null,
-            /// The current value of the select list's set-returning call
-            /// (wave 4 text-json; Exec.projectSet).
-            set_value: ?*const V.Cell = null,
+            /// The current value of each set-returning call of the select
+            /// list (ProjectSet; B11 wave 5 composite lane): Exec.projectSets.
+            set_values: []const SetValue = &.{},
         };
+
+        /// A set-returning call node and its value for the current row.
+        pub const SetValue = struct { node: u16, value: *const V.Cell };
 
         /// Values of a running routine: parameters / PL/pgSQL variables and
         /// the NEW and OLD rows of a trigger (null: a NULL record).
@@ -647,6 +650,14 @@ pub fn Eval(comptime config: types.Config) type {
                 },
                 .to_regtype, .regtype_in => {
                     if (types.typeByName(first.text.slice())) |data_type| return .{ .integer = types.typeOid(data_type) };
+                    // A user type (composite lane).
+                    if (ctx.session.sequences) |hook| if (hook.type_oid) |lookup| {
+                        const found = lookup(hook.ptr, first.text.slice()) catch |err| {
+                            if (n.func == .to_regtype) return .null_value;
+                            return err;
+                        };
+                        if (found) |oid| return .{ .integer = oid };
+                    };
                     if (n.func == .to_regtype) return .null_value;
                     return error.UndefinedObject;
                 },
@@ -1095,6 +1106,9 @@ pub fn Eval(comptime config: types.Config) type {
                             return true;
                         }
                         const value = try eval(ctx, n.a);
+                        // A composite value is NULL when every field is
+                        // and NOT NULL when none is (ExecEvalRowNull).
+                        if (value == .record) return V.Records.nullTest(value.record.slice(), n.test_kind == .is_null);
                         return (value == .null_value) == (n.test_kind == .is_null);
                     }
                     const value = try truth(ctx, n.a);
@@ -1735,10 +1749,11 @@ pub fn Eval(comptime config: types.Config) type {
                 // SQL/XML XPath, IS DOCUMENT and table mapping (B11 wave 5).
                 .xml_call => return xml_eval.XmlEval(config, @This()).call(ctx, n),
                 .xmltable, .xmltable_namespace, .xmltable_column => return error.UnsupportedStatement,
-                .jsonb_set, .jsonb_set_lax, .jsonb_insert, .jsonb_delete_path, .jsonb_strip_nulls, .jsonb_pretty, .to_json, .to_jsonb, .jsonb_path_exists, .jsonb_path_match, .jsonb_path_query_array, .jsonb_path_query_first, .jsonb_exists_any, .jsonb_exists_all, .jsonb_minus_op, .jsonb_delete_path_op, .jsonb_exists_any_op, .jsonb_exists_all_op, .jsonb_path_exists_op, .jsonb_path_match_op => return json_eval.JsonEval(config, @This()).call(ctx, n),
+                .jsonb_set, .jsonb_set_lax, .jsonb_insert, .jsonb_delete_path, .jsonb_strip_nulls, .jsonb_pretty, .to_json, .to_jsonb, .row_to_json, .jsonb_path_exists, .jsonb_path_match, .jsonb_path_query_array, .jsonb_path_query_first, .jsonb_exists_any, .jsonb_exists_all, .jsonb_minus_op, .jsonb_delete_path_op, .jsonb_exists_any_op, .jsonb_exists_all_op, .jsonb_path_exists_op, .jsonb_path_match_op => return json_eval.JsonEval(config, @This()).call(ctx, n),
                 .regexp_match, .regexp_replace, .regexp_split_to_array, .regexp_count, .regexp_instr, .regexp_substr, .substring_regex, .substring_similar => return regex_eval.RegexEval(config, @This()).call(ctx, n),
                 // A set-returning call reads the value exec is expanding.
-                .regexp_matches, .regexp_split_to_table, .jsonb_path_query => return if (ctx.set_value) |current| current.* else error.UnsupportedStatement,
+                // Set-returning calls are expanded by Exec.projectSets.
+                .regexp_matches, .regexp_split_to_table, .jsonb_path_query, .srf_series, .srf_unnest, .srf_subscripts, .srf_expandarray => return error.UnsupportedStatement,
                 .json_query_function => return json_eval.JsonEval(config, @This()).queryFunction(ctx, n),
                 .json_constructor => return json_eval.JsonEval(config, @This()).constructor(ctx, n),
                 .tsvector_length, .ts_strip, .ts_setweight, .tsvector_to_array, .array_to_tsvector, .ts_delete, .ts_filter, .ts_numnode => return textSearchUtility(ctx, n),
@@ -1879,18 +1894,42 @@ pub fn Eval(comptime config: types.Config) type {
         }
 
         fn evalCallable(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
+            // A set-returning call of the select list reads the current row.
+            for (ctx.set_values) |slot| {
+                if (&ctx.pool.nodes[slot.node] == n) return slot.value.*;
+            }
             switch (n.func) {
                     // Routine frames already own their parameters/records.
                     // Keep these reads and calls out of the scalar dispatcher's
                     // unrelated wide-cell temporaries on a bounded stack.
                     // A select-list set-returning call reads the row's value.
-                    .routine => return if (n.boolean and ctx.set_value != null) ctx.set_value.?.* else routineCall(ctx, n),
+                    .routine => return if (n.boolean) error.UnsupportedStatement else routineCall(ctx, n),
                     .routine_param => return routineValue(ctx, n),
                     .lo_import, .lo_export => return evalLargeObjectFile(ctx, n),
                     .lo_truncate, .lo_truncate64, .lo_from_bytea, .lo_get, .lo_create, .lo_creat, .lo_unlink => return evalLargeObject(ctx, n),
                     else => return evalFunction(ctx, n),
 
             }
+        }
+
+        /// A bound row constructor's record (B11 wave 5, composite lane):
+        /// a composite type's fields carry their declared typmods (the
+        /// binder's field casts); an untyped field is text.
+        fn evalRecord(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
+            if (n.ty != .record) return error.UnsupportedStatement;
+            var out: V.Text = .{};
+            var builder = try V.Records.Builder.begin(&out, types.recordTypeOid(n.typmod));
+            var item = n.b;
+            while (item != none) : (item = node(ctx, item).next) {
+                const field = node(ctx, item);
+                const cell = try eval(ctx, item);
+                const typmod: i32 = switch (field.kind) {
+                    .cast, .column => field.typmod,
+                    else => -1,
+                };
+                try builder.append(types.dataTypeOf(field.ty), typmod, &cell);
+            }
+            return .{ .record = out };
         }
 
         fn evalCompound(ctx: *const Context, n: *const ast.Node, id: u16) Error!V.Cell {
@@ -1918,7 +1957,14 @@ pub fn Eval(comptime config: types.Config) type {
                 },
                 .aggregate => unreachable,
                 .values_row, .default_value => return error.Syntax,
-                .row_constructor => return error.UnsupportedStatement,
+                .row_constructor => return evalRecord(ctx, n),
+                .field_select => {
+                    const base = try eval(ctx, n.a);
+                    if (base == .null_value) return .null_value;
+                    if (base != .record) return error.TypeMismatch;
+                    const field = V.Records.field(base.record.slice(), @intCast(n.integer)) orelse return error.ColumnNotFound;
+                    return field.cell;
+                },
                 .row_compare, .row_in => return boolCell(try truth(ctx, id)),
                 // Unwrapped by binding (only user routine calls accept one).
                 .named_argument => return error.UnsupportedStatement,

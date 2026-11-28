@@ -69,8 +69,12 @@ pub const record_oid: u32 = 2249;
 /// The extended creation op (B11 wave 4, routines-sig lane: ops 80-84).
 pub const create_routine_extended: u8 = 80;
 /// Transition tables and constraint triggers (B11 wave 5, routines-trig
-/// lane: ops 120-124).
+/// lane: op 120).
 pub const create_trigger_extended: u8 = 120;
+/// User casts (B11 wave 5, composite lane): op 121 creates one (payload in
+/// encodeCast), op 122 drops one (its OID u32); 123-124 stay reserved.
+pub const create_cast_op: u8 = 121;
+pub const drop_cast_op: u8 = 122;
 pub const trigger_old_table: u8 = 1;
 pub const trigger_new_table: u8 = 2;
 pub const trigger_constraint: u8 = 4;
@@ -87,7 +91,9 @@ pub const tg_truncate: u8 = 32;
 pub const tg_instead: u8 = 64;
 
 /// Object class of a write-set entry (Mvcc.Write.new) and of an overlay slot.
-pub const Class = enum(u8) { routine = 0, trigger = 1, rule = 2 };
+pub const Class = enum(u8) { routine = 0, trigger = 1, rule = 2,
+    /// User casts (B11 wave 5, composite lane).
+    cast = 3 };
 
 pub const Op = enum(u8) { create_routine = 60, drop_routine = 61, create_trigger = 62, drop_trigger = 63, create_rule = 64, drop_rule = 65, create_rule_action = 85, create_trigger_extended = 120 };
 
@@ -454,11 +460,55 @@ pub fn Catalog(comptime config: types.Config) type {
             multiple: bool = false,
         };
 
+        /// A user cast (pg_cast; B11 wave 5, composite lane): `function`
+        /// is the cast function's OID for method 'f' (0 otherwise).
+        pub const Cast = struct {
+            live: bool = false,
+            stamp: Stamp = .{},
+            oid: u32 = 0,
+            source: u32 = 0,
+            target: u32 = 0,
+            function: u32 = 0,
+            /// pg_cast.castcontext: 'e' explicit, 'a' assignment, 'i' implicit.
+            context: u8 = 'e',
+            /// pg_cast.castmethod: 'f' function, 'i' I/O (WITH INOUT),
+            /// 'b' binary (WITHOUT FUNCTION).
+            method: u8 = 'f',
+
+            /// Whether the cast applies in a coercion `context`.
+            pub fn applies(self: *const Cast, wanted: u8) bool {
+                return switch (wanted) {
+                    'e' => true,
+                    'a' => self.context == 'a' or self.context == 'i',
+                    else => self.context == 'i',
+                };
+            }
+        };
+
         /// Every object slot of a database.
         pub const Set = struct {
             routines: [config.routines]Routine = @splat(.{}),
             triggers: [config.triggers]Trigger = @splat(.{}),
             rules: [config.rules]Rule = @splat(.{}),
+            casts: [config.casts]Cast = @splat(.{}),
+
+            /// The visible cast from type `source` to type `target`.
+            pub fn findCast(self: *const Set, source: u32, target: u32, snap: storage.Snapshot) ?usize {
+                for (&self.casts, 0..) |*item, index| {
+                    if (item.live and item.stamp.visible(snap) and item.source == source and item.target == target) return index;
+                }
+                return null;
+            }
+
+            /// Another transaction's uncommitted version of that cast.
+            pub fn castWriter(self: *const Set, source: u32, target: u32, snap: storage.Snapshot) ?u16 {
+                for (&self.casts) |*item| {
+                    if (!item.live or item.source != source or item.target != target) continue;
+                    if (item.stamp.creatorOther(snap)) |other| return other;
+                    if (item.stamp.deleterOther(snap)) |other| return other;
+                }
+                return null;
+            }
 
             pub fn visibleRoutine(self: *const Set, index: usize, snap: storage.Snapshot) bool {
                 const item = &self.routines[index];
@@ -559,6 +609,7 @@ pub fn Catalog(comptime config: types.Config) type {
                     .routine => &self.routines[index].stamp,
                     .trigger => &self.triggers[index].stamp,
                     .rule => &self.rules[index].stamp,
+                    .cast => &self.casts[index].stamp,
                 };
             }
 
@@ -567,6 +618,7 @@ pub fn Catalog(comptime config: types.Config) type {
                     .routine => &self.routines[index].live,
                     .trigger => &self.triggers[index].live,
                     .rule => &self.rules[index].live,
+                    .cast => &self.casts[index].live,
                 };
             }
 
@@ -575,13 +627,14 @@ pub fn Catalog(comptime config: types.Config) type {
                     .routine => self.routines[index].oid,
                     .trigger => self.triggers[index].oid,
                     .rule => self.rules[index].oid,
+                    .cast => self.casts[index].oid,
                 };
             }
 
             /// Frees every slot whose deletion passed the horizon.
             pub fn reclaim(self: *Set, horizon: u64) bool {
                 var freed = false;
-                inline for (.{ "routines", "triggers", "rules" }) |field| {
+                inline for (.{ "routines", "triggers", "rules", "casts" }) |field| {
                     for (&@field(self, field)) |*item| {
                         if (item.live and item.stamp.xmax.epoch != 0 and item.stamp.xmax_csn != 0 and item.stamp.xmax_csn <= horizon) {
                             item.live = false;
@@ -595,7 +648,7 @@ pub fn Catalog(comptime config: types.Config) type {
             /// Uncommitted object versions or marks (leak accounting).
             pub fn pending(self: *const Set) usize {
                 var count: usize = 0;
-                inline for (.{ "routines", "triggers", "rules" }) |field| {
+                inline for (.{ "routines", "triggers", "rules", "casts" }) |field| {
                     for (&@field(self, field)) |*item| {
                         if (!item.live) continue;
                         if (item.stamp.xmin_csn == 0) count += 1;
@@ -610,7 +663,9 @@ pub fn Catalog(comptime config: types.Config) type {
 
         /// One argument of a call: its name in named notation (else
         /// empty), its type and whether it is an untyped literal or NULL.
-        pub const Supplied = struct { name: Name = .{}, ty: types.Type = .unknown, unknown: bool = false };
+        pub const Supplied = struct { name: Name = .{}, ty: types.Type = .unknown, unknown: bool = false,
+            /// A record's composite type OID (-1 anonymous; composite lane).
+            typmod: i32 = -1 };
 
         pub const default_slot: u8 = 0xff;
         pub const expanded_slot: u8 = 0xfe;
@@ -706,6 +761,18 @@ pub fn Catalog(comptime config: types.Config) type {
             for (params, 0..) |param, position| {
                 const slot = out.slots[position];
                 if (slot == default_slot) continue;
+                // A composite parameter (composite lane): the same type is
+                // exact; an anonymous record or untyped literal may convert.
+                if (userTypeOid(param.oid)) {
+                    if (slot == expanded_slot) return false;
+                    const arg = supplied[slot];
+                    if (arg.unknown or arg.ty == .unknown) continue;
+                    if (arg.ty != .record) return false;
+                    if (arg.typmod == @as(i64, param.oid)) {
+                        out.exact += 2;
+                    } else if (arg.typmod > 0) return false;
+                    continue;
+                }
                 const data = types.typeFromOid(param.oid) orelse return false;
                 const declared = types.typeOfData(data);
                 if (slot == expanded_slot) {
@@ -844,6 +911,35 @@ pub fn Catalog(comptime config: types.Config) type {
 
         /// Op 62 carries plain triggers only; catalog images refuse
         /// transition tables and constraint triggers (op 120).
+        /// Op 121 (create_cast, B11 wave 5): oid u32, source type OID u32,
+        /// target type OID u32, function OID u32 (0 unless method 'f'),
+        /// context u8 ('e', 'a', 'i') and method u8 ('f', 'i', 'b').
+        pub fn encodeCast(out: *Payload, item: *const Cast) Error!void {
+            try out.int(u32, item.oid);
+            try out.int(u32, item.source);
+            try out.int(u32, item.target);
+            try out.int(u32, item.function);
+            try out.int(u8, item.context);
+            try out.int(u8, item.method);
+        }
+
+        pub fn decodeCast(payload: []const u8, out: *Cast) Error!void {
+            var reader = Reader{ .bytes = payload };
+            out.* = .{};
+            out.oid = try reader.int(u32);
+            out.source = try reader.int(u32);
+            out.target = try reader.int(u32);
+            out.function = try reader.int(u32);
+            out.context = try reader.int(u8);
+            out.method = try reader.int(u8);
+            if (!reader.finished()) return error.InvalidChangeRecord;
+            if (out.context != 'e' and out.context != 'a' and out.context != 'i') return error.InvalidChangeRecord;
+            if (out.method != 'f' and out.method != 'i' and out.method != 'b') return error.InvalidChangeRecord;
+            if ((out.method == 'f') != (out.function != 0)) return error.InvalidChangeRecord;
+            if (out.source == out.target or !knownType(out.source) or !knownType(out.target)) return error.InvalidChangeRecord;
+            if (out.source == record_oid or out.target == record_oid or out.source == void_oid or out.target == void_oid) return error.InvalidChangeRecord;
+        }
+
         pub fn encodeTrigger(out: *Payload, item: *const Trigger) Error!void {
             if (item.extended()) return error.UnsupportedStatement;
             try encodeTriggerFields(out, item);
@@ -922,8 +1018,34 @@ pub fn Catalog(comptime config: types.Config) type {
             return len;
         }
 
+        /// A built-in type, or an allocated OID: a composite type (B11
+        /// wave 5, composite lane) that replay checks against the catalog.
         fn knownType(oid: u32) bool {
-            return types.typeFromOid(oid) != null;
+            return types.typeFromOid(oid) != null or (oid >= 16384 and oid != 0xffffffff);
+        }
+
+        /// Whether `oid` names no built-in type (a composite type).
+        pub fn userTypeOid(oid: u32) bool {
+            return types.typeFromOid(oid) == null and oid >= 16384 and oid != 0xffffffff;
+        }
+
+        /// Every composite type a routine's signature names is live.
+        fn compositeTypesLive(item: *const Routine, context: anytype) bool {
+            for (item.arg_oids[0..item.arg_count]) |oid| if (userTypeOid(oid) and !context.compositeLive(oid)) return false;
+            for (item.out_oids[0..item.out_count]) |oid| if (userTypeOid(oid) and !context.compositeLive(oid)) return false;
+            if (userTypeOid(item.return_oid) and !context.compositeLive(item.return_oid)) return false;
+            return true;
+        }
+
+        /// Whether a live routine or cast of the overlay names composite
+        /// type `oid`.
+        pub fn overlayUsesType(overlay: *const Overlay, oid: u32) bool {
+            for (&overlay.objects) |*object| {
+                if (!object.live or (object.class != .routine and object.class != .cast)) continue;
+                if (object.return_oid == oid) return true;
+                for (object.arg_oids[0..object.arg_count]) |arg| if (arg == oid) return true;
+            }
+            return false;
         }
 
         pub fn decodeRoutine(payload: []const u8, out: *Routine) Error!void {
@@ -1181,7 +1303,7 @@ pub fn Catalog(comptime config: types.Config) type {
 
         // ---- replay validation overlay ------------------------------------
 
-        pub const object_capacity = config.routines + config.triggers + config.rules;
+        pub const object_capacity = config.routines + config.triggers + config.rules + config.casts;
 
         const VObject = struct {
             live: bool = false,
@@ -1205,7 +1327,7 @@ pub fn Catalog(comptime config: types.Config) type {
         /// validated (part of ChangeLog.Scratch).
         pub const Overlay = struct {
             objects: [object_capacity]VObject = @splat(.{}),
-            counts: [3]usize = @splat(0),
+            counts: [4]usize = @splat(0),
         };
 
         fn capacityOf(class: Class) usize {
@@ -1213,6 +1335,7 @@ pub fn Catalog(comptime config: types.Config) type {
                 .routine => config.routines,
                 .trigger => config.triggers,
                 .rule => config.rules,
+                .cast => config.casts,
             };
         }
 
@@ -1238,6 +1361,21 @@ pub fn Catalog(comptime config: types.Config) type {
                 overlay.counts[2] += 1;
                 at += 1;
             }
+            for (&set.casts) |*item| {
+                if (!item.live or !item.stamp.committedLive()) continue;
+                overlay.objects[at] = castObject(item);
+                overlay.counts[3] += 1;
+                at += 1;
+            }
+        }
+
+        /// A cast in the overlay: its source and target as the first two
+        /// argument OIDs, its function as `function_oid`.
+        fn castObject(item: *const Cast) VObject {
+            var object: VObject = .{ .live = true, .class = .cast, .oid = item.oid, .function_oid = item.function, .arg_count = 2 };
+            object.arg_oids[0] = item.source;
+            object.arg_oids[1] = item.target;
+            return object;
         }
 
         /// A routine of the overlay lives in this namespace (DROP SCHEMA
@@ -1279,6 +1417,7 @@ pub fn Catalog(comptime config: types.Config) type {
                     if (tag == create_routine_extended) try decodeRoutineExtended(payload, &item) else try decodeRoutine(payload, &item);
                     if (item.oid < 16384 or item.oid == 0xffffffff or overlayHas(overlay, item.oid) or context.oidTaken(item.oid)) return error.ChangeRecordConflict;
                     if (!context.namespaceKnown(item.namespace)) return error.ChangeRecordConflict;
+                    if (!compositeTypesLive(&item, context)) return error.ChangeRecordConflict;
                     for (&overlay.objects) |*object| {
                         if (object.live and object.class == .routine and object.namespace == item.namespace and types.same(object.name.slice(), item.name.slice()) and
                             sameArgs(object.arg_oids[0..object.arg_count], item.args())) return error.ChangeRecordConflict;
@@ -1314,10 +1453,26 @@ pub fn Catalog(comptime config: types.Config) type {
                     try overlayAdd(overlay, .{ .live = true, .class = .rule, .oid = item.oid, .table_oid = item.table_oid, .name = item.name });
                     return item.oid;
                 },
-                @intFromEnum(Op.drop_routine), @intFromEnum(Op.drop_trigger), @intFromEnum(Op.drop_rule) => {
+                create_cast_op => {
+                    var item: Cast = undefined;
+                    try decodeCast(payload, &item);
+                    if (item.oid < 16384 or item.oid == 0xffffffff or overlayHas(overlay, item.oid) or context.oidTaken(item.oid)) return error.ChangeRecordConflict;
+                    for ([_]u32{ item.source, item.target }) |oid| if (userTypeOid(oid) and !context.compositeLive(oid)) return error.ChangeRecordConflict;
+                    if (item.method == 'f') {
+                        const function = overlayFind(overlay, .routine, item.function) orelse return error.ChangeRecordConflict;
+                        if (function.kind != 'f' or function.arg_count < 1 or function.arg_count > 3 or function.arg_oids[0] != item.source or function.return_oid != item.target) return error.ChangeRecordConflict;
+                    }
+                    for (&overlay.objects) |*object| {
+                        if (object.live and object.class == .cast and object.arg_oids[0] == item.source and object.arg_oids[1] == item.target) return error.ChangeRecordConflict;
+                    }
+                    try overlayAdd(overlay, castObject(&item));
+                    return item.oid;
+                },
+                @intFromEnum(Op.drop_routine), @intFromEnum(Op.drop_trigger), @intFromEnum(Op.drop_rule), drop_cast_op => {
                     const class: Class = switch (tag) {
                         @intFromEnum(Op.drop_routine) => .routine,
                         @intFromEnum(Op.drop_trigger) => .trigger,
+                        drop_cast_op => .cast,
                         else => .rule,
                     };
                     const object = overlayFind(overlay, class, try decodeOid(payload)) orelse return error.ChangeRecordConflict;
@@ -1347,6 +1502,9 @@ pub fn Catalog(comptime config: types.Config) type {
                         for (graph.edges[0..graph.len], support[0..graph.len]) |edge, state| {
                             if (edge.flags & ~state.available != 0) return error.ChangeRecordConflict;
                         }
+                    },
+                    .cast => if (object.function_oid != 0) {
+                        _ = overlayFind(overlay, .routine, object.function_oid) orelse return error.ChangeRecordConflict;
                     },
                     .trigger => {
                         const function = overlayFind(overlay, .routine, object.function_oid) orelse return error.ChangeRecordConflict;

@@ -218,6 +218,9 @@ pub const Config = struct {
     triggers: usize = 8,
     /// Rewrite-rule versions (CREATE RULE); more are TableCapacity (54000).
     rules: usize = 4,
+    /// User cast versions (CREATE CAST, B11 wave 5 composite lane); more
+    /// are TableCapacity (54000).
+    casts: usize = 4,
     /// Arguments per routine and CALL (more are ColumnCapacity, 54000).
     routine_args: usize = 8,
     /// Explicit EXECUTE grantees per routine, excluding the owner and PUBLIC.
@@ -231,6 +234,10 @@ pub const Config = struct {
     /// PL/pgSQL variables per routine frame (parameters, DECLAREd
     /// variables, FOUND, loop variables, TG_*); more are ColumnCapacity.
     routine_variables: usize = 24,
+    /// Row shapes (field names and types) of PL/pgSQL `record` variables
+    /// one routine frame holds at once (B11 wave 5, composite lane); more
+    /// are ColumnCapacity (54000).
+    routine_records: usize = 4,
     /// SQL/JSON path (B11 json-agg lane): parsed nodes of one jsonpath
     /// (more is StatementTooComplex, 54001) and the items one evaluation
     /// holds at once for predicate operands and subscripts (more is
@@ -672,7 +679,10 @@ pub const DataType = enum(u8) { integer, integer32, boolean, text, smallint, num
     void,
     macaddr8,
     lseg, line, path, polygon, circle,
-    int4multirange, int8multirange, nummultirange, datemultirange, tsmultirange, tstzmultirange, _ };
+    int4multirange, int8multirange, nummultirange, datemultirange, tsmultirange, tstzmultirange,
+    // B11 wave 5 (composite lane): composite (row) values. The typmod holds
+    // the composite type's OID, or -1 for an anonymous record.
+    record, _ };
 
 /// Bound expression type. `unknown` is an untyped string or NULL literal
 /// that has not been resolved by context yet. Unnamed values are array
@@ -681,10 +691,29 @@ pub const Type = enum(u8) { unknown, int2, int4, int8, numeric, float4, float8, 
     void,
     macaddr8,
     lseg, line, path, polygon, circle,
-    int4multirange, int8multirange, nummultirange, datemultirange, tsmultirange, tstzmultirange, _ };
+    int4multirange, int8multirange, nummultirange, datemultirange, tsmultirange, tstzmultirange,
+    record, _ };
 
 /// Array types set this bit over the element type's ordinal.
 pub const array_bit: u8 = 0x80;
+/// pg_type `record` (RECORDOID): anonymous composite values.
+pub const record_oid: u32 = 2249;
+
+/// The type OID a record type and typmod report: the composite type's
+/// OID, or `record` for an anonymous record (composite lane, B11 wave 5).
+pub fn recordTypeOid(typmod: i32) u32 {
+    return if (typmod > 0) @intCast(typmod) else record_oid;
+}
+
+/// The value type of a routine parameter or result type OID: a built-in
+/// type, or an allocated OID taken as a composite type (record with the OID
+/// as its typmod; composite lane). Null for anything else.
+pub const OidType = struct { ty: Type, typmod: i32 };
+pub fn oidType(oid: u32, typmod: i32) ?OidType {
+    if (typeFromOid(oid)) |data_type| return .{ .ty = typeOfData(data_type), .typmod = typmod };
+    if (oid >= 16384 and oid <= 0x7fffffff) return .{ .ty = .record, .typmod = @intCast(oid) };
+    return null;
+}
 const data_type_count = @typeInfo(DataType).@"enum".field_names.len;
 const type_count = @typeInfo(Type).@"enum".field_names.len;
 
@@ -694,27 +723,33 @@ pub const catalog_anyarray: Type = @enumFromInt(127);
 const catalog_anyarray_data: DataType = @enumFromInt(127);
 pub const catalog_anyarray_oid: u32 = 2277;
 
-// The anonymous record and record[] pseudo-types (OIDs 2249 and 2287) of the
-// SEARCH sequence and CYCLE path columns (T133, B11 wave 5 proc-tx). A value
-// is its PostgreSQL text form in a text cell; no table or view column has
-// them (42P16) and, like catalog_anyarray, they stay out of the registry and
-// the array encodings.
-pub const record_type: Type = @enumFromInt(126);
-const record_data: DataType = @enumFromInt(126);
+// The anonymous record (2249) of a SEARCH BREADTH FIRST sequence column is
+// the composite lane's record value (Type.record, typmod -1, a record cell;
+// B11 wave 5). The record[] pseudo-type (2287) of DEPTH FIRST sequences and
+// CYCLE paths (T133, proc-tx) is its PostgreSQL text form in a text cell:
+// no table or view column has it (42P16) and, like catalog_anyarray, it
+// stays out of the registry and the array encodings.
+pub const record_type: Type = .record;
 pub const record_array_type: Type = @enumFromInt(125);
 const record_array_data: DataType = @enumFromInt(125);
-pub const record_oid: u32 = 2249;
 pub const record_array_oid: u32 = 2287;
 
-/// record or record[] (pseudo-types no table column can have).
+/// record[] (a pseudo-type no table column can have; its text form has no
+/// record operators). Composite values are ordinary `record` values.
 pub fn pseudoRecord(ty: Type) bool {
-    return ty == record_type or ty == record_array_type;
+    return ty == record_array_type;
+}
+
+/// A column type no table may have: record[], or an anonymous record
+/// (42P16, "column has pseudo-type record").
+pub fn pseudoColumn(ty: Type, typmod: i32) bool {
+    return ty == record_array_type or (ty == .record and typmod <= 0);
 }
 
 /// The array type of a named element type (null for an array).
 pub fn arrayData(element: DataType) ?DataType {
     const raw = @intFromEnum(element);
-    if (element == .mysql_bigint_unsigned or element == .void or raw >= data_type_count) return null;
+    if (element == .mysql_bigint_unsigned or element == .void or element == .record or raw >= data_type_count) return null;
     return @enumFromInt(raw | array_bit);
 }
 
@@ -723,12 +758,12 @@ pub fn elementData(data_type: DataType) ?DataType {
     const raw = @intFromEnum(data_type);
     if (raw < array_bit or raw & ~array_bit >= data_type_count) return null;
     const element: DataType = @enumFromInt(raw & ~array_bit);
-    return if (element == .mysql_bigint_unsigned or element == .void) null else element;
+    return if (element == .mysql_bigint_unsigned or element == .void or element == .record) null else element;
 }
 
 pub fn arrayType(element: Type) ?Type {
     const raw = @intFromEnum(element);
-    if (element == .unknown or element == .mysql_bigint_unsigned or element == .void or raw >= type_count) return null;
+    if (element == .unknown or element == .mysql_bigint_unsigned or element == .void or element == .record or raw >= type_count) return null;
     return @enumFromInt(raw | array_bit);
 }
 
@@ -736,7 +771,7 @@ pub fn elementType(ty: Type) ?Type {
     const raw = @intFromEnum(ty);
     if (raw < array_bit or raw & ~array_bit >= type_count or raw & ~array_bit == 0) return null;
     const element: Type = @enumFromInt(raw & ~array_bit);
-    return if (element == .mysql_bigint_unsigned or element == .void) null else element;
+    return if (element == .mysql_bigint_unsigned or element == .void or element == .record) null else element;
 }
 
 pub fn isArray(ty: Type) bool {
@@ -785,7 +820,6 @@ pub fn isRange(ty: Type) bool {
 pub fn dataTypeOf(ty: Type) DataType {
     return switch (ty) {
         catalog_anyarray => catalog_anyarray_data,
-        record_type => record_data,
         record_array_type => record_array_data,
         .int2 => .smallint,
         .int4 => .integer32,
@@ -848,6 +882,7 @@ pub fn dataTypeOf(ty: Type) DataType {
         .datemultirange => .datemultirange,
         .tsmultirange => .tsmultirange,
         .tstzmultirange => .tstzmultirange,
+        .record => .record,
         _ => if (elementType(ty)) |element| arrayData(dataTypeOf(element)).? else .text,
     };
 }
@@ -855,7 +890,6 @@ pub fn dataTypeOf(ty: Type) DataType {
 pub fn typeOfData(data_type: DataType) Type {
     return switch (data_type) {
         catalog_anyarray_data => catalog_anyarray,
-        record_data => record_type,
         record_array_data => record_array_type,
         .smallint => .int2,
         .integer32 => .int4,
@@ -918,6 +952,7 @@ pub fn typeOfData(data_type: DataType) Type {
         .datemultirange => .datemultirange,
         .tsmultirange => .tsmultirange,
         .tstzmultirange => .tstzmultirange,
+        .record => .record,
         _ => if (elementData(data_type)) |element| arrayType(typeOfData(element)).? else .text,
     };
 }
@@ -948,6 +983,8 @@ pub fn validTypeTypmod(comptime config: Config, data_type: DataType, typmod: i32
         .timestamp, .timestamptz, .time, .timetz => typmod >= -1 and typmod <= 6,
         .varchar, .bpchar => character.validTypmod(typmod),
         .bit, .varbit => bit_string.validTypmod(typmod),
+        // A composite column's typmod is its type's OID (composite lane).
+        .record => typmod > 0,
         else => typmod == -1,
     };
 }
@@ -979,7 +1016,6 @@ const array_sql_names = blk: {
 fn baseInfo(data_type: DataType) TypeInfo {
     return switch (data_type) {
         catalog_anyarray_data => .{ .oid = catalog_anyarray_oid, .name = "anyarray", .len = -1, .category = 'P', .array = 0, .alignment = 'd' },
-        record_data => .{ .oid = record_oid, .name = "record", .len = -1, .category = 'P', .array = record_array_oid, .alignment = 'd' },
         record_array_data => .{ .oid = record_array_oid, .name = "_record", .len = -1, .category = 'P', .array = 0, .alignment = 'd' },
         .aclitem => .{ .oid = 1033, .name = "aclitem", .len = 16, .category = 'U', .array = 1034, .alignment = 'd' },
         .pg_internal_char => .{ .oid = 18, .name = "char", .len = 1, .category = 'Z', .array = 1002, .alignment = 'c' },
@@ -1044,6 +1080,7 @@ fn baseInfo(data_type: DataType) TypeInfo {
         .datemultirange => .{ .oid = 4535, .name = "datemultirange", .len = -1, .category = 'R', .array = 6155 },
         .tsmultirange => .{ .oid = 4533, .name = "tsmultirange", .len = -1, .category = 'R', .array = 6152, .alignment = 'd' },
         .tstzmultirange => .{ .oid = 4534, .name = "tstzmultirange", .len = -1, .category = 'R', .array = 6153, .alignment = 'd' },
+        .record => .{ .oid = record_oid, .name = "record", .len = -1, .category = 'P', .array = record_array_oid, .alignment = 'd' },
         _ => .{ .oid = 0, .name = "", .len = -1, .category = 'A', .array = 0 },
     };
 }
@@ -1080,7 +1117,6 @@ pub fn sqlTypeName(data_type: DataType) []const u8 {
 
 fn baseSqlName(data_type: DataType) []const u8 {
     return switch (data_type) {
-        record_data => "record",
         record_array_data => "record[]",
         .integer => "bigint",
         .integer32 => "integer",
@@ -1142,6 +1178,7 @@ fn baseSqlName(data_type: DataType) []const u8 {
         .datemultirange => "datemultirange",
         .tsmultirange => "tsmultirange",
         .tstzmultirange => "tstzmultirange",
+        .record => "record",
         _ => "",
     };
 }
@@ -1199,6 +1236,7 @@ pub fn typeInputName(data_type: DataType) []const u8 {
         .polygon => "poly_in",
         .circle => "circle_in",
         .int4multirange, .int8multirange, .nummultirange, .datemultirange, .tsmultirange, .tstzmultirange => "multirange_in",
+        .record => "record_in",
         _ => "array_in",
     };
 }
@@ -1339,7 +1377,9 @@ pub const CommandTag = enum { none, select, insert, update, delete, create_table
     create_role, alter_role, drop_role, grant, revoke, grant_role, revoke_role, create_policy, alter_policy, drop_policy, comment,
     alter_default_privileges,
     create_foreign_data_wrapper, drop_foreign_data_wrapper, create_server, drop_server, create_publication, drop_publication, create_extension, explain, create_domain, drop_domain, vacuum, analyze, create_type, drop_type, create_statistics, alter_statistics, drop_statistics, alter_schema, alter_large_object,
-    prepare_transaction, commit_prepared, rollback_prepared, alter_function, alter_procedure };
+    prepare_transaction, commit_prepared, rollback_prepared, alter_function, alter_procedure,
+    // B11 wave 5 (composite lane).
+    create_cast, drop_cast };
 
 pub fn lower(byte: u8) u8 {
     return if (byte >= 'A' and byte <= 'Z') byte + ('a' - 'A') else byte;
@@ -1476,7 +1516,9 @@ pub fn Values(comptime config: Config) type {
         /// compares/hashes without trailing spaces.
         pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar, uuid, bytea, time, timetz, bits, money, pg_lsn, xid8, array, range, inet, macaddr, point, box, xml, regtype, tsvector, tsquery, pg_internal_char, regproc,
             // B11 wave-4 types-ext.
-            macaddr8, geo, multirange };
+            macaddr8, geo, multirange,
+            // B11 wave 5 (composite lane): record.sig layout.
+            record };
 
         pub const Cell = union(CellTag) {
             null_value: void,
@@ -1531,6 +1573,8 @@ pub fn Values(comptime config: Config) type {
             geo: Text,
             /// Built-in multiranges (multirange.sig layout).
             multirange: Text,
+            /// Composite (row) values (record.sig layout).
+            record: Text,
         };
 
         /// Range values of these cells (range.sig).
@@ -1541,6 +1585,9 @@ pub fn Values(comptime config: Config) type {
 
         /// Multirange values of these cells (multirange.sig).
         pub const Multiranges = @import("multirange.sig").Multiranges(@This());
+
+        /// Composite values of these cells (record.sig).
+        pub const Records = @import("record.sig").Records(@This());
 
         pub const Row = struct {
             cells: [config.columns]Cell = @splat(.null_value),
@@ -1604,6 +1651,7 @@ pub fn Values(comptime config: Config) type {
                 .macaddr8 => .macaddr8,
                 .lseg, .line, .path, .polygon, .circle => .geo,
                 .int4multirange, .int8multirange, .nummultirange, .datemultirange, .tsmultirange, .tstzmultirange => .multirange,
+                .record => .record,
                 _ => .array,
             };
         }
@@ -1647,6 +1695,7 @@ pub fn Values(comptime config: Config) type {
                 // No ordering operators (42883); bytes keep internal equality.
                 .geo => |*value| bytesOrder(value.slice(), right.geo.slice()),
                 .multirange => |*value| Multiranges.compare(value.slice(), right.multirange.slice()),
+                .record => |*value| Records.compare(value.slice(), right.record.slice()),
                 .point => |value| geometric.comparePoints(value, right.point),
                 .box => |value| geometric.compareBoxes(value, right.box),
                 .xml => |*value| bytesOrder(value.slice(), right.xml.slice()),
@@ -1740,6 +1789,7 @@ pub fn Values(comptime config: Config) type {
                     for (bytes.slice()) |byte| code = (code ^ byte) *% 1099511628211;
                 },
                 .multirange => |*set| return wordHash(Multiranges.hash(set.slice()), tag),
+                .record => |*fields| return wordHash(Records.hash(fields.slice()), tag),
                 .point => |point| {
                     mix(&code, tag);
                     mix(&code, @bitCast(normalFloat(point.x)));
@@ -1815,6 +1865,18 @@ pub fn Values(comptime config: Config) type {
                 var reader = Arrays.Reader.init(value.array.slice());
                 var cell: Cell = undefined;
                 while (reader.next(&cell)) try validate(&member, &cell);
+                return;
+            }
+            if (value.* == .record) {
+                // A composite column (B11 wave 5): the value's type and
+                // every field's own checks (CHAR(n), VARCHAR(n), BIT(n)).
+                if (Records.typeOf(value.record.slice()) != recordTypeOid(column.typmod)) return error.TypeMismatch;
+                var reader = Records.Reader.init(value.record.slice());
+                var item: Records.Field = .{};
+                while (reader.next(&item)) {
+                    const member: Column = .{ .data_type = item.data_type, .typmod = item.typmod };
+                    try validate(&member, &item.cell);
+                }
                 return;
             }
             switch (column.data_type) {

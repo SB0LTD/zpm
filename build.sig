@@ -288,6 +288,8 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("postgres", "src/db/postgres.sig"), importEntry("scram", "src/db/scram.sig"),
     });
     _ = try addContract(ctx, test_sql, "contract-sql-composite-catalog", "tests/test_sql_composite_catalog.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    // B11 wave 5 composite lane: composite values, user casts, ProjectSet.
+    _ = try addContract(ctx, test_sql, "contract-sql-composite", "tests/test_sql_composite.sig", &.{importEntry("sql", "src/core/sql.sig")});
     // Generated SQL-standard feature probes (tests/sql_conformance/generate_feature_contract.py):
     // fails only when a probe the committed scoreboard records as passing regresses.
     // information_schema and CURRENT_CATALOG / CURRENT_SCHEMA (B11 wave 5,

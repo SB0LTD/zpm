@@ -2560,16 +2560,24 @@ pub fn Parser(comptime config: types.Config) type {
             } else {
                 if (self.mode == .standard and !typeWord(self.current) and !(try self.catalogTypeAhead()) and
                     (self.current.kind == .quoted_word or (self.current.kind == .word and !lexer.reserved(self.current.keyword)))) {
-                    return error.UnsupportedStatement;
+                    // A user type: binding resolves a composite type
+                    // (composite lane); arrays of user types stay open.
+                    if (self.tokens.dialect != .postgres) return error.UnsupportedStatement;
+                    const named = try self.qualifiedName();
+                    if (self.isSymbol(.lbracket) or self.isSymbol(.lparen) or self.rawWord("array")) return error.UnsupportedStatement;
+                    column.type_name = .record;
+                    column.user_type = named.name;
+                    column.user_type_schema = named.schema orelse .{};
+                } else {
+                    const mysql_bigint = self.mode == .standard and self.tokens.dialect == .mysql and self.isWord("BIGINT");
+                    const spec = try self.typeName();
+                    // regclass/regtype columns are outside the subset.
+                    if (spec.typmod < -1) return error.UnsupportedStatement;
+                    // A column cannot have the void pseudo-type (42P16).
+                    if (spec.ty == .void) return error.InvalidTableDefinition;
+                    column.type_name = if (mysql_bigint and spec.ty == .int8 and try self.takeRaw("unsigned")) .mysql_bigint_unsigned else spec.ty;
+                    column.typmod = spec.typmod;
                 }
-                const mysql_bigint = self.mode == .standard and self.tokens.dialect == .mysql and self.isWord("BIGINT");
-                const spec = try self.typeName();
-                // regclass/regtype columns are outside the subset.
-                if (spec.typmod < -1) return error.UnsupportedStatement;
-                // A column cannot have the void pseudo-type (42P16).
-                if (spec.ty == .void) return error.InvalidTableDefinition;
-                column.type_name = if (mysql_bigint and spec.ty == .int8 and try self.takeRaw("unsigned")) .mysql_bigint_unsigned else spec.ty;
-                column.typmod = spec.typmod;
             }
             var has_not_null = false;
             while (true) {
@@ -3577,6 +3585,7 @@ pub fn Parser(comptime config: types.Config) type {
                     target.star = true;
                     star = true;
                 } else {
+                    const target_start = self.pool.len;
                     target.expr = try self.expression();
                     const n = &self.pool.nodes[target.expr];
                     if (n.kind == .column and n.star) {
@@ -3591,6 +3600,9 @@ pub fn Parser(comptime config: types.Config) type {
                                 if (types.same(name, "unnest") or types.same(name, "generate_subscripts")) self.pool.complex = true;
                             }
                         }
+                        // Set-returning built-ins anywhere in a target run in
+                        // the query engine's ProjectSet (composite lane).
+                        if (self.mode == .standard and self.tokens.dialect == .postgres and !self.pool.complex and self.setCallParsed(target_start)) self.pool.complex = true;
                         target.expression_end = self.previous_end;
                         target.alias = try self.bareAlias();
                     }
@@ -5682,7 +5694,7 @@ pub fn Parser(comptime config: types.Config) type {
                         return self.overlapsTail(row);
                     }
                     try self.expectSymbol(.rparen);
-                    return self.subscriptTail(inner);
+                    return self.fieldTail(try self.subscriptTail(inner));
                 },
                 .end => return error.Syntax,
                 .word, .quoted_word => {},
@@ -5936,6 +5948,42 @@ pub fn Parser(comptime config: types.Config) type {
             }
             try self.expectSymbol(.rbracket);
             return node;
+        }
+
+        /// Whether a parsed target holds a call to a set-returning built-in
+        /// (bounded walk; the binder checks where they may appear).
+        fn setCallParsed(self: *Self, start: usize) bool {
+            var index: usize = start;
+            while (index < self.pool.len) : (index += 1) {
+                const n = &self.pool.nodes[index];
+                if (n.kind != .function) continue;
+                var buf: [64]u8 = undefined;
+                const name = identText(self.source, n.name, &buf) orelse continue;
+                if (types.same(name, "generate_series") or types.same(name, "unnest") or types.same(name, "generate_subscripts") or
+                    types.same(name, "regexp_matches") or types.same(name, "regexp_split_to_table") or types.same(name, "jsonb_path_query") or
+                    types.same(name, "_pg_expandarray")) return true;
+            }
+            return false;
+        }
+
+        /// `(base).name` and `(base).*` field selection (B11 wave 5,
+        /// composite lane), repeated and mixed with subscripts.
+        fn fieldTail(self: *Self, base: u16) Error!u16 {
+            var current = base;
+            while (self.mode == .standard and self.tokens.dialect == .postgres and self.isSymbol(.dot)) {
+                try self.advance();
+                if (try self.takeSymbol(.star)) {
+                    const all = try self.pool.add(.{ .kind = .field_select, .a = current, .star = true });
+                    try self.pool.raise(all, current);
+                    return all;
+                }
+                // A field name is any label (attr_name: ColLabel).
+                const name = try self.label();
+                const node = try self.pool.add(.{ .kind = .field_select, .a = current, .name = name });
+                try self.pool.raise(node, current);
+                current = try self.subscriptTail(node);
+            }
+            return current;
         }
 
         /// `base[i]`, `base[lo:hi]` (either bound optional), repeated: one

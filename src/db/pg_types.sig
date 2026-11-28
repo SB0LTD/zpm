@@ -274,6 +274,25 @@ pub fn Types(comptime Result: type) type {
                         at += size;
                     }
                 },
+                // record_send (B11 wave 5, composite lane): the field count,
+                // then each field's type OID, length (-1 NULL) and binary.
+                .record => |*fields| {
+                    const bytes = fields.slice();
+                    try putInt(i32, out, &at, @intCast(Io.Records.count(bytes)));
+                    var reader = Io.Records.Reader.init(bytes);
+                    var item: Io.Records.Field = .{};
+                    while (reader.next(&item)) {
+                        try putInt(u32, out, &at, Io.typeInfo(item.data_type).oid);
+                        if (item.cell == .null_value) {
+                            try putInt(i32, out, &at, -1);
+                            continue;
+                        }
+                        if (out.len - at < 4) return error.BufferTooSmall;
+                        const size = try sendBinary(&item.cell, item.data_type, session, out[at + 4 ..]);
+                        try putInt(i32, out, &at, @intCast(size));
+                        at += size;
+                    }
+                },
                 .array => |*items| {
                     const element = Io.elementData(data_type) orelse return error.UnsupportedBinaryType;
                     const shape = Io.Arrays.shape(items.slice());

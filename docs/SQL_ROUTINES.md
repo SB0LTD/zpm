@@ -417,14 +417,9 @@ were mapped). Used: 55006, 58P01, 22004, 42601, P0002, P0003, 42P02,
 
 Not covered (open):
 
-- Record values: a function with several OUT parameters in an
-  expression, `ROW(...)` without a declared type, field access
-  `(f()).a` and `(f()).*` (0A000 / 42601); RETURNS SETOF table in a
-  select list; RETURNS a single composite row.
-- S211 user-defined casts (CREATE / DROP CAST): composite-type parameters
-  and field access are missing first.
-- Two set-returning calls in one select list (PostgreSQL runs them in
-  lockstep) are 0A000; generate_series in a select list is 42883.
+- Record values, user casts and several set-returning calls in one select
+  list: the composite lane (below) covers them; its section lists what
+  stays open.
 - Referential actions run while the parent rows change, so the
   referencing table's BEFORE triggers fire before the parent's AFTER ROW
   triggers; PostgreSQL runs the actions from its after-trigger queue,
@@ -452,6 +447,155 @@ Not covered (open):
   aggregating ALSO action over 3 inserted rows sums 3 times in
   PostgreSQL).
 
+## Wave 5: composite values, user casts, ProjectSet (composite lane)
+
+`contract-sql-composite` (tests/test_sql_composite.sig, 467 assertions,
+55 replayed records) covers this section with values in PostgreSQL text
+output, column names and type OIDs, exact errors (the SQLSTATE through the
+error name), atomicity after a failure, replay (every committed record is
+applied to a replica that must answer every probe like the primary) and
+corrupted records that must fail closed. Expected values were checked
+against native PostgreSQL 18.7.
+
+- **Composite values (X014, F641).** A record is one cell
+  (`src/core/sql/record.sig`): its type OID (a composite type, or 2249
+  `record` for an anonymous record), then per field its built-in type,
+  typmod and value; fields are never records. `ROW(...)` and `(a, b)` are
+  values of type `record` (fields f1, f2, ...; an untyped field reads as
+  text). A cast to a composite type works anywhere in an expression: a
+  row constructor converts field by field (explicitly in a cast, by
+  assignment for a column; a different count is 42846), an untyped literal
+  is read by record_in (PostgreSQL's quoting; 22P02 for too few or too many
+  columns or junk after the parenthesis), a string by I/O conversion, a
+  record of the same type passes and an anonymous record is checked field
+  by field when evaluated. `'...'::record` and an untyped side of a
+  record comparison are 0A000 (input of anonymous composite types). Text
+  output is record_out (`(1,"a b",)`), binary output record_send.
+  `pg_typeof`, RowDescription and pg_attribute name the composite type:
+  a result column of a composite type carries the type's OID as its
+  nominal type with typmod -1 (an anonymous record is OID 2249).
+- **Field selection.** `(x).field` (42809 when `x` is no record, 42703
+  for a missing field; a field name may be any keyword), `(x).*` in a
+  select list (one column per field), `variable.field` for composite
+  routine parameters and PL/pgSQL variables. `(f()).*` evaluates `f`
+  once per field, as PostgreSQL does.
+- **Comparison.** Two row constructors (or a row constructor and a row
+  subquery) compare row-wise with SQL NULL semantics; other record
+  comparisons are record_eq / record_cmp: two NULL fields are equal and a
+  NULL field sorts after every value. A row constructor beside a
+  composite value, or two composite types, must have the same field types
+  (42804); two composite types with them compare. `IS [NOT] NULL` tests
+  every field. ORDER BY, GROUP BY, DISTINCT, `min` / `max`, CASE and
+  COALESCE work on records; `to_json` and `row_to_json(record [,
+  pretty])` render objects.
+- **Composite columns.** `CREATE TABLE t (d doc)` stores records whose
+  type is the column's. The column is `record` (type OID 2249) with the
+  composite type's OID as its typmod in the definition encoding, so the
+  table definition format is unchanged; pg_attribute reports the type's
+  OID and typmod -1. Values are change-log value tag 57 (the record's type
+  OID u32, a field count u8, then per field a built-in type OID u32, a
+  typmod i32 and the value; never a record), validated on replay against
+  the column type and every field's own checks. Replay also checks that a
+  composite column's type is live and refuses to drop a type a live
+  column, routine or cast uses. Domain and enum columns stay 0A000, a
+  `record` column is 42P16 and an unknown type 42704. Base images
+  (RSBASE) refuse composite columns.
+- **Routines.** Composite parameters and results (pg_proc stores the
+  type's OID); a SQL body may return a record or one column per field.
+  A function with several OUT parameters is an anonymous record in an
+  expression (`f()`, `(f()).a`, `(f()).*`). DROP TYPE of a type a
+  column, routine or cast uses is 2BP01 (CASCADE is 0A000 here), also
+  when another transaction is creating that dependent or committed it
+  after the dropper's snapshot; a column, routine or cast naming a type
+  another transaction is dropping is 40001 (PostgreSQL waits on the
+  type's lock), so a dependent never outlives its type in the log.
+- **PL/pgSQL variables.** `DECLARE p pt` and `DECLARE r record`;
+  assignment, field assignment (a NULL composite becomes a row of NULLs),
+  `SELECT ... INTO` a lone composite or record target from separate
+  columns and RETURN of a composite. A record variable keeps the shape of
+  the row it last took (Config.routine_records shapes per frame; 54000
+  beyond); before its first row it is 55000.
+- **User casts (S211).** `CREATE CAST (source AS target) {WITH FUNCTION
+  f[(types)] | WITHOUT FUNCTION | WITH INOUT} [AS ASSIGNMENT | AS
+  IMPLICIT]` and `DROP CAST [IF EXISTS] (source AS target) [CASCADE |
+  RESTRICT]`, with CreateCast's checks: types exist (42704), are no
+  pseudo-type (42809) and differ (42P17); the caller owns one of them
+  (42501); no cast exists for the pair, built-in or user (42710); the
+  function is a normal, non-set function of one to three arguments (the
+  source type, int4, boolean) returning the target type (42P17); WITHOUT
+  FUNCTION needs physically compatible built-in types (42P17; between
+  different cell kinds 0A000 here). Casts are routine-catalog objects
+  with MVCC versions (Config.casts) and pg_cast rows. Explicit,
+  assignment and implicit coercion consult them before the built-in
+  rules, as find_coercion_pathway does: WITH FUNCTION calls the function
+  (passing the typmod and explicitness when it takes them), WITH INOUT
+  converts through text and WITHOUT FUNCTION relabels; a cast of another
+  context leaves no coercion path (no I/O fallback). DROP FUNCTION of a
+  cast function is 2BP01 unless CASCADE drops the cast. regtype input
+  resolves user type names.
+- **ProjectSet.** Every set-returning call of a select list
+  (generate_series, unnest, generate_subscripts, regexp_matches,
+  regexp_split_to_table, jsonb_path_query, user set-returning routines),
+  at the top of a target or inside an expression, runs once per input row
+  (after aggregation in a grouped select list) and the calls are zipped as
+  in PostgreSQL 10+: the longest decides the row count, exhausted calls
+  yield NULL and a call with no rows contributes NULLs. Their values are
+  chained in workspace cells (54000 when they do not fit). A call in
+  WHERE, CASE, COALESCE or an aggregate's arguments is 0A000, as in
+  PostgreSQL. `(f()).*` over a set-returning `f` runs it once for all
+  its fields.
+- **information_schema.** A composite column, routine result or
+  parameter is `USER-DEFINED` with the type's schema and name as its
+  udt (columns, routines, parameters); user_defined_types and attributes
+  list composite types as native 18.7 does.
+  `information_schema._pg_expandarray(anyarray)` is a select-list
+  set-returning call returning the anonymous record (x, n): every element
+  in storage order with its ordinal (PostgreSQL 18's unnest WITH
+  ORDINALITY body; NULL yields nothing, an untyped literal is 42804).
+  `(record).field` and `(record).*` follow a derived table's or CTE's
+  anonymous record column to the target that computes it, as
+  expandRecordVariable does, so pgjdbc's getPrimaryKeys shape
+  `(result.KEYS).x` binds. pg_index.indkey is text here, not int2vector,
+  so that query itself still needs the catalog's int2vector.
+
+Durability: change-log ops 121 `create_cast` (payload: oid u32, source and
+target type OIDs u32, function OID u32, context u8 `e` / `a` / `i`, method
+u8 `f` / `i` / `b`) and 122 `drop_cast` (the OID), validated on replay
+(method and context, function present for method `f` only, a live
+function of one to three arguments taking the source and returning the
+target, live composite types, one cast per pair, the function outliving
+its casts); 123-124 stay reserved. Value tag 57 carries records (above);
+58 stays reserved. Routine records (ops 60 / 80) may name composite type
+OIDs, checked against the live types on replay. Existing records and the
+table definition format are unchanged; base images (RSBASE) refuse casts,
+composite columns and routines naming composite types.
+
+Limits: Config.casts (4 cast versions; TableCapacity, 54000, beyond) and
+Config.routine_records (4 record shapes per PL/pgSQL frame; 54000 beyond).
+A record value fits one cell (Config.text_bytes; TextCapacity, 54000).
+
+New SQLSTATE mappings: none. Used: 42846, 42809, 42703, 42804, 42P16,
+42704, 22P02, 0A000, 2BP01, 42710, 42P17, 42501, 55000, 22023, 2200N,
+54000, 40001.
+
+Not covered (open):
+
+- Records of records (a composite field of a composite or row type),
+  arrays of composite types, domain and enum table columns.
+- A table's row type: PostgreSQL gives every table a pg_type row; this
+  catalog has none, so `SELECT t FROM t`, `t.*` as a function argument,
+  `DECLARE r t` and `RETURNS t` stay 42703 / 42704. `(ROW(1,'a')).*` on
+  a constant row constructor works here where PostgreSQL raises XX000.
+- DROP TYPE ... CASCADE over columns, routines or casts (0A000); field
+  assignment in UPDATE (`SET d.body = ...`); `FOR r IN SELECT` loops.
+- S211's probe also creates a domain over NUMERIC(10,2) and a function
+  returning it: domains support only integer bases with a comparison CHECK
+  (0A000), so that probe stays open although CREATE / DROP CAST pass.
+- A set-returning call nested in another one's arguments
+  (`generate_series(1, generate_series(1, 3))`) is 0A000 where PostgreSQL
+  stacks ProjectSet nodes. JSON set-returning functions (json_each,
+  jsonb_array_elements, ...) and string_to_table do not exist yet.
+
 ## Not covered (open)
 
 - INSTEAD OF triggers, automatically updatable views, rule actions, SQL
@@ -460,10 +604,9 @@ Not covered (open):
   expression, RETURN QUERY and CALL from a function run as nested
   statements (wave 4 nested-stmts lane, docs/SQL_NESTED_STATEMENTS.md,
   which lists what stays open).
-- Record values (a function with several OUT parameters in an
-  expression) are 0A000; RETURNS record without OUT parameters,
-  polymorphic types, %TYPE / %ROWTYPE / record variables, cursors,
-  FOREACH and FOR over queries remain open (see Wave 5 for the rest).
+- RETURNS record without OUT parameters, polymorphic types, %TYPE /
+  %ROWTYPE, cursors, FOREACH and FOR over queries remain open (record
+  values and record variables: the composite lane above).
 - COMMIT / ROLLBACK where PostgreSQL allows them work through the store
   (docs/SQL_PROC_TX.md); a lock wait after one fails instead of waiting.
 - A SQL body is validated under the session's settings, not the

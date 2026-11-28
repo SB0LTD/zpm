@@ -2384,9 +2384,12 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                 try w.u16be(0);
                 const data_type = self.result.column_types[i];
                 const nominal = if (@hasDecl(DB.Result, "nominalColumnType")) self.result.nominalColumnType(i) else null;
-                try w.u32be(if (nominal) |identity| identity.oid else T.oid(data_type));
+                var typmod: i32 = if (@hasField(DB.Result, "column_typmods")) self.result.column_typmods[i] else -1;
+                // A composite column (B11 wave 5): its typmod is the type's OID.
+                const record_oid: ?u32 = if (data_type == .record) (if (typmod > 0) @as(u32, @intCast(typmod)) else 2249) else null;
+                if (record_oid != null) typmod = -1;
+                try w.u32be(if (nominal) |identity| identity.oid else record_oid orelse T.oid(data_type));
                 try w.u16be(@bitCast(if (nominal) |identity| identity.len else T.length(data_type)));
-                const typmod: i32 = if (@hasField(DB.Result, "column_typmods")) self.result.column_typmods[i] else -1;
                 try w.u32be(@bitCast(typmod));
                 if (portal_value) |v| {
                     if (v.format_count > 1 and v.format_count != self.result.column_count) return error.ProtocolViolation;
@@ -2547,6 +2550,8 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                 .drop_trigger => "DROP TRIGGER",
                 .create_rule => "CREATE RULE",
                 .drop_rule => "DROP RULE",
+                .create_cast => "CREATE CAST",
+                .drop_cast => "DROP CAST",
                 else => "",
             };
         }

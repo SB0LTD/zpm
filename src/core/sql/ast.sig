@@ -206,7 +206,15 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     // `integer` an XmlTableColumn). Exec reads the table's members.
     xml_call, xmltable, xmltable_namespace, xmltable_column,
     // pg_function_is_visible(oid) and version() (B11 wave 5 catalog lane).
-    pg_function_is_visible, version };
+    pg_function_is_visible, version,
+    // row_to_json(record [, pretty]) (B11 wave 5, composite lane).
+    row_to_json,
+    // Set-returning built-ins in a select list (ProjectSet, B11 wave 5
+    // composite lane): generate_series (`integer`: 0 integer, 1 numeric,
+    // 2 timestamp series), unnest and generate_subscripts.
+    srf_series, srf_unnest, srf_subscripts,
+    // information_schema._pg_expandarray(anyarray) -> setof (x, n).
+    srf_expandarray };
 
 /// xml_call variants (xml_eval.sig).
 pub const XmlFn = enum(u8) {
@@ -374,6 +382,13 @@ pub fn setFunction(func: Func) bool {
     return func == .regexp_matches or func == .regexp_split_to_table or func == .jsonb_path_query;
 }
 
+/// A set-returning call a select list expands (ProjectSet): the built-ins,
+/// and user set-returning routines (`boolean`).
+pub fn selectSetCall(n: *const Node) bool {
+    if (n.kind != .function) return false;
+    return setFunction(n.func) or n.func == .srf_series or n.func == .srf_unnest or n.func == .srf_subscripts or n.func == .srf_expandarray or (n.func == .routine and n.boolean);
+}
+
 /// Cast typmods marking `::regclass` / `::regtype` (OID-valued casts).
 pub const regclass_typmod: i32 = -2;
 pub const regtype_typmod: i32 = -3;
@@ -493,6 +508,11 @@ pub const NodeKind = enum {
     /// a`) or marked VARIADIC (`integer` 1; `name` empty when positional).
     /// Only user routine calls accept it; binding unwraps it (B11 wave 4).
     named_argument,
+    /// `(a).name` or `(a).*` on a composite value (B11 wave 5, composite
+    /// lane): `a` is the record, `name` the field (`star` for `.*`, which
+    /// only a select list expands). Binding sets `integer` to the field's
+    /// 0-based index and `ty` / `typmod` to its type.
+    field_select,
 };
 
 /// Children by kind: unary/not/test/cast `a`; binary/and/or/nullif `a`,`b`;
@@ -681,6 +701,10 @@ pub fn Ast(comptime config: types.Config) type {
             serial: u32 = 0,
             /// GENERATED ALWAYS AS (expr) VIRTUAL (or without STORED).
             virtual: bool = false,
+            /// A user type name (`type_name` .record until binding resolves
+            /// it to a composite type; B11 wave 5, composite lane).
+            user_type: Ident = .{},
+            user_type_schema: Ident = .{},
         };
 
         /// ALTER SEQUENCE [IF EXISTS] name options (RESTART included).

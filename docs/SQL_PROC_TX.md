@@ -120,14 +120,21 @@ PostgreSQL's values:
 - **Cost.** Values are built from the parent row's as rows are generated,
   and only when the statement reads them (or a UNION compares them).
 
+Since the composite lane (B11 wave 5, docs/SQL_ROUTINES.md) the BREADTH
+FIRST sequence is an ordinary anonymous record value (a record cell of the
+depth and the search columns): record comparisons, ordering (record_cmp)
+and min / max apply to it like any record (its fields are f1, f2, ... here,
+where PostgreSQL names them). record[] (DEPTH FIRST sequences and CYCLE paths) keeps the text
+form above as the only pseudo-type.
+
 Not PostgreSQL's, each an error rather than a different answer: ordering
-by a sequence or path value that passed through a derived table, a set
-operation, grouping or DISTINCT, or by a path whose cycle columns have no
-key (numeric, ...) is 0A000; record / record[] operators and functions
-(`o > ARRAY[ROW(1)]`, `ROW(2) = ANY(path)`, cardinality, `||`, min / max,
-json_agg) are 0A000 or 42883; a value longer than a text value
-(Config.text_bytes) is 54000. A VALUES non-recursive term is 0A000 as
-before.
+by a record[] value that passed through a derived table, a set operation,
+grouping or DISTINCT, or by a path whose cycle columns have no key
+(numeric, ...) is 0A000; record[] operators and functions (`o >
+ARRAY[ROW(1)]`, `ROW(2) = ANY(path)`, cardinality, `||`, json_agg) are
+0A000 or 42883 (arrays of records do not exist yet); a value longer than a
+text value (Config.text_bytes) is 54000. A VALUES non-recursive term is
+0A000 as before.
 
 ## Engine and store changes
 

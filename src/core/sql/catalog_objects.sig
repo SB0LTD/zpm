@@ -444,7 +444,9 @@ pub const LargeObjectDefaults = struct {
 };
 pub const CreateEnum = struct { name: Qualified, labels: Span };
 pub const CreateComposite = struct { name: Qualified, fields: Span };
-pub const DropTypes = struct { names: [list_capacity]Qualified = @splat(.{}), count: usize = 0, if_exists: bool = false };
+pub const DropTypes = struct { names: [list_capacity]Qualified = @splat(.{}), count: usize = 0, if_exists: bool = false,
+    /// DROP TYPE ... CASCADE (composite lane: dependents decide).
+    cascade: bool = false };
 
 pub const Statement = union(enum) {
     create_role: RoleSpec,
@@ -787,9 +789,9 @@ const Parser = struct {
             drop.count += 1;
             if (!try self.takeSymbol(.comma)) break;
         }
-        // These objects have no optional dependents. Type arrays and enum
-        // labels always follow the owning type.
-        _ = try self.dropBehavior();
+        // Type arrays and enum labels always follow the owning type;
+        // composite columns and routines decide on CASCADE (composite lane).
+        drop.cascade = try self.dropBehavior();
         try self.finish();
         return drop;
     }
@@ -2241,6 +2243,7 @@ pub fn Objects(comptime config: types.Config) type {
                 const offset = bytes.len - fields.bytes.len;
                 const field = fields.next().?;
                 const data_type = types.typeFromOid(field.oid) orelse return error.InvalidChangeRecord;
+                if (data_type == .record) return error.InvalidChangeRecord;
                 if (!types.validTypeTypmod(config, data_type, field.typmod)) return error.InvalidChangeRecord;
                 for (field.name) |byte| if (byte == 0) return error.InvalidChangeRecord;
                 var earlier: CompositeFields = .{ .bytes = bytes[0..offset] };
@@ -2363,6 +2366,11 @@ pub fn Objects(comptime config: types.Config) type {
             fn liveOid(self: *const Overlay, kind: Kind, oid: u32) bool {
                 for (&self.items) |*v| if (v.live and v.kind == kind and v.oid == oid) return true;
                 return false;
+            }
+
+            /// A live composite type (B11 wave 5: composite table columns).
+            pub fn compositeLive(self: *const Overlay, oid: u32) bool {
+                return self.liveOid(.composite_type, oid);
             }
 
             /// Op 70 against the overlay. `ctx` answers objectTableLive,

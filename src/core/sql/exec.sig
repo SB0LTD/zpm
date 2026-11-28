@@ -617,8 +617,111 @@ pub fn Exec(comptime config: types.Config) type {
                     .regexp_matches, .regexp_split_to_table => regex_eval.RegexEval(config, E).rows(ctx, n, sink),
                     .jsonb_path_query => json_eval.JsonEval(config, E).pathRows(ctx, n, sink.context, sink.row),
                     .routine => routineSetRows(ctx, n, sink),
+                    .srf_series => seriesSetRows(ctx, n, sink),
+                    .srf_unnest => unnestSetRows(ctx, n, sink),
+                    .srf_subscripts => subscriptSetRows(ctx, n, sink),
+                    .srf_expandarray => expandArraySetRows(ctx, n, sink),
                     else => error.UnsupportedStatement,
                 };
+            }
+
+            /// generate_series in a select list (as in FROM: a NULL argument
+            /// yields no value, a zero step is 22023, an integer series stops
+            /// at its type's range, numeric NaN / infinity is 22023).
+            fn seriesSetRows(ctx: *const E.Context, call: *const ast.Node, sink: regex_eval.RegexEval(config, E).Sink) Error!void {
+                var args: [3]V.Cell = undefined;
+                var count: usize = 0;
+                var arg = call.b;
+                while (arg != none) : (arg = ctx.pool.nodes[arg].next) {
+                    if (count == 3) return error.UndefinedFunction;
+                    args[count] = try E.eval(ctx, arg);
+                    count += 1;
+                }
+                for (args[0..count]) |cell| if (cell == .null_value) return;
+                const series: B.Series = @enumFromInt(call.integer);
+                var one: numeric_module.Numeric = .{};
+                one.setCoef(1);
+                const step: V.Cell = if (count == 3) args[2] else if (series == .numeric) .{ .numeric = one } else .{ .integer = 1 };
+                var direction: i8 = 0;
+                switch (series) {
+                    .integer => direction = if (step.integer > 0) 1 else if (step.integer < 0) -1 else 0,
+                    .numeric => {
+                        for ([_]*const V.Cell{ &args[0], &args[1], &step }) |cell| {
+                            if (cell.numeric.special != .finite) return error.InvalidParameterValue;
+                        }
+                        direction = if (step.numeric.isZero()) 0 else if (step.numeric.negative) -1 else 1;
+                    },
+                    .timestamp => {
+                        const zero: V.Cell = .{ .interval = .{} };
+                        direction = V.compare(&step, &zero);
+                    },
+                    else => return error.UnsupportedStatement,
+                }
+                if (direction == 0) return error.InvalidParameterValue;
+                var current = args[0];
+                while (true) {
+                    try ctx.session.checkpoint();
+                    const order = V.compare(&current, &args[1]);
+                    if ((direction > 0 and order > 0) or (direction < 0 and order < 0)) break;
+                    if (!try sink.row(sink.context, &current)) return;
+                    switch (series) {
+                        .integer => {
+                            const next = @addWithOverflow(current.integer, step.integer);
+                            if (next[1] != 0) break;
+                            if (call.ty == .int4 and (next[0] > 2147483647 or next[0] < -2147483648)) break;
+                            current = .{ .integer = next[0] };
+                        },
+                        else => current = try Io.arithmetic(.add, &current, &step, call.ty, ctx.session),
+                    }
+                }
+            }
+
+            /// unnest(array | multirange) in a select list: its elements.
+            fn unnestSetRows(ctx: *const E.Context, call: *const ast.Node, sink: regex_eval.RegexEval(config, E).Sink) Error!void {
+                var value = try E.eval(ctx, call.b);
+                if (value == .null_value) return;
+                if (value == .multirange) value = try types_ext_eval.TypesExt(config, E).rangesArray(&value);
+                var reader = V.Arrays.Reader.init(value.array.slice());
+                var element: V.Cell = undefined;
+                while (reader.next(&element)) {
+                    try ctx.session.checkpoint();
+                    if (!try sink.row(sink.context, &element)) return;
+                }
+            }
+
+            /// information_schema._pg_expandarray(anyarray) in a select list:
+            /// per element (every dimension, in storage order) the record
+            /// (x, n), n counting from 1, as PostgreSQL 18's unnest WITH
+            /// ORDINALITY body; a NULL array yields nothing (STRICT).
+            fn expandArraySetRows(ctx: *const E.Context, call: *const ast.Node, sink: regex_eval.RegexEval(config, E).Sink) Error!void {
+                const value = try E.eval(ctx, call.b);
+                if (value == .null_value) return;
+                if (value != .array) return error.TypeMismatch;
+                const element_type = types.dataTypeOf(call.cast_type);
+                var reader = V.Arrays.Reader.init(value.array.slice());
+                var element: V.Cell = undefined;
+                var ordinal: i64 = 0;
+                while (reader.next(&element)) {
+                    try ctx.session.checkpoint();
+                    ordinal += 1;
+                    var out: V.Text = .{};
+                    var builder = try V.Records.Builder.begin(&out, types.record_oid);
+                    try builder.append(element_type, -1, &element);
+                    try builder.append(.integer, -1, &.{ .integer = ordinal });
+                    const cell: V.Cell = .{ .record = out };
+                    if (!try sink.row(sink.context, &cell)) return;
+                }
+            }
+
+            /// generate_subscripts(array, dim [, reverse]) in a select list.
+            fn subscriptSetRows(ctx: *const E.Context, call: *const ast.Node, sink: regex_eval.RegexEval(config, E).Sink) Error!void {
+                var query: Query = undefined;
+                var series = try query.subscriptSeries(call, ctx);
+                while (series.next()) |value| {
+                    try ctx.session.checkpoint();
+                    const cell: V.Cell = .{ .integer = value };
+                    if (!try sink.row(sink.context, &cell)) return;
+                }
             }
 
             /// A user set-returning function in a select list (B11 wave 5):
@@ -1248,6 +1351,9 @@ pub fn Exec(comptime config: types.Config) type {
             // ---- projection and grouping -------------------------------
 
             fn projectRow(self: *Query, p: *const B.Plan, ctx: *E.Context, out: *List) Error!void {
+                // A grouped select list with set-returning calls (ProjectSet
+                // over the groups; composite lane).
+                if (p.unnest_column != none) return self.projectSets(p, ctx, out, 0xffffffffffffffff);
                 const at = try self.cells(p.width);
                 try self.writeProjection(p, ctx, at);
                 try self.push(out, at);
@@ -1272,87 +1378,77 @@ pub fn Exec(comptime config: types.Config) type {
                     self.setTuple(p, &ctx, &tuple_rows, tuples, index);
                     if (p.unnest_column == none) {
                         try self.projectRow(p, &ctx, &out);
-                    } else if (p.set_call != none) {
-                        try self.projectSet(p, &ctx, &out, if (lazy) wanted else 0xffffffffffffffff);
-                    } else {
-                        try self.projectUnnest(p, &ctx, &out, if (lazy) wanted else 0xffffffffffffffff);
-                    }
+                    } else try self.projectSets(p, &ctx, &out, if (lazy) wanted else 0xffffffffffffffff);
                 }
                 return out;
             }
 
-            /// A select list with a set-returning call (wave 4 text-json):
-            /// one output row per produced value, every target evaluated
-            /// with the call reading that value.
-            fn projectSet(self: *Query, p: *const B.Plan, ctx: *const E.Context, out: *List, wanted: u64) Error!void {
-                const Emit = struct {
+            /// ProjectSet (B11 wave 5, composite lane; PostgreSQL 10+): every
+            /// set-returning call of the select list runs once per input row
+            /// and their values are zipped, the longest deciding the row count
+            /// and exhausted calls yielding NULL; each output row evaluates the
+            /// targets with every call reading its current value. The values
+            /// are chained in workspace cells (value, next) so producers may
+            /// use the workspace in between.
+            fn projectSets(self: *Query, p: *const B.Plan, ctx: *const E.Context, out: *List, wanted: u64) Error!void {
+                if (out.count >= wanted) return;
+                const Chain = struct { head: u32 = no_cell, tail: u32 = no_cell, length: u64 = 0 };
+                const Collector = struct {
                     query: *Query,
-                    plan: *const B.Plan,
-                    context: *const E.Context,
-                    out: *List,
-                    wanted: u64,
+                    chain: *Chain,
                     fn row(raw: *anyopaque, cell: *const V.Cell) Error!bool {
                         const state: *@This() = @ptrCast(@alignCast(raw));
-                        if (state.out.count >= state.wanted) return false;
-                        try state.query.session.checkpoint();
-                        var inner = state.context.*;
-                        inner.set_value = cell;
-                        const at = try state.query.cells(state.plan.width);
-                        for (state.plan.targets[0..state.plan.width], 0..) |id, column| {
-                            state.query.work.cells[at + column] = if (!state.plan.required[column]) .null_value else try E.eval(&inner, id);
-                        }
-                        try state.query.push(state.out, at);
+                        const query = state.query;
+                        const at = try query.cells(2);
+                        query.work.cells[at] = cell.*;
+                        query.work.cells[at + 1] = .{ .integer = -1 };
+                        if (state.chain.tail == no_cell) state.chain.head = at else query.work.cells[state.chain.tail + 1] = .{ .integer = at };
+                        state.chain.tail = at;
+                        state.chain.length += 1;
                         return true;
                     }
                 };
-                if (out.count >= wanted) return;
-                var producer: Emit = .{ .query = self, .plan = p, .context = ctx, .out = out, .wanted = wanted };
-                try setRows(ctx, p.set_call, .{ .context = &producer, .row = Emit.row });
-            }
-
-            /// Top-level set-returning targets (B11 wave 4: several, in
-            /// lockstep): unnest(array) and generate_subscripts. The row
-            /// count is the longest; exhausted ones yield NULL.
-            fn projectUnnest(self: *Query, p: *const B.Plan, ctx: *const E.Context, out: *List, wanted: u64) Error!void {
-                const Srf = struct { reader: V.Arrays.Reader = .{ .bytes = &.{}, .element = .integer, .at = 0, .total = 0 }, series: SubscriptSeries = .{}, subscripts: bool = false };
-                var states: [types.projectionColumns(config)]Srf = undefined;
-                var longest: usize = 0;
-                for (p.targets[0..p.count], 0..) |id, column| {
-                    if (!p.srf_set.isSet(column)) continue;
-                    const call = &self.pool.nodes[id];
-                    states[column] = .{};
-                    if (call.integer == 1) {
-                        states[column].subscripts = true;
-                        states[column].series = try self.subscriptSeries(call, ctx);
-                        longest = @max(longest, states[column].series.remaining);
-                        continue;
-                    }
-                    const slot = try self.cells(1);
-                    self.work.cells[slot] = try E.eval(ctx, call.b);
-                    if (self.work.cells[slot] == .multirange) self.work.cells[slot] = try types_ext_eval.TypesExt(config, E).rangesArray(&self.work.cells[slot]);
-                    const value = &self.work.cells[slot];
-                    if (value.* != .null_value) states[column].reader = V.Arrays.Reader.init(value.array.slice());
-                    longest = @max(longest, states[column].reader.total);
+                const count = p.set_call_count;
+                var chains: [types.projectionColumns(config)]Chain = undefined;
+                var longest: u64 = 0;
+                for (p.set_calls[0..count], 0..) |call, index| {
+                    chains[index] = .{};
+                    var collector: Collector = .{ .query = self, .chain = &chains[index] };
+                    try setRows(ctx, call, .{ .context = &collector, .row = Collector.row });
+                    longest = @max(longest, chains[index].length);
                 }
-                var produced: usize = 0;
-                while (out.count < wanted and produced < longest) : (produced += 1) {
+                var cursors: [types.projectionColumns(config)]u32 = undefined;
+                var slots: [types.projectionColumns(config)]E.SetValue = undefined;
+                // The current values live in workspace cells (wide cells stay
+                // off the stack).
+                const current = try self.cells(count);
+                for (0..count) |index| {
+                    cursors[index] = chains[index].head;
+                    slots[index] = .{ .node = p.set_calls[index], .value = &self.work.cells[current + index] };
+                }
+                var inner = ctx.*;
+                inner.set_values = slots[0..count];
+                var produced: u64 = 0;
+                while (produced < longest and out.count < wanted) : (produced += 1) {
                     try self.session.checkpoint();
-                    const at = try self.cells(p.width);
-                    for (p.targets[0..p.width], 0..) |id, column| {
-                        if (column < p.count and p.srf_set.isSet(column)) {
-                            const state = &states[column];
-                            var element: V.Cell = .null_value;
-                            if (state.subscripts) {
-                                if (state.series.next()) |value| element = .{ .integer = value };
-                            } else if (!state.reader.next(&element)) element = .null_value;
-                            self.work.cells[at + column] = if (p.required[column]) element else .null_value;
+                    for (0..count) |index| {
+                        if (cursors[index] == no_cell) {
+                            self.work.cells[current + index] = .null_value;
                             continue;
                         }
-                        self.work.cells[at + column] = if (!p.required[column]) .null_value else try E.eval(ctx, id);
+                        self.work.cells[current + index] = self.work.cells[cursors[index]];
+                        const next = self.work.cells[cursors[index] + 1].integer;
+                        cursors[index] = if (next < 0) no_cell else @intCast(next);
+                    }
+                    const at = try self.cells(p.width);
+                    for (p.targets[0..p.width], 0..) |id, column| {
+                        self.work.cells[at + column] = if (!p.required[column]) .null_value else try E.eval(&inner, id);
                     }
                     try self.push(out, at);
                 }
             }
+
+            const no_cell: u32 = 0xffffffff;
 
             /// Keep the selected cells of simple catalog scans. The candidate
             /// view row belongs to the caller and only lives for one sink call.
@@ -5126,7 +5222,7 @@ pub fn Exec(comptime config: types.Config) type {
             }
 
             fn core(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!List {
-                if (p.unnest_column != none) {
+                if (p.unnest_column != none and !p.grouped) {
                     const tuples = try self.join(p, outer);
                     return self.finish(p, try self.project(p, tuples, outer));
                 }
@@ -5522,13 +5618,25 @@ pub fn Exec(comptime config: types.Config) type {
                         for (definition.search_columns[0..definition.search_count]) |column| try appendKeyCell(&key, &row_cells[column]);
                         row_cells[definition.ord_key_column] = .{ .text = key };
                         if (!with_ord) {} else if (definition.breadth) {
-                            var text: V.Text = .{};
-                            try self.recordText(&text, row_cells, definition.search_columns[0..definition.search_count], depth);
-                            row_cells[definition.ord_column] = .{ .text = text };
+                            row_cells[definition.ord_column] = try self.breadthRecord(definition, row_cells, depth);
                         } else try self.recordPath(definition, row_cells, parent, definition.ord_column, definition.search_columns[0..definition.search_count]);
                     }
                     if (seed) row_cells[link] = .null_value;
                 }
+            }
+
+            /// BREADTH FIRST's sequence value: an anonymous record of the
+            /// depth (bigint) and the search columns (a record cell, B11
+            /// wave 5 composite lane).
+            noinline fn breadthRecord(self: *Query, definition: *const B.CteDef, row_cells: []const V.Cell, depth: i64) Error!V.Cell {
+                const tys = &self.plans.items[definition.plan].tys;
+                var out: V.Text = .{};
+                var builder = try V.Records.Builder.begin(&out, types.record_oid);
+                try builder.append(.integer, -1, &.{ .integer = depth });
+                for (definition.search_columns[0..definition.search_count]) |column| {
+                    try builder.append(types.dataTypeOf(tys[column]), -1, &row_cells[column]);
+                }
+                return .{ .record = out };
             }
 
             /// A record[] path value: the parent's elements, then this row's

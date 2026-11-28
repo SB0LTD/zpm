@@ -108,14 +108,16 @@ fn corruptRecords(existing_relation_oid: u32) !void {
     try durable("DROP TYPE secondary");
 }
 
+/// A composite value is a record column whose typmod is the type's OID
+/// (B11 wave 5, composite lane); its text is record_out's.
 fn recordText(db: *DB, statement: []const u8, expected: []const u8, name: []const u8) !void {
     try db.execute(statement, &result);
     try check(result.row_count == 1 and result.column_count == 1 and equal(result.column_names[0].slice(), name));
-    const identity = result.nominalColumnType(0).?;
-    try check(identity.oid >= sql.change_records.first_oid and identity.len == -1 and identity.representation == .flat_record);
-    var out: [256]u8 = undefined;
-    const len = (try result.formatNominalText(0, &result.rows[0].cells[0], &out)).?;
-    try check(equal(out[0..len], expected));
+    try check(result.column_types[0] == .record and result.column_typmods[0] == -1);
+    try check(result.nominalColumnType(0).?.oid >= sql.change_records.first_oid);
+    try check(result.rows[0].cells[0] == .record);
+    try result.textify(DB.Result.default_session);
+    try check(result.column_types[0] == .text and equal(result.rows[0].cells[0].text.slice(), expected));
 }
 
 fn flatRecordContracts() !void {
@@ -123,19 +125,13 @@ fn flatRecordContracts() !void {
     try durable("CREATE TYPE narrow_fields AS (s SMALLINT, l BIGINT, b BOOLEAN)");
     for ([_]*DB{ &primary, &restored }) |db| {
         try recordText(db, "SELECT ROW(1,'x')::pair", "(1,x)", "row");
-        const binary =
-            "\x00\x00\x00\x02" ++
-            "\x00\x00\x00\x17\x00\x00\x00\x04\x00\x00\x00\x01" ++
-            "\x00\x00\x00\x19\x00\x00\x00\x01x";
-        try check(equal(result.rows[0].cells[0].bytea.slice(), binary));
         try recordText(db, "SELECT ROW(NULL,'')::pair", "(,\"\")", "row");
         try recordText(db, "SELECT ROW(-7,' a,b()\"\\ ')::pair", "(-7,\" a,b()\"\"\\\\ \")", "row");
         try recordText(db, "SELECT ROW(-32768,-9223372036854775808,TRUE)::narrow_fields", "(-32768,-9223372036854775808,t)", "row");
         try recordText(db, "SELECT ROW('003','nice')::pair", "(3,nice)", "row");
-        try result.textify(DB.Result.default_session);
-        try check(result.nominalColumnType(0) == null and result.column_types[0] == .text and equal(result.rows[0].cells[0].text.slice(), "(3,nice)"));
+        try recordText(db, "SELECT ROW(1+2,'x')::pair", "(3,x)", "row");
         try db.execute("SELECT CAST(NULL AS pair)", &result);
-        try check(result.rows[0].cells[0] == .null_value and result.nominalColumnType(0).?.representation == .flat_record);
+        try check(result.rows[0].cells[0] == .null_value and result.column_types[0] == .record and result.nominalColumnType(0).?.oid >= sql.change_records.first_oid);
         try check(equal(result.column_names[0].slice(), "pair"));
         try db.execute("DECLARE records CURSOR WITH HOLD FOR SELECT ROW(1,'x')::pair", &result);
         try recordText(db, "FETCH NEXT FROM records", "(1,x)", "row");
@@ -145,9 +141,8 @@ fn flatRecordContracts() !void {
     try rejects("SELECT ROW(1,'x',NULL)::pair", error.CannotCoerce);
     try rejects("SELECT ROW('invalid','x')::pair", error.InvalidTextRepresentation);
     try rejects("SELECT ROW(32768,1,TRUE)::narrow_fields", error.NumericValueOutOfRange);
-    try rejects("SELECT ROW(1+2,'x')::pair", error.UnsupportedStatement);
-    try rejects("SELECT ROW(1,'x')::pair::TEXT", error.UnsupportedStatement);
-    try rejects("SELECT ROW(1,'x')::pair = ROW(1,'x')::pair", error.UnsupportedStatement);
+    try primary.execute("SELECT ROW(1,'x')::pair::TEXT, ROW(1,'x')::pair = ROW(1,'x')::pair", &result);
+    try check(equal(result.rows[0].cells[0].text.slice(), "(1,x)") and result.rows[0].cells[1].boolean);
 }
 
 fn contract() !void {
@@ -175,8 +170,13 @@ fn contract() !void {
     try rejects("CREATE TYPE collated AS (x TEXT COLLATE \"C\")", error.UnsupportedStatement);
     try rejects("CREATE DOMAIN coords.\"Point\" AS INT", error.DuplicateObject);
     try rejects("CREATE TABLE coords.\"Point\" (id INT)", error.DuplicateObject);
-    try rejects("CREATE TABLE stored (p coords.\"Point\")", error.UnsupportedStatement);
-    try rejects("SELECT ROW(1, 2, NULL, NULL, NULL, NULL)::coords.\"Point\"", error.UnsupportedStatement);
+    // Composite columns and values of every field type (composite lane).
+    try durable("CREATE TABLE stored (p coords.\"Point\")");
+    try rejects("DROP TYPE coords.\"Point\"", error.DependentObjects);
+    try durable("DROP TABLE stored");
+    try primary.execute("SELECT ROW(1, 2, NULL, NULL, NULL, NULL)::coords.\"Point\"", &result);
+    try result.textify(DB.Result.default_session);
+    try check(equal(result.rows[0].cells[0].text.slice(), "(1,2,,,,)"));
     try rejects("ALTER TYPE coords.\"Point\" ADD ATTRIBUTE note2 TEXT", error.UnsupportedStatement);
     try rejects("DROP DOMAIN coords.\"Point\"", error.WrongObjectType);
     try rejects("DROP ROLE coordinates_owner", error.DependentObjects);

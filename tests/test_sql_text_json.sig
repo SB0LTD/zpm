@@ -326,11 +326,11 @@ fn regularExpressions() !void {
 
     // Errors: options and positions are 22023, patterns 2201B; set-returning
     // calls in WHERE, CASE, COALESCE or an aggregate are 0A000 as in
-    // PostgreSQL. Two of them in one select list are 0A000 here only
-    // (PostgreSQL expands them in lockstep: {a}|{b}).
+    // PostgreSQL. Two of them in one select list run in lockstep (ProjectSet,
+    // B11 wave 5 composite lane).
     try rejects("SELECT regexp_matches('a', 'a') FROM rxf WHERE regexp_matches(s, 'a') IS NULL", error.UnsupportedStatement);
     try rejects("SELECT 1 FROM rxf WHERE regexp_split_to_table(s, ',') = 'a'", error.UnsupportedStatement);
-    try rejects("SELECT regexp_matches('a', 'a'), regexp_matches('b', 'b')", error.UnsupportedStatement);
+    try rows("SELECT regexp_matches('a', 'a'), regexp_matches('b', 'b')", "{a}|{b}");
     try rejects("SELECT CASE WHEN true THEN regexp_matches('a', 'a') END", error.UnsupportedStatement);
     try rejects("SELECT COALESCE(regexp_split_to_table('a', ','), 'x')", error.UnsupportedStatement);
     try rejects("SELECT count(regexp_split_to_table('a', ','))", error.UnsupportedStatement);

@@ -50,14 +50,29 @@ pub fn Routines(comptime config: types.Config) type {
         /// (B11 wave 5; never stored: it is 58P01).
         const c_language: u8 = 2;
 
-        pub const Kind = enum { create_function, create_procedure, drop_function, drop_procedure, call, do_block, create_trigger, drop_trigger, create_rule, drop_rule, grant_execute, revoke_execute, alter_function, alter_procedure };
+        pub const Kind = enum { create_function, create_procedure, drop_function, drop_procedure, call, do_block, create_trigger, drop_trigger, create_rule, drop_rule, grant_execute, revoke_execute, alter_function, alter_procedure,
+            // B11 wave 5 (composite lane).
+            create_cast, drop_cast };
 
         /// A byte range of the statement source.
         pub const Span = struct { start: usize = 0, end: usize = 0 };
 
         /// A declared parameter: its mode ('i' IN, 'o' OUT, 'b' INOUT, 'v'
         /// VARIADIC, 't' a RETURNS TABLE column) and DEFAULT text.
-        pub const Arg = struct { name: Name = .{}, oid: u32 = 0, typmod: i32 = -1, mode: u8 = 'i', default: Span = .{} };
+        pub const Arg = struct { name: Name = .{}, oid: u32 = 0, typmod: i32 = -1, mode: u8 = 'i', default: Span = .{},
+            /// A user type name (B11 wave 5, composite lane): `oid` is 0
+            /// until CREATE resolves it to a composite type.
+            user_type: UserType = .{} };
+
+        /// A composite type named in a DECLARE: its OID and where the name ends.
+        pub const UserTypeAt = struct { oid: u32, end: usize };
+
+        /// `[schema.]name` of a user type, resolved when the statement runs.
+        pub const UserType = struct { name: Name = .{}, schema: Name = .{}, has_schema: bool = false,
+            pub fn named(self: *const UserType) bool {
+                return self.name.len != 0;
+            }
+        };
 
         pub fn inputMode(mode: u8) bool {
             return mode == 'i' or mode == 'b' or mode == 'v';
@@ -101,6 +116,9 @@ pub fn Routines(comptime config: types.Config) type {
             setof_table: TableName = .{},
             /// The TABLE columns came from that table (not variables).
             rowtype: bool = false,
+            /// RETURNS [SETOF] a user type name (B11 wave 5, composite lane),
+            /// resolved at CREATE: a composite type, or for SETOF a table.
+            return_user: UserType = .{},
 
             /// The input types (the routine's signature).
             pub fn argOids(self: *const CreateRoutine, out: *[config.routine_args]u32) []const u32 {
@@ -132,6 +150,8 @@ pub fn Routines(comptime config: types.Config) type {
             has_args: bool = false,
             args: [config.routine_args]u32 = @splat(0),
             arg_count: usize = 0,
+            /// User type names of `args` (0 OIDs until resolved; B11 wave 5).
+            arg_users: [config.routine_args]UserType = @splat(.{}),
         };
 
         pub const Call = struct {
@@ -164,6 +184,21 @@ pub fn Routines(comptime config: types.Config) type {
         };
 
         pub const DoBlock = struct { body: Text = .{} };
+
+        /// CREATE CAST (source AS target) {WITH FUNCTION f[(args)] | WITHOUT
+        /// FUNCTION | WITH INOUT} [AS ASSIGNMENT | AS IMPLICIT] (B11 wave 5).
+        pub const CreateCast = struct {
+            source: Arg = .{},
+            target: Arg = .{},
+            /// 'f' WITH FUNCTION, 'i' WITH INOUT, 'b' WITHOUT FUNCTION.
+            method: u8 = 'f',
+            function: DropRoutine = .{},
+            /// 'e' explicit, 'a' AS ASSIGNMENT, 'i' AS IMPLICIT.
+            context: u8 = 'e',
+        };
+
+        /// DROP CAST [IF EXISTS] (source AS target) [CASCADE | RESTRICT].
+        pub const DropCast = struct { source: Arg = .{}, target: Arg = .{}, if_exists: bool = false, cascade: bool = false };
 
         pub const TableName = struct { schema: Name = .{}, name: Name = .{} };
 
@@ -227,6 +262,8 @@ pub fn Routines(comptime config: types.Config) type {
             revoke_execute: ExecuteGrant,
             alter_function: AlterOwner,
             alter_procedure: AlterOwner,
+            create_cast: CreateCast,
+            drop_cast: DropCast,
         };
 
         // ---- tokens -------------------------------------------------------
@@ -384,7 +421,62 @@ pub fn Routines(comptime config: types.Config) type {
             if (cursor.is("trigger")) return if (create) .create_trigger else .drop_trigger;
             if (cursor.is("constraint") and create) return .create_trigger;
             if (cursor.is("rule")) return if (create) .create_rule else .drop_rule;
+            if (cursor.is("cast")) return if (create) .create_cast else .drop_cast;
             return null;
+        }
+
+        /// `(source AS target)` of CREATE / DROP CAST.
+        fn castTypes(cursor: *Cursor, pool: anytype, source: *Arg, target: *Arg) Error!void {
+            try cursor.expectSymbol(.lparen);
+            source.* = try typeOrUser(cursor, pool);
+            try cursor.expect("as");
+            target.* = try typeOrUser(cursor, pool);
+            try cursor.expectSymbol(.rparen);
+        }
+
+        fn createCast(cursor: *Cursor, pool: anytype, out: *CreateCast) Error!void {
+            out.* = .{};
+            try cursor.expect("create");
+            try cursor.expect("cast");
+            try castTypes(cursor, pool, &out.source, &out.target);
+            if (try cursor.take("without")) {
+                try cursor.expect("function");
+                out.method = 'b';
+            } else {
+                try cursor.expect("with");
+                if (try cursor.take("inout")) {
+                    out.method = 'i';
+                } else {
+                    try cursor.expect("function");
+                    out.method = 'f';
+                    out.function.name = try qualifiedName(cursor, &out.function.has_schema, &out.function.schema);
+                    try routineSignature(cursor, pool, &out.function);
+                }
+            }
+            if (try cursor.take("as")) {
+                if (try cursor.take("assignment")) {
+                    out.context = 'a';
+                } else {
+                    try cursor.expect("implicit");
+                    out.context = 'i';
+                }
+            }
+            try finish(cursor);
+        }
+
+        fn dropCast(cursor: *Cursor, pool: anytype, out: *DropCast) Error!void {
+            out.* = .{};
+            try cursor.expect("drop");
+            try cursor.expect("cast");
+            if (try cursor.take("if")) {
+                try cursor.expect("exists");
+                out.if_exists = true;
+            }
+            try castTypes(cursor, pool, &out.source, &out.target);
+            if (try cursor.take("cascade")) {
+                out.cascade = true;
+            } else _ = try cursor.take("restrict");
+            try finish(cursor);
         }
 
         // ---- routine statements -------------------------------------------
@@ -407,6 +499,25 @@ pub fn Routines(comptime config: types.Config) type {
             return cursor.current.kind == .word;
         }
 
+        /// A built-in type, else a user type name (B11 wave 5, composite
+        /// lane: CREATE resolves it). No arrays of user types.
+        fn typeOrUser(cursor: *Cursor, pool: anytype) Error!Arg {
+            const before = cursor.*;
+            if (typeAt(cursor, pool)) |typed| return typed else |err| {
+                if (before.current.kind != .word and before.current.kind != .quoted_word) return err;
+                cursor.* = before;
+                var out: Arg = .{};
+                out.user_type.name = cursor.identifier() catch return err;
+                if (try cursor.takeSymbol(.dot)) {
+                    out.user_type.has_schema = true;
+                    out.user_type.schema = out.user_type.name;
+                    out.user_type.name = try cursor.identifier();
+                }
+                if (cursor.symbol(.lbracket) or cursor.symbol(.lparen)) return error.UnsupportedStatement;
+                return out;
+            }
+        }
+
         /// `[IN | OUT | INOUT | VARIADIC] [name] type [{DEFAULT | =} expr]`
         /// (a DEFAULT only where `defaults` allows it: CREATE).
         fn argument(cursor: *Cursor, pool: anytype, named: bool, defaults: bool) Error!Arg {
@@ -422,11 +533,11 @@ pub fn Routines(comptime config: types.Config) type {
             if (named) {
                 // `name type` unless the first word is the whole type.
                 var probe = cursor.*;
-                const typed = typeAt(&probe, pool) catch null;
+                const typed = typeOrUser(&probe, pool) catch null;
                 const alone = if (typed != null) (probe.symbol(.comma) or probe.symbol(.rparen) or probe.is("default") or probe.symbol(.eq)) else false;
                 if (!alone) name = try cursor.identifier();
             }
-            var out = try typeAt(cursor, pool);
+            var out = try typeOrUser(cursor, pool);
             out.name = name;
             out.mode = mode;
             if (cursor.is("default") or cursor.symbol(.eq)) {
@@ -555,9 +666,10 @@ pub fn Routines(comptime config: types.Config) type {
                         while (true) {
                             if (out.arg_count == config.routine_args) return error.ColumnCapacity;
                             var column: Arg = .{ .mode = 't', .name = try cursor.identifier() };
-                            const typed = try typeAt(cursor, pool);
+                            const typed = try typeOrUser(cursor, pool);
                             column.oid = typed.oid;
                             column.typmod = typed.typmod;
+                            column.user_type = typed.user_type;
                             out.args[out.arg_count] = column;
                             out.arg_count += 1;
                             if (try cursor.takeSymbol(.rparen)) break;
@@ -580,11 +692,16 @@ pub fn Routines(comptime config: types.Config) type {
                             out.return_oid = ret.oid;
                             out.return_typmod = ret.typmod;
                         } else |err| {
-                            // SETOF a relation's row type (resolved at CREATE).
-                            if (!out.retset or (before.current.kind != .word and before.current.kind != .quoted_word)) return err;
+                            // A user type, or SETOF a relation's row type
+                            // (resolved at CREATE; composite lane).
+                            if (before.current.kind != .word and before.current.kind != .quoted_word) return err;
                             cursor.* = before;
-                            out.setof_table = try tableName(cursor);
-                            out.has_setof_table = true;
+                            const named = typeOrUser(cursor, pool) catch return err;
+                            out.return_user = named.user_type;
+                            if (out.retset) {
+                                out.setof_table = .{ .schema = named.user_type.schema, .name = named.user_type.name };
+                                out.has_setof_table = true;
+                            }
                             out.return_oid = routine_catalog.record_oid;
                         }
                     }
@@ -807,6 +924,7 @@ pub fn Routines(comptime config: types.Config) type {
                         continue;
                     }
                     out.args[out.arg_count] = arg.oid;
+                    out.arg_users[out.arg_count] = arg.user_type;
                     out.arg_count += 1;
                     if (try cursor.takeSymbol(.rparen)) break;
                     try cursor.expectSymbol(.comma);
@@ -1275,6 +1393,14 @@ pub fn Routines(comptime config: types.Config) type {
                     out.* = .{ .revoke_execute = .{} };
                     try executeGrant(&cursor, pool, &out.revoke_execute, true);
                 },
+                .create_cast => {
+                    out.* = .{ .create_cast = .{} };
+                    try createCast(&cursor, pool, &out.create_cast);
+                },
+                .drop_cast => {
+                    out.* = .{ .drop_cast = .{} };
+                    try dropCast(&cursor, pool, &out.drop_cast);
+                },
             }
         }
 
@@ -1294,6 +1420,8 @@ pub fn Routines(comptime config: types.Config) type {
                 .drop_rule => .drop_rule,
                 .grant_execute => .grant,
                 .revoke_execute => .revoke,
+                .create_cast => .create_cast,
+                .drop_cast => .drop_cast,
             };
         }
 
@@ -1367,6 +1495,8 @@ pub fn Routines(comptime config: types.Config) type {
         pub const Capture = struct {
             cells: [config.columns]V.Cell = @splat(.null_value),
             tys: [config.columns]types.Type = @splat(.unknown),
+            /// Column names (a `record` INTO target's row shape).
+            names: [config.columns]Name = @splat(.{}),
             count: usize = 0,
             rows: usize = 0,
             /// Only the row count is wanted (PERFORM): no value is kept.
@@ -1426,6 +1556,8 @@ pub fn Routines(comptime config: types.Config) type {
             index: usize = 0,
             ty: types.Type = .unknown,
             typmod: i32 = -1,
+            /// A field of a composite or `record` variable (composite lane).
+            field: ?usize = null,
         };
 
         /// Exception condition names (PostgreSQL's plerrcodes.h) and the
@@ -2050,8 +2182,19 @@ pub fn Routines(comptime config: types.Config) type {
                     const c = &self.cursor;
                     const name = try c.identifier();
                     const constant = try c.take("constant");
-                    if (c.is("alias") or c.is("cursor") or c.is("record") or c.is("refcursor")) return error.UnsupportedStatement;
-                    const typed = try self.host.routineType(self.source, c.start());
+                    if (c.is("alias") or c.is("cursor") or c.is("refcursor")) return error.UnsupportedStatement;
+                    // `record` and composite types (B11 wave 5, composite
+                    // lane): a record variable takes the shape of each row.
+                    var typed: parser.Parser(config).TypeAt = undefined;
+                    if (c.is("record")) {
+                        try c.advance();
+                        typed = .{ .spec = .{ .ty = .record, .typmod = -1 }, .end = c.start() };
+                    } else if (self.host.routineType(self.source, c.start())) |builtin| {
+                        typed = builtin;
+                    } else |err| {
+                        const user = (try self.host.routineUserType(self.source, c.start())) orelse return err;
+                        typed = .{ .spec = .{ .ty = .record, .typmod = @intCast(user.oid) }, .end = user.end };
+                    }
                     self.cursor = try Cursor.init(self.source, typed.end);
                     if (self.cursor.symbol(.percent)) return error.UnsupportedStatement;
                     if (self.cursor.is("collate")) {
@@ -2115,7 +2258,7 @@ pub fn Routines(comptime config: types.Config) type {
                     if (try c.takeSymbol(.dot)) {
                         const field = try c.identifier();
                         const record: u8 = if (types.same(first.slice(), "new")) 1 else if (types.same(first.slice(), "old")) 2 else 0;
-                        if (record == 0) return error.UnsupportedStatement;
+                        if (record == 0) return self.fieldTarget(first, field, mode);
                         const table = self.frame.variables.record_table orelse {
                             if (mode == .check) return .{ .record = record };
                             return error.TableNotFound;
@@ -2133,9 +2276,108 @@ pub fn Routines(comptime config: types.Config) type {
                     return .{ .index = index, .ty = item.ty, .typmod = item.typmod };
                 }
 
+                /// `variable.field` of a composite or `record` variable.
+                fn fieldTarget(self: *Self, variable: Name, field: Name, mode: Mode) Error!Target {
+                    const index = self.frame.variables.find(variable.slice()) orelse return error.Syntax;
+                    const item = &self.frame.variables.items[index];
+                    if (item.ty != .record) return error.UnsupportedStatement;
+                    if (self.frame.constant[index]) return error.ErrorInAssignment;
+                    var fields: catalog_objects.CompositeFields = .{ .bytes = &.{} };
+                    if (item.typmod > 0) {
+                        fields.bytes = value_module.compositeLayout(self.host.routineSession(), @intCast(item.typmod)) orelse return error.UndefinedObject;
+                    } else if (item.shape != 0) {
+                        const shape = &self.frame.variables.record_shapes[item.shape - 1];
+                        fields.bytes = shape.bytes[0..shape.len];
+                    } else {
+                        // A record variable's fields are known once assigned.
+                        if (mode == .check) return .{ .index = index, .field = 0, .ty = .unknown };
+                        return error.ObjectNotInPrerequisiteState;
+                    }
+                    var position: usize = 0;
+                    while (fields.next()) |entry| : (position += 1) {
+                        if (!types.same(entry.name, field.slice())) continue;
+                        const typed = types.oidType(entry.oid, entry.typmod) orelse return error.UnsupportedStatement;
+                        return .{ .index = index, .field = position, .ty = typed.ty, .typmod = typed.typmod };
+                    }
+                    return error.ColumnNotFound;
+                }
+
+                /// The row shape of `record` variable `index`: its slot of
+                /// record_shapes (ColumnCapacity past Config.routine_records).
+                fn shapeOf(self: *Self, index: usize) Error!*B.RecordShape {
+                    const variables = &self.frame.variables;
+                    if (variables.items[index].shape == 0) {
+                        if (variables.record_shape_count == variables.record_shapes.len) return error.ColumnCapacity;
+                        variables.record_shape_count += 1;
+                        variables.items[index].shape = @intCast(variables.record_shape_count);
+                    }
+                    const shape = &variables.record_shapes[variables.items[index].shape - 1];
+                    shape.len = 0;
+                    return shape;
+                }
+
+                fn shapeAppend(shape: *B.RecordShape, name: []const u8, oid: u32, typmod: i32) Error!void {
+                    const length = 1 + name.len + 8;
+                    if (name.len == 0 or name.len > 255 or length > shape.bytes.len - shape.len) return error.ColumnCapacity;
+                    const out = shape.bytes[shape.len..][0..length];
+                    out[0] = @intCast(name.len);
+                    @memcpy(out[1..][0..name.len], name);
+                    for ([_]u32{ oid, @bitCast(typmod) }, 0..) |word, part| {
+                        for (0..4) |byte| out[1 + name.len + part * 4 + byte] = @truncate(word >> @intCast(byte * 8));
+                    }
+                    shape.len += length;
+                }
+
+                /// A `record` variable takes the shape of the record it is
+                /// given: a composite type's fields, else f1, f2, ...
+                fn takeShape(self: *Self, index: usize, value: *const V.Cell) Error!void {
+                    if (value.* != .record) return;
+                    const shape = try self.shapeOf(index);
+                    const bytes = value.record.slice();
+                    const oid = V.Records.typeOf(bytes);
+                    if (oid != types.record_oid) if (value_module.compositeLayout(self.host.routineSession(), oid)) |layout| {
+                        if (layout.len > shape.bytes.len) return error.ColumnCapacity;
+                        @memcpy(shape.bytes[0..layout.len], layout);
+                        shape.len = layout.len;
+                        return;
+                    };
+                    var reader = V.Records.Reader.init(bytes);
+                    var item: V.Records.Field = .{};
+                    var digits: [8]u8 = undefined;
+                    while (reader.next(&item)) {
+                        const name = std.fmt.bufPrint(&digits, "f{d}", .{reader.index}) catch return error.ColumnCapacity;
+                        try shapeAppend(shape, name, types.typeOid(item.data_type), item.typmod);
+                    }
+                }
+
+                /// The record a SELECT INTO gives a lone composite or `record`
+                /// target from separate columns: a composite variable's type,
+                /// or the row's own shape for a `record` variable.
+                fn rowRecord(self: *Self, place: Target, capture: *const Capture) Error!V.Cell {
+                    const item = &self.frame.variables.items[place.index];
+                    if (item.typmod > 0) return self.host.compositeOfColumns(item.typmod, capture.cells[0..capture.count], capture.tys[0..capture.count]);
+                    var out: V.Text = .{};
+                    var builder = try V.Records.Builder.begin(&out, types.record_oid);
+                    const shape = try self.shapeOf(place.index);
+                    for (0..capture.count) |column| {
+                        const ty: types.Type = if (capture.tys[column] == .unknown) .text else capture.tys[column];
+                        if (ty == .record) return error.UnsupportedStatement;
+                        try builder.append(types.dataTypeOf(ty), -1, &capture.cells[column]);
+                        try shapeAppend(shape, capture.names[column].slice(), types.typeOid(types.dataTypeOf(ty)), -1);
+                    }
+                    return .{ .record = out };
+                }
+
                 /// Stores a value already converted to the target's type.
                 fn store(self: *Self, place: Target, value: V.Cell, initializing: bool) Error!void {
                     _ = initializing;
+                    if (place.field) |field| return self.storeField(place, field, value);
+                    if (place.record == 0 and place.ty == .record and place.typmod <= 0) {
+                        // A `record` variable takes any row and its shape.
+                        try self.takeShape(place.index, &value);
+                        self.frame.cells[place.index] = value;
+                        return;
+                    }
                     const column = columnOf(place.ty, place.typmod);
                     const stored = try D.store(&column, value, self.host.routineSession());
                     switch (place.record) {
@@ -2148,11 +2390,42 @@ pub fn Routines(comptime config: types.Config) type {
                     }
                 }
 
+                /// `variable.field := value`: the record with that field
+                /// replaced (a NULL composite variable becomes a row of NULLs;
+                /// an unassigned `record` variable is 55000).
+                fn storeField(self: *Self, place: Target, field: usize, value: V.Cell) Error!void {
+                    const column = columnOf(place.ty, place.typmod);
+                    const stored = try D.store(&column, value, self.host.routineSession());
+                    const item = &self.frame.variables.items[place.index];
+                    var current = self.frame.cells[place.index];
+                    if (current == .null_value) {
+                        if (item.typmod <= 0) return error.ObjectNotInPrerequisiteState;
+                        const layout = value_module.compositeLayout(self.host.routineSession(), @intCast(item.typmod)) orelse return error.UndefinedObject;
+                        var out: V.Text = .{};
+                        var builder = try V.Records.Builder.begin(&out, @intCast(item.typmod));
+                        var fields: catalog_objects.CompositeFields = .{ .bytes = layout };
+                        const nothing: V.Cell = .null_value;
+                        while (fields.next()) |entry| try builder.append(types.typeFromOid(entry.oid) orelse return error.UnsupportedStatement, entry.typmod, &nothing);
+                        current = .{ .record = out };
+                    }
+                    if (current != .record) return error.TypeMismatch;
+                    var out: V.Text = .{};
+                    try V.Records.withField(current.record.slice(), field, &stored, &out);
+                    self.frame.cells[place.index] = .{ .record = out };
+                }
+
                 /// Converts a value of type `from` to the target (assignment;
                 /// without an assignment cast PL/pgSQL converts through the
                 /// types' text forms, as exec_cast_value's I/O coercion).
                 fn storeCast(self: *Self, place: Target, value: V.Cell, from: types.Type) Error!void {
                     var cell = value;
+                    // A record into a composite variable takes its type
+                    // (its fields must match; composite lane).
+                    if (place.ty == .record and place.field == null) {
+                        if (cell == .record and place.typmod > 0) cell = try E.cast(cell, .record, .record, place.typmod, self.host.routineSession());
+                        if (cell != .null_value and cell != .record) return error.TypeMismatch;
+                        return self.store(place, cell, false);
+                    }
                     if (cell != .null_value and from != place.ty and from != .unknown) {
                         const session = self.host.routineSession();
                         if (value_module.castable(from, place.ty, .assignment) or (value_module.integral(from) and value_module.integral(place.ty))) {
@@ -2904,6 +3177,15 @@ pub fn Routines(comptime config: types.Config) type {
                     if (into_start != null) {
                         if (strict and capture.rows == 0) return error.NoDataFound;
                         if (strict and capture.rows > 1) return error.TooManyRows;
+                        const lone = targets[0];
+                        if (target_count == 1 and lone.record == 0 and lone.field == null and lone.ty == .record and !(capture.count == 1 and capture.tys[0] == .record)) {
+                            const row = if (capture.rows == 0) V.Cell.null_value else try self.rowRecord(lone, &capture);
+                            // A record variable keeps the row's own shape.
+                            if (lone.typmod <= 0) {
+                                self.frame.cells[lone.index] = row;
+                            } else try self.storeCast(lone, row, .record);
+                            return .normal;
+                        }
                         if (capture.count != target_count and !(capture.rows == 0)) return error.Syntax;
                         for (targets[0..target_count], 0..) |place, index| {
                             const value: V.Cell = if (capture.rows == 0 or index >= capture.count) .null_value else capture.cells[index];
