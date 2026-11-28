@@ -66,7 +66,7 @@ continues to use its existing single-verifier bootstrap path.
 | Program | Implemented | Not covered |
 |---|---|---|
 | PG.CATALOG | pg_namespace / schemata list pg_toast (99); it is always empty and closed to CREATE TABLE / DROP SCHEMA | TOAST storage |
-| PG.SECURITY.ROLE | CREATE / ALTER (attributes, CONNECTION LIMIT, RENAME) / DROP ROLE, CREATE ROLE ... IN ROLE, GRANT / REVOKE role [WITH ADMIN OPTION], GRANT / REVOKE table privileges [WITH GRANT OPTION] incl. ALL and PUBLIC, ALTER TABLE OWNER TO, SET [LOCAL] ROLE / RESET ROLE / SHOW role, current_user / session_user / current_role / user; 42501 checks on reads (FROM items, also subqueries), INSERT / UPDATE / DELETE / TRUNCATE / MERGE / COPY FROM, ownership for ALTER / DROP / REFRESH / CREATE INDEX, CREATE only for superusers (PostgreSQL 15+ public schema); pg_roles, pg_authid (superusers), pg_auth_members, pg_tables, information_schema.table_privileges | column privileges, privileges on sequences, schemas, databases, functions; predefined roles (pg_read_all_data ...); passwords and VALID UNTIL; PostgreSQL 16 INHERIT / SET grant options; grant chains (one aclitem per table and grantee, grantor = owner); CREATEROLE creators are not made ADMIN of their roles; SET SESSION AUTHORIZATION |
+| PG.SECURITY.ROLE | CREATE / ALTER (attributes, CONNECTION LIMIT, RENAME) / DROP ROLE, CREATE ROLE ... IN ROLE, GRANT / REVOKE role [WITH ADMIN OPTION], GRANT / REVOKE table privileges [WITH GRANT OPTION] incl. ALL and PUBLIC, ALTER TABLE OWNER TO, SET [LOCAL] ROLE / RESET ROLE / SHOW role, current_user / session_user / current_role / user; 42501 checks on reads (FROM items, also subqueries), INSERT / UPDATE / DELETE / TRUNCATE / MERGE / COPY FROM, ownership for ALTER / DROP / REFRESH / CREATE INDEX, CREATE only for superusers (PostgreSQL 15+ public schema); pg_roles, pg_authid (superusers), pg_auth_members, pg_tables, information_schema.table_privileges | privileges on databases; passwords and VALID UNTIL; CREATEROLE creators are not made ADMIN of their roles. Column, sequence, schema and type privileges, grant chains with grantors, predefined roles and role grants keyed by grantor: [SQL_PRIVILEGES.md](SQL_PRIVILEGES.md) (wave 5) |
 | PG.SECURITY.RLS | ENABLE / DISABLE / [NO] FORCE ROW LEVEL SECURITY, CREATE / ALTER (RENAME, TO, USING, WITH CHECK) / DROP POLICY, AS PERMISSIVE / RESTRICTIVE, FOR ALL / SELECT / INSERT / UPDATE / DELETE, TO roles / PUBLIC; reads see USING-filtered rows (permissive OR, restrictive AND, no policy = deny), UPDATE / DELETE targets are filtered (plus SELECT policies when they filter or return), new rows of INSERT / UPDATE must pass WITH CHECK (USING when absent; NULL fails) or 42501; owners bypass unless FORCE, superusers and BYPASSRLS always; views run with their owner's rights; pg_policy, pg_policies (canonical qual text) | subqueries in policy expressions (0A000, bound like CHECK); COPY FROM, MERGE, ON CONFLICT and data-modifying WITH under RLS (0A000); dropping a column a policy names is not prevented (the policy then fails when used). RLS on partitioned and inheritance parents, SELECT policies on returned rows and WITH CHECK before constraints: ddl-dml wave 4 (docs/SQL_DDL_DML.md) |
 | PG.UTILITY.COMMENT | COMMENT ON TABLE / VIEW / MATERIALIZED VIEW / COLUMN / SEQUENCE / SCHEMA / ROLE / POLICY / FOREIGN DATA WRAPPER / SERVER / PUBLICATION IS 'text' / NULL ('' removes too); obj_description(oid [, catalog]), col_description, shobj_description; pg_description, pg_shdescription; comments die with their object and column comments follow ALTER TABLE | comments on indexes, extensions, functions, types, constraints (0A000) |
 | PG.INTEGRATION.EXTENSION | pg_extension's plpgsql row; CREATE EXTENSION plpgsql is 42710 (IF NOT EXISTS: no-op) | every other extension (0A000), DROP / ALTER EXTENSION |
@@ -74,7 +74,10 @@ continues to use its existing single-verifier bootstrap path.
 | PG.INTEGRATION.REPLICATION | CREATE PUBLICATION [FOR ALL TABLES] [WITH (publish = ..., publish_via_partition_root)], DROP PUBLICATION (superusers); pg_publication. Catalog entries only | FOR TABLE / TABLES IN SCHEMA, ALTER PUBLICATION, logical decoding, subscriptions (0A000) |
 
 `information_schema` (B11 wave 5) is described below. `pg_class` and
-`pg_attribute` expose relation metadata to ordinary roles.
+`pg_attribute` expose relation metadata to ordinary roles. The privilege
+model (column, sequence, schema and type ACLs, grant options, grantors,
+predefined roles) is the privileges lane's; see
+[SQL_PRIVILEGES.md](SQL_PRIVILEGES.md).
 
 ## information_schema (B11 wave 5, catalog lane)
 
@@ -145,9 +148,10 @@ infallible conjunct of the WHERE clause (comparisons, IN lists and LIKE
 with a literal pattern), so filtered scans of the wide views keep only
 matching rows; an unfiltered scan wider than the workspace is 54000.
 
-Not represented, because nothing in the engine stores it: column-level
-grants and type / sequence ACLs (the privileges lane), columns typed by a
-domain, temporary schemas,
+Privilege views read the privileges lane's ACL model (column, type and
+sequence ACLs included; see [SQL_PRIVILEGES.md](SQL_PRIVILEGES.md)).
+Not represented, because nothing in the engine stores it: columns typed by
+a domain, temporary schemas,
 table row types (`udt_privileges` lists composite types only), named NOT
 NULL constraints, foreign tables, options and user mappings, transforms,
 dependencies of routines and of system views (`routine_*_usage`,

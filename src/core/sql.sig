@@ -125,6 +125,7 @@ const routine_module = @import("sql/routine.sig");
 const nested_module = @import("sql/nested.sig");
 const xml_eval_module = @import("sql/xml_eval.sig");
 const CO = @import("sql/catalog_objects.sig");
+const AclRules = @import("sql/acl_update.sig");
 const operator_catalog = @import("sql/operator_catalog.sig");
 const index_operator_catalog = @import("sql/index_operator_catalog.sig");
 const array_module = @import("sql/array.sig");
@@ -1051,6 +1052,9 @@ pub fn Database(comptime config: Config) type {
             /// Bytes of `expansion` the running statement uses (a nested
             /// statement saves and restores them, B11 wave 4).
             expansion_used: usize = 0,
+            /// Columns the statement reads, for column privileges
+            /// (privileges lane, B11 wave 5).
+            column_reads: B.ColumnReads = .{},
         };
 
         /// A decoded identifier (quoted names keep case, others fold).
@@ -1098,11 +1102,18 @@ pub fn Database(comptime config: Config) type {
             var authority = snap;
             authority.csn = self.csn;
             if (self.catalog_objects.superuser(role, authority)) return;
-            if (!plain or namespace < change_log.first_oid) return error.InsufficientPrivilege;
+            if (!plain) return error.InsufficientPrivilege;
+            // CREATE on the schema (privileges lane): public belongs to
+            // pg_database_owner; user schemas to their owner.
+            if (namespace == CO.public_namespace) {
+                if (self.catalog_objects.schemaPrivilegeMask(role, namespace, CO.role_pg_database_owner, authority) & CO.priv_create != 0) return;
+                return error.InsufficientPrivilege;
+            }
+            if (namespace < change_log.first_oid) return error.InsufficientPrivilege;
             for (&self.schemas) |*schema| {
                 if (!schema.live or schema.oid != namespace) continue;
                 if (schema.dead_csn != 0) return error.UndefinedSchema;
-                if (schema.private_usage and self.catalog_objects.memberOf(role, self.schemaOwner(schema, authority), true, authority)) return;
+                if (schema.private_usage and self.catalog_objects.schemaPrivilegeMask(role, namespace, self.schemaOwner(schema, authority), authority) & CO.priv_create != 0) return;
                 break;
             }
             return error.InsufficientPrivilege;
@@ -1225,6 +1236,7 @@ pub fn Database(comptime config: Config) type {
             const tables = &db.tables;
             const catalog = &db.catalog;
             workspace.expanded_count = 0;
+            workspace.column_reads = .{};
             const pool = &workspace.nodes;
             // Each appended query remembers the view and parent that introduced
             // it. A repeated sibling is legal; a repeated ancestor is recursive
@@ -2053,6 +2065,8 @@ pub fn Database(comptime config: Config) type {
         /// Roles, grants, policies, comments, wrappers, servers and
         /// publications (catalog_objects.sig, B11 wave 3).
         catalog_objects: O = .{},
+        /// GRANT / REVOKE scratch (privileges lane).
+        privilege_scratch: PrivilegeScratch = .{},
         large_pages: ?large_object_pages.Pages = null,
         large_object_files: ?LargeObjectFiles = null,
         /// Sequence slots (Config.sequences); values are non-transactional.
@@ -2275,6 +2289,9 @@ pub fn Database(comptime config: Config) type {
             show: *const fn (?*anyopaque, []const u8, []u8) ?usize,
             set: *const fn (?*anyopaque, []const u8, []const u8, bool, bool) Error!bool,
             warn: ?*const fn (?*anyopaque, []const u8, []const u8) void = null,
+            /// A NOTICE-level message (privileges lane: role grants that
+            /// already exist).
+            notice: ?*const fn (?*anyopaque, []const u8, []const u8) void = null,
         };
 
         const storage_fields = .{ "rows", "versions", "row_index", "key_index", "scan_values", "scan_nonnull", "scan_live", "scan_presence", "index_slots" } ++
@@ -2741,6 +2758,8 @@ pub fn Database(comptime config: Config) type {
             self.routine_path_len = 0;
             self.routine_diag = .{};
             self.error_detail = "";
+            // GRANT / REVOKE scratch (privileges lane) carries nothing over.
+            self.privilege_scratch.column_count = 0;
             // A logical copy has fresh session/execution state. In particular,
             // never copy caller-owned interrupt or sequence-hook pointers.
             self.sequence_session = null;
@@ -3626,6 +3645,7 @@ pub fn Database(comptime config: Config) type {
             }
             var context = self.bindContext(source, mode, snap);
             context.stored_source_start = original.len;
+            if (!self.privilegedRole(snap)) context.column_reads = &self.workspace.column_reads;
             if (explain) |options| context.describe_only = !options.analyze;
             // Domains resolve in any query (S071, B11 wave 5); enum and
             // composite values only as a simple SELECT's projected roots.
@@ -4512,7 +4532,20 @@ pub fn Database(comptime config: Config) type {
                 }
                 try self.dropObject(slot, .routine, index, current);
             }
-            try self.reserveWrites(slot, 2 + type_count);
+            var type_grants: usize = 0;
+            for (&self.catalog_objects.items) |*o| {
+                if (o.kind != .type_acl or !O.visible(o, current)) continue;
+                const type_index = self.catalog_objects.byOid(.domain, o.target, current) orelse self.catalog_objects.byOid(.enum_type, o.target, current) orelse
+                    self.catalog_objects.byOid(.composite_type, o.target, current) orelse continue;
+                if (self.catalog_objects.items[type_index].target == drop.oid) type_grants += 1;
+            }
+            try self.reserveWrites(slot, 2 + type_count + type_grants);
+            for (&self.catalog_objects.items, 0..) |*o, index| {
+                if (o.kind != .type_acl or !O.visible(o, current)) continue;
+                const type_index = self.catalog_objects.byOid(.domain, o.target, current) orelse self.catalog_objects.byOid(.enum_type, o.target, current) orelse
+                    self.catalog_objects.byOid(.composite_type, o.target, current) orelse continue;
+                if (self.catalog_objects.items[type_index].target == drop.oid) self.objectDelete(slot, index, current);
+            }
             for (&self.catalog_objects.items, 0..) |*o, index| {
                 if (CO.userType(o.kind) and o.target == drop.oid and O.visible(o, current)) self.objectDelete(slot, index, current);
             }
@@ -4592,9 +4625,11 @@ pub fn Database(comptime config: Config) type {
         /// `role` holds ADMIN OPTION on `group` (or is a superuser).
         fn roleAdmin(self: *const Self, role: u32, group: u32, snap: Snapshot) bool {
             if (self.catalog_objects.superuser(role, snap)) return true;
-            const key: O.Object = .{ .kind = .member, .target = group, .grantee = role };
-            const index = self.catalog_objects.findKey(&key, snap) orelse return false;
-            return self.catalog_objects.items[index].grant_flags & CO.member_admin != 0;
+            for (&self.catalog_objects.items) |*row| {
+                if (row.kind == .member and row.target == group and row.grantee == role and
+                    row.grant_flags & CO.member_admin != 0 and O.visible(row, snap)) return true;
+            }
+            return false;
         }
 
         fn objectPark(self: *Self, slot: u16, other: u16) Error {
@@ -4632,7 +4667,7 @@ pub fn Database(comptime config: Config) type {
         /// transaction's uncommitted object naming it is waited for.
         fn objectDependent(o: *const O.Object, oid: u32) bool {
             return switch (o.kind) {
-                .acl, .schema_acl, .schema_acl_state, .schema_owner, .relation, .policy => o.target == oid,
+                .acl, .schema_acl, .schema_acl_state, .schema_owner, .relation, .policy, .column_acl, .sequence_acl, .type_acl => o.target == oid,
                 .statistics => o.target == oid or o.grantee == oid,
                 .publication_table, .publication_schema => o.grantee == oid,
                 .routine_default_acl => @as(u32, @bitCast(o.sub)) == oid,
@@ -4647,7 +4682,7 @@ pub fn Database(comptime config: Config) type {
             latest.csn = self.csn;
             var count: usize = 0;
             for (&self.catalog_objects.items) |*o| {
-                if ((o.kind == .statistics or o.kind == .schema_acl or o.kind == .schema_acl_state or o.kind == .schema_owner or o.kind == .routine_default_acl or CO.publicationMembership(o.kind)) and objectDependent(o, oid) and O.visible(o, latest) != O.visible(o, snap)) return error.SerializationFailure;
+                if ((o.kind == .statistics or o.kind == .schema_acl or o.kind == .schema_acl_state or o.kind == .schema_owner or o.kind == .routine_default_acl or o.kind == .sequence_acl or o.kind == .type_acl or CO.publicationMembership(o.kind)) and objectDependent(o, oid) and O.visible(o, latest) != O.visible(o, snap)) return error.SerializationFailure;
                 if (!O.visible(o, snap) or o.xmax.epoch != 0) continue;
                 if (objectDependent(o, oid)) count += 1;
                 // Comments on the table's policies go with them.
@@ -4696,6 +4731,45 @@ pub fn Database(comptime config: Config) type {
                     next.sub = @intCast(position + 1);
                     _ = try self.objectInsert(slot, &next, false, snap);
                 }
+            }
+        }
+
+        /// ALTER TABLE moved or dropped columns: column grants follow their
+        /// column (`sources[new] = old`, 0xff for a new column) or go with it.
+        fn remapColumnAcls(self: *Self, slot: u16, oid: u32, sources: []const u8, snap: Snapshot) Error!void {
+            var count: usize = 0;
+            for (&self.catalog_objects.items) |*o| {
+                if (o.kind == .column_acl and o.target == oid and O.visible(o, snap) and o.xmax.epoch == 0 and !(o.xmin_csn == 0 and o.xmin_cid == snap.cid)) count += 1;
+            }
+            if (count == 0) return;
+            try self.reserveWrites(slot, 2 * count);
+            for (0..self.catalog_objects.items.len) |index| {
+                const o = &self.catalog_objects.items[index];
+                if (o.kind != .column_acl or o.target != oid or !O.visible(o, snap) or o.xmax.epoch != 0) continue;
+                if (o.xmin_csn == 0 and o.xmin_cid == snap.cid) continue;
+                var bytes: [2 * config.columns]u8 = @splat(0);
+                var used: usize = 0;
+                for (sources, 0..) |origin, position| {
+                    if (origin == 0xff or 2 * @as(usize, origin) + 1 >= o.text_len) continue;
+                    bytes[2 * position] = o.text[2 * @as(usize, origin)];
+                    bytes[2 * position + 1] = o.text[2 * @as(usize, origin) + 1];
+                    if (bytes[2 * position] != 0) used = 2 * position + 2;
+                }
+                if (std.mem.eql(u8, bytes[0..used], o.textSlice())) continue;
+                var next = o.*;
+                self.objectDelete(slot, index, snap);
+                if (used == 0) continue;
+                var flags: u32 = 0;
+                var options: u32 = 0;
+                var at: usize = 0;
+                while (at < used) : (at += 2) {
+                    flags |= CO.columnFlags(bytes[at] & 0x0f);
+                    options |= CO.columnFlags(bytes[at] >> 4);
+                }
+                next.flags = flags;
+                next.grant_flags = options;
+                try next.setText("", bytes[0..used]);
+                _ = try self.objectInsert(slot, &next, false, snap);
             }
         }
 
@@ -5621,21 +5695,17 @@ pub fn Database(comptime config: Config) type {
                 .grant => |*grant| blk: {
                     if (grant.membership) {
                         try self.grantMembership(slot, source, grant, false, snap);
-                    } else if (grant.schema) {
-                        try self.grantSchemaUsage(slot, source, grant, false, snap);
                     } else if (grant.large_object_count != 0) {
                         try self.grantLargeObjects(slot, source, grant, false, snap);
-                    } else try self.grantTables(slot, source, grant, false, snap);
+                    } else try self.grantPrivileges(slot, source, grant, false, snap);
                     break :blk if (grant.membership) .grant_role else .grant;
                 },
                 .revoke => |*grant| blk: {
                     if (grant.membership) {
                         try self.grantMembership(slot, source, grant, true, snap);
-                    } else if (grant.schema) {
-                        try self.grantSchemaUsage(slot, source, grant, true, snap);
                     } else if (grant.large_object_count != 0) {
                         try self.grantLargeObjects(slot, source, grant, true, snap);
-                    } else try self.grantTables(slot, source, grant, true, snap);
+                    } else try self.grantPrivileges(slot, source, grant, true, snap);
                     break :blk if (grant.membership) .revoke_role else .revoke;
                 },
                 .create_policy => |*policy| blk: {
@@ -5764,9 +5834,10 @@ pub fn Database(comptime config: Config) type {
 
         fn createUserType(self: *Self, slot: u16, source: []const u8, qualified: CO.Qualified, object: *O.Object, payload: UserTypePayload, snap: Snapshot) Error!void {
             if (self.dialect != .postgres or self.routine_frame != null) return error.UnsupportedStatement;
-            if (!self.privilegedRole(snap)) return error.InsufficientPrivilege;
             const namespace = try self.typeNamespace(source, qualified, snap);
             if (namespace != catalog_module.public_namespace and namespace < change_log.first_oid) return error.InsufficientPrivilege;
+            // CREATE on the schema (privileges lane); the creator owns it.
+            try bindNamespaceCreate(self, self.session.role, namespace, snap, true);
             for (&self.schemas) |*schema| {
                 if (schema.live and schema.oid == namespace and schema.pending_drop and schema.creator != slot) return self.objectPark(slot, schema.creator);
             }
@@ -5859,6 +5930,31 @@ pub fn Database(comptime config: Config) type {
             return self.catalog_objects.memberOf(self.session.role, self.catalog_objects.items[index].owner, true, snap);
         }
 
+        /// has_type_privilege(role, oid, 'USAGE') (privileges lane): a user
+        /// type's ACL, PUBLIC USAGE until it is materialized; built-in
+        /// types grant USAGE to PUBLIC.
+        fn typeUsable(self: *const Self, oid: u32, role: u32, snap: Snapshot) bool {
+            for ([_]CO.Kind{ .composite_type, .domain, .enum_type }) |kind| {
+                const index = self.catalog_objects.byOid(kind, oid, snap) orelse continue;
+                const owner = self.catalog_objects.items[index].owner;
+                return self.catalog_objects.objectPrivilegeMask(.type_acl, oid, owner, role, CO.priv_usage, snap) & CO.priv_usage != 0;
+            }
+            return true;
+        }
+
+        /// USAGE on a type a statement uses for a column, a routine
+        /// argument or result, or a cast (aclcheck_error_type: 42501).
+        fn needTypeUsage(self: *const Self, oid: u32, snap: Snapshot) Error!void {
+            if (!self.typeUsable(oid, self.session.role, snap)) return error.InsufficientPrivilege;
+        }
+
+        /// A composite column's type needs USAGE (BuildDescForRelation,
+        /// ALTER TABLE ADD COLUMN / ALTER COLUMN TYPE).
+        fn columnTypeUsage(self: *const Self, column: *const V.Column, snap: Snapshot) Error!void {
+            if (column.data_type != .record or column.typmod <= 0) return;
+            try self.needTypeUsage(@intCast(column.typmod), snap);
+        }
+
         /// Whether a built-in cast (pg_cast) already converts `source` to
         /// `target`: PostgreSQL's casts, not its I/O conversions to and
         /// from the string types.
@@ -5883,6 +5979,9 @@ pub fn Database(comptime config: Config) type {
             for ([_]u32{ source, destination }) |oid| if (oid == tg.record_oid or oid == tg.void_oid or oid == tg.trigger_oid) return error.WrongObjectType;
             if (source == destination) return error.InvalidObjectDefinition;
             if (!self.privilegedRole(snap) and !self.ownsType(source, snap) and !self.ownsType(destination, snap)) return error.InsufficientPrivilege;
+            // USAGE on both types (CreateCast, privileges lane).
+            try self.needTypeUsage(source, snap);
+            try self.needTypeUsage(destination, snap);
             var cast: RC.Cast = .{ .source = source, .target = destination, .context = definition.context, .method = definition.method };
             switch (definition.method) {
                 'f' => {
@@ -6008,6 +6107,8 @@ pub fn Database(comptime config: Config) type {
             }
             try self.reserveWrites(slot, count);
             for (found[0..count]) |index| self.objectDelete(slot, index, snap);
+            // Their USAGE grants (privileges lane) go with them.
+            for (found[0..count]) |index| try self.dropObjectsOf(slot, self.catalog_objects.items[index].oid, snap);
         }
 
         // -- roles ---------------------------------------------------------
@@ -6036,13 +6137,16 @@ pub fn Database(comptime config: Config) type {
             const index = try self.objectInsert(slot, &role, true, snap);
             const oid = self.catalog_objects.items[index].oid;
             for (groups[0..spec.in_count]) |group| {
-                var member: O.Object = .{ .kind = .member, .target = group, .grantee = oid, .flags = CO.membershipFlags(flags & CO.role_inherit != 0, true), .owner = if (superuser) CO.bootstrap_role else self.session.role };
+                const grantor = if (superuser) CO.bootstrap_role else self.session.role;
+                var member: O.Object = .{ .kind = .member, .target = group, .grantee = oid, .flags = CO.membershipFlags(flags & CO.role_inherit != 0, true), .owner = grantor, .sub = @bitCast(grantor) };
                 _ = try self.objectInsert(slot, &member, true, snap);
             }
         }
 
         fn alterRole(self: *Self, slot: u16, source: []const u8, spec: *const CO.RoleSpec, snap: Snapshot) Error!void {
             const oid = self.catalog_objects.roleByName(objectName(source, spec.name).slice(), snap) orelse return error.UndefinedObject;
+            // Reserved roles cannot be altered (42939).
+            if (CO.predefinedRole(oid)) return error.ReservedName;
             if (spec.defaults) |defaults| return self.alterRoleDefaults(slot, source, oid, defaults, snap);
             if (oid == CO.bootstrap_role) {
                 // A stock archive restates the built-in role's attributes.
@@ -6143,7 +6247,9 @@ pub fn Database(comptime config: Config) type {
                     return error.UndefinedObject;
                 };
                 if (oid == self.session.role or oid == self.session.session_role) return error.ObjectInUse;
-                if (oid == CO.bootstrap_role) return error.DependentObjects;
+                // The bootstrap superuser and the predefined roles are
+                // required by the database system (2BP01).
+                if (oid == CO.bootstrap_role or CO.predefinedRole(oid)) return error.DependentObjects;
                 if (!superuser and (actor & CO.role_createrole == 0 or self.catalog_objects.superuser(oid, snap) or !self.roleAdmin(self.session.role, oid, snap))) return error.InsufficientPrivilege;
                 var known = false;
                 for (roles[0..count]) |seen| known = known or seen == oid;
@@ -6177,7 +6283,8 @@ pub fn Database(comptime config: Config) type {
                 }
                 for (&self.catalog_objects.items) |*o| {
                     const affected = (CO.userType(o.kind) or o.kind == .statistics or o.kind == .relation or o.kind == .large_object) and o.owner == oid or
-                        (o.kind == .schema_acl or o.kind == .large_object_acl or CO.defaultAcl(o.kind) or o.kind == .builtin_routine_acl) and
+                        (o.kind == .schema_acl or o.kind == .large_object_acl or CO.defaultAcl(o.kind) or o.kind == .builtin_routine_acl or
+                            o.kind == .column_acl or o.kind == .type_acl or o.kind == .sequence_acl) and
                             (o.owner == oid or o.grantee == oid) or
                         o.kind == .role_settings and o.target == oid;
                     if (affected and O.visible(o, latest) != O.visible(o, snap)) return error.SerializationFailure;
@@ -6192,7 +6299,8 @@ pub fn Database(comptime config: Config) type {
                             writes += 1;
                         },
                         .role_settings => if (o.target == oid) { writes += 1; },
-                        .acl, .schema_acl, .large_object_acl, .large_object_default_acl, .routine_default_acl, .builtin_routine_acl => if (o.grantee == oid or o.owner == oid) return error.DependentObjects,
+                        .acl, .schema_acl, .large_object_acl, .large_object_default_acl, .routine_default_acl, .builtin_routine_acl,
+                        .column_acl, .type_acl, .sequence_acl => if (o.grantee == oid or o.owner == oid) return error.DependentObjects,
                         .policy => {
                             for (o.roleList()) |listed| {
                                 if (listed == oid) return error.DependentObjects;
@@ -6222,135 +6330,599 @@ pub fn Database(comptime config: Config) type {
             }
         }
 
-        /// GRANT / REVOKE role membership. Granting needs ADMIN OPTION on
-        /// the role (superusers have it); a grant that would make a role a
-        /// member of itself is 0LP01.
+        /// select_best_admin: the first role, `role` and then the roles it
+        /// inherits, that holds ADMIN OPTION on `group` (a role never
+        /// administers itself).
+        fn bestAdmin(self: *Self, role: u32, group: u32, snap: Snapshot) ?u32 {
+            if (role == group) return null;
+            for (self.inheritedRoles(role, snap)) |candidate| {
+                for (&self.catalog_objects.items) |*row| {
+                    if (row.kind == .member and row.target == group and row.grantee == candidate and
+                        row.grant_flags & CO.member_admin != 0 and O.visible(row, snap)) return candidate;
+                }
+            }
+            return null;
+        }
+
+        /// The membership row of (group, member) granted by `grantor`.
+        fn membershipRow(self: *const Self, group: u32, member: u32, grantor: u32, snap: Snapshot) ?usize {
+            for (&self.catalog_objects.items, 0..) |*row, index| {
+                if (row.kind == .member and row.target == group and row.grantee == member and row.owner == grantor and O.visible(row, snap)) return index;
+            }
+            return null;
+        }
+
+        /// GRANT / REVOKE role membership (PostgreSQL 16+). Each membership
+        /// row records its grantor: the bootstrap superuser for superusers,
+        /// else the closest role holding ADMIN OPTION (42501 without one),
+        /// or GRANTED BY a role the current one has the privileges of. A
+        /// grant that would make a role a member of itself is 0LP01.
         fn grantMembership(self: *Self, slot: u16, source: []const u8, grant: *const CO.Grant, revoke: bool, snap: Snapshot) Error!void {
+            var latest = snap;
+            latest.csn = self.csn;
             const actor = self.session.role;
-            const superuser = self.privilegedRole(snap);
-            const owner = if (superuser) CO.bootstrap_role else actor;
-            if (grant.grantor) |grantor| {
-                if (try self.objectRole(source, grantor, snap) != owner) return error.UnsupportedStatement;
+            const superuser = self.privilegedRole(latest);
+            const explicit: ?u32 = if (grant.grantor) |grantor| try self.objectRole(source, grantor, latest) else null;
+            if (explicit) |grantor| {
+                if (grantor == CO.public_role) return error.UndefinedObject;
+                if (!superuser and !self.catalog_objects.memberOf(actor, grantor, true, latest)) return error.InsufficientPrivilege;
             }
             var groups: [CO.list_capacity]u32 = undefined;
+            var grantors: [CO.list_capacity]u32 = undefined;
             var members: [CO.list_capacity]u32 = undefined;
-            for (grant.granted[0..grant.granted_count], 0..) |ident, index| {
-                groups[index] = self.catalog_objects.roleByName(objectName(source, ident).slice(), snap) orelse return error.UndefinedObject;
-                if (!self.roleAdmin(actor, groups[index], snap)) return error.InsufficientPrivilege;
-                if (!superuser and self.catalog_objects.superuser(groups[index], snap)) return error.InsufficientPrivilege;
+            var group_count: usize = 0;
+            for (grant.granted[0..grant.granted_count]) |ident| {
+                const group = self.catalog_objects.roleByName(objectName(source, ident).slice(), latest) orelse return error.UndefinedObject;
+                // A role named twice is granted once.
+                if (std.mem.indexOfScalar(u32, groups[0..group_count], group) != null) continue;
+                const index = group_count;
+                group_count += 1;
+                groups[index] = group;
+                if (!superuser and self.catalog_objects.superuser(group, latest)) return error.InsufficientPrivilege;
+                grantors[index] = if (explicit) |grantor| blk: {
+                    if (!revoke and grantor != CO.bootstrap_role and self.bestAdmin(grantor, group, latest) != grantor) return error.InsufficientPrivilege;
+                    break :blk grantor;
+                } else if (superuser) CO.bootstrap_role else self.bestAdmin(actor, group, latest) orelse return error.InsufficientPrivilege;
+                // pg_database_owner's only member is the database owner (0A000).
+                if (!revoke and group == CO.role_pg_database_owner) return error.UnsupportedStatement;
             }
-            for (grant.grantees[0..grant.grantee_count], 0..) |grantee, index| {
+            var member_count: usize = 0;
+            for (grant.grantees[0..grant.grantee_count]) |grantee| {
                 if (grantee.kind == .public) return error.UndefinedObject;
-                members[index] = try self.objectRole(source, grantee, snap);
+                const member = try self.objectRole(source, grantee, latest);
+                if (!revoke and member == CO.role_pg_database_owner) return error.UnsupportedStatement;
+                if (std.mem.indexOfScalar(u32, members[0..member_count], member) != null) continue;
+                members[member_count] = member;
+                member_count += 1;
             }
-            var writes: usize = 0;
-            for (groups[0..grant.granted_count]) |group| {
-                for (members[0..grant.grantee_count]) |member| {
-                    if (!revoke and (group == member or self.catalog_objects.memberOf(group, member, false, snap))) return error.InvalidGrantOperation;
-                    const key: O.Object = .{ .kind = .member, .target = group, .grantee = member };
-                    if (self.catalog_objects.pendingConflict(&key, snap)) |other| return self.objectPark(slot, other);
-                    if (grant.grantor != null) {
-                        if (self.catalog_objects.findKey(&key, snap)) |index| {
-                            if (self.catalog_objects.items[index].owner != owner) return error.UnsupportedStatement;
-                        }
-                    }
-                    writes += 2;
+            for (groups[0..group_count]) |group| {
+                for (&self.catalog_objects.items) |*row| {
+                    if (row.kind == .member and row.target == group) if (O.pendingOf(row, snap)) |other| return self.objectPark(slot, other);
                 }
             }
-            try self.reserveWrites(slot, writes);
-            for (0..grant.granted_count * grant.grantee_count) |pair| {
-                const group = groups[pair / grant.grantee_count];
-                const member = members[pair % grant.grantee_count];
-                const key: O.Object = .{ .kind = .member, .target = group, .grantee = member };
-                const existing = self.catalog_objects.findKey(&key, snap);
-                if (existing) |index| if (self.catalog_objects.items[index].xmax.epoch != 0) continue;
-                if (revoke) {
-                    const index = existing orelse continue;
-                    var next = self.catalog_objects.items[index];
-                    self.objectDelete(slot, index, snap);
-                    // REVOKE ADMIN OPTION FOR keeps the membership.
-                    if (grant.option) {
-                        next.grant_flags = 0;
-                        _ = try self.objectInsert(slot, &next, false, snap);
-                    }
-                    continue;
+            if (revoke) {
+                for (groups[0..group_count], grantors[0..group_count]) |group, grantor| {
+                    try self.revokeMembership(slot, grant, group, grantor, members[0..member_count], snap, latest);
                 }
-                if (existing) |index| {
+                return;
+            }
+            try self.reserveWrites(slot, 2 * group_count * member_count);
+            for (0..group_count * member_count) |pair| {
+                const group = groups[pair / member_count];
+                const grantor = grantors[pair / member_count];
+                const member = members[pair % member_count];
+                if (group == member or self.catalog_objects.memberOf(group, member, false, latest)) return error.InvalidGrantOperation;
+                if (self.membershipRow(group, member, grantor, latest)) |index| {
                     var next = self.catalog_objects.items[index];
                     if (grant.admin) |admin| next.grant_flags = if (admin) CO.member_admin else 0;
                     if (grant.inherit != null or grant.set != null) {
-                        next.flags = CO.membershipFlags(grant.inherit orelse self.catalog_objects.membershipInherits(&next, snap),
+                        next.flags = CO.membershipFlags(grant.inherit orelse self.catalog_objects.membershipInherits(&next, latest),
                             grant.set orelse O.membershipCanSet(&next));
                     }
                     const current = &self.catalog_objects.items[index];
-                    if (next.grant_flags == current.grant_flags and next.flags == current.flags) continue;
+                    if (next.grant_flags == current.grant_flags and next.flags == current.flags) {
+                        self.privilegeNotice("role \"{s}\" has already been granted membership in role \"{s}\" by role \"{s}\"", .{
+                            self.catalog_objects.roleName(member, latest) orelse "", self.catalog_objects.roleName(group, latest) orelse "",
+                            self.catalog_objects.roleName(grantor, latest) orelse "" });
+                        continue;
+                    }
                     self.objectDelete(slot, index, snap);
                     _ = try self.objectInsert(slot, &next, false, snap);
                     continue;
                 }
-                const inherits = (self.catalog_objects.roleFlags(member, snap) orelse 0) & CO.role_inherit != 0;
-                var member_object: O.Object = .{ .kind = .member, .target = group, .grantee = member,
+                const inherits = (self.catalog_objects.roleFlags(member, latest) orelse 0) & CO.role_inherit != 0;
+                var row: O.Object = .{ .kind = .member, .target = group, .grantee = member, .sub = @bitCast(grantor),
                     .flags = CO.membershipFlags(grant.inherit orelse inherits, grant.set orelse true),
-                    .grant_flags = if (grant.admin orelse false) CO.member_admin else 0, .owner = owner };
-                _ = try self.objectInsert(slot, &member_object, true, snap);
+                    .grant_flags = if (grant.admin orelse false) CO.member_admin else 0, .owner = grantor };
+                _ = try self.objectInsert(slot, &row, true, snap);
             }
         }
 
-        /// GRANT / REVOKE table privileges: the owner (or a superuser) or a
-        /// holder of the grant options (42501 otherwise). One aclitem per
-        /// table and grantee; its grantor is the table owner.
-        fn grantTables(self: *Self, slot: u16, source: []const u8, grant: *const CO.Grant, revoke: bool, snap: Snapshot) Error!void {
-            const actor = self.session.role;
-            var slots: [CO.list_capacity]usize = undefined;
-            var grantees: [CO.list_capacity]u32 = undefined;
-            for (grant.tables[0..grant.table_count], 0..) |name, index| {
-                slots[index] = try self.objectTable(slot, source, name, .access_share, snap);
-                const oid = self.tables[slots[index]].oid;
-                if (!self.catalog_objects.grantOptions(actor, oid, grant.privileges, snap)) return error.InsufficientPrivilege;
+        const MemberAction = enum(u8) { keep, delete, remove_admin, remove_inherit, remove_set };
+
+        /// DelRoleMems: the (member, grantor) row of each member goes, or
+        /// loses the named option. Without such a row PostgreSQL only warns.
+        /// Revoking a grant (or its ADMIN OPTION) also revokes the grants
+        /// its member issued, unless it keeps ADMIN another way: CASCADE
+        /// does that, RESTRICT is 2BP01 (plan_recursive_revoke).
+        fn revokeMembership(self: *Self, slot: u16, grant: *const CO.Grant, group: u32, grantor: u32, members: []const u32, snap: Snapshot, latest: Snapshot) Error!void {
+            const scratch = &self.privilege_scratch;
+            var count: usize = 0;
+            for (&self.catalog_objects.items, 0..) |*row, index| {
+                if (row.kind != .member or row.target != group or !O.visible(row, latest)) continue;
+                scratch.member_rows[count] = @intCast(index);
+                scratch.member_actions[count] = .keep;
+                count += 1;
             }
-            for (grant.grantees[0..grant.grantee_count], 0..) |grantee, index| grantees[index] = try self.objectRole(source, grantee, snap);
+            for (members) |member| {
+                var position: ?usize = null;
+                for (scratch.member_rows[0..count], 0..) |index, at| {
+                    const row = &self.catalog_objects.items[index];
+                    if (row.grantee == member and row.owner == grantor) position = at;
+                }
+                const at = position orelse {
+                    self.privilegeWarning("01000", "role \"{s}\" has not been granted membership in role \"{s}\" by role \"{s}\"", .{
+                        self.catalog_objects.roleName(member, latest) orelse "", self.catalog_objects.roleName(group, latest) orelse "",
+                        self.catalog_objects.roleName(grantor, latest) orelse "" });
+                    continue;
+                };
+                if (grant.revoke_option == .inherit) {
+                    scratch.member_actions[at] = .remove_inherit;
+                } else if (grant.revoke_option == .set) {
+                    scratch.member_actions[at] = .remove_set;
+                } else try self.planMemberRevoke(count, at, grant.option, grant.cascade);
+            }
             var writes: usize = 0;
-            for (0..grant.table_count * grant.grantee_count) |pair| {
-                const key: O.Object = .{ .kind = .acl, .target = self.tables[slots[pair / grant.grantee_count]].oid, .grantee = grantees[pair % grant.grantee_count] };
-                if (self.catalog_objects.pendingConflict(&key, snap)) |other| return self.objectPark(slot, other);
-                writes += 2;
-            }
+            for (scratch.member_actions[0..count]) |action| writes += switch (action) {
+                .keep => 0,
+                .delete => 1,
+                else => 2,
+            };
             try self.reserveWrites(slot, writes);
-            for (0..grant.table_count * grant.grantee_count) |pair| {
-                const grantee = grantees[pair % grant.grantee_count];
-                const oid = self.tables[slots[pair / grant.grantee_count]].oid;
-                const key: O.Object = .{ .kind = .acl, .target = oid, .grantee = grantee };
-                var next: O.Object = .{ .kind = .acl, .target = oid, .grantee = grantee, .owner = self.catalog_objects.owner(oid, snap) };
-                const existing = self.catalog_objects.findKey(&key, snap);
-                if (existing) |index| {
-                    if (self.catalog_objects.items[index].xmax.epoch != 0) continue;
-                    next.flags = self.catalog_objects.items[index].flags;
-                    next.grant_flags = self.catalog_objects.items[index].grant_flags;
+            for (scratch.member_rows[0..count], scratch.member_actions[0..count]) |index, action| {
+                if (action == .keep) continue;
+                var next = self.catalog_objects.items[index];
+                self.objectDelete(slot, index, snap);
+                switch (action) {
+                    .keep, .delete => continue,
+                    .remove_admin => next.grant_flags = 0,
+                    .remove_inherit => next.flags = CO.membershipFlags(false, O.membershipCanSet(&next)),
+                    .remove_set => next.flags = CO.membershipFlags(self.catalog_objects.membershipInherits(&next, latest), false),
                 }
-                if (revoke) {
-                    next.grant_flags &= ~grant.privileges;
-                    if (!grant.option) next.flags &= ~grant.privileges;
-                } else {
-                    next.flags |= grant.privileges;
-                    if (grant.option) next.grant_flags |= grant.privileges;
-                }
-                if (existing) |index| {
-                    const old = &self.catalog_objects.items[index];
-                    if (old.flags == next.flags and old.grant_flags == next.grant_flags) continue;
-                    self.objectDelete(slot, index, snap);
-                } else if (next.flags == 0) continue;
-                if (next.flags != 0) _ = try self.objectInsert(slot, &next, false, snap);
+                _ = try self.objectInsert(slot, &next, false, snap);
             }
         }
 
-        /// Schema grants use the owning role as grantor. This scope has no
-        /// delegated grant chain, CREATE privilege, or built-in schema ACL.
-        fn grantSchemaUsage(self: *Self, slot: u16, source: []const u8, grant: *const CO.Grant, revoke: bool, snap: Snapshot) Error!void {
-            if (self.dialect != .postgres or grant.option or grant.cascade or grant.table_count != 1) return error.UnsupportedStatement;
-            const schema_target = grant.tables[0];
-            if (schema_target.has_schema) return error.Syntax;
-            const name = objectName(source, schema_target.name);
+        /// plan_recursive_revoke as a worklist over the group's rows.
+        fn planMemberRevoke(self: *Self, count: usize, at: usize, admin_only: bool, cascade: bool) Error!void {
+            const scratch = &self.privilege_scratch;
+            const actions = scratch.member_actions[0..count];
+            const rows = scratch.member_rows[0..count];
+            if (actions[at] == .delete or (actions[at] == .remove_admin and admin_only)) return;
+            const admin = self.catalog_objects.items[rows[at]].grant_flags & CO.member_admin != 0;
+            if (!admin_only) {
+                actions[at] = .delete;
+                if (!admin) return;
+            } else {
+                if (!admin) return;
+                actions[at] = .remove_admin;
+            }
+            const stack = &scratch.member_stack;
+            stack[0] = @intCast(at);
+            var top: usize = 1;
+            while (top != 0) {
+                top -= 1;
+                const member = self.catalog_objects.items[rows[stack[top]]].grantee;
+                var still_admin = false;
+                for (rows, actions) |index, action| {
+                    const row = &self.catalog_objects.items[index];
+                    if (row.grantee == member and row.grant_flags & CO.member_admin != 0 and action == .keep) still_admin = true;
+                }
+                if (still_admin) continue;
+                for (rows, actions, 0..) |index, *action, position| {
+                    const row = &self.catalog_objects.items[index];
+                    if (row.owner != member or action.* == .delete) continue;
+                    if (!cascade) return error.DependentObjects;
+                    action.* = .delete;
+                    if (row.grant_flags & CO.member_admin != 0) {
+                        stack[top] = @intCast(position);
+                        top += 1;
+                    }
+                }
+            }
+        }
+
+        // ---- privileges (privileges lane, B11 wave 5) ------------------------
+        //
+        // Every ACL (a relation, a column, a sequence, a schema, a type) is
+        // rewritten by PostgreSQL's rules (acl_update.sig) over the entries
+        // the catalog rows hold in ACL order: the owner's entry (its marker
+        // row, or the kind's default) and one row per (grantee, grantor).
+
+        const acl_entry_capacity = O.capacity + CO.list_capacity + 2;
+
+        /// has_privs_of_role for the ACL rules.
+        const PrivilegeOracle = struct {
+            objects: *const O,
+            snap: Snapshot,
+            pub fn privilegesOf(self: PrivilegeOracle, role: u32, other: u32) bool {
+                return self.objects.superuser(role, self.snap) or self.objects.memberOf(role, other, true, self.snap);
+            }
+        };
+
+        /// A column-grant row a statement rewrites: its key and per-column
+        /// privilege / position bytes.
+        pub const ColumnRowState = struct { grantee: u32 = 0, grantor: u32 = 0, original: ?usize = null, bytes: [2 * config.columns]u8 = @splat(0) };
+
+        /// GRANT / REVOKE scratch in database storage (nothing on the stack).
+        pub const PrivilegeScratch = struct {
+            work: [acl_entry_capacity]AclRules.Entry = undefined,
+            copy: [acl_entry_capacity]AclRules.Entry = undefined,
+            relation: [acl_entry_capacity]AclRules.Entry = undefined,
+            merged: [2 * acl_entry_capacity]AclRules.Entry = undefined,
+            pending: [acl_entry_capacity]AclRules.Pending = undefined,
+            columns: [acl_entry_capacity]ColumnRowState = undefined,
+            column_count: usize = 0,
+            roles: [O.capacity + CO.predefined_oids.len + 2]u32 = undefined,
+            member_rows: [O.capacity]u32 = undefined,
+            member_actions: [O.capacity]MemberAction = undefined,
+            member_stack: [O.capacity]u32 = undefined,
+        };
+
+        fn privilegeOracle(self: *const Self, snap: Snapshot) PrivilegeOracle {
+            return .{ .objects = &self.catalog_objects, .snap = snap };
+        }
+
+        /// A WARNING with PostgreSQL's text (sent after the command).
+        fn privilegeWarning(self: *Self, state: []const u8, comptime format: []const u8, args: anytype) void {
+            const provider = self.settings_provider orelse return;
+            const warn = provider.warn orelse return;
+            var buffer: [256]u8 = undefined;
+            warn(provider.context, state, std.fmt.bufPrint(&buffer, format, args) catch return);
+        }
+
+        fn privilegeNotice(self: *Self, comptime format: []const u8, args: anytype) void {
+            const provider = self.settings_provider orelse return;
+            const notice = provider.notice orelse return;
+            var buffer: [256]u8 = undefined;
+            notice(provider.context, "00000", std.fmt.bufPrint(&buffer, format, args) catch return);
+        }
+
+        /// restrict_and_check_grant's warnings for an object or a column.
+        fn grantWarning(self: *Self, warning: AclRules.Warning, object: []const u8, column: ?[]const u8) void {
+            if (column) |name| switch (warning) {
+                .none => {},
+                .none_granted => self.privilegeWarning("01007", "no privileges were granted for column \"{s}\" of relation \"{s}\"", .{ name, object }),
+                .not_all_granted => self.privilegeWarning("01007", "not all privileges were granted for column \"{s}\" of relation \"{s}\"", .{ name, object }),
+                .none_revoked => self.privilegeWarning("01006", "no privileges could be revoked for column \"{s}\" of relation \"{s}\"", .{ name, object }),
+                .not_all_revoked => self.privilegeWarning("01006", "not all privileges could be revoked for column \"{s}\" of relation \"{s}\"", .{ name, object }),
+            } else switch (warning) {
+                .none => {},
+                .none_granted => self.privilegeWarning("01007", "no privileges were granted for \"{s}\"", .{object}),
+                .not_all_granted => self.privilegeWarning("01007", "not all privileges were granted for \"{s}\"", .{object}),
+                .none_revoked => self.privilegeWarning("01006", "no privileges could be revoked for \"{s}\"", .{object}),
+                .not_all_revoked => self.privilegeWarning("01006", "not all privileges could be revoked for \"{s}\"", .{object}),
+            }
+        }
+
+        /// roles_is_member_of(ROLERECURSE_PRIVS): `role`, then every role
+        /// whose privileges it inherits, breadth first.
+        fn inheritedRoles(self: *Self, role: u32, snap: Snapshot) []const u32 {
+            const roles = &self.privilege_scratch.roles;
+            roles[0] = role;
+            var count: usize = 1;
+            var next: usize = 0;
+            while (next < count) : (next += 1) {
+                const current = roles[next];
+                for (&self.catalog_objects.items) |*entry| {
+                    if (entry.kind != .member or entry.grantee != current or !O.visible(entry, snap) or
+                        !self.catalog_objects.membershipInherits(entry, snap)) continue;
+                    if (count < roles.len and std.mem.indexOfScalar(u32, roles[0..count], entry.target) == null) {
+                        roles[count] = entry.target;
+                        count += 1;
+                    }
+                }
+                const implied: []const u32 = if (current == CO.bootstrap_role) &.{CO.role_pg_database_owner} else if (current == CO.role_pg_monitor) &CO.monitor_members else &.{};
+                for (implied) |group| if (count < roles.len and std.mem.indexOfScalar(u32, roles[0..count], group) == null) {
+                    roles[count] = group;
+                    count += 1;
+                };
+            }
+            return roles[0..count];
+        }
+
+        /// Another transaction's uncommitted grant row on `object_oid`.
+        fn aclWait(self: *Self, slot: u16, kinds: []const CO.Kind, object_oid: u32, snap: Snapshot) Error!void {
+            for (&self.catalog_objects.items) |*row| {
+                if (row.target != object_oid or std.mem.indexOfScalar(CO.Kind, kinds, row.kind) == null) continue;
+                if (row.kind == .schema_acl_state and std.mem.indexOfScalar(CO.Kind, kinds, .schema_acl) == null) continue;
+                if (O.pendingOf(row, snap)) |other| return self.objectPark(slot, other);
+            }
+        }
+
+        /// Sort key of an ACL entry: its position (legacy rows, stored before
+        /// positions existed, sit right after the owner), the owner first.
+        fn aclBefore(a: AclRules.Entry, b: AclRules.Entry, owner: u32) bool {
+            const a_position = @max(a.ordinal, 1);
+            const b_position = @max(b.ordinal, 1);
+            if (a_position != b_position) return a_position < b_position;
+            const a_owner = a.grantee == owner and a.grantor == owner;
+            const b_owner = b.grantee == owner and b.grantor == owner;
+            if (a_owner != b_owner) return a_owner;
+            return (a.origin orelse 0) < (b.origin orelse 0);
+        }
+
+        fn sortAcl(acl: *AclRules.Acl, owner: u32) void {
+            var index: usize = 1;
+            while (index < acl.len) : (index += 1) {
+                const entry = acl.items[index];
+                var at = index;
+                while (at > 0 and aclBefore(entry, acl.items[at - 1], owner)) : (at -= 1) acl.items[at] = acl.items[at - 1];
+                acl.items[at] = entry;
+            }
+        }
+
+        /// PUBLIC's privilege in acldefault (types) or the public schema's
+        /// initdb ACL, and the owner's default position.
+        fn aclDefaults(kind: CO.Kind, object_oid: u32) struct { public: u32, public_position: u32, owner_position: u32 } {
+            if (kind == .type_acl) return .{ .public = CO.priv_usage, .public_position = 1, .owner_position = 2 };
+            if (kind == .schema_acl and object_oid == CO.public_namespace) return .{ .public = CO.priv_usage, .public_position = 2, .owner_position = 1 };
+            return .{ .public = 0, .public_position = 0, .owner_position = 1 };
+        }
+
+        fn aclMaterialized(self: *const Self, kind: CO.Kind, object_oid: u32, owner: u32, snap: Snapshot) bool {
+            if (kind == .schema_acl) return self.catalog_objects.schemaMaterialized(object_oid, snap);
+            if (self.catalog_objects.ownerMarker(kind, object_oid, owner, snap) != null) return true;
+            // Legacy table grants materialized relacl without a marker.
+            for (&self.catalog_objects.items) |*row| {
+                if (row.kind == kind and row.target == object_oid and O.visible(row, snap) and O.grantEntry(row, owner)) return true;
+            }
+            return false;
+        }
+
+        /// The stored ACL of an object (acldefault when never granted).
+        fn loadAcl(self: *const Self, acl: *AclRules.Acl, kind: CO.Kind, object_oid: u32, owner: u32, snap: Snapshot) Error!void {
+            acl.len = 0;
+            const defaults = aclDefaults(kind, object_oid);
+            const marker = self.catalog_objects.ownerMarker(kind, object_oid, owner, snap);
+            if (defaults.public != 0 and !self.aclMaterialized(kind, object_oid, owner, snap))
+                _ = try acl.append(.{ .grantee = CO.public_role, .grantor = owner, .privileges = defaults.public, .ordinal = defaults.public_position });
+            const owner_privileges = self.catalog_objects.ownerPrivileges(kind, object_oid, owner, snap);
+            if (owner_privileges != 0) {
+                var entry: AclRules.Entry = .{ .grantee = owner, .grantor = owner, .privileges = owner_privileges, .ordinal = defaults.owner_position };
+                if (marker) |index| {
+                    const row = &self.catalog_objects.items[index];
+                    entry.options = row.grant_flags & ~CO.acl_explicit_owner;
+                    if (row.oid != 0) entry.ordinal = row.oid;
+                    entry.origin = index;
+                }
+                _ = try acl.append(entry);
+            }
+            for (&self.catalog_objects.items, 0..) |*row, index| {
+                if (row.kind != kind or row.target != object_oid or !O.visible(row, snap) or !O.grantEntry(row, owner)) continue;
+                _ = try acl.append(.{ .grantee = row.grantee, .grantor = row.owner, .privileges = row.flags, .options = row.grant_flags, .ordinal = row.oid, .origin = index });
+            }
+            sortAcl(acl, owner);
+        }
+
+        /// Appended entries take the positions after the last one.
+        fn numberAcl(acl: *AclRules.Acl) void {
+            var floor: u32 = 0;
+            for (acl.items[0..acl.len]) |*entry| {
+                if (entry.ordinal <= floor) entry.ordinal = floor + 1;
+                floor = entry.ordinal;
+            }
+        }
+
+        fn aclRow(kind: CO.Kind, object_oid: u32, owner: u32, entry: AclRules.Entry) O.Object {
+            if (entry.grantee == owner and entry.grantor == owner) {
+                return .{ .kind = kind, .target = object_oid, .grantee = owner, .owner = owner, .flags = entry.privileges,
+                    .grant_flags = CO.acl_explicit_owner | entry.options, .oid = entry.ordinal };
+            }
+            return .{ .kind = kind, .target = object_oid, .grantee = entry.grantee, .owner = entry.grantor, .sub = CO.grantorKey(owner, entry.grantor),
+                .flags = entry.privileges, .grant_flags = entry.options, .oid = entry.ordinal };
+        }
+
+        fn sameAclRow(row: *const O.Object, wanted: *const O.Object) bool {
+            return row.grantee == wanted.grantee and row.owner == wanted.owner and row.sub == wanted.sub and
+                row.flags == wanted.flags and row.grant_flags == wanted.grant_flags and row.oid == wanted.oid;
+        }
+
+        /// The owner's marker row a stored ACL needs: its entry (or an empty
+        /// one when every owner privilege was revoked). A schema keeps none
+        /// for the default owner entry: its state row materializes the ACL.
+        fn wantedMarker(acl: *const AclRules.Acl, kind: CO.Kind, object_oid: u32, owner: u32) ?O.Object {
+            for (acl.entries()) |entry| {
+                if (entry.grantee != owner or entry.grantor != owner) continue;
+                if (kind == .schema_acl and entry.privileges == CO.schema_privileges and entry.options == 0 and
+                    entry.ordinal == aclDefaults(kind, object_oid).owner_position) return null;
+                return aclRow(kind, object_oid, owner, entry);
+            }
+            var empty = aclRow(kind, object_oid, owner, .{ .grantee = owner, .grantor = owner });
+            empty.oid = 0;
+            return empty;
+        }
+
+        fn isMarker(row: *const O.Object) bool {
+            return row.grant_flags & CO.acl_explicit_owner != 0;
+        }
+
+        /// Writes the ACL back: unchanged rows stay, the rest are replaced.
+        fn storeAcl(self: *Self, slot: u16, acl: *AclRules.Acl, kind: CO.Kind, object_oid: u32, owner: u32, snap: Snapshot, latest: Snapshot) Error!void {
+            numberAcl(acl);
+            const marker = wantedMarker(acl, kind, object_oid, owner);
+            var marker_kept = false;
+            var writes: usize = 0;
+            for (&self.catalog_objects.items, 0..) |*row, index| {
+                if (row.kind != kind or row.target != object_oid or !O.visible(row, latest)) continue;
+                if (aclRowKept(acl, owner, row, index, marker)) {
+                    if (isMarker(row)) marker_kept = true;
+                } else writes += 1;
+            }
+            for (acl.entries()) |entry| {
+                if (entry.grantee == owner and entry.grantor == owner) continue;
+                const wanted = aclRow(kind, object_oid, owner, entry);
+                if (entry.origin == null or !sameAclRow(&self.catalog_objects.items[entry.origin.?], &wanted)) writes += 1;
+            }
+            const insert_marker = marker != null and !marker_kept;
+            if (insert_marker) writes += 1;
+            const schema_state = kind == .schema_acl and !self.catalog_objects.schemaMaterialized(object_oid, latest);
+            if (schema_state) writes += 1;
+            try self.reserveWrites(slot, writes);
+            if (schema_state) {
+                var state: O.Object = .{ .kind = .schema_acl_state, .target = object_oid, .owner = owner };
+                _ = try self.objectInsert(slot, &state, false, snap);
+            }
+            for (&self.catalog_objects.items, 0..) |*row, index| {
+                if (row.kind != kind or row.target != object_oid or !O.visible(row, latest)) continue;
+                if (!aclRowKept(acl, owner, row, index, marker)) self.objectDelete(slot, index, snap);
+            }
+            if (insert_marker) {
+                var wanted = marker.?;
+                _ = try self.objectInsert(slot, &wanted, false, snap);
+            }
+            for (acl.entries()) |entry| {
+                if (entry.grantee == owner and entry.grantor == owner) continue;
+                var wanted = aclRow(kind, object_oid, owner, entry);
+                if (entry.origin != null and sameAclRow(&self.catalog_objects.items[entry.origin.?], &wanted)) continue;
+                _ = try self.objectInsert(slot, &wanted, false, snap);
+            }
+        }
+
+        /// A stored row the new ACL keeps unchanged.
+        fn aclRowKept(acl: *const AclRules.Acl, owner: u32, row: *const O.Object, index: usize, marker: ?O.Object) bool {
+            if (isMarker(row)) return marker != null and sameAclRow(row, &marker.?);
+            for (acl.entries()) |entry| {
+                if (entry.origin != index or (entry.grantee == owner and entry.grantor == owner)) continue;
+                const wanted = aclRow(row.kind, row.target, owner, entry);
+                return sameAclRow(row, &wanted);
+            }
+            return false;
+        }
+
+        /// The roles a GRANT names, once each (42704 for an unknown role).
+        fn grantRoles(self: *Self, slot: u16, source: []const u8, grant: *const CO.Grant, out: *[CO.list_capacity]u32, snap: Snapshot) Error![]const u32 {
+            var count: usize = 0;
+            var latest = snap;
+            latest.csn = self.csn;
+            for (grant.grantees[0..grant.grantee_count]) |grantee| {
+                const role = try self.objectRole(source, grantee, latest);
+                if (std.mem.indexOfScalar(u32, out[0..count], role) != null) continue;
+                if (role != CO.public_role and !CO.predefinedRole(role) and role != CO.bootstrap_role) {
+                    const key: O.Object = .{ .kind = .role, .oid = role };
+                    if (self.catalog_objects.pendingConflict(&key, snap)) |other| return self.objectPark(slot, other);
+                }
+                out[count] = role;
+                count += 1;
+            }
+            return out[0..count];
+        }
+
+        /// The privilege set a GRANT names for an object kind: ALL is every
+        /// privilege of the kind; another word is 0LP01.
+        fn grantSet(grant: *const CO.Grant, all: u32) Error!u32 {
+            if (grant.all_privileges) return all;
+            if (grant.privileges & ~all != 0) return error.InvalidGrantOperation;
+            return grant.privileges;
+        }
+
+        const GrantTarget = union(enum) { relation: usize, sequence: usize, schema: usize, public_schema, user_type: usize };
+
+        /// GRANT / REVOKE privileges on tables, columns, sequences, schemas
+        /// and types (PostgreSQL's ExecuteGrantStmt): GRANTED BY must be the
+        /// current user (0A000), then the objects resolve, then the
+        /// grantees, then the privilege types are checked per object kind.
+        fn grantPrivileges(self: *Self, slot: u16, source: []const u8, grant: *const CO.Grant, revoke: bool, snap: Snapshot) Error!void {
+            if (self.dialect != .postgres and grant.object != .table) return error.UnsupportedStatement;
+            var latest = snap;
+            latest.csn = self.csn;
+            if (grant.grantor) |grantor| {
+                if (try self.objectRole(source, grantor, latest) != self.session.role) return error.UnsupportedStatement;
+            }
+            var targets: [CO.list_capacity]GrantTarget = undefined;
+            var namespaces: [CO.list_capacity]u32 = undefined;
+            for (grant.tables[0..grant.table_count], 0..) |name, index| switch (grant.object) {
+                .table => targets[index] = try self.grantRelationTarget(slot, source, name, true, snap),
+                .sequence => targets[index] = try self.grantRelationTarget(slot, source, name, false, snap),
+                .schema => {
+                    if (name.has_schema) return error.Syntax;
+                    targets[index] = try self.grantSchemaTarget(slot, source, name.name, snap);
+                },
+                .domain, .type_name => targets[index] = .{ .user_type = try self.grantTypeTarget(source, name, grant.object == .domain, latest) },
+                .all_tables, .all_sequences => {
+                    if (name.has_schema) return error.Syntax;
+                    namespaces[index] = namespaceFor(&self.catalog, objectName(source, name.name).slice(), latest) orelse return error.UndefinedSchema;
+                },
+            };
+            var grantee_buffer: [CO.list_capacity]u32 = undefined;
+            const grantees = try self.grantRoles(slot, source, grant, &grantee_buffer, snap);
+            // Privilege types per object kind (0LP01). TABLE accepts the
+            // sequence privileges too: they are checked per relation.
+            const relation_set = CO.table_privileges | CO.sequence_privileges;
+            switch (grant.object) {
+                .table, .all_tables => _ = try grantSet(grant, relation_set),
+                .sequence, .all_sequences => _ = try grantSet(grant, CO.sequence_privileges),
+                .schema => _ = try grantSet(grant, CO.schema_privileges),
+                .domain, .type_name => _ = try grantSet(grant, CO.type_privileges),
+            }
+            for (grant.columns[0..grant.column_count]) |column| {
+                if (column.privileges & ~CO.column_privileges != 0) return error.InvalidGrantOperation;
+            }
+            switch (grant.object) {
+                .all_tables, .all_sequences => {
+                    var relations: [K.relation_rows]K.Found = undefined;
+                    const count = self.catalog.visibleRelations(latest, &relations);
+                    for (namespaces[0..grant.table_count], 0..) |namespace, position| {
+                        // A schema named twice is changed once.
+                        if (std.mem.indexOfScalar(u32, namespaces[0..position], namespace) != null) continue;
+                        for (relations[0..count]) |found| {
+                            if (grant.object == .all_sequences) {
+                                if (found.kind != 'S' or self.seqs[found.slot].namespace != namespace) continue;
+                                try self.grantSequence(slot, grant, found.slot, grantees, revoke, false, snap);
+                                continue;
+                            }
+                            // ALL TABLES covers views, materialized views and
+                            // partitioned tables, never sequences.
+                            if (found.kind == 'S' or self.tables[found.slot].namespace != namespace) continue;
+                            try self.lockTable(slot, found.slot, .access_share);
+                            try self.grantRelation(slot, source, grant, found.slot, grantees, revoke, snap);
+                        }
+                    }
+                },
+                else => for (targets[0..grant.table_count], 0..) |object_oid, position| {
+                    // An object named twice is changed once (PostgreSQL's
+                    // CommandCounterIncrement between duplicates).
+                    var duplicate = false;
+                    for (targets[0..position]) |earlier| duplicate = duplicate or std.meta.eql(earlier, object_oid);
+                    if (duplicate) continue;
+                    switch (object_oid) {
+                    .relation => |table_slot| try self.grantRelation(slot, source, grant, table_slot, grantees, revoke, snap),
+                    .sequence => |seq_slot| try self.grantSequence(slot, grant, seq_slot, grantees, revoke, grant.object == .table, snap),
+                    .schema => |schema_slot| try self.grantSchema(slot, grant, self.schemas[schema_slot].oid, self.schemaOwner(&self.schemas[schema_slot], latest), self.schemas[schema_slot].name.slice(), grantees, revoke, snap),
+                    .public_schema => try self.grantSchema(slot, grant, CO.public_namespace, CO.role_pg_database_owner, "public", grantees, revoke, snap),
+                    .user_type => |index| try self.grantType(slot, grant, index, grantees, revoke, snap),
+                    }
+                },
+            }
+        }
+
+        /// A relation named by GRANT ON [TABLE] (any relation, sequences
+        /// included) or ON SEQUENCE (42809 for another relation).
+        fn grantRelationTarget(self: *Self, slot: u16, source: []const u8, name: CO.Qualified, any_relation: bool, snap: Snapshot) Error!GrantTarget {
+            const schema_name = if (name.has_schema) objectName(source, name.schema) else Name{};
+            const relation_name = objectName(source, name.name);
+            const namespace = (try self.relationNamespace(self.session.role, if (name.has_schema) schema_name.slice() else null, relation_name.slice(), snap)) orelse return error.TableNotFound;
+            const found = self.catalog.findIn(namespace, relation_name.slice(), snap) orelse return error.TableNotFound;
+            if (found.kind == 'S') return .{ .sequence = found.slot };
+            if (!any_relation) return error.WrongObjectType;
+            try self.lockTable(slot, found.slot, .access_share);
+            return .{ .relation = found.slot };
+        }
+
+        fn grantSchemaTarget(self: *Self, slot: u16, source: []const u8, ident: CO.Ident, snap: Snapshot) Error!GrantTarget {
+            const name = objectName(source, ident);
             if (namespaceFor(&self.catalog, name.slice(), snap)) |oid| {
+                if (oid == CO.public_namespace) return .public_schema;
                 if (oid < change_log.first_oid) return error.UnsupportedStatement;
             }
             const visible = self.catalog.findSchema(name.slice(), snap) orelse return error.UndefinedSchema;
@@ -6358,49 +6930,263 @@ pub fn Database(comptime config: Config) type {
             if (!schema.private_usage) return error.UnsupportedStatement;
             if (schema.pending_drop and schema.creator != slot) return self.objectPark(slot, schema.creator);
             if (self.catalog_objects.pendingReference(schema.oid, snap)) |other| return self.objectPark(slot, other);
-
             var latest = snap;
             latest.csn = self.csn;
-            const current_schema = self.catalog.findSchema(name.slice(), latest) orelse return error.SerializationFailure;
-            if (visible.oid != current_schema.oid) return error.SerializationFailure;
-            if (!self.ownsNamespace(schema.oid, latest)) return error.InsufficientPrivilege;
+            const current = self.catalog.findSchema(name.slice(), latest) orelse return error.SerializationFailure;
+            if (visible.oid != current.oid) return error.SerializationFailure;
+            return .{ .schema = visible.slot };
+        }
 
-            var grantees: [CO.list_capacity]u32 = undefined;
-            var count: usize = 0;
-            for (grant.grantees[0..grant.grantee_count]) |grantee| {
-                const role = try self.objectRole(source, grantee, latest);
-                if (role != CO.public_role) {
-                    if (self.catalog_objects.pendingReference(role, snap)) |other| return self.objectPark(slot, other);
-                    if (self.catalog_objects.roleName(role, latest) == null) return error.UndefinedObject;
-                }
-                var duplicate = false;
-                for (grantees[0..count]) |prior| duplicate = duplicate or prior == role;
-                if (duplicate) continue;
-                grantees[count] = role;
-                count += 1;
+        /// A user type named by GRANT ON TYPE / DOMAIN (42704 missing; 42809
+        /// when DOMAIN names another type).
+        fn grantTypeTarget(self: *Self, source: []const u8, name: CO.Qualified, domain: bool, snap: Snapshot) Error!usize {
+            const wanted = objectName(source, name.name);
+            const namespace = try self.typeNamespace(source, name, snap);
+            for ([_]CO.Kind{ .domain, .enum_type, .composite_type }) |kind| {
+                const index = self.catalog_objects.byName(kind, namespace, wanted.slice(), snap) orelse continue;
+                if (domain and kind != .domain) return error.WrongObjectType;
+                return index;
             }
-            // The first authorized GRANT or REVOKE materializes the ACL,
-            // even if its effective privileges are exactly the default.
-            const owner = self.schemaOwner(schema, latest);
-            var state: O.Object = .{ .kind = .schema_acl_state, .target = schema.oid, .owner = owner };
-            const first_acl = self.catalog_objects.findKey(&state, latest) == null;
-            try self.reserveWrites(slot, 2 * count + @intFromBool(first_acl));
-            if (first_acl) _ = try self.objectInsert(slot, &state, false, snap);
-            for (grantees[0..count]) |role| {
-                var acl: O.Object = .{ .kind = .schema_acl, .target = schema.oid, .grantee = role, .owner = owner };
-                const before = self.catalog_objects.findKey(&acl, latest);
-                const old: ?u32 = if (before) |index| self.catalog_objects.items[index].flags else null;
-                const next: ?u32 = if (role == owner)
-                    (if (revoke) 0 else null)
-                else
-                    (if (revoke) null else CO.priv_schema_usage);
-                if (old == next) continue;
-                if (before) |index| self.objectDelete(slot, index, snap);
-                if (next) |flags| {
-                    acl.flags = flags;
-                    _ = try self.objectInsert(slot, &acl, false, snap);
-                }
+            return error.UndefinedObject;
+        }
+
+        /// pg_aclmask's ANY test of restrict_and_check_grant: the grantor
+        /// holds some privilege (or option) on the object at all.
+        fn grantorHolds(self: *const Self, acl: *const AclRules.Acl, role: u32, owner: u32, all: u32, extra: u32, latest: Snapshot) bool {
+            if (self.catalog_objects.superuser(role, latest)) return true;
+            if (extra & all != 0) return true;
+            return AclRules.aclmask(acl, self.privilegeOracle(latest), role, owner, AclRules.combine(all, all), false) != 0;
+        }
+
+        /// One object's ACL change (ExecGrant_*): the grantor PostgreSQL
+        /// would pick, the restriction to its grant options with warnings,
+        /// then the change for every grantee. Returns false when nothing
+        /// was asked (no privileges).
+        fn changeAcl(self: *Self, acl: *AclRules.Acl, grant: *const CO.Grant, privileges: u32, all: u32, all_privileges: bool, grantees: []const u32, revoke: bool, owner: u32, grantor_acl: *const AclRules.Acl, extra: u32, name: []const u8, column: ?[]const u8, latest: Snapshot) Error!void {
+            const superuser = self.catalog_objects.superuser(self.session.role, latest);
+            const roles = self.inheritedRoles(self.session.role, latest);
+            const grantor = AclRules.selectBestGrantor(grantor_acl, roles, privileges, owner, superuser);
+            const restricted = try AclRules.restrictAndCheck(!revoke, grantor.options, all_privileges, privileges,
+                self.grantorHolds(grantor_acl, grantor.role, owner, all, extra, latest));
+            self.grantWarning(restricted.warning, name, column);
+            var scratch: AclRules.Scratch = .{ .copy = .{ .items = &self.privilege_scratch.copy }, .pending = &self.privilege_scratch.pending };
+            for (grantees) |grantee| {
+                try AclRules.mergeGrant(acl, self.privilegeOracle(latest), !revoke, grant.option, if (grant.cascade) .cascade else .restrict,
+                    grantee, restricted.privileges, grantor.role, owner, &scratch);
             }
+        }
+
+        /// ExecGrant_Relation for a table, view or materialized view, with
+        /// its column privileges (ExecGrant_Attribute): a REVOKE of column
+        /// privileges on the table revokes them from every column too.
+        fn grantRelation(self: *Self, slot: u16, source: []const u8, grant: *const CO.Grant, table_slot: usize, grantees: []const u32, revoke: bool, snap: Snapshot) Error!void {
+            var latest = snap;
+            latest.csn = self.csn;
+            const table = &self.tables[table_slot];
+            const oid = table.oid;
+            const owner = self.catalog_objects.owner(oid, latest);
+            try self.aclWait(slot, &.{ .acl, .column_acl }, oid, snap);
+            const privileges: u32 = if (grant.all_privileges) CO.table_privileges else grant.privileges;
+            // USAGE is a sequence privilege only.
+            if (privileges & ~CO.table_privileges != 0) return error.InvalidGrantOperation;
+            const scratch = &self.privilege_scratch;
+            var relation: AclRules.Acl = .{ .items = &scratch.relation };
+            try self.loadAcl(&relation, .acl, oid, owner, latest);
+            const extra = self.catalog_objects.predefinedPrivileges(self.session.role, latest) & CO.table_privileges;
+            if (privileges != 0) {
+                var acl: AclRules.Acl = .{ .items = &scratch.work };
+                try acl.copyFrom(&relation);
+                try self.changeAcl(&acl, grant, privileges, CO.table_privileges, grant.all_privileges, grantees, revoke, owner, &relation, extra, table.name.slice(), null, latest);
+                try self.storeAcl(slot, &acl, .acl, oid, owner, snap, latest);
+            }
+            const implied = if (revoke) privileges & CO.column_privileges else 0;
+            if (grant.column_count == 0 and implied == 0) return;
+            // Column privileges per column (0-based), named columns first.
+            var wanted: [config.columns]u32 = @splat(implied);
+            for (grant.columns[0..grant.column_count]) |column| {
+                const name = objectName(source, column.column);
+                var found: ?usize = null;
+                for (table.columns[0..table.column_count], 0..) |*definition, index| {
+                    if (types.same(definition.name.slice(), name.slice())) found = index;
+                }
+                wanted[found orelse return error.ColumnNotFound] |= column.privileges;
+            }
+            try self.loadColumnRows(oid, latest);
+            for (0..table.column_count) |column| {
+                if (wanted[column] == 0) continue;
+                try self.grantColumn(grant, column, wanted[column], grantees, revoke, owner, &relation, extra, table.name.slice(), table.columns[column].name.slice(), latest);
+            }
+            try self.storeColumnRows(slot, oid, owner, snap, latest);
+        }
+
+        fn loadColumnRows(self: *Self, table: u32, latest: Snapshot) Error!void {
+            const scratch = &self.privilege_scratch;
+            scratch.column_count = 0;
+            for (&self.catalog_objects.items, 0..) |*row, index| {
+                if (row.kind != .column_acl or row.target != table or !O.visible(row, latest)) continue;
+                if (scratch.column_count == scratch.columns.len) return error.TableCapacity;
+                var state: ColumnRowState = .{ .grantee = row.grantee, .grantor = row.owner, .original = index };
+                const length = @min(row.text_len, state.bytes.len);
+                @memcpy(state.bytes[0..length], row.text[0..length]);
+                scratch.columns[scratch.column_count] = state;
+                scratch.column_count += 1;
+            }
+        }
+
+        /// ExecGrant_Attribute for one column: the grantor comes from the
+        /// relation's ACL (before this statement) and the column's.
+        fn grantColumn(self: *Self, grant: *const CO.Grant, column: usize, privileges: u32, grantees: []const u32, revoke: bool, owner: u32, relation: *const AclRules.Acl, extra: u32, table_name: []const u8, column_name: []const u8, latest: Snapshot) Error!void {
+            const scratch = &self.privilege_scratch;
+            var acl: AclRules.Acl = .{ .items = &scratch.work };
+            for (scratch.columns[0..scratch.column_count], 0..) |*state, index| {
+                const bits = state.bytes[2 * column];
+                if (bits == 0) continue;
+                _ = try acl.append(.{ .grantee = state.grantee, .grantor = state.grantor, .privileges = CO.columnFlags(bits & 0x0f),
+                    .options = CO.columnFlags(bits >> 4), .ordinal = state.bytes[2 * column + 1], .origin = index });
+            }
+            sortAcl(&acl, owner);
+            var merged: AclRules.Acl = .{ .items = &scratch.merged };
+            try merged.copyFrom(relation);
+            for (acl.entries()) |entry| _ = try merged.append(entry);
+            try self.changeAcl(&acl, grant, privileges, CO.column_privileges, privileges == CO.column_privileges, grantees, revoke, owner, &merged, extra & CO.column_privileges, table_name, column_name, latest);
+            numberAcl(&acl);
+            for (scratch.columns[0..scratch.column_count]) |*state| {
+                state.bytes[2 * column] = 0;
+                state.bytes[2 * column + 1] = 0;
+            }
+            for (acl.entries()) |entry| {
+                if (entry.ordinal > 0xff) return error.ProgramLimitExceeded;
+                var object_oid: ?*ColumnRowState = null;
+                for (scratch.columns[0..scratch.column_count]) |*state| {
+                    if (state.grantee == entry.grantee and state.grantor == entry.grantor) object_oid = state;
+                }
+                const state = object_oid orelse blk: {
+                    if (scratch.column_count == scratch.columns.len) return error.TableCapacity;
+                    scratch.columns[scratch.column_count] = .{ .grantee = entry.grantee, .grantor = entry.grantor };
+                    scratch.column_count += 1;
+                    break :blk &scratch.columns[scratch.column_count - 1];
+                };
+                state.bytes[2 * column] = CO.columnNibble(entry.privileges) | (CO.columnNibble(entry.options) << 4);
+                state.bytes[2 * column + 1] = @intCast(entry.ordinal);
+            }
+        }
+
+        /// The row a column state becomes (null: no column privileges left).
+        fn columnRow(table: u32, owner: u32, state: *const ColumnRowState) Error!?O.Object {
+            var used: usize = 0;
+            var flags: u32 = 0;
+            var options: u32 = 0;
+            var index: usize = 0;
+            while (index < state.bytes.len) : (index += 2) {
+                const bits = state.bytes[index];
+                if (bits == 0) continue;
+                used = index + 2;
+                flags |= CO.columnFlags(bits & 0x0f);
+                options |= CO.columnFlags(bits >> 4);
+            }
+            if (used == 0) return null;
+            if (used > O.text_capacity) return error.TextCapacity;
+            var row: O.Object = .{ .kind = .column_acl, .target = table, .grantee = state.grantee, .owner = state.grantor,
+                .sub = CO.grantorKey(owner, state.grantor), .flags = flags, .grant_flags = options };
+            try row.setText("", state.bytes[0..used]);
+            return row;
+        }
+
+        fn sameColumnRow(row: *const O.Object, wanted: *const O.Object) bool {
+            return row.grantee == wanted.grantee and row.owner == wanted.owner and row.sub == wanted.sub and row.flags == wanted.flags and
+                row.grant_flags == wanted.grant_flags and std.mem.eql(u8, row.textSlice(), wanted.textSlice());
+        }
+
+        fn storeColumnRows(self: *Self, slot: u16, table: u32, owner: u32, snap: Snapshot, latest: Snapshot) Error!void {
+            _ = latest;
+            const scratch = &self.privilege_scratch;
+            var writes: usize = 0;
+            for (scratch.columns[0..scratch.column_count]) |*state| {
+                const wanted = try columnRow(table, owner, state);
+                if (state.original) |index| {
+                    if (wanted != null and sameColumnRow(&self.catalog_objects.items[index], &wanted.?)) continue;
+                    writes += 1;
+                }
+                if (wanted != null) writes += 1;
+            }
+            try self.reserveWrites(slot, writes);
+            for (scratch.columns[0..scratch.column_count]) |*state| {
+                const index = state.original orelse continue;
+                const wanted = try columnRow(table, owner, state);
+                if (wanted != null and sameColumnRow(&self.catalog_objects.items[index], &wanted.?)) continue;
+                self.objectDelete(slot, index, snap);
+            }
+            for (scratch.columns[0..scratch.column_count]) |*state| {
+                var wanted = (try columnRow(table, owner, state)) orelse continue;
+                if (state.original) |index| if (sameColumnRow(&self.catalog_objects.items[index], &wanted)) continue;
+                _ = try self.objectInsert(slot, &wanted, false, snap);
+            }
+        }
+
+        /// The owner of a sequence: its owning table's, else the bootstrap role.
+        fn sequenceOwner(self: *const Self, seq_slot: usize, snap: Snapshot) u32 {
+            const seq = &self.seqs[seq_slot];
+            return if (seq.owner == 0) CO.bootstrap_role else self.catalog_objects.owner(seq.owner, snap);
+        }
+
+        /// ExecGrant_Relation for a sequence. Through GRANT ... ON TABLE,
+        /// privileges other than USAGE, SELECT and UPDATE only warn.
+        fn grantSequence(self: *Self, slot: u16, grant: *const CO.Grant, seq_slot: usize, grantees: []const u32, revoke: bool, table_syntax: bool, snap: Snapshot) Error!void {
+            var latest = snap;
+            latest.csn = self.csn;
+            const seq = &self.seqs[seq_slot];
+            const owner = self.sequenceOwner(seq_slot, latest);
+            try self.aclWait(slot, &.{.sequence_acl}, seq.oid, snap);
+            if (grant.column_count != 0) return error.UnsupportedStatement;
+            var privileges: u32 = if (grant.all_privileges) CO.sequence_privileges else grant.privileges;
+            if (privileges & ~CO.sequence_privileges != 0) {
+                if (!table_syntax) return error.InvalidGrantOperation;
+                self.privilegeWarning("0LP01", "sequence \"{s}\" only supports USAGE, SELECT, and UPDATE privileges", .{seq.name.slice()});
+                privileges &= CO.sequence_privileges;
+            }
+            const scratch = &self.privilege_scratch;
+            var acl: AclRules.Acl = .{ .items = &scratch.work };
+            try self.loadAcl(&acl, .sequence_acl, seq.oid, owner, latest);
+            if (privileges == 0) return;
+            var before: AclRules.Acl = .{ .items = &scratch.relation };
+            try before.copyFrom(&acl);
+            const extra = self.catalog_objects.predefinedPrivileges(self.session.role, latest) & CO.priv_select;
+            try self.changeAcl(&acl, grant, privileges, CO.sequence_privileges, grant.all_privileges, grantees, revoke, owner, &before, extra, seq.name.slice(), null, latest);
+            try self.storeAcl(slot, &acl, .sequence_acl, seq.oid, owner, snap, latest);
+        }
+
+        /// ExecGrant_Namespace: USAGE and CREATE on a schema. The public
+        /// schema starts from its initdb ACL (pg_database_owner=UC, =U).
+        fn grantSchema(self: *Self, slot: u16, grant: *const CO.Grant, namespace: u32, owner: u32, name: []const u8, grantees: []const u32, revoke: bool, snap: Snapshot) Error!void {
+            var latest = snap;
+            latest.csn = self.csn;
+            try self.aclWait(slot, &.{ .schema_acl, .schema_acl_state }, namespace, snap);
+            const privileges: u32 = if (grant.all_privileges) CO.schema_privileges else grant.privileges;
+            const scratch = &self.privilege_scratch;
+            var acl: AclRules.Acl = .{ .items = &scratch.work };
+            try self.loadAcl(&acl, .schema_acl, namespace, owner, latest);
+            var before: AclRules.Acl = .{ .items = &scratch.relation };
+            try before.copyFrom(&acl);
+            const extra = self.catalog_objects.predefinedPrivileges(self.session.role, latest) & CO.priv_usage;
+            try self.changeAcl(&acl, grant, privileges, CO.schema_privileges, grant.all_privileges, grantees, revoke, owner, &before, extra, name, null, latest);
+            try self.storeAcl(slot, &acl, .schema_acl, namespace, owner, snap, latest);
+        }
+
+        /// ExecGrant_Type: USAGE on a domain, enum or composite type.
+        fn grantType(self: *Self, slot: u16, grant: *const CO.Grant, index: usize, grantees: []const u32, revoke: bool, snap: Snapshot) Error!void {
+            var latest = snap;
+            latest.csn = self.csn;
+            const object = self.catalog_objects.items[index];
+            try self.aclWait(slot, &.{.type_acl}, object.oid, snap);
+            if (O.pendingOf(&self.catalog_objects.items[index], snap)) |other| return self.objectPark(slot, other);
+            const privileges: u32 = if (grant.all_privileges) CO.type_privileges else grant.privileges;
+            const scratch = &self.privilege_scratch;
+            var acl: AclRules.Acl = .{ .items = &scratch.work };
+            try self.loadAcl(&acl, .type_acl, object.oid, object.owner, latest);
+            var before: AclRules.Acl = .{ .items = &scratch.relation };
+            try before.copyFrom(&acl);
+            try self.changeAcl(&acl, grant, privileges, CO.type_privileges, grant.all_privileges, grantees, revoke, object.owner, &before, 0, object.name.slice(), null, latest);
+            try self.storeAcl(slot, &acl, .type_acl, object.oid, object.owner, snap, latest);
         }
 
         fn alterSchemaOwner(self: *Self, slot: u16, source: []const u8, ident: CO.Ident, grantee: CO.Grantee, snap: Snapshot) Error!void {
@@ -6425,35 +7211,20 @@ pub fn Database(comptime config: Config) type {
 
             var owner_entry: O.Object = .{ .kind = .schema_owner, .target = schema.oid, .owner = new_owner };
             const previous = self.catalog_objects.findKey(&owner_entry, latest);
-            var acl_count: usize = 0;
-            var owner_revoked = false;
-            var new_owner_usage = false;
-            for (&self.catalog_objects.items) |*item| {
-                if (item.target != schema.oid or !O.visible(item, latest)) continue;
-                if (item.kind == .schema_acl_state) acl_count += 1;
-                if (item.kind != .schema_acl) continue;
-                acl_count += 1;
-                owner_revoked = owner_revoked or (item.grantee == old_owner and item.flags == 0);
-                new_owner_usage = new_owner_usage or (item.grantee == new_owner and item.flags != 0);
-            }
-            try self.reserveWrites(slot, 1 + @as(usize, @intFromBool(previous != null)) + 2 * acl_count);
+            const state_key: O.Object = .{ .kind = .schema_acl_state, .target = schema.oid };
+            const state = self.catalog_objects.findKey(&state_key, latest);
+            try self.reserveWrites(slot, 1 + @as(usize, @intFromBool(previous != null)) + 2 * @as(usize, @intFromBool(state != null)));
             if (previous) |index| self.objectDelete(slot, index, latest);
             _ = try self.objectInsert(slot, &owner_entry, false, latest);
-            for (&self.catalog_objects.items, 0..) |*item, index| {
-                if (item.target != schema.oid or !O.visible(item, latest)) continue;
-                if (item.kind != .schema_acl and item.kind != .schema_acl_state) continue;
-                var updated = item.*;
+            // The materialization marker follows the owner; the grants move
+            // to it (aclnewowner).
+            if (state) |index| {
+                var next = self.catalog_objects.items[index];
+                next.owner = new_owner;
                 self.objectDelete(slot, index, latest);
-                if (updated.kind == .schema_acl) {
-                    if (updated.grantee == new_owner) continue;
-                    if (updated.grantee == old_owner) {
-                        if (!owner_revoked or new_owner_usage) continue;
-                        updated.grantee = new_owner;
-                    }
-                }
-                updated.owner = new_owner;
-                _ = try self.objectInsert(slot, &updated, false, latest);
+                _ = try self.objectInsert(slot, &next, false, latest);
             }
+            try self.changeAclOwner(slot, .schema_acl, schema.oid, old_owner, new_owner, snap);
         }
 
         // -- row-level security ------------------------------------------------
@@ -6590,30 +7361,92 @@ pub fn Database(comptime config: Config) type {
                 },
             }
             if (owner == old_owner and flags == self.catalog_objects.securityFlags(oid, snap)) return;
-            // Grants recorded by the old owner move to the new one (aclnewowner).
-            var grants: usize = 0;
-            if (owner != old_owner) {
-                for (&self.catalog_objects.items) |*o| {
-                    if (o.kind == .acl and o.target == oid and o.owner == old_owner and O.visible(o, snap)) grants += 1;
-                }
-            }
-            try self.reserveWrites(slot, 2 + 2 * grants);
+            try self.reserveWrites(slot, 2);
             if (existing) |index| self.objectDelete(slot, index, snap);
             if (owner != CO.bootstrap_role or flags != 0) {
                 var next: O.Object = .{ .kind = .relation, .target = oid, .owner = owner, .flags = flags };
                 _ = try self.objectInsert(slot, &next, false, snap);
             }
-            if (grants != 0) {
-                for (0..self.catalog_objects.items.len) |index| {
-                    const o = &self.catalog_objects.items[index];
-                    if (o.kind != .acl or o.target != oid or o.owner != old_owner or !O.visible(o, snap) or o.xmax.epoch != 0) continue;
-                    if (o.xmin_csn == 0 and o.xmin_cid == snap.cid) continue;
-                    var next = o.*;
-                    next.owner = owner;
-                    self.objectDelete(slot, index, snap);
-                    _ = try self.objectInsert(slot, &next, false, snap);
+            if (owner == old_owner) return;
+            // Grants move to the new owner (aclnewowner): the relation's,
+            // its columns' and those of the sequences it owns.
+            try self.changeAclOwner(slot, .acl, oid, old_owner, owner, snap);
+            try self.changeColumnAclOwner(slot, oid, old_owner, owner, snap);
+            for (&self.seqs) |*seq| {
+                if (seq.live and seq.owner == oid) try self.changeAclOwner(slot, .sequence_acl, seq.oid, old_owner, owner, snap);
+            }
+        }
+
+        /// aclnewowner: the old owner becomes the new one as grantee and
+        /// grantor; entries that now coincide merge (the first keeps its
+        /// place). An ACL never materialized stays so.
+        fn changeAclOwner(self: *Self, slot: u16, kind: CO.Kind, object_oid: u32, old_owner: u32, new_owner: u32, snap: Snapshot) Error!void {
+            var latest = snap;
+            latest.csn = self.csn;
+            try self.aclWait(slot, &.{kind}, object_oid, snap);
+            if (!self.aclMaterialized(kind, object_oid, old_owner, latest)) return;
+            var acl: AclRules.Acl = .{ .items = &self.privilege_scratch.work };
+            try self.loadAcl(&acl, kind, object_oid, old_owner, latest);
+            renameAclRole(&acl, old_owner, new_owner);
+            try self.storeAcl(slot, &acl, kind, object_oid, new_owner, snap, latest);
+        }
+
+        fn renameAclRole(acl: *AclRules.Acl, old_owner: u32, new_owner: u32) void {
+            for (acl.items[0..acl.len]) |*entry| {
+                if (entry.grantee == old_owner) entry.grantee = new_owner;
+                if (entry.grantor == old_owner) entry.grantor = new_owner;
+            }
+            var index: usize = 0;
+            while (index < acl.len) : (index += 1) {
+                var other = index + 1;
+                while (other < acl.len) {
+                    const later = acl.items[other];
+                    if (later.grantee != acl.items[index].grantee or later.grantor != acl.items[index].grantor) {
+                        other += 1;
+                        continue;
+                    }
+                    acl.items[index].privileges |= later.privileges;
+                    acl.items[index].options |= later.options;
+                    var at = other;
+                    while (at + 1 < acl.len) : (at += 1) acl.items[at] = acl.items[at + 1];
+                    acl.len -= 1;
                 }
             }
+        }
+
+        fn changeColumnAclOwner(self: *Self, slot: u16, table: u32, old_owner: u32, new_owner: u32, snap: Snapshot) Error!void {
+            var latest = snap;
+            latest.csn = self.csn;
+            try self.aclWait(slot, &.{.column_acl}, table, snap);
+            try self.loadColumnRows(table, latest);
+            const scratch = &self.privilege_scratch;
+            var changed = false;
+            for (scratch.columns[0..scratch.column_count]) |*state| {
+                if (state.grantee == old_owner) state.grantee = new_owner;
+                if (state.grantor == old_owner) state.grantor = new_owner;
+                changed = changed or state.grantee == new_owner or state.grantor == new_owner;
+            }
+            // Coinciding rows merge column by column (the first position wins).
+            var index: usize = 0;
+            while (index < scratch.column_count) : (index += 1) {
+                var other = index + 1;
+                while (other < scratch.column_count) : (other += 1) {
+                    const first = &scratch.columns[index];
+                    const later = &scratch.columns[other];
+                    if (later.grantee != first.grantee or later.grantor != first.grantor) continue;
+                    var at: usize = 0;
+                    while (at < first.bytes.len) : (at += 2) {
+                        if (later.bytes[at] == 0) continue;
+                        if (first.bytes[at] == 0) first.bytes[at + 1] = later.bytes[at + 1];
+                        first.bytes[at] |= later.bytes[at];
+                        later.bytes[at] = 0;
+                        later.bytes[at + 1] = 0;
+                    }
+                }
+            }
+            // Owner-issued keys (sub 0) change with the owner.
+            if (!changed and scratch.column_count == 0) return;
+            try self.storeColumnRows(slot, table, new_owner, snap, latest);
         }
 
         // -- comments ----------------------------------------------------------
@@ -6967,20 +7800,84 @@ pub fn Database(comptime config: Config) type {
             if (!self.catalog_objects.ownsTable(self.session.role, self.tables[table_slot].oid, snap)) return error.InsufficientPrivilege;
         }
 
-        fn insertPrivileges(self: *const Self, insert: *const B.Insert, snap: Snapshot) Error!void {
-            var wanted: u32 = CO.priv_insert;
-            if (insert.replace) wanted |= CO.priv_delete;
-            if (insert.returning.count != 0) wanted |= CO.priv_select;
-            if (insert.conflict.action == .update) wanted |= CO.priv_update;
-            try self.needTable(insert.table, wanted, snap);
+        /// Every column of `table_slot` the statement reads needs SELECT on
+        /// the table or on the column (42501).
+        fn needColumnReads(self: *const Self, table_slot: usize, snap: Snapshot) Error!void {
+            const reads = &self.workspace.column_reads.columns[table_slot];
+            if (reads.count() == 0) return;
+            const role = self.session.role;
+            const oid = self.tables[table_slot].oid;
+            if (self.catalog_objects.tablePrivileges(role, oid, CO.priv_select, snap)) return;
+            for (0..self.tables[table_slot].column_count) |column| {
+                if (column >= config.columns or !reads.isSet(column)) continue;
+                if (self.catalog_objects.columnGrantMask(role, oid, column, snap) & CO.priv_select == 0) return error.InsufficientPrivilege;
+            }
         }
 
-        /// UPDATE / DELETE read the rows they change when they filter or
-        /// return them (SELECT privilege, as column reads in PostgreSQL).
-        fn changePrivileges(self: *const Self, table_slot: usize, privilege: u32, where: u16, returning: usize, snap: Snapshot) Error!void {
-            var wanted = privilege;
-            if (where != ast.none or returning != 0) wanted |= CO.priv_select;
-            try self.needTable(table_slot, wanted, snap);
+        /// `privilege` on the table, else on every listed column (with none
+        /// listed, on some column: PostgreSQL's ACLMASK_ANY case).
+        fn needColumns(self: *const Self, table_slot: usize, privilege: u32, listed: *const [config.columns]bool, snap: Snapshot) Error!void {
+            const role = self.session.role;
+            const table = &self.tables[table_slot];
+            if (self.catalog_objects.tablePrivileges(role, table.oid, privilege, snap)) return;
+            var any = false;
+            for (0..table.column_count) |column| {
+                if (!listed[column]) continue;
+                any = true;
+                if (self.catalog_objects.columnGrantMask(role, table.oid, column, snap) & privilege == 0) return error.InsufficientPrivilege;
+            }
+            if (!any and !self.catalog_objects.anyColumnGrant(role, table.oid, table.column_count, privilege, snap)) return error.InsufficientPrivilege;
+        }
+
+        /// checkFkeyPermissions: REFERENCES on every referenced column (on
+        /// the table or the column). A self-reference needs none.
+        fn foreignKeyPrivileges(self: *const Self, constraint: *const S.Constraint, own: u32, snap: Snapshot) Error!void {
+            if (constraint.kind != .foreign or constraint.ref_oid == 0 or constraint.ref_oid == own) return;
+            const referenced = self.visibleTableSlot(constraint.ref_oid, snap) orelse return;
+            var listed: [config.columns]bool = @splat(false);
+            for (constraint.ref_columns[0..constraint.column_count]) |column| listed[column] = true;
+            try self.needColumns(referenced, CO.priv_references, &listed, snap);
+        }
+
+        /// INSERT on the target columns, SELECT on what RETURNING or ON
+        /// CONFLICT reads, UPDATE on ON CONFLICT DO UPDATE's SET columns.
+        fn insertPrivileges(self: *const Self, insert: *const B.Insert, snap: Snapshot) Error!void {
+            var listed: [config.columns]bool = @splat(false);
+            if (insert.plan != ast.none) {
+                for (insert.values[0..self.tables[insert.table].column_count], 0..) |value_id, column| listed[column] = value_id != ast.none;
+            } else if (insert.rows != ast.none) {
+                for (insert.mapping[0..insert.count]) |column| listed[column] = true;
+            }
+            try self.needColumns(insert.table, CO.priv_insert, &listed, snap);
+            if (insert.replace) try self.needTable(insert.table, CO.priv_delete, snap);
+            if (insert.conflict.action == .update) {
+                var set: [config.columns]bool = @splat(false);
+                for (insert.conflict.update.values[0..self.tables[insert.table].column_count], 0..) |value_id, column| set[column] = value_id != ast.none;
+                try self.needColumns(insert.table, CO.priv_update, &set, snap);
+            }
+            try self.needColumnReads(insert.table, snap);
+        }
+
+        /// UPDATE on the SET columns and SELECT on the columns read.
+        fn updatePrivileges(self: *const Self, update: *const B.Update, snap: Snapshot) Error!void {
+            var set: [config.columns]bool = @splat(false);
+            for (update.values[0..self.tables[update.table].column_count], 0..) |value_id, column| set[column] = value_id != ast.none;
+            try self.needColumns(update.table, CO.priv_update, &set, snap);
+            try self.needColumnReads(update.table, snap);
+        }
+
+        fn deletePrivileges(self: *const Self, delete: *const B.Delete, snap: Snapshot) Error!void {
+            try self.needTable(delete.table, CO.priv_delete, snap);
+            try self.needColumnReads(delete.table, snap);
+        }
+
+        /// The FROM items admitted through column grants read only granted
+        /// columns.
+        fn checkColumnReads(self: *const Self, snap: Snapshot) Error!void {
+            const reads = &self.workspace.column_reads;
+            for (0..config.tables) |table_slot| {
+                if (reads.checked.isSet(table_slot)) try self.needColumnReads(table_slot, snap);
+            }
         }
 
         /// Table privileges of a bound statement for a role that is not a
@@ -6990,16 +7887,23 @@ pub fn Database(comptime config: Config) type {
         /// superuser. Altering or dropping a relation needs its ownership.
         fn checkPrivileges(self: *const Self, bound: *const B.Bound, snap: Snapshot) Error!void {
             if (self.privilegedRole(snap)) return;
+            try self.checkColumnReads(snap);
             switch (bound.*) {
+                // FOR UPDATE / SHARE also needs UPDATE on the table or on
+                // some column (PostgreSQL's ACL_SELECT_FOR_UPDATE).
+                .select => |*select| if (select.lock.strength != .none) if (select.table) |table_slot| {
+                    const none: [config.columns]bool = @splat(false);
+                    try self.needColumns(table_slot, CO.priv_update, &none, snap);
+                },
                 .insert => |*insert| try self.insertPrivileges(insert, snap),
-                .update => |*update| try self.changePrivileges(update.table, CO.priv_update, update.where, update.returning.count, snap),
-                .delete => |*delete| try self.changePrivileges(delete.table, CO.priv_delete, delete.where, delete.returning.count, snap),
+                .update => |*update| try self.updatePrivileges(update, snap),
+                .delete => |*delete| try self.deletePrivileges(delete, snap),
                 .query => {
                     const plans = &self.workspace.plans;
                     for (plans.dml[0..plans.dml_len]) |*dml| switch (dml.*) {
                         .insert => |*insert| try self.insertPrivileges(insert, snap),
-                        .update => |*update| try self.changePrivileges(update.table, CO.priv_update, update.where, update.returning.count, snap),
-                        .delete => |*delete| try self.changePrivileges(delete.table, CO.priv_delete, delete.where, delete.returning.count, snap),
+                        .update => |*update| try self.updatePrivileges(update, snap),
+                        .delete => |*delete| try self.deletePrivileges(delete, snap),
                     };
                 },
                 .truncate => |*truncate| {
@@ -7017,10 +7921,29 @@ pub fn Database(comptime config: Config) type {
                 },
                 .drop_table => |table_slot| try self.needOwner(table_slot, snap),
                 .drop_relation => |*drop| try self.needOwner(drop.slot, snap),
-                .alter_table => |*alter| try self.needOwner(alter.table, snap),
+                .alter_table => |*alter| {
+                    try self.needOwner(alter.table, snap);
+                    const table = &self.tables[alter.table];
+                    // A new composite column, or one changing type, needs
+                    // USAGE on its type.
+                    for (alter.columns[0..alter.count], alter.sources[0..alter.count]) |*column, from| {
+                        if (from != 0xff and from < table.column_count and table.columns[from].data_type == column.data_type and table.columns[from].typmod == column.typmod) continue;
+                        try self.columnTypeUsage(column, snap);
+                    }
+                    for (alter.constraints[0..alter.constraint_count]) |*constraint| {
+                        var existing = false;
+                        for (table.constraints[0..table.constraint_count]) |*old| existing = existing or (old.kind == .foreign and old.oid == constraint.oid and constraint.oid != 0);
+                        if (!existing) try self.foreignKeyPrivileges(constraint, table.oid, snap);
+                    }
+                },
                 .legacy_attribute_options => |options| try self.needOwner(options.table, snap),
-                .refresh_view => |*refresh| try self.needOwner(refresh.slot, snap),
-                .create_table => |*create| if (self.dialect != .postgres or !create.plain_definition) return error.InsufficientPrivilege,
+                // PostgreSQL 17+: REFRESH needs MAINTAIN (owners hold it).
+                .refresh_view => |*refresh| try self.needTable(refresh.slot, CO.priv_maintain, snap),
+                .create_table => |*create| {
+                    if (self.dialect != .postgres or !create.plain_definition) return error.InsufficientPrivilege;
+                    for (create.columns[0..create.count]) |*column| try self.columnTypeUsage(column, snap);
+                    for (create.constraints[0..create.constraint_count]) |*constraint| try self.foreignKeyPrivileges(constraint, 0, snap);
+                },
                 .create_sequence, .drop_sequence, .alter_sequence, .create_schema => return error.InsufficientPrivilege,
                 else => {},
             }
@@ -7187,13 +8110,17 @@ pub fn Database(comptime config: Config) type {
         /// derived query replacing it under row security, or none.
         fn secureItem(db: *const Self, workspace: *Workspace, length: *usize, source: []const u8, role: u32, row_security: bool, found: K.Found, only: bool, snap: Snapshot) Error!u16 {
             if (found.kind == 'S') {
-                const seq = &db.seqs[found.slot];
-                const owner = if (seq.owner == 0) CO.bootstrap_role else db.catalog_objects.owner(seq.owner, snap);
-                if (!db.catalog_objects.memberOf(role, owner, true, snap)) return error.InsufficientPrivilege;
+                // SELECT on the sequence (privileges lane).
+                if (db.sequencePrivileges(found.slot, role, snap) & CO.priv_select == 0) return error.InsufficientPrivilege;
                 return ast.none;
             }
             const table = &db.tables[found.slot];
-            if (!db.catalog_objects.tablePrivileges(role, table.oid, CO.priv_select, snap)) return error.InsufficientPrivilege;
+            if (!db.catalog_objects.tablePrivileges(role, table.oid, CO.priv_select, snap)) {
+                // SELECT on some column admits the item; the columns it
+                // reads are checked after binding (privileges lane).
+                if (!db.catalog_objects.anyColumnGrant(role, table.oid, table.column_count, CO.priv_select, snap)) return error.InsufficientPrivilege;
+                workspace.column_reads.checked.set(found.slot);
+            }
             if (table.relkind != 'r' and table.relkind != 'p') return ast.none;
             if (!try db.checkRowSecurity(role, table.oid, row_security, snap)) return ast.none;
             if (length.* == 0) {
@@ -7217,34 +8144,135 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn relationAcl(self: *const Self, oid: u32, snapshot: Snapshot) Error!Cell {
-            const owner = self.catalog_objects.owner(oid, snapshot);
+            return self.aclCell(.acl, oid, self.catalog_objects.owner(oid, snapshot), snapshot);
+        }
+
+        /// Position of an ACL entry in display order (see sortAcl).
+        pub const AclKey = struct { position: u32, rank: u1, index: usize };
+
+        /// One aclexplode entry and its position (the cursor of the next).
+        pub const AclItem = struct { key: AclKey, grantee: u32, grantor: u32, privileges: u32, options: u32 };
+
+        /// aclexplode(coalesce(acl, acldefault)) of an object's ACL of
+        /// `kind`, one entry at a time in ACL order (start with null): the
+        /// information_schema privilege views read the ACL model here.
+        pub fn nextAclItem(self: *const Self, kind: CO.Kind, object_oid: u32, owner: u32, after: ?AclKey, snapshot: Snapshot) ?AclItem {
+            const defaults = aclDefaults(kind, object_oid);
+            var best = self.nextAclKey(kind, object_oid, owner, after, snapshot);
+            if (defaults.public != 0 and !self.aclMaterialized(kind, object_oid, owner, snapshot)) {
+                const key: AclKey = .{ .position = defaults.public_position, .rank = 0, .index = 1 };
+                if ((after == null or aclKeyBefore(after.?, key)) and (best == null or aclKeyBefore(key, best.?))) best = key;
+            }
+            const key = best orelse return null;
+            if (key.rank == 0 and key.index == 1) return .{ .key = key, .grantee = CO.public_role, .grantor = owner, .privileges = defaults.public, .options = 0 };
+            if (key.rank == 0) {
+                const marker = self.catalog_objects.ownerMarker(kind, object_oid, owner, snapshot);
+                const options = if (marker) |index| self.catalog_objects.items[index].grant_flags & ~CO.acl_explicit_owner else 0;
+                return .{ .key = key, .grantee = owner, .grantor = owner, .privileges = self.catalog_objects.ownerPrivileges(kind, object_oid, owner, snapshot), .options = options };
+            }
+            const row = &self.catalog_objects.items[key.index];
+            return .{ .key = key, .grantee = row.grantee, .grantor = row.owner, .privileges = row.flags, .options = row.grant_flags };
+        }
+
+        /// Whether a GRANT / REVOKE replaced the object's acldefault (an
+        /// unmaterialized ACL is NULL in the catalogs).
+        pub fn aclStored(self: *const Self, kind: CO.Kind, object_oid: u32, owner: u32, snapshot: Snapshot) bool {
+            return self.aclMaterialized(kind, object_oid, owner, snapshot);
+        }
+
+        /// aclexplode(attacl) of column `column` (0-based) of a table, one
+        /// entry at a time in ACL order (start with null; no default).
+        pub fn nextColumnAclItem(self: *const Self, table: u32, column: usize, after: ?AclKey, snapshot: Snapshot) ?AclItem {
+            var best: ?AclKey = null;
+            for (&self.catalog_objects.items, 0..) |*row, index| {
+                if (row.kind != .column_acl or row.target != table or !O.visible(row, snapshot) or 2 * column + 1 >= row.text_len or row.text[2 * column] == 0) continue;
+                const key: AclKey = .{ .position = row.text[2 * column + 1], .rank = 1, .index = index };
+                if (after != null and !aclKeyBefore(after.?, key)) continue;
+                if (best == null or aclKeyBefore(key, best.?)) best = key;
+            }
+            const key = best orelse return null;
+            const row = &self.catalog_objects.items[key.index];
+            const bits = row.text[2 * column];
+            return .{ .key = key, .grantee = row.grantee, .grantor = row.owner, .privileges = CO.columnFlags(bits & 0x0f), .options = CO.columnFlags(bits >> 4) };
+        }
+
+        fn aclKeyBefore(a: AclKey, b: AclKey) bool {
+            if (a.position != b.position) return a.position < b.position;
+            if (a.rank != b.rank) return a.rank < b.rank;
+            return a.index < b.index;
+        }
+
+        /// The stored entry following `after` in ACL order: the owner's
+        /// (rank 0, index 0) or a grant row (rank 1, its store index).
+        fn nextAclKey(self: *const Self, kind: CO.Kind, object_oid: u32, owner: u32, after: ?AclKey, snapshot: Snapshot) ?AclKey {
+            var best: ?AclKey = null;
+            const defaults = aclDefaults(kind, object_oid);
+            if (self.catalog_objects.ownerPrivileges(kind, object_oid, owner, snapshot) != 0) {
+                var position = defaults.owner_position;
+                if (self.catalog_objects.ownerMarker(kind, object_oid, owner, snapshot)) |index| {
+                    if (self.catalog_objects.items[index].oid != 0) position = self.catalog_objects.items[index].oid;
+                }
+                const key: AclKey = .{ .position = position, .rank = 0, .index = 0 };
+                if (after == null or aclKeyBefore(after.?, key)) best = key;
+            }
+            for (&self.catalog_objects.items, 0..) |*row, index| {
+                if (row.kind != kind or row.target != object_oid or !O.visible(row, snapshot) or !O.grantEntry(row, owner)) continue;
+                const key: AclKey = .{ .position = @max(row.oid, 1), .rank = 1, .index = index };
+                if (after != null and !aclKeyBefore(after.?, key)) continue;
+                if (best == null or aclKeyBefore(key, best.?)) best = key;
+            }
+            return best;
+        }
+
+        fn aclRoleName(self: *const Self, role: u32, snapshot: Snapshot) Error![]const u8 {
+            if (role == CO.public_role) return "";
+            return self.catalog_objects.roleName(role, snapshot) orelse error.UndefinedObject;
+        }
+
+        /// An object's ACL as aclitem[]: NULL until a GRANT / REVOKE
+        /// materialized it (the public schema shows its initdb ACL).
+        fn aclCell(self: *const Self, kind: CO.Kind, object_oid: u32, owner: u32, snapshot: Snapshot) Error!Cell {
+            const Acl = @import("sql/catalog_acl.sig").Acl(V);
+            const owner_name = try self.aclRoleName(owner, snapshot);
+            var letters: [2 * CO.acl_letters.len]u8 = undefined;
+            if (!self.aclMaterialized(kind, object_oid, owner, snapshot)) {
+                if (kind == .schema_acl and object_oid == CO.public_namespace) return Acl.ownerAndPublic(owner_name, "UC", "U");
+                return .null_value;
+            }
             var count: u32 = 0;
-            for (&self.catalog_objects.items) |*item| {
-                if (item.kind == .acl and item.target == oid and item.grantee != owner and O.visible(item, snapshot)) count += 1;
+            var key = self.nextAclKey(kind, object_oid, owner, null, snapshot);
+            while (key) |current| : (key = self.nextAclKey(kind, object_oid, owner, current, snapshot)) count += 1;
+            var output: Text = .{};
+            var writer = try Acl.begin(&output, count);
+            key = self.nextAclKey(kind, object_oid, owner, null, snapshot);
+            while (key) |current| : (key = self.nextAclKey(kind, object_oid, owner, current, snapshot)) {
+                if (current.rank == 0) {
+                    const marker = self.catalog_objects.ownerMarker(kind, object_oid, owner, snapshot);
+                    const options = if (marker) |index| self.catalog_objects.items[index].grant_flags & ~CO.acl_explicit_owner else 0;
+                    try Acl.append(&writer, owner_name, CO.aclLetters(self.catalog_objects.ownerPrivileges(kind, object_oid, owner, snapshot), options, &letters), owner_name);
+                    continue;
+                }
+                const row = &self.catalog_objects.items[current.index];
+                try Acl.append(&writer, try self.aclRoleName(row.grantee, snapshot), CO.aclLetters(row.flags, row.grant_flags, &letters), try self.aclRoleName(row.owner, snapshot));
+            }
+            return .{ .array = output };
+        }
+
+        /// pg_attribute.attacl of column `column` (0-based): its grants in
+        /// ACL order, NULL without any.
+        fn columnAcl(self: *const Self, table: u32, column: usize, snapshot: Snapshot) Error!Cell {
+            const Acl = @import("sql/catalog_acl.sig").Acl(V);
+            var count: u32 = 0;
+            for (&self.catalog_objects.items) |*row| {
+                if (row.kind == .column_acl and row.target == table and O.visible(row, snapshot) and 2 * column + 1 < row.text_len and row.text[2 * column] != 0) count += 1;
             }
             if (count == 0) return .null_value;
-            const Acl = @import("sql/catalog_acl.sig").Acl(V);
-            const owner_name = self.catalog_objects.roleName(owner, snapshot) orelse return error.UndefinedObject;
             var output: Text = .{};
-            var writer = try Acl.begin(&output, count + 1);
-            try Acl.append(&writer, owner_name, "arwdDxt", owner_name);
-            for (&self.catalog_objects.items) |*item| {
-                if (item.kind != .acl or item.target != oid or item.grantee == owner or !O.visible(item, snapshot)) continue;
-                const grantee = if (item.grantee == CO.public_role) "" else
-                    self.catalog_objects.roleName(item.grantee, snapshot) orelse return error.UndefinedObject;
-                const grantor = self.catalog_objects.roleName(item.owner, snapshot) orelse return error.UndefinedObject;
-                var permissions: [16]u8 = undefined;
-                var used: usize = 0;
-                for ("arwdDxtm", CO.privilege_bits) |letter, flag| {
-                    if (item.flags & flag == 0) continue;
-                    permissions[used] = letter;
-                    used += 1;
-                    if (item.grant_flags & flag != 0) {
-                        permissions[used] = '*';
-                        used += 1;
-                    }
-                }
-                try Acl.append(&writer, grantee, permissions[0..used], grantor);
+            var writer = try Acl.begin(&output, count);
+            var letters: [2 * CO.acl_letters.len]u8 = undefined;
+            var after: ?AclKey = null;
+            while (self.nextColumnAclItem(table, column, after, snapshot)) |item| : (after = item.key) {
+                try Acl.append(&writer, try self.aclRoleName(item.grantee, snapshot), CO.aclLetters(item.privileges, item.options, &letters), try self.aclRoleName(item.grantor, snapshot));
             }
             return .{ .array = output };
         }
@@ -7293,28 +8321,225 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn namespaceAcl(self: *const Self, oid: u32, owner: u32, snapshot: Snapshot) Error!Cell {
-            const key: O.Object = .{ .kind = .schema_acl_state, .target = oid, .owner = owner };
-            if (self.catalog_objects.findKey(&key, snapshot) == null) return .null_value;
-            const owner_name = self.catalog_objects.roleName(owner, snapshot) orelse return error.UndefinedObject;
-            const Acl = @import("sql/catalog_acl.sig").Acl(V);
-            var count: u32 = 1;
-            var owner_privileges: []const u8 = "UC";
-            for (&self.catalog_objects.items) |*item| {
-                if (item.kind != .schema_acl or item.target != oid or !O.visible(item, snapshot)) continue;
-                if (item.grantee == owner) {
-                    owner_privileges = "C";
-                } else count += 1;
+            return self.aclCell(.schema_acl, oid, owner, snapshot);
+        }
+
+        // ---- access privilege inquiry (privileges lane, B11 wave 5) --------
+
+        const PrivilegeMode = struct { privileges: u32 = 0, options: u32 = 0 };
+
+        /// convert_any_priv_string: privilege names separated by commas (any
+        /// case, blanks around each ignored), each optionally WITH GRANT
+        /// OPTION (pg_has_role: also WITH ADMIN OPTION); 22023 otherwise.
+        fn privilegeText(text: []const u8, names: []const []const u8, bits: []const u32, admin: bool) Error!PrivilegeMode {
+            var mode: PrivilegeMode = .{};
+            var rest = text;
+            while (true) {
+                const comma = std.mem.indexOfScalar(u8, rest, ',');
+                const chunk = std.mem.trim(u8, if (comma) |at| rest[0..at] else rest, " \t\n\r\x0b\x0c");
+                var matched = false;
+                for (names, bits) |name, bit| {
+                    if (std.ascii.eqlIgnoreCase(chunk, name)) {
+                        mode.privileges |= bit;
+                        matched = true;
+                    } else if (chunk.len > name.len and std.ascii.eqlIgnoreCase(chunk[0..name.len], name) and
+                        (std.ascii.eqlIgnoreCase(chunk[name.len..], " WITH GRANT OPTION") or (admin and std.ascii.eqlIgnoreCase(chunk[name.len..], " WITH ADMIN OPTION"))))
+                    {
+                        mode.options |= bit;
+                        matched = true;
+                    }
+                    if (matched) break;
+                }
+                if (!matched) return error.InvalidParameterValue;
+                rest = rest[(comma orelse break) + 1 ..];
             }
-            var output: Text = .{};
-            var writer = try Acl.begin(&output, count);
-            try Acl.append(&writer, owner_name, owner_privileges, owner_name);
-            for (&self.catalog_objects.items) |*item| {
-                if (item.kind != .schema_acl or item.target != oid or item.grantee == owner or !O.visible(item, snapshot)) continue;
-                const grantee = if (item.grantee == CO.public_role) "" else
-                    self.catalog_objects.roleName(item.grantee, snapshot) orelse return error.UndefinedObject;
-                try Acl.append(&writer, grantee, "U", owner_name);
+            return mode;
+        }
+
+        const table_privilege_names = [_][]const u8{ "SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "MAINTAIN", "RULE" };
+        const table_privilege_bits = [_]u32{ CO.priv_select, CO.priv_insert, CO.priv_update, CO.priv_delete, CO.priv_truncate, CO.priv_references, CO.priv_trigger, CO.priv_maintain, 0 };
+        const column_privilege_names = [_][]const u8{ "SELECT", "INSERT", "UPDATE", "REFERENCES" };
+        const column_privilege_bits = [_]u32{ CO.priv_select, CO.priv_insert, CO.priv_update, CO.priv_references };
+        const schema_privilege_names = [_][]const u8{ "CREATE", "USAGE" };
+        const schema_privilege_bits = [_]u32{ CO.priv_create, CO.priv_usage };
+        const sequence_privilege_names = [_][]const u8{ "USAGE", "SELECT", "UPDATE" };
+        const sequence_privilege_bits = [_]u32{ CO.priv_usage, CO.priv_select, CO.priv_update };
+        const role_privilege_names = [_][]const u8{ "MEMBER", "USAGE", "SET" };
+        const role_privilege_bits = [_]u32{ 1, 2, 4 };
+
+        /// Grant options `role` holds on an object (owners hold them all).
+        fn objectOptions(self: *const Self, kind: CO.Kind, object_oid: u32, owner: u32, role: u32, snap: Snapshot) u32 {
+            if (self.catalog_objects.superuser(role, snap) or self.catalog_objects.memberOf(role, owner, true, snap)) return ~@as(u32, 0);
+            var held: u32 = 0;
+            for (&self.catalog_objects.items) |*row| {
+                if (row.kind != kind or row.target != object_oid or !O.visible(row, snap) or !O.grantEntry(row, owner)) continue;
+                if (kind == .column_acl) continue;
+                if (row.grantee == CO.public_role or self.catalog_objects.memberOf(role, row.grantee, true, snap)) held |= row.grant_flags;
             }
-            return .{ .array = output };
+            return held;
+        }
+
+        fn columnOptions(self: *const Self, table: u32, column: usize, role: u32, snap: Snapshot) u32 {
+            var held: u32 = 0;
+            for (&self.catalog_objects.items) |*row| {
+                if (row.kind != .column_acl or row.target != table or !O.visible(row, snap) or 2 * column + 1 >= row.text_len) continue;
+                if (row.grantee == CO.public_role or self.catalog_objects.memberOf(role, row.grantee, true, snap)) held |= CO.columnFlags(row.text[2 * column] >> 4);
+            }
+            return held;
+        }
+
+        fn privilegeGranted(mode: PrivilegeMode, privileges: u32, options: u32) bool {
+            return mode.privileges & privileges != 0 or mode.options & options != 0;
+        }
+
+        const InquiryRelation = union(enum) { table: usize, sequence: usize, catalog };
+
+        fn inquiryRelation(self: *const Self, subject: value_module.PrivilegeSubject) Error!?InquiryRelation {
+            const oid: u32 = switch (subject) {
+                .none => return null,
+                .oid => |value| if (value < 0 or value > 0xffff_ffff) return null else @intCast(value),
+                .name => |name| @intCast(try self.regclassOid(name, true)),
+            };
+            if (self.visibleTableSlot(oid, self.seq_snap)) |slot| return .{ .table = slot };
+            for (&self.seqs, 0..) |*seq, slot| if (seq.live and seq.oid == oid and seq.dead_csn == 0) return .{ .sequence = slot };
+            for (catalog_module.bootstrap_relations) |relation| if (relation.oid == oid) return .catalog;
+            return null;
+        }
+
+        /// has_*_privilege and pg_has_role (ACLMASK_ANY over the listed
+        /// privileges): 42704 / 42P01 / 3F000 for unknown names, NULL for an
+        /// OID naming nothing, 22023 for an unknown privilege.
+        fn privilegeInquiry(ptr: *anyopaque, request: *const value_module.PrivilegeRequest) Error!?bool {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            const snap = self.seq_snap;
+            const role: u32 = switch (request.user) {
+                .none => self.session.role,
+                .oid => |value| if (value < 0 or value > 0xffff_ffff) return null else @intCast(value),
+                .name => |name| self.catalog_objects.roleByName(name, snap) orelse return error.UndefinedObject,
+            };
+            const superuser = self.catalog_objects.superuser(role, snap);
+            switch (request.inquiry) {
+                .table, .column, .any_column => {
+                    const relation = (try self.inquiryRelation(request.object)) orelse return null;
+                    if (request.inquiry == .table) {
+                        const mode = try privilegeText(request.privileges, &table_privilege_names, &table_privilege_bits, false);
+                        return switch (relation) {
+                            .table => |slot| privilegeGranted(mode, self.catalog_objects.tablePrivilegeMask(role, self.tables[slot].oid, snap),
+                                self.objectOptions(.acl, self.tables[slot].oid, self.catalog_objects.owner(self.tables[slot].oid, snap), role, snap)),
+                            .sequence => |slot| privilegeGranted(mode, self.sequencePrivileges(slot, role, snap) | (self.catalog_objects.predefinedPrivileges(role, snap) & CO.table_privileges),
+                                self.objectOptions(.sequence_acl, self.seqs[slot].oid, self.sequenceOwner(slot, snap), role, snap)),
+                            .catalog => privilegeGranted(mode, if (superuser or role == CO.bootstrap_role) CO.table_privileges else CO.priv_select, if (superuser) CO.table_privileges else 0),
+                        };
+                    }
+                    const mode = try privilegeText(request.privileges, &column_privilege_names, &column_privilege_bits, false);
+                    const slot = switch (relation) {
+                        .table => |slot| slot,
+                        else => return privilegeGranted(mode, if (superuser) CO.column_privileges else CO.priv_select, if (superuser) CO.column_privileges else 0),
+                    };
+                    const table = &self.tables[slot];
+                    const table_mask = self.catalog_objects.tablePrivilegeMask(role, table.oid, snap);
+                    const table_options = self.objectOptions(.acl, table.oid, self.catalog_objects.owner(table.oid, snap), role, snap);
+                    if (request.inquiry == .any_column) {
+                        if (privilegeGranted(mode, table_mask, table_options)) return true;
+                        for (0..table.column_count) |column| {
+                            if (privilegeGranted(mode, self.catalog_objects.columnGrantMask(role, table.oid, column, snap), self.columnOptions(table.oid, column, role, snap))) return true;
+                        }
+                        return false;
+                    }
+                    const column: usize = switch (request.column) {
+                        .none => return null,
+                        .oid => |value| if (value < 1 or value > table.column_count) return null else @intCast(value - 1),
+                        .name => |name| for (table.columns[0..table.column_count], 0..) |*definition, index| {
+                            if (types.same(definition.name.slice(), name)) break index;
+                        } else return error.ColumnNotFound,
+                    };
+                    return privilegeGranted(mode, table_mask | self.catalog_objects.columnGrantMask(role, table.oid, column, snap),
+                        table_options | self.columnOptions(table.oid, column, role, snap));
+                },
+                .sequence => {
+                    const mode = try privilegeText(request.privileges, &sequence_privilege_names, &sequence_privilege_bits, false);
+                    const relation = (try self.inquiryRelation(request.object)) orelse return null;
+                    const slot = switch (relation) {
+                        .sequence => |slot| slot,
+                        else => return error.WrongObjectType,
+                    };
+                    return privilegeGranted(mode, self.sequencePrivileges(slot, role, snap), self.objectOptions(.sequence_acl, self.seqs[slot].oid, self.sequenceOwner(slot, snap), role, snap));
+                },
+                .schema => {
+                    const mode = try privilegeText(request.privileges, &schema_privilege_names, &schema_privilege_bits, false);
+                    const namespace: u32 = switch (request.object) {
+                        .none => return null,
+                        .oid => |value| if (value < 0 or value > 0xffff_ffff) return null else @intCast(value),
+                        .name => |name| namespaceFor(&self.catalog, name, snap) orelse return error.UndefinedSchema,
+                    };
+                    if (namespace == CO.public_namespace) {
+                        return privilegeGranted(mode, self.catalog_objects.schemaPrivilegeMask(role, namespace, CO.role_pg_database_owner, snap),
+                            self.objectOptions(.schema_acl, namespace, CO.role_pg_database_owner, role, snap));
+                    }
+                    for (catalog_module.namespaces) |known| if (known.oid == namespace) {
+                        const owner_rights: u32 = if (superuser or role == CO.bootstrap_role) CO.schema_privileges else CO.priv_usage;
+                        return privilegeGranted(mode, owner_rights, if (superuser or role == CO.bootstrap_role) CO.schema_privileges else 0);
+                    };
+                    for (&self.schemas) |*schema| {
+                        if (!schema.live or schema.oid != namespace or schema.dead_csn != 0) continue;
+                        const owner = self.schemaOwner(schema, snap);
+                        const mask = if (schema.private_usage) self.catalog_objects.schemaPrivilegeMask(role, namespace, owner, snap) else CO.schema_privileges;
+                        return privilegeGranted(mode, mask, self.objectOptions(.schema_acl, namespace, owner, role, snap));
+                    }
+                    return null;
+                },
+                .type_usage => {
+                    const mode = try privilegeText(request.privileges, &[_][]const u8{"USAGE"}, &[_]u32{CO.priv_usage}, false);
+                    const found: ?usize = switch (request.object) {
+                        .none => return null,
+                        .oid => |value| blk: {
+                            if (value < 0 or value > 0xffff_ffff) return null;
+                            const oid: u32 = @intCast(value);
+                            for ([_]CO.Kind{ .domain, .enum_type, .composite_type }) |kind| {
+                                if (self.catalog_objects.byOid(kind, oid, snap) orelse self.catalog_objects.byOid(kind, oid - 1, snap)) |index| break :blk index;
+                            }
+                            if (types.typeFromOid(oid) == null) return null;
+                            break :blk null;
+                        },
+                        .name => |name| blk: {
+                            var path: [routine_path_capacity]u32 = undefined;
+                            const count = self.routinePath(snap, &path);
+                            for (path[0..count]) |namespace| for ([_]CO.Kind{ .domain, .enum_type, .composite_type }) |kind| {
+                                if (self.catalog_objects.byName(kind, namespace, name, snap)) |index| break :blk index;
+                            };
+                            break :blk null;
+                        },
+                    };
+                    const index = found orelse return privilegeGranted(mode, CO.priv_usage, if (superuser) CO.priv_usage else 0);
+                    const object = &self.catalog_objects.items[index];
+                    return privilegeGranted(mode, self.catalog_objects.objectPrivilegeMask(.type_acl, object.oid, object.owner, role, CO.priv_usage, snap),
+                        self.objectOptions(.type_acl, object.oid, object.owner, role, snap));
+                },
+                .role => {
+                    const mode = try privilegeText(request.privileges, &role_privilege_names, &role_privilege_bits, true);
+                    const group: u32 = switch (request.object) {
+                        .none => return null,
+                        .oid => |value| if (value < 0 or value > 0xffff_ffff) return null else @intCast(value),
+                        .name => |name| self.catalog_objects.roleByName(name, snap) orelse return error.UndefinedObject,
+                    };
+                    if (self.catalog_objects.roleFlags(group, snap) == null) return null;
+                    var held: u32 = 0;
+                    if (superuser or self.catalog_objects.memberOf(role, group, false, snap)) held |= 1;
+                    if (superuser or self.catalog_objects.memberOf(role, group, true, snap)) held |= 2;
+                    if (superuser or self.catalog_objects.membershipPath(role, group, .set, snap)) held |= 4;
+                    const admin = superuser or (role != group and self.roleAdmin(role, group, snap));
+                    return privilegeGranted(mode, held, if (admin) 7 else 0);
+                },
+            }
+        }
+
+        /// The privileges `role` holds on a sequence (USAGE, SELECT, UPDATE).
+        fn sequencePrivileges(self: *const Self, seq_slot: usize, role: u32, snap: Snapshot) u32 {
+            const held = self.catalog_objects.objectPrivilegeMask(.sequence_acl, self.seqs[seq_slot].oid, self.sequenceOwner(seq_slot, snap), role, 0, snap);
+            // pg_read_all_data reads and pg_write_all_data updates every
+            // sequence (pg_class_aclmask); their schema USAGE is no
+            // sequence USAGE.
+            return held | (self.catalog_objects.predefinedPrivileges(role, snap) & (CO.priv_select | CO.priv_update));
         }
 
         fn catalogText(ptr: *anyopaque, kind: value_module.CatalogText, object: u32, classoid: u32, sub: i32, out: []u8) Error!?usize {
@@ -7435,11 +8660,23 @@ pub fn Database(comptime config: Config) type {
                     var bootstrap: O.Object = .{ .kind = .role, .oid = CO.bootstrap_role, .flags = CO.role_attributes, .grant_flags = @bitCast(@as(i32, -1)) };
                     bootstrap.setName(CO.bootstrap_name) catch {};
                     try self.roleRow(view, &bootstrap, sink);
+                    // PostgreSQL's predefined roles (privileges lane).
+                    for (CO.predefined_oids, CO.predefined_names) |oid, name| {
+                        var predefined: O.Object = .{ .kind = .role, .oid = oid, .flags = CO.role_inherit, .grant_flags = @bitCast(@as(i32, -1)) };
+                        predefined.setName(name) catch {};
+                        try self.roleRow(view, &predefined, sink);
+                    }
                     for (&self.catalog_objects.items) |*o| if (o.kind == .role and O.visible(o, snapshot)) try self.roleRow(view, o, sink);
                 },
-                .pg_auth_members => for (&self.catalog_objects.items) |*o| if (o.kind == .member and O.visible(o, snapshot)) {
-                    try sink.add(&.{ intCell(o.oid), intCell(o.target), intCell(o.grantee), intCell(o.owner),
-                        boolCell(o.grant_flags & CO.member_admin != 0), boolCell(self.catalog_objects.membershipInherits(o, snapshot)), boolCell(O.membershipCanSet(o)) });
+                .pg_auth_members => {
+                    // pg_monitor's initdb memberships.
+                    for (CO.monitor_member_oids, CO.monitor_members) |oid, group| {
+                        try sink.add(&.{ intCell(oid), intCell(group), intCell(CO.role_pg_monitor), intCell(CO.bootstrap_role), boolCell(false), boolCell(true), boolCell(true) });
+                    }
+                    for (&self.catalog_objects.items) |*o| if (o.kind == .member and O.visible(o, snapshot)) {
+                        try sink.add(&.{ intCell(o.oid), intCell(o.target), intCell(o.grantee), intCell(o.owner),
+                            boolCell(o.grant_flags & CO.member_admin != 0), boolCell(self.catalog_objects.membershipInherits(o, snapshot)), boolCell(O.membershipCanSet(o)) });
+                    };
                 },
                 .pg_db_role_setting => for (&self.catalog_objects.items) |*o| if (o.kind == .role_settings and O.visible(o, snapshot)) {
                     var array: Text = .{};
@@ -8267,11 +9504,22 @@ pub fn Database(comptime config: Config) type {
             const session = self.sequence_session orelse &self.default_sequences;
             if (kind == .lastval) {
                 if (session.last == 0 or !(LiveOids{ .db = self }).has(session.last)) return error.SequenceNotReady;
+                // SELECT or USAGE on the sequence (privileges lane).
+                if (self.sequencePrivileges(try self.sequenceByOid(session.last), self.session.role, self.seq_snap) & (CO.priv_select | CO.priv_usage) == 0) return error.InsufficientPrivilege;
                 return session.currval(session.last) orelse error.SequenceNotReady;
             }
             if (kind == .regclass) return self.regclassOid(name, called);
             const index = if (kind == .identity) try self.identitySequence(oid, @intCast(amount)) else if (oid != 0) try self.sequenceByOid(oid) else try self.sequenceByName(name);
             const seq = &self.seqs[index];
+            // nextval: USAGE or UPDATE; currval: SELECT or USAGE; setval:
+            // UPDATE. Identity columns need none (privileges lane).
+            const needed: u32 = switch (kind) {
+                .nextval => CO.priv_usage | CO.priv_update,
+                .currval => CO.priv_select | CO.priv_usage,
+                .setval => CO.priv_update,
+                else => 0,
+            };
+            if (needed != 0 and self.sequencePrivileges(index, self.session.role, self.seq_snap) & needed == 0) return error.InsufficientPrivilege;
             const tx = &self.txs[self.seq_slot];
             // nextval/setval write the sequence: 25006 in a READ ONLY transaction.
             if (kind != .currval and tx.active and tx.read_only) return error.ReadOnlyTransaction;
@@ -8493,6 +9741,8 @@ pub fn Database(comptime config: Config) type {
             generated: u8 = 0,
             has_expression: bool = false,
             local: bool = true,
+            /// attacl (privileges lane).
+            acl: Cell = .null_value,
         };
 
         fn attributeRow(sink: *X.RowSink, relation: i64, name: []const u8, data_type: DataType, typmod: i32, ordinal: i64, metadata: AttributeMetadata) Error!void {
@@ -8508,7 +9758,7 @@ pub fn Database(comptime config: Config) type {
                 .{ .pg_internal_char = metadata.generated }, boolCell(metadata.has_expression),
                 intCell(collation.typeCollation(types.typeOfData(data_type))), intCell(info.len),
                 .{ .pg_internal_char = info.alignment }, intCell(-1), .{ .pg_internal_char = types.typeStorage(data_type) },
-                boolCell(metadata.local), .null_value, .null_value, .{ .pg_internal_char = 0 }, boolCell(false), .null_value, .null_value,
+                boolCell(metadata.local), .null_value, .null_value, .{ .pg_internal_char = 0 }, boolCell(false), .null_value, metadata.acl,
             });
         }
 
@@ -8719,9 +9969,12 @@ pub fn Database(comptime config: Config) type {
                 .pg_namespace => {
                     const include_acl = sink.referencesColumn(catalog_module.pg_namespace_acl_column);
                     for (catalog_module.namespaces) |namespace| {
-                        const acl = if (!include_acl or namespace.oid == catalog_module.toast_namespace) .null_value else
+                        // public belongs to pg_database_owner (PostgreSQL 15+).
+                        const public = namespace.oid == CO.public_namespace;
+                        const acl = if (!include_acl or namespace.oid == catalog_module.toast_namespace) .null_value else if (public)
+                            try self.namespaceAcl(namespace.oid, CO.role_pg_database_owner, snapshot) else
                             try @import("sql/catalog_acl.sig").Acl(V).ownerAndPublic(CO.bootstrap_name, "UC", "U");
-                        try sink.add(&.{ intCell(namespace.oid), nameCell(namespace.name), intCell(CO.bootstrap_role), acl });
+                        try sink.add(&.{ intCell(namespace.oid), nameCell(namespace.name), intCell(if (public) CO.role_pg_database_owner else CO.bootstrap_role), acl });
                     }
                     var schemas: [K.relation_rows]K.SchemaFound = undefined;
                     const schema_count = self.catalog.visibleSchemas(snapshot, &schemas);
@@ -8937,10 +10190,10 @@ pub fn Database(comptime config: Config) type {
                 switch (object.kind) {
                     .domain => {
                         const info = types.typeInfo(types.dataTypeOf(object.domain.base));
-                        try sink.add(&.{ intCell(object.oid), nameCell(object.name.slice()), intCell(object.target), intCell(info.len), .{ .pg_internal_char = 'd' }, .{ .pg_internal_char = 'N' }, intCell(object.oid + 1), .{ .pg_internal_char = ',' }, nameCell("domain_in"), intCell(info.oid), intCell(0), intCell(object.owner), intCell(-1), boolCell(object.domain.not_null), intCell(0), type_collation, .null_value, boolCell(true), .{ .pg_internal_char = types.typeStorage(types.dataTypeOf(object.domain.base)) } });
+                        try sink.add(&.{ intCell(object.oid), nameCell(object.name.slice()), intCell(object.target), intCell(info.len), .{ .pg_internal_char = 'd' }, .{ .pg_internal_char = 'N' }, intCell(object.oid + 1), .{ .pg_internal_char = ',' }, nameCell("domain_in"), intCell(info.oid), intCell(0), intCell(object.owner), intCell(-1), boolCell(object.domain.not_null), intCell(0), type_collation, try self.aclCell(.type_acl, object.oid, object.owner, snapshot), boolCell(true), .{ .pg_internal_char = types.typeStorage(types.dataTypeOf(object.domain.base)) } });
                     },
-                    .enum_type => try sink.add(&.{ intCell(object.oid), nameCell(object.name.slice()), intCell(object.target), intCell(4), .{ .pg_internal_char = 'e' }, .{ .pg_internal_char = 'E' }, intCell(object.oid + 1), .{ .pg_internal_char = ',' }, nameCell("enum_in"), intCell(0), intCell(0), intCell(object.owner), intCell(-1), boolCell(false), intCell(0), type_collation, .null_value, boolCell(true), .{ .pg_internal_char = 'p' } }),
-                    .composite_type => try sink.add(&.{ intCell(object.oid), nameCell(object.name.slice()), intCell(object.target), intCell(-1), .{ .pg_internal_char = 'c' }, .{ .pg_internal_char = 'C' }, intCell(object.oid + 1), .{ .pg_internal_char = ',' }, nameCell("record_in"), intCell(0), intCell(0), intCell(object.owner), intCell(-1), boolCell(false), intCell(object.compositeRelationOid()), type_collation, .null_value, boolCell(true), .{ .pg_internal_char = 'x' } }),
+                    .enum_type => try sink.add(&.{ intCell(object.oid), nameCell(object.name.slice()), intCell(object.target), intCell(4), .{ .pg_internal_char = 'e' }, .{ .pg_internal_char = 'E' }, intCell(object.oid + 1), .{ .pg_internal_char = ',' }, nameCell("enum_in"), intCell(0), intCell(0), intCell(object.owner), intCell(-1), boolCell(false), intCell(0), type_collation, try self.aclCell(.type_acl, object.oid, object.owner, snapshot), boolCell(true), .{ .pg_internal_char = 'p' } }),
+                    .composite_type => try sink.add(&.{ intCell(object.oid), nameCell(object.name.slice()), intCell(object.target), intCell(-1), .{ .pg_internal_char = 'c' }, .{ .pg_internal_char = 'C' }, intCell(object.oid + 1), .{ .pg_internal_char = ',' }, nameCell("record_in"), intCell(0), intCell(0), intCell(object.owner), intCell(-1), boolCell(false), intCell(object.compositeRelationOid()), type_collation, try self.aclCell(.type_acl, object.oid, object.owner, snapshot), boolCell(true), .{ .pg_internal_char = 'x' } }),
                     else => unreachable,
                 }
                 try sink.add(&.{ intCell(object.oid + 1), nameCell(object.arrayName()), intCell(object.target), intCell(-1), .{ .pg_internal_char = 'b' }, .{ .pg_internal_char = 'A' }, intCell(0), .{ .pg_internal_char = ',' }, nameCell("array_in"), intCell(0), intCell(object.oid), intCell(object.owner), intCell(-1), boolCell(false), intCell(0), type_collation, .null_value, boolCell(true), .{ .pg_internal_char = 'x' } });
@@ -8955,7 +10208,7 @@ pub fn Database(comptime config: Config) type {
                     const seq = &self.seqs[found.slot];
                     switch (view) {
                         .pg_class => try classRow(sink, seq.oid, seq.name.slice(), seq.namespace, 'S', 3,
-                            .{ .owner = if (seq.owner == 0) CO.bootstrap_role else self.catalog_objects.owner(seq.owner, snapshot) }),
+                            .{ .owner = self.sequenceOwner(found.slot, snapshot), .acl = if (include_class_acl) try self.aclCell(.sequence_acl, seq.oid, self.sequenceOwner(found.slot, snapshot), snapshot) else .null_value }),
                         .pg_sequence => try sink.add(&.{ intCell(seq.oid), intCell(seq.spec.type_oid), intCell(seq.spec.start), intCell(seq.spec.increment), intCell(seq.spec.max), intCell(seq.spec.min), intCell(seq.spec.cache), boolCell(seq.spec.cycle) }),
                         else => {},
                     }
@@ -9054,6 +10307,7 @@ pub fn Database(comptime config: Config) type {
                                     .generated = if (kind != .generated) 0 else if (column.virtual) 'v' else 's',
                                     .has_expression = has_expression,
                                     .local = self.attributeIsLocal(table, column.name.slice(), snapshot),
+                                    .acl = if (sink.referencesColumn(catalog_module.pg_attribute_acl_column)) try self.columnAcl(table.oid, index, snapshot) else .null_value,
                                 });
                             },
                             .pg_attrdef => if (has_expression) {
@@ -10417,6 +11671,7 @@ pub fn Database(comptime config: Config) type {
                 copy.pending_late_primary = !fold_created_primary;
             }
             try self.remapColumnComments(slot, source.oid, alter.sources[0..alter.count], snap);
+            try self.remapColumnAcls(slot, source.oid, alter.sources[0..alter.count], snap);
             try self.remapStatistics(slot, source.oid, alter.sources[0..alter.count], snap);
             if (alter.identity) |identity| try self.createSequence(slot, copy.namespace, identity.name, identity.spec, copy.oid, identity.column, false, snap);
             // DROP IDENTITY / RESTART: the column's own sequence (ddl-dml).
@@ -11871,7 +13126,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn statementHooks(self: *Self, slot: u16, snap: Snapshot) void {
-            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .large_object = &largeObjectCall, .large_object_data = &largeObjectDataCall, .large_object_truncate = &truncateLargeObject, .large_object_file = .{ .authorize = &authorizeLargeObjectFile, .call = &largeObjectFileCall }, .relation_name = &relationName, .relation_display_name = &relationDisplayName, .catalog_text = &catalogText, .schema_path = &catalogSchemaPath, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .function_visible = &functionVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .view_definition = &postgresViewDefinition, .trigger_definition = &postgresTriggerDefinition, .rule_definition = &postgresRuleDefinition, .statistics_columns = &postgresStatisticsColumns, .relation_publishable = &relationPublishable, .partition_key_definition = &postgresPartitionKey, .partition_ancestors = &postgresPartitionAncestors, .namespace_lookup = &postgresNamespaceLookup, .namespace_name = &postgresNamespaceName, .routine_lookup = &postgresRoutineLookup, .routine_name = &postgresRoutineName, .xml_query = &xmlQuery, .xml_cursor = &xmlCursor, .type_name = &postgresTypeName, .composite_layout = &compositeLayoutHook, .type_oid = &postgresTypeOid };
+            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .large_object = &largeObjectCall, .large_object_data = &largeObjectDataCall, .large_object_truncate = &truncateLargeObject, .large_object_file = .{ .authorize = &authorizeLargeObjectFile, .call = &largeObjectFileCall }, .relation_name = &relationName, .relation_display_name = &relationDisplayName, .catalog_text = &catalogText, .schema_path = &catalogSchemaPath, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .function_visible = &functionVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .view_definition = &postgresViewDefinition, .trigger_definition = &postgresTriggerDefinition, .rule_definition = &postgresRuleDefinition, .statistics_columns = &postgresStatisticsColumns, .relation_publishable = &relationPublishable, .partition_key_definition = &postgresPartitionKey, .partition_ancestors = &postgresPartitionAncestors, .namespace_lookup = &postgresNamespaceLookup, .namespace_name = &postgresNamespaceName, .routine_lookup = &postgresRoutineLookup, .routine_name = &postgresRoutineName, .privilege = &privilegeInquiry, .xml_query = &xmlQuery, .xml_cursor = &xmlCursor, .type_name = &postgresTypeName, .composite_layout = &compositeLayoutHook, .type_oid = &postgresTypeOid };
             self.session.sequences = &self.seq_hook;
             // A statement starts with the whole XML scratch region free.
             self.xml_region = .{ .bytes = &self.xml_backing };
@@ -13095,7 +14350,7 @@ pub fn Database(comptime config: Config) type {
             }
             const name = folded[0..length];
             const snap = self.settingSnapshot(slot);
-            const oid = self.catalog_objects.roleByName(name, snap) orelse return if (authorization) error.UndefinedObject else error.InvalidSettingValue;
+            const oid = self.catalog_objects.roleByName(name, snap) orelse return error.InvalidSettingValue;
             const state = self.sessionState();
             if (authorization) {
                 if (oid == state.session_role) return 0;
@@ -14770,12 +16025,16 @@ pub fn Database(comptime config: Config) type {
             for (resolved.args[0..resolved.arg_count]) |*arg| {
                 if (!arg.user_type.named()) continue;
                 arg.oid = (try self.dependedCompositeOid(&arg.user_type, snap)) orelse return error.UndefinedObject;
+                // interpret_function_parameter_list: USAGE on the type.
+                try self.needTypeUsage(arg.oid, snap);
                 arg.typmod = -1;
                 arg.user_type = .{};
             }
             if (resolved.return_user.named()) {
                 if (try self.dependedCompositeOid(&resolved.return_user, snap)) |oid| {
                     if (resolved.outputCount() != 0) return error.InvalidFunctionDefinition;
+                    // compute_return_type: USAGE on the result type.
+                    try self.needTypeUsage(oid, snap);
                     resolved.return_oid = oid;
                     resolved.return_typmod = -1;
                     resolved.has_setof_table = false;
@@ -16796,6 +18055,8 @@ pub fn Database(comptime config: Config) type {
                 if (!row or definition.column_count != 0 or definition.when.end != definition.when.start) return error.UnsupportedStatement;
             } else if (table.relkind == 'v' and row) return error.WrongObjectType;
             if (kind & tg.tg_truncate != 0 and row) return error.UnsupportedStatement;
+            // The TRIGGER privilege (owners hold it; privileges lane).
+            if (!self.catalog_objects.tablePrivileges(self.session.role, table.oid, CO.priv_trigger, snap)) return error.InsufficientPrivilege;
             var columns: [config.columns]u8 = undefined;
             for (definition.columns[0..definition.column_count], 0..) |*column_name, position| {
                 var found: ?usize = null;

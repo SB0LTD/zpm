@@ -12,8 +12,12 @@
 //! computed natively, so they have no SQL view definition, constraints or
 //! dependencies.
 //!
+//! ACLs come from the privileges lane's model (Database.nextAclItem and
+//! nextColumnAclItem: relacl, attacl, typacl and sequence relacl with
+//! grantors and grant options, acldefault until a GRANT / REVOKE).
+//!
 //! Not represented (empty or NULL here; nothing in the engine stores them):
-//! column-level grants (the privileges lane), columns typed by a domain,
+//! columns typed by a domain,
 //! WITH CHECK OPTION, temporary schemas, table row types, foreign tables,
 //! user mappings, transforms, routine and view dependencies on routines.
 const std = @import("std");
@@ -207,6 +211,9 @@ pub fn Rows(comptime config: types.Config) type {
                 role: u32,
                 database: []const u8,
                 relations: []const K.Found,
+                /// seesColumn's table and whether all its columns show.
+                column_memo: u32 = 0,
+                column_memo_all: bool = false,
 
                 fn objects(self: *const Self) *const O {
                     return &self.db.catalog_objects;
@@ -291,24 +298,50 @@ pub fn Rows(comptime config: types.Config) type {
                     return self.objects().tableHasAnyPrivilege(self.role, table.oid, mask, self.snap);
                 }
 
+                /// has_any_column_privilege(oid, mask): a table privilege or
+                /// a column grant on any column.
+                fn anyColumn(self: *const Self, table: *const S.Table, mask: u32) bool {
+                    return self.tableAny(table, mask) or self.objects().anyColumnGrant(self.role, table.oid, table.column_count, mask, self.snap);
+                }
+
+                const column_privilege_mask = CO.priv_insert | CO.priv_select | CO.priv_update | CO.priv_references;
+
                 /// tables/views: owner, any table privilege, any column
                 /// privilege (SELECT, INSERT, UPDATE, REFERENCES).
                 fn seesRelation(self: *const Self, table: *const S.Table) bool {
-                    return self.hasRole(self.tableOwner(table)) or self.tableAny(table, CO.table_privileges & ~CO.priv_maintain);
+                    return self.hasRole(self.tableOwner(table)) or self.tableAny(table, CO.table_privileges & ~CO.priv_maintain) or
+                        self.anyColumn(table, column_privilege_mask);
                 }
 
                 /// table_constraints / referential_constraints / triggers:
                 /// SELECT omitted, per the SQL standard.
                 fn seesConstraints(self: *const Self, table: *const S.Table) bool {
                     const mask = CO.priv_insert | CO.priv_update | CO.priv_delete | CO.priv_truncate | CO.priv_references | CO.priv_trigger;
-                    return self.hasRole(self.tableOwner(table)) or self.tableAny(table, mask);
+                    return self.hasRole(self.tableOwner(table)) or self.tableAny(table, mask) or
+                        self.anyColumn(table, CO.priv_insert | CO.priv_update | CO.priv_references);
                 }
 
-                /// columns / key_column_usage: has_column_privilege(SELECT,
-                /// INSERT, UPDATE, REFERENCES); table grants cover columns.
+                /// Some column passes seesColumn (a quick per-table test).
                 fn seesColumns(self: *const Self, table: *const S.Table) bool {
-                    const mask = CO.priv_select | CO.priv_insert | CO.priv_update | CO.priv_references;
-                    return self.hasRole(self.tableOwner(table)) or self.tableAny(table, mask);
+                    return self.hasRole(self.tableOwner(table)) or self.anyColumn(table, column_privilege_mask);
+                }
+
+                /// columns / key_column_usage: pg_has_role(owner) or
+                /// has_column_privilege(SELECT, INSERT, UPDATE, REFERENCES)
+                /// on the column (`index` 0-based); table grants cover it.
+                fn seesColumn(self: *Self, table: *const S.Table, index: usize) bool {
+                    // Owner or table-wide privileges decide once per table.
+                    if (self.column_memo != table.oid) {
+                        self.column_memo = table.oid;
+                        self.column_memo_all = self.hasRole(self.tableOwner(table)) or self.tableAny(table, column_privilege_mask);
+                    }
+                    if (self.column_memo_all) return true;
+                    return self.objects().columnGrantMask(self.role, table.oid, index, self.snap) & column_privilege_mask != 0;
+                }
+
+                fn columnAllowed(self: *const Self, table: *const S.Table, index: usize, mask: u32) bool {
+                    if (self.hasRole(self.tableOwner(table))) return true;
+                    return self.objects().columnPrivilegeMask(self.role, table.oid, index, self.snap) & mask != 0;
                 }
 
                 fn seesSystemRelation(self: *const Self, view: View) bool {
@@ -341,12 +374,7 @@ pub fn Rows(comptime config: types.Config) type {
 
                 /// has_schema_privilege(oid, 'CREATE, USAGE').
                 fn schemaPrivilege(self: *const Self, oid: u32, owner: u32) bool {
-                    if (self.objects().schemaUsage(self.role, oid, owner, self.snap)) return true;
-                    for (&self.objects().items) |*o| {
-                        if (o.kind != .schema_acl or o.target != oid or o.flags == 0 or !O.visible(o, self.snap)) continue;
-                        if (o.grantee == CO.public_role or self.objects().memberOf(self.role, o.grantee, true, self.snap)) return true;
-                    }
-                    return false;
+                    return self.objects().schemaPrivilegeMask(self.role, oid, owner, self.snap) & (CO.priv_usage | CO.priv_create) != 0;
                 }
 
                 // ---- relations ----------------------------------------------
@@ -569,6 +597,13 @@ pub fn Rows(comptime config: types.Config) type {
                     for ([_]u32{ catalog.toast_namespace, catalog.catalog_namespace, catalog.public_namespace, catalog.information_namespace }) |oid| {
                         // Built-in schemas grant USAGE to PUBLIC except pg_toast.
                         if (oid == catalog.toast_namespace and !self.hasRole(CO.bootstrap_role)) continue;
+                        if (oid == catalog.public_namespace) {
+                            // Owned by pg_database_owner; its ACL can change.
+                            const owner = CO.role_pg_database_owner;
+                            if (!self.hasRole(owner) and !self.schemaPrivilege(oid, owner)) continue;
+                            try self.schemaRow(self.namespaceName(oid), owner);
+                            continue;
+                        }
                         try self.schemaRow(self.namespaceName(oid), CO.bootstrap_role);
                     }
                     var schemas: [K.relation_rows]K.SchemaFound = undefined;
@@ -868,6 +903,7 @@ pub fn Rows(comptime config: types.Config) type {
                         const primary = primaryColumns(table, &keys);
                         const schema = self.namespaceName(table.namespace);
                         for (table.columns[0..table.column_count], 0..) |*column, index| {
+                            if (!self.seesColumn(table, index)) continue;
                             const kind = column.default_kind;
                             const identity: u8 = switch (kind) {
                                 .identity_always => 'a',
@@ -1113,6 +1149,7 @@ pub fn Rows(comptime config: types.Config) type {
                 }
 
                 fn keyRow(self: *Self, schema: []const u8, name: []const u8, table: *const S.Table, column: u8, position: usize, unique_position: ?i64) Error!void {
+                    if (!self.seesColumn(table, column)) return;
                     const prefix = try self.constraintPrefix(schema, name);
                     try self.add(&.{
                         prefix[0], prefix[1], prefix[2], try self.catalogName(), try self.text(schema), try self.text(table.name.slice()),
@@ -1293,24 +1330,52 @@ pub fn Rows(comptime config: types.Config) type {
 
                 // ---- privileges ---------------------------------------------
 
-                /// One aclexplode entry of a relation: owner default first,
-                /// then each grant (aclitem order). Column-level grants are
-                /// not represented by the engine.
+                /// One aclexplode entry: grantor, grantee, privileges and
+                /// their grant options (is_grantable).
                 const AclEntry = struct { grantor: u32, grantee: u32, flags: u32, options: u32 };
 
-                fn relationAcl(self: *const Self, table_oid: u32, owner: u32, out: *[O.capacity + 1]AclEntry) []const AclEntry {
-                    out[0] = .{ .grantor = owner, .grantee = owner, .flags = CO.table_privileges, .options = CO.table_privileges };
-                    var count: usize = 1;
-                    for (&self.objects().items) |*o| {
-                        if (o.kind != .acl or o.target != table_oid or o.grantee == owner or !O.visible(o, self.snap)) continue;
-                        out[count] = .{ .grantor = o.owner, .grantee = o.grantee, .flags = o.flags, .options = o.grant_flags };
-                        count += 1;
+                const AclKey = @typeInfo(Db).pointer.child.AclKey;
+
+                /// aclexplode(coalesce(acl, acldefault)) of an object, one
+                /// entry per call in ACL order (the privileges lane's model:
+                /// owner entry, grants with their grantors and options).
+                const AclCursor = struct {
+                    kind: CO.Kind,
+                    target: u32,
+                    owner: u32,
+                    after: ?AclKey = null,
+
+                    fn next(cursor: *AclCursor, context: *const Self) ?AclEntry {
+                        const item = context.db.nextAclItem(cursor.kind, cursor.target, cursor.owner, cursor.after, context.snap) orelse return null;
+                        cursor.after = item.key;
+                        return .{ .grantor = item.grantor, .grantee = item.grantee, .flags = item.privileges, .options = item.options };
                     }
-                    return out[0..count];
+                };
+
+                /// aclexplode(attacl) of one column (0-based; none by default).
+                const ColumnCursor = struct {
+                    table: u32,
+                    column: usize,
+                    after: ?AclKey = null,
+
+                    fn next(cursor: *ColumnCursor, context: *const Self) ?AclEntry {
+                        const item = context.db.nextColumnAclItem(cursor.table, cursor.column, cursor.after, context.snap) orelse return null;
+                        cursor.after = item.key;
+                        return .{ .grantor = item.grantor, .grantee = item.grantee, .flags = item.privileges, .options = item.options };
+                    }
+                };
+
+                /// The relacl entry of (grantee, grantor) on a table, if any.
+                fn relationEntry(self: *const Self, table_oid: u32, owner: u32, grantee: u32, grantor: u32) ?AclEntry {
+                    var cursor: AclCursor = .{ .kind = .acl, .target = table_oid, .owner = owner };
+                    while (cursor.next(self)) |entry| {
+                        if (entry.grantee == grantee and entry.grantor == grantor) return entry;
+                    }
+                    return null;
                 }
 
-                fn systemAcl(view: View, out: *[O.capacity + 1]AclEntry) []const AclEntry {
-                    out[0] = .{ .grantor = CO.bootstrap_role, .grantee = CO.bootstrap_role, .flags = CO.table_privileges, .options = CO.table_privileges };
+                fn systemAcl(view: View, out: *[2]AclEntry) []const AclEntry {
+                    out[0] = .{ .grantor = CO.bootstrap_role, .grantee = CO.bootstrap_role, .flags = CO.table_privileges, .options = 0 };
                     if (!publicSelect(view)) return out[0..1];
                     out[1] = .{ .grantor = CO.bootstrap_role, .grantee = CO.public_role, .flags = CO.priv_select, .options = 0 };
                     return out[0..2];
@@ -1322,7 +1387,7 @@ pub fn Rows(comptime config: types.Config) type {
                 }
 
                 fn tablePrivileges(self: *Self, role_grants: bool) Error!void {
-                    var entries: [O.capacity + 1]AclEntry = undefined;
+                    var entries: [2]AclEntry = undefined;
                     for (0..system_view_slots) |index| {
                         const view = self.systemView(index) orelse continue;
                         const kind = systemRelkind(view);
@@ -1340,9 +1405,8 @@ pub fn Rows(comptime config: types.Config) type {
                         }
                         const owner = self.tableOwner(table);
                         const schema = self.namespaceName(table.namespace);
-                        for (self.relationAcl(table.oid, owner, &entries)) |entry| {
-                            try self.tablePrivilegeRows(schema, table.name.slice(), owner, entry, role_grants);
-                        }
+                        var cursor: AclCursor = .{ .kind = .acl, .target = table.oid, .owner = owner };
+                        while (cursor.next(self)) |entry| try self.tablePrivilegeRows(schema, table.name.slice(), owner, entry, role_grants);
                     }
                 }
 
@@ -1360,10 +1424,12 @@ pub fn Rows(comptime config: types.Config) type {
                     }
                 }
 
-                const column_privilege_mask = CO.priv_insert | CO.priv_select | CO.priv_update | CO.priv_references;
-
+                /// The UNION of aclexplode(relacl) over every column and
+                /// aclexplode(attacl) per column: a column entry repeating
+                /// a table entry (same grantor, grantee, privilege and
+                /// grantability) is listed once.
                 fn columnPrivileges(self: *Self, role_grants: bool) Error!void {
-                    var entries: [O.capacity + 1]AclEntry = undefined;
+                    var entries: [2]AclEntry = undefined;
                     for (0..system_view_slots) |index| {
                         const view = self.systemView(index) orelse continue;
                         const acl = systemAcl(view, &entries);
@@ -1380,9 +1446,20 @@ pub fn Rows(comptime config: types.Config) type {
                         }
                         const owner = self.tableOwner(table);
                         const schema = self.namespaceName(table.namespace);
-                        const acl = self.relationAcl(table.oid, owner, &entries);
-                        for (table.columns[0..table.column_count]) |*column| {
-                            for (acl) |entry| try self.columnPrivilegeRows(schema, table.name.slice(), column.name.slice(), owner, entry, role_grants);
+                        for (table.columns[0..table.column_count], 0..) |*column, index| {
+                            var cursor: AclCursor = .{ .kind = .acl, .target = table.oid, .owner = owner };
+                            while (cursor.next(self)) |entry| try self.columnPrivilegeRows(schema, table.name.slice(), column.name.slice(), owner, entry, role_grants);
+                            var own: ColumnCursor = .{ .table = table.oid, .column = index };
+                            while (own.next(self)) |entry| {
+                                var unique = entry;
+                                if (self.relationEntry(table.oid, owner, entry.grantee, entry.grantor)) |shared| {
+                                    // Bits whose grantability matches the table entry's.
+                                    const same = shared.flags & ~(shared.options ^ entry.options);
+                                    unique.flags &= ~same;
+                                    unique.options &= unique.flags;
+                                }
+                                try self.columnPrivilegeRows(schema, table.name.slice(), column.name.slice(), owner, unique, role_grants);
+                            }
                         }
                     }
                 }
@@ -1761,7 +1838,12 @@ pub fn Rows(comptime config: types.Config) type {
                         if (found.kind != 'S') continue;
                         const seq = &self.db.seqs[found.slot];
                         if (self.identityOwned(seq)) continue;
-                        if (!self.hasRole(self.sequenceOwner(seq))) continue;
+                        // pg_has_role(owner) or has_sequence_privilege(SELECT,
+                        // UPDATE, USAGE).
+                        const owner = self.sequenceOwner(seq);
+                        const held = self.objects().objectPrivilegeMask(.sequence_acl, seq.oid, owner, self.role, 0, self.snap) |
+                            (self.objects().predefinedPrivileges(self.role, self.snap) & (CO.priv_select | CO.priv_update));
+                        if (!self.hasRole(owner) and held & (CO.priv_select | CO.priv_update | CO.priv_usage) == 0) continue;
                         const data_type = types.typeFromOid(seq.spec.type_oid) orelse .integer;
                         try self.add(&.{
                             try self.catalogName(), try self.text(self.namespaceName(seq.namespace)), try self.text(seq.name.slice()),
@@ -1793,12 +1875,10 @@ pub fn Rows(comptime config: types.Config) type {
                     }
                 }
 
-                /// has_type_privilege(oid, 'USAGE'): types grant USAGE to
-                /// PUBLIC by default; type ACLs are not represented.
+                /// has_type_privilege(oid, 'USAGE'): PUBLIC holds USAGE
+                /// until the type's ACL is materialized.
                 fn typeUsage(self: *const Self, o: *const O.Object) bool {
-                    _ = self;
-                    _ = o;
-                    return true;
+                    return self.objects().objectPrivilegeMask(.type_acl, o.oid, o.owner, self.role, CO.priv_usage, self.snap) & CO.priv_usage != 0;
                 }
 
                 fn domainRow(self: *Self, schema: []const u8, name: []const u8, data_type: DataType, typmod: i32, collation_name: ?[]const u8, default: ?[]const u8) Error!void {
@@ -1870,7 +1950,7 @@ pub fn Rows(comptime config: types.Config) type {
                     }
                     for (&self.objects().items) |*o| {
                         if (o.kind != .domain or !O.visible(o, self.snap)) continue;
-                        try self.defaultUsageRows(self.namespaceName(o.target), o.name.slice(), "DOMAIN", o.owner, role_grants);
+                        try self.aclUsageRows(.type_acl, o.oid, self.namespaceName(o.target), o.name.slice(), "DOMAIN", o.owner, role_grants);
                     }
                     // Foreign-data wrappers and servers: owner USAGE only.
                     for (&self.objects().items) |*o| {
@@ -1883,7 +1963,25 @@ pub fn Rows(comptime config: types.Config) type {
                     }
                     // Sequences appear only with an explicit relacl
                     // (PostgreSQL explodes acldefault('r'), which has no
-                    // USAGE); sequence grants are not represented.
+                    // USAGE).
+                    for (self.relations) |found| {
+                        if (found.kind != 'S') continue;
+                        const seq = &self.db.seqs[found.slot];
+                        const owner = self.sequenceOwner(seq);
+                        if (!self.db.aclStored(.sequence_acl, seq.oid, owner, self.snap)) continue;
+                        try self.aclUsageRows(.sequence_acl, seq.oid, self.namespaceName(seq.namespace), seq.name.slice(), "SEQUENCE", owner, role_grants);
+                    }
+                }
+
+                /// The USAGE entries of an object's ACL.
+                fn aclUsageRows(self: *Self, kind: CO.Kind, oid: u32, schema: []const u8, name: []const u8, label: []const u8, owner: u32, role_grants: bool) Error!void {
+                    var cursor: AclCursor = .{ .kind = kind, .target = oid, .owner = owner };
+                    while (cursor.next(self)) |entry| {
+                        if (entry.flags & CO.priv_usage == 0) continue;
+                        if (!self.showsGrant(entry.grantor, entry.grantee)) continue;
+                        if (role_grants and !self.enabledGrant(entry.grantor, entry.grantee)) continue;
+                        try self.usageGrantRow(schema, name, label, entry.grantor, entry.grantee, self.roleHasRole(entry.grantee, owner) or entry.options & CO.priv_usage != 0);
+                    }
                 }
 
                 fn defaultUsageRows(self: *Self, schema: []const u8, name: []const u8, kind: []const u8, owner: u32, role_grants: bool) Error!void {
@@ -1908,12 +2006,14 @@ pub fn Rows(comptime config: types.Config) type {
                 fn udtPrivileges(self: *Self, role_grants: bool) Error!void {
                     for (&self.objects().items) |*o| {
                         if (o.kind != .composite_type or !O.visible(o, self.snap)) continue;
-                        for ([_]u32{ CO.public_role, o.owner }) |grantee| {
-                            if (!self.showsGrant(o.owner, grantee)) continue;
-                            if (role_grants and !self.enabledGrant(o.owner, grantee)) continue;
-                            try self.add(&.{ try self.text(self.roleName(o.owner)), try self.text(self.roleName(grantee)), try self.catalogName(),
+                        var cursor: AclCursor = .{ .kind = .type_acl, .target = o.oid, .owner = o.owner };
+                        while (cursor.next(self)) |entry| {
+                            if (entry.flags & CO.priv_usage == 0) continue;
+                            if (!self.showsGrant(entry.grantor, entry.grantee)) continue;
+                            if (role_grants and !self.enabledGrant(entry.grantor, entry.grantee)) continue;
+                            try self.add(&.{ try self.text(self.roleName(entry.grantor)), try self.text(self.roleName(entry.grantee)), try self.catalogName(),
                                 try self.text(self.namespaceName(o.target)), try self.text(o.name.slice()), try static("TYPE USAGE"),
-                                try yesNo(self.roleHasRole(grantee, o.owner)) });
+                                try yesNo(self.roleHasRole(entry.grantee, o.owner) or entry.options & CO.priv_usage != 0) });
                         }
                     }
                 }
@@ -2035,11 +2135,11 @@ pub fn Rows(comptime config: types.Config) type {
                     for (&self.db.objects.triggers) |*trigger| {
                         if (!trigger.live or !trigger.stamp.visible(self.snap)) continue;
                         const table = self.visibleTable(trigger.table_oid) orelse continue;
-                        const visible = self.hasRole(self.tableOwner(table)) or self.tableAny(table, CO.priv_insert | CO.priv_update | CO.priv_references);
-                        if (!visible) continue;
                         const schema = self.namespaceName(table.namespace);
                         for (trigger.columns[0..trigger.column_count]) |column| {
                             if (column >= table.column_count) continue;
+                            // has_column_privilege(INSERT, UPDATE, REFERENCES).
+                            if (!self.columnAllowed(table, column, CO.priv_insert | CO.priv_update | CO.priv_references)) continue;
                             try self.add(&.{ try self.catalogName(), try self.text(schema), try self.text(trigger.name.slice()),
                                 try self.catalogName(), try self.text(schema), try self.text(table.name.slice()),
                                 try self.text(table.columns[column].name.slice()) });
@@ -2244,12 +2344,14 @@ pub fn Rows(comptime config: types.Config) type {
                         if (!self.seesColumns(table)) continue;
                         const schema = self.namespaceName(table.namespace);
                         for (table.columns[0..table.column_count], 1..) |*column, position| {
+                            if (!self.seesColumn(table, position - 1)) continue;
                             const element = types.elementData(column.data_type) orelse continue;
                             try self.elementRow(schema, table.name.slice(), "TABLE", position, element);
                         }
                     }
                     for (&self.objects().items) |*o| {
                         if (o.kind != .composite_type or !O.visible(o, self.snap)) continue;
+                        if (!self.hasRole(o.owner) and !self.typeUsage(o)) continue;
                         var fields = o.compositeFields();
                         var position: usize = 1;
                         while (fields.next()) |field| : (position += 1) {
@@ -2315,6 +2417,7 @@ pub fn Rows(comptime config: types.Config) type {
                 fn dataTypePrivileges(self: *Self) Error!void {
                     for (&self.objects().items) |*o| {
                         if (o.kind != .composite_type or !O.visible(o, self.snap)) continue;
+                        if (!self.hasRole(o.owner) and !self.typeUsage(o)) continue;
                         var fields = o.compositeFields();
                         var position: usize = 1;
                         while (fields.next()) |_| : (position += 1) {
@@ -2334,11 +2437,15 @@ pub fn Rows(comptime config: types.Config) type {
                             else => continue,
                         }
                         if (!self.seesColumns(table)) continue;
-                        for (1..table.column_count + 1) |position| try self.dtdRow(self.namespaceName(table.namespace), table.name.slice(), "TABLE", position);
+                        for (1..table.column_count + 1) |position| {
+                            if (!self.seesColumn(table, position - 1)) continue;
+                            try self.dtdRow(self.namespaceName(table.namespace), table.name.slice(), "TABLE", position);
+                        }
                     }
                     for (is_domains) |domain| try self.dtdRow("information_schema", IS.domainName(domain), "DOMAIN", 1);
                     for (&self.objects().items) |*o| {
                         if (o.kind != .domain or !O.visible(o, self.snap)) continue;
+                        if (!self.hasRole(o.owner) and !self.typeUsage(o)) continue;
                         try self.dtdRow(self.namespaceName(o.target), o.name.slice(), "DOMAIN", 1);
                     }
                     for (0..routine_slots) |index| {

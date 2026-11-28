@@ -185,6 +185,9 @@ pub const SequenceHook = struct {
     /// or not; the search path finds an unqualified one): its OID, null
     /// when there is none (composite lane).
     type_oid: ?*const fn (ptr: *anyopaque, input: []const u8) Error!?u32 = null,
+    /// has_*_privilege / pg_has_role (privileges lane): null is SQL NULL
+    /// (an OID naming nothing).
+    privilege: ?*const fn (ptr: *anyopaque, request: *const PrivilegeRequest) Error!?bool = null,
 };
 
 /// The fields of composite type `oid` through the session's catalog hook.
@@ -257,6 +260,20 @@ pub const RoutineHook = struct {
 };
 
 pub const CatalogText = enum { description, shared_description, role_name, function_arguments, function_identity_arguments, function_result, function_sqlbody };
+
+/// Access privilege inquiry (privileges lane, B11 wave 5).
+pub const PrivilegeInquiry = enum(u8) { table, column, any_column, schema, sequence, type_usage, role };
+
+/// A name or OID argument of a privilege inquiry (none: the current user).
+pub const PrivilegeSubject = union(enum) { none, oid: i64, name: []const u8 };
+
+pub const PrivilegeRequest = struct {
+    inquiry: PrivilegeInquiry,
+    user: PrivilegeSubject = .none,
+    object: PrivilegeSubject,
+    column: PrivilegeSubject = .none,
+    privileges: []const u8,
+};
 
 pub const default_session: Session = .{};
 const SessionType = Session;

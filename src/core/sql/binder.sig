@@ -415,6 +415,11 @@ pub fn Binder(comptime config: types.Config) type {
             /// table (ddl-dml, wave 4): the member table this binding
             /// targets instead of the named one, which keeps naming it.
             family_target: ?usize = null,
+            /// Column privileges (privileges lane, B11 wave 5): the columns
+            /// the statement reads from tables the role reads only through
+            /// column grants. Stored view bodies and column expressions
+            /// (defaults, CHECK, generated) never record.
+            column_reads: ?*ColumnReads = null,
 
             fn node(self: *const Context, id: u16) *ast.Node {
                 return &self.pool.nodes[id];
@@ -424,6 +429,27 @@ pub fn Binder(comptime config: types.Config) type {
                 return self.legacy or self.dialect != .postgres;
             }
         };
+
+        /// Columns read per table slot; `checked` marks the FROM items the
+        /// role reads only through column grants (the Database checks those
+        /// and the DML target after binding).
+        pub const ColumnReads = struct {
+            checked: std.StaticBitSet(config.tables) = .empty,
+            columns: [config.tables]std.StaticBitSet(config.columns) = @splat(.empty),
+
+            pub fn note(self: *ColumnReads, table: usize, column: usize) void {
+                if (table < config.tables and column < config.columns) self.columns[table].set(column);
+            }
+
+            pub fn noteAll(self: *ColumnReads, table: usize, count: usize) void {
+                for (0..count) |column| self.note(table, column);
+            }
+        };
+
+        fn noteRead(context: *const Context, table: ?usize, column: usize) void {
+            const reads = context.column_reads orelse return;
+            reads.note(table orelse return, column);
+        }
 
         /// $1..$n of a SQL prepared statement (tx-session lane).
         pub const Parameters = struct {
@@ -529,6 +555,8 @@ pub fn Binder(comptime config: types.Config) type {
             /// `JOIN this USING (...) AS alias` (F404): names only the
             /// join's merged columns.
             using_alias: ast.Ident = .{},
+            /// ON CONFLICT's EXCLUDED row: reading it needs no privilege.
+            privilege_exempt: bool = false,
         };
 
         /// USING column merged from the relations joined before `right`.
@@ -1908,6 +1936,14 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "pg_advisory_unlock", .func = .pg_advisory_unlock },
                 .{ .name = "pg_advisory_unlock_shared", .func = .pg_advisory_unlock_shared },
                 .{ .name = "pg_backend_pid", .func = .pg_backend_pid },
+                // Access privilege inquiry (privileges lane, B11 wave 5).
+                .{ .name = "has_table_privilege", .func = .has_table_privilege },
+                .{ .name = "has_column_privilege", .func = .has_column_privilege },
+                .{ .name = "has_any_column_privilege", .func = .has_any_column_privilege },
+                .{ .name = "has_schema_privilege", .func = .has_schema_privilege },
+                .{ .name = "has_sequence_privilege", .func = .has_sequence_privilege },
+                .{ .name = "has_type_privilege", .func = .has_type_privilege },
+                .{ .name = "pg_has_role", .func = .pg_has_role },
                 .{ .name = "pg_is_in_recovery", .func = .pg_is_in_recovery },
                 // void-returning session functions (B11 wave-4 types-ext).
                 .{ .name = "pg_notify", .func = .pg_notify },
@@ -3160,6 +3196,8 @@ pub fn Binder(comptime config: types.Config) type {
                     try bindSignature(context, n, &[_]ast.Type{.oid}, .name, true);
                     n.constant = false;
                 },
+                .has_table_privilege, .has_column_privilege, .has_any_column_privilege, .has_schema_privilege,
+                .has_sequence_privilege, .has_type_privilege, .pg_has_role => try bindPrivilegeInquiry(context, n, count),
                 .pg_tablespace_location => {
                     try bindSignature(context, n, &[_]ast.Type{.oid}, .text, true);
                     n.constant = false;
@@ -4332,6 +4370,29 @@ pub fn Binder(comptime config: types.Config) type {
         /// Binds a call to one fixed signature: an unknown argument takes the
         /// parameter type, a typed one needs an implicit cast (42883). A
         /// strict call with a syntactic NULL argument is planned NULL.
+        /// has_*_privilege and pg_has_role (privileges lane): [user,] object
+        /// [, column], privilege. A user or object given as a number is an
+        /// OID (a column as a number its attnum); else a name. Strict.
+        fn bindPrivilegeInquiry(context: *const Context, n: *ast.Node, count: usize) Error!void {
+            const base: usize = if (n.func == .has_column_privilege) 3 else 2;
+            if (count != base and count != base + 1) return error.UndefinedFunction;
+            var params: [4]ast.Type = undefined;
+            var numbers: i64 = 0;
+            var item = n.b;
+            var index: usize = 0;
+            while (item != none) : (item = context.node(item).next) {
+                const ty = context.node(item).ty;
+                const last = index + 1 == count;
+                const numeric = !last and (ty == .int2 or ty == .int4 or ty == .int8 or ty == .oid);
+                if (numeric) numbers |= @as(i64, 1) << @intCast(index);
+                params[index] = if (numeric) (if (n.func == .has_column_privilege and index + 2 == count) ast.Type.int4 else ast.Type.oid) else .text;
+                index += 1;
+            }
+            try bindSignature(context, n, params[0..count], .boolean, true);
+            n.integer = numbers;
+            n.constant = false;
+        }
+
         fn bindSignature(context: *const Context, n: *ast.Node, params: []const ast.Type, result: ast.Type, strict: bool) Error!void {
             var args: [8]u16 = undefined;
             var count: usize = 0;
@@ -4504,6 +4565,7 @@ pub fn Binder(comptime config: types.Config) type {
 
         fn bindExpressionText(context: *const Context, column: *const V.Column, row_table: ?usize, source_owner: i64) Error!u16 {
             var sub = context.*;
+            sub.column_reads = null;
             sub.source = column.expression.slice();
             const start = context.pool.len;
             const id = try P.parseExpression(sub.source, context.pool);
@@ -4796,6 +4858,7 @@ pub fn Binder(comptime config: types.Config) type {
         /// function (42P20).
         fn bindCheckText(context: *const Context, text: []const u8, table: usize) Error!u16 {
             var sub = context.*;
+            sub.column_reads = null;
             sub.source = text;
             const id = try P.parseExpression(text, context.pool);
             try generatedSubqueries(&sub, id);
@@ -4924,7 +4987,7 @@ pub fn Binder(comptime config: types.Config) type {
             if (table_alias) |name| scope.rels[0].name = toName(context, name);
             // EXCLUDED is an ordinary relation name: an unqualified column
             // present in both is ambiguous (42702), as in PostgreSQL.
-            scope.rels[1] = .{ .table = index, .name = literalName("excluded") };
+            scope.rels[1] = .{ .table = index, .name = literalName("excluded"), .privilege_exempt = true };
             scope.rel_count = 2;
             var update: Update = .{ .table = index, .values = @splat(none), .where = none, .key = none };
             try bindAssignments(context, &scope, entry, conflict.assignments[0..conflict.count], &update.values);
@@ -6850,6 +6913,7 @@ pub fn Binder(comptime config: types.Config) type {
                         const qualifier = toName(context, context.node(target.expr).qualifier);
                         if (!types.same(qualifier.slice(), scope.rels[0].name.slice())) return error.TableNotFound;
                     }
+                    if (context.column_reads) |reads| reads.noteAll(index, entry.column_count);
                     for (entry.columns[0..entry.column_count], 0..) |*column, position| {
                         if (out.count == config.columns) return error.ColumnCapacity;
                         out.targets[out.count] = try context.pool.add(.{ .kind = .column, .column = @intCast(position), .ty = types.typeOfData(column.data_type), .typmod = column.typmod });
@@ -7636,6 +7700,7 @@ pub fn Binder(comptime config: types.Config) type {
             for (select.targets[0..select.count]) |*target| {
                 if (target.star) {
                     const entry = &context.tables[out.table.?];
+                    if (context.column_reads) |reads| reads.noteAll(out.table.?, entry.column_count);
                     for (entry.columns[0..entry.column_count], 0..) |*column, index| {
                         if (out.count == config.columns) return error.ColumnCapacity;
                         const data_type = projectedDataType(context, column.data_type);
@@ -7789,6 +7854,7 @@ pub fn Binder(comptime config: types.Config) type {
                 n.kind = .column;
                 n.ty = relationColumnType(context, rel, column);
                 n.typmod = relationColumnTypmod(context, rel, column);
+                if (!rel.privilege_exempt) noteRead(context, rel.table, column);
             }
             markCorrelated(context, scope, level);
             if (rel.cte != no_cte) {
@@ -10301,7 +10367,9 @@ pub fn Binder(comptime config: types.Config) type {
                 } else if (item.query != none) {
                     // Derived tables are not LATERAL: they see enclosing blocks
                     // only; an expanded view sees neither (it is a stored query).
-                    const child = try bindPlan(context, item.query, if (item.view) null else parent, if (item.view) null else env, false);
+                    var stored = context.*;
+                    if (item.view_table != none) stored.column_reads = null;
+                    const child = try bindPlan(&stored, item.query, if (item.view) null else parent, if (item.view) null else env, false);
                     rel.plan = child;
                     source.plan = child;
                     if (item.view_table != none) {
@@ -11139,11 +11207,14 @@ pub fn Binder(comptime config: types.Config) type {
         fn plainTableDefinition(create: *const Ast.CreateTable) bool {
             if (create.temporary or create.as_query != none or create.like != null or create.inherits != null or
                 create.partition_by != .none or create.partition_of != null) return false;
+            // Column defaults, CHECK and FOREIGN KEY need no ownership
+            // model beyond the table's (privileges lane: REFERENCES is
+            // checked after binding); owned sequences still do.
             for (create.columns[0..create.count]) |*column| {
-                if (column.serial != 0 or column.default_kind != .none) return false;
+                if (column.serial != 0 or (column.default_kind != .none and column.default_kind != .default and column.default_kind != .generated)) return false;
             }
             for (create.constraints[0..create.constraint_count]) |*constraint| {
-                if (constraint.kind != .primary and constraint.kind != .unique) return false;
+                if (constraint.kind != .primary and constraint.kind != .unique and constraint.kind != .foreign and constraint.kind != .check) return false;
             }
             return true;
         }

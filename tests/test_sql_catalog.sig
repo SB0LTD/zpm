@@ -139,10 +139,12 @@ fn dumpDiscovery() !void {
         "xid|aclitem[]");
     try run("CREATE ROLE catalog_reader");
     try run("GRANT SELECT, MAINTAIN ON discoverable TO catalog_reader WITH GRANT OPTION");
+    // PostgreSQL 18 (checked against native 18.7): the owner holds MAINTAIN
+    // too, and an ACL once granted stays materialized after REVOKE.
     try expect("SELECT relacl::text FROM pg_class WHERE relname='discoverable'",
-        "{ramsql=arwdDxt/ramsql,catalog_reader=r*m*/ramsql}");
+        "{ramsql=arwdDxtm/ramsql,catalog_reader=r*m*/ramsql}");
     try run("REVOKE ALL ON discoverable FROM catalog_reader");
-    try expect("SELECT relacl IS NULL FROM pg_class WHERE relname='discoverable'", "t");
+    try expect("SELECT relacl::text FROM pg_class WHERE relname='discoverable'", "{ramsql=arwdDxtm/ramsql}");
     try run("DROP ROLE catalog_reader");
     try expect("SELECT 1,2,3,4,5,6,7,8,9,10", "1|2|3|4|5|6|7|8|9|10");
     try run("INSERT INTO discoverable VALUES (2),(1),(1)");

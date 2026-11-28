@@ -537,9 +537,11 @@ fn namespaceGrants() !void {
     try expect(read, "77");
     try as("usage_owner");
     try run("REVOKE USAGE ON SCHEMA usage_ns FROM PUBLIC");
-    try fails("GRANT CREATE ON SCHEMA usage_ns TO usage_guest", error.UnsupportedStatement);
-    try fails("GRANT USAGE ON SCHEMA usage_ns TO usage_guest WITH GRANT OPTION", error.UnsupportedStatement);
-    try fails("REVOKE USAGE ON SCHEMA usage_ns FROM usage_guest CASCADE", error.UnsupportedStatement);
+    // CREATE, grant options and CASCADE on schemas (privileges lane, wave 5).
+    try run("GRANT CREATE ON SCHEMA usage_ns TO usage_guest");
+    try run("GRANT USAGE ON SCHEMA usage_ns TO usage_guest WITH GRANT OPTION");
+    try run("REVOKE USAGE ON SCHEMA usage_ns FROM usage_guest CASCADE");
+    try run("REVOKE CREATE ON SCHEMA usage_ns FROM usage_guest");
     try as("usage_guest");
     try fails(read, error.InsufficientPrivilege);
     replica.default_session_state.values.role = guest;
@@ -811,7 +813,7 @@ fn comments() !void {
 
 fn roles() !void {
     try reset();
-    const listing = "SELECT rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb, rolcanlogin, rolreplication, rolconnlimit, rolbypassrls FROM pg_roles ORDER BY oid";
+    const listing = "SELECT rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb, rolcanlogin, rolreplication, rolconnlimit, rolbypassrls FROM pg_roles WHERE rolname NOT LIKE 'pg\\_%' ORDER BY oid";
     try expect(listing, "ramsql|t|t|t|t|t|t|-1|t");
     try expect("SELECT current_user, session_user, current_role, user", "ramsql|ramsql|ramsql|ramsql");
     try metadata("SELECT current_user", &.{"current_user"}, &.{19});
@@ -825,7 +827,7 @@ fn roles() !void {
     try check(try roleOid("r_plain") == 16388 and try roleOid("r_user") == 16389 and try roleOid("r_admin") == 16390);
     try sameState();
     // 42710, 42939, 42601 (conflicting options), 0A000 (passwords).
-    const count = "SELECT COUNT(*) FROM pg_roles";
+    const count = "SELECT COUNT(*) FROM pg_roles WHERE rolname NOT LIKE 'pg\\_%'";
     try rejects("CREATE ROLE r_plain", error.DuplicateObject, count, "4");
     try rejects("CREATE ROLE ramsql", error.DuplicateObject, count, "4");
     try rejects("CREATE ROLE public", error.ReservedName, count, "4");
@@ -850,9 +852,9 @@ fn roles() !void {
     try run("CREATE ROLE r_member IN ROLE r_group");
     const result = try replicate("GRANT r_group TO r_plain WITH ADMIN OPTION");
     try check(result.command == .grant_role);
-    const members = "SELECT g.rolname, m.rolname, a.admin_option FROM pg_auth_members a JOIN pg_roles g ON g.oid = a.roleid JOIN pg_roles m ON m.oid = a.member ORDER BY a.oid";
+    const members = "SELECT g.rolname, m.rolname, a.admin_option FROM pg_auth_members a JOIN pg_roles g ON g.oid = a.roleid JOIN pg_roles m ON m.oid = a.member WHERE a.roleid >= 16384 ORDER BY a.oid";
     try expect(members, "r_group|r_member|f;r_group|r_plain|t");
-    try expect("SELECT COUNT(*) FROM pg_auth_members WHERE grantor = 10", "2");
+    try expect("SELECT COUNT(*) FROM pg_auth_members WHERE grantor = 10 AND roleid >= 16384", "2");
     try rejects("GRANT r_plain TO r_group", error.InvalidGrantOperation, members, "r_group|r_member|f;r_group|r_plain|t");
     try rejects("GRANT r_group TO r_group", error.InvalidGrantOperation, members, "r_group|r_member|f;r_group|r_plain|t");
     try rejects("GRANT nosuch TO r_plain", error.UndefinedObject, members, "r_group|r_member|f;r_group|r_plain|t");
@@ -885,12 +887,13 @@ fn roles() !void {
     try commit(local_tx);
     try expect("SELECT current_user", "ramsql");
     try fails("SET ROLE nosuch", error.InvalidSettingValue);
-    const options = "SELECT admin_option, inherit_option, set_option FROM pg_auth_members";
+    const options = "SELECT admin_option, inherit_option, set_option FROM pg_auth_members WHERE roleid >= 16384";
     try run("GRANT r_group TO r_plain WITH ADMIN TRUE, INHERIT FALSE, SET FALSE GRANTED BY ramsql");
     try expect(options, "t|f|f");
     try rejects("GRANT r_plain TO r_group", error.InvalidGrantOperation, options, "t|f|f");
     try rejects("GRANT r_group TO r_plain WITH SET FALSE, SET TRUE", error.Syntax, options, "t|f|f");
-    try rejects("GRANT r_group TO r_plain WITH ADMIN FALSE GRANTED BY r_member", error.UnsupportedStatement, options, "t|f|f");
+    // PostgreSQL 16+: an explicit grantor needs ADMIN OPTION (checked against native 18.7).
+    try rejects("GRANT r_group TO r_plain WITH ADMIN FALSE GRANTED BY r_member", error.InsufficientPrivilege, options, "t|f|f");
     try sameState();
     db.default_session_state.session_role = try roleOid("r_plain");
     try fails("SET ROLE r_group", error.InsufficientPrivilege);
@@ -989,7 +992,7 @@ fn privileges() !void {
     try fails("INSERT INTO tdd_a VALUES (9, 9, 9)", error.InsufficientPrivilege);
     try fails("TRUNCATE tdd_a", error.InsufficientPrivilege);
     try fails("SELECT * FROM pg_authid", error.InsufficientPrivilege);
-    try expect("SELECT COUNT(*) FROM pg_roles", "6");
+    try expect("SELECT COUNT(*) FROM pg_roles WHERE rolname NOT LIKE 'pg\\_%'", "6");
     try as("ramsql");
     try run("GRANT SELECT ON tdd_a TO reader");
     try run("GRANT INSERT, UPDATE ON TABLE tdd_a, tdd_b TO writer WITH GRANT OPTION");
@@ -1003,7 +1006,9 @@ fn privileges() !void {
     try fails("CREATE TABLE mine (id INT)", error.InsufficientPrivilege);
     try fails("DROP TABLE tdd_a", error.InsufficientPrivilege);
     try fails("ALTER TABLE tdd_a ADD COLUMN x INT", error.InsufficientPrivilege);
-    try fails("GRANT SELECT ON tdd_a TO writer", error.InsufficientPrivilege);
+    // Without grant options a holder only warns (01007; checked against
+    // native PostgreSQL 18.7, privileges lane).
+    try run("GRANT SELECT ON tdd_a TO writer");
     // INSERT and UPDATE without WHERE need no SELECT; filtering needs it.
     try as("writer");
     try run("INSERT INTO tdd_a VALUES (5, 3, 50)");
@@ -1011,9 +1016,9 @@ fn privileges() !void {
     try fails("UPDATE tdd_a SET v = 1 WHERE id = 1", error.InsufficientPrivilege);
     try fails("INSERT INTO tdd_a VALUES (6, 3, 60) RETURNING id", error.InsufficientPrivilege);
     try fails("DELETE FROM tdd_a", error.InsufficientPrivilege);
-    // WITH GRANT OPTION lets the grantee grant; the grant is recorded by the owner.
+    // WITH GRANT OPTION lets the grantee grant; the grantee is the grantor.
     try run("GRANT INSERT ON tdd_a TO reader");
-    try fails("GRANT DELETE ON tdd_a TO reader", error.InsufficientPrivilege);
+    try run("GRANT DELETE ON tdd_a TO reader");
     // Roles inherit their groups' privileges unless NOINHERIT.
     try as("grp_member");
     try expect("SELECT id, v FROM tdd_b ORDER BY id", "1|0;3|0;5|0");
@@ -1030,18 +1035,24 @@ fn privileges() !void {
     try expect("SELECT COUNT(*) FROM tdd_b", "2");
     try as("ramsql");
     try run("REVOKE SELECT ON tdd_b FROM PUBLIC");
-    try run("REVOKE GRANT OPTION FOR INSERT ON tdd_a FROM writer");
+    // reader's INSERT depends on writer's grant option (2BP01 unless CASCADE).
+    try fails("REVOKE GRANT OPTION FOR INSERT ON tdd_a FROM writer", error.DependentObjects);
+    try run("REVOKE GRANT OPTION FOR INSERT ON tdd_a FROM writer CASCADE");
     try run("REVOKE ALL ON tdd_b FROM grp, writer");
     try run("REVOKE SELECT ON tdd_a FROM reader");
-    try expect(grants, "ramsql|reader|tdd_a|INSERT|NO;ramsql|writer|tdd_a|INSERT|NO;ramsql|writer|tdd_a|UPDATE|YES");
+    try expect(grants, "ramsql|writer|tdd_a|INSERT|NO;ramsql|writer|tdd_a|UPDATE|YES");
     try as("reader");
     try fails("SELECT * FROM tdd_a", error.InsufficientPrivilege);
     try as("ramsql");
-    try rejects("GRANT SELECT ON missing TO reader", error.TableNotFound, grants, "ramsql|reader|tdd_a|INSERT|NO;ramsql|writer|tdd_a|INSERT|NO;ramsql|writer|tdd_a|UPDATE|YES");
-    try rejects("GRANT SELECT ON tdd_a TO nosuch", error.UndefinedObject, grants, "ramsql|reader|tdd_a|INSERT|NO;ramsql|writer|tdd_a|INSERT|NO;ramsql|writer|tdd_a|UPDATE|YES");
-    try rejects("GRANT SELECT (id) ON tdd_a TO reader", error.UnsupportedStatement, grants, "ramsql|reader|tdd_a|INSERT|NO;ramsql|writer|tdd_a|INSERT|NO;ramsql|writer|tdd_a|UPDATE|YES");
-    try rejects("GRANT USAGE ON SCHEMA public TO reader", error.UnsupportedStatement, grants, "ramsql|reader|tdd_a|INSERT|NO;ramsql|writer|tdd_a|INSERT|NO;ramsql|writer|tdd_a|UPDATE|YES");
-    try rejects("GRANT SELECT ON tdd_a TO reader GRANTED BY ramsql", error.UnsupportedStatement, grants, "ramsql|reader|tdd_a|INSERT|NO;ramsql|writer|tdd_a|INSERT|NO;ramsql|writer|tdd_a|UPDATE|YES");
+    try rejects("GRANT SELECT ON missing TO reader", error.TableNotFound, grants, "ramsql|writer|tdd_a|INSERT|NO;ramsql|writer|tdd_a|UPDATE|YES");
+    try rejects("GRANT SELECT ON tdd_a TO nosuch", error.UndefinedObject, grants, "ramsql|writer|tdd_a|INSERT|NO;ramsql|writer|tdd_a|UPDATE|YES");
+    try rejects("GRANT SELECT ON tdd_a TO reader GRANTED BY writer", error.UnsupportedStatement, grants, "ramsql|writer|tdd_a|INSERT|NO;ramsql|writer|tdd_a|UPDATE|YES");
+    // Column, schema and GRANTED BY grants (privileges lane, wave 5).
+    try run("GRANT SELECT (id) ON tdd_a TO reader");
+    try run("GRANT USAGE ON SCHEMA public TO reader");
+    try run("GRANT SELECT ON tdd_a TO reader GRANTED BY ramsql");
+    try expect(grants, "ramsql|reader|tdd_a|SELECT|NO;ramsql|writer|tdd_a|INSERT|NO;ramsql|writer|tdd_a|UPDATE|YES");
+    try expect("SELECT relacl::text FROM pg_class WHERE relname = 'tdd_a'", "{ramsql=arwdDxtm/ramsql,writer=aw*/ramsql,reader=r/ramsql}");
     // OWNER TO: the new owner holds every privilege and may grant.
     try run("ALTER TABLE tdd_b OWNER TO reader");
     try expect("SELECT tablename, tableowner FROM pg_tables ORDER BY tablename", "tdd_a|ramsql;tdd_b|reader");
@@ -1052,12 +1063,14 @@ fn privileges() !void {
     try fails("ALTER TABLE tdd_b OWNER TO writer", error.InsufficientPrivilege);
     try as("ramsql");
     try expect("SELECT grantor, grantee, privilege_type FROM information_schema.table_privileges WHERE table_name = 'tdd_b' AND grantee = 'writer'", "reader|writer|SELECT");
-    try rejects("DROP ROLE reader", error.DependentObjects, "SELECT COUNT(*) FROM pg_roles", "6");
+    try rejects("DROP ROLE reader", error.DependentObjects, "SELECT COUNT(*) FROM pg_roles WHERE rolname NOT LIKE 'pg\\_%'", "6");
     try sameState();
     // DROP TABLE drops its grants, owner entry and comment.
     try run("DROP TABLE tdd_b");
     try expect("SELECT COUNT(*) FROM information_schema.table_privileges WHERE table_name = 'tdd_b'", "0");
     try run("REVOKE ALL ON tdd_a FROM reader, writer");
+    try rejects("DROP ROLE reader, writer", error.DependentObjects, "SELECT COUNT(*) FROM pg_roles WHERE rolname IN ('reader', 'writer')", "2");
+    try run("REVOKE USAGE ON SCHEMA public FROM reader");
     try run("DROP ROLE reader, writer");
     try sameState();
     // GRANT holds AccessShare: DROP TABLE waits for the granting transaction.
@@ -1417,7 +1430,7 @@ fn capacities() !void {
     try small.execute("DROP ROLE b", &result);
     try smallFails("CREATE ROLE c IN ROLE a", error.TableCapacity);
     try small.execute("CREATE ROLE c", &result);
-    try same(try queryOn(&small, "SELECT rolname FROM pg_roles ORDER BY oid"), "ramsql;a;c");
+    try same(try queryOn(&small, "SELECT rolname FROM pg_roles WHERE oid = 10 OR oid >= 16384 ORDER BY oid"), "ramsql;a;c");
     // Lists in one statement: eight names.
     try smallFails("DROP ROLE IF EXISTS n1, n2, n3, n4, n5, n6, n7, n8, n9", error.ProgramLimitExceeded);
 }

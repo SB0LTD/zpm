@@ -907,9 +907,11 @@ pub fn XmlEval(comptime config: types.Config, comptime E: type) type {
             try out.byte('\'');
         }
 
-        const schema_tables_query = "SELECT c.oid FROM pg_catalog.pg_class c WHERE c.relnamespace = {s} AND c.relkind IN ('r', 'm', 'v') ORDER BY c.relname";
-        const visible_schemas_query = "SELECT n.oid FROM pg_catalog.pg_namespace n WHERE NOT (n.nspname ~ '^pg_' OR n.nspname = 'information_schema') ORDER BY n.nspname";
-        const database_tables_query = "SELECT c.oid FROM pg_catalog.pg_class c WHERE c.relkind IN ('r', 'm', 'v') AND c.relnamespace IN (SELECT n.oid FROM pg_catalog.pg_namespace n WHERE NOT (n.nspname ~ '^pg_' OR n.nspname = 'information_schema')) ORDER BY c.oid";
+        // PostgreSQL's schema_get_xml_visible_tables / XML_VISIBLE_SCHEMAS:
+        // only relations the user may SELECT, schemas it may use (privileges lane).
+        const schema_tables_query = "SELECT c.oid FROM pg_catalog.pg_class c WHERE c.relnamespace = {s} AND c.relkind IN ('r', 'm', 'v') AND pg_catalog.has_table_privilege(c.oid, 'SELECT') ORDER BY c.relname";
+        const visible_schemas_query = "SELECT n.oid FROM pg_catalog.pg_namespace n WHERE pg_catalog.has_schema_privilege(n.oid, 'USAGE') AND NOT (n.nspname ~ '^pg_' OR n.nspname = 'information_schema') ORDER BY n.nspname";
+        const database_tables_query = "SELECT c.oid FROM pg_catalog.pg_class c WHERE c.relkind IN ('r', 'm', 'v') AND pg_catalog.has_table_privilege(c.oid, 'SELECT') AND c.relnamespace IN (SELECT n.oid FROM pg_catalog.pg_namespace n WHERE pg_catalog.has_schema_privilege(n.oid, 'USAGE') AND NOT (n.nspname ~ '^pg_' OR n.nspname = 'information_schema')) ORDER BY c.oid";
 
         /// LookupExplicitNamespace: the OID of a schema (3F000 when there
         /// is none).
