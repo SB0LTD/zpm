@@ -292,7 +292,7 @@ before applying it. RSBASE10 images refuse such routines before writing
 
 ## Wave 5: schema statements, paths, context, transition tables (routines-trig lane)
 
-`contract-sql-routines-trig` (tests/test_sql_routines_trig.sig, 444
+`contract-sql-routines-trig` (tests/test_sql_routines_trig.sig, 449
 assertions, 223 replayed records) covers this section with values in PostgreSQL text output, command tags, exact errors
 (the SQLSTATE through the error name), atomicity after a failure and
 replay: every committed record is applied to a replica that must answer
