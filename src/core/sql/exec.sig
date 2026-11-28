@@ -846,11 +846,7 @@ pub fn Exec(comptime config: types.Config) type {
                     var scan = S.indexScan(table, which, &span, false);
                     while (S.scanNext(table, which, &scan)) |version| try self.pushVisible(table, version, &list);
                 }
-                if (list.count > 1) {
-                    const scratch = try self.refs(list.count);
-                    const sorter: HeapSorter = .{ .table = table };
-                    _ = try sort_module.mergeSort(self.work.refs[list.start..][0..list.count], self.work.refs[scratch..][0..list.count], &sorter);
-                }
+                heapOrder(table, self.work.refs[list.start..][0..list.count]);
                 return list;
             }
 
@@ -6204,18 +6200,43 @@ pub fn Exec(comptime config: types.Config) type {
             if (backward) reverseRun(indices[run_start..found.*]);
         }
 
-        const HeapSorter = struct {
-            table: *const S.Table,
-            pub fn order(self: *const HeapSorter, left: u32, right: u32) Error!i8 {
-                const a = self.table.versions[left].rowSlot();
-                const b = self.table.versions[right].rowSlot();
-                return if (a < b) -1 else if (a > b) 1 else 0;
+        /// In-place heapsort of version handles by row slot (heap order, a
+        /// scan's order). Each row contributes at most one visible version,
+        /// so slots are distinct and stability is moot; no scratch.
+        fn heapOrder(table: *const S.Table, items: []u32) void {
+            if (items.len < 2) return;
+            var start = items.len / 2;
+            while (start > 0) {
+                start -= 1;
+                siftSlot(table, items, start, items.len);
             }
-        };
+            var end = items.len;
+            while (end > 1) {
+                end -= 1;
+                const swap = items[0];
+                items[0] = items[end];
+                items[end] = swap;
+                siftSlot(table, items, 0, end);
+            }
+        }
+
+        fn siftSlot(table: *const S.Table, items: []u32, first: usize, end: usize) void {
+            var root = first;
+            while (true) {
+                var child = 2 * root + 1;
+                if (child >= end) return;
+                if (child + 1 < end and table.versions[items[child]].rowSlot() < table.versions[items[child + 1]].rowSlot()) child += 1;
+                if (table.versions[items[root]].rowSlot() >= table.versions[items[child]].rowSlot()) return;
+                const swap = items[root];
+                items[root] = items[child];
+                items[child] = swap;
+                root = child;
+            }
+        }
 
         /// Equality through a hash index: the chain's visible versions
         /// WHERE keeps, in heap order.
-        fn hashCandidates(ctx: *E.Context, table: *const S.Table, row_scratch: *S.VersionRowScratch, query: *const B.Select, snap: storage.Snapshot, span: *const S.Span, indices: []u32, heap_scratch: []u32, session: *const value_module.Session, stats: *ReadStats) Error!usize {
+        fn hashCandidates(ctx: *E.Context, table: *const S.Table, row_scratch: *S.VersionRowScratch, query: *const B.Select, snap: storage.Snapshot, span: *const S.Span, indices: []u32, session: *const value_module.Session, stats: *ReadStats) Error!usize {
             const which: usize = query.index.which;
             var cells: [config.columns]V.Cell = @splat(.null_value);
             cells[table.indexes[which].keys[0]] = span.cells[0];
@@ -6230,17 +6251,14 @@ pub fn Exec(comptime config: types.Config) type {
                 indices[found] = version;
                 found += 1;
             }
-            if (found > 1) {
-                const sorter: HeapSorter = .{ .table = table };
-                _ = try sort_module.mergeSort(indices[0..found], heap_scratch, &sorter);
-            }
+            heapOrder(table, indices[0..found]);
             return found;
         }
 
         /// Candidates of a bound index path: in index order when it serves
         /// ORDER BY, else in heap order (a scan's order). Null when a bound
         /// cannot be evaluated: the caller scans, as without the index.
-        fn indexCandidates(ctx: *E.Context, table: *const S.Table, row_scratch: *S.VersionRowScratch, query: *const B.Select, snap: storage.Snapshot, indices: []u32, heap_scratch: []u32, locking: bool, session: *const value_module.Session, stats: *ReadStats) Error!?usize {
+        fn indexCandidates(ctx: *E.Context, table: *const S.Table, row_scratch: *S.VersionRowScratch, query: *const B.Select, snap: storage.Snapshot, indices: []u32, locking: bool, session: *const value_module.Session, stats: *ReadStats) Error!?usize {
             const path = &query.index;
             var span: S.Span = .{};
             ctx.row = null;
@@ -6261,7 +6279,7 @@ pub fn Exec(comptime config: types.Config) type {
             }
             stats.index_scans += 1;
             if (empty) return 0;
-            if (path.hash) return try hashCandidates(ctx, table, row_scratch, query, snap, &span, indices, heap_scratch, session, stats);
+            if (path.hash) return try hashCandidates(ctx, table, row_scratch, query, snap, &span, indices, session, stats);
             // Only an ordered walk without row locks can stop at LIMIT.
             const stop: u64 = if (path.ordered and !locking) query.limit else 0xffffffffffffffff;
             var found: usize = 0;
@@ -6272,10 +6290,7 @@ pub fn Exec(comptime config: types.Config) type {
                     try walkSpan(ctx, table, row_scratch, query, snap, &span, indices, &found, stop, session, stats);
                 }
             } else try walkSpan(ctx, table, row_scratch, query, snap, &span, indices, &found, stop, session, stats);
-            if (!path.ordered and found > 1) {
-                const sorter: HeapSorter = .{ .table = table };
-                _ = try sort_module.mergeSort(indices[0..found], heap_scratch, &sorter);
-            }
+            if (!path.ordered) heapOrder(table, indices[0..found]);
             return found;
         }
 
@@ -6384,9 +6399,7 @@ pub fn Exec(comptime config: types.Config) type {
                 .scan => scan: {
                   if (comptime observing) observation.operation = .table_scan;
                   if (query.index.which != B.no_index and S.hasIndexHash(table, query.index.which) and table.indexes[query.index.which].hash == query.index.hash) {
-                    var inline_heap: [if (config.external_workspace) 0 else types.workRows(config)]u32 = undefined;
-                    const heap_scratch = if (config.external_workspace) work.refs[index_capacity..][0..index_capacity] else inline_heap[0..];
-                    if (try indexCandidates(&ctx, table, &row_scratch, query, snap, indices, heap_scratch, locking, session, stats)) |count| {
+                    if (try indexCandidates(&ctx, table, &row_scratch, query, snap, indices, locking, session, stats)) |count| {
                         if (comptime observing) observation.operation = indexOperation(&query.index);
                         found = count;
                         ordered = query.index.ordered;
