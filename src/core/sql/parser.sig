@@ -5960,7 +5960,8 @@ pub fn Parser(comptime config: types.Config) type {
                 var buf: [64]u8 = undefined;
                 const name = identText(self.source, n.name, &buf) orelse continue;
                 if (types.same(name, "generate_series") or types.same(name, "unnest") or types.same(name, "generate_subscripts") or
-                    types.same(name, "regexp_matches") or types.same(name, "regexp_split_to_table") or types.same(name, "jsonb_path_query")) return true;
+                    types.same(name, "regexp_matches") or types.same(name, "regexp_split_to_table") or types.same(name, "jsonb_path_query") or
+                    types.same(name, "_pg_expandarray")) return true;
             }
             return false;
         }

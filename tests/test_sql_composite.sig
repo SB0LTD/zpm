@@ -527,6 +527,42 @@ fn concurrency() !void {
     try sameState(&.{"SELECT count(*) FROM pg_type WHERE typname = 'cc'"});
 }
 
+// ---- information_schema and _pg_expandarray ---------------------------------
+
+/// Composite types in information_schema (user_defined_types, attributes,
+/// columns, routines, parameters) and information_schema._pg_expandarray
+/// with `(record).field` through a derived table (pgjdbc's getPrimaryKeys
+/// shape), as native PostgreSQL 18.7 answers them.
+fn informationSchema() !void {
+    try expect("SELECT user_defined_type_schema, user_defined_type_name, user_defined_type_category, is_instantiable, is_final FROM information_schema.user_defined_types WHERE user_defined_type_name IN ('pt', 'money_box') ORDER BY 2",
+        "public|money_box|STRUCTURED|YES|NULL;public|pt|STRUCTURED|YES|NULL");
+    try expect("SELECT udt_name, attribute_name, ordinal_position, data_type, character_maximum_length, attribute_udt_name FROM information_schema.attributes WHERE udt_name IN ('pt', 'money_box') ORDER BY 1, 3",
+        "money_box|amount|1|numeric|NULL|numeric;money_box|code|2|character varying|3|varchar;money_box|at|3|timestamp without time zone|NULL|timestamp;money_box|tags|4|ARRAY|NULL|_text;pt|x|1|integer|NULL|int4;pt|y|2|text|NULL|text");
+    try expect("SELECT attribute_name, numeric_precision, numeric_scale, datetime_precision, dtd_identifier FROM information_schema.attributes WHERE udt_name = 'money_box' ORDER BY ordinal_position",
+        "amount|6|2|NULL|1;code|NULL|NULL|NULL|2;at|NULL|NULL|0|3;tags|NULL|NULL|NULL|4");
+    try expect("SELECT column_name, data_type, udt_schema, udt_name, dtd_identifier FROM information_schema.columns WHERE table_name = 'shapes' ORDER BY ordinal_position",
+        "id|integer|pg_catalog|int4|1;p|USER-DEFINED|public|pt|2;d|USER-DEFINED|public|doc|3");
+    try expect("SELECT routine_name, data_type, type_udt_schema, type_udt_name FROM information_schema.routines WHERE routine_name IN ('pt_label', 'mk') ORDER BY 1",
+        "mk|USER-DEFINED|public|pt;pt_label|text|pg_catalog|text");
+    try expect("SELECT parameter_name, data_type, udt_schema, udt_name FROM information_schema.parameters WHERE specific_name LIKE 'mk%' OR specific_name LIKE 'pt_label%' ORDER BY 1",
+        "a|integer|pg_catalog|int4;p|USER-DEFINED|public|pt");
+
+    try expectColumns("SELECT (information_schema._pg_expandarray(ARRAY['a','b'])).n, (information_schema._pg_expandarray(ARRAY['a','b'])).x", "n,x", &.{ 23, 25 }, "", "1|a;2|b");
+    try expectColumns("SELECT information_schema._pg_expandarray(ARRAY[10,NULL])", "_pg_expandarray", &.{2249}, "", "(10,1);(,2)");
+    try expectColumns("SELECT (information_schema._pg_expandarray(ARRAY[[1,2],[3,4]])).*", "x,n", &.{ 23, 23 }, "", "1|1;2|2;3|3;4|4");
+    try expect("SELECT result.k, result.key_seq FROM (SELECT (information_schema._pg_expandarray(ARRAY[3,1,2])).n AS key_seq, information_schema._pg_expandarray(ARRAY[3,1,2]) AS keys, 2 AS k) result WHERE result.k = (result.keys).x ORDER BY result.key_seq", "2|3");
+    try expect("SELECT (e).x, (e).n FROM (SELECT information_schema._pg_expandarray('[0:1]={p,q}'::text[]) AS e) s", "p|1;q|2");
+    try expect("WITH c AS (SELECT information_schema._pg_expandarray(ARRAY[true,false]) AS e) SELECT (e).* FROM c", "t|1;f|2");
+    try expect("SELECT (information_schema._pg_expandarray(NULL::int[])).n", "");
+    try fails("SELECT information_schema._pg_expandarray('x')", error.TypeMismatch);
+    try fails("SELECT _pg_expandarray(ARRAY[1])", error.UndefinedFunction);
+    try fails("SELECT 1 WHERE (information_schema._pg_expandarray(ARRAY[1])).n = 1", error.UnsupportedStatement);
+    try fails("SELECT (information_schema._pg_expandarray(ARRAY[1])).y", error.ColumnNotFound);
+    try fails("SELECT (s.e).nope FROM (SELECT information_schema._pg_expandarray(ARRAY[1]) AS e) s", error.ColumnNotFound);
+    try fails("SELECT (s.e).x FROM (SELECT 1 AS e) s", error.WrongObjectType);
+    try fails("CREATE TABLE ex AS SELECT information_schema._pg_expandarray(ARRAY[1]) AS e", error.InvalidTableDefinition);
+}
+
 fn contract() !void {
     try values();
     try columns();
@@ -536,6 +572,7 @@ fn contract() !void {
     try corruption();
     try projectSet();
     try concurrency();
+    try informationSchema();
 }
 
 pub fn main(init: std.process.Init) !void {

@@ -317,6 +317,16 @@ pub fn Rows(comptime config: types.Config) type {
 
                 // ---- namespaces ---------------------------------------------
 
+                /// A composite type's schema and name (composite lane): a
+                /// composite column's typmod, or a routine type's OID.
+                const UserType = struct { schema: []const u8, name: []const u8 };
+
+                fn compositeType(self: *const Self, oid: u32) ?UserType {
+                    const index = self.objects().byOid(.composite_type, oid, self.snap) orelse return null;
+                    const object = &self.objects().items[index];
+                    return .{ .schema = self.namespaceName(object.target), .name = object.name.slice() };
+                }
+
                 fn namespaceName(self: *const Self, oid: u32) []const u8 {
                     for (catalog.namespaces) |namespace| if (namespace.oid == oid) return namespace.name;
                     for (&self.db.schemas) |*schema| if (schema.live and schema.oid == oid) return schema.name.slice();
@@ -895,7 +905,8 @@ pub fn Rows(comptime config: types.Config) type {
                     const data_type = column.data_type;
                     const typmod = column.typmod;
                     const collation_name = if (column.catalog_collation and collation.collatable(types.typeOfData(data_type))) "C" else collationName(data_type, column.domain);
-                    const udt = udtName(data_type);
+                    const composite: ?UserType = if (data_type == .record and typmod > 0) self.compositeType(@intCast(typmod)) else null;
+                    const udt = if (composite) |known| known.name else udtName(data_type);
                     var identity_cells: [5]Cell = @splat(.null_value);
                     var cycle: Cell = try yesNo(false);
                     if (column.seq_index) |slot| {
@@ -907,7 +918,7 @@ pub fn Rows(comptime config: types.Config) type {
                         try self.catalogName(),                         try self.text(schema),
                         try self.text(table),                           try self.text(column.name),
                         int(@intCast(column.position)),                 if (column.is_generated) .null_value else column.default,
-                        try yesNo(!column.not_null),                        try static(dataTypeName(data_type)),
+                        try yesNo(!column.not_null),                        try static(if (composite != null) "USER-DEFINED" else dataTypeName(data_type)),
                         optionalInt(charMaxLength(data_type, typmod)),  optionalInt(charOctetLength(data_type, typmod)),
                         optionalInt(numericPrecision(data_type, typmod)), optionalInt(numericRadix(data_type)),
                         optionalInt(numericScale(data_type, typmod)),   optionalInt(datetimePrecision(data_type, typmod)),
@@ -917,7 +928,7 @@ pub fn Rows(comptime config: types.Config) type {
                         if (collation_name != null) try static("pg_catalog") else .null_value, try self.optionalText(collation_name),
                         if (column.domain != null) try self.catalogName() else .null_value, if (column.domain != null) try static("information_schema") else .null_value,
                         if (column.domain) |domain| try static(IS.domainName(domain)) else .null_value, try self.catalogName(),
-                        try static("pg_catalog"),                       try static(udt),
+                        if (composite) |known| try self.text(known.schema) else try static("pg_catalog"), try self.text(udt),
                         .null_value,                                    .null_value,
                         .null_value,                                    .null_value,
                         try self.number(@intCast(column.position)),     try yesNo(false),
@@ -1580,10 +1591,11 @@ pub fn Rows(comptime config: types.Config) type {
                         cells[5] = try self.text(routine.name);
                         cells[6] = try static(if (procedure) "PROCEDURE" else "FUNCTION");
                         if (!procedure) {
-                            cells[13] = try static(typeDataName(routine.result));
+                            const composite = self.compositeType(routine.result);
+                            cells[13] = try static(if (composite != null) "USER-DEFINED" else typeDataName(routine.result));
                             cells[28] = try self.catalogName();
-                            cells[29] = try static("pg_catalog");
-                            cells[30] = try static(typeUdtName(routine.result));
+                            cells[29] = if (composite) |known| try self.text(known.schema) else try static("pg_catalog");
+                            cells[30] = if (composite) |known| try self.text(known.name) else try static(typeUdtName(routine.result));
                             cells[35] = try static("0");
                         }
                         cells[36] = try static(if (routine.language == catalog.sql_language_oid) "SQL" else "EXTERNAL");
@@ -1673,10 +1685,11 @@ pub fn Rows(comptime config: types.Config) type {
                             cells[5] = try yesNo(false);
                             cells[6] = try yesNo(false);
                             if (parameter.name.len != 0) cells[7] = try self.text(parameter.name);
-                            cells[8] = try static(typeDataName(parameter.oid));
+                            const composite = self.compositeType(parameter.oid);
+                            cells[8] = try static(if (composite != null) "USER-DEFINED" else typeDataName(parameter.oid));
                             cells[23] = try self.catalogName();
-                            cells[24] = try static("pg_catalog");
-                            cells[25] = try static(typeUdtName(parameter.oid));
+                            cells[24] = if (composite) |known| try self.text(known.schema) else try static("pg_catalog");
+                            cells[25] = if (composite) |known| try self.text(known.name) else try static(typeUdtName(parameter.oid));
                             cells[30] = try self.number(@intCast(position));
                             if (owner_sees) {
                                 if (parameter.default) |default| cells[31] = self.typedDefault(default, parameter.oid);

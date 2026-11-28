@@ -1425,6 +1425,7 @@ pub fn Binder(comptime config: types.Config) type {
         /// 0A000 elsewhere). False when the call is none of them.
         fn selectSetBuiltin(context: *const Context, scope: *const Scope, n: *ast.Node) Error!bool {
             if (n.kind != .function or n.func != .none or n.name.quoted or context.dialect != .postgres) return false;
+            if (try expandArrayCall(context, scope, n)) return true;
             if (n.qualifier.len != 0 and !types.same(toName(context, n.qualifier).slice(), "pg_catalog")) return false;
             const name = toName(context, n.name);
             const series = types.same(name.slice(), "generate_series");
@@ -1447,6 +1448,29 @@ pub fn Binder(comptime config: types.Config) type {
                 n.func = .srf_subscripts;
             }
             n.typmod = -1;
+            n.constant = false;
+            seen.* +|= 1;
+            return true;
+        }
+
+        /// information_schema._pg_expandarray(anyarray): a set-returning
+        /// call of a select list returning the anonymous record (x
+        /// anyelement, n int4); the element type is in `cast_type`.
+        fn expandArrayCall(context: *const Context, scope: *const Scope, n: *ast.Node) Error!bool {
+            if (n.qualifier.len == 0 or !types.same(toName(context, n.qualifier).slice(), "information_schema")) return false;
+            if (!types.same(toName(context, n.name).slice(), "_pg_expandarray")) return false;
+            if (n.window != none) return error.WindowingError;
+            const seen = scope.set_calls orelse return error.UnsupportedStatement;
+            if (n.star or n.distinct or n.c != none or n.order != none or n.b == none or context.node(n.b).next != none) return error.UndefinedFunction;
+            try typeExpr(context, scope, n.b);
+            const argument = context.node(n.b).ty;
+            // An untyped literal cannot decide anyarray (42804).
+            if (argument == .unknown) return error.TypeMismatch;
+            const element = types.elementType(argument) orelse return error.UndefinedFunction;
+            n.cast_type = element;
+            n.ty = .record;
+            n.typmod = -1;
+            n.func = .srf_expandarray;
             n.constant = false;
             seen.* +|= 1;
             return true;
@@ -2804,7 +2828,7 @@ pub fn Binder(comptime config: types.Config) type {
             extFunctionOverload(context, n, count);
             switch (n.func) {
                 // Select-list set-returning built-ins are typed when bound.
-                .srf_series, .srf_unnest, .srf_subscripts => {},
+                .srf_series, .srf_unnest, .srf_subscripts, .srf_expandarray => {},
                 .grouping => {
                     if(!scope.aggregates) return error.GroupingError;
                     if(count==0 or count>31) return error.InvalidParameterValue;
@@ -7264,8 +7288,29 @@ pub fn Binder(comptime config: types.Config) type {
         /// Field `want` (by name, or by position when `name` is null) of the
         /// record expression `id`: a composite type's fields, or a user
         /// function's OUT / TABLE columns. Null when it has no such field.
-        fn recordField(context: *const Context, id: u16, name: ?[]const u8, want: usize) Error!?RecordField {
+        fn recordField(context: *const Context, scope: ?*const Scope, id: u16, name: ?[]const u8, want: usize) Error!?RecordField {
             const n = context.node(id);
+            // A derived table's (or CTE's) anonymous record column: the
+            // record its subquery's target computes.
+            if (n.kind == .column and n.typmod <= 0) {
+                var owner = scope orelse return null;
+                var level = n.level;
+                while (level > 0) : (level -= 1) owner = owner.parent orelse return null;
+                if (n.relation >= owner.rel_count) return null;
+                const rel = &owner.rels[n.relation];
+                if (rel.plan == none or rel.table != null or rel.view != null) return null;
+                const plan = &plansOf(context).items[rel.plan];
+                if (plan.set_op != .none or plan.values != none or n.column >= plan.count) return null;
+                return recordField(context, null, plan.targets[n.column], name, want);
+            }
+            if (n.kind == .function and n.func == .srf_expandarray) {
+                const index: usize = if (name) |wanted| (if (types.same(wanted, "x")) 0 else if (types.same(wanted, "n")) 1 else return null) else want;
+                return switch (index) {
+                    0 => .{ .index = 0, .ty = n.cast_type, .typmod = -1, .name = "x" },
+                    1 => .{ .index = 1, .ty = .int4, .typmod = -1, .name = "n" },
+                    else => null,
+                };
+            }
             if (n.typmod > 0) {
                 const layout = compositeLayout(context, @intCast(n.typmod)) orelse return error.UndefinedObject;
                 var fields: catalog_objects.CompositeFields = .{ .bytes = layout };
@@ -7347,7 +7392,7 @@ pub fn Binder(comptime config: types.Config) type {
             if (base.ty != .record) return error.WrongObjectType;
             if (base.kind == .row_constructor) try anonymousFields(context, n.a);
             const wanted = toName(context, n.name);
-            const field = (try recordField(context, n.a, wanted.slice(), 0)) orelse return error.ColumnNotFound;
+            const field = (try recordField(context, scope, n.a, wanted.slice(), 0)) orelse return error.ColumnNotFound;
             n.integer = @intCast(field.index);
             n.ty = field.ty;
             n.typmod = field.typmod;
@@ -7390,25 +7435,25 @@ pub fn Binder(comptime config: types.Config) type {
             const base = context.node(n.a);
             if (base.ty != .record) return error.WrongObjectType;
             var count: usize = 0;
-            while (try recordField(context, n.a, null, count)) |_| count += 1;
+            while (try recordField(context, scope, n.a, null, count)) |_| count += 1;
             if (count == 0 and base.typmod <= 0) return error.ColumnNotFound;
             return count;
         }
 
         /// Field `index` of an expanded `(a).*` (its base already bound):
         /// a new field_select node sharing the base.
-        fn recordStarField(context: *const Context, id: u16, index: usize) Error!u16 {
+        fn recordStarField(context: *const Context, scope: *const Scope, id: u16, index: usize) Error!u16 {
             const n = context.node(id);
-            const field = (try recordField(context, n.a, null, index)) orelse return error.ColumnNotFound;
+            const field = (try recordField(context, scope, n.a, null, index)) orelse return error.ColumnNotFound;
             const selected = try context.pool.add(.{ .kind = .field_select, .a = n.a, .integer = @intCast(index), .ty = field.ty, .typmod = field.typmod, .constant = isConstant(context, n.a) });
             try context.pool.raise(selected, n.a);
             return selected;
         }
 
         /// The output name of an expanded field.
-        fn recordStarName(context: *const Context, id: u16, index: usize) Error!V.Name {
+        fn recordStarName(context: *const Context, scope: *const Scope, id: u16, index: usize) Error!V.Name {
             const n = context.node(id);
-            const field = (try recordField(context, n.a, null, index)) orelse return error.ColumnNotFound;
+            const field = (try recordField(context, scope, n.a, null, index)) orelse return error.ColumnNotFound;
             var name: V.Name = .{};
             if (field.name.len == 0) {
                 const label = std.fmt.bufPrint(&name.bytes, "f{d}", .{index + 1}) catch return error.NameCapacity;
@@ -7610,9 +7655,9 @@ pub fn Binder(comptime config: types.Config) type {
                     const width = try recordStarWidth(context, &scope, target.expr);
                     for (0..width) |index| {
                         if (out.count == config.columns) return error.ColumnCapacity;
-                        const id = try recordStarField(context, target.expr, index);
+                        const id = try recordStarField(context, &scope, target.expr, index);
                         out.targets[out.count] = id;
-                        out.names[out.count] = try recordStarName(context, target.expr, index);
+                        out.names[out.count] = try recordStarName(context, &scope, target.expr, index);
                         out.types[out.count] = types.dataTypeOf(context.node(id).ty);
                         out.typmods[out.count] = outputTypmod(context, id);
                         out.count += 1;
@@ -8029,7 +8074,7 @@ pub fn Binder(comptime config: types.Config) type {
                     if (item.typmod <= 0 and item.shape == 0) return error.ObjectNotInPrerequisiteState;
                     const base = try context.pool.add(.{});
                     bindVariableNode(context.node(base), 0, index, 0, item.ty, item.typmod);
-                    const field = (try recordField(context, base, wanted.slice(), 0)) orelse return error.ColumnNotFound;
+                    const field = (try recordField(context, scope, base, wanted.slice(), 0)) orelse return error.ColumnNotFound;
                     const name = n.name;
                     n.* = .{ .kind = .field_select, .a = base, .name = name, .integer = @intCast(field.index), .ty = field.ty, .typmod = field.typmod, .next = n.next };
                     try context.pool.raise(nodeIndex(context, n), base);
@@ -10348,9 +10393,21 @@ pub fn Binder(comptime config: types.Config) type {
                     continue;
                 }
                 if (recordStar(context, target.expr)) {
-                    // `(a).*`: one output column per field (composite lane).
-                    const width = try recordStarWidth(context, &scope, target.expr);
-                    for (0..width) |index| try addTarget(context, p, try recordStarField(context, target.expr, index), try recordStarName(context, target.expr, index));
+                    // `(a).*`: one output column per field (composite lane);
+                    // a set-returning `a` runs once for all of them.
+                    var star_calls: u8 = 0;
+                    scope.set_calls = &star_calls;
+                    const width = recordStarWidth(context, &scope, target.expr) catch |err| {
+                        scope.set_calls = null;
+                        return err;
+                    };
+                    scope.set_calls = null;
+                    if (star_calls != 0) {
+                        if (q.lock.strength != .none) return error.UnsupportedStatement;
+                        try collectSetCalls(context, context.node(target.expr).a, p, false);
+                        if (p.unnest_column == none) p.unnest_column = @intCast(p.count);
+                    }
+                    for (0..width) |index| try addTarget(context, p, try recordStarField(context, &scope, target.expr, index), try recordStarName(context, &scope, target.expr, index));
                     continue;
                 }
                 // Set-returning calls anywhere in the target (ProjectSet).

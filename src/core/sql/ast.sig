@@ -212,7 +212,9 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     // Set-returning built-ins in a select list (ProjectSet, B11 wave 5
     // composite lane): generate_series (`integer`: 0 integer, 1 numeric,
     // 2 timestamp series), unnest and generate_subscripts.
-    srf_series, srf_unnest, srf_subscripts };
+    srf_series, srf_unnest, srf_subscripts,
+    // information_schema._pg_expandarray(anyarray) -> setof (x, n).
+    srf_expandarray };
 
 /// xml_call variants (xml_eval.sig).
 pub const XmlFn = enum(u8) {
@@ -384,7 +386,7 @@ pub fn setFunction(func: Func) bool {
 /// and user set-returning routines (`boolean`).
 pub fn selectSetCall(n: *const Node) bool {
     if (n.kind != .function) return false;
-    return setFunction(n.func) or n.func == .srf_series or n.func == .srf_unnest or n.func == .srf_subscripts or (n.func == .routine and n.boolean);
+    return setFunction(n.func) or n.func == .srf_series or n.func == .srf_unnest or n.func == .srf_subscripts or n.func == .srf_expandarray or (n.func == .routine and n.boolean);
 }
 
 /// Cast typmods marking `::regclass` / `::regtype` (OID-valued casts).

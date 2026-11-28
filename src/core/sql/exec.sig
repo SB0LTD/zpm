@@ -620,6 +620,7 @@ pub fn Exec(comptime config: types.Config) type {
                     .srf_series => seriesSetRows(ctx, n, sink),
                     .srf_unnest => unnestSetRows(ctx, n, sink),
                     .srf_subscripts => subscriptSetRows(ctx, n, sink),
+                    .srf_expandarray => expandArraySetRows(ctx, n, sink),
                     else => error.UnsupportedStatement,
                 };
             }
@@ -685,6 +686,30 @@ pub fn Exec(comptime config: types.Config) type {
                 while (reader.next(&element)) {
                     try ctx.session.checkpoint();
                     if (!try sink.row(sink.context, &element)) return;
+                }
+            }
+
+            /// information_schema._pg_expandarray(anyarray) in a select list:
+            /// per element (every dimension, in storage order) the record
+            /// (x, n), n counting from 1, as PostgreSQL 18's unnest WITH
+            /// ORDINALITY body; a NULL array yields nothing (STRICT).
+            fn expandArraySetRows(ctx: *const E.Context, call: *const ast.Node, sink: regex_eval.RegexEval(config, E).Sink) Error!void {
+                const value = try E.eval(ctx, call.b);
+                if (value == .null_value) return;
+                if (value != .array) return error.TypeMismatch;
+                const element_type = types.dataTypeOf(call.cast_type);
+                var reader = V.Arrays.Reader.init(value.array.slice());
+                var element: V.Cell = undefined;
+                var ordinal: i64 = 0;
+                while (reader.next(&element)) {
+                    try ctx.session.checkpoint();
+                    ordinal += 1;
+                    var out: V.Text = .{};
+                    var builder = try V.Records.Builder.begin(&out, types.record_oid);
+                    try builder.append(element_type, -1, &element);
+                    try builder.append(.integer, -1, &.{ .integer = ordinal });
+                    const cell: V.Cell = .{ .record = out };
+                    if (!try sink.row(sink.context, &cell)) return;
                 }
             }
 

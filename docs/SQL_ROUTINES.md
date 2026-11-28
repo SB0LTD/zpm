@@ -449,7 +449,7 @@ Not covered (open):
 
 ## Wave 5: composite values, user casts, ProjectSet (composite lane)
 
-`contract-sql-composite` (tests/test_sql_composite.sig, 408 assertions,
+`contract-sql-composite` (tests/test_sql_composite.sig, 467 assertions,
 55 replayed records) covers this section with values in PostgreSQL text
 output, column names and type OIDs, exact errors (the SQLSTATE through the
 error name), atomicity after a failure, replay (every committed record is
@@ -542,7 +542,21 @@ against native PostgreSQL 18.7.
   yield NULL and a call with no rows contributes NULLs. Their values are
   chained in workspace cells (54000 when they do not fit). A call in
   WHERE, CASE, COALESCE or an aggregate's arguments is 0A000, as in
-  PostgreSQL.
+  PostgreSQL. `(f()).*` over a set-returning `f` runs it once for all
+  its fields.
+- **information_schema.** A composite column, routine result or
+  parameter is `USER-DEFINED` with the type's schema and name as its
+  udt (columns, routines, parameters); user_defined_types and attributes
+  list composite types as native 18.7 does.
+  `information_schema._pg_expandarray(anyarray)` is a select-list
+  set-returning call returning the anonymous record (x, n): every element
+  in storage order with its ordinal (PostgreSQL 18's unnest WITH
+  ORDINALITY body; NULL yields nothing, an untyped literal is 42804).
+  `(record).field` and `(record).*` follow a derived table's or CTE's
+  anonymous record column to the target that computes it, as
+  expandRecordVariable does, so pgjdbc's getPrimaryKeys shape
+  `(result.KEYS).x` binds. pg_index.indkey is text here, not int2vector,
+  so that query itself still needs the catalog's int2vector.
 
 Durability: change-log ops 121 `create_cast` (payload: oid u32, source and
 target type OIDs u32, function OID u32, context u8 `e` / `a` / `i`, method

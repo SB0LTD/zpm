@@ -1753,7 +1753,7 @@ pub fn Eval(comptime config: types.Config) type {
                 .regexp_match, .regexp_replace, .regexp_split_to_array, .regexp_count, .regexp_instr, .regexp_substr, .substring_regex, .substring_similar => return regex_eval.RegexEval(config, @This()).call(ctx, n),
                 // A set-returning call reads the value exec is expanding.
                 // Set-returning calls are expanded by Exec.projectSets.
-                .regexp_matches, .regexp_split_to_table, .jsonb_path_query, .srf_series, .srf_unnest, .srf_subscripts => return error.UnsupportedStatement,
+                .regexp_matches, .regexp_split_to_table, .jsonb_path_query, .srf_series, .srf_unnest, .srf_subscripts, .srf_expandarray => return error.UnsupportedStatement,
                 .json_query_function => return json_eval.JsonEval(config, @This()).queryFunction(ctx, n),
                 .json_constructor => return json_eval.JsonEval(config, @This()).constructor(ctx, n),
                 .tsvector_length, .ts_strip, .ts_setweight, .tsvector_to_array, .array_to_tsvector, .ts_delete, .ts_filter, .ts_numnode => return textSearchUtility(ctx, n),
