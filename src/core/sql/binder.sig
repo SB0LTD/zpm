@@ -457,7 +457,17 @@ pub fn Binder(comptime config: types.Config) type {
         pub const InlineCall = struct { node: u16 = none, routine: u16 = 0, query: u16 = 0, low: u16 = 0, high: u16 = 0 };
 
         /// One routine variable visible to expressions (B11 wave 3).
-        pub const RoutineVariable = struct { name: V.Name = .{}, ty: ast.Type = .int4, typmod: i32 = -1 };
+        pub const RoutineVariable = struct { name: V.Name = .{}, ty: ast.Type = .int4, typmod: i32 = -1,
+            /// A PL/pgSQL `record` variable's row shape: record_shapes
+            /// index + 1 (0: not assigned yet; composite lane).
+            shape: u8 = 0 };
+
+        /// The field names and types of the row a `record` variable last
+        /// took (catalog_objects.CompositeFields layout).
+        pub const RecordShape = struct {
+            bytes: [config.columns * (1 + config.name_bytes + 8)]u8 = undefined,
+            len: usize = 0,
+        };
 
         /// The variables of a routine frame, in frame order.
         pub const RoutineVariables = struct {
@@ -472,6 +482,9 @@ pub fn Binder(comptime config: types.Config) type {
             routine_name: V.Name = .{},
             /// Parameters of the routine (the first `parameters` items).
             parameters: usize = 0,
+            /// Row shapes of `record` variables (B11 wave 5, composite lane).
+            record_shapes: [config.routine_records]RecordShape = undefined,
+            record_shape_count: usize = 0,
             /// REFERENCING transition tables of the firing trigger (T212,
             /// B11 wave 5): FROM names reading its statement's rows through
             /// the trigger's window (Database.transition_windows).
@@ -7271,6 +7284,24 @@ pub fn Binder(comptime config: types.Config) type {
                 }
                 return null;
             }
+            // A PL/pgSQL `record` variable: the row it last took.
+            if (n.kind == .function and n.func == .routine_param and n.relation == 0) if (context.variables) |variables| {
+                const index: usize = @intCast(n.integer);
+                if (index < variables.count) {
+                    const shape = variables.items[index].shape;
+                    if (shape == 0) return error.ObjectNotInPrerequisiteState;
+                    const layout = &variables.record_shapes[shape - 1];
+                    var fields: catalog_objects.CompositeFields = .{ .bytes = layout.bytes[0..layout.len] };
+                    var position: usize = 0;
+                    while (fields.next()) |field| : (position += 1) {
+                        const hit = if (name) |wanted| types.same(field.name, wanted) else position == want;
+                        if (!hit) continue;
+                        const typed = types.oidType(field.oid, field.typmod) orelse return error.UnsupportedStatement;
+                        return .{ .index = position, .ty = typed.ty, .typmod = typed.typmod, .name = field.name };
+                    }
+                    return null;
+                }
+            };
             if (n.kind == .function and n.func == .routine) {
                 const set = context.routines orelse return null;
                 const routine = &set.routines[@intCast(n.integer)];
@@ -7985,6 +8016,7 @@ pub fn Binder(comptime config: types.Config) type {
                 if (variables.find(q.slice())) |index| {
                     const item = &variables.items[index];
                     if (item.ty != .record or relationNamed(scope, q.slice())) return false;
+                    if (item.typmod <= 0 and item.shape == 0) return error.ObjectNotInPrerequisiteState;
                     const base = try context.pool.add(.{});
                     bindVariableNode(context.node(base), 0, index, 0, item.ty, item.typmod);
                     const field = (try recordField(context, base, wanted.slice(), 0)) orelse return error.ColumnNotFound;

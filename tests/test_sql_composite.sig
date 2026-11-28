@@ -317,6 +317,32 @@ fn routines() !void {
     try fails("SELECT swap(ROW(1,'a')::pt)", error.UndefinedFunction);
 }
 
+// ---- PL/pgSQL composite and record variables -----------------------------------
+
+fn variables() !void {
+    try run("CREATE TABLE rows_t(a INT, b TEXT)");
+    try run("INSERT INTO rows_t VALUES (1, 'x'), (2, 'y')");
+    // A `record` variable takes the shape of the row SELECT INTO gives it.
+    try run("CREATE FUNCTION rec1() RETURNS TEXT LANGUAGE plpgsql AS $$DECLARE r record; BEGIN SELECT a, b INTO r FROM rows_t WHERE a = 2; RETURN r.b || r.a; END$$");
+    try expect("SELECT rec1()", "y2");
+    // Composite variables: assignment, field assignment, SELECT INTO from
+    // columns, RETURN of the record.
+    try run("CREATE FUNCTION comp1() RETURNS TEXT LANGUAGE plpgsql AS $$DECLARE p pt; BEGIN p := ROW(3, 'z')::pt; RETURN p.y || p.x; END$$");
+    try run("CREATE FUNCTION comp2() RETURNS pt LANGUAGE plpgsql AS $$DECLARE p pt; BEGIN p.x := 5; p.y := 'q'; RETURN p; END$$");
+    try run("CREATE FUNCTION comp3() RETURNS pt LANGUAGE plpgsql AS $$DECLARE p pt; BEGIN SELECT a, b INTO p FROM rows_t WHERE a = 1; RETURN p; END$$");
+    try expect("SELECT comp1(), comp2(), comp3()", "z3|(5,q)|(1,x)");
+    try run("CREATE FUNCTION rec2() RETURNS TEXT LANGUAGE plpgsql AS $$DECLARE r record; BEGIN r := ROW(1,'k')::pt; RETURN r.y; END$$");
+    try run("CREATE FUNCTION rec3() RETURNS INT LANGUAGE plpgsql AS $$DECLARE r record; BEGIN SELECT a, b INTO r FROM rows_t WHERE a = 1; r.a := 40; RETURN r.a + 2; END$$");
+    try expect("SELECT rec2(), rec3()", "k|42");
+    try run("DO $$DECLARE r record; BEGIN SELECT a, b INTO r FROM rows_t WHERE a = 1; RAISE NOTICE '%', r.b; END$$");
+    // An unassigned record variable is 55000; a missing field 42703.
+    try run("CREATE FUNCTION rec4() RETURNS TEXT LANGUAGE plpgsql AS $$DECLARE r record; BEGIN RETURN r.a; END$$");
+    try fails("SELECT rec4()", error.ObjectNotInPrerequisiteState);
+    try run("CREATE FUNCTION rec5() RETURNS TEXT LANGUAGE plpgsql AS $$DECLARE r record; BEGIN SELECT a INTO r FROM rows_t WHERE a = 1; RETURN r.zz; END$$");
+    try fails("SELECT rec5()", error.ColumnNotFound);
+    try sameState(&.{ "SELECT rec1(), rec2(), rec3()", "SELECT comp1(), comp2(), comp3()" });
+}
+
 // ---- user casts (S211) -------------------------------------------------------
 
 fn casts() !void {
@@ -454,6 +480,7 @@ fn contract() !void {
     try values();
     try columns();
     try routines();
+    try variables();
     try casts();
     try corruption();
     try projectSet();

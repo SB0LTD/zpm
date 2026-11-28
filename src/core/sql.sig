@@ -13853,6 +13853,22 @@ pub fn Database(comptime config: Config) type {
             return &self.session;
         }
 
+        /// A PL/pgSQL DECLARE naming a composite type (B11 wave 5,
+        /// composite lane): its OID and the end of the name; null when the
+        /// name is no composite type.
+        pub fn routineUserType(self: *Self, source: []const u8, start: usize) Error!?R.UserTypeAt {
+            var cursor = try R.Cursor.init(source, start);
+            var user: R.UserType = .{};
+            user.name = cursor.identifier() catch return null;
+            if (try cursor.takeSymbol(.dot)) {
+                user.has_schema = true;
+                user.schema = user.name;
+                user.name = try cursor.identifier();
+            }
+            const oid = (try self.userCompositeOid(&user, self.routine_snap)) orelse return null;
+            return .{ .oid = oid, .end = cursor.start() };
+        }
+
         pub fn routineType(self: *Self, source: []const u8, start: usize) Error!P.TypeAt {
             return P.parseTypeAt(source, start, &self.workspace.nodes);
         }
@@ -14459,6 +14475,7 @@ pub fn Database(comptime config: Config) type {
                     for (0..plan.count) |column| {
                         out.cells[column] = try ownCell(row[column]);
                         out.tys[column] = plan.tys[column];
+                        out.names[column] = plan.names[column];
                     }
                 }
             }
@@ -15993,7 +16010,7 @@ pub fn Database(comptime config: Config) type {
         /// A record of composite type `oid` (as a typmod) from separate
         /// column values, each converted by assignment to its field's type
         /// (a different column count is 42P13 / 42804).
-        fn compositeOfColumns(self: *Self, oid: i32, cells: []const V.Cell, tys: []const types.Type) Error!V.Cell {
+        pub fn compositeOfColumns(self: *Self, oid: i32, cells: []const V.Cell, tys: []const types.Type) Error!V.Cell {
             if (oid <= 0) return error.UnsupportedStatement;
             const layout = value_module.compositeLayout(&self.session, @intCast(oid)) orelse return error.UndefinedObject;
             var fields: CO.CompositeFields = .{ .bytes = layout };

@@ -64,6 +64,9 @@ pub fn Routines(comptime config: types.Config) type {
             /// until CREATE resolves it to a composite type.
             user_type: UserType = .{} };
 
+        /// A composite type named in a DECLARE: its OID and where the name ends.
+        pub const UserTypeAt = struct { oid: u32, end: usize };
+
         /// `[schema.]name` of a user type, resolved when the statement runs.
         pub const UserType = struct { name: Name = .{}, schema: Name = .{}, has_schema: bool = false,
             pub fn named(self: *const UserType) bool {
@@ -1492,6 +1495,8 @@ pub fn Routines(comptime config: types.Config) type {
         pub const Capture = struct {
             cells: [config.columns]V.Cell = @splat(.null_value),
             tys: [config.columns]types.Type = @splat(.unknown),
+            /// Column names (a `record` INTO target's row shape).
+            names: [config.columns]Name = @splat(.{}),
             count: usize = 0,
             rows: usize = 0,
             /// Only the row count is wanted (PERFORM): no value is kept.
@@ -1551,6 +1556,8 @@ pub fn Routines(comptime config: types.Config) type {
             index: usize = 0,
             ty: types.Type = .unknown,
             typmod: i32 = -1,
+            /// A field of a composite or `record` variable (composite lane).
+            field: ?usize = null,
         };
 
         /// Exception condition names (PostgreSQL's plerrcodes.h) and the
@@ -2175,8 +2182,19 @@ pub fn Routines(comptime config: types.Config) type {
                     const c = &self.cursor;
                     const name = try c.identifier();
                     const constant = try c.take("constant");
-                    if (c.is("alias") or c.is("cursor") or c.is("record") or c.is("refcursor")) return error.UnsupportedStatement;
-                    const typed = try self.host.routineType(self.source, c.start());
+                    if (c.is("alias") or c.is("cursor") or c.is("refcursor")) return error.UnsupportedStatement;
+                    // `record` and composite types (B11 wave 5, composite
+                    // lane): a record variable takes the shape of each row.
+                    var typed: parser.Parser(config).TypeAt = undefined;
+                    if (c.is("record")) {
+                        try c.advance();
+                        typed = .{ .spec = .{ .ty = .record, .typmod = -1 }, .end = c.start() };
+                    } else if (self.host.routineType(self.source, c.start())) |builtin| {
+                        typed = builtin;
+                    } else |err| {
+                        const user = (try self.host.routineUserType(self.source, c.start())) orelse return err;
+                        typed = .{ .spec = .{ .ty = .record, .typmod = @intCast(user.oid) }, .end = user.end };
+                    }
                     self.cursor = try Cursor.init(self.source, typed.end);
                     if (self.cursor.symbol(.percent)) return error.UnsupportedStatement;
                     if (self.cursor.is("collate")) {
@@ -2240,7 +2258,7 @@ pub fn Routines(comptime config: types.Config) type {
                     if (try c.takeSymbol(.dot)) {
                         const field = try c.identifier();
                         const record: u8 = if (types.same(first.slice(), "new")) 1 else if (types.same(first.slice(), "old")) 2 else 0;
-                        if (record == 0) return error.UnsupportedStatement;
+                        if (record == 0) return self.fieldTarget(first, field, mode);
                         const table = self.frame.variables.record_table orelse {
                             if (mode == .check) return .{ .record = record };
                             return error.TableNotFound;
@@ -2258,9 +2276,108 @@ pub fn Routines(comptime config: types.Config) type {
                     return .{ .index = index, .ty = item.ty, .typmod = item.typmod };
                 }
 
+                /// `variable.field` of a composite or `record` variable.
+                fn fieldTarget(self: *Self, variable: Name, field: Name, mode: Mode) Error!Target {
+                    const index = self.frame.variables.find(variable.slice()) orelse return error.Syntax;
+                    const item = &self.frame.variables.items[index];
+                    if (item.ty != .record) return error.UnsupportedStatement;
+                    if (self.frame.constant[index]) return error.ErrorInAssignment;
+                    var fields: catalog_objects.CompositeFields = .{ .bytes = &.{} };
+                    if (item.typmod > 0) {
+                        fields.bytes = value_module.compositeLayout(self.host.routineSession(), @intCast(item.typmod)) orelse return error.UndefinedObject;
+                    } else if (item.shape != 0) {
+                        const shape = &self.frame.variables.record_shapes[item.shape - 1];
+                        fields.bytes = shape.bytes[0..shape.len];
+                    } else {
+                        // A record variable's fields are known once assigned.
+                        if (mode == .check) return .{ .index = index, .field = 0, .ty = .unknown };
+                        return error.ObjectNotInPrerequisiteState;
+                    }
+                    var position: usize = 0;
+                    while (fields.next()) |entry| : (position += 1) {
+                        if (!types.same(entry.name, field.slice())) continue;
+                        const typed = types.oidType(entry.oid, entry.typmod) orelse return error.UnsupportedStatement;
+                        return .{ .index = index, .field = position, .ty = typed.ty, .typmod = typed.typmod };
+                    }
+                    return error.ColumnNotFound;
+                }
+
+                /// The row shape of `record` variable `index`: its slot of
+                /// record_shapes (ColumnCapacity past Config.routine_records).
+                fn shapeOf(self: *Self, index: usize) Error!*B.RecordShape {
+                    const variables = &self.frame.variables;
+                    if (variables.items[index].shape == 0) {
+                        if (variables.record_shape_count == variables.record_shapes.len) return error.ColumnCapacity;
+                        variables.record_shape_count += 1;
+                        variables.items[index].shape = @intCast(variables.record_shape_count);
+                    }
+                    const shape = &variables.record_shapes[variables.items[index].shape - 1];
+                    shape.len = 0;
+                    return shape;
+                }
+
+                fn shapeAppend(shape: *B.RecordShape, name: []const u8, oid: u32, typmod: i32) Error!void {
+                    const length = 1 + name.len + 8;
+                    if (name.len == 0 or name.len > 255 or length > shape.bytes.len - shape.len) return error.ColumnCapacity;
+                    const out = shape.bytes[shape.len..][0..length];
+                    out[0] = @intCast(name.len);
+                    @memcpy(out[1..][0..name.len], name);
+                    for ([_]u32{ oid, @bitCast(typmod) }, 0..) |word, part| {
+                        for (0..4) |byte| out[1 + name.len + part * 4 + byte] = @truncate(word >> @intCast(byte * 8));
+                    }
+                    shape.len += length;
+                }
+
+                /// A `record` variable takes the shape of the record it is
+                /// given: a composite type's fields, else f1, f2, ...
+                fn takeShape(self: *Self, index: usize, value: *const V.Cell) Error!void {
+                    if (value.* != .record) return;
+                    const shape = try self.shapeOf(index);
+                    const bytes = value.record.slice();
+                    const oid = V.Records.typeOf(bytes);
+                    if (oid != types.record_oid) if (value_module.compositeLayout(self.host.routineSession(), oid)) |layout| {
+                        if (layout.len > shape.bytes.len) return error.ColumnCapacity;
+                        @memcpy(shape.bytes[0..layout.len], layout);
+                        shape.len = layout.len;
+                        return;
+                    };
+                    var reader = V.Records.Reader.init(bytes);
+                    var item: V.Records.Field = .{};
+                    var digits: [8]u8 = undefined;
+                    while (reader.next(&item)) {
+                        const name = std.fmt.bufPrint(&digits, "f{d}", .{reader.index}) catch return error.ColumnCapacity;
+                        try shapeAppend(shape, name, types.typeOid(item.data_type), item.typmod);
+                    }
+                }
+
+                /// The record a SELECT INTO gives a lone composite or `record`
+                /// target from separate columns: a composite variable's type,
+                /// or the row's own shape for a `record` variable.
+                fn rowRecord(self: *Self, place: Target, capture: *const Capture) Error!V.Cell {
+                    const item = &self.frame.variables.items[place.index];
+                    if (item.typmod > 0) return self.host.compositeOfColumns(item.typmod, capture.cells[0..capture.count], capture.tys[0..capture.count]);
+                    var out: V.Text = .{};
+                    var builder = try V.Records.Builder.begin(&out, types.record_oid);
+                    const shape = try self.shapeOf(place.index);
+                    for (0..capture.count) |column| {
+                        const ty: types.Type = if (capture.tys[column] == .unknown) .text else capture.tys[column];
+                        if (ty == .record) return error.UnsupportedStatement;
+                        try builder.append(types.dataTypeOf(ty), -1, &capture.cells[column]);
+                        try shapeAppend(shape, capture.names[column].slice(), types.typeOid(types.dataTypeOf(ty)), -1);
+                    }
+                    return .{ .record = out };
+                }
+
                 /// Stores a value already converted to the target's type.
                 fn store(self: *Self, place: Target, value: V.Cell, initializing: bool) Error!void {
                     _ = initializing;
+                    if (place.field) |field| return self.storeField(place, field, value);
+                    if (place.record == 0 and place.ty == .record and place.typmod <= 0) {
+                        // A `record` variable takes any row and its shape.
+                        try self.takeShape(place.index, &value);
+                        self.frame.cells[place.index] = value;
+                        return;
+                    }
                     const column = columnOf(place.ty, place.typmod);
                     const stored = try D.store(&column, value, self.host.routineSession());
                     switch (place.record) {
@@ -2273,11 +2390,42 @@ pub fn Routines(comptime config: types.Config) type {
                     }
                 }
 
+                /// `variable.field := value`: the record with that field
+                /// replaced (a NULL composite variable becomes a row of NULLs;
+                /// an unassigned `record` variable is 55000).
+                fn storeField(self: *Self, place: Target, field: usize, value: V.Cell) Error!void {
+                    const column = columnOf(place.ty, place.typmod);
+                    const stored = try D.store(&column, value, self.host.routineSession());
+                    const item = &self.frame.variables.items[place.index];
+                    var current = self.frame.cells[place.index];
+                    if (current == .null_value) {
+                        if (item.typmod <= 0) return error.ObjectNotInPrerequisiteState;
+                        const layout = value_module.compositeLayout(self.host.routineSession(), @intCast(item.typmod)) orelse return error.UndefinedObject;
+                        var out: V.Text = .{};
+                        var builder = try V.Records.Builder.begin(&out, @intCast(item.typmod));
+                        var fields: catalog_objects.CompositeFields = .{ .bytes = layout };
+                        const nothing: V.Cell = .null_value;
+                        while (fields.next()) |entry| try builder.append(types.typeFromOid(entry.oid) orelse return error.UnsupportedStatement, entry.typmod, &nothing);
+                        current = .{ .record = out };
+                    }
+                    if (current != .record) return error.TypeMismatch;
+                    var out: V.Text = .{};
+                    try V.Records.withField(current.record.slice(), field, &stored, &out);
+                    self.frame.cells[place.index] = .{ .record = out };
+                }
+
                 /// Converts a value of type `from` to the target (assignment;
                 /// without an assignment cast PL/pgSQL converts through the
                 /// types' text forms, as exec_cast_value's I/O coercion).
                 fn storeCast(self: *Self, place: Target, value: V.Cell, from: types.Type) Error!void {
                     var cell = value;
+                    // A record into a composite variable takes its type
+                    // (its fields must match; composite lane).
+                    if (place.ty == .record and place.field == null) {
+                        if (cell == .record and place.typmod > 0) cell = try E.cast(cell, .record, .record, place.typmod, self.host.routineSession());
+                        if (cell != .null_value and cell != .record) return error.TypeMismatch;
+                        return self.store(place, cell, false);
+                    }
                     if (cell != .null_value and from != place.ty and from != .unknown) {
                         const session = self.host.routineSession();
                         if (value_module.castable(from, place.ty, .assignment) or (value_module.integral(from) and value_module.integral(place.ty))) {
@@ -3029,6 +3177,15 @@ pub fn Routines(comptime config: types.Config) type {
                     if (into_start != null) {
                         if (strict and capture.rows == 0) return error.NoDataFound;
                         if (strict and capture.rows > 1) return error.TooManyRows;
+                        const lone = targets[0];
+                        if (target_count == 1 and lone.record == 0 and lone.field == null and lone.ty == .record and !(capture.count == 1 and capture.tys[0] == .record)) {
+                            const row = if (capture.rows == 0) V.Cell.null_value else try self.rowRecord(lone, &capture);
+                            // A record variable keeps the row's own shape.
+                            if (lone.typmod <= 0) {
+                                self.frame.cells[lone.index] = row;
+                            } else try self.storeCast(lone, row, .record);
+                            return .normal;
+                        }
                         if (capture.count != target_count and !(capture.rows == 0)) return error.Syntax;
                         for (targets[0..target_count], 0..) |place, index| {
                             const value: V.Cell = if (capture.rows == 0 or index >= capture.count) .null_value else capture.cells[index];

@@ -234,6 +234,10 @@ pub const Config = struct {
     /// PL/pgSQL variables per routine frame (parameters, DECLAREd
     /// variables, FOUND, loop variables, TG_*); more are ColumnCapacity.
     routine_variables: usize = 24,
+    /// Row shapes (field names and types) of PL/pgSQL `record` variables
+    /// one routine frame holds at once (B11 wave 5, composite lane); more
+    /// are ColumnCapacity (54000).
+    routine_records: usize = 4,
     /// SQL/JSON path (B11 json-agg lane): parsed nodes of one jsonpath
     /// (more is StatementTooComplex, 54001) and the items one evaluation
     /// holds at once for predicate operands and subscripts (more is

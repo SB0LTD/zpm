@@ -218,6 +218,17 @@ pub fn Records(comptime V: type) type {
             return null;
         }
 
+        /// The record with field `index` replaced by `cell` (of the field's
+        /// data type), into `out`.
+        pub fn withField(bytes: []const u8, index: usize, cell: *const Cell, out: *Text) Error!void {
+            var builder = try Builder.begin(out, typeOid(bytes));
+            var reader = Reader.init(bytes);
+            var item: Field = .{};
+            while (reader.next(&item)) {
+                try builder.append(item.data_type, item.typmod, if (reader.index == index + 1) cell else &item.cell);
+            }
+        }
+
         /// The same fields under another composite type OID.
         pub fn retyped(bytes: []const u8, type_oid: u32) Text {
             var out = Text.fromValueBytes(bytes);

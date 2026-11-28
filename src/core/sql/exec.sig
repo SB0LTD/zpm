@@ -1393,11 +1393,13 @@ pub fn Exec(comptime config: types.Config) type {
                     longest = @max(longest, chains[index].length);
                 }
                 var cursors: [types.projectionColumns(config)]u32 = undefined;
-                var current: [types.projectionColumns(config)]V.Cell = undefined;
                 var slots: [types.projectionColumns(config)]E.SetValue = undefined;
+                // The current values live in workspace cells (wide cells stay
+                // off the stack).
+                const current = try self.cells(count);
                 for (0..count) |index| {
                     cursors[index] = chains[index].head;
-                    slots[index] = .{ .node = p.set_calls[index], .value = &current[index] };
+                    slots[index] = .{ .node = p.set_calls[index], .value = &self.work.cells[current + index] };
                 }
                 var inner = ctx.*;
                 inner.set_values = slots[0..count];
@@ -1406,10 +1408,10 @@ pub fn Exec(comptime config: types.Config) type {
                     try self.session.checkpoint();
                     for (0..count) |index| {
                         if (cursors[index] == no_cell) {
-                            current[index] = .null_value;
+                            self.work.cells[current + index] = .null_value;
                             continue;
                         }
-                        current[index] = self.work.cells[cursors[index]];
+                        self.work.cells[current + index] = self.work.cells[cursors[index]];
                         const next = self.work.cells[cursors[index] + 1].integer;
                         cursors[index] = if (next < 0) no_cell else @intCast(next);
                     }
