@@ -214,6 +214,9 @@ pub const Control = union(enum) {
     reset: ?ControlText,
     /// SET SESSION CHARACTERISTICS AS TRANSACTION (default_transaction_*).
     set_session_characteristics: Characteristics,
+    /// COMMIT / ROLLBACK AND CHAIN (T261, B11 wave 5).
+    commit_chain: void,
+    rollback_chain: void,
 };
 
 pub const StatementOptions = struct {
@@ -998,6 +1001,13 @@ pub fn Database(comptime config: Config) type {
             security_start: usize = 0,
             security_len: usize = 0,
             security_table: usize = 0,
+            /// WITH CHECK OPTION conditions of the views an INSERT / UPDATE
+            /// writes through (B11 wave 5), rewritten over the base table
+            /// `view_check_table` (relation named `view_check_alias`).
+            view_checks: [config.tables]u16 = undefined,
+            view_check_count: usize = 0,
+            view_check_table: usize = 0,
+            view_check_alias: ?ast.Ident = null,
             /// Bytes of `expansion` the running statement uses (a nested
             /// statement saves and restores them, B11 wave 4).
             expansion_used: usize = 0,
@@ -1547,7 +1557,7 @@ pub fn Database(comptime config: Config) type {
                 // Describe only needs the static relation schema.
                 if (!describe_only) for (self.workspace.plans.items[0..self.workspace.plans.len]) |*block| {
                     for (block.sources[0..block.source_count]) |*item| {
-                        if (item.view == .pg_settings or item.sequence != null) return error.UnsupportedStatement;
+                        if (item.view == .pg_settings or item.view == .pg_cursors or item.sequence != null) return error.UnsupportedStatement;
                     }
                 };
                 // Metadata-only Describe does not call evaluation hooks.
@@ -2135,6 +2145,9 @@ pub fn Database(comptime config: Config) type {
         family_returning: CommandTag = .none,
         /// ON CONFLICT DO UPDATE of a routed partition row is running.
         conflict_routed: bool = false,
+        /// DECLARE CURSOR of a simple single-table query (B11 wave 5): where
+        /// the scan leaves each output row's rowid (WHERE CURRENT OF).
+        cursor_capture: ?*CursorCapture = null,
 
         /// Borrow the embedding's cluster catalogue while serving statements.
         /// The embedding keeps the provider and its rows consistent for the
@@ -2593,6 +2606,7 @@ pub fn Database(comptime config: Config) type {
             self.family_root = null;
             self.family_returning = .none;
             self.conflict_routed = false;
+            self.cursor_capture = null;
             self.rule_active_len = 0;
             self.nested_tables = @splat(0);
             self.scan_tables = @splat(0);
@@ -3282,6 +3296,16 @@ pub fn Database(comptime config: Config) type {
                 return legacy(options.mode, err);
             };
             const parsed = &top.command;
+            // `catalog.schema.name` names only the session's database
+            // (F651, B11 wave 5): another is PostgreSQL's 0A000.
+            if (!routine) for (self.workspace.nodes.catalog_refs[0..self.workspace.nodes.catalog_ref_len]) |ident| {
+                var name: ControlText = .{};
+                decodeIdent(source, ident, &name) catch {};
+                if (!std.mem.eql(u8, name.bytes[0..name.len], self.session.database)) {
+                    if (options.@"resume") self.dropStatement(slot);
+                    return error.UnsupportedStatement;
+                }
+            };
             var snap: Snapshot = undefined;
             if (options.@"resume") {
                 const pinned = tx.pin orelse return error.QueryCanceled;
@@ -3403,6 +3427,10 @@ pub fn Database(comptime config: Config) type {
             }
             try self.serializableSnapshot(slot);
             self.workspace.security_check = ast.none;
+            // View check options belong to this statement only: a later
+            // write that does not come through body() (COPY) checks none.
+            self.workspace.view_check_count = 0;
+            defer self.workspace.view_check_count = 0;
             // Catalog objects (B11 wave 3); a READ ONLY transaction writes none (25006).
             if (parsed.* == .catalog_object) {
                 if (self.txs[slot].read_only) return error.ReadOnlyTransaction;
@@ -3455,6 +3483,7 @@ pub fn Database(comptime config: Config) type {
             if (parsed.* == .select and self.routine_frame == null and self.active_params == null) context.user_type_catalog = &self.catalog_objects;
             var bound: B.Bound = undefined;
             try B.bindInto(&context, &statement_copy, &bound);
+            if (self.workspace.view_check_count != 0) try self.bindViewChecks(&context, &bound);
             if (self.txs[slot].read_only and (explain == null or explain.?.analyze)) try readOnlyCheck(&bound, &self.workspace.plans);
             if (view_owner) |owner| {
                 // The view's owner needs the privileges on the base relation.
@@ -3826,7 +3855,42 @@ pub fn Database(comptime config: Config) type {
             if (select.table) |table| try self.lockTable(slot, table, if (select.lock.strength == .none) .access_share else .row_share);
         }
 
+        /// Output rows' rowids of a DECLARE CURSOR scan (B11 wave 5).
+        const CursorCapture = struct { rowids: []u64, count: usize = 0, table: ?usize = null };
+
+        /// A row locker that also records the scan's output rows.
+        fn Capturing(comptime Inner: type) type {
+            return struct {
+                inner: Inner,
+                db: *Self,
+                into: *CursorCapture,
+                pub const active = Inner.active;
+                pub fn lock(self: @This(), table_index: usize, version: u32) Error!?u32 {
+                    return self.inner.lock(table_index, version);
+                }
+                pub fn capture(self: @This(), table_index: usize, versions: []const u32) Error!void {
+                    if (versions.len > self.into.rowids.len) return error.SessionCapacity;
+                    const table = &self.db.tables[table_index];
+                    for (versions, 0..) |version, index| self.into.rowids[index] = table.rows[table.versions[version].rowSlot()].rowid;
+                    self.into.count = versions.len;
+                    self.into.table = table_index;
+                }
+            };
+        }
+
         fn runBoundSelect(self: *Self, slot: u16, source: []const u8, select: *const B.Select, snap: Snapshot, output: anytype) Error!void {
+            if (self.cursor_capture) |into| if (comptime @TypeOf(output) == *Result) {
+                self.cursor_capture = null;
+                if (select.lock.strength == .none) return self.executeBoundSelect(slot, source, select, snap, Capturing(X.NoLock){ .inner = .{}, .db = self, .into = into }, output);
+                const capture_mode: locks_module.RowMode = switch (select.lock.strength) {
+                    .update, .none => .update,
+                    .no_key_update => .no_key_update,
+                    .share => .share,
+                    .key_share => .key_share,
+                };
+                const inner: RowLocker = .{ .db = self, .slot = slot, .snap = snap, .mode = capture_mode, .wait = select.lock.wait };
+                return self.executeBoundSelect(slot, source, select, snap, Capturing(RowLocker){ .inner = inner, .db = self, .into = into }, output);
+            };
             if (select.lock.strength == .none) return self.executeBoundSelect(slot, source, select, snap, X.NoLock{}, output);
             const row_mode: locks_module.RowMode = switch (select.lock.strength) {
                 .update, .none => .update,
@@ -6786,6 +6850,34 @@ pub fn Database(comptime config: Config) type {
             if (verdict != .boolean or !verdict.boolean) return error.InsufficientPrivilege;
         }
 
+        /// Binds the collected WITH CHECK OPTION conditions over the bound
+        /// INSERT / UPDATE target (B11 wave 5); other statements check none.
+        fn bindViewChecks(self: *Self, context: *const B.Context, bound: *const B.Bound) Error!void {
+            const table_slot = switch (bound.*) {
+                .insert => |*insert| insert.table,
+                .update => |*update| update.table,
+                else => {
+                    self.workspace.view_check_count = 0;
+                    return;
+                },
+            };
+            self.workspace.view_check_table = table_slot;
+            for (self.workspace.view_checks[0..self.workspace.view_check_count]) |*check| check.* = try B.bindViewCheck(context, check.*, table_slot, self.workspace.view_check_alias);
+        }
+
+        /// A new row written through views with WITH CHECK OPTION must make
+        /// every collected condition TRUE (44000 for FALSE or NULL, as
+        /// PostgreSQL's ExecWithCheckOptions), after its constraints.
+        fn viewChecks(self: *Self, ctx: *const E.Context, table_slot: usize, cells: *const E.Row) Error!void {
+            if (self.workspace.view_check_count == 0 or table_slot != self.workspace.view_check_table) return;
+            var sub = ctx.*;
+            sub.row = cells;
+            for (self.workspace.view_checks[0..self.workspace.view_check_count]) |id| {
+                const verdict = try E.eval(&sub, id);
+                if (verdict != .boolean or !verdict.boolean) return error.WithCheckOptionViolation;
+            }
+        }
+
         /// With row_security disabled, access requiring any policy errors,
         /// including the default-deny case. Owners and bypass roles still
         /// use the ordinary catalog eligibility check.
@@ -7974,6 +8066,7 @@ pub fn Database(comptime config: Config) type {
         fn viewRows(ptr: *anyopaque, view: catalog_module.View, sink: *X.RowSink) Error!void {
             const self: *Self = @ptrCast(@alignCast(ptr));
             if (view == .pg_settings) return settingRows(self.sessionState(), sink);
+            if (view == .pg_cursors) return self.cursorRows(sink);
             return self.fillViewRows(&self.session,self.seq_snap,&self.workspace.nodes,view,sink);
         }
 
@@ -8259,7 +8352,7 @@ pub fn Database(comptime config: Config) type {
 
         fn fillSchemaViewRows(self: *const Self, session_values: *const value_module.Session, snapshot: Snapshot, pool: *A.Pool, view: catalog_module.View, sink: *X.RowSink) Error!void {
             const include_class_acl = view == .pg_class and sink.referencesColumn(catalog_module.pg_class_acl_column);
-            if (view == .pg_settings) return error.UnsupportedStatement;
+            if (view == .pg_settings or view == .pg_cursors) return error.UnsupportedStatement;
             if (view == .sequence_state) return error.UnsupportedStatement;
             // Parameter grants have no persisted objects. Stock tools still
             // discover the typed catalog before exporting global roles.
@@ -10060,9 +10153,11 @@ pub fn Database(comptime config: Config) type {
             var ctx = self.evalContext(source);
             const derived: D.Derived = .{ .defaults = &insert.defaults, .generated = &insert.generated, .checks = &insert.checks };
             var position: usize = 0;
+            var queries: X.StatementQueries = .{};
             if (insert.plan != ast.none) {
                 const work = &self.workspace.query;
                 const rows = try X.queryRows(&self.tables, source, &self.workspace.nodes, &self.workspace.plans, insert.plan, snap, &self.session, work);
+                self.statementQueries(&queries, source, snap, false, &ctx);
                 for (0..rows.count) |index| {
                     if (position >= done) {
                         ctx.tuple[1] = X.rowAt(work, rows, index);
@@ -10071,8 +10166,10 @@ pub fn Database(comptime config: Config) type {
                     position += 1;
                 }
             } else if (insert.rows == ast.none) {
+                self.statementQueries(&queries, source, snap, true, &ctx);
                 if (done == 0) try self.insertProgress(slot, &ctx, insert, &insert.values, derived, snap, 0);
             } else {
+                self.statementQueries(&queries, source, snap, true, &ctx);
                 const nodes = &self.workspace.nodes.nodes;
                 var row = insert.rows;
                 while (row != ast.none) : (row = nodes[row].next) {
@@ -10314,6 +10411,7 @@ pub fn Database(comptime config: Config) type {
             if (try self.uniqueTaken(slot, table_index, &cells, 0xffffffff, null, snap)) |_| return error.PrimaryKeyViolation;
             try self.exclusionTaken(slot, table_index, &cells, 0xffffffff, null, snap);
             try self.checkReferences(slot, table_index, &cells, null, snap);
+            try self.viewChecks(ctx, table_index, &cells);
             try self.appendRow(slot, table_index, &cells, snap);
             if (auto) |column| {
                 const tx = &self.txs[slot];
@@ -11541,6 +11639,36 @@ pub fn Database(comptime config: Config) type {
             return .{ .list = list, .offsets = offsets };
         }
 
+        /// WHERE CURRENT OF (E121-06, E121-07, B11 wave 5): the row slot of
+        /// the named cursor's current row in `table_index` (null when that
+        /// row is gone). PostgreSQL's errors: 34000 for no such cursor;
+        /// 24000 for one held from a previous transaction, one that is not a
+        /// simply updatable scan of the table, or one not on a row.
+        fn currentOfRow(self: *Self, source: []const u8, ident: ast.Ident, table_index: usize) Error!?u32 {
+            const state = self.sessionState();
+            var name: ControlText = .{};
+            try decodeIdent(source, ident, &name);
+            const index = self.cursors.find(state.id, name.slice()) orelse return error.PortalNotFound;
+            const cursor = &self.cursors.slots[index];
+            if (cursor.committed) return error.InvalidCursorState;
+            if (cursor.table == null or cursor.table_oid != self.tables[table_index].oid) return error.InvalidCursorState;
+            if (cursor.position == 0 or cursor.position > cursor.count) return error.InvalidCursorState;
+            return S.findRow(&self.tables[table_index], self.cursors.rowids[cursor.base + cursor.position - 1]);
+        }
+
+        /// Subqueries in the statement's own WHERE / SET / VALUES (B11 wave
+        /// 5, docs/SQL_DDL_DML.md): installed only when the bound statement
+        /// has one. `fresh` starts the query workspace; UPDATE FROM / DELETE
+        /// USING and INSERT ... SELECT rows already in it are kept.
+        fn statementQueries(self: *Self, queries: *X.StatementQueries, source: []const u8, snap: Snapshot, fresh: bool, ctx: *E.Context) void {
+            const pool = &self.workspace.nodes;
+            const any = for (pool.nodes[0..pool.len]) |*n| {
+                if (n.kind == .scalar_subquery or n.kind == .exists_subquery or n.kind == .in_subquery) break true;
+            } else false;
+            if (!any) return;
+            queries.install(&self.tables, source, pool, &self.workspace.plans, snap, &self.session, &self.workspace.query, fresh, ctx);
+        }
+
         /// WHERE over the target row and, with FROM/USING, the first joined
         /// source row that satisfies it (PostgreSQL updates or deletes a
         /// target row once, with one arbitrary matching source row). The
@@ -11565,6 +11693,12 @@ pub fn Database(comptime config: Config) type {
             var row_scratch: S.VersionRowScratch = undefined;
             var affected: usize = 0;
             const joined = try self.joinedRows(source, update.from, &update.offsets, snap);
+            var queries: X.StatementQueries = .{};
+            self.statementQueries(&queries, source, snap, joined == null, &ctx);
+            if (update.current_of) |cursor| {
+                const row = (try self.currentOfRow(source, cursor, update.table)) orelse return 0;
+                return self.updateSlot(slot, &ctx, &row_scratch, update, row, snap, joined);
+            }
             switch (try X.candidates(&ctx, table, update.key, snap)) {
                 .empty => {},
                 .slot => |hit| affected += try self.updateSlot(slot, &ctx, &row_scratch, update, hit.row, snap, joined),
@@ -11663,6 +11797,7 @@ pub fn Database(comptime config: Config) type {
             // A referential action of this statement may have replaced it.
             if (table.versions[old].hasDeletion()) return true;
             _ = tx;
+            try self.viewChecks(ctx, update.table, &cells);
             try self.placeUpdate(slot, update.table, row, old, &cells, snap);
             if (mysqlAutoColumn(table)) |column| {
                 if (update.values[column] != ast.none) try self.mysqlSetCounter(slot,
@@ -11677,6 +11812,12 @@ pub fn Database(comptime config: Config) type {
             var row_scratch: S.VersionRowScratch = undefined;
             var affected: usize = 0;
             const joined = try self.joinedRows(source, delete.using, &delete.offsets, snap);
+            var queries: X.StatementQueries = .{};
+            self.statementQueries(&queries, source, snap, joined == null, &ctx);
+            if (delete.current_of) |cursor| {
+                const row = (try self.currentOfRow(source, cursor, delete.table)) orelse return 0;
+                return self.deleteSlot(slot, &ctx, &row_scratch, delete, row, snap, joined);
+            }
             switch (try X.candidates(&ctx, table, delete.key, snap)) {
                 .empty => {},
                 .slot => |hit| affected += try self.deleteSlot(slot, &ctx, &row_scratch, delete, hit.row, snap, joined),
@@ -12058,6 +12199,18 @@ pub fn Database(comptime config: Config) type {
                 try writer.append(&cell);
             }
             return .{ .array = out };
+        }
+
+        /// pg_cursors (E121-08, B11 wave 5): this session's open cursors.
+        /// is_scrollable follows the declaration (NO SCROLL is false).
+        fn cursorRows(self: *Self, sink: *X.RowSink) Error!void {
+            const state = self.sessionState();
+            for (&self.cursors.slots) |*cursor| {
+                if (!cursor.used or cursor.session != state.id) continue;
+                const declared = self.cursors.value_backing[cursor.value_base + cursor.statement_offset ..][0..cursor.statement_len];
+                try sink.add(&.{ try objectTextCell(cursor.name.slice()), try definitionCell(declared, sink), boolCell(cursor.hold), boolCell(false),
+                    boolCell(cursor.scroll), if (cursor.created_us) |us| Cell{ .timestamptz = us } else .null_value });
+            }
         }
 
         fn settingRows(state: *const Sess.State, sink: *X.RowSink) Error!void {
@@ -12583,6 +12736,24 @@ pub fn Database(comptime config: Config) type {
             return self.applyModes(slot, modes, false);
         }
 
+        /// The characteristics COMMIT / ROLLBACK AND CHAIN carries into the
+        /// next transaction (T261): the ending transaction's isolation level,
+        /// READ ONLY and DEFERRABLE. A transaction that failed outside any
+        /// savepoint has had its transaction settings undone, as
+        /// PostgreSQL's abort does: the next one takes the session defaults
+        /// (null).
+        pub fn chainCharacteristics(self: *const Self, slot: u16, failed: bool) ?ast.Characteristics {
+            const tx = &self.txs[slot];
+            if (failed and tx.userSavepoints() == 0) return null;
+            const isolation: ast.Isolation = switch (tx.isolation) {
+                .read_committed => .read_committed,
+                .repeatable_read => .repeatable_read,
+                .serializable => .serializable,
+                .read_uncommitted => .read_uncommitted,
+            };
+            return .{ .isolation = isolation, .read_only = tx.read_only, .deferrable = tx.deferrable };
+        }
+
         /// SET SESSION CHARACTERISTICS AS TRANSACTION (default_transaction_*).
         pub fn sessionCharacteristics(self: *Self, slot: ?u16, modes: ast.Characteristics) Error!void {
             return self.setCharacteristics(slot, modes);
@@ -12664,7 +12835,7 @@ pub fn Database(comptime config: Config) type {
                     if (self.statement_implicit) return error.UnsupportedStatement;
                     self.outcome = .{ .command = .begin };
                 },
-                .commit, .rollback, .prepared_transaction, .savepoint, .release, .rollback_to => return error.UnsupportedStatement,
+                .commit, .rollback, .prepared_transaction, .savepoint, .release, .rollback_to, .commit_chain, .rollback_chain => return error.UnsupportedStatement,
                 .set => |set| {
                     var name: ControlText = .{};
                     try settingName(source, set.name, &name);
@@ -12868,8 +13039,20 @@ pub fn Database(comptime config: Config) type {
             };
             // PostgreSQL: FOR UPDATE/SHARE cursors cannot be SCROLL or WITH HOLD.
             if (locking and ((declare.scroll orelse false) or declare.hold)) return error.UnsupportedStatement;
+            // A simple single-table query keeps its rows' rowids for WHERE
+            // CURRENT OF (B11 wave 5). Without FOR UPDATE / SHARE, as
+            // PostgreSQL's plan search, a sorted scan is not simply
+            // updatable.
+            var capture: CursorCapture = .{ .rowids = self.cursors.rowids[self.cursors.used_rows..] };
+            const updatable = switch (inner) {
+                .select => |query| locking or self.workspace.nodes.queries[query].order_count == 0,
+                else => false,
+            };
+            if (updatable) self.cursor_capture = &capture;
+            defer self.cursor_capture = null;
             try self.body(slot, inner_source, &inner, snap, result, .{ .mode = mode });
             const rows = result.row_count;
+            if (capture.table != null and capture.count != rows) capture.table = null;
             if (rows > Sess.cursor_row_capacity - self.cursors.used_rows) return error.SessionCapacity;
             const columns = result.column_count;
             var values: types.ValueBytes = .{ .bytes = &self.cursors.value_backing, .used = self.cursors.value_used };
@@ -12886,6 +13069,9 @@ pub fn Database(comptime config: Config) type {
                     }
                 }
             }
+            // pg_cursors' statement text (E121-08) shares the value bytes.
+            const statement_offset = values.used - value_base;
+            _ = values.copy(source) catch return error.SessionCapacity;
             const cursor = &self.cursors.slots[index];
             cursor.* = .{ .used = true, .session = state.id, .hold = declare.hold, .scroll = declare.scroll orelse true, .epoch = tx.epoch, .slot = slot, .depth = tx.userSavepoints(), .column_count = columns, .base = self.cursors.used_rows, .count = rows, .value_base = value_base, .value_len = values.used - value_base };
             @memcpy(cursor.name.bytes[0..name.len], name.slice());
@@ -12895,6 +13081,13 @@ pub fn Database(comptime config: Config) type {
             @memcpy(cursor.typmods[0..columns], result.column_typmods[0..columns]);
             cursor.has_nominal_types = result.has_nominal_types;
             if (result.has_nominal_types) @memcpy(cursor.nominal_types[0..columns], result.nominal_types[0..columns]);
+            if (capture.table) |table| {
+                cursor.table = table;
+                cursor.table_oid = self.tables[table].oid;
+            }
+            cursor.statement_offset = statement_offset;
+            cursor.statement_len = source.len;
+            cursor.created_us = self.session.statement_us orelse if (self.session.clock) |clock| clock() else null;
             self.cursors.used_rows += rows;
             self.cursors.value_used = values.used;
             result.clear(0);
@@ -16128,6 +16321,10 @@ pub fn Database(comptime config: Config) type {
             };
             var view = first_view;
             var depth: usize = 0;
+            // WITH CHECK OPTION (F311-04, F751): a view's own condition when
+            // it has the option, and every view's below a CASCADED one.
+            var cascade = false;
+            self.workspace.view_check_count = 0;
             while (true) : (depth += 1) {
                 if (depth == config.tables) return error.StackDepthExceeded;
                 // Every view on the way to the base relation is restricted.
@@ -16204,6 +16401,18 @@ pub fn Database(comptime config: Config) type {
                         delete.only = delete.only or shape.item.only;
                     },
                     else => return error.UnsupportedStatement,
+                }
+                if (event != tg.tg_delete) {
+                    // Conditions of the views above read this view's columns.
+                    for (self.workspace.view_checks[0..self.workspace.view_check_count]) |check| try self.substituteView(current, view, &shape, names[0..name_count], check);
+                    const option = self.tables[view].check_option;
+                    if ((option != 0 or cascade) and shape.where != ast.none) {
+                        if (self.workspace.view_check_count == config.tables) return error.StackDepthExceeded;
+                        self.workspace.view_checks[self.workspace.view_check_count] = try copyTree(&self.workspace.nodes, shape.where);
+                        self.workspace.view_check_count += 1;
+                    }
+                    if (option == 2) cascade = true;
+                    self.workspace.view_check_alias = shape.item.alias;
                 }
                 const base = try self.viewBase(text.bytes[0..text.len], &shape.item);
                 if (self.tables[base].relkind != 'v') break;
@@ -16826,13 +17035,51 @@ pub fn Database(comptime config: Config) type {
                     lexer.decodeQuoted(source, value.quoted, &out.bytes);
                     out.len = value.quoted.len;
                 },
+                .interval => try zoneIntervalHours(source, value, out),
             }
             return switch (value.kind) {
                 .default => .default,
                 .word => .word,
                 .string => .string,
-                .number => .number,
+                .number, .interval => .number,
             };
+        }
+
+        /// SET TIME ZONE INTERVAL 'text' [fields] (F761, B11 wave 5): the
+        /// offset in hours east as decimal text, the form the numeric zone
+        /// setting reads. A bare number counts in the qualifier's last
+        /// field; finer fields are dropped. Months or days are 22023, as in
+        /// PostgreSQL (invalid interval value for time zone).
+        fn zoneIntervalHours(source: []const u8, value: ast.SettingValue, out: *ControlText) Error!void {
+            var text: [64]u8 = undefined;
+            if (value.quoted.len > text.len) return error.InvalidParameterValue;
+            lexer.decodeQuoted(source, value.quoted, &text);
+            const raw = std.mem.trim(u8, text[0..value.quoted.len], " \t");
+            const unit_us: i64 = switch (value.interval_field) {
+                .none, .second => 1_000_000,
+                .minute => 60_000_000,
+                .hour => 3_600_000_000,
+                .day, .month, .year => return error.InvalidParameterValue,
+            };
+            var us: i64 = 0;
+            const bare = raw.len != 0 and for (raw, 0..) |byte, index| {
+                if (!(types.digit(byte) or ((byte == '+' or byte == '-') and index == 0))) break false;
+            } else true;
+            if (bare) {
+                const number = std.fmt.parseInt(i64, raw, 10) catch return error.InvalidParameterValue;
+                us = std.math.mul(i64, number, unit_us) catch return error.InvalidParameterValue;
+            } else {
+                const interval = try temporal_module.parseInterval(raw);
+                if (interval.months != 0 or interval.days != 0) return error.InvalidParameterValue;
+                us = interval.us;
+                // The qualifier drops fields below its last one.
+                if (value.interval_field == .minute or value.interval_field == .hour) us -= @rem(us, unit_us);
+            }
+            const seconds = @divTrunc(us, 1_000_000);
+            const negative = seconds < 0;
+            const magnitude: u64 = @abs(seconds);
+            const written = std.fmt.bufPrint(&out.bytes, "{s}{d}.{d:0>6}", .{ if (negative) "-" else "", magnitude / 3600, (magnitude % 3600) * 1_000_000 / 3600 }) catch return error.InvalidParameterValue;
+            out.len = written.len;
         }
 
         /// Lexer-based scheduling hint, including nested comments/whitespace.
@@ -16872,6 +17119,8 @@ pub fn Database(comptime config: Config) type {
                 .begin => |modes| out = .{ .begin = modes },
                 .commit => out = .commit,
                 .rollback => out = .rollback,
+                .commit_chain => out = .commit_chain,
+                .rollback_chain => out = .rollback_chain,
                 .prepared_transaction => |prepared| {
                     var gid: ?two_phase.Gid = null;
                     if (prepared.gid.len <= 199) {

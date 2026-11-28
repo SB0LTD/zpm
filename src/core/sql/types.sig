@@ -567,6 +567,10 @@ pub const Error = error{
     /// SQLSTATE 2200F: an empty string where one is not allowed
     /// (array_to_tsvector lexemes; wave 4 text-json).
     ZeroLengthCharacterString,
+    /// SQLSTATE 24000: WHERE CURRENT OF names a cursor that is not on a
+    /// row, not a simply updatable scan of the table, or held from a
+    /// previous transaction (B11 wave 5).
+    InvalidCursorState,
 };
 
 /// Caller-owned execution accounting and interrupt polling. This is independent

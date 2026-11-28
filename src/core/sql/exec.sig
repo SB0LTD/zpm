@@ -5358,7 +5358,8 @@ pub fn Exec(comptime config: types.Config) type {
                         if (n.func == .array_subquery) return self.arrayFromSubquery(list, p.tys[0]);
                         if (list.count > 1) return error.CardinalityViolation;
                         if (list.count == 0) return .null_value;
-                        return self.row(self.handles(list)[0])[0];
+                        // A row comparison's field reads its own column (F641).
+                        return self.row(self.handles(list)[0])[n.column];
                     },
                     .exists_subquery => return .{ .boolean = list.count != 0 },
                     .in_subquery => {
@@ -5410,6 +5411,32 @@ pub fn Exec(comptime config: types.Config) type {
             }
             result.row_count = list.count;
         }
+        /// Subqueries in a data-modifying statement's own expressions
+        /// (WHERE, SET, VALUES, RETURNING; B11 wave 5): one runner for the
+        /// statement under its snapshot. Uncorrelated results are computed
+        /// once and cached for the statement, correlated ones per row. Rows
+        /// the statement writes carry its command id and stay invisible to
+        /// them, as PostgreSQL's statement snapshot does. `fresh` starts the
+        /// workspace; otherwise rows already in it (UPDATE FROM / DELETE
+        /// USING sources) stay below the runner's scratch.
+        pub const StatementQueries = struct {
+            runner: Query = undefined,
+            active: value_module.Session = undefined,
+
+            pub fn install(self: *StatementQueries, tables: *const [config.tables]S.Table, source: []const u8, pool: *const Ast.Pool, plans: *const B.Plans, snap: storage.Snapshot, session: *const value_module.Session, work: *Work, fresh: bool, ctx: *E.Context) void {
+                if (fresh) {
+                    work.reset();
+                    self.active = work.setupValues(session);
+                } else {
+                    self.active = session.*;
+                    self.active.value_bytes = &work.values;
+                }
+                self.runner = .{ .tables = tables, .source = source, .pool = pool, .plans = plans, .snap = snap, .session = &self.active, .work = work };
+                self.runner.hook = .{ .ptr = &self.runner, .run = Query.subquery };
+                ctx.hook = &self.runner.hook;
+            }
+        };
+
         /// Runs a bound general query and leaves its output rows in `work`
         /// (INSERT ... SELECT); read them with rowAt until the next reset.
         pub fn queryRows(tables: *const [config.tables]S.Table, source: []const u8, pool: *const Ast.Pool, plans: *const B.Plans, root: u16, snap: storage.Snapshot, session: *const value_module.Session, work: *Work) Error!List {
@@ -6018,6 +6045,9 @@ pub fn Exec(comptime config: types.Config) type {
             }
             const rows: usize = if (query.limit < found) @intCast(query.limit) else found;
             if (comptime !observing) if (rows > result.rows.len) return error.WorkspaceCapacity;
+            // A cursor's DECLARE keeps each output row's source row (B11
+            // wave 5, WHERE CURRENT OF).
+            if (comptime @hasDecl(@TypeOf(locker), "capture")) try locker.capture(table_index, indices[0..rows]);
             if (!plain) {
                 // Validation pass: projections may fail; the result is untouched.
                 for (indices[0..rows]) |version| {

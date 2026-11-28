@@ -343,11 +343,23 @@ pub fn Sessions(comptime config: types.Config) type {
             value_len: usize = 0,
             /// 0 before the first row, 1..count on a row, count+1 after the last.
             position: usize = 0,
+            /// Positioned UPDATE / DELETE (B11 wave 5): the table index a
+            /// simply updatable cursor scans (its rows' rowids are kept in
+            /// Cursors.rowids), or null.
+            table: ?usize = null,
+            table_oid: u32 = 0,
+            /// pg_cursors (E121-08): the DECLARE text, kept in the cursor's
+            /// value bytes at this offset from value_base, and its time.
+            statement_offset: usize = 0,
+            statement_len: usize = 0,
+            created_us: ?i64 = null,
         };
 
         pub const Cursors = struct {
             slots: [config.cursors]Cursor = @splat(.{}),
             rows: [cursor_rows]Row = undefined,
+            /// Source rowid of each row of a simply updatable cursor.
+            rowids: [cursor_rows]u64 = undefined,
             used_rows: usize = 0,
             value_backing: [types.catalogValueBytes(config) / 2]u8 = undefined,
             value_used: usize = 0,
@@ -375,7 +387,10 @@ pub fn Sessions(comptime config: types.Config) type {
                 cursor.* = .{};
                 if (count == 0) return;
                 var at = base;
-                while (at + count < self.used_rows) : (at += 1) self.rows[at] = self.rows[at + count];
+                while (at + count < self.used_rows) : (at += 1) {
+                    self.rows[at] = self.rows[at + count];
+                    self.rowids[at] = self.rowids[at + count];
+                }
                 self.used_rows -= count;
                 if (value_len != 0) {
                     const tail = self.value_backing[value_base + value_len .. self.value_used];

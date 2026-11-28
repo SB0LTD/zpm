@@ -151,10 +151,14 @@ pub fn Binder(comptime config: types.Config) type {
         /// UPDATE ... FROM: `from` is the root plan of `SELECT * FROM items`;
         /// FROM item i (relation i + 1 of WHERE/SET) starts at output
         /// column offsets[i + 1] of each joined row.
-        pub const Update = struct { table: usize, values: [config.columns]u16, where: u16, key: u16, returning: Returning = .{}, defaults: [config.columns]u16 = @splat(none), generated: [config.columns]u16 = @splat(none), checks: [config.table_constraints]u16 = @splat(none), from: u16 = none, offsets: [config.relations]u16 = @splat(0) };
+        pub const Update = struct { table: usize, values: [config.columns]u16, where: u16, key: u16, returning: Returning = .{}, defaults: [config.columns]u16 = @splat(none), generated: [config.columns]u16 = @splat(none), checks: [config.table_constraints]u16 = @splat(none), from: u16 = none, offsets: [config.relations]u16 = @splat(0),
+            /// WHERE CURRENT OF cursor (B11 wave 5), resolved when it runs.
+            current_of: ?ast.Ident = null };
 
         /// DELETE ... USING: like Update.from.
-        pub const Delete = struct { table: usize, where: u16, key: u16, returning: Returning = .{}, using: u16 = none, offsets: [config.relations]u16 = @splat(0) };
+        pub const Delete = struct { table: usize, where: u16, key: u16, returning: Returning = .{}, using: u16 = none, offsets: [config.relations]u16 = @splat(0),
+            /// WHERE CURRENT OF cursor (B11 wave 5), resolved when it runs.
+            current_of: ?ast.Ident = null };
 
         /// Binds an UPDATE FROM / DELETE USING list as `SELECT * FROM items`
         /// and adds every item to the statement scope after the target
@@ -492,6 +496,9 @@ pub fn Binder(comptime config: types.Config) type {
             /// Hidden identity also retained by a catalog column-alias wrapper.
             catalog_oid: u32 = 0,
             catalog_qualified_only: bool = false,
+            /// `JOIN this USING (...) AS alias` (F404): names only the
+            /// join's merged columns.
+            using_alias: ast.Ident = .{},
         };
 
         /// USING column merged from the relations joined before `right`.
@@ -772,8 +779,8 @@ pub fn Binder(comptime config: types.Config) type {
                 .control => |control| switch (control) {
                     .maintenance => |spec| if (spec.operation == .vacuum) .vacuum else .analyze,
                     .begin, .set_transaction => .begin,
-                    .commit => .commit,
-                    .rollback, .rollback_to => .rollback,
+                    .commit, .commit_chain => .commit,
+                    .rollback, .rollback_to, .rollback_chain => .rollback,
                     .prepared_transaction => |prepared| switch (prepared.action) {
                         .prepare => .prepare_transaction,
                         .commit => .commit_prepared,
@@ -4644,8 +4651,33 @@ pub fn Binder(comptime config: types.Config) type {
             row.constant = listConstant(context, row.b);
         }
 
+        /// `row op (SELECT ...)` (F641, B11 wave 5): the subquery's output
+        /// columns become the right row's fields, each a scalar_subquery
+        /// node over the same plan reading its own output column (`column`).
+        /// More than one row is 21000; no row compares as NULLs.
+        fn rowSubquery(context: *const Context, scope: *const Scope, id: u16) Error!u16 {
+            const plans = context.plans orelse return error.UnsupportedStatement;
+            const plan_id = try bindPlan(context, @intCast(context.node(id).integer), scope, scope.ctes, false);
+            var head: u16 = none;
+            var tail: u16 = none;
+            for (0..plans.items[plan_id].count) |column| {
+                if (plans.items[plan_id].tys[column] == .unknown) try castColumn(context, plan_id, column, .text);
+                const plan = &plans.items[plan_id];
+                const field = try context.pool.add(.{ .kind = .scalar_subquery, .integer = plan_id, .column = @intCast(column), .ty = plan.tys[column], .typmod = plan.typmods[column] });
+                if (head == none) head = field else context.node(tail).next = field;
+                tail = field;
+            }
+            return context.pool.add(.{ .kind = .row_constructor, .b = head });
+        }
+
         fn bindRowCompare(context: *const Context, scope: *const Scope, id: u16) Error!void {
             const n = context.node(id);
+            if (context.node(n.a).kind == .row_constructor and context.node(n.b).kind == .scalar_subquery and context.node(n.b).func != .array_subquery) {
+                // Only the ordering and equality operators take a row
+                // subquery; IS DISTINCT FROM reads a one-column one (42601).
+                switch (n.op) { .eq, .ne, .lt, .le, .gt, .ge => {}, else => return error.Syntax }
+                n.b = try rowSubquery(context, scope, n.b);
+            }
             if (context.node(n.a).kind != .row_constructor or context.node(n.b).kind != .row_constructor) return error.UndefinedFunction;
             switch (n.op) { .eq, .ne, .lt, .le, .gt, .ge, .is_distinct, .is_not_distinct => {}, else => return error.UndefinedFunction }
             try bindRowFields(context, scope, n.a);
@@ -6626,6 +6658,15 @@ pub fn Binder(comptime config: types.Config) type {
                     level += 1;
                 }
                 if (qualifier) |q| {
+                    // A USING join alias names the join's merged columns
+                    // only (F404): another column is 42703.
+                    for (s.rels[s.rel_first..s.rel_count], s.rel_first..) |*rel, item| {
+                        if (rel.using_alias.len == 0 or !types.same(toName(context, rel.using_alias).slice(), q.slice())) continue;
+                        for (s.using[0..s.using_count]) |*entry| {
+                            if (entry.item == item and types.same(entry.name.slice(), wanted.slice())) return bindUsing(context, scope, n, s, level, entry);
+                        }
+                        return error.ColumnNotFound;
+                    }
                     for (s.rels[s.rel_first..s.rel_count], s.rel_first..) |*rel, index| {
                         if (!types.same(rel.name.slice(), q.slice())) continue;
                         const column = selectableColumn(context, rel, wanted.slice(), true) orelse return error.ColumnNotFound;
@@ -8526,6 +8567,7 @@ pub fn Binder(comptime config: types.Config) type {
                     if (plans.items[rel.plan].correlated) plans.items[id].correlated = true;
                 }
                 if (item.column_aliases != none) try applyColumnAliases(context, item, &rel, &source);
+                if (item.using_alias) |alias| rel.using_alias = alias;
                 scope.rels[index] = rel;
                 scope.rel_count = index + 1;
                 plans.items[id].sources[index] = source;
@@ -9640,6 +9682,7 @@ pub fn Binder(comptime config: types.Config) type {
                         out.values[column] = try assignment(context, item.value, &entry.columns[column]);
                     }
                     out.where = try bindWhere(context, &scope, update.where);
+                    out.current_of = update.current_of;
                     // The key probe reads relation 0 only: no probe with FROM.
                     out.key = if (out.from != none) none else primaryKey(context, entry, out.where);
                     const needed = assignedDefaults(context, &out.values);
@@ -9660,6 +9703,7 @@ pub fn Binder(comptime config: types.Config) type {
                     var out: Delete = .{ .table = index, .where = none, .key = none };
                     if (delete.using != none) try bindSources(context, delete.using, &scope, &out.using, &out.offsets);
                     out.where = try bindWhere(context, &scope, delete.where);
+                    out.current_of = delete.current_of;
                     if (delete.returning.output and out.using != none) return error.UnsupportedStatement;
                     out.returning = try bindReturning(context, index, &delete.returning, if (family) delete.alias orelse delete.table else delete.alias, .delete);
                     if (out.using == none) out.key = primaryKey(context, &context.tables[index], out.where);
@@ -11000,6 +11044,8 @@ pub fn Binder(comptime config: types.Config) type {
                 out.columns[index] = column;
             }
             const text = create.text.slice(context.source);
+            if (create.check_option != 0) try checkOptionUpdatable(context, create.query, plan);
+            out.extras.check_option = create.check_option;
             out.extras.relkind = if (create.materialized) 'm' else 'v';
             if (text.len > out.extras.query.bytes.len) {
                 out.extras.query.len = try lexer.compactDefinition(text, &out.extras.query.bytes);
@@ -11032,6 +11078,7 @@ pub fn Binder(comptime config: types.Config) type {
                 // silently change an existing dependent view's row shape.
                 if (out.count != old.column_count and dependentViews(context, old.oid)) return error.UnsupportedStatement;
                 var replacement = alterOf(context, found.slot, .create_view);
+                replacement.extras.check_option = out.extras.check_option;
                 replacement.extras.query = out.extras.query;
                 replacement.extras.depends = out.extras.depends;
                 replacement.extras.depend_count = out.extras.depend_count;
@@ -11043,6 +11090,49 @@ pub fn Binder(comptime config: types.Config) type {
                 return .{ .alter_table = replacement };
             };
             return .{ .create_table = out };
+        }
+
+        /// WITH CHECK OPTION needs an automatically updatable view
+        /// (PostgreSQL's view_query_is_auto_updatable with updatable
+        /// columns): one FROM item that is a table or a view, no DISTINCT,
+        /// grouping, HAVING, set operation, WITH, LIMIT / OFFSET, aggregate
+        /// or window target, and at least one plain column (0A000).
+        fn checkOptionUpdatable(context: *const Context, query: u16, plan: *const Plan) Error!void {
+            const q = &context.pool.queries[query];
+            if (q.distinct or q.distinct_on_count != 0 or q.group_count != 0 or q.grouping_sets != none or q.rollup or q.having != none or
+                q.set_op != .none or q.cte_count != 0 or q.limit_present or q.offset_present or q.item_count != 1) return error.UnsupportedStatement;
+            const item = &q.items[0];
+            // A view in FROM was expanded into a derived table (item.view).
+            if ((item.query != none and !item.view) or item.function != none or item.sample_method != 0 or item.column_aliases != none) return error.UnsupportedStatement;
+            if (plan.source_count != 1 or plan.grouped or plan.window_count != 0) return error.UnsupportedStatement;
+            if (!item.view) {
+                const table = plan.sources[0].table orelse return error.UnsupportedStatement;
+                const kind = context.tables[table].relkind;
+                if (kind != 'r' and kind != 'p') return error.UnsupportedStatement;
+            }
+            var plain = false;
+            for (q.targets[0..q.count]) |*target| {
+                if (target.star) {
+                    plain = true;
+                    continue;
+                }
+                const n = context.node(target.expr);
+                if (n.kind == .aggregate or (n.kind == .function and n.window != none)) return error.UnsupportedStatement;
+                plain = plain or n.kind == .column;
+            }
+            if (!plain) return error.UnsupportedStatement;
+        }
+
+        /// A view's check option condition, already rewritten over the
+        /// statement's target table (B11 wave 5): bound like a CHECK
+        /// constraint over the row, the relation named by `alias` when the
+        /// base item had one.
+        pub fn bindViewCheck(context: *const Context, id: u16, table: usize, alias: ?ast.Ident) Error!u16 {
+            var scope = tableScope(context, table);
+            if (alias) |name| scope.rels[0].name = toName(context, name);
+            try typeExpr(context, &scope, id);
+            try booleanArgument(context, id);
+            return id;
         }
 
         /// DROP VIEW / DROP MATERIALIZED VIEW (42809 for another kind).

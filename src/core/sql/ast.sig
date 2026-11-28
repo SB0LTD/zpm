@@ -556,6 +556,9 @@ pub const AggregateInput = struct {
     }
 };
 
+/// Catalog qualifiers one statement may write (`catalog.schema.name`).
+pub const catalog_ref_capacity: usize = 8;
+
 pub fn Ast(comptime config: types.Config) type {
     return struct {
         pub const Pool = struct {
@@ -573,6 +576,10 @@ pub fn Ast(comptime config: types.Config) type {
             /// Strict NULL record comparisons need a post-binding constant pass.
             discarded_row_constants: bool = false,
             planned_nulls: bool = false,
+            /// Catalog qualifiers of `catalog.schema.name` (F651, B11 wave
+            /// 5), checked against the session's database before binding.
+            catalog_refs: [catalog_ref_capacity]Ident = undefined,
+            catalog_ref_len: usize = 0,
 
             pub fn reset(self: *Pool) void {
                 self.window_len=0;
@@ -581,6 +588,14 @@ pub fn Ast(comptime config: types.Config) type {
                 self.complex = false;
                 self.discarded_row_constants = false;
                 self.planned_nulls = false;
+                self.catalog_ref_len = 0;
+            }
+
+            /// Records a catalog qualifier (54001 past the capacity).
+            pub fn addCatalog(self: *Pool, ident: Ident) Error!void {
+                if (self.catalog_ref_len == catalog_ref_capacity) return error.StatementTooComplex;
+                self.catalog_refs[self.catalog_ref_len] = ident;
+                self.catalog_ref_len += 1;
             }
 
             /// A new default query block, initialized in place (blocks are
@@ -760,6 +775,9 @@ pub fn Ast(comptime config: types.Config) type {
             query: u16 = none,
             text: Span = .{},
             with_data: bool = true,
+            /// WITH [LOCAL | CASCADED] CHECK OPTION or WITH (check_option =
+            /// ...) (B11 wave 5): 0 none, 1 LOCAL, 2 CASCADED.
+            check_option: u8 = 0,
         };
 
         /// MERGE INTO target [AS alias] USING source ON condition WHEN ...
@@ -934,6 +952,9 @@ pub fn Ast(comptime config: types.Config) type {
             sample_method: u8 = 0,
             sample_percent: u16 = none,
             sample_seed: u16 = none,
+            /// `JOIN ... USING (columns) AS alias` (F404, B11 wave 5): the
+            /// range variable naming the join's merged columns.
+            using_alias: ?Ident = null,
         };
 
         pub const Cte = struct {
@@ -1046,6 +1067,8 @@ pub fn Ast(comptime config: types.Config) type {
             /// UPDATE ... FROM items: a query block (index into Pool.queries)
             /// holding only the FROM list, or none.
             from: u16 = none,
+            /// WHERE CURRENT OF cursor (E121-06, B11 wave 5).
+            current_of: ?Ident = null,
         };
 
         pub const Delete = struct {
@@ -1057,6 +1080,8 @@ pub fn Ast(comptime config: types.Config) type {
             alias: ?Ident = null,
             /// DELETE ... USING items (a FROM-list query block), or none.
             using: u16 = none,
+            /// WHERE CURRENT OF cursor (E121-07, B11 wave 5).
+            current_of: ?Ident = null,
         };
 
         /// COPY t [(columns)] FROM STDIN | COPY t [(columns)] | (query) TO
@@ -1238,6 +1263,9 @@ pub const Isolation = enum { default, read_uncommitted, read_committed, repeatab
 
 /// Transaction modes of BEGIN / START TRANSACTION / SET TRANSACTION / SET
 /// SESSION CHARACTERISTICS AS TRANSACTION (null: not given).
+/// Interval qualifier fields, coarsest first.
+pub const IntervalField = enum(u8) { none, year, month, day, hour, minute, second };
+
 pub const Characteristics = struct {
     isolation: Isolation = .default,
     read_only: ?bool = null,
@@ -1254,7 +1282,10 @@ pub const SettingName = struct {
 /// SET value: DEFAULT, LOCAL (TIME ZONE LOCAL), a word, a string literal or
 /// a (signed) number. `span` is the raw word/number; `quoted` the string.
 pub const SettingValue = struct {
-    kind: enum { default, word, string, number } = .default,
+    kind: enum { default, word, string, number, interval } = .default,
+    /// SET TIME ZONE INTERVAL 'text' [fields] (F761, B11 wave 5): the
+    /// qualifier's last field (IntervalField; none without one).
+    interval_field: IntervalField = .none,
     span: Span = .{},
     // Sign of a numeric token, separate from whitespace or comments.
     number_sign: u8 = 0,
@@ -1285,6 +1316,10 @@ pub const Control = union(enum) {
     /// null = RESET ALL.
     reset: ?SettingName,
     set_session_characteristics: Characteristics,
+    /// COMMIT / ROLLBACK AND CHAIN (T261, B11 wave 5): the next
+    /// transaction starts at once with the same characteristics.
+    commit_chain: void,
+    rollback_chain: void,
 };
 
 /// LOCK TABLE modes (PostgreSQL's eight, weakest first).

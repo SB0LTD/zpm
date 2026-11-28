@@ -521,6 +521,9 @@ pub fn Parser(comptime config: types.Config) type {
             }
             if (try self.takeWord("INSERT")) return .{ .insert = try self.insert() };
             if (self.isWord("SELECT") or (self.mode == .standard and (self.isWord("WITH") or self.isWord("VALUES") or self.isWord("TABLE")))) return self.topQuery();
+            // `(SELECT ... ORDER BY ...) UNION ...`: a parenthesized query
+            // expression as the statement (F855, B11 wave 5).
+            if (self.mode == .standard and self.isSymbol(.lparen) and try self.parenthesizedQuery(false)) return self.topQuery();
             if (try self.takeWord("UPDATE")) return .{ .update = try self.update() };
             if (try self.takeWord("DELETE")) return .{ .delete = try self.delete() };
             if (self.mode == .standard and self.rawWord("copy")) {
@@ -724,15 +727,49 @@ pub fn Parser(comptime config: types.Config) type {
                 }
                 try self.expectSymbol(.rparen);
             }
+            // WITH (check_option = local | cascaded) (B11 wave 5); other
+            // view options stay outside the subset (0A000).
+            if (!materialized and try self.takeWord("WITH")) {
+                try self.expectSymbol(.lparen);
+                if (!try self.takeRaw("check_option")) return error.UnsupportedStatement;
+                if (!try self.takeSymbol(.eq)) return error.Syntax;
+                out.check_option = try self.checkOptionValue();
+                try self.expectSymbol(.rparen);
+            }
             try self.expectWord("AS");
             if (!self.isWord("SELECT") and !self.isWord("WITH")) return error.UnsupportedStatement;
             const start = self.tokenStart();
             out.query = try self.query();
             out.text = try self.storedSpan(start);
             if (materialized) out.with_data = try self.withData();
-            if (!materialized and self.isWord("WITH")) return error.UnsupportedStatement;
+            // WITH [CASCADED | LOCAL] CHECK OPTION (F311-04, F751).
+            if (!materialized and try self.takeWord("WITH")) {
+                out.check_option = 2;
+                if (try self.takeRaw("local")) out.check_option = 1 else _ = try self.takeRaw("cascaded");
+                if (!try self.takeRaw("check") or !try self.takeRaw("option")) return error.Syntax;
+            }
             try self.finish();
             return out;
+        }
+
+        /// A check_option reloption value: local or cascaded, quoted or not
+        /// (22023 otherwise, PostgreSQL's invalid value for the option).
+        fn checkOptionValue(self: *Self) Error!u8 {
+            const token = self.current;
+            var buffer: [16]u8 = undefined;
+            const text: []const u8 = switch (token.kind) {
+                .string => blk: {
+                    if (token.len > buffer.len) return error.InvalidParameterValue;
+                    lexer.decodeQuoted(self.source, token.quoted(), &buffer);
+                    break :blk buffer[0..token.len];
+                },
+                .word, .quoted_word => token.raw(self.source),
+                else => return error.Syntax,
+            };
+            try self.advance();
+            if (types.keyword(text, "local")) return 1;
+            if (types.keyword(text, "cascaded")) return 2;
+            return error.InvalidParameterValue;
         }
 
         /// A query block of a stored view text inside `source` from `start`
@@ -845,8 +882,21 @@ pub fn Parser(comptime config: types.Config) type {
             if (try self.takeSymbol(.dot)) {
                 out.schema = out.name;
                 out.name = try self.identifier();
+                try self.catalogTail(&out.schema, &out.name);
             }
             return out;
+        }
+
+        /// `catalog.schema.name` (F651, B11 wave 5): after `schema.name`, a
+        /// third part shifts the names. The catalog is recorded and checked
+        /// against the session's database before binding (another one is
+        /// 0A000, PostgreSQL's cross-database reference).
+        fn catalogTail(self: *Self, schema: *?ast.Ident, name: *ast.Ident) Error!void {
+            if (self.mode != .standard or !self.isSymbol(.dot)) return;
+            try self.advance();
+            try self.pool.addCatalog(schema.*.?);
+            schema.* = name.*;
+            name.* = try self.identifier();
         }
 
         fn ifExists(self: *Self) Error!bool {
@@ -1329,6 +1379,16 @@ pub fn Parser(comptime config: types.Config) type {
             return .{ .prepared_transaction = .{ .action = action, .gid = gid } };
         }
 
+        /// `AND [NO] CHAIN` after COMMIT / END / ROLLBACK / ABORT (T261,
+        /// B11 wave 5); true for AND CHAIN. The statement must end there.
+        fn chainClause(self: *Self) Error!bool {
+            if (self.mode != .standard or !try self.takeWord("AND")) return false;
+            const chain = !try self.takeWord("NO");
+            if (!try self.takeRaw("chain")) return error.Syntax;
+            try self.finish();
+            return chain;
+        }
+
         fn controlStatement(self: *Self) Error!ast.Control {
             if (self.mode == .standard and (self.rawWord("vacuum") or self.rawWord("analyze") or self.rawWord("analyse"))) {
                 const vacuum = self.rawWord("vacuum");
@@ -1357,11 +1417,13 @@ pub fn Parser(comptime config: types.Config) type {
                 try self.advance();
                 if (commit and self.tokens.dialect == .postgres and self.rawWord("prepared")) return self.preparedTransaction(.commit);
                 _ = (try self.takeWord("WORK")) or (try self.takeWord("TRANSACTION"));
+                if (try self.chainClause()) return .commit_chain;
                 self.finish() catch return error.UnsupportedStatement;
                 return .commit;
             }
             if (try self.takeWord("ABORT")) {
                 _ = (try self.takeWord("WORK")) or (try self.takeWord("TRANSACTION"));
+                if (try self.chainClause()) return .rollback_chain;
                 try self.finish();
                 return .rollback;
             }
@@ -1374,6 +1436,7 @@ pub fn Parser(comptime config: types.Config) type {
                     try self.finish();
                     return .{ .rollback_to = name };
                 }
+                if (try self.chainClause()) return .rollback_chain;
                 self.finish() catch return error.UnsupportedStatement;
                 return .rollback;
             }
@@ -1416,7 +1479,9 @@ pub fn Parser(comptime config: types.Config) type {
                 if (try self.takeWord("TIME")) {
                     try self.expectWord("ZONE");
                     var value: ast.SettingValue = .{};
-                    if (!try self.takeWord("LOCAL")) value = try self.settingValue();
+                    if (self.mode == .standard and self.rawWord("interval")) {
+                        value = try self.zoneInterval();
+                    } else if (!try self.takeWord("LOCAL")) value = try self.settingValue();
                     try self.finish();
                     return .{ .set = .{ .local = local, .name = .{ .special = .time_zone }, .value = value } };
                 }
@@ -1513,6 +1578,35 @@ pub fn Parser(comptime config: types.Config) type {
                 if (out.len > config.name_bytes) return error.NameCapacity;
             }
             return out;
+        }
+
+        /// `INTERVAL 'text' [field [TO field]]` as a time zone (F761, B11
+        /// wave 5, gram.y zone_value): the string and the qualifier's last
+        /// field; the engine reads the offset.
+        fn zoneInterval(self: *Self) Error!ast.SettingValue {
+            try self.advance();
+            if (self.current.kind != .string) return error.Syntax;
+            var value: ast.SettingValue = .{ .kind = .interval, .quoted = self.current.quoted() };
+            try self.advance();
+            const first = try self.intervalField();
+            var last = first;
+            if (first != .none and try self.takeWord("TO")) {
+                last = try self.intervalField();
+                if (@intFromEnum(last) <= @intFromEnum(first)) return error.Syntax;
+            }
+            // PostgreSQL: only HOUR, MINUTE or HOUR TO MINUTE (42601).
+            if (first != .none and first != .hour and first != .minute) return error.Syntax;
+            if (last != .hour and last != .minute and last != .none) return error.Syntax;
+            value.interval_field = last;
+            return value;
+        }
+
+        fn intervalField(self: *Self) Error!ast.IntervalField {
+            const fields = [_]struct { []const u8, ast.IntervalField }{ .{ "year", .year }, .{ "month", .month }, .{ "day", .day }, .{ "hour", .hour }, .{ "minute", .minute }, .{ "second", .second } };
+            inline for (fields) |entry| {
+                if (try self.takeRaw(entry[0])) return entry[1];
+            }
+            return .none;
         }
 
         fn settingValue(self: *Self) Error!ast.SettingValue {
@@ -2736,6 +2830,7 @@ pub fn Parser(comptime config: types.Config) type {
             if (self.mode == .standard and try self.takeSymbol(.dot)) {
                 out.schema = out.table;
                 out.table = try self.identifier();
+                try self.catalogTail(&out.schema, &out.table);
             }
             if (self.mode == .standard and try self.takeWord("AS")) out.alias = try self.identifier();
             if (try self.takeSymbol(.lparen)) {
@@ -2858,6 +2953,16 @@ pub fn Parser(comptime config: types.Config) type {
             }
         }
 
+        /// `WHERE CURRENT OF cursor` of a positioned UPDATE / DELETE (E121-06,
+        /// E121-07, B11 wave 5): the cursor's name, or null for another WHERE.
+        fn currentOf(self: *Self) Error!?ast.Ident {
+            if (self.mode != .standard or !self.isWord("WHERE") or !wordIs(self.source, try self.peek(), "current")) return null;
+            try self.advance();
+            try self.advance();
+            if (!try self.takeRaw("of")) return error.Syntax;
+            return try self.identifier();
+        }
+
         fn where(self: *Self) Error!u16 {
             if (!try self.takeWord("WHERE")) return none;
             return self.expression();
@@ -2966,6 +3071,11 @@ pub fn Parser(comptime config: types.Config) type {
             }
             var limited = has_core_limit;
             var offset_seen = false;
+            // `(SELECT ... LIMIT n) LIMIT m`: the parenthesized block's own
+            // clauses cannot be given twice (42601, F856, B11 wave 5).
+            const inner_limit = self.mode == .standard and !has_core_limit and block.limit_present;
+            const inner_offset = self.mode == .standard and block.offset_present;
+            if ((inner_limit and (self.isWord("LIMIT") or self.isWord("FETCH"))) or (inner_offset and self.isWord("OFFSET"))) return error.Syntax;
             while (true) {
                 if (!limited and try self.takeWord("LIMIT")) {
                     limited = true;block.limit_present=true;
@@ -3129,6 +3239,40 @@ pub fn Parser(comptime config: types.Config) type {
             block.right = right;
             return index;
         }
+
+        /// At `(`: whether the first token past this and any further `(`
+        /// starts a query block, so the parentheses open a query expression
+        /// such as `((SELECT ...) UNION ...)` rather than a join group (F855,
+        /// B11 wave 5). Looks ahead without consuming.
+        /// In FROM (`in_from`), `((SELECT ...) alias JOIN ...)` is a join
+        /// group: the token after the `)` matching the current `(` decides
+        /// (`)`, a set operator or a query tail clause continue the query).
+        fn parenthesizedQuery(self: *Self, in_from: bool) Error!bool {
+            var copy = self.tokens;
+            var depth: usize = 1;
+            var token = try copy.next();
+            while (token.kind == .symbol and token.symbol == .lparen) : (token = try copy.next()) {
+                if (depth == max_paren_lookahead) return false;
+                depth += 1;
+            }
+            if (!(token.isWord("SELECT") or token.isWord("WITH") or token.isWord("VALUES") or token.isWord("TABLE"))) return false;
+            if (!in_from) return true;
+            // Scan to the `)` that closes the current `(` (depth 1).
+            while (true) {
+                if (token.kind == .end) return false;
+                if (token.kind == .symbol and token.symbol == .lparen) depth += 1;
+                if (token.kind == .symbol and token.symbol == .rparen) {
+                    depth -= 1;
+                    if (depth == 0) break;
+                }
+                token = try copy.next();
+            }
+            const after = try copy.next();
+            return (after.kind == .symbol and after.symbol == .rparen) or after.isWord("UNION") or after.isWord("INTERSECT") or
+                after.isWord("EXCEPT") or after.isWord("ORDER") or after.isWord("LIMIT") or after.isWord("OFFSET") or after.isWord("FETCH");
+        }
+
+        const max_paren_lookahead: usize = 64;
 
         /// A token that starts a query block: SELECT, WITH, VALUES, TABLE.
         fn queryWord(self: *const Self) bool {
@@ -3567,6 +3711,11 @@ pub fn Parser(comptime config: types.Config) type {
                     if (!try self.takeSymbol(.comma)) break;
                 }
                 try self.expectSymbol(.rparen);
+                // USING (...) AS alias (F404, B11 wave 5): AS is required.
+                if (self.mode == .standard and try self.takeWord("AS")) {
+                    item.using_alias = try self.identifier();
+                    self.pool.complex = true;
+                }
             } else return error.Syntax;
             return true;
         }
@@ -3593,7 +3742,7 @@ pub fn Parser(comptime config: types.Config) type {
                 self.pool.complex = true;
             }
             if (self.mode == .standard and try self.takeSymbol(.lparen)) {
-                if (!self.queryWord()) {
+                if (!self.queryWord() and !(self.isSymbol(.lparen) and try self.parenthesizedQuery(true))) {
                     if (item.lateral) return error.Syntax;
                     return self.joinGroup(out, kind);
                 }
@@ -3608,6 +3757,7 @@ pub fn Parser(comptime config: types.Config) type {
                 if (self.mode == .standard and try self.takeSymbol(.dot)) {
                     item.schema = item.name;
                     item.name = try self.identifier();
+                    try self.catalogTail(&item.schema, &item.name);
                 }
                 if (wrapped) try self.expectSymbol(.rparen);
                 // A function call in FROM (B11), implicitly LATERAL, with
@@ -3928,6 +4078,7 @@ pub fn Parser(comptime config: types.Config) type {
             if (self.mode == .standard and try self.takeSymbol(.dot)) {
                 out.schema = out.table;
                 out.table = try self.identifier();
+                try self.catalogTail(&out.schema, &out.table);
             }
             if (self.mode == .standard) out.alias = try self.targetAlias();
             try self.expectWord("SET");
@@ -3937,7 +4088,7 @@ pub fn Parser(comptime config: types.Config) type {
             }
             try self.outputClause(&out.returning);
             if (self.mode == .standard and try self.takeWord("FROM")) out.from = try self.fromBlock();
-            out.where = try self.where();
+            if (try self.currentOf()) |cursor| out.current_of = cursor else out.where = try self.where();
             try self.returningClause(&out.returning);
             try self.finish();
             return out;
@@ -3950,11 +4101,12 @@ pub fn Parser(comptime config: types.Config) type {
             if (self.mode == .standard and try self.takeSymbol(.dot)) {
                 out.schema = out.table;
                 out.table = try self.identifier();
+                try self.catalogTail(&out.schema, &out.table);
             }
             if (self.mode == .standard) out.alias = try self.targetAlias();
             try self.outputClause(&out.returning);
             if (self.mode == .standard and try self.takeWord("USING")) out.using = try self.fromBlock();
-            out.where = try self.where();
+            if (try self.currentOf()) |cursor| out.current_of = cursor else out.where = try self.where();
             try self.returningClause(&out.returning);
             try self.finish();
             return out;
@@ -5583,13 +5735,29 @@ pub fn Parser(comptime config: types.Config) type {
             if (self.isSymbol(.lparen)) return self.functionCall(name);
             if (try self.takeSymbol(.dot)) {
                 if (self.mode == .standard and try self.takeSymbol(.star)) return self.pool.add(.{ .kind = .column, .star = true, .qualifier = name });
-                const column = try self.identifier();
+                var qualifier = name;
+                var column = try self.identifier();
                 if (self.mode == .standard and self.tokens.dialect == .postgres and self.isSymbol(.lparen)) {
                     const call = try self.functionCall(column);
                     self.pool.nodes[call].qualifier = name;
                     return call;
                 }
-                return self.subscriptTail(try self.pool.add(.{ .kind = .column, .name = column, .qualifier = name }));
+                // `schema.table.column` and `catalog.schema.table.column`
+                // (F651, B11 wave 5): the column's qualifier is the table.
+                if (self.mode == .standard and self.isSymbol(.dot)) {
+                    try self.advance();
+                    const third = try self.identifier();
+                    if (self.isSymbol(.dot)) {
+                        try self.advance();
+                        try self.pool.addCatalog(name);
+                        qualifier = third;
+                        column = try self.identifier();
+                    } else {
+                        qualifier = column;
+                        column = third;
+                    }
+                }
+                return self.subscriptTail(try self.pool.add(.{ .kind = .column, .name = column, .qualifier = qualifier }));
             }
             return self.subscriptTail(try self.pool.add(.{ .kind = .column, .name = name }));
         }

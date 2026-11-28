@@ -1468,7 +1468,7 @@ pub fn Store(comptime Raw: type) type {
                 const raw = self.db();
                 const command = try raw.control(source);
                 switch (command) {
-                    .commit, .rollback, .rollback_to => {},
+                    .commit, .rollback, .rollback_to, .commit_chain, .rollback_chain => {},
                     else => if (self.failed) return error.TransactionFailed,
                 }
                 switch (command) {
@@ -1527,6 +1527,25 @@ pub fn Store(comptime Raw: type) type {
                         if (!explicit) self.warn("25P01", "there is no transaction in progress");
                         result.clear(0);
                         result.command = .rollback;
+                    },
+                    // COMMIT / ROLLBACK AND CHAIN (T261, B11 wave 5): only in
+                    // a transaction block (25P01); the block ends as COMMIT
+                    // or ROLLBACK does and the next one begins at once with
+                    // the same characteristics (session defaults after a
+                    // failure outside any savepoint, as PostgreSQL's abort
+                    // undoes them).
+                    .commit_chain, .rollback_chain => {
+                        const explicit = self.in_transaction and !self.postgres_extended_implicit and !self.implicitSimpleQueryBlock();
+                        if (!explicit) return error.NoActiveTransaction;
+                        if (comptime !has_engine_session) return error.UnsupportedStatement;
+                        const failed = self.failed;
+                        const modes = self.db().chainCharacteristics(self.tx.?, failed);
+                        const committing = command == .commit_chain;
+                        if (committing) try self.commitTransaction() else try self.rollbackTransaction();
+                        try self.beginTransaction();
+                        if (modes) |chained| try self.db().beginModes(self.tx.?, chained);
+                        result.clear(0);
+                        result.command = if (committing and !failed) .commit else .rollback;
                     },
                     .prepared_transaction => |prepared| {
                         if (comptime PreparedWal == void) return error.UnsupportedStatement;
