@@ -5930,6 +5930,31 @@ pub fn Database(comptime config: Config) type {
             return self.catalog_objects.memberOf(self.session.role, self.catalog_objects.items[index].owner, true, snap);
         }
 
+        /// has_type_privilege(role, oid, 'USAGE') (privileges lane): a user
+        /// type's ACL, PUBLIC USAGE until it is materialized; built-in
+        /// types grant USAGE to PUBLIC.
+        fn typeUsable(self: *const Self, oid: u32, role: u32, snap: Snapshot) bool {
+            for ([_]CO.Kind{ .composite_type, .domain, .enum_type }) |kind| {
+                const index = self.catalog_objects.byOid(kind, oid, snap) orelse continue;
+                const owner = self.catalog_objects.items[index].owner;
+                return self.catalog_objects.objectPrivilegeMask(.type_acl, oid, owner, role, CO.priv_usage, snap) & CO.priv_usage != 0;
+            }
+            return true;
+        }
+
+        /// USAGE on a type a statement uses for a column, a routine
+        /// argument or result, or a cast (aclcheck_error_type: 42501).
+        fn needTypeUsage(self: *const Self, oid: u32, snap: Snapshot) Error!void {
+            if (!self.typeUsable(oid, self.session.role, snap)) return error.InsufficientPrivilege;
+        }
+
+        /// A composite column's type needs USAGE (BuildDescForRelation,
+        /// ALTER TABLE ADD COLUMN / ALTER COLUMN TYPE).
+        fn columnTypeUsage(self: *const Self, column: *const V.Column, snap: Snapshot) Error!void {
+            if (column.data_type != .record or column.typmod <= 0) return;
+            try self.needTypeUsage(@intCast(column.typmod), snap);
+        }
+
         /// Whether a built-in cast (pg_cast) already converts `source` to
         /// `target`: PostgreSQL's casts, not its I/O conversions to and
         /// from the string types.
@@ -5954,6 +5979,9 @@ pub fn Database(comptime config: Config) type {
             for ([_]u32{ source, destination }) |oid| if (oid == tg.record_oid or oid == tg.void_oid or oid == tg.trigger_oid) return error.WrongObjectType;
             if (source == destination) return error.InvalidObjectDefinition;
             if (!self.privilegedRole(snap) and !self.ownsType(source, snap) and !self.ownsType(destination, snap)) return error.InsufficientPrivilege;
+            // USAGE on both types (CreateCast, privileges lane).
+            try self.needTypeUsage(source, snap);
+            try self.needTypeUsage(destination, snap);
             var cast: RC.Cast = .{ .source = source, .target = destination, .context = definition.context, .method = definition.method };
             switch (definition.method) {
                 'f' => {
@@ -7896,6 +7924,12 @@ pub fn Database(comptime config: Config) type {
                 .alter_table => |*alter| {
                     try self.needOwner(alter.table, snap);
                     const table = &self.tables[alter.table];
+                    // A new composite column, or one changing type, needs
+                    // USAGE on its type.
+                    for (alter.columns[0..alter.count], alter.sources[0..alter.count]) |*column, from| {
+                        if (from != 0xff and from < table.column_count and table.columns[from].data_type == column.data_type and table.columns[from].typmod == column.typmod) continue;
+                        try self.columnTypeUsage(column, snap);
+                    }
                     for (alter.constraints[0..alter.constraint_count]) |*constraint| {
                         var existing = false;
                         for (table.constraints[0..table.constraint_count]) |*old| existing = existing or (old.kind == .foreign and old.oid == constraint.oid and constraint.oid != 0);
@@ -7907,6 +7941,7 @@ pub fn Database(comptime config: Config) type {
                 .refresh_view => |*refresh| try self.needTable(refresh.slot, CO.priv_maintain, snap),
                 .create_table => |*create| {
                     if (self.dialect != .postgres or !create.plain_definition) return error.InsufficientPrivilege;
+                    for (create.columns[0..create.count]) |*column| try self.columnTypeUsage(column, snap);
                     for (create.constraints[0..create.constraint_count]) |*constraint| try self.foreignKeyPrivileges(constraint, 0, snap);
                 },
                 .create_sequence, .drop_sequence, .alter_sequence, .create_schema => return error.InsufficientPrivilege,
@@ -15990,12 +16025,16 @@ pub fn Database(comptime config: Config) type {
             for (resolved.args[0..resolved.arg_count]) |*arg| {
                 if (!arg.user_type.named()) continue;
                 arg.oid = (try self.dependedCompositeOid(&arg.user_type, snap)) orelse return error.UndefinedObject;
+                // interpret_function_parameter_list: USAGE on the type.
+                try self.needTypeUsage(arg.oid, snap);
                 arg.typmod = -1;
                 arg.user_type = .{};
             }
             if (resolved.return_user.named()) {
                 if (try self.dependedCompositeOid(&resolved.return_user, snap)) |oid| {
                     if (resolved.outputCount() != 0) return error.InvalidFunctionDefinition;
+                    // compute_return_type: USAGE on the result type.
+                    try self.needTypeUsage(oid, snap);
                     resolved.return_oid = oid;
                     resolved.return_typmod = -1;
                     resolved.has_setof_table = false;

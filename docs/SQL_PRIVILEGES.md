@@ -69,7 +69,7 @@ Enforcement:
 | column | SELECT INSERT UPDATE REFERENCES | a FROM item admitted by column grants reads only granted columns (select list, `*`, WHERE, ORDER BY, joins, subqueries); INSERT target columns (none: some column), UPDATE SET targets, ON CONFLICT DO UPDATE SET, RETURNING and every column UPDATE / DELETE read |
 | sequence | USAGE SELECT UPDATE | nextval (USAGE or UPDATE, also SERIAL defaults), currval / lastval (SELECT or USAGE), setval (UPDATE), SELECT from it (SELECT); identity columns need none |
 | schema | USAGE CREATE | name lookup (USAGE), CREATE TABLE / VIEW / TYPE / DOMAIN (CREATE; PostgreSQL 15+: the public schema too) |
-| domain, enum, composite type | USAGE | ACL kept and reported; casts need none (as PostgreSQL) |
+| domain, enum, composite type | USAGE | a composite column type (CREATE TABLE, ALTER TABLE ADD COLUMN or a column changing type), a routine argument or result type (CREATE FUNCTION / PROCEDURE), both types of CREATE CAST; reading such values, casts in queries and DROP CAST need none (as PostgreSQL) |
 
 information_schema (the catalog lane's views) reads this model through
 `Database.nextAclItem` / `nextColumnAclItem` (aclexplode of relacl,
@@ -194,8 +194,9 @@ ACL, column rows) lives in database storage.
 - One notice per statement reaches the client (PostgreSQL may send
   several, e.g. one per column of an implied column revoke); per-column
   warnings for system columns (ZPM has none).
-- USAGE on types is not checked when a column uses a type (ZPM tables
-  hold no user-type columns); CREATE SEQUENCE, owned sequences, CREATE
+- Domain and enum columns and domains over user types stay 0A000 in ZPM,
+  so only composite types reach the USAGE checks above; CREATE SEQUENCE,
+  owned sequences, CREATE
   SCHEMA and database privileges stay superuser-only; LOCK, VACUUM and
   ANALYZE privileges; function privileges stay with the routine ACLs of
   wave 4; DROP OWNED / REASSIGN OWNED.
