@@ -71,6 +71,29 @@ Enforcement:
 | schema | USAGE CREATE | name lookup (USAGE), CREATE TABLE / VIEW / TYPE / DOMAIN (CREATE; PostgreSQL 15+: the public schema too) |
 | domain, enum, composite type | USAGE | ACL kept and reported; casts need none (as PostgreSQL) |
 
+information_schema (the catalog lane's views) reads this model through
+`Database.nextAclItem` / `nextColumnAclItem` (aclexplode of relacl,
+attacl, typacl and a sequence's relacl, acldefault until materialized):
+table_privileges and role_table_grants list each entry with its grantor;
+column_privileges and role_column_grants are the UNION of the relation's
+entries for every column and each column's own entries (a column entry
+repeating a relation entry with the same grantability is listed once, as
+PostgreSQL's UNION does); usage_privileges lists domains from typacl and
+sequences once their relacl exists (PostgreSQL explodes acldefault('r')
+there, which has no USAGE), udt_privileges composite types from typacl.
+The filters follow PostgreSQL: tables, views, table_constraints,
+referential_constraints and triggers admit relations through column
+grants (has_any_column_privilege), columns, key_column_usage,
+triggered_update_columns, element_types and data_type_privileges check
+each column (has_column_privilege), domains, domain_constraints,
+user_defined_types and attributes check has_type_privilege, sequences
+has_sequence_privilege, and schemata lists the public schema with its
+owner pg_database_owner under its ACL. pg_read_all_data /
+pg_write_all_data read / update every sequence (has_sequence_privilege,
+nextval, setval). The `information_schema_grants` and
+`information_schema_usage` programs check all of it against native 18.7
+(F231 and E081-08's information_schema statement).
+
 Non-superusers may now create tables with defaults, CHECK and FOREIGN KEY
 constraints; owned sequences (SERIAL, identity) and CREATE SEQUENCE remain
 superuser-only.
@@ -168,10 +191,6 @@ ACL, column rows) lives in database storage.
 
 - GRANT as a CREATE SCHEMA element (needs the schema-element grammar of
   the ddl-alter lane; standalone GRANT ... ON ALL TABLES IN SCHEMA works).
-- information_schema privilege views (table_privileges column types,
-  column_privileges, usage_privileges, role_* views): the catalog lane
-  builds them on this model (E081-08's last statement and F231 wait on
-  them).
 - One notice per statement reaches the client (PostgreSQL may send
   several, e.g. one per column of an implied column revoke); per-column
   warnings for system columns (ZPM has none).

@@ -148,9 +148,10 @@ infallible conjunct of the WHERE clause (comparisons, IN lists and LIKE
 with a literal pattern), so filtered scans of the wide views keep only
 matching rows; an unfiltered scan wider than the workspace is 54000.
 
-Not represented, because nothing in the engine stores it: column-level
-grants and type / sequence ACLs (the privileges lane), columns typed by a
-domain, temporary schemas,
+Privilege views read the privileges lane's ACL model (column, type and
+sequence ACLs included; see [SQL_PRIVILEGES.md](SQL_PRIVILEGES.md)).
+Not represented, because nothing in the engine stores it: columns typed by
+a domain, temporary schemas,
 table row types (`udt_privileges` lists composite types only), named NOT
 NULL constraints, foreign tables, options and user mappings, transforms,
 dependencies of routines and of system views (`routine_*_usage`,

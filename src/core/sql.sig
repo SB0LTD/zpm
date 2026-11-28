@@ -8113,7 +8113,53 @@ pub fn Database(comptime config: Config) type {
         }
 
         /// Position of an ACL entry in display order (see sortAcl).
-        const AclKey = struct { position: u32, rank: u1, index: usize };
+        pub const AclKey = struct { position: u32, rank: u1, index: usize };
+
+        /// One aclexplode entry and its position (the cursor of the next).
+        pub const AclItem = struct { key: AclKey, grantee: u32, grantor: u32, privileges: u32, options: u32 };
+
+        /// aclexplode(coalesce(acl, acldefault)) of an object's ACL of
+        /// `kind`, one entry at a time in ACL order (start with null): the
+        /// information_schema privilege views read the ACL model here.
+        pub fn nextAclItem(self: *const Self, kind: CO.Kind, object_oid: u32, owner: u32, after: ?AclKey, snapshot: Snapshot) ?AclItem {
+            const defaults = aclDefaults(kind, object_oid);
+            var best = self.nextAclKey(kind, object_oid, owner, after, snapshot);
+            if (defaults.public != 0 and !self.aclMaterialized(kind, object_oid, owner, snapshot)) {
+                const key: AclKey = .{ .position = defaults.public_position, .rank = 0, .index = 1 };
+                if ((after == null or aclKeyBefore(after.?, key)) and (best == null or aclKeyBefore(key, best.?))) best = key;
+            }
+            const key = best orelse return null;
+            if (key.rank == 0 and key.index == 1) return .{ .key = key, .grantee = CO.public_role, .grantor = owner, .privileges = defaults.public, .options = 0 };
+            if (key.rank == 0) {
+                const marker = self.catalog_objects.ownerMarker(kind, object_oid, owner, snapshot);
+                const options = if (marker) |index| self.catalog_objects.items[index].grant_flags & ~CO.acl_explicit_owner else 0;
+                return .{ .key = key, .grantee = owner, .grantor = owner, .privileges = self.catalog_objects.ownerPrivileges(kind, object_oid, owner, snapshot), .options = options };
+            }
+            const row = &self.catalog_objects.items[key.index];
+            return .{ .key = key, .grantee = row.grantee, .grantor = row.owner, .privileges = row.flags, .options = row.grant_flags };
+        }
+
+        /// Whether a GRANT / REVOKE replaced the object's acldefault (an
+        /// unmaterialized ACL is NULL in the catalogs).
+        pub fn aclStored(self: *const Self, kind: CO.Kind, object_oid: u32, owner: u32, snapshot: Snapshot) bool {
+            return self.aclMaterialized(kind, object_oid, owner, snapshot);
+        }
+
+        /// aclexplode(attacl) of column `column` (0-based) of a table, one
+        /// entry at a time in ACL order (start with null; no default).
+        pub fn nextColumnAclItem(self: *const Self, table: u32, column: usize, after: ?AclKey, snapshot: Snapshot) ?AclItem {
+            var best: ?AclKey = null;
+            for (&self.catalog_objects.items, 0..) |*row, index| {
+                if (row.kind != .column_acl or row.target != table or !O.visible(row, snapshot) or 2 * column + 1 >= row.text_len or row.text[2 * column] == 0) continue;
+                const key: AclKey = .{ .position = row.text[2 * column + 1], .rank = 1, .index = index };
+                if (after != null and !aclKeyBefore(after.?, key)) continue;
+                if (best == null or aclKeyBefore(key, best.?)) best = key;
+            }
+            const key = best orelse return null;
+            const row = &self.catalog_objects.items[key.index];
+            const bits = row.text[2 * column];
+            return .{ .key = key, .grantee = row.grantee, .grantor = row.owner, .privileges = CO.columnFlags(bits & 0x0f), .options = CO.columnFlags(bits >> 4) };
+        }
 
         fn aclKeyBefore(a: AclKey, b: AclKey) bool {
             if (a.position != b.position) return a.position < b.position;
@@ -8190,19 +8236,8 @@ pub fn Database(comptime config: Config) type {
             var writer = try Acl.begin(&output, count);
             var letters: [2 * CO.acl_letters.len]u8 = undefined;
             var after: ?AclKey = null;
-            for (0..count) |_| {
-                var best: ?AclKey = null;
-                for (&self.catalog_objects.items, 0..) |*row, index| {
-                    if (row.kind != .column_acl or row.target != table or !O.visible(row, snapshot) or 2 * column + 1 >= row.text_len or row.text[2 * column] == 0) continue;
-                    const key: AclKey = .{ .position = row.text[2 * column + 1], .rank = 1, .index = index };
-                    if (after != null and !aclKeyBefore(after.?, key)) continue;
-                    if (best == null or aclKeyBefore(key, best.?)) best = key;
-                }
-                const current = best orelse break;
-                after = current;
-                const row = &self.catalog_objects.items[current.index];
-                const bits = row.text[2 * column];
-                try Acl.append(&writer, try self.aclRoleName(row.grantee, snapshot), CO.aclLetters(CO.columnFlags(bits & 0x0f), CO.columnFlags(bits >> 4), &letters), try self.aclRoleName(row.owner, snapshot));
+            while (self.nextColumnAclItem(table, column, after, snapshot)) |item| : (after = item.key) {
+                try Acl.append(&writer, try self.aclRoleName(item.grantee, snapshot), CO.aclLetters(item.privileges, item.options, &letters), try self.aclRoleName(item.grantor, snapshot));
             }
             return .{ .array = output };
         }
@@ -8356,7 +8391,7 @@ pub fn Database(comptime config: Config) type {
                         return switch (relation) {
                             .table => |slot| privilegeGranted(mode, self.catalog_objects.tablePrivilegeMask(role, self.tables[slot].oid, snap),
                                 self.objectOptions(.acl, self.tables[slot].oid, self.catalog_objects.owner(self.tables[slot].oid, snap), role, snap)),
-                            .sequence => |slot| privilegeGranted(mode, self.sequencePrivileges(slot, role, snap),
+                            .sequence => |slot| privilegeGranted(mode, self.sequencePrivileges(slot, role, snap) | (self.catalog_objects.predefinedPrivileges(role, snap) & CO.table_privileges),
                                 self.objectOptions(.sequence_acl, self.seqs[slot].oid, self.sequenceOwner(slot, snap), role, snap)),
                             .catalog => privilegeGranted(mode, if (superuser or role == CO.bootstrap_role) CO.table_privileges else CO.priv_select, if (superuser) CO.table_privileges else 0),
                         };
@@ -8466,7 +8501,10 @@ pub fn Database(comptime config: Config) type {
         /// The privileges `role` holds on a sequence (USAGE, SELECT, UPDATE).
         fn sequencePrivileges(self: *const Self, seq_slot: usize, role: u32, snap: Snapshot) u32 {
             const held = self.catalog_objects.objectPrivilegeMask(.sequence_acl, self.seqs[seq_slot].oid, self.sequenceOwner(seq_slot, snap), role, 0, snap);
-            return held | (self.catalog_objects.predefinedPrivileges(role, snap) & CO.priv_select);
+            // pg_read_all_data reads and pg_write_all_data updates every
+            // sequence (pg_class_aclmask); their schema USAGE is no
+            // sequence USAGE.
+            return held | (self.catalog_objects.predefinedPrivileges(role, snap) & (CO.priv_select | CO.priv_update));
         }
 
         fn catalogText(ptr: *anyopaque, kind: value_module.CatalogText, object: u32, classoid: u32, sub: i32, out: []u8) Error!?usize {
