@@ -2,7 +2,7 @@
 //! wave 5, catalog lane; F021, F231, F341, F501, F502, F762, F763, F869,
 //! T321-06, T321-07).
 //!
-//! Part 1 runs the scripts of tests/sql_conformance/catalog_views/ through
+//! Part 1 runs the seven scripts of tests/sql_conformance/catalog_views/ through
 //! the PostgreSQL wire session over a store connection, one simple Query
 //! per statement, continuing after errors, and compares every response
 //! with the native PostgreSQL 18.7 recording in

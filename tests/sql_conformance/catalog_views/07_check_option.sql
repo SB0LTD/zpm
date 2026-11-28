@@ -1,0 +1,12 @@
+CREATE TABLE t(a INT, b TEXT);
+CREATE VIEW v AS SELECT a, b FROM t;
+CREATE VIEW vc AS SELECT a, b FROM t WHERE a > 0 WITH CHECK OPTION;
+CREATE VIEW vl AS SELECT a FROM vc WHERE a < 10 WITH LOCAL CHECK OPTION;
+CREATE VIEW vcc AS SELECT a FROM v WITH CASCADED CHECK OPTION;
+CREATE VIEW vx AS SELECT a + 1 AS x FROM t;
+SELECT table_name, check_option, is_updatable, is_insertable_into, is_trigger_updatable, is_trigger_deletable, is_trigger_insertable_into FROM information_schema.views WHERE table_schema = 'public' ORDER BY table_name;
+SELECT table_name, is_insertable_into FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name;
+SELECT table_name, column_name, is_updatable FROM information_schema.columns WHERE table_schema = 'public' ORDER BY table_name, ordinal_position;
+SELECT view_name, table_name, column_name FROM information_schema.view_column_usage WHERE view_schema = 'public' ORDER BY 1, 2, 3;
+INSERT INTO vc VALUES (-1, 'x');
+SELECT count(*) FROM t;

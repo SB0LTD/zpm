@@ -636,11 +636,15 @@ pub fn Rows(comptime config: types.Config) type {
                     }
                 }
 
-                /// views.check_option: CASCADED / LOCAL / NONE. The engine
-                /// stores no WITH CHECK OPTION yet, so every view is NONE.
+                /// views.check_option from CREATE VIEW ... WITH [LOCAL |
+                /// CASCADED] CHECK OPTION (S.Table.check_option: 0 none,
+                /// 1 LOCAL, 2 CASCADED).
                 fn viewCheckOption(table: *const S.Table) []const u8 {
-                    _ = table;
-                    return "NONE";
+                    return switch (table.check_option) {
+                        1 => "LOCAL",
+                        2 => "CASCADED",
+                        else => "NONE",
+                    };
                 }
 
                 fn viewDefinition(self: *Self, table: *const S.Table) Error!Cell {

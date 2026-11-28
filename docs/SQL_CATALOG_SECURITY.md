@@ -109,7 +109,8 @@ narrow them to enabled roles. MAINTAIN is not listed (PostgreSQL 18).
 PostgreSQL 18's NOT NULL constraints are listed as `<table>_<column>_not_null`
 CHECK constraints (`table_constraints`, `check_constraints`,
 `constraint_column_usage`), including primary-key columns. `views` reports
-`is_updatable` / `is_insertable_into` from pg_relation_is_updatable (an
+`check_option` (WITH [LOCAL | CASCADED] CHECK OPTION) and `is_updatable` /
+`is_insertable_into` from pg_relation_is_updatable (an
 automatically updatable view chain, unconditional INSTEAD rules) and the
 INSTEAD OF trigger flags; `columns.is_updatable` follows
 pg_column_is_updatable. `routines` and `parameters` cover user routines
@@ -131,11 +132,10 @@ Also: CURRENT_CATALOG and CURRENT_SCHEMA (niladic; `current_catalog()` is
 appearance), "char" typing of pg_class.relpersistence / relreplident,
 pg_constraint.contype / confupdtype / confdeltype / confmatchtype,
 pg_type.typcategory / typdelim, pg_collation.collprovider and
-pg_policy.polcmd, PostgreSQL's CASE column naming (a named ELSE result
-names the column), and `schema.table.column` / `schema.table.*` column
-references in the PostgreSQL dialect (SQLAlchemy's reflection writes
-`pg_catalog.pg_class.relname`); the schema part is not checked against the
-FROM item, so a mismatched schema is accepted where PostgreSQL raises 42P01.
+pg_policy.polcmd, and PostgreSQL's CASE column naming (a named ELSE result
+names the column). With the `schema.table.column` references of F651
+(dml-temp lane), SQLAlchemy's reflection queries (`pg_catalog.pg_class.relname`,
+`unnest(conkey)`, `generate_subscripts`) answer like PostgreSQL.
 
 A lone catalog source filters each candidate row with every available,
 infallible conjunct of the WHERE clause (comparisons, IN lists and LIKE
@@ -144,7 +144,7 @@ matching rows; an unfiltered scan wider than the workspace is 54000.
 
 Not represented, because nothing in the engine stores it: column-level
 grants and type / sequence ACLs (the privileges lane), columns typed by a
-domain, WITH CHECK OPTION (`views.check_option` is NONE), temporary schemas,
+domain, temporary schemas,
 table row types (`udt_privileges` lists composite types only), named NOT
 NULL constraints, foreign tables, options and user mappings, transforms,
 dependencies of routines and of system views (`routine_*_usage`,

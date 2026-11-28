@@ -269,4 +269,18 @@ pub const scripts = [_]Script{
         .{ .source = "SELECT information_schema.tables.table_name, information_schema.tables.table_type FROM information_schema.tables WHERE information_schema.tables.table_name = 'kp'", .head = "T:table_name/19/64/-1,table_type/1043/-1/-1;C:SELECT 1;Z:I", .rows = &.{"kp|BASE TABLE"}, .ordered = false },
         .{ .source = "SELECT k.conname, array_agg(CAST(a.attname AS TEXT) ORDER BY a.attnum) FROM pg_catalog.pg_constraint k JOIN pg_catalog.pg_attribute a ON a.attrelid = k.conrelid AND a.attnum = ANY (k.conkey) WHERE k.conrelid = 'kf'::regclass AND k.contype IN ('u', 'f') GROUP BY k.conname ORDER BY 1", .head = "T:conname/19/64/-1,array_agg/1009/-1/-1;C:SELECT 3;Z:I", .rows = &.{"kf_fk|{x}", "kf_fk2|{y}", "kf_u|{x\\,y}"}, .ordered = true },
     } },
+    .{ .name = "07_check_option", .statements = &.{
+        .{ .source = "CREATE TABLE t(a INT, b TEXT)", .head = "C:CREATE TABLE;Z:I", .rows = &.{}, .ordered = false },
+        .{ .source = "CREATE VIEW v AS SELECT a, b FROM t", .head = "C:CREATE VIEW;Z:I", .rows = &.{}, .ordered = false },
+        .{ .source = "CREATE VIEW vc AS SELECT a, b FROM t WHERE a > 0 WITH CHECK OPTION", .head = "C:CREATE VIEW;Z:I", .rows = &.{}, .ordered = false },
+        .{ .source = "CREATE VIEW vl AS SELECT a FROM vc WHERE a < 10 WITH LOCAL CHECK OPTION", .head = "C:CREATE VIEW;Z:I", .rows = &.{}, .ordered = false },
+        .{ .source = "CREATE VIEW vcc AS SELECT a FROM v WITH CASCADED CHECK OPTION", .head = "C:CREATE VIEW;Z:I", .rows = &.{}, .ordered = false },
+        .{ .source = "CREATE VIEW vx AS SELECT a + 1 AS x FROM t", .head = "C:CREATE VIEW;Z:I", .rows = &.{}, .ordered = false },
+        .{ .source = "SELECT table_name, check_option, is_updatable, is_insertable_into, is_trigger_updatable, is_trigger_deletable, is_trigger_insertable_into FROM information_schema.views WHERE table_schema = 'public' ORDER BY table_name", .head = "T:table_name/19/64/-1,check_option/1043/-1/-1,is_updatable/1043/-1/7,is_insertable_into/1043/-1/7,is_trigger_updatable/1043/-1/7,is_trigger_deletable/1043/-1/7,is_trigger_insertable_into/1043/-1/7;C:SELECT 5;Z:I", .rows = &.{"v|NONE|YES|YES|NO|NO|NO", "vc|CASCADED|YES|YES|NO|NO|NO", "vcc|CASCADED|YES|YES|NO|NO|NO", "vl|LOCAL|YES|YES|NO|NO|NO", "vx|NONE|NO|NO|NO|NO|NO"}, .ordered = true },
+        .{ .source = "SELECT table_name, is_insertable_into FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name", .head = "T:table_name/19/64/-1,is_insertable_into/1043/-1/7;C:SELECT 6;Z:I", .rows = &.{"t|YES", "v|YES", "vc|YES", "vcc|YES", "vl|YES", "vx|NO"}, .ordered = true },
+        .{ .source = "SELECT table_name, column_name, is_updatable FROM information_schema.columns WHERE table_schema = 'public' ORDER BY table_name, ordinal_position", .head = "T:table_name/19/64/-1,column_name/19/64/-1,is_updatable/1043/-1/7;C:SELECT 9;Z:I", .rows = &.{"t|a|YES", "t|b|YES", "v|a|YES", "v|b|YES", "vc|a|YES", "vc|b|YES", "vcc|a|YES", "vl|a|YES", "vx|x|NO"}, .ordered = true },
+        .{ .source = "SELECT view_name, table_name, column_name FROM information_schema.view_column_usage WHERE view_schema = 'public' ORDER BY 1, 2, 3", .head = "T:view_name/19/64/-1,table_name/19/64/-1,column_name/19/64/-1;C:SELECT 7;Z:I", .rows = &.{"v|t|a", "v|t|b", "vc|t|a", "vc|t|b", "vcc|v|a", "vl|vc|a", "vx|t|a"}, .ordered = true },
+        .{ .source = "INSERT INTO vc VALUES (-1, 'x')", .head = "E:44000;Z:I", .rows = &.{}, .ordered = false },
+        .{ .source = "SELECT count(*) FROM t", .head = "T:count/20/8/-1;C:SELECT 1;Z:I", .rows = &.{"0"}, .ordered = false },
+    } },
 };
