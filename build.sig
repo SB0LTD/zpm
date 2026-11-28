@@ -290,6 +290,13 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addContract(ctx, test_sql, "contract-sql-composite-catalog", "tests/test_sql_composite_catalog.sig", &.{importEntry("sql", "src/core/sql.sig")});
     // Generated SQL-standard feature probes (tests/sql_conformance/generate_feature_contract.py):
     // fails only when a probe the committed scoreboard records as passing regresses.
+    // information_schema and CURRENT_CATALOG / CURRENT_SCHEMA (B11 wave 5,
+    // catalog lane): native PostgreSQL 18.7 recordings plus snapshots, replay
+    // and capacity.
+    _ = try addContract(ctx, test_sql, "contract-sql-catalog-views", "tests/test_sql_catalog_views.sig", &.{
+        importEntry("sql", "src/core/sql.sig"),       importEntry("db_store", "src/db/store.sig"),
+        importEntry("postgres", "src/db/postgres.sig"), importEntry("scram", "src/db/scram.sig"),
+    });
     _ = try addContract(ctx, test_sql, "contract-sql-features", "tests/test_sql_features.sig", &.{
         importEntry("sql", "src/core/sql.sig"),       importEntry("db_store", "src/db/store.sig"),
         importEntry("postgres", "src/db/postgres.sig"), importEntry("scram", "src/db/scram.sig"),

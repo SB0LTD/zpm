@@ -73,16 +73,90 @@ continues to use its existing single-verifier bootstrap path.
 | PG.INTEGRATION.FOREIGN | CREATE / DROP FOREIGN DATA WRAPPER [NO HANDLER] [NO VALIDATOR] (superusers), CREATE [IF NOT EXISTS] / DROP SERVER [TYPE] [VERSION] (USAGE = wrapper owner); DROP ... CASCADE; pg_foreign_data_wrapper, pg_foreign_server. Catalog entries only | handlers, validators, OPTIONS, user mappings, foreign tables, IMPORT FOREIGN SCHEMA (0A000) |
 | PG.INTEGRATION.REPLICATION | CREATE PUBLICATION [FOR ALL TABLES] [WITH (publish = ..., publish_via_partition_root)], DROP PUBLICATION (superusers); pg_publication. Catalog entries only | FOR TABLE / TABLES IN SCHEMA, ALTER PUBLICATION, logical decoding, subscriptions (0A000) |
 
-`information_schema.tables`, `columns`, `table_constraints`, and
-`key_column_usage` use the current role's ownership and effective table
-grants, including inherited and `PUBLIC` grants. A grant of SELECT, INSERT,
-UPDATE, or REFERENCES qualifies a relation for `columns` and qualifies a
-table for `key_column_usage`. DELETE, TRUNCATE, and TRIGGER also qualify for
-`tables`, while `table_constraints` uses the `tables` grant set with SELECT
-omitted. The `tables` and `columns` views omit materialized views. Constraint
-metadata covers ordinary and partitioned tables. `pg_class` and `pg_attribute`
-expose relation metadata to ordinary roles. Schema ACLs for `schemata` and
-column-level grants remain separate conformance work.
+`information_schema` (B11 wave 5) is described below. `pg_class` and
+`pg_attribute` expose relation metadata to ordinary roles.
+
+## information_schema (B11 wave 5, catalog lane)
+
+Every relation of PostgreSQL 18's information_schema exists: the 60 views,
+the four tables `sql_features`, `sql_implementation_info`, `sql_parts` and
+`sql_sizing`, and the five internal `_pg_*` helper views
+(src/core/sql/information_schema.sig, rows in information_schema_rows.sig).
+Nothing is stored: each is computed at scan time from the versioned catalogs
+under the statement snapshot, so a transaction sees its own uncommitted DDL,
+an aborted one leaves no trace, and a replica built from the change records
+answers like its primary. No change-log op, value tag or definition format
+was added.
+
+Shapes. Column names, order and types are generated from native PostgreSQL
+18.7 (tools/gen_information_schema.py into information_schema_data.sig).
+Columns carry their information_schema domain and, as PostgreSQL does, the
+wire reports the domain's base type: `sql_identifier` name (19/64/-1),
+`cardinal_number` int4, `character_data` varchar, `yes_or_no` varchar(3)
+(typmod 7), `time_stamp` timestamptz(2). `information_schema.columns`
+reports those domains (`domain_name`), collation "C" for the string columns
+of catalog tables and information_schema relations, and the five domains
+appear in `domains`, `domain_constraints`, `domain_udt_usage`,
+`check_constraints`, `column_domain_usage` and `usage_privileges`.
+
+Rows follow information_schema.sql (REL_18): privilege filters use
+`pg_has_role(..., 'USAGE')` (superusers and members, with INHERIT) and the
+table grants (`tables`/`views`/`columns` any of SELECT, INSERT, UPDATE,
+DELETE, TRUNCATE, REFERENCES, TRIGGER; constraints and triggers without
+SELECT); `*_privileges` explode the owner's default and each grant and list
+rows whose grantor or grantee the role has, or PUBLIC; `role_*_grants`
+narrow them to enabled roles. MAINTAIN is not listed (PostgreSQL 18).
+PostgreSQL 18's NOT NULL constraints are listed as `<table>_<column>_not_null`
+CHECK constraints (`table_constraints`, `check_constraints`,
+`constraint_column_usage`), including primary-key columns. `views` reports
+`is_updatable` / `is_insertable_into` from pg_relation_is_updatable (an
+automatically updatable view chain, unconditional INSTEAD rules) and the
+INSTEAD OF trigger flags; `columns.is_updatable` follows
+pg_column_is_updatable. `routines` and `parameters` cover user routines
+(modes, typed `parameter_default`) and the built-ins pg_proc lists.
+`sql_features`, `sql_implementation_info`, `sql_parts` and `sql_sizing` hold
+PostgreSQL 18's rows in physical order, PostgreSQL's own `is_supported`
+values included; DBMS VERSION is `16.00.0000` (the wire's server_version
+16.0) and the sizing rows for columns per table / per SELECT report this
+configuration's limits. System relations (the implemented pg_catalog
+relations and information_schema itself) are listed in `tables`, `columns`,
+`views`, `*_privileges` with PostgreSQL's catalog ACLs: owned by the
+bootstrap superuser, SELECT to PUBLIC except pg_authid, pg_largeobject,
+pg_subscription, sql_parts, transforms and the `_pg_*` views.
+
+Also: CURRENT_CATALOG and CURRENT_SCHEMA (niladic; `current_catalog()` is
+42601), `version()` (`PostgreSQL 16.0 on <arch>-<os>, compiled by Sig,
+64-bit`), `pg_function_is_visible(oid)` (psql's `\df`), pg_constraint
+`conkey` / `confkey` (int2[]; a CHECK's columns in order of first
+appearance), "char" typing of pg_class.relpersistence / relreplident,
+pg_constraint.contype / confupdtype / confdeltype / confmatchtype,
+pg_type.typcategory / typdelim, pg_collation.collprovider and
+pg_policy.polcmd, and PostgreSQL's CASE column naming (a named ELSE result
+names the column).
+
+A lone catalog source filters each candidate row with every available,
+infallible conjunct of the WHERE clause (comparisons, IN lists and LIKE
+with a literal pattern), so filtered scans of the wide views keep only
+matching rows; an unfiltered scan wider than the workspace is 54000.
+
+Not represented, because nothing in the engine stores it: column-level
+grants and type / sequence ACLs (the privileges lane), columns typed by a
+domain, WITH CHECK OPTION (`views.check_option` is NONE), temporary schemas,
+table row types (`udt_privileges` lists composite types only), named NOT
+NULL constraints, foreign tables, options and user mappings, transforms,
+dependencies of routines and of system views (`routine_*_usage`,
+`check_constraint_routine_usage`, `view_routine_usage` are empty; system
+views have no `view_definition`). `views.view_definition`,
+`check_clause` and `triggers.action_condition` show the stored text as
+pg_get_viewdef / pg_get_constraintdef / pg_get_triggerdef do, not
+PostgreSQL's deparsed form. The public schema's owner is the bootstrap
+role (PostgreSQL 15+ uses pg_database_owner).
+
+`contract-sql-catalog-views` (tests/test_sql_catalog_views.sig) replays
+tests/sql_conformance/catalog_views/*.sql through the wire and compares
+every response with the native PostgreSQL 18.7 recording
+(tools/capture_sql_catalog_views.py, test_sql_catalog_views_cases.sig),
+then checks snapshots, atomicity, replay and capacity.
 
 ## PG.TYPE.ENUM_DOMAIN_COMPOSITE
 
