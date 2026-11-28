@@ -809,6 +809,7 @@ pub fn Eval(comptime config: types.Config) type {
                 count += 1;
             }
             const base: usize = if (n.func == .has_column_privilege) 3 else 2;
+            if (count < base) return error.UndefinedFunction;
             const first: usize = count - base;
             const subject = struct {
                 fn of(cell: *const V.Cell, numeric: bool) value_module.PrivilegeSubject {

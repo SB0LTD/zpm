@@ -2758,6 +2758,8 @@ pub fn Database(comptime config: Config) type {
             self.routine_path_len = 0;
             self.routine_diag = .{};
             self.error_detail = "";
+            // GRANT / REVOKE scratch (privileges lane) carries nothing over.
+            self.privilege_scratch.column_count = 0;
             // A logical copy has fresh session/execution state. In particular,
             // never copy caller-owned interrupt or sequence-hook pointers.
             self.sequence_session = null;
@@ -6340,8 +6342,13 @@ pub fn Database(comptime config: Config) type {
             var groups: [CO.list_capacity]u32 = undefined;
             var grantors: [CO.list_capacity]u32 = undefined;
             var members: [CO.list_capacity]u32 = undefined;
-            for (grant.granted[0..grant.granted_count], 0..) |ident, index| {
+            var group_count: usize = 0;
+            for (grant.granted[0..grant.granted_count]) |ident| {
                 const group = self.catalog_objects.roleByName(objectName(source, ident).slice(), latest) orelse return error.UndefinedObject;
+                // A role named twice is granted once.
+                if (std.mem.indexOfScalar(u32, groups[0..group_count], group) != null) continue;
+                const index = group_count;
+                group_count += 1;
                 groups[index] = group;
                 if (!superuser and self.catalog_objects.superuser(group, latest)) return error.InsufficientPrivilege;
                 grantors[index] = if (explicit) |grantor| blk: {
@@ -6351,27 +6358,31 @@ pub fn Database(comptime config: Config) type {
                 // pg_database_owner's only member is the database owner (0A000).
                 if (!revoke and group == CO.role_pg_database_owner) return error.UnsupportedStatement;
             }
-            for (grant.grantees[0..grant.grantee_count], 0..) |grantee, index| {
+            var member_count: usize = 0;
+            for (grant.grantees[0..grant.grantee_count]) |grantee| {
                 if (grantee.kind == .public) return error.UndefinedObject;
-                members[index] = try self.objectRole(source, grantee, latest);
-                if (!revoke and members[index] == CO.role_pg_database_owner) return error.UnsupportedStatement;
+                const member = try self.objectRole(source, grantee, latest);
+                if (!revoke and member == CO.role_pg_database_owner) return error.UnsupportedStatement;
+                if (std.mem.indexOfScalar(u32, members[0..member_count], member) != null) continue;
+                members[member_count] = member;
+                member_count += 1;
             }
-            for (groups[0..grant.granted_count]) |group| {
+            for (groups[0..group_count]) |group| {
                 for (&self.catalog_objects.items) |*row| {
                     if (row.kind == .member and row.target == group) if (O.pendingOf(row, snap)) |other| return self.objectPark(slot, other);
                 }
             }
             if (revoke) {
-                for (groups[0..grant.granted_count], grantors[0..grant.granted_count]) |group, grantor| {
-                    try self.revokeMembership(slot, grant, group, grantor, members[0..grant.grantee_count], snap, latest);
+                for (groups[0..group_count], grantors[0..group_count]) |group, grantor| {
+                    try self.revokeMembership(slot, grant, group, grantor, members[0..member_count], snap, latest);
                 }
                 return;
             }
-            try self.reserveWrites(slot, 2 * grant.granted_count * grant.grantee_count);
-            for (0..grant.granted_count * grant.grantee_count) |pair| {
-                const group = groups[pair / grant.grantee_count];
-                const grantor = grantors[pair / grant.grantee_count];
-                const member = members[pair % grant.grantee_count];
+            try self.reserveWrites(slot, 2 * group_count * member_count);
+            for (0..group_count * member_count) |pair| {
+                const group = groups[pair / member_count];
+                const grantor = grantors[pair / member_count];
+                const member = members[pair % member_count];
                 if (group == member or self.catalog_objects.memberOf(group, member, false, latest)) return error.InvalidGrantOperation;
                 if (self.membershipRow(group, member, grantor, latest)) |index| {
                     var next = self.catalog_objects.items[index];
@@ -6833,7 +6844,9 @@ pub fn Database(comptime config: Config) type {
                 .all_tables, .all_sequences => {
                     var relations: [K.relation_rows]K.Found = undefined;
                     const count = self.catalog.visibleRelations(latest, &relations);
-                    for (namespaces[0..grant.table_count]) |namespace| {
+                    for (namespaces[0..grant.table_count], 0..) |namespace, position| {
+                        // A schema named twice is changed once.
+                        if (std.mem.indexOfScalar(u32, namespaces[0..position], namespace) != null) continue;
                         for (relations[0..count]) |found| {
                             if (grant.object == .all_sequences) {
                                 if (found.kind != 'S' or self.seqs[found.slot].namespace != namespace) continue;
@@ -6848,12 +6861,19 @@ pub fn Database(comptime config: Config) type {
                         }
                     }
                 },
-                else => for (targets[0..grant.table_count]) |object_oid| switch (object_oid) {
+                else => for (targets[0..grant.table_count], 0..) |object_oid, position| {
+                    // An object named twice is changed once (PostgreSQL's
+                    // CommandCounterIncrement between duplicates).
+                    var duplicate = false;
+                    for (targets[0..position]) |earlier| duplicate = duplicate or std.meta.eql(earlier, object_oid);
+                    if (duplicate) continue;
+                    switch (object_oid) {
                     .relation => |table_slot| try self.grantRelation(slot, source, grant, table_slot, grantees, revoke, snap),
                     .sequence => |seq_slot| try self.grantSequence(slot, grant, seq_slot, grantees, revoke, grant.object == .table, snap),
                     .schema => |schema_slot| try self.grantSchema(slot, grant, self.schemas[schema_slot].oid, self.schemaOwner(&self.schemas[schema_slot], latest), self.schemas[schema_slot].name.slice(), grantees, revoke, snap),
                     .public_schema => try self.grantSchema(slot, grant, CO.public_namespace, CO.role_pg_database_owner, "public", grantees, revoke, snap),
                     .user_type => |index| try self.grantType(slot, grant, index, grantees, revoke, snap),
+                    }
                 },
             }
         }
