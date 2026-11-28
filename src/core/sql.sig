@@ -10613,6 +10613,8 @@ pub fn Database(comptime config: Config) type {
                 boolCell(false), boolCell(false), boolCell(true), boolCell(true),
                 intCell(table.oid), intCell(0), intCell(0), intCell(0), intCell(0),
                 .{ .pg_internal_char = ' ' }, .{ .pg_internal_char = ' ' }, .{ .pg_internal_char = ' ' }, boolCell(false), boolCell(true),
+                // conkey {attnum}; no referenced columns.
+                try attnumArray(&[1]u8{@intCast(attnum - 1)}), .null_value,
             });
         }
 
