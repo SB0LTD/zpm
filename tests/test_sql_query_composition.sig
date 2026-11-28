@@ -645,17 +645,18 @@ fn recursiveSearch() !void {
     // NULL cycle values never equal, so they never close a cycle.
     try expect("WITH RECURSIVE t(n,k) AS (SELECT 1,NULL::int UNION ALL SELECT n+1,k FROM t WHERE n<3) CYCLE k SET c USING p SELECT n,c FROM t ORDER BY n", "1|f;2|f;3|f");
     try expect("WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t WHERE n<3) CYCLE n SET c USING p SELECT COUNT(*) FROM t WHERE false", "0");
-    // The record-typed sequence and path columns are not exposed (0A000).
-    try rejects(graph ++ "SEARCH DEPTH FIRST BY node SET ord SELECT ord FROM r", error.UnsupportedStatement);
-    try rejects(graph ++ "CYCLE node SET looped USING trail SELECT trail FROM r", error.UnsupportedStatement);
-    try rejects(graph ++ "CYCLE node SET looped USING trail SELECT * FROM r", error.UnsupportedStatement);
-    try rejects(graph ++ "SEARCH DEPTH FIRST BY node SET ord SELECT node FROM r WHERE ord IS NULL", error.UnsupportedStatement);
+    // The sequence and path columns are record[] values (T133, B11 wave 5
+    // proc-tx; checked against native PostgreSQL 18.7).
+    try expectTyped(graph ++ "CYCLE node SET looped USING trail SELECT trail FROM r ORDER BY trail", "trail:2287", "{(1)};{(1),(2)};{(1),(2),(3)};{(1),(2),(3),(1)};{(1),(4)};{(1),(4),(5)}");
+    try expectTyped(graph ++ "CYCLE node SET looped USING trail SELECT * FROM r ORDER BY trail", "node:23,looped:16,trail:2287", "1|f|{(1)};2|f|{(1),(2)};3|f|{(1),(2),(3)};1|t|{(1),(2),(3),(1)};4|f|{(1),(4)};5|f|{(1),(4),(5)}");
+    try expect(graph ++ "SEARCH DEPTH FIRST BY node SET ord CYCLE node SET looped USING trail SELECT node, ord FROM r WHERE ord IS NULL", "");
     // Errors.
     try rejects("WITH t(n) AS (SELECT 1) SEARCH DEPTH FIRST BY n SET o SELECT 1", error.Syntax);
     try rejects("WITH RECURSIVE t(n) AS (SELECT 1) CYCLE n SET c USING p SELECT 1", error.Syntax);
     try rejects("WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t WHERE n<3) SEARCH DEPTH FIRST BY z SET o SELECT 1", error.Syntax);
     try rejects("WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t WHERE n<3) SEARCH DEPTH FIRST BY n,n SET o SELECT 1", error.DuplicateColumn);
-    try rejects("WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t WHERE n<3) SEARCH DEPTH FIRST BY n SET n SELECT 1", error.Syntax);
+    // The recursive term reads n, which SET n makes ambiguous (42702).
+    try rejects("WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t WHERE n<3) SEARCH DEPTH FIRST BY n SET n SELECT 1", error.AmbiguousColumn);
     try rejects("WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t WHERE n<3) CYCLE n SET c USING c SELECT 1", error.Syntax);
     try rejects("WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t WHERE n<3) SEARCH DEPTH FIRST BY n SET o CYCLE n SET o USING p SELECT 1", error.Syntax);
     try rejects("WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t WHERE n<3) CYCLE n SET c TO 1 DEFAULT true USING p SELECT 1", error.TypeMismatch);

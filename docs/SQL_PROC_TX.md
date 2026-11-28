@@ -1,11 +1,13 @@
-# Transaction control in procedures, SEARCH / CYCLE (B11 wave 5, proc-tx)
+# Transaction control in procedures, SEARCH / CYCLE values (B11 wave 5, proc-tx)
 
 Branch `w5/proc-tx`. `contract-sql-proc-tx` (tests/test_sql_proc_tx.sig)
 runs every statement through the PostgreSQL wire over store connections,
 replays every committed record into a replica that must answer like the
 primary after each step, and checks a crash between two COMMITs. Every
 expectation was checked against native PostgreSQL 18.7 statement by
-statement, except where this page says otherwise.
+statement, except where this page says otherwise. It closes two items that
+docs/SQL_DML_TEMP.md lists as not done (COMMIT / ROLLBACK inside procedures
+and enhanced cycle marks).
 
 ## COMMIT / ROLLBACK inside procedures and DO blocks (T261 in CALL / DO)
 
@@ -81,6 +83,52 @@ Not covered: `FOR record IN query LOOP` (and with it the holdable cursor a
 COMMIT inside such a loop needs) is still outside the PL/pgSQL subset
 (docs/SQL_ROUTINES.md); cursors declared in routines.
 
+## SEARCH and CYCLE values (T133)
+
+`WITH RECURSIVE ... SEARCH DEPTH | BREADTH FIRST BY c, ... SET seq` and
+`CYCLE c, ... SET mark [TO v DEFAULT d] USING path` were executed before
+(wave 4), but the sequence and path columns were 0A000. They are now
+PostgreSQL's values:
+
+| Column | Type (OID) | Text |
+|---|---|---|
+| DEPTH FIRST sequence | record[] (2287) | `{(1),(2)}`, `{"(1,2)","(2,3)"}` |
+| BREADTH FIRST sequence | record (2249) | `(0,1)`, `(1,2,"a,b")` |
+| CYCLE path | record[] (2287) | `{(1),(2),(1)}` |
+
+- **Text.** Each record is record_out's: every field in its type's output
+  form (booleans `t` / `f`, dates in the session's style, floats by
+  extra_float_digits), double-quoted when empty or holding a quote,
+  backslash, parenthesis, comma or white space, quotes and backslashes
+  doubled, NULL empty. Arrays quote elements as array_out does.
+- **Columns.** `SELECT *` lists the user columns, then the sequence, mark
+  and path, as PostgreSQL. pg_typeof gives `record` / `record[]`; `::text`
+  and assignment to a text column give the text; `=`, IS [NOT] DISTINCT
+  FROM, DISTINCT, GROUP BY and count(DISTINCT) compare the values.
+- **Ordering.** ORDER BY a sequence or path column read straight from its
+  CTE (by name, position or qualified) sorts by an order-preserving key
+  that compares the records field by field and the arrays element by
+  element, NULL fields last, as PostgreSQL does. SEARCH columns and keyed
+  CYCLE columns are smallint, integer, bigint, boolean, text, date,
+  timestamp[tz], real and double precision (other SEARCH column types stay
+  0A000, as before).
+- **Names.** PostgreSQL binds the recursive term with the SEARCH / CYCLE
+  columns already added: a reference there to a WITH column named like one
+  of them is 42702; any other clash with a WITH column or between the names
+  is 42601; listed columns must exist (42601) once (42701). A column of
+  either type in CREATE TABLE AS or CREATE VIEW is 42P16.
+- **Cost.** Values are built from the parent row's as rows are generated,
+  and only when the statement reads them (or a UNION compares them).
+
+Not PostgreSQL's, each an error rather than a different answer: ordering
+by a sequence or path value that passed through a derived table, a set
+operation, grouping or DISTINCT, or by a path whose cycle columns have no
+key (numeric, ...) is 0A000; record / record[] operators and functions
+(`o > ARRAY[ROW(1)]`, `ROW(2) = ANY(path)`, cardinality, `||`, min / max,
+json_agg) are 0A000 or 42883; a value longer than a text value
+(Config.text_bytes) is 54000. A VALUES non-recursive term is 0A000 as
+before.
+
 ## Engine and store changes
 
 - `src/core/sql.sig`: `StatementOptions.transaction_control`,
@@ -91,6 +139,10 @@ COMMIT inside such a loop needs) is still outside the PL/pgSQL subset
   transaction changed under them.
 - `src/core/sql/routine.sig`: the interpreter passes COMMIT vs ROLLBACK and
   AND CHAIN, and reports its EXCEPTION blocks (not while a handler runs).
+- T133: `src/core/sql/types.sig` (the record / record[] pseudo-types next
+  to catalog_anyarray), `src/core/sql/binder.sig` (column layout, ORDER BY
+  keys, name checks, 42P16, orderableType), `src/core/sql/exec.sig` (values
+  and keys), `src/core/sql/json_build.sig` (no JSON of the text form).
 - `src/db/store.sig`: `Connection.endStatementTransaction` (the hook),
   `Pending.nonatomic`, `statement_commit_error`.
 - New Database fields (`statement_control`, `call_commits`,
@@ -99,5 +151,6 @@ COMMIT inside such a loop needs) is still outside the PL/pgSQL subset
 
 ## Errors
 
-Used: 2D000, 0A000, 25001, 25006, 55P03, 22012, 23503, 42883, 58030, 53200.
-No new SQLSTATE mapping was needed.
+Used: 2D000, 0A000, 25001, 25006, 55P03, 22012, 23503, 42883, 58030, 53200;
+for T133 also 42702, 42601, 42701, 42P16, 42846, 22P02, 54000. No new
+SQLSTATE mapping was needed.

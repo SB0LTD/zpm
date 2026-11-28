@@ -10,13 +10,17 @@
 //! nested CALL / DO chains, loops, INOUT results, AND CHAIN characteristics,
 //! SET TRANSACTION after a COMMIT, an error after a COMMIT, lock waits before
 //! and after a COMMIT, the extended protocol and a crash between two COMMITs.
+//! Then the SEARCH sequence and CYCLE path values of recursive queries (T133):
+//! record / record[] types and text, ordering by their keys and name checks.
 //!
 //! Every statement runs through the PostgreSQL wire over store connections
 //! and reduces to command tags, SQLSTATEs, column names and data rows; every
 //! committed record replays into a replica that must answer like the primary
 //! after each step. Every expectation was checked against native PostgreSQL
 //! 18.7, except the lock wait after a COMMIT, which PostgreSQL waits out and
-//! this store fails at once (55P03; docs/SQL_PROC_TX.md).
+//! this store fails at once (55P03; native gives the same with lock_timeout
+//! set), and the marked SEARCH / CYCLE errors where PostgreSQL computes a
+//! value (docs/SQL_PROC_TX.md).
 const std = @import("std");
 const sql = @import("sql");
 const pg = @import("postgres");
@@ -612,6 +616,100 @@ fn clocks() !void {
     });
 }
 
+// ---- SEARCH / CYCLE (T133) ----------------------------------------------
+
+const cte_w = "WITH RECURSIVE w(a) AS (SELECT 1 UNION ALL SELECT a + 1 FROM w WHERE a < 3) ";
+const cte_g = "WITH RECURSIVE w(a, b) AS (SELECT a, b FROM g WHERE a = 1 UNION ALL SELECT g.a, g.b FROM g JOIN w ON g.a = w.b) ";
+
+fn searchCycle() !void {
+    try reset();
+    try steps(0, &.{
+        .{ "CREATE TABLE g(a INT, b INT)", "C:CREATE TABLE" },
+        .{ "INSERT INTO g VALUES (1, 2), (2, 3), (3, 1)", "C:INSERT 0 3" },
+        // The T133 probe: marks, the record[] path and the sequence.
+        .{ cte_g ++ "CYCLE a SET looped TO 'Y' DEFAULT 'N' USING path SELECT a, b, looped FROM w", "T:a,b,looped;1|2|N;2|3|N;3|1|N;1|2|Y C:SELECT 4" },
+        .{ cte_g ++ "CYCLE a SET looped USING path SELECT a, looped, path FROM w", "T:a,looped,path;1|f|{(1)};2|f|{(1),(2)};3|f|{(1),(2),(3)};1|t|{(1),(2),(3),(1)} C:SELECT 4" },
+        .{ cte_w ++ "SEARCH DEPTH FIRST BY a SET ord SELECT a, ord FROM w ORDER BY ord", "T:a,ord;1|{(1)};2|{(1),(2)};3|{(1),(2),(3)} C:SELECT 3" },
+        .{ cte_w ++ "SEARCH BREADTH FIRST BY a SET ord SELECT * FROM w ORDER BY ord", "T:a,ord;1|(0,1);2|(1,2);3|(2,3) C:SELECT 3" },
+        .{ cte_g ++ "SEARCH DEPTH FIRST BY a, b SET ord CYCLE a, b SET looped USING path SELECT * FROM w",
+            "T:a,b,ord,looped,path;1|2|{\"(1,2)\"}|f|{\"(1,2)\"};2|3|{\"(1,2)\",\"(2,3)\"}|f|{\"(1,2)\",\"(2,3)\"};3|1|{\"(1,2)\",\"(2,3)\",\"(3,1)\"}|f|{\"(1,2)\",\"(2,3)\",\"(3,1)\"};" ++
+                "1|2|{\"(1,2)\",\"(2,3)\",\"(3,1)\",\"(1,2)\"}|t|{\"(1,2)\",\"(2,3)\",\"(3,1)\",\"(1,2)\"} C:SELECT 4" },
+        // record_out and array_out quoting, NULL fields, empty strings.
+        .{ "WITH RECURSIVE w(a, t) AS (SELECT 1, 'x y'::text UNION ALL SELECT a + 1, CASE WHEN a = 1 THEN NULL ELSE 'q\"z' END FROM w WHERE a < 4) CYCLE a, t SET c USING p SELECT * FROM w",
+            "T:a,t,c,p;1|x y|f|{\"(1,\\\"x y\\\")\"};2|\\N|f|{\"(1,\\\"x y\\\")\",\"(2,)\"};3|q\"z|f|{\"(1,\\\"x y\\\")\",\"(2,)\",\"(3,\\\"q\\\"\\\"z\\\")\"};" ++
+                "4|q\"z|f|{\"(1,\\\"x y\\\")\",\"(2,)\",\"(3,\\\"q\\\"\\\"z\\\")\",\"(4,\\\"q\\\"\\\"z\\\")\"} C:SELECT 4" },
+        .{ "WITH RECURSIVE w(a, t) AS (SELECT 1, ''::text UNION ALL SELECT a + 1, 'a,b' FROM w WHERE a < 3) SEARCH BREADTH FIRST BY a, t SET o SELECT * FROM w", "T:a,t,o;1||(0,1,\"\");2|a,b|(1,2,\"a,b\");3|a,b|(2,3,\"a,b\") C:SELECT 3" },
+        .{ "WITH RECURSIVE w(a, f) AS (SELECT 1, true UNION ALL SELECT a + 1, NOT f FROM w WHERE a < 3) SEARCH DEPTH FIRST BY f, a SET o SELECT o, a FROM w ORDER BY o", "T:o,a;{\"(t,1)\"}|1;{\"(t,1)\",\"(f,2)\"}|2;{\"(t,1)\",\"(f,2)\",\"(t,3)\"}|3 C:SELECT 3" },
+        .{ "WITH RECURSIVE w(a, d) AS (SELECT 1, 1.5::numeric UNION ALL SELECT a + 1, d * 2 FROM w WHERE a < 3) CYCLE d SET m USING p SELECT * FROM w", "T:a,d,m,p;1|1.5|f|{(1.5)};2|3.0|f|{(1.5),(3.0)};3|6.0|f|{(1.5),(3.0),(6.0)} C:SELECT 3" },
+        .{ "WITH RECURSIVE w(a, d) AS (SELECT 1, date '2024-01-01' UNION ALL SELECT a + 1, d + 1 FROM w WHERE a < 3) SEARCH DEPTH FIRST BY d SET o SELECT * FROM w", "T:a,d,o;1|2024-01-01|{(2024-01-01)};2|2024-01-02|{(2024-01-01),(2024-01-02)};3|2024-01-03|{(2024-01-01),(2024-01-02),(2024-01-03)} C:SELECT 3" },
+        .{ "WITH RECURSIVE w(a, x) AS (SELECT 1, 1.5::float8 UNION ALL SELECT a + 1, x / 3 FROM w WHERE a < 3) SEARCH BREADTH FIRST BY x SET o SELECT * FROM w", "T:a,x,o;1|1.5|(0,1.5);2|0.5|(1,0.5);3|0.16666666666666666|(2,0.16666666666666666) C:SELECT 3" },
+        // Ordering compares the records field by field, not their text.
+        .{ "WITH RECURSIVE w(a) AS (SELECT 1 UNION ALL SELECT a + 1 FROM w WHERE a < 12) SEARCH DEPTH FIRST BY a SET o SELECT a FROM w ORDER BY o DESC LIMIT 3", "T:a;12;11;10 C:SELECT 3" },
+        .{ "WITH RECURSIVE w(a) AS (SELECT 1 UNION ALL SELECT a + 1 FROM w WHERE a < 12) CYCLE a SET m USING p SELECT a FROM w ORDER BY p DESC LIMIT 2", "T:a;12;11 C:SELECT 2" },
+        .{ cte_w ++ "SEARCH DEPTH FIRST BY a SET o SELECT o FROM w ORDER BY 1 DESC", "T:o;{(1),(2),(3)};{(1),(2)};{(1)} C:SELECT 3" },
+        .{ cte_w ++ "SEARCH DEPTH FIRST BY a SET o SELECT x.o FROM w AS x ORDER BY x.o DESC", "T:o;{(1),(2),(3)};{(1),(2)};{(1)} C:SELECT 3" },
+        .{ cte_w ++ "SEARCH DEPTH FIRST BY a SET o SELECT a FROM w ORDER BY o, a", "T:a;1;2;3 C:SELECT 3" },
+        .{ cte_w ++ "CYCLE a SET m USING p SELECT * FROM w ORDER BY p DESC", "T:a,m,p;3|f|{(1),(2),(3)};2|f|{(1),(2)};1|f|{(1)} C:SELECT 3" },
+        .{ cte_w ++ "SEARCH BREADTH FIRST BY a SET o SELECT o FROM w WHERE a = 2", "T:o;(1,2) C:SELECT 1" },
+        .{ "WITH RECURSIVE w(a) AS (SELECT 1 UNION SELECT a + 1 FROM w WHERE a < 3) CYCLE a SET m USING p SELECT * FROM w", "T:a,m,p;1|f|{(1)};2|f|{(1),(2)};3|f|{(1),(2),(3)} C:SELECT 3" },
+        // The record types: their names, text casts, equality, DISTINCT.
+        .{ cte_w ++ "SEARCH DEPTH FIRST BY a SET o SELECT pg_typeof(o), o::text FROM w LIMIT 1", "T:pg_typeof,o;record[]|{(1)} C:SELECT 1" },
+        .{ cte_w ++ "SEARCH BREADTH FIRST BY a SET o SELECT pg_typeof(o) FROM w LIMIT 1", "T:pg_typeof;record C:SELECT 1" },
+        .{ cte_w ++ "CYCLE a SET m USING p SELECT p::text || '!' AS t, length(p::text) FROM w", "T:t,length;{(1)}!|5;{(1),(2)}!|9;{(1),(2),(3)}!|13 C:SELECT 3" },
+        .{ cte_w ++ "CYCLE a SET m USING p SELECT count(DISTINCT p), max(a) FROM w", "T:count,max;3|3 C:SELECT 1" },
+        .{ cte_w ++ "CYCLE a SET m USING p SELECT p = p FROM w LIMIT 1", "T:?column?;t C:SELECT 1" },
+        .{ "CREATE TABLE s(x text)", "C:CREATE TABLE" },
+        .{ "INSERT INTO s " ++ cte_w ++ "CYCLE a SET m USING p SELECT p FROM w", "C:INSERT 0 3" },
+        .{ "SELECT x FROM s ORDER BY x", "T:x;{(1),(2),(3)};{(1),(2)};{(1)} C:SELECT 3" },
+        // No table or view column has a pseudo-type (42P16).
+        .{ "CREATE TABLE keep AS " ++ cte_w ++ "SEARCH BREADTH FIRST BY a SET o SELECT * FROM w", "E:42P16" },
+        .{ "CREATE VIEW v AS " ++ cte_w ++ "CYCLE a SET m USING p SELECT * FROM w", "E:42P16" },
+        // Names: a reference in the recursive term to a WITH column named
+        // like a SEARCH / CYCLE column is ambiguous (42702); otherwise the
+        // clash is 42601. Listed columns must exist (42601), once (42701).
+        .{ cte_w ++ "SEARCH DEPTH FIRST BY a SET a SELECT 1 FROM w", "E:42702" },
+        .{ cte_w ++ "CYCLE a SET a USING p SELECT 1 FROM w", "E:42702" },
+        .{ cte_w ++ "CYCLE a SET m USING a SELECT 1 FROM w", "E:42702" },
+        .{ "WITH RECURSIVE w(a, b) AS (SELECT 1, 2 UNION ALL SELECT a + 1, 5 FROM w WHERE a < 3) SEARCH BREADTH FIRST BY a SET b SELECT 1 FROM w", "E:42601" },
+        .{ cte_w ++ "CYCLE a SET m USING m SELECT * FROM w", "E:42601" },
+        .{ cte_w ++ "SEARCH DEPTH FIRST BY a SET m CYCLE a SET m USING p SELECT * FROM w", "E:42601" },
+        .{ cte_w ++ "SEARCH DEPTH FIRST BY a SET p CYCLE a SET m USING p SELECT * FROM w", "E:42601" },
+        .{ cte_w ++ "SEARCH DEPTH FIRST BY z SET o SELECT * FROM w", "E:42601" },
+        .{ cte_w ++ "SEARCH DEPTH FIRST BY a, a SET o SELECT * FROM w", "E:42701" },
+        .{ cte_w ++ "CYCLE z SET m USING p SELECT * FROM w", "E:42601" },
+        .{ cte_w ++ "CYCLE a, a SET m USING p SELECT * FROM w", "E:42701" },
+        .{ cte_w ++ "CYCLE a SET m TO 1 DEFAULT 'x' USING p SELECT * FROM w", "E:22P02" },
+        .{ "WITH w(a) AS (SELECT 1) SEARCH DEPTH FIRST BY a SET o SELECT * FROM w", "E:42601" },
+        .{ "WITH RECURSIVE w(a) AS (SELECT 1) SEARCH DEPTH FIRST BY a SET o SELECT * FROM w", "E:42601" },
+        .{ "WITH RECURSIVE w(a, j) AS (SELECT 1, '{}'::json UNION ALL SELECT a + 1, j FROM w WHERE a < 3) CYCLE j SET m USING p SELECT a FROM w", "E:42883" },
+        // NULL fields, an element spelled NULL and one with braces.
+        .{ "WITH RECURSIVE w(a, t) AS (SELECT 1, 'NULL'::text UNION ALL SELECT a + 1, '{x}' FROM w WHERE a < 3) CYCLE t SET m USING p SELECT p FROM w", "T:p;{(NULL)};{(NULL),\"({x})\"};{(NULL),\"({x})\",\"({x})\"} C:SELECT 3" },
+        .{ "WITH RECURSIVE w(a, t) AS (SELECT 1, NULL::text UNION ALL SELECT a + 1, NULL FROM w WHERE a < 3) SEARCH DEPTH FIRST BY t SET o SELECT a, o FROM w ORDER BY o", "T:a,o;1|{()};2|{(),()};3|{(),(),()} C:SELECT 3" },
+        .{ cte_w ++ "SEARCH BREADTH FIRST BY a SET o CYCLE a SET m USING p SELECT * FROM w ORDER BY o DESC", "T:a,o,m,p;3|(2,3)|f|{(1),(2),(3)};2|(1,2)|f|{(1),(2)};1|(0,1)|f|{(1)} C:SELECT 3" },
+        .{ cte_w ++ "CYCLE a SET m USING p SELECT p IS NULL, p IS DISTINCT FROM p FROM w LIMIT 1", "T:?column?,?column?;f|f C:SELECT 1" },
+        .{ cte_w ++ "CYCLE a SET m USING p SELECT length(p) FROM w", "E:42883" },
+        .{ cte_w ++ "CYCLE a SET m USING p SELECT p::int FROM w", "E:42846" },
+    });
+    // Not PostgreSQL's (docs/SQL_PROC_TX.md): what needs record and
+    // record[] operators fails (0A000) where PostgreSQL computes it,
+    // instead of acting on the values' text, and a path longer than a text
+    // value is 54000.
+    try steps(0, &.{
+        .{ cte_w ++ "SEARCH DEPTH FIRST BY a SET o SELECT * FROM (SELECT o, a FROM w) q ORDER BY o DESC", "E:0A000" },
+        .{ cte_w ++ "CYCLE a SET m USING p SELECT p FROM w UNION SELECT p FROM w ORDER BY 1", "E:0A000" },
+        .{ cte_w ++ "CYCLE a SET m USING p SELECT p FROM w GROUP BY p ORDER BY p", "E:0A000" },
+        .{ "WITH RECURSIVE w(a, n) AS (SELECT 1, 1.5::numeric UNION ALL SELECT a + 1, n + 1 FROM w WHERE a < 3) CYCLE n SET m USING p SELECT a FROM w ORDER BY p", "E:0A000" },
+        .{ cte_w ++ "CYCLE a SET m USING p SELECT json_agg(p) FROM w", "E:0A000" },
+        .{ cte_w ++ "CYCLE a SET m USING p SELECT p || 'x' FROM w", "E:0A000" },
+        .{ cte_w ++ "SEARCH DEPTH FIRST BY a SET o SELECT a FROM w WHERE o > ARRAY[ROW(1)]", "E:0A000" },
+        .{ "WITH RECURSIVE w(a) AS (SELECT 1 UNION ALL SELECT a + 1 FROM w WHERE a < 120) CYCLE a SET m USING p SELECT a, p FROM w ORDER BY a DESC LIMIT 1", "E:54000" },
+    });
+    // A path the statement never reads is never built.
+    try steps(0, &.{.{ "WITH RECURSIVE w(a) AS (SELECT 1 UNION ALL SELECT a + 1 FROM w WHERE a < 120) CYCLE a SET m USING p SELECT max(a), bool_or(m) FROM w", "T:max,bool_or;120|f C:SELECT 1" }});
+    // The path text a statement stored replays like any text.
+    try sameOnReplica("SELECT x FROM s ORDER BY x");
+}
+
 // ---- a crash between two COMMITs ---------------------------------------
 
 var recovery: DB = .{};
@@ -658,6 +756,7 @@ pub fn main() !void {
     try commitChecks();
     try clocks();
     try crash();
+    try searchCycle();
     try check(replayed != 0);
     std.debug.print("proc-tx contract: {d} assertions, {d} records replayed\n", .{ assertions, replayed });
 }
