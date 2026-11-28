@@ -90,9 +90,9 @@ fn typeOid(name: []const u8) !u32 {
 }
 
 /// A result column's type OID as the wire reports it (a composite
-/// column's typmod is its type's OID).
+/// column's type is its nominal identity, its typmod -1).
 fn columnOid(result: *const DB.Result, column: usize) u32 {
-    if (result.column_types[column] == .record) return if (result.column_typmods[column] > 0) @intCast(result.column_typmods[column]) else 2249;
+    if (result.nominalColumnType(column)) |nominal| return nominal.oid;
     return sql.typeOid(result.column_types[column]);
 }
 

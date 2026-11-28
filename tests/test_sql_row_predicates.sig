@@ -112,8 +112,12 @@ pub fn main(init:std.process.Init) !void {
     try rejects("SELECT ROW()=ROW()",error.UnsupportedStatement);
     try rejects("SELECT ROW(1) IS TRUE",error.TypeMismatch);
     try rejects("SELECT \"row\"(1,2)=\"row\"(1,2)",error.UndefinedFunction);
-    // Record payloads and nested records remain explicit unsupported scopes.
-    try unsupported("SELECT ROW(1,2)");
+    // A row constructor is a record value since B11 wave 5 (composite lane:
+    // record_out text); nested records remain an explicit unsupported scope.
+    try db.execute("SELECT ROW(1,2)",&r);
+    try check(r.row_count==1 and r.rows[0].cells[0]==.record);
+    try r.textify(DB.Result.default_session);
+    try check(std.mem.eql(u8,r.rows[0].cells[0].text.slice(),"(1,2)"));
     try unsupported("SELECT ROW(ROW(1,2),3)=ROW(ROW(1,2),3)");
     // Source-based schema metadata must round-trip without a record value type.
     var primary:DB=.{};var replayed:DB=.{};var scratch:DB.ReplayScratch=.{};

@@ -498,6 +498,22 @@ pub fn Database(comptime config: Config) type {
                 self.has_nominal_types = true;
             }
 
+            /// Composite columns (B11 wave 5, composite lane): a record
+            /// column's typmod (its composite type's OID) becomes the
+            /// column's nominal type, the wire's RowDescription OID, and its
+            /// typmod -1, as PostgreSQL reports it.
+            pub fn recordIdentities(self: *Result) void {
+                for (0..self.column_count) |column| {
+                    if (self.column_types[column] != .record or self.column_typmods[column] <= 0) continue;
+                    if (!self.has_nominal_types) {
+                        @memset(self.nominal_types[0..self.column_count], .{});
+                        self.has_nominal_types = true;
+                    }
+                    self.nominal_types[column] = .{ .oid = @intCast(self.column_typmods[column]), .len = -1 };
+                    self.column_typmods[column] = -1;
+                }
+            }
+
             pub fn nominalColumnType(self: *const Result, column: usize) ?types.NominalColumnType {
                 if (!self.has_nominal_types or column >= self.column_count) return null;
                 const identity = self.nominal_types[column];
@@ -1790,6 +1806,7 @@ pub fn Database(comptime config: Config) type {
                 if (key.* != .null_value) try V.validate(&table.columns[plan.column], key);
                 self.workspace.query.read_stats = .{};
                 try X.selectPrimaryKey(table, &plan.select, plan.projection[0..plan.select.count], key, snapshot, result, &self.session);
+                result.recordIdentities();
             }
 
             pub fn run(self:*Context,result:*Result) Error!void {
@@ -1854,6 +1871,7 @@ pub fn Database(comptime config: Config) type {
                         &self.session,&self.workspace.query,self.snapshot.epoch==0),
                     .primary_key => return error.UndefinedParameter,
                 }
+                result.recordIdentities();
                 if (cache_hash) |hash| {
                     if (projected_cache) |tier| tier.put(self, hash, result)
                     else try cache.?.put(self, hash, result);
@@ -1977,6 +1995,7 @@ pub fn Database(comptime config: Config) type {
                         }
                     },
                 }
+                result.recordIdentities();
             }
             fn readViewRows(pointer:*anyopaque,view:catalog_module.View,sink:*X.RowSink) Error!void {
                 const context:*Context=@ptrCast(@alignCast(pointer));
@@ -3490,6 +3509,7 @@ pub fn Database(comptime config: Config) type {
                 self.wake_epoch +%= 1;
                 return legacy(options.mode, err);
             };
+            result.recordIdentities();
             // DEFERRABLE constraints in IMMEDIATE mode and the foreign keys
             // a row could not satisfy yet: end of statement.
             self.deferredCheck(slot, start, true, true) catch |err| {

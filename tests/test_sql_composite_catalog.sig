@@ -113,7 +113,8 @@ fn corruptRecords(existing_relation_oid: u32) !void {
 fn recordText(db: *DB, statement: []const u8, expected: []const u8, name: []const u8) !void {
     try db.execute(statement, &result);
     try check(result.row_count == 1 and result.column_count == 1 and equal(result.column_names[0].slice(), name));
-    try check(result.column_types[0] == .record and result.column_typmods[0] >= sql.change_records.first_oid);
+    try check(result.column_types[0] == .record and result.column_typmods[0] == -1);
+    try check(result.nominalColumnType(0).?.oid >= sql.change_records.first_oid);
     try check(result.rows[0].cells[0] == .record);
     try result.textify(DB.Result.default_session);
     try check(result.column_types[0] == .text and equal(result.rows[0].cells[0].text.slice(), expected));
@@ -130,7 +131,7 @@ fn flatRecordContracts() !void {
         try recordText(db, "SELECT ROW('003','nice')::pair", "(3,nice)", "row");
         try recordText(db, "SELECT ROW(1+2,'x')::pair", "(3,x)", "row");
         try db.execute("SELECT CAST(NULL AS pair)", &result);
-        try check(result.rows[0].cells[0] == .null_value and result.column_types[0] == .record and result.column_typmods[0] >= sql.change_records.first_oid);
+        try check(result.rows[0].cells[0] == .null_value and result.column_types[0] == .record and result.nominalColumnType(0).?.oid >= sql.change_records.first_oid);
         try check(equal(result.column_names[0].slice(), "pair"));
         try db.execute("DECLARE records CURSOR WITH HOLD FOR SELECT ROW(1,'x')::pair", &result);
         try recordText(db, "FETCH NEXT FROM records", "(1,x)", "row");
