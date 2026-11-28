@@ -334,6 +334,8 @@ fn render(comptime T: type, result: *const T.Result) ![]const u8 {
 }
 
 var probe_result: DB.Result = .{};
+/// Results live in globals: DB.Result is megabytes (a stack local overflows).
+var statement_result: DB.Result = .{};
 
 fn rowsOf(target: *DB, source: []const u8) ![]const u8 {
     target.execute(source, &probe_result) catch |err| {
@@ -358,8 +360,8 @@ fn rowsIn(slot: u16, source: []const u8) ![]const u8 {
 }
 
 fn statementIn(slot: u16, source: []const u8) !void {
-    var result: DB.Result = .{};
-    primary.statement(slot, source, &result, .{}) catch |err| {
+    const result = &statement_result;
+    primary.statement(slot, source, result, .{}) catch |err| {
         std.debug.print("{s}: {s}\n", .{ source, @errorName(err) });
         return err;
     };
@@ -367,9 +369,9 @@ fn statementIn(slot: u16, source: []const u8) !void {
 
 /// Autocommit on the primary; its change record goes to the replica.
 fn durable(source: []const u8) !void {
-    var result: DB.Result = .{};
+    const result = &statement_result;
     var used: usize = 0;
-    primary.executeChanges(source, &result, &record, &used, null, null) catch |err| {
+    primary.executeChanges(source, result, &record, &used, null, null) catch |err| {
         std.debug.print("{s}: {s}\n", .{ source, @errorName(err) });
         return err;
     };
@@ -463,9 +465,9 @@ fn snapshotsAndReplay() !void {
     try expectOn(&primary, "SELECT count(*) FROM information_schema.referential_constraints", "2");
     try expectOn(&primary, "SELECT count(*) FROM information_schema.routines WHERE routine_name = 'gone_f'", "0");
     // A failing statement (duplicate column) is atomic too.
-    var result: DB.Result = .{};
+    const result = &statement_result;
     var used: usize = 0;
-    if (primary.executeChanges("CREATE TABLE dup (a INT, a TEXT)", &result, &record, &used, null, null)) |_| return error.InvalidStatementAccepted else |err| try check(err == error.DuplicateColumn);
+    if (primary.executeChanges("CREATE TABLE dup (a INT, a TEXT)", result, &record, &used, null, null)) |_| return error.InvalidStatementAccepted else |err| try check(err == error.DuplicateColumn);
     try check(used == 0);
     try expectOn(&primary, "SELECT count(*) FROM information_schema.columns WHERE table_name = 'dup'", "0");
     // DROP removes every row the object contributed.
@@ -476,13 +478,13 @@ fn snapshotsAndReplay() !void {
     try expectOn(&replica, "SELECT count(*) FROM information_schema.referential_constraints", "0");
     try expectOn(&replica, "SELECT count(*) FROM information_schema.parameters WHERE specific_schema = 'public'", "1");
     // Privilege filtering follows the role (SET ROLE), on both sides.
-    try primary.execute("SET ROLE w5c_member", &result);
+    try primary.execute("SET ROLE w5c_member", result);
     try expectOn(&primary, tables_probe, "public|p|BASE TABLE|YES");
     try expectOn(&primary, "SELECT grantor, grantee, table_name, privilege_type, is_grantable FROM information_schema.table_privileges WHERE table_schema = 'public' ORDER BY privilege_type",
         "ramsql|w5c_member|p|SELECT|YES;ramsql|w5c_member|p|UPDATE|YES");
     try expectOn(&primary, "SELECT role_name FROM information_schema.enabled_roles ORDER BY 1", "w5c_group;w5c_member");
     try expectOn(&primary, "SELECT constraint_name FROM information_schema.check_constraints WHERE constraint_schema = 'public'", "");
-    try primary.execute("RESET ROLE", &result);
+    try primary.execute("RESET ROLE", result);
     try sameState();
 }
 
