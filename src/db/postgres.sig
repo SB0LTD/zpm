@@ -2780,6 +2780,8 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "ObjectNotInPrerequisiteState") or equal(name, "RestrictedNonSystemView") or equal(name, "RestrictedNonSystemForeignTable")) return "55000";
     if (equal(name, "DuplicateObject")) return "42710";
     if (equal(name, "InvalidTableDefinition")) return "42P16";
+    if (equal(name, "InvalidColumnDefinition")) return "42611";
+    if (equal(name, "InvalidSchemaDefinition")) return "42P15";
     if (equal(name, "UndefinedSchema")) return "3F000";
     if (equal(name, "DuplicateSchema")) return "42P06";
     if (equal(name, "IndeterminateDatatype")) return "42P18";

@@ -196,6 +196,12 @@ pub const Config = struct {
     /// Schemas the search path resolves (ddl-dml, wave 4): existing schemas
     /// of search_path beyond this many are not searched.
     search_path_schemas: usize = 8,
+    /// Elements of one CREATE SCHEMA statement (ddl-alter, wave 5; more
+    /// is 54000).
+    schema_elements: usize = 16,
+    /// Relations a CREATE VIEW names unqualified that resolve outside
+    /// public: the stored text qualifies them (ddl-alter; more is 54000).
+    view_qualifiers: usize = 16,
     /// LISTEN channels per session (also its pending LISTEN/UNLISTEN
     /// actions), listening sessions, committed notifications not yet read
     /// by every listener, uncommitted NOTIFY entries of all transactions
@@ -614,6 +620,12 @@ pub const Error = error{
     /// (an XPath namespace with an empty name cannot be registered; B11
     /// wave 5 xml).
     InternalError,
+    /// SQLSTATE 42611: an invalid column definition, such as USING on a
+    /// generated column's ALTER COLUMN TYPE (ddl-alter, wave 5).
+    InvalidColumnDefinition,
+    /// SQLSTATE 42P15: a CREATE SCHEMA element names another schema
+    /// (ddl-alter, wave 5).
+    InvalidSchemaDefinition,
 };
 
 /// Caller-owned execution accounting and interrupt polling. This is independent
@@ -1611,6 +1623,13 @@ pub fn Values(comptime config: Config) type {
             /// catalogs report 'v'. The immutable expression is evaluated
             /// when a row is written, so reads equal evaluation on read.
             virtual: bool = false,
+            /// Definition format 8 (ddl-alter, wave 5): the column's
+            /// pg_collation OID (0: its type's default), the name of its NOT
+            /// NULL constraint when not `<table>_<column>_not_null` as the
+            /// current names spell it, and a domain type OID (0: none).
+            collation: u32 = 0,
+            not_null_name: Name = .{},
+            domain: u32 = 0,
         };
 
         pub fn cellTag(data_type: DataType) CellTag {

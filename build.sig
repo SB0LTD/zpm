@@ -187,6 +187,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addContract(ctx, test_sql, "contract-sql-ddl-core", "tests/test_sql_ddl_core.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-schema-objects", "tests/test_sql_schema_objects.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-ddl-dml", "tests/test_sql_ddl_dml.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    _ = try addContract(ctx, test_sql, "contract-sql-ddl-alter", "tests/test_sql_ddl_alter.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-index-external", "tests/test_sql_index_external.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-btree", "tests/test_sql_btree.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-routines", "tests/test_sql_routines.sig", &.{importEntry("sql", "src/core/sql.sig")});

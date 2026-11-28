@@ -219,3 +219,25 @@ cursors, COMMENT ON INDEX / FUNCTION / TYPE / CONSTRAINT, column, sequence
 and schema-usage privileges beyond what main has, ALTER COLUMN TYPE,
 identifiers longer than 63 bytes (truncation) and varchar(3) yes/no
 information_schema columns remain open.
+
+## Wave 5 (ddl-alter) updates
+
+Branch `w5/ddl-alter` (`contract-sql-ddl-alter`, tests/test_sql_ddl_alter.sig)
+closes several "Not covered" entries above; checked against native
+PostgreSQL 18.7.
+
+- ALTER COLUMN TYPE [USING] rewrites the table (latest visible version of
+  each row converted, other versions dropped), re-checks defaults, CHECK,
+  NOT NULL, keys and foreign keys over the column (42804, 23502, 23503,
+  23505, 23514), and is 0A000 for columns views or generated columns use;
+  durable as change-log op 105. A REPEATABLE READ snapshot older than a
+  row it would rewrite is 40001.
+- DROP COLUMN ... CASCADE drops the views that use the column (column
+  usage from binding each view's query), generated columns over it and
+  other tables' foreign keys referencing it; RESTRICT stays 2BP01.
+- CREATE SCHEMA with schema elements runs them in PostgreSQL's order with
+  the new schema first in the search path (42P15, 42601, 0A000 as native).
+- CREATE VIEW stores relation names resolved outside public qualified with
+  their schema instead of 0A000.
+- Table definition format 8 adds per-column collations, NOT NULL constraint
+  names and domain OIDs; pg_constraint lists NOT NULL constraints.

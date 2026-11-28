@@ -449,6 +449,18 @@ pub fn Rows(comptime config: types.Config) type {
                     return out[0..at];
                 }
 
+                /// The name of a column's NOT NULL constraint: the one its
+                /// definition stores (ddl-alter: named, inherited or kept
+                /// across renames), else makeObjectName's.
+                fn columnNotNullName(table: *const S.Table, index: usize, out: *[max_identifier + 1]u8) []const u8 {
+                    const stored = table.columns[index].not_null_name.slice();
+                    if (stored.len != 0 and stored.len <= out.len) {
+                        @memcpy(out[0..stored.len], stored);
+                        return out[0..stored.len];
+                    }
+                    return notNullName(table.name.slice(), table.columns[index].name.slice(), out);
+                }
+
                 fn clipUtf8(bytes: []const u8, length: usize) usize {
                     var end = length;
                     while (end > 0 and end < bytes.len and bytes[end] & 0xc0 == 0x80) end -= 1;
@@ -864,6 +876,9 @@ pub fn Rows(comptime config: types.Config) type {
                     /// A catalog table's or information_schema relation's
                     /// string column: collation "C", as initdb creates them.
                     catalog_collation: bool = false,
+                    /// A stored column collation (ddl-alter definition format
+                    /// 8): its pg_collation OID, 0 for the type's default.
+                    collation_oid: u32 = 0,
                 };
 
                 fn columns(self: *Self) Error!void {
@@ -917,6 +932,7 @@ pub fn Rows(comptime config: types.Config) type {
                                 .data_type = if (column.data_type == .mysql_bigint_unsigned) .numeric else column.data_type,
                                 .typmod = column.typmod,
                                 .not_null = notNullColumn(table, index, primary),
+                                .collation_oid = column.collation,
                                 .default = if (kind == .default) DbType.expressionTextWithPool(self.pool, column) else .null_value,
                                 .identity = identity,
                                 .seq_index = if (identity != 0) self.identitySequence(table.oid, index) else null,
@@ -940,7 +956,7 @@ pub fn Rows(comptime config: types.Config) type {
                 fn columnRow(self: *Self, schema: []const u8, table: []const u8, column: ColumnShape) Error!void {
                     const data_type = column.data_type;
                     const typmod = column.typmod;
-                    const collation_name = if (column.catalog_collation and collation.collatable(types.typeOfData(data_type))) "C" else collationName(data_type, column.domain);
+                    const collation_name = if (column.collation_oid != 0) collation.nameOfOid(column.collation_oid) else if (column.catalog_collation and collation.collatable(types.typeOfData(data_type))) "C" else collationName(data_type, column.domain);
                     const composite: ?UserType = if (data_type == .record and typmod > 0) self.compositeType(@intCast(typmod)) else null;
                     const udt = if (composite) |known| known.name else udtName(data_type);
                     var identity_cells: [5]Cell = @splat(.null_value);
@@ -998,7 +1014,7 @@ pub fn Rows(comptime config: types.Config) type {
                         for (0..table.column_count) |index| {
                             if (!notNullColumn(table, index, primary)) continue;
                             var buffer: [max_identifier + 1]u8 = undefined;
-                            try self.tableConstraintRow(schema, table, notNullName(table.name.slice(), table.columns[index].name.slice(), &buffer), "CHECK", null, null);
+                            try self.tableConstraintRow(schema, table, columnNotNullName(table, index, &buffer), "CHECK", null, null);
                         }
                         if (S.keyed(table)) {
                             var name: [max_identifier + 8]u8 = undefined;
@@ -1073,7 +1089,7 @@ pub fn Rows(comptime config: types.Config) type {
                             var clause: [max_identifier + 24]u8 = undefined;
                             const column = table.columns[index].name.slice();
                             const text_clause = std.fmt.bufPrint(&clause, "{s} IS NOT NULL", .{column}) catch return error.TextCapacity;
-                            try self.checkRow(schema, notNullName(table.name.slice(), column, &name), text_clause);
+                            try self.checkRow(schema, columnNotNullName(table, index, &name), text_clause);
                         }
                     }
                     for (&self.objects().items) |*o| {
@@ -1232,7 +1248,7 @@ pub fn Rows(comptime config: types.Config) type {
                             if (!notNullColumn(table, index, primary)) continue;
                             var name: [max_identifier + 1]u8 = undefined;
                             const column = table.columns[index].name.slice();
-                            try self.usageRow(schema, table.name.slice(), column, schema, notNullName(table.name.slice(), column, &name));
+                            try self.usageRow(schema, table.name.slice(), column, schema, columnNotNullName(table, index, &name));
                         }
                     }
                     // PRIMARY KEY, UNIQUE and FOREIGN KEY (referenced columns).

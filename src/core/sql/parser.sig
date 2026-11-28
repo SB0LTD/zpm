@@ -475,8 +475,20 @@ pub fn Parser(comptime config: types.Config) type {
                         // Without a name the schema is named after a named role.
                         if (!out.named) out.name = out.owner orelse return error.UnsupportedStatement;
                     } else if (!out.named) return error.Syntax;
-                    // Schema elements are outside the subset.
-                    if (self.current.kind != .end and !self.isSymbol(.semicolon)) return error.UnsupportedStatement;
+                    // Schema elements (ddl-alter, wave 5): CREATE TABLE /
+                    // VIEW / INDEX / SEQUENCE / TRIGGER and GRANT, split and
+                    // run by the engine. IF NOT EXISTS cannot have them (0A000).
+                    if (self.current.kind != .end and !self.isSymbol(.semicolon)) {
+                        if (!self.isWord("CREATE") and !self.rawWord("grant")) return error.Syntax;
+                        if (out.if_not_exists) return error.UnsupportedStatement;
+                        const start = self.tokenStart();
+                        var end = start;
+                        while (self.current.kind != .end and !self.isSymbol(.semicolon)) {
+                            end = self.current.end + self.current.suffix;
+                            try self.advance();
+                        }
+                        out.elements = .{ .start = start, .len = end - start };
+                    }
                     try self.finish();
                     return .{ .create_schema = out };
                 }
@@ -986,12 +998,33 @@ pub fn Parser(comptime config: types.Config) type {
                     try self.advance();
                     try self.advance();
                     const constraint = try self.identifier();
-                    const enforced = if (self.isWord("NOT") and wordIs(self.source, try self.peek(), "enforced")) blk: {
+                    // [[NOT] DEFERRABLE] [INITIALLY {DEFERRED | IMMEDIATE}] (ddl-alter, wave 5).
+                    var deferral: Ast.AlterAction = .{ .alter_deferrable = .{ .name = constraint } };
+                    const timing = &deferral.alter_deferrable;
+                    if (try self.takeRaw("deferrable")) {
+                        timing.deferrable = 2;
+                    } else if (self.isWord("NOT") and wordIs(self.source, try self.peek(), "deferrable")) {
                         try self.advance();
                         try self.advance();
-                        break :blk false;
-                    } else if (try self.takeRaw("enforced")) true else return error.UnsupportedStatement;
-                    try pushAction(&out, .{ .alter_enforced = .{ .name = constraint, .enforced = enforced } });
+                        timing.deferrable = 1;
+                    }
+                    if (try self.takeRaw("initially")) {
+                        if (try self.takeRaw("deferred")) {
+                            timing.deferred = 2;
+                        } else if (try self.takeRaw("immediate")) {
+                            timing.deferred = 1;
+                        } else return error.Syntax;
+                    }
+                    if (timing.deferrable != 0 or timing.deferred != 0) {
+                        try pushAction(&out, deferral);
+                    } else {
+                        const enforced = if (self.isWord("NOT") and wordIs(self.source, try self.peek(), "enforced")) blk: {
+                            try self.advance();
+                            try self.advance();
+                            break :blk false;
+                        } else if (try self.takeRaw("enforced")) true else return error.UnsupportedStatement;
+                        try pushAction(&out, .{ .alter_enforced = .{ .name = constraint, .enforced = enforced } });
+                    }
                 } else if (self.mode == .standard and try self.takeRaw("validate")) {
                     try self.expectWord("CONSTRAINT");
                     try pushAction(&out, .{ .validate_constraint = try self.identifier() });
@@ -1002,13 +1035,21 @@ pub fn Parser(comptime config: types.Config) type {
                     } else {
                         _ = try self.takeRaw("column");
                         const conditional = try self.ifExists();
-                        try pushAction(&out, .{ .drop_column = .{ .if_exists = conditional, .name = try self.identifier() } });
+                        const column_name = try self.identifier();
+                        // DROP COLUMN ... CASCADE drops dependent views (ddl-alter).
+                        const cascade = try self.takeRaw("cascade");
+                        if (!cascade) _ = try self.takeRaw("restrict");
+                        try pushAction(&out, .{ .drop_column = .{ .if_exists = conditional, .name = column_name, .cascade = cascade } });
+                        if (!try self.takeSymbol(.comma)) break;
+                        continue;
                     }
                     if (!try self.takeRaw("cascade")) _ = try self.takeRaw("restrict");
                 } else if (try self.takeRaw("alter")) {
                     _ = try self.takeRaw("column");
                     const name = try self.identifier();
-                    if (self.mode == .standard and try self.takeRaw("add")) {
+                    if (self.mode == .standard and self.tokens.dialect == .postgres and try self.takeRaw("type")) {
+                        try pushAction(&out, try self.alterColumnType(name));
+                    } else if (self.mode == .standard and try self.takeRaw("add")) {
                         try self.expectWord("GENERATED");
                         const always = try self.takeWord("ALWAYS");
                         if (!always) {
@@ -1043,6 +1084,11 @@ pub fn Parser(comptime config: types.Config) type {
                         } else if (try self.takeWord("NOT")) {
                             try self.expectWord("NULL");
                             try pushAction(&out, .{ .set_not_null = name });
+                        } else if (self.mode == .standard and self.tokens.dialect == .postgres and try self.takeRaw("data")) {
+                            if (!try self.takeRaw("type")) return error.Syntax;
+                            try pushAction(&out, try self.alterColumnType(name));
+                        } else if (self.mode == .standard and self.tokens.dialect == .postgres and (self.rawWord("statistics") or self.rawWord("storage") or self.rawWord("compression"))) {
+                            try pushAction(&out, try self.columnOption(name));
                         } else if (self.isSymbol(.lparen)) {
                             try self.legacyAttributeOptions(false);
                             try pushAction(&out, .{ .legacy_attribute_options = name });
@@ -1073,6 +1119,71 @@ pub fn Parser(comptime config: types.Config) type {
             }
             try self.finish();
             return out;
+        }
+
+        /// After `ALTER [COLUMN] c [SET DATA] TYPE`: the type, an optional
+        /// COLLATE and an optional USING expression (ddl-alter, wave 5).
+        fn alterColumnType(self: *Self, column: ast.Ident) Error!Ast.AlterAction {
+            // A user type: binding resolves a composite type (domain and
+            // enum columns stay 0A000), as CREATE TABLE's columnDef does.
+            if (!typeWord(self.current) and !(try self.catalogTypeAhead()) and
+                (self.current.kind == .quoted_word or (self.current.kind == .word and !lexer.reserved(self.current.keyword)))) {
+                const named = try self.qualifiedName();
+                if (self.isSymbol(.lbracket) or self.isSymbol(.lparen) or self.rawWord("array")) return error.UnsupportedStatement;
+                var action: Ast.AlterAction = .{ .alter_type = .{ .column = column, .type_name = .record, .user_type = named.name, .user_type_schema = named.schema orelse .{} } };
+                if (try self.takeRaw("using")) {
+                    const start = self.tokenStart();
+                    _ = try self.expression();
+                    action.alter_type.using = try self.storedSpan(start);
+                }
+                return action;
+            }
+            const spec = try self.typeName();
+            if (spec.typmod < -1) return error.UnsupportedStatement;
+            if (spec.ty == .void) return error.InvalidTableDefinition;
+            var action: Ast.AlterAction = .{ .alter_type = .{ .column = column, .type_name = spec.ty, .typmod = spec.typmod } };
+            const change = &action.alter_type;
+            if (try self.takeRaw("collate")) {
+                change.collation = try self.collationName();
+                if (change.collation == collation_module.unknown) return error.UndefinedObject;
+                if (!collation_module.collatable(spec.ty)) return error.TypeMismatch;
+                if (change.collation == collation_module.unsupported) return error.UnsupportedStatement;
+            }
+            if (try self.takeRaw("using")) {
+                const start = self.tokenStart();
+                _ = try self.expression();
+                change.using = try self.storedSpan(start);
+            }
+            return action;
+        }
+
+        /// SET STATISTICS n | SET STORAGE {PLAIN | EXTERNAL | EXTENDED |
+        /// MAIN | DEFAULT} | SET COMPRESSION method (ddl-alter): accepted
+        /// with PostgreSQL's checks; this engine stores none of them.
+        fn columnOption(self: *Self, column: ast.Ident) Error!Ast.AlterAction {
+            if (try self.takeRaw("statistics")) {
+                // SET STATISTICS DEFAULT (PostgreSQL 17+) resets to -1.
+                if (try self.takeWord("DEFAULT")) return .{ .column_option = .{ .column = column, .option = .statistics, .value = -1 } };
+                return .{ .column_option = .{ .column = column, .option = .statistics, .value = try self.signedInteger() } };
+            }
+            if (try self.takeRaw("storage")) {
+                const options = [_]struct { word: []const u8, option: Ast.ColumnOption }{
+                    .{ .word = "plain", .option = .storage_plain },       .{ .word = "external", .option = .storage_external },
+                    .{ .word = "extended", .option = .storage_extended }, .{ .word = "main", .option = .storage_main },
+                };
+                if (try self.takeWord("DEFAULT")) return .{ .column_option = .{ .column = column, .option = .storage_default } };
+                var buffer: [64]u8 = undefined;
+                const word = identText(self.source, try self.identifier(), &buffer) orelse return error.InvalidParameterValue;
+                for (options) |candidate| if (types.same(word, candidate.word)) return .{ .column_option = .{ .column = column, .option = candidate.option } };
+                return error.InvalidParameterValue;
+            }
+            if (!try self.takeRaw("compression")) return error.Syntax;
+            if (try self.takeWord("DEFAULT")) return .{ .column_option = .{ .column = column, .option = .compression_default } };
+            var buffer: [64]u8 = undefined;
+            const word = identText(self.source, try self.identifier(), &buffer) orelse return error.InvalidParameterValue;
+            if (types.same(word, "pglz")) return .{ .column_option = .{ .column = column, .option = .compression_pglz } };
+            if (types.same(word, "lz4")) return .{ .column_option = .{ .column = column, .option = .compression_lz4 } };
+            return error.InvalidParameterValue;
         }
 
         /// Older PostgreSQL 18 dumps can include the internal row-format
@@ -2624,13 +2735,13 @@ pub fn Parser(comptime config: types.Config) type {
                         column.default_kind = .generated;
                     }
                 } else if (self.mode == .standard and name == null and try self.takeRaw("collate")) {
-                    // Column collations would need the table definition to
-                    // carry them: only the database collation ("default",
-                    // the same as no clause) is accepted.
+                    // Column collations (ddl-alter, wave 5): stored by
+                    // definition format 8; "default" is the same as no clause.
                     const value = try self.collationName();
                     if (value == collation_module.unknown) return error.UndefinedObject;
                     if (!collation_module.collatable(column.type_name)) return error.TypeMismatch;
-                    if (value != collation_module.database_default) return error.UnsupportedStatement;
+                    if (value == collation_module.unsupported) return error.UnsupportedStatement;
+                    column.collation = value;
                 } else if (self.mode == .standard and self.isWord("NULL")) {
                     try self.advance();
                 } else if (try self.takeWord("NOT")) {
@@ -2638,6 +2749,7 @@ pub fn Parser(comptime config: types.Config) type {
                     try self.expectWord("NULL");
                     has_not_null = true;
                     column.not_null = true;
+                    if (name != null) column.not_null_name = name;
                 } else if (try self.takeWord("PRIMARY")) {
                     // Multiple primary keys: 42P16, as PostgreSQL (ddl-dml).
                     if (has_primary.*) {if(if_not_exists) invalid.*=true else return error.InvalidTableDefinition;}
