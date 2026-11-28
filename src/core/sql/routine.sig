@@ -57,7 +57,17 @@ pub fn Routines(comptime config: types.Config) type {
 
         /// A declared parameter: its mode ('i' IN, 'o' OUT, 'b' INOUT, 'v'
         /// VARIADIC, 't' a RETURNS TABLE column) and DEFAULT text.
-        pub const Arg = struct { name: Name = .{}, oid: u32 = 0, typmod: i32 = -1, mode: u8 = 'i', default: Span = .{} };
+        pub const Arg = struct { name: Name = .{}, oid: u32 = 0, typmod: i32 = -1, mode: u8 = 'i', default: Span = .{},
+            /// A user type name (B11 wave 5, composite lane): `oid` is 0
+            /// until CREATE resolves it to a composite type.
+            user_type: UserType = .{} };
+
+        /// `[schema.]name` of a user type, resolved when the statement runs.
+        pub const UserType = struct { name: Name = .{}, schema: Name = .{}, has_schema: bool = false,
+            pub fn named(self: *const UserType) bool {
+                return self.name.len != 0;
+            }
+        };
 
         pub fn inputMode(mode: u8) bool {
             return mode == 'i' or mode == 'b' or mode == 'v';
@@ -101,6 +111,9 @@ pub fn Routines(comptime config: types.Config) type {
             setof_table: TableName = .{},
             /// The TABLE columns came from that table (not variables).
             rowtype: bool = false,
+            /// RETURNS [SETOF] a user type name (B11 wave 5, composite lane),
+            /// resolved at CREATE: a composite type, or for SETOF a table.
+            return_user: UserType = .{},
 
             /// The input types (the routine's signature).
             pub fn argOids(self: *const CreateRoutine, out: *[config.routine_args]u32) []const u32 {
@@ -132,6 +145,8 @@ pub fn Routines(comptime config: types.Config) type {
             has_args: bool = false,
             args: [config.routine_args]u32 = @splat(0),
             arg_count: usize = 0,
+            /// User type names of `args` (0 OIDs until resolved; B11 wave 5).
+            arg_users: [config.routine_args]UserType = @splat(.{}),
         };
 
         pub const Call = struct {
@@ -407,6 +422,25 @@ pub fn Routines(comptime config: types.Config) type {
             return cursor.current.kind == .word;
         }
 
+        /// A built-in type, else a user type name (B11 wave 5, composite
+        /// lane: CREATE resolves it). No arrays of user types.
+        fn typeOrUser(cursor: *Cursor, pool: anytype) Error!Arg {
+            const before = cursor.*;
+            if (typeAt(cursor, pool)) |typed| return typed else |err| {
+                if (before.current.kind != .word and before.current.kind != .quoted_word) return err;
+                cursor.* = before;
+                var out: Arg = .{};
+                out.user_type.name = cursor.identifier() catch return err;
+                if (try cursor.takeSymbol(.dot)) {
+                    out.user_type.has_schema = true;
+                    out.user_type.schema = out.user_type.name;
+                    out.user_type.name = try cursor.identifier();
+                }
+                if (cursor.symbol(.lbracket) or cursor.symbol(.lparen)) return error.UnsupportedStatement;
+                return out;
+            }
+        }
+
         /// `[IN | OUT | INOUT | VARIADIC] [name] type [{DEFAULT | =} expr]`
         /// (a DEFAULT only where `defaults` allows it: CREATE).
         fn argument(cursor: *Cursor, pool: anytype, named: bool, defaults: bool) Error!Arg {
@@ -422,11 +456,11 @@ pub fn Routines(comptime config: types.Config) type {
             if (named) {
                 // `name type` unless the first word is the whole type.
                 var probe = cursor.*;
-                const typed = typeAt(&probe, pool) catch null;
+                const typed = typeOrUser(&probe, pool) catch null;
                 const alone = if (typed != null) (probe.symbol(.comma) or probe.symbol(.rparen) or probe.is("default") or probe.symbol(.eq)) else false;
                 if (!alone) name = try cursor.identifier();
             }
-            var out = try typeAt(cursor, pool);
+            var out = try typeOrUser(cursor, pool);
             out.name = name;
             out.mode = mode;
             if (cursor.is("default") or cursor.symbol(.eq)) {
@@ -555,9 +589,10 @@ pub fn Routines(comptime config: types.Config) type {
                         while (true) {
                             if (out.arg_count == config.routine_args) return error.ColumnCapacity;
                             var column: Arg = .{ .mode = 't', .name = try cursor.identifier() };
-                            const typed = try typeAt(cursor, pool);
+                            const typed = try typeOrUser(cursor, pool);
                             column.oid = typed.oid;
                             column.typmod = typed.typmod;
+                            column.user_type = typed.user_type;
                             out.args[out.arg_count] = column;
                             out.arg_count += 1;
                             if (try cursor.takeSymbol(.rparen)) break;
@@ -580,11 +615,16 @@ pub fn Routines(comptime config: types.Config) type {
                             out.return_oid = ret.oid;
                             out.return_typmod = ret.typmod;
                         } else |err| {
-                            // SETOF a relation's row type (resolved at CREATE).
-                            if (!out.retset or (before.current.kind != .word and before.current.kind != .quoted_word)) return err;
+                            // A user type, or SETOF a relation's row type
+                            // (resolved at CREATE; composite lane).
+                            if (before.current.kind != .word and before.current.kind != .quoted_word) return err;
                             cursor.* = before;
-                            out.setof_table = try tableName(cursor);
-                            out.has_setof_table = true;
+                            const named = typeOrUser(cursor, pool) catch return err;
+                            out.return_user = named.user_type;
+                            if (out.retset) {
+                                out.setof_table = .{ .schema = named.user_type.schema, .name = named.user_type.name };
+                                out.has_setof_table = true;
+                            }
                             out.return_oid = routine_catalog.record_oid;
                         }
                     }
@@ -807,6 +847,7 @@ pub fn Routines(comptime config: types.Config) type {
                         continue;
                     }
                     out.args[out.arg_count] = arg.oid;
+                    out.arg_users[out.arg_count] = arg.user_type;
                     out.arg_count += 1;
                     if (try cursor.takeSymbol(.rparen)) break;
                     try cursor.expectSymbol(.comma);

@@ -434,7 +434,8 @@ fn parameters() !void {
     try expect("SELECT x10(1)", "z");
     // Several OUT parameters return a record: no record values here.
     try run("CREATE FUNCTION fio(INOUT a INT, OUT b INT) LANGUAGE plpgsql AS $$BEGIN a := a * 10; b := a + 1; END$$");
-    try fails("SELECT fio(2)", error.UnsupportedStatement);
+    // Several OUT parameters make a record value (B11 wave 5, composite lane).
+    try expectColumns("SELECT fio(2)", "fio", &.{2249}, "(20,21)");
     // Definition rules (42P13) and DEFAULT analysis at CREATE.
     try fails("CREATE FUNCTION fdup(a INT, a INT) RETURNS INT LANGUAGE sql AS 'SELECT 1'", error.InvalidFunctionDefinition);
     try fails("CREATE FUNCTION x12(INOUT a INT, OUT a TEXT) LANGUAGE sql AS $$SELECT 1, 'z'$$", error.InvalidFunctionDefinition);

@@ -111,7 +111,10 @@
 //!   f64 bits u64} | 26 box {high x, high y, low x, low y as f64 bits}
 //!   | 27 xml len u32 + the stored text | 28 tsvector / 29 tsquery len u32
 //!   + canonical output text (re-read and checked on replay) | 30 regtype
-//!   OID u32 | 31 PostgreSQL internal "char" byte | 32 regproc OID u32.
+//!   OID u32 | 31 PostgreSQL internal "char" byte | 32 regproc OID u32
+//!   | 57 record {type OID u32 (2249 for an anonymous record), field count
+//!   u8, per field: built-in type OID u32, typmod i32, value (never a
+//!   record)} (B11 wave 5, composite lane).
 //!    21 create_scoped_identity_sequence: op 7 plus cache i64 and schema OID u32.
 //!    22 create_scoped_sequence: op 21's layout with no owning table.
 //!    70 object_create / 71 object_drop: catalog objects (roles, grants,
@@ -495,6 +498,22 @@ pub fn ChangeLog(comptime config: types.Config) type {
                     try writer.int(u8, span.bytes[1]);
                     if (!value.empty and !value.lower.infinite) try encodeValue(writer, &value.lower.value);
                     if (!value.empty and !value.upper.infinite) try encodeValue(writer, &value.upper.value);
+                },
+                // B11 wave 5 (composite lane): value tag 57, a record: its
+                // type OID u32 (2249 anonymous), field count u8, then per
+                // field its type OID u32, typmod i32 and value (no records).
+                .record => |*fields| {
+                    const bytes = fields.slice();
+                    try writer.int(u8, 57);
+                    try writer.int(u32, V.Records.typeOf(bytes));
+                    try writer.int(u8, @intCast(V.Records.count(bytes)));
+                    var reader = V.Records.Reader.init(bytes);
+                    var item: V.Records.Field = .{};
+                    while (reader.next(&item)) {
+                        try writer.int(u32, types.typeOid(item.data_type));
+                        try writer.int(i32, item.typmod);
+                        try encodeValue(writer, &item.cell);
+                    }
                 },
                 .array => |*items| {
                     const shape = V.Arrays.shape(items.slice());
@@ -996,7 +1015,32 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 pub fn namespaceKnown(self: @This(), namespace: u32) bool {
                     return knownNamespace(self.scratch, namespace);
                 }
+
+                /// A live composite type (B11 wave 5, composite lane).
+                pub fn compositeLive(self: @This(), oid: u32) bool {
+                    return self.scratch.object_overlay.compositeLive(oid);
+                }
             };
+        }
+
+        /// A composite column's type (its typmod) is a live composite type
+        /// (B11 wave 5, composite lane).
+        fn compositeColumns(scratch: *const Scratch, definition: *const Definition) Error!void {
+            for (definition.columns[0..definition.count]) |*column| {
+                if (column.data_type != .record) continue;
+                if (column.typmod <= 0 or !scratch.object_overlay.compositeLive(@intCast(column.typmod))) return error.ChangeRecordConflict;
+            }
+        }
+
+        /// Whether a live table has a column of composite type `oid`.
+        fn compositeInUse(scratch: *const Scratch, oid: u32) bool {
+            for (&scratch.tables) |*vt| {
+                if (!vt.live) continue;
+                for (vt.columns[0..vt.column_count]) |*column| {
+                    if (column.data_type == .record and column.typmod == @as(i64, oid)) return true;
+                }
+            }
+            return false;
         }
 
         /// What catalog-object validation asks of the record so far.
@@ -1365,6 +1409,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 24 => .{ .macaddr = (try reader.take(6))[0..6].* },
                 46 => .{ .macaddr8 = (try reader.take(8))[0..8].* },
                 40 => try decodeMultirange(reader),
+                57 => try decodeRecord(reader),
                 41 => blk: {
                     const len = try reader.int(u32);
                     if (len > config.text_bytes) return error.ChangeRecordConflict;
@@ -1477,6 +1522,32 @@ pub fn ChangeLog(comptime config: types.Config) type {
             var out: V.Text = .{};
             R.encode(&made, &out) catch return error.ChangeRecordConflict;
             return .{ .range = out };
+        }
+
+        /// Value tag 57 (B11 wave 5, composite lane): a record's type OID
+        /// (`record` or an allocated OID), a field count and per field a
+        /// built-in type OID, a typmod valid for it and a value of its cell
+        /// kind (never another record: no recursion). The in-cell record is
+        /// rebuilt; capacity overflow is ChangeRecordConflict.
+        fn decodeRecord(reader: *Reader) Error!V.Cell {
+            const type_oid = try reader.int(u32);
+            if (type_oid != types.record_oid and type_oid < first_oid) return error.InvalidChangeRecord;
+            const count = try reader.int(u8);
+            var out: V.Text = .{};
+            var builder = V.Records.Builder.begin(&out, type_oid) catch return error.ChangeRecordConflict;
+            for (0..count) |_| {
+                const data_type = types.typeFromOid(try reader.int(u32)) orelse return error.InvalidChangeRecord;
+                if (data_type == .record or data_type == .void or data_type == .mysql_bigint_unsigned) return error.InvalidChangeRecord;
+                const typmod = try reader.int(i32);
+                if (!types.validTypeTypmod(config, data_type, typmod)) return error.InvalidChangeRecord;
+                if (reader.position < reader.bytes.len and reader.bytes[reader.position] == 57) return error.InvalidChangeRecord;
+                const cell = (try decodeValue(reader)).cell;
+                if (cell != .null_value and @as(V.CellTag, cell) != V.cellTag(data_type)) return error.InvalidChangeRecord;
+                const member: V.Column = .{ .data_type = data_type, .typmod = typmod };
+                V.validate(&member, &cell) catch return error.InvalidChangeRecord;
+                builder.append(data_type, typmod, &cell) catch |err| return if (err == error.TextCapacity) error.ChangeRecordConflict else error.InvalidChangeRecord;
+            }
+            return .{ .record = out };
         }
 
         /// Value tag 40: a range type, a count and that many tag-22
@@ -1987,6 +2058,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
             if (relkind != 'r' or indexes != 0 or parent != 0 or dependencies != 0 or constraints != 0) return false;
             for (columns) |column| {
                 if (column.virtual) return false;
+                // Composite columns need their types first (composite lane).
+                if (column.data_type == .record) return false;
                 switch (column.default_kind) {
                     .none => {},
                     .default, .identity_always, .identity_by_default => if (!with_defaults) return false,
@@ -2093,6 +2166,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         if (definition.oid < first_oid or definition.oid >= 0xfffffffe or oidTaken(db, scratch, definition.oid, width)) return error.ChangeRecordConflict;
                         if (definition.primary_index_oid != 0 and oidTaken(db, scratch, definition.primary_index_oid, 1)) return error.ChangeRecordConflict;
                         if (nameTaken(scratch, definition.name.slice(), definition.namespace)) return error.ChangeRecordConflict;
+                        try compositeColumns(scratch, &definition);
                         const columns = definition.columns[0..definition.count];
                         var free: ?usize = null;
                         for (&scratch.tables, 0..) |*vt, index| {
@@ -2135,6 +2209,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         var definition: Definition = .{ .oid = vt.oid, .name = .{}, .columns = @splat(.{}), .count = 0 };
                         try decodeDefinition(&reader, &definition);
                         if (definition.namespace != vt.namespace) return error.ChangeRecordConflict;
+                        try compositeColumns(scratch, &definition);
                         if (!types.same(definition.name.slice(), vt.name.slice()) and nameTaken(scratch, definition.name.slice(), vt.namespace)) return error.ChangeRecordConflict;
                         var sources: [config.columns]u8 = undefined;
                         var used: [config.columns]bool = @splat(false);
@@ -2445,6 +2520,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
                                     scratch.large_pages.audit = true;
                             }
                         }
+                        // A composite type a live column uses stays (composite lane).
+                        if (key.kind == .composite_type and (compositeInUse(scratch, key.oid) or RC.overlayUsesType(&scratch.objects, key.oid))) return error.ChangeRecordConflict;
                         try scratch.object_overlay.drop(&key);
                         check_schema_owners = check_schema_owners or key.kind == .role;
                         check_large_object_grants = check_large_object_grants or key.kind == .large_object_acl or key.kind == .builtin_routine_acl;

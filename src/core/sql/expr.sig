@@ -1095,6 +1095,9 @@ pub fn Eval(comptime config: types.Config) type {
                             return true;
                         }
                         const value = try eval(ctx, n.a);
+                        // A composite value is NULL when every field is
+                        // and NOT NULL when none is (ExecEvalRowNull).
+                        if (value == .record) return V.Records.nullTest(value.record.slice(), n.test_kind == .is_null);
                         return (value == .null_value) == (n.test_kind == .is_null);
                     }
                     const value = try truth(ctx, n.a);
@@ -1735,7 +1738,7 @@ pub fn Eval(comptime config: types.Config) type {
                 // SQL/XML XPath, IS DOCUMENT and table mapping (B11 wave 5).
                 .xml_call => return xml_eval.XmlEval(config, @This()).call(ctx, n),
                 .xmltable, .xmltable_namespace, .xmltable_column => return error.UnsupportedStatement,
-                .jsonb_set, .jsonb_set_lax, .jsonb_insert, .jsonb_delete_path, .jsonb_strip_nulls, .jsonb_pretty, .to_json, .to_jsonb, .jsonb_path_exists, .jsonb_path_match, .jsonb_path_query_array, .jsonb_path_query_first, .jsonb_exists_any, .jsonb_exists_all, .jsonb_minus_op, .jsonb_delete_path_op, .jsonb_exists_any_op, .jsonb_exists_all_op, .jsonb_path_exists_op, .jsonb_path_match_op => return json_eval.JsonEval(config, @This()).call(ctx, n),
+                .jsonb_set, .jsonb_set_lax, .jsonb_insert, .jsonb_delete_path, .jsonb_strip_nulls, .jsonb_pretty, .to_json, .to_jsonb, .row_to_json, .jsonb_path_exists, .jsonb_path_match, .jsonb_path_query_array, .jsonb_path_query_first, .jsonb_exists_any, .jsonb_exists_all, .jsonb_minus_op, .jsonb_delete_path_op, .jsonb_exists_any_op, .jsonb_exists_all_op, .jsonb_path_exists_op, .jsonb_path_match_op => return json_eval.JsonEval(config, @This()).call(ctx, n),
                 .regexp_match, .regexp_replace, .regexp_split_to_array, .regexp_count, .regexp_instr, .regexp_substr, .substring_regex, .substring_similar => return regex_eval.RegexEval(config, @This()).call(ctx, n),
                 // A set-returning call reads the value exec is expanding.
                 .regexp_matches, .regexp_split_to_table, .jsonb_path_query => return if (ctx.set_value) |current| current.* else error.UnsupportedStatement,
@@ -1893,6 +1896,26 @@ pub fn Eval(comptime config: types.Config) type {
             }
         }
 
+        /// A bound row constructor's record (B11 wave 5, composite lane):
+        /// a composite type's fields carry their declared typmods (the
+        /// binder's field casts); an untyped field is text.
+        fn evalRecord(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
+            if (n.ty != .record) return error.UnsupportedStatement;
+            var out: V.Text = .{};
+            var builder = try V.Records.Builder.begin(&out, types.recordTypeOid(n.typmod));
+            var item = n.b;
+            while (item != none) : (item = node(ctx, item).next) {
+                const field = node(ctx, item);
+                const cell = try eval(ctx, item);
+                const typmod: i32 = switch (field.kind) {
+                    .cast, .column => field.typmod,
+                    else => -1,
+                };
+                try builder.append(types.dataTypeOf(field.ty), typmod, &cell);
+            }
+            return .{ .record = out };
+        }
+
         fn evalCompound(ctx: *const Context, n: *const ast.Node, id: u16) Error!V.Cell {
             switch (n.kind) {
                 .null_literal, .bool_literal, .int_literal => unreachable,
@@ -1918,7 +1941,14 @@ pub fn Eval(comptime config: types.Config) type {
                 },
                 .aggregate => unreachable,
                 .values_row, .default_value => return error.Syntax,
-                .row_constructor => return error.UnsupportedStatement,
+                .row_constructor => return evalRecord(ctx, n),
+                .field_select => {
+                    const base = try eval(ctx, n.a);
+                    if (base == .null_value) return .null_value;
+                    if (base != .record) return error.TypeMismatch;
+                    const field = V.Records.field(base.record.slice(), @intCast(n.integer)) orelse return error.ColumnNotFound;
+                    return field.cell;
+                },
                 .row_compare, .row_in => return boolCell(try truth(ctx, id)),
                 // Unwrapped by binding (only user routine calls accept one).
                 .named_argument => return error.UnsupportedStatement,

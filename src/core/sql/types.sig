@@ -672,7 +672,10 @@ pub const DataType = enum(u8) { integer, integer32, boolean, text, smallint, num
     void,
     macaddr8,
     lseg, line, path, polygon, circle,
-    int4multirange, int8multirange, nummultirange, datemultirange, tsmultirange, tstzmultirange, _ };
+    int4multirange, int8multirange, nummultirange, datemultirange, tsmultirange, tstzmultirange,
+    // B11 wave 5 (composite lane): composite (row) values. The typmod holds
+    // the composite type's OID, or -1 for an anonymous record.
+    record, _ };
 
 /// Bound expression type. `unknown` is an untyped string or NULL literal
 /// that has not been resolved by context yet. Unnamed values are array
@@ -681,10 +684,29 @@ pub const Type = enum(u8) { unknown, int2, int4, int8, numeric, float4, float8, 
     void,
     macaddr8,
     lseg, line, path, polygon, circle,
-    int4multirange, int8multirange, nummultirange, datemultirange, tsmultirange, tstzmultirange, _ };
+    int4multirange, int8multirange, nummultirange, datemultirange, tsmultirange, tstzmultirange,
+    record, _ };
 
 /// Array types set this bit over the element type's ordinal.
 pub const array_bit: u8 = 0x80;
+/// pg_type `record` (RECORDOID): anonymous composite values.
+pub const record_oid: u32 = 2249;
+
+/// The type OID a record type and typmod report: the composite type's
+/// OID, or `record` for an anonymous record (composite lane, B11 wave 5).
+pub fn recordTypeOid(typmod: i32) u32 {
+    return if (typmod > 0) @intCast(typmod) else record_oid;
+}
+
+/// The value type of a routine parameter or result type OID: a built-in
+/// type, or an allocated OID taken as a composite type (record with the OID
+/// as its typmod; composite lane). Null for anything else.
+pub const OidType = struct { ty: Type, typmod: i32 };
+pub fn oidType(oid: u32, typmod: i32) ?OidType {
+    if (typeFromOid(oid)) |data_type| return .{ .ty = typeOfData(data_type), .typmod = typmod };
+    if (oid >= 16384 and oid <= 0x7fffffff) return .{ .ty = .record, .typmod = @intCast(oid) };
+    return null;
+}
 const data_type_count = @typeInfo(DataType).@"enum".field_names.len;
 const type_count = @typeInfo(Type).@"enum".field_names.len;
 
@@ -714,7 +736,7 @@ pub fn pseudoRecord(ty: Type) bool {
 /// The array type of a named element type (null for an array).
 pub fn arrayData(element: DataType) ?DataType {
     const raw = @intFromEnum(element);
-    if (element == .mysql_bigint_unsigned or element == .void or raw >= data_type_count) return null;
+    if (element == .mysql_bigint_unsigned or element == .void or element == .record or raw >= data_type_count) return null;
     return @enumFromInt(raw | array_bit);
 }
 
@@ -723,12 +745,12 @@ pub fn elementData(data_type: DataType) ?DataType {
     const raw = @intFromEnum(data_type);
     if (raw < array_bit or raw & ~array_bit >= data_type_count) return null;
     const element: DataType = @enumFromInt(raw & ~array_bit);
-    return if (element == .mysql_bigint_unsigned or element == .void) null else element;
+    return if (element == .mysql_bigint_unsigned or element == .void or element == .record) null else element;
 }
 
 pub fn arrayType(element: Type) ?Type {
     const raw = @intFromEnum(element);
-    if (element == .unknown or element == .mysql_bigint_unsigned or element == .void or raw >= type_count) return null;
+    if (element == .unknown or element == .mysql_bigint_unsigned or element == .void or element == .record or raw >= type_count) return null;
     return @enumFromInt(raw | array_bit);
 }
 
@@ -736,7 +758,7 @@ pub fn elementType(ty: Type) ?Type {
     const raw = @intFromEnum(ty);
     if (raw < array_bit or raw & ~array_bit >= type_count or raw & ~array_bit == 0) return null;
     const element: Type = @enumFromInt(raw & ~array_bit);
-    return if (element == .mysql_bigint_unsigned or element == .void) null else element;
+    return if (element == .mysql_bigint_unsigned or element == .void or element == .record) null else element;
 }
 
 pub fn isArray(ty: Type) bool {
@@ -848,6 +870,7 @@ pub fn dataTypeOf(ty: Type) DataType {
         .datemultirange => .datemultirange,
         .tsmultirange => .tsmultirange,
         .tstzmultirange => .tstzmultirange,
+        .record => .record,
         _ => if (elementType(ty)) |element| arrayData(dataTypeOf(element)).? else .text,
     };
 }
@@ -918,6 +941,7 @@ pub fn typeOfData(data_type: DataType) Type {
         .datemultirange => .datemultirange,
         .tsmultirange => .tsmultirange,
         .tstzmultirange => .tstzmultirange,
+        .record => .record,
         _ => if (elementData(data_type)) |element| arrayType(typeOfData(element)).? else .text,
     };
 }
@@ -948,6 +972,8 @@ pub fn validTypeTypmod(comptime config: Config, data_type: DataType, typmod: i32
         .timestamp, .timestamptz, .time, .timetz => typmod >= -1 and typmod <= 6,
         .varchar, .bpchar => character.validTypmod(typmod),
         .bit, .varbit => bit_string.validTypmod(typmod),
+        // A composite column's typmod is its type's OID (composite lane).
+        .record => typmod > 0,
         else => typmod == -1,
     };
 }
@@ -1044,6 +1070,7 @@ fn baseInfo(data_type: DataType) TypeInfo {
         .datemultirange => .{ .oid = 4535, .name = "datemultirange", .len = -1, .category = 'R', .array = 6155 },
         .tsmultirange => .{ .oid = 4533, .name = "tsmultirange", .len = -1, .category = 'R', .array = 6152, .alignment = 'd' },
         .tstzmultirange => .{ .oid = 4534, .name = "tstzmultirange", .len = -1, .category = 'R', .array = 6153, .alignment = 'd' },
+        .record => .{ .oid = record_oid, .name = "record", .len = -1, .category = 'P', .array = 2287, .alignment = 'd' },
         _ => .{ .oid = 0, .name = "", .len = -1, .category = 'A', .array = 0 },
     };
 }
@@ -1142,6 +1169,7 @@ fn baseSqlName(data_type: DataType) []const u8 {
         .datemultirange => "datemultirange",
         .tsmultirange => "tsmultirange",
         .tstzmultirange => "tstzmultirange",
+        .record => "record",
         _ => "",
     };
 }
@@ -1199,6 +1227,7 @@ pub fn typeInputName(data_type: DataType) []const u8 {
         .polygon => "poly_in",
         .circle => "circle_in",
         .int4multirange, .int8multirange, .nummultirange, .datemultirange, .tsmultirange, .tstzmultirange => "multirange_in",
+        .record => "record_in",
         _ => "array_in",
     };
 }
@@ -1476,7 +1505,9 @@ pub fn Values(comptime config: Config) type {
         /// compares/hashes without trailing spaces.
         pub const CellTag = enum { null_value, integer, boolean, text, float4, float8, numeric, date, timestamp, timestamptz, interval, jsonb, bpchar, uuid, bytea, time, timetz, bits, money, pg_lsn, xid8, array, range, inet, macaddr, point, box, xml, regtype, tsvector, tsquery, pg_internal_char, regproc,
             // B11 wave-4 types-ext.
-            macaddr8, geo, multirange };
+            macaddr8, geo, multirange,
+            // B11 wave 5 (composite lane): record.sig layout.
+            record };
 
         pub const Cell = union(CellTag) {
             null_value: void,
@@ -1531,6 +1562,8 @@ pub fn Values(comptime config: Config) type {
             geo: Text,
             /// Built-in multiranges (multirange.sig layout).
             multirange: Text,
+            /// Composite (row) values (record.sig layout).
+            record: Text,
         };
 
         /// Range values of these cells (range.sig).
@@ -1541,6 +1574,9 @@ pub fn Values(comptime config: Config) type {
 
         /// Multirange values of these cells (multirange.sig).
         pub const Multiranges = @import("multirange.sig").Multiranges(@This());
+
+        /// Composite values of these cells (record.sig).
+        pub const Records = @import("record.sig").Records(@This());
 
         pub const Row = struct {
             cells: [config.columns]Cell = @splat(.null_value),
@@ -1604,6 +1640,7 @@ pub fn Values(comptime config: Config) type {
                 .macaddr8 => .macaddr8,
                 .lseg, .line, .path, .polygon, .circle => .geo,
                 .int4multirange, .int8multirange, .nummultirange, .datemultirange, .tsmultirange, .tstzmultirange => .multirange,
+                .record => .record,
                 _ => .array,
             };
         }
@@ -1647,6 +1684,7 @@ pub fn Values(comptime config: Config) type {
                 // No ordering operators (42883); bytes keep internal equality.
                 .geo => |*value| bytesOrder(value.slice(), right.geo.slice()),
                 .multirange => |*value| Multiranges.compare(value.slice(), right.multirange.slice()),
+                .record => |*value| Records.compare(value.slice(), right.record.slice()),
                 .point => |value| geometric.comparePoints(value, right.point),
                 .box => |value| geometric.compareBoxes(value, right.box),
                 .xml => |*value| bytesOrder(value.slice(), right.xml.slice()),
@@ -1740,6 +1778,7 @@ pub fn Values(comptime config: Config) type {
                     for (bytes.slice()) |byte| code = (code ^ byte) *% 1099511628211;
                 },
                 .multirange => |*set| return wordHash(Multiranges.hash(set.slice()), tag),
+                .record => |*fields| return wordHash(Records.hash(fields.slice()), tag),
                 .point => |point| {
                     mix(&code, tag);
                     mix(&code, @bitCast(normalFloat(point.x)));
@@ -1815,6 +1854,18 @@ pub fn Values(comptime config: Config) type {
                 var reader = Arrays.Reader.init(value.array.slice());
                 var cell: Cell = undefined;
                 while (reader.next(&cell)) try validate(&member, &cell);
+                return;
+            }
+            if (value.* == .record) {
+                // A composite column (B11 wave 5): the value's type and
+                // every field's own checks (CHAR(n), VARCHAR(n), BIT(n)).
+                if (Records.typeOf(value.record.slice()) != recordTypeOid(column.typmod)) return error.TypeMismatch;
+                var reader = Records.Reader.init(value.record.slice());
+                var item: Records.Field = .{};
+                while (reader.next(&item)) {
+                    const member: Column = .{ .data_type = item.data_type, .typmod = item.typmod };
+                    try validate(&member, &item.cell);
+                }
                 return;
             }
             switch (column.data_type) {

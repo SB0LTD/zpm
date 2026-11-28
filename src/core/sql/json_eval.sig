@@ -179,6 +179,14 @@ pub fn JsonEval(comptime config: types.Config, comptime E: type) type {
                     text.len = out.len;
                     return .{ .text = text };
                 },
+                .row_to_json => {
+                    if (args.cells[0] == .null_value) return .null_value;
+                    var buffer: [JB.buffer_bytes]u8 = undefined;
+                    var out: json_build.Out = .{ .bytes = &buffer };
+                    const pretty = args.count > 1 and args.cells[1] == .boolean and args.cells[1].boolean;
+                    try JB.appendRecord(&out, &args.cells[0], pretty, false, ctx.session);
+                    return JB.jsonOf(&out);
+                },
                 .to_json, .to_jsonb => {
                     if (args.any_null) return .null_value;
                     var buffer: [JB.buffer_bytes]u8 = undefined;

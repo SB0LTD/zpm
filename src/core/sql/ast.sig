@@ -206,7 +206,9 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     // `integer` an XmlTableColumn). Exec reads the table's members.
     xml_call, xmltable, xmltable_namespace, xmltable_column,
     // pg_function_is_visible(oid) and version() (B11 wave 5 catalog lane).
-    pg_function_is_visible, version };
+    pg_function_is_visible, version,
+    // row_to_json(record [, pretty]) (B11 wave 5, composite lane).
+    row_to_json };
 
 /// xml_call variants (xml_eval.sig).
 pub const XmlFn = enum(u8) {
@@ -493,6 +495,11 @@ pub const NodeKind = enum {
     /// a`) or marked VARIADIC (`integer` 1; `name` empty when positional).
     /// Only user routine calls accept it; binding unwraps it (B11 wave 4).
     named_argument,
+    /// `(a).name` or `(a).*` on a composite value (B11 wave 5, composite
+    /// lane): `a` is the record, `name` the field (`star` for `.*`, which
+    /// only a select list expands). Binding sets `integer` to the field's
+    /// 0-based index and `ty` / `typmod` to its type.
+    field_select,
 };
 
 /// Children by kind: unary/not/test/cast `a`; binary/and/or/nullif `a`,`b`;
@@ -681,6 +688,10 @@ pub fn Ast(comptime config: types.Config) type {
             serial: u32 = 0,
             /// GENERATED ALWAYS AS (expr) VIRTUAL (or without STORED).
             virtual: bool = false,
+            /// A user type name (`type_name` .record until binding resolves
+            /// it to a composite type; B11 wave 5, composite lane).
+            user_type: Ident = .{},
+            user_type_schema: Ident = .{},
         };
 
         /// ALTER SEQUENCE [IF EXISTS] name options (RESTART included).

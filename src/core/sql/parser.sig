@@ -2560,16 +2560,24 @@ pub fn Parser(comptime config: types.Config) type {
             } else {
                 if (self.mode == .standard and !typeWord(self.current) and !(try self.catalogTypeAhead()) and
                     (self.current.kind == .quoted_word or (self.current.kind == .word and !lexer.reserved(self.current.keyword)))) {
-                    return error.UnsupportedStatement;
+                    // A user type: binding resolves a composite type
+                    // (composite lane); arrays of user types stay open.
+                    if (self.tokens.dialect != .postgres) return error.UnsupportedStatement;
+                    const named = try self.qualifiedName();
+                    if (self.isSymbol(.lbracket) or self.isSymbol(.lparen) or self.rawWord("array")) return error.UnsupportedStatement;
+                    column.type_name = .record;
+                    column.user_type = named.name;
+                    column.user_type_schema = named.schema orelse .{};
+                } else {
+                    const mysql_bigint = self.mode == .standard and self.tokens.dialect == .mysql and self.isWord("BIGINT");
+                    const spec = try self.typeName();
+                    // regclass/regtype columns are outside the subset.
+                    if (spec.typmod < -1) return error.UnsupportedStatement;
+                    // A column cannot have the void pseudo-type (42P16).
+                    if (spec.ty == .void) return error.InvalidTableDefinition;
+                    column.type_name = if (mysql_bigint and spec.ty == .int8 and try self.takeRaw("unsigned")) .mysql_bigint_unsigned else spec.ty;
+                    column.typmod = spec.typmod;
                 }
-                const mysql_bigint = self.mode == .standard and self.tokens.dialect == .mysql and self.isWord("BIGINT");
-                const spec = try self.typeName();
-                // regclass/regtype columns are outside the subset.
-                if (spec.typmod < -1) return error.UnsupportedStatement;
-                // A column cannot have the void pseudo-type (42P16).
-                if (spec.ty == .void) return error.InvalidTableDefinition;
-                column.type_name = if (mysql_bigint and spec.ty == .int8 and try self.takeRaw("unsigned")) .mysql_bigint_unsigned else spec.ty;
-                column.typmod = spec.typmod;
             }
             var has_not_null = false;
             while (true) {
@@ -5682,7 +5690,7 @@ pub fn Parser(comptime config: types.Config) type {
                         return self.overlapsTail(row);
                     }
                     try self.expectSymbol(.rparen);
-                    return self.subscriptTail(inner);
+                    return self.fieldTail(try self.subscriptTail(inner));
                 },
                 .end => return error.Syntax,
                 .word, .quoted_word => {},
@@ -5936,6 +5944,25 @@ pub fn Parser(comptime config: types.Config) type {
             }
             try self.expectSymbol(.rbracket);
             return node;
+        }
+
+        /// `(base).name` and `(base).*` field selection (B11 wave 5,
+        /// composite lane), repeated and mixed with subscripts.
+        fn fieldTail(self: *Self, base: u16) Error!u16 {
+            var current = base;
+            while (self.mode == .standard and self.tokens.dialect == .postgres and self.isSymbol(.dot)) {
+                try self.advance();
+                if (try self.takeSymbol(.star)) {
+                    const all = try self.pool.add(.{ .kind = .field_select, .a = current, .star = true });
+                    try self.pool.raise(all, current);
+                    return all;
+                }
+                const name = try self.identifier();
+                const node = try self.pool.add(.{ .kind = .field_select, .a = current, .name = name });
+                try self.pool.raise(node, current);
+                current = try self.subscriptTail(node);
+            }
+            return current;
         }
 
         /// `base[i]`, `base[lo:hi]` (either bound optional), repeated: one

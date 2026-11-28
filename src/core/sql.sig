@@ -3530,6 +3530,7 @@ pub fn Database(comptime config: Config) type {
             const inlined = self.workspace.inline_count != 0 and source.ptr == &self.workspace.expansion and source.len == self.workspace.inline_source_len;
             return .{ .inline_calls = if (inlined) self.workspace.inline_calls[0..self.workspace.inline_count] else &.{}, .routine_path = self.routine_path_items[0..self.routine_path_len], .routine_path_known = true, .catalog_rank = catalog_rank, .source = source, .tables = &self.tables, .catalog = &self.catalog, .snapshot = snap, .pool = &self.workspace.nodes, .legacy = mode == .legacy_alpha, .dialect = self.dialect, .session = &self.session, .plans = &self.workspace.plans, .params = self.active_params,
                 .routines = &self.objects, .variables = if (self.routine_frame) |frame| &frame.variables else null,
+                .composite_types = if (self.dialect == .postgres) &self.catalog_objects else null,
                 .namespace_usage = .{ .ptr = self, .check = &bindNamespaceUsage },
                 .namespace_create = .{ .ptr = self, .check = &bindNamespaceCreate } };
         }
@@ -5822,6 +5823,29 @@ pub fn Database(comptime config: Config) type {
             object.text_len = @intCast(@as(usize, object.split) + used);
         }
 
+        /// Whether a live table has a column of composite type `oid` (B11
+        /// wave 5, composite lane).
+        fn compositeTypeUsed(self: *const Self, oid: u32) bool {
+            for (&self.tables) |*table| {
+                if (!table.live) continue;
+                for (table.columns[0..table.column_count]) |*column| {
+                    if (column.data_type == .record and column.typmod == @as(i64, oid)) return true;
+                }
+            }
+            return false;
+        }
+
+        /// Whether a visible routine has a parameter or result of type `oid`.
+        fn routineUsesType(self: *const Self, oid: u32, snap: Snapshot) bool {
+            for (&self.objects.routines) |*routine| {
+                if (!routine.live or !routine.stamp.visible(snap)) continue;
+                if (routine.return_oid == oid) return true;
+                for (routine.arg_oids[0..routine.arg_count]) |arg| if (arg == oid) return true;
+                for (routine.out_oids[0..routine.out_count]) |out| if (out == oid) return true;
+            }
+            return false;
+        }
+
         fn dropTypes(self: *Self, slot: u16, source: []const u8, drop: *const CO.DropTypes, domain_only: bool, snap: Snapshot) Error!void {
             if (self.dialect != .postgres or self.routine_frame != null) return error.UnsupportedStatement;
             var found: [CO.list_capacity]usize = undefined;
@@ -5843,6 +5867,11 @@ pub fn Database(comptime config: Config) type {
                 const object = &self.catalog_objects.items[index];
                 if (domain_only and object.kind != .domain) return error.WrongObjectType;
                 if (object.xmax_csn > snap.csn) return error.SerializationFailure;
+                // A composite type a table column or a routine uses
+                // (composite lane): 2BP01; CASCADE would drop them, which is
+                // open.
+                if (object.kind == .composite_type and (self.compositeTypeUsed(object.oid) or self.routineUsesType(object.oid, snap)))
+                    return if (drop.cascade) error.UnsupportedStatement else error.DependentObjects;
                 if (!self.privilegedRole(snap) and !self.catalog_objects.memberOf(self.session.role, object.owner, true, snap)) return error.InsufficientPrivilege;
                 for (found[0..count]) |previous| {
                     if (previous == index) break;
@@ -7824,6 +7853,17 @@ pub fn Database(comptime config: Config) type {
         /// regtype output of a user type: its name, qualified when the
         /// search path's first schema holding a type of that name is
         /// another one (S071, B11 wave 5).
+        /// A composite type's fields for record I/O (B11 wave 5, composite
+        /// lane), under the latest committed catalog and the statement's
+        /// own changes.
+        fn compositeLayoutHook(ptr: *anyopaque, oid: u32) ?[]const u8 {
+            const self: *const Self = @ptrCast(@alignCast(ptr));
+            var snap = self.seq_snap;
+            snap.csn = @max(snap.csn, self.csn);
+            const index = self.catalog_objects.byOid(.composite_type, oid, snap) orelse return null;
+            return self.catalog_objects.items[index].compositeFields().bytes;
+        }
+
         fn postgresTypeName(ptr: *anyopaque, oid: u32, out: []u8) Error!?usize {
             const self: *const Self = @ptrCast(@alignCast(ptr));
             // Output formatting can follow the statement: read the latest
@@ -8301,10 +8341,13 @@ pub fn Database(comptime config: Config) type {
 
         fn attributeRow(sink: *X.RowSink, relation: i64, name: []const u8, data_type: DataType, typmod: i32, ordinal: i64, metadata: AttributeMetadata) Error!void {
             const info = types.typeInfo(data_type);
+            // A composite column: the type's OID, typmod -1 (composite lane).
+            const type_oid: u32 = if (data_type == .record) types.recordTypeOid(typmod) else info.oid;
+            const attribute_typmod: i32 = if (data_type == .record) -1 else typmod;
             // Stock tools see the default settings. RamSQL materializes
             // added columns and has no TOAST, column ACLs or per-column FDW overrides.
             try sink.add(&.{
-                intCell(relation), nameCell(name), intCell(info.oid), intCell(typmod), intCell(ordinal),
+                intCell(relation), nameCell(name), intCell(type_oid), intCell(attribute_typmod), intCell(ordinal),
                 boolCell(metadata.not_null), boolCell(false), .{ .pg_internal_char = metadata.identity },
                 .{ .pg_internal_char = metadata.generated }, boolCell(metadata.has_expression),
                 intCell(collation.typeCollation(types.typeOfData(data_type))), intCell(info.len),
@@ -11659,12 +11702,12 @@ pub fn Database(comptime config: Config) type {
         /// and regtype text; the Store's wire session has no statement
         /// hooks then; S071, B11 wave 5).
         pub fn installOutputHooks(self: *Self) void {
-            self.output_hook = .{ .ptr = self, .call = &sequenceCall, .relation_name = &relationName, .routine_name = &postgresRoutineName, .type_name = &postgresTypeName };
+            self.output_hook = .{ .ptr = self, .call = &sequenceCall, .relation_name = &relationName, .routine_name = &postgresRoutineName, .type_name = &postgresTypeName, .composite_layout = &compositeLayoutHook };
             self.session.sequences = &self.output_hook;
         }
 
         fn statementHooks(self: *Self, slot: u16, snap: Snapshot) void {
-            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .large_object = &largeObjectCall, .large_object_data = &largeObjectDataCall, .large_object_truncate = &truncateLargeObject, .large_object_file = .{ .authorize = &authorizeLargeObjectFile, .call = &largeObjectFileCall }, .relation_name = &relationName, .relation_display_name = &relationDisplayName, .catalog_text = &catalogText, .schema_path = &catalogSchemaPath, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .function_visible = &functionVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .view_definition = &postgresViewDefinition, .trigger_definition = &postgresTriggerDefinition, .rule_definition = &postgresRuleDefinition, .statistics_columns = &postgresStatisticsColumns, .relation_publishable = &relationPublishable, .partition_key_definition = &postgresPartitionKey, .partition_ancestors = &postgresPartitionAncestors, .namespace_lookup = &postgresNamespaceLookup, .namespace_name = &postgresNamespaceName, .routine_lookup = &postgresRoutineLookup, .routine_name = &postgresRoutineName, .xml_query = &xmlQuery, .xml_cursor = &xmlCursor, .type_name = &postgresTypeName };
+            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .large_object = &largeObjectCall, .large_object_data = &largeObjectDataCall, .large_object_truncate = &truncateLargeObject, .large_object_file = .{ .authorize = &authorizeLargeObjectFile, .call = &largeObjectFileCall }, .relation_name = &relationName, .relation_display_name = &relationDisplayName, .catalog_text = &catalogText, .schema_path = &catalogSchemaPath, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .function_visible = &functionVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .view_definition = &postgresViewDefinition, .trigger_definition = &postgresTriggerDefinition, .rule_definition = &postgresRuleDefinition, .statistics_columns = &postgresStatisticsColumns, .relation_publishable = &relationPublishable, .partition_key_definition = &postgresPartitionKey, .partition_ancestors = &postgresPartitionAncestors, .namespace_lookup = &postgresNamespaceLookup, .namespace_name = &postgresNamespaceName, .routine_lookup = &postgresRoutineLookup, .routine_name = &postgresRoutineName, .xml_query = &xmlQuery, .xml_cursor = &xmlCursor, .type_name = &postgresTypeName, .composite_layout = &compositeLayoutHook };
             self.session.sequences = &self.seq_hook;
             // A statement starts with the whole XML scratch region free.
             self.xml_region = .{ .bytes = &self.xml_backing };
@@ -14406,17 +14449,26 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn columnOfOid(oid: u32, typmod: i32) V.Column {
+            // A composite type (composite lane): record with its OID.
+            if (types.oidType(oid, typmod)) |typed| if (typed.ty == .record) return .{ .data_type = .record, .typmod = typed.typmod };
             const data = types.typeFromOid(oid) orelse .text;
             return .{ .data_type = data, .typmod = typmod };
         }
 
         fn typeOfOid(oid: u32) types.Type {
-            return types.typeOfData(types.typeFromOid(oid) orelse .text);
+            if (types.oidType(oid, -1)) |typed| return typed.ty;
+            return .text;
+        }
+
+        /// A parameter's typmod: a composite type's is its OID.
+        fn typmodOfOid(oid: u32, typmod: i32) i32 {
+            if (types.oidType(oid, typmod)) |typed| return typed.typmod;
+            return typmod;
         }
 
         /// Parameters (and FOUND for PL/pgSQL) of a routine frame.
         fn routineParameters(frame: *R.Frame, names: []const V.Name, oids: []const u32, typmods: []const i32, routine_name: V.Name, plpgsql: bool) Error!void {
-            for (names, oids, typmods) |*name, oid, typmod| _ = try frame.declare(name.slice(), typeOfOid(oid), typmod);
+            for (names, oids, typmods) |*name, oid, typmod| _ = try frame.declare(name.slice(), typeOfOid(oid), typmodOfOid(oid, typmod));
             frame.variables.parameters = names.len;
             frame.variables.routine_name = routine_name;
             frame.variables.conflict_error = plpgsql;
@@ -14484,8 +14536,54 @@ pub fn Database(comptime config: Config) type {
         /// CREATE [OR REPLACE] FUNCTION / PROCEDURE: validates the signature
         /// and optionally analyzes the quoted body before writing its version.
         fn createRoutine(self: *Self, slot: u16, source: []const u8, definition: *const R.CreateRoutine, snap: Snapshot) Error!void {
+            if (routineNamesUserTypes(definition)) return self.createUserTypedRoutine(slot, source, definition, snap);
             if (definition.has_setof_table) return self.createSetofRoutine(slot, source, definition, snap);
             return self.createRoutineFrom(slot, source, definition, snap);
+        }
+
+        fn routineNamesUserTypes(definition: *const R.CreateRoutine) bool {
+            if (definition.return_user.named()) return true;
+            for (definition.args[0..definition.arg_count]) |*arg| if (arg.user_type.named()) return true;
+            return false;
+        }
+
+        /// The composite type a user type name denotes (B11 wave 5,
+        /// composite lane): an unqualified name searches the path. A
+        /// domain or enum is 0A000, no such type 42704.
+        fn userCompositeOid(self: *const Self, user: *const R.UserType, snap: Snapshot) Error!?u32 {
+            const name = user.name.slice();
+            var path: [routine_path_capacity]u32 = undefined;
+            const count = try self.routineSearch(user.has_schema, user.schema, snap, &path);
+            for (path[0..count]) |namespace| {
+                if (!self.catalog_objects.userTypeNameTaken(namespace, name, snap)) continue;
+                const index = self.catalog_objects.byName(.composite_type, namespace, name, snap) orelse return error.UnsupportedStatement;
+                return self.catalog_objects.items[index].oid;
+            }
+            return null;
+        }
+
+        /// CREATE FUNCTION naming user types: each becomes its composite
+        /// type's OID (typmod -1, as PostgreSQL); a RETURNS SETOF name
+        /// that is no type is a table's row type as before.
+        noinline fn createUserTypedRoutine(self: *Self, slot: u16, source: []const u8, given: *const R.CreateRoutine, snap: Snapshot) Error!void {
+            var resolved = given.*;
+            for (resolved.args[0..resolved.arg_count]) |*arg| {
+                if (!arg.user_type.named()) continue;
+                arg.oid = (try self.userCompositeOid(&arg.user_type, snap)) orelse return error.UndefinedObject;
+                arg.typmod = -1;
+                arg.user_type = .{};
+            }
+            if (resolved.return_user.named()) {
+                if (try self.userCompositeOid(&resolved.return_user, snap)) |oid| {
+                    if (resolved.outputCount() != 0) return error.InvalidFunctionDefinition;
+                    resolved.return_oid = oid;
+                    resolved.return_typmod = -1;
+                    resolved.has_setof_table = false;
+                } else if (!resolved.has_setof_table) return error.UndefinedObject;
+                resolved.return_user = .{};
+            }
+            if (resolved.has_setof_table) return self.createSetofRoutine(slot, source, &resolved, snap);
+            return self.createRoutineFrom(slot, source, &resolved, snap);
         }
 
         /// RETURNS SETOF table: its columns are the TABLE columns, as of
@@ -14821,11 +14919,11 @@ pub fn Database(comptime config: Config) type {
         /// Frame variables of a routine: its inputs, then OUT / TABLE
         /// parameters (NULL), then FOUND (PL/pgSQL).
         fn routineFrame(frame: *R.Frame, routine: *const RC.Routine) Error!void {
-            for (routine.arg_names[0..routine.arg_count], routine.arg_oids[0..routine.arg_count], routine.arg_typmods[0..routine.arg_count]) |*name, oid, typmod| _ = try frame.declare(name.slice(), typeOfOid(oid), typmod);
+            for (routine.arg_names[0..routine.arg_count], routine.arg_oids[0..routine.arg_count], routine.arg_typmods[0..routine.arg_count]) |*name, oid, typmod| _ = try frame.declare(name.slice(), typeOfOid(oid), typmodOfOid(oid, typmod));
             for (0..routine.out_count) |output| {
                 if (routine.out_inputs[output] != 0xff) continue;
                 // A row type's columns are no variables (no name binds them).
-                _ = try frame.declare(if (routine.rowtype) "" else routine.out_names[output].slice(), typeOfOid(routine.out_oids[output]), routine.out_typmods[output]);
+                _ = try frame.declare(if (routine.rowtype) "" else routine.out_names[output].slice(), typeOfOid(routine.out_oids[output]), typmodOfOid(routine.out_oids[output], routine.out_typmods[output]));
             }
             frame.variables.parameters = frame.variables.count;
             frame.variables.routine_name = routine.name;
@@ -14946,6 +15044,22 @@ pub fn Database(comptime config: Config) type {
             // The final statement returns one column of the result type
             // (an assignment-coercible one).
             const result = final_type orelse return error.InvalidFunctionDefinition;
+            // A composite result: one record column, or one column per
+            // field, each assignment-coercible (composite lane).
+            if (typeOfOid(definition.return_oid) == .record and !(final_count == 1 and result == .record)) {
+                const layout = value_module.compositeLayout(&self.session, definition.return_oid) orelse return error.UndefinedObject;
+                var fields: CO.CompositeFields = .{ .bytes = layout };
+                var position: usize = 0;
+                while (fields.next()) |field| : (position += 1) {
+                    if (position == final_count) return error.InvalidFunctionDefinition;
+                    const field_type = typeOfOid(field.oid);
+                    const column = final_types[position];
+                    if (column != field_type and column != .unknown and !value_module.castable(column, field_type, .assignment) and !(value_module.integral(column) and value_module.integral(field_type)))
+                        return error.InvalidFunctionDefinition;
+                }
+                if (position != final_count) return error.InvalidFunctionDefinition;
+                return;
+            }
             if (final_count != 1) return error.InvalidFunctionDefinition;
             const wanted = typeOfOid(definition.return_oid);
             if (result != wanted and result != .unknown and !value_module.castable(result, wanted, .assignment) and !(value_module.integral(result) and value_module.integral(wanted)))
@@ -14978,10 +15092,22 @@ pub fn Database(comptime config: Config) type {
             const name = drop.name.slice();
             var found: ?usize = null;
             if (drop.has_args) {
+                // User type names in the signature (composite lane).
+                var args = drop.args;
+                for (drop.arg_users[0..drop.arg_count], 0..) |*user, position| {
+                    if (!user.named()) continue;
+                    args[position] = (self.userCompositeOid(user, snap) catch |err| {
+                        if (drop.if_exists and err == error.UndefinedSchema) return null;
+                        return err;
+                    }) orelse {
+                        if (drop.if_exists) return null;
+                        return error.UndefinedObject;
+                    };
+                }
                 // The first namespace of the path with this signature.
                 for (path[0..path_len]) |namespace| {
-                    if (self.objects.routineWriter(namespace, name, drop.args[0..drop.arg_count], snap)) |other| return self.waitObject(slot, other);
-                    found = self.objects.findRoutine(namespace, name, drop.args[0..drop.arg_count], snap);
+                    if (self.objects.routineWriter(namespace, name, args[0..drop.arg_count], snap)) |other| return self.waitObject(slot, other);
+                    found = self.objects.findRoutine(namespace, name, args[0..drop.arg_count], snap);
                     if (found != null) break;
                 }
             } else {
@@ -15420,6 +15546,9 @@ pub fn Database(comptime config: Config) type {
             const column = columnOfOid(oid, typmod);
             var cell = value;
             const to = typeOfOid(oid);
+            // A record result of a composite type takes that type (its
+            // fields must have the declared types; composite lane).
+            if (to == .record and cell == .record) return E.cast(cell, .record, .record, column.typmod, &self.session);
             if (cell != .null_value and from != to and from != .unknown) {
                 if (!value_module.castable(from, to, .assignment) and !(value_module.integral(from) and value_module.integral(to))) return error.TypeMismatch;
                 cell = try E.cast(cell, from, to, typmod, &self.session);
@@ -15605,8 +15734,19 @@ pub fn Database(comptime config: Config) type {
                 const outputs = routine.out_count != 0;
                 var interpreter: Interp = .{ .host = self, .source = text_body, .frame = &frame, .purpose = .function, .return_column = result_column, .void_result = outputs or routine.return_oid == tg.void_oid, .routine_index = index, .routine_oid = routine.oid };
                 try interpreter.execute(.run);
+                // Several OUT parameters make a record (composite lane).
+                if (routine.out_count > 1) {
+                    var values: [config.routine_args]V.Cell = undefined;
+                    for (0..routine.out_count) |output| values[output] = frame.cells[outputVariable(routine, output)];
+                    out.* = try self.outputRecord(routine, values[0..routine.out_count], null);
+                    return;
+                }
                 // PL/pgSQL returns void as an empty, non-NULL value.
                 out.* = if (outputs) frame.cells[outputVariable(routine, 0)] else if (routine.return_oid == tg.void_oid) V.Cell{ .text = .{} } else interpreter.result;
+                return;
+            }
+            if (routine.out_count > 1) {
+                out.* = try self.sqlFunctionRecord(&frame, text_body, routine, index);
                 return;
             }
             if (routine.return_oid != tg.void_oid) if (try self.sqlFunctionExpression(&frame, text_body, &result_column)) |value| {
@@ -15658,6 +15798,9 @@ pub fn Database(comptime config: Config) type {
                 _ = try self.sqlFunctionStatement(frame, text_body[span.start..span.end], &last, routine, number);
             }
             if (void_result or last.rows == 0 or last.count == 0) return .null_value;
+            // A composite result from the final row's columns (composite lane).
+            if (result_column.data_type == .record and (last.count != 1 or last.tys[0] != .record))
+                return self.compositeOfColumns(result_column.typmod, last.cells[0..last.count], last.tys[0..last.count]);
             var cell = last.cells[0];
             if (cell != .null_value) {
                 const from = last.tys[0];
@@ -15665,6 +15808,57 @@ pub fn Database(comptime config: Config) type {
                 if (from != to) cell = try E.cast(cell, if (from == .unknown) .text else from, to, result_column.typmod, &self.session);
             }
             return D.store(result_column, cell, &self.session);
+        }
+
+        /// A SQL function with several OUT parameters (composite lane): the
+        /// final statement's first row as an anonymous record of the OUT
+        /// types; NULL when it returns no row.
+        fn sqlFunctionRecord(self: *Self, frame: *R.Frame, text_body: []const u8, routine: *const RC.Routine, index: usize) Error!V.Cell {
+            var statements: R.Statements = .{ .source = text_body };
+            var last: R.Capture = .{};
+            var number: usize = 0;
+            while (try statements.next()) |span| {
+                try self.session.checkpoint();
+                last = .{};
+                number += 1;
+                _ = try self.sqlFunctionStatement(frame, text_body[span.start..span.end], &last, index, number);
+            }
+            if (last.rows == 0) return .null_value;
+            if (last.count != routine.out_count) return error.InvalidFunctionDefinition;
+            return self.outputRecord(routine, last.cells[0..last.count], last.tys[0..last.count]);
+        }
+
+        /// The anonymous record of a routine's OUT values, each converted
+        /// to its parameter's type (`tys`: the values' types, null when they
+        /// already have them).
+        fn outputRecord(self: *Self, routine: *const RC.Routine, cells: []const V.Cell, tys: ?[]const types.Type) Error!V.Cell {
+            var out: V.Text = .{};
+            var builder = try V.Records.Builder.begin(&out, types.record_oid);
+            for (cells, 0..) |cell, output| {
+                const column = columnOfOid(routine.out_oids[output], routine.out_typmods[output]);
+                const value = if (tys) |given| try self.castCell(cell, given[output], routine.out_oids[output], routine.out_typmods[output]) else cell;
+                try builder.append(column.data_type, column.typmod, &value);
+            }
+            return .{ .record = out };
+        }
+
+        /// A record of composite type `oid` (as a typmod) from separate
+        /// column values, each converted by assignment to its field's type
+        /// (a different column count is 42P13 / 42804).
+        fn compositeOfColumns(self: *Self, oid: i32, cells: []const V.Cell, tys: []const types.Type) Error!V.Cell {
+            if (oid <= 0) return error.UnsupportedStatement;
+            const layout = value_module.compositeLayout(&self.session, @intCast(oid)) orelse return error.UndefinedObject;
+            var fields: CO.CompositeFields = .{ .bytes = layout };
+            var out: V.Text = .{};
+            var builder = try V.Records.Builder.begin(&out, @intCast(oid));
+            var position: usize = 0;
+            while (fields.next()) |field| : (position += 1) {
+                if (position == cells.len) return error.InvalidFunctionDefinition;
+                const value = try self.castCell(cells[position], tys[position], field.oid, field.typmod);
+                try builder.append(types.typeFromOid(field.oid) orelse return error.UnsupportedStatement, field.typmod, &value);
+            }
+            if (position != cells.len) return error.InvalidFunctionDefinition;
+            return .{ .record = out };
         }
 
         /// Statement `number` of SQL routine `routine` ('SQL function "f"

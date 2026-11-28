@@ -30,6 +30,7 @@ const routine_catalog = @import("routine_catalog.sig");
 const collation = @import("collation.sig");
 const catalog_objects = @import("catalog_objects.sig");
 const flat_record = @import("flat_record.sig");
+const record_module = @import("record.sig");
 const Error = types.Error;
 const none = ast.none;
 
@@ -357,6 +358,9 @@ pub fn Binder(comptime config: types.Config) type {
             catalog: *const K,
             /// Present only when binding an independent top-level SQL read.
             user_type_catalog: ?*const catalog_objects.Objects(config) = null,
+            /// Composite types every expression resolves (B11 wave 5,
+            /// composite lane); falls back to user_type_catalog.
+            composite_types: ?*const catalog_objects.Objects(config) = null,
             /// Statement snapshot: every name lookup reads the catalog under it.
             snapshot: storage.Snapshot,
             pool: *Ast.Pool,
@@ -924,6 +928,7 @@ pub fn Binder(comptime config: types.Config) type {
         /// Wraps `id` in an implicit/assignment cast to `target` when needed.
         fn convert(context: *const Context, id: u16, target: ast.Type, typmod: i32, mode: value.Context) Error!u16 {
             const n = context.node(id);
+            if (target == .record or (n.ty == .record and target != .unknown)) return convertRecord(context, id, target, typmod, mode);
             if (n.ty == .unknown) {
                 try coerce(context, id, target);
                 return id;
@@ -959,6 +964,7 @@ pub fn Binder(comptime config: types.Config) type {
                 b.* = try unsignedComparisonOperand(context, b.*);
                 return;
             }
+            if (left == .record or right == .record) return comparableRecords(context, a, b);
             if (left == .unknown and right == .unknown) {
                 try coerce(context, a.*, .text);
                 return coerce(context, b.*, .text);
@@ -1502,6 +1508,18 @@ pub fn Binder(comptime config: types.Config) type {
                     else => return error.UndefinedFunction,
                 },
                 .jsonb_pretty => try bindSignature(context, n, &[_]T{.jsonb}, .text, true),
+                // row_to_json(record [, pretty boolean]) (composite lane).
+                .row_to_json => {
+                    if (count != 1 and count != 2) return error.UndefinedFunction;
+                    if (context.node(n.b).ty != .record) return error.UndefinedFunction;
+                    if (count == 2) {
+                        const pretty = context.node(n.b).next;
+                        try coerce(context, pretty, .boolean);
+                        if (context.node(pretty).ty != .boolean) return error.UndefinedFunction;
+                    }
+                    n.ty = .json;
+                    n.constant = listConstant(context, n.b);
+                },
                 .to_json, .to_jsonb => {
                     if (count != 1) return error.UndefinedFunction;
                     // anyelement: an untyped literal is 42804.
@@ -1725,6 +1743,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "jsonb_insert", .func = .jsonb_insert }, .{ .name = "jsonb_delete_path", .func = .jsonb_delete_path },
                 .{ .name = "jsonb_strip_nulls", .func = .jsonb_strip_nulls }, .{ .name = "jsonb_pretty", .func = .jsonb_pretty },
                 .{ .name = "to_json", .func = .to_json },           .{ .name = "to_jsonb", .func = .to_jsonb },
+                .{ .name = "row_to_json", .func = .row_to_json },
                 .{ .name = "jsonb_path_exists", .func = .jsonb_path_exists }, .{ .name = "jsonb_path_match", .func = .jsonb_path_match },
                 .{ .name = "jsonb_path_query_array", .func = .jsonb_path_query_array }, .{ .name = "jsonb_path_query_first", .func = .jsonb_path_query_first },
                 // The *_tz variants differ only in datetime comparisons (wave 4).
@@ -2139,7 +2158,7 @@ pub fn Binder(comptime config: types.Config) type {
             n.a = n.b;
             n.b = none;
             n.ty = result;
-            n.typmod = if (kind == .sum and arg_ty == .mysql_bigint_unsigned) ast.mysql_unsigned_sum_typmod else -1;
+            n.typmod = if (kind == .sum and arg_ty == .mysql_bigint_unsigned) ast.mysql_unsigned_sum_typmod else if (result == .record) context.node(n.a).typmod else -1;
             n.constant = false;
             if (scope.saw_aggregate) |flag| flag.* = true;
         }
@@ -2188,6 +2207,8 @@ pub fn Binder(comptime config: types.Config) type {
                 // array_larger/array_smaller compare whole arrays.
                 .min, .max => if (types.isArray(arg_ty)) arg_ty else switch (arg_ty) {
                     .int2, .int4, .int8, .numeric, .float4, .float8, .text, .oid, .date, .timestamp, .timestamptz, .interval, .bpchar, .time, .timetz, .money => arg_ty,
+                    // record_larger / record_smaller (composite lane).
+                    .record => arg_ty,
                     // pg_lsn_larger/smaller and xid8_larger/smaller.
                     .pg_lsn, .xid8, .mysql_bigint_unsigned => arg_ty,
                     // network_larger/network_smaller (cidr input converts).
@@ -2651,7 +2672,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .aggregate_input => return,
                 // Bound by bindJsonTable only (B11).
                 .json_table, .json_table_passing, .json_table_column => return error.Syntax,
-                .jsonb_set, .jsonb_set_lax, .jsonb_insert, .jsonb_delete_path, .jsonb_strip_nulls, .jsonb_pretty, .to_json, .to_jsonb, .jsonb_path_exists, .jsonb_path_match, .jsonb_path_query_array, .jsonb_path_query_first, .jsonb_exists_any, .jsonb_exists_all, .jsonb_minus_op, .jsonb_delete_path_op, .jsonb_exists_any_op, .jsonb_exists_all_op, .jsonb_path_exists_op, .jsonb_path_match_op => try typeJsonFunction(context, n, count),
+                .jsonb_set, .jsonb_set_lax, .jsonb_insert, .jsonb_delete_path, .jsonb_strip_nulls, .jsonb_pretty, .to_json, .to_jsonb, .row_to_json, .jsonb_path_exists, .jsonb_path_match, .jsonb_path_query_array, .jsonb_path_query_first, .jsonb_exists_any, .jsonb_exists_all, .jsonb_minus_op, .jsonb_delete_path_op, .jsonb_exists_any_op, .jsonb_exists_all_op, .jsonb_path_exists_op, .jsonb_path_match_op => try typeJsonFunction(context, n, count),
                 .greatest, .least => {
                     if (count == 0) return error.Syntax;
                     var target: ast.Type = .unknown;
@@ -2982,7 +3003,7 @@ pub fn Binder(comptime config: types.Config) type {
                         .regclass => 2205,
                         .regtype => 2206,
                         .regnamespace => 4089,
-                        .none => if (argument.ty == .unknown) 705 else types.typeOid(types.dataTypeOf(argument.ty)),
+                        .none => if (argument.ty == .unknown) 705 else if (argument.ty == .record) types.recordTypeOid(argument.typmod) else types.typeOid(types.dataTypeOf(argument.ty)),
                     };
                     // A domain cast's type is the domain (S071).
                     if (argument.kind == .cast and argument.domain_cast) {
@@ -5132,7 +5153,8 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 // DEFAULT outside an INSERT VALUES item or SET value (42601).
                 .values_row, .default_value => return error.Syntax,
-                .row_constructor => return error.UnsupportedStatement,
+                .row_constructor => try bindRecordValue(context, scope, id),
+                .field_select => try bindFieldSelect(context, scope, id),
                 // Internal comparison lists have already bound every field.
                 .row_compare, .row_in => { n.ty = .boolean; n.constant = isConstant(context, n.a) and listConstant(context, n.b); },
                 // A named or VARIADIC call argument: typed through its value;
@@ -5175,7 +5197,7 @@ pub fn Binder(comptime config: types.Config) type {
                     n.constant = isConstant(context, n.a);
                 },
                 .binary => {
-                    if (context.node(n.a).kind == .row_constructor or context.node(n.b).kind == .row_constructor) return bindRowCompare(context, scope, id);
+                    if (rowWise(context, n)) return bindRowCompare(context, scope, id);
                     try typeExpr(context, scope, n.a);
                     try typeExpr(context, scope, n.b);
                     n.constant = isConstant(context, n.a) and isConstant(context, n.b);
@@ -5378,15 +5400,23 @@ pub fn Binder(comptime config: types.Config) type {
                     }
                     if (result == .unknown) result = .text;
                     const widen = !value.integral(result);
+                    // Records take the arms' composite type (composite lane).
+                    var result_typmod: i32 = -1;
+                    if (result == .record) {
+                        arm = n.b;
+                        while (arm != none) : (arm = context.node(arm).next) try commonRecordTypmod(context, context.node(arm).b, &result_typmod);
+                        if (n.c != none) try commonRecordTypmod(context, n.c, &result_typmod);
+                    }
                     arm = n.b;
                     while (arm != none) : (arm = context.node(arm).next) {
                         const entry = context.node(arm);
-                        if (widen) entry.b = try convert(context, entry.b, result, -1, .implicit) else try coerce(context, entry.b, result);
+                        if (widen) entry.b = try convert(context, entry.b, result, result_typmod, .implicit) else try coerce(context, entry.b, result);
                     }
                     if (n.c != none) {
-                        if (widen) n.c = try convert(context, n.c, result, -1, .implicit) else try coerce(context, n.c, result);
+                        if (widen) n.c = try convert(context, n.c, result, result_typmod, .implicit) else try coerce(context, n.c, result);
                     }
                     n.ty = result;
+                    n.typmod = result_typmod;
                     n.constant = constant;
                 },
                 .coalesce => {
@@ -5407,6 +5437,23 @@ pub fn Binder(comptime config: types.Config) type {
                     if (value.integral(result)) {
                         item = n.b;
                         while (item != none) : (item = context.node(item).next) try coerce(context, item, result);
+                    } else if (result == .record) {
+                        // Records take the arguments' composite type.
+                        var result_typmod: i32 = -1;
+                        item = n.b;
+                        while (item != none) : (item = context.node(item).next) try commonRecordTypmod(context, item, &result_typmod);
+                        var previous: u16 = none;
+                        item = n.b;
+                        while (item != none) {
+                            const following = context.node(item).next;
+                            const converted = try convert(context, item, .record, result_typmod, .implicit);
+                            context.node(converted).next = following;
+                            if (converted != item) context.node(item).next = none;
+                            if (previous == none) n.b = converted else context.node(previous).next = converted;
+                            previous = converted;
+                            item = following;
+                        }
+                        n.typmod = result_typmod;
                     } else n.b = try convertList(context, n.b, result);
                     n.ty = result;
                     n.constant = listConstant(context, n.b);
@@ -5431,8 +5478,13 @@ pub fn Binder(comptime config: types.Config) type {
                     n.date_bound=false;
                     if (n.flat_record_cast) return;
                     // A domain named anywhere in an expression (S071, B11
-                    // wave 5); other user types only as a projected root.
-                    if (n.cast_type == .unknown and !try bindDomainCast(context, n)) return error.UnsupportedStatement;
+                    // wave 5); composite types too (composite lane); enums
+                    // only as a projected root.
+                    if (n.cast_type == .unknown and !try bindDomainCast(context, n)) {
+                        if (try bindCompositeCast(context, scope, id)) return;
+                        return error.UnsupportedStatement;
+                    }
+                    if (n.cast_type == .record) return bindRecordCast(context, scope, id, n.typmod);
                     if (ast.regKind(n.typmod) != .none) return regCast(context, scope, n);
                     if (n.typmod == ast.mysql_integer_cast_typmod) {
                         if (context.dialect != .mysql or (n.cast_type == .mysql_bigint_unsigned and config.numeric_digits < 20))
@@ -6091,6 +6143,8 @@ pub fn Binder(comptime config: types.Config) type {
         /// Returns the (possibly cast-wrapped) expression id.
         fn assignment(context: *const Context, id: u16, column: *const V.Column) Error!u16 {
             const target = types.typeOfData(column.data_type);
+            // A composite column (composite lane): its typmod is the type.
+            if (target == .record) return convert(context, id, .record, column.typmod, .assignment);
             const ty = context.node(id).ty;
             if (ty == .unknown) {
                 try coerce(context, id, target);
@@ -6175,12 +6229,19 @@ pub fn Binder(comptime config: types.Config) type {
                     }
                     break :blk .{ .name = "case", .strength = 1 };
                 },
+                // A row constructor is `row`; a field selection its field.
+                .row_constructor => .{ .name = "row", .strength = 2 },
+                .field_select => blk: {
+                    if (n.name.len == 0) break :blk .{ .name = "?column?", .strength = 0 };
+                    buffer.* = toName(context, n.name);
+                    break :blk .{ .name = buffer.slice(), .strength = 2 };
+                },
                 .cast => blk: {
                     if (n.flat_record_cast and context.node(n.a).kind == .row_constructor)
                         break :blk .{ .name = "row", .strength = 2 };
                     const inner = figure(context, n.a, buffer);
                     if (inner.strength > 1) break :blk inner;
-                    if (n.domain_cast or n.enum_cast or n.flat_record_cast) {
+                    if (n.domain_cast or n.enum_cast or n.flat_record_cast or (n.cast_type == .record and n.name.len != 0)) {
                         buffer.* = toName(context, n.name);
                         break :blk .{ .name = buffer.slice(), .strength = 1 };
                     }
@@ -6557,6 +6618,8 @@ pub fn Binder(comptime config: types.Config) type {
 
         fn outputTypmod(context: *const Context, id: u16) i32 {
             const n = context.node(id);
+            // A record's typmod is its composite type OID (composite lane).
+            if (n.ty == .record) return n.typmod;
             return switch (n.kind) {
                 .column, .aggregate => n.typmod,
                 .cast => if (n.typmod == ast.mysql_integer_cast_typmod) -1 else n.typmod,
@@ -6680,40 +6743,418 @@ pub fn Binder(comptime config: types.Config) type {
             out.plan = root;
         }
 
-        fn recordFieldLiteral(context: *const Context, id: u16) bool {
-            const n = context.node(id);
-            return switch (n.kind) {
-                .null_literal, .int_literal, .text_literal, .bool_literal, .decimal_literal => true,
-                .unary => (n.op == .neg or n.op == .pos) and recordFieldLiteral(context, n.a),
-                else => false,
-            };
+        // ---- composite values (B11 wave 5, composite lane) -----------------
+
+        fn compositeCatalog(context: *const Context) ?*const catalog_objects.Objects(config) {
+            return context.composite_types orelse context.user_type_catalog;
         }
 
-        fn bindFlatRecordCast(context: *const Context, scope: *const Scope, n: *ast.Node, object: *const catalog_objects.Objects(config).Object) Error!void {
-            const row = context.node(n.a);
-            if (row.kind == .row_constructor) {
-                var item = &row.b;
-                var layout = object.compositeFields();
-                while (layout.next()) |attribute| {
-                    const id = item.*;
-                    if (id == none) return error.CannotCoerce;
-                    const data_type = types.typeFromOid(attribute.oid) orelse return error.UnsupportedStatement;
-                    if (attribute.typmod != -1 or !flat_record.supports(data_type) or !recordFieldLiteral(context, id)) return error.UnsupportedStatement;
-                    const next = context.node(id).next;
-                    try typeExpr(context, scope, id);
-                    const coerced = convert(context, id, types.typeOfData(data_type), -1, .explicit) catch |err|
-                        return if (err == error.UndefinedFunction) error.CannotCoerce else err;
-                    item.* = coerced;
-                    item = &context.node(coerced).next;
-                    item.* = next;
+        /// The fields of composite type `oid` (catalog_objects layout).
+        fn compositeLayout(context: *const Context, oid: u32) ?[]const u8 {
+            const user_types = compositeCatalog(context) orelse return null;
+            const index = user_types.byOid(.composite_type, oid, context.snapshot) orelse return null;
+            return user_types.items[index].compositeFields().bytes;
+        }
+
+        /// The composite type a type name denotes (an unqualified name: the
+        /// search path's first schema with a user type of that name).
+        fn compositeNamed(context: *const Context, name_ident: ast.Ident, qualifier: ast.Ident) Error!?u32 {
+            const user_types = compositeCatalog(context) orelse return null;
+            const name = toName(context, name_ident);
+            const namespace = if (qualifier.len == 0) blk: {
+                if (!context.routine_path_known) break :blk catalog.public_namespace;
+                for (context.routine_path) |candidate| {
+                    if (user_types.userTypeNameTaken(candidate, name.slice(), context.snapshot)) break :blk candidate;
                 }
-                if (item.* != none) return error.CannotCoerce;
-            } else if (row.kind != .null_literal) return error.UnsupportedStatement;
-            n.cast_type = .bytea;
-            n.ty = .bytea;
-            n.flat_record_cast = true;
-            n.constant = true;
-            n.integer = object.composite_field_count;
+                return null;
+            } else try qualifierNamespace(context, qualifier);
+            const index = user_types.byName(.composite_type, namespace, name.slice(), context.snapshot) orelse return null;
+            return user_types.items[index].oid;
+        }
+
+        /// Whether a comparison is PostgreSQL's row-wise comparison: two
+        /// row constructors, or a row constructor and a row subquery.
+        fn rowWise(context: *const Context, n: *const ast.Node) bool {
+            const left = context.node(n.a).kind;
+            const right = context.node(n.b).kind;
+            if (left == .row_constructor and right == .row_constructor) return true;
+            return left == .row_constructor and right == .scalar_subquery and context.node(n.b).func != .array_subquery;
+        }
+
+        /// ROW(...) / (a, b) as a value: an anonymous record of its fields'
+        /// types. Untyped literals stay unknown until a composite target
+        /// types them; an anonymous record keeps them as text.
+        fn bindRecordValue(context: *const Context, scope: *const Scope, id: u16) Error!void {
+            const n = context.node(id);
+            var count: usize = 0;
+            var constant = true;
+            var item = n.b;
+            while (item != none) : (item = context.node(item).next) {
+                try typeExpr(context, scope, item);
+                const field = context.node(item);
+                // Records of records are not representable (no nesting).
+                if (field.ty == .record) return error.UnsupportedStatement;
+                if (field.ty == .void) return error.UndefinedFunction;
+                constant = constant and isConstant(context, item);
+                count += 1;
+                if (count > record_module.max_fields) return error.ColumnCapacity;
+            }
+            n.ty = .record;
+            n.typmod = -1;
+            n.constant = constant;
+        }
+
+        /// A field value converted to its declared type: always a cast node
+        /// that carries the declared typmod (record evaluation reads it).
+        fn fieldCast(context: *const Context, id: u16, target: ast.Type, typmod: i32, mode: value.Context) Error!u16 {
+            const n = context.node(id);
+            if (n.ty == .unknown) {
+                try coerce(context, id, target);
+            } else if (n.ty == .record) {
+                return error.UnsupportedStatement;
+            } else if (n.ty != target and !value.castable(n.ty, target, mode)) {
+                return if (mode == .explicit) error.CannotCoerce else error.TypeMismatch;
+            }
+            const cast_id = try context.pool.add(.{ .kind = .cast, .cast_type = target, .typmod = typmod, .a = id, .ty = target });
+            const cast_node = context.node(cast_id);
+            cast_node.constant = isConstant(context, id);
+            cast_node.collation = if (collation.collatable(target)) n.collation else collation.none;
+            try context.pool.raise(cast_id, id);
+            return cast_id;
+        }
+
+        /// Coerces a bound row constructor to composite type `oid` field by
+        /// field in `mode` (coerce_record_to_complex): a different field
+        /// count is 42846.
+        fn coerceRowTo(context: *const Context, id: u16, oid: u32, mode: value.Context) Error!void {
+            const layout = compositeLayout(context, oid) orelse return error.UndefinedObject;
+            var fields: catalog_objects.CompositeFields = .{ .bytes = layout };
+            const row = context.node(id);
+            var link: *u16 = &row.b;
+            var constant = true;
+            while (fields.next()) |field| {
+                const item = link.*;
+                if (item == none) return error.CannotCoerce;
+                const next = context.node(item).next;
+                const data_type = types.typeFromOid(field.oid) orelse return error.UnsupportedStatement;
+                const converted = try fieldCast(context, item, types.typeOfData(data_type), field.typmod, mode);
+                context.node(item).next = none;
+                context.node(converted).next = next;
+                link.* = converted;
+                try context.pool.raise(id, converted);
+                constant = constant and isConstant(context, converted);
+                link = &context.node(converted).next;
+            }
+            if (link.* != none) return error.CannotCoerce;
+            row.ty = .record;
+            row.typmod = @intCast(oid);
+            row.constant = constant;
+        }
+
+        /// A cast to a composite type named by the cast (`x::pt`), or to
+        /// `record`; false when the name is no composite type.
+        fn bindCompositeCast(context: *const Context, scope: *const Scope, id: u16) Error!bool {
+            const n = context.node(id);
+            if (context.dialect != .postgres or n.name.len == 0) return false;
+            const name = toName(context, n.name);
+            if (types.keyword(name.slice(), "record") and (n.qualifier.len == 0 or types.keyword(toName(context, n.qualifier).slice(), "pg_catalog"))) {
+                try bindRecordCast(context, scope, id, -1);
+                return true;
+            }
+            const oid = (try compositeNamed(context, n.name, n.qualifier)) orelse return false;
+            try bindRecordCast(context, scope, id, @intCast(oid));
+            return true;
+        }
+
+        /// `x::composite` (typmod: its OID, -1 for `record`): a row
+        /// constructor's fields convert explicitly, an untyped literal is
+        /// read by record_in, a string by I/O conversion, a record of the
+        /// same type passes; other records are checked when evaluated.
+        fn bindRecordCast(context: *const Context, scope: *const Scope, id: u16, typmod: i32) Error!void {
+            const n = context.node(id);
+            const inner = context.node(n.a);
+            if (inner.kind == .row_constructor) {
+                if (inner.ty != .record) try bindRecordValue(context, scope, n.a);
+                if (typmod > 0) try coerceRowTo(context, n.a, @intCast(typmod), .explicit) else try anonymousFields(context, n.a);
+            } else {
+                try typeExpr(context, scope, n.a);
+                n.a = try convertRecord(context, n.a, .record, typmod, .explicit);
+            }
+            n.cast_type = .record;
+            n.typmod = typmod;
+            n.ty = .record;
+            n.constant = isConstant(context, n.a);
+            n.collation = collation.none;
+        }
+
+        /// An anonymous record's untyped fields read as text.
+        fn anonymousFields(context: *const Context, id: u16) Error!void {
+            var item = context.node(id).b;
+            while (item != none) : (item = context.node(item).next) {
+                if (context.node(item).ty == .unknown) try coerce(context, item, .text);
+            }
+        }
+
+        /// A record conversion (convert's record branch): to a composite or
+        /// `record` target, or from a record to another type.
+        fn convertRecord(context: *const Context, id: u16, target: ast.Type, typmod: i32, mode: value.Context) Error!u16 {
+            const n = context.node(id);
+            if (target != .record) {
+                // record -> text by I/O conversion (assignment or explicit).
+                if (!value.stringType(target) or mode == .implicit) return if (mode == .explicit) error.CannotCoerce else error.TypeMismatch;
+                if (n.kind == .row_constructor) try anonymousFields(context, id);
+                return recordCastNode(context, id, target, -1);
+            }
+            switch (n.ty) {
+                .unknown => {
+                    if (n.kind == .text_literal) {
+                        // record_in, validated now and again when evaluated.
+                        if (typmod <= 0) return error.UnsupportedStatement;
+                        const layout = compositeLayout(context, @intCast(typmod)) orelse return error.UndefinedObject;
+                        const text = E.literalText(context.source, n.text);
+                        _ = try Io.parseRecord(text.slice(), @intCast(typmod), layout, context.session);
+                    }
+                    n.ty = .record;
+                    n.typmod = typmod;
+                    return id;
+                },
+                .record => {
+                    if (typmod <= 0 or n.typmod == typmod) {
+                        if (n.kind == .row_constructor) try anonymousFields(context, id);
+                        return id;
+                    }
+                    if (n.kind == .row_constructor and n.typmod <= 0) {
+                        try coerceRowTo(context, id, @intCast(typmod), mode);
+                        return id;
+                    }
+                    // Another composite type: no cast (42846); an
+                    // anonymous record is checked field by field at run time.
+                    if (n.typmod > 0) return if (mode == .explicit) error.CannotCoerce else error.TypeMismatch;
+                    if (mode != .explicit) return error.TypeMismatch;
+                    return recordCastNode(context, id, .record, typmod);
+                },
+                else => {
+                    // A string reads as the composite's text (record_in) in
+                    // an explicit cast only.
+                    if (!value.stringType(n.ty) or mode != .explicit) return if (mode == .explicit) error.CannotCoerce else error.TypeMismatch;
+                    if (typmod <= 0) return error.UnsupportedStatement;
+                    return recordCastNode(context, id, .record, typmod);
+                },
+            }
+        }
+
+        fn recordCastNode(context: *const Context, id: u16, target: ast.Type, typmod: i32) Error!u16 {
+            const cast_id = try context.pool.add(.{ .kind = .cast, .cast_type = target, .typmod = typmod, .a = id, .ty = target });
+            context.node(cast_id).constant = isConstant(context, id);
+            try context.pool.raise(cast_id, id);
+            return cast_id;
+        }
+
+        /// Comparison of composite values (record_eq, record_lt, ...): an
+        /// untyped side or a row constructor takes the other side's
+        /// composite type; two different composite types do not compare
+        /// (42883).
+        fn comparableRecords(context: *const Context, a: *u16, b: *u16) Error!void {
+            const left = context.node(a.*);
+            const right = context.node(b.*);
+            // record_eq(record, record): an untyped side is an anonymous
+            // record (whose input is 0A000).
+            if (left.ty != .record) {
+                if (left.ty != .unknown) return error.UndefinedFunction;
+                a.* = try convertRecord(context, a.*, .record, -1, .implicit);
+                return;
+            }
+            if (right.ty != .record) {
+                if (right.ty != .unknown) return error.UndefinedFunction;
+                b.* = try convertRecord(context, b.*, .record, -1, .implicit);
+                return;
+            }
+            if (left.typmod == right.typmod) {
+                if (left.kind == .row_constructor) try anonymousFields(context, a.*);
+                if (right.kind == .row_constructor) try anonymousFields(context, b.*);
+                return;
+            }
+            if (left.typmod > 0 and right.typmod > 0) return error.UndefinedFunction;
+            // A row constructor beside a composite value keeps its own
+            // field types: record_eq needs the same column types (42804).
+            if (left.typmod > 0 and right.kind == .row_constructor) return sameFieldTypes(context, b.*, @intCast(left.typmod));
+            if (right.typmod > 0 and left.kind == .row_constructor) return sameFieldTypes(context, a.*, @intCast(right.typmod));
+            if (left.kind == .row_constructor) try anonymousFields(context, a.*);
+            if (right.kind == .row_constructor) try anonymousFields(context, b.*);
+        }
+
+        /// The composite type CASE / COALESCE results share: two different
+        /// composite types do not match (42804).
+        fn commonRecordTypmod(context: *const Context, id: u16, typmod: *i32) Error!void {
+            const n = context.node(id);
+            if (n.ty != .record or n.typmod <= 0) return;
+            if (typmod.* <= 0) {
+                typmod.* = n.typmod;
+            } else if (typmod.* != n.typmod) return error.TypeMismatch;
+        }
+
+        /// A row constructor compared with composite type `oid`: its fields
+        /// must have the field types (record_eq's 42804 otherwise; an
+        /// untyped field is `unknown`). The row then takes the type.
+        fn sameFieldTypes(context: *const Context, id: u16, oid: u32) Error!void {
+            const layout = compositeLayout(context, oid) orelse return error.UndefinedObject;
+            var fields: catalog_objects.CompositeFields = .{ .bytes = layout };
+            const row = context.node(id);
+            var item = row.b;
+            while (fields.next()) |field| {
+                if (item == none) return error.TypeMismatch;
+                const field_type = types.oidType(field.oid, field.typmod) orelse return error.UnsupportedStatement;
+                const value_type = context.node(item).ty;
+                if (value_type != field_type.ty and !(value.integral(value_type) and value_type == field_type.ty)) return error.TypeMismatch;
+                item = context.node(item).next;
+            }
+            if (item != none) return error.TypeMismatch;
+            return coerceRowTo(context, id, oid, .implicit);
+        }
+
+        /// One field of a record expression's row type.
+        const RecordField = struct { index: usize, ty: ast.Type, typmod: i32, name: []const u8 };
+
+        /// Field `want` (by name, or by position when `name` is null) of the
+        /// record expression `id`: a composite type's fields, or a user
+        /// function's OUT / TABLE columns. Null when it has no such field.
+        fn recordField(context: *const Context, id: u16, name: ?[]const u8, want: usize) Error!?RecordField {
+            const n = context.node(id);
+            if (n.typmod > 0) {
+                const layout = compositeLayout(context, @intCast(n.typmod)) orelse return error.UndefinedObject;
+                var fields: catalog_objects.CompositeFields = .{ .bytes = layout };
+                var index: usize = 0;
+                while (fields.next()) |field| : (index += 1) {
+                    const hit = if (name) |wanted| types.same(field.name, wanted) else index == want;
+                    if (!hit) continue;
+                    const data_type = types.typeFromOid(field.oid) orelse return error.UnsupportedStatement;
+                    return .{ .index = index, .ty = types.typeOfData(data_type), .typmod = field.typmod, .name = field.name };
+                }
+                return null;
+            }
+            if (n.kind == .row_constructor) {
+                // A row constructor's fields are f1, f2, ... (RowExpr).
+                var item = n.b;
+                var index: usize = 0;
+                while (item != none) : ({
+                    item = context.node(item).next;
+                    index += 1;
+                }) {
+                    const hit = if (name) |wanted| anonymousFieldIndex(wanted) == index else index == want;
+                    if (!hit) continue;
+                    const field = context.node(item);
+                    // An empty name: fN, formatted by its user.
+                    return .{ .index = index, .ty = if (field.ty == .unknown) .text else field.ty, .typmod = if (field.kind == .cast or field.kind == .column) field.typmod else -1, .name = "" };
+                }
+                return null;
+            }
+            if (n.kind == .function and n.func == .routine) {
+                const set = context.routines orelse return null;
+                const routine = &set.routines[@intCast(n.integer)];
+                for (0..routine.out_count) |index| {
+                    const hit = if (name) |wanted| types.same(routine.out_names[index].slice(), wanted) else index == want;
+                    if (!hit) continue;
+                    const data_type = types.typeFromOid(routine.out_oids[index]) orelse return error.UnsupportedStatement;
+                    return .{ .index = index, .ty = types.typeOfData(data_type), .typmod = routine.out_typmods[index], .name = routine.out_names[index].slice() };
+                }
+            }
+            return null;
+        }
+
+        /// The 0-based index a row constructor field name `fN` denotes.
+        fn anonymousFieldIndex(name: []const u8) ?usize {
+            if (name.len < 2 or name.len > 4 or name[0] != 'f' or name[1] == '0') return null;
+            var number: usize = 0;
+            for (name[1..]) |byte| {
+                if (byte < '0' or byte > '9') return null;
+                number = number * 10 + (byte - '0');
+            }
+            return number - 1;
+        }
+
+        /// `(a).name` on a composite value: 42809 when `a` is no record,
+        /// 42703 when its row type has no such field.
+        fn bindFieldSelect(context: *const Context, scope: *const Scope, id: u16) Error!void {
+            const n = context.node(id);
+            // `(a).*` is a select list's row expansion only (0A000 here).
+            if (n.star) return error.UnsupportedStatement;
+            try typeExpr(context, scope, n.a);
+            const base = context.node(n.a);
+            if (base.ty != .record) return error.WrongObjectType;
+            if (base.kind == .row_constructor) try anonymousFields(context, n.a);
+            const wanted = toName(context, n.name);
+            const field = (try recordField(context, n.a, wanted.slice(), 0)) orelse return error.ColumnNotFound;
+            n.integer = @intCast(field.index);
+            n.ty = field.ty;
+            n.typmod = field.typmod;
+            n.constant = isConstant(context, n.a);
+        }
+
+        /// A composite column's type: its OID as the column typmod. Domain
+        /// and enum columns stay 0A000, `record` is a pseudo-type (42P16)
+        /// and an unknown name is 42704.
+        fn compositeColumnTypmod(context: *const Context, definition: *const Ast.ColumnDef) Error!i32 {
+            if (definition.user_type.len == 0) return error.InvalidTableDefinition;
+            if (try compositeNamed(context, definition.user_type, definition.user_type_schema)) |oid| return @intCast(oid);
+            const name = toName(context, definition.user_type);
+            if (definition.user_type_schema.len == 0 and types.keyword(name.slice(), "record")) return error.InvalidTableDefinition;
+            const user_types = compositeCatalog(context) orelse return error.UnsupportedStatement;
+            if (definition.user_type_schema.len != 0) {
+                const namespace = try qualifierNamespace(context, definition.user_type_schema);
+                if (user_types.userTypeNameTaken(namespace, name.slice(), context.snapshot)) return error.UnsupportedStatement;
+                return error.UndefinedObject;
+            }
+            for (context.routine_path) |namespace| {
+                if (user_types.userTypeNameTaken(namespace, name.slice(), context.snapshot)) return error.UnsupportedStatement;
+            }
+            if (user_types.userTypeNameTaken(catalog.public_namespace, name.slice(), context.snapshot)) return error.UnsupportedStatement;
+            return error.UndefinedObject;
+        }
+
+        /// A select-list `(a).*`.
+        fn recordStar(context: *const Context, id: u16) bool {
+            if (id == none) return false;
+            const n = context.node(id);
+            return n.kind == .field_select and n.star;
+        }
+
+        /// The number of fields `(a).*` expands to, binding `a` (42809 when
+        /// it is no record, 42703 for an anonymous record).
+        fn recordStarWidth(context: *const Context, scope: *const Scope, id: u16) Error!usize {
+            const n = context.node(id);
+            try typeExpr(context, scope, n.a);
+            const base = context.node(n.a);
+            if (base.ty != .record) return error.WrongObjectType;
+            var count: usize = 0;
+            while (try recordField(context, n.a, null, count)) |_| count += 1;
+            if (count == 0 and base.typmod <= 0) return error.ColumnNotFound;
+            return count;
+        }
+
+        /// Field `index` of an expanded `(a).*` (its base already bound):
+        /// a new field_select node sharing the base.
+        fn recordStarField(context: *const Context, id: u16, index: usize) Error!u16 {
+            const n = context.node(id);
+            const field = (try recordField(context, n.a, null, index)) orelse return error.ColumnNotFound;
+            const selected = try context.pool.add(.{ .kind = .field_select, .a = n.a, .integer = @intCast(index), .ty = field.ty, .typmod = field.typmod, .constant = isConstant(context, n.a) });
+            try context.pool.raise(selected, n.a);
+            return selected;
+        }
+
+        /// The output name of an expanded field.
+        fn recordStarName(context: *const Context, id: u16, index: usize) Error!V.Name {
+            const n = context.node(id);
+            const field = (try recordField(context, n.a, null, index)) orelse return error.ColumnNotFound;
+            var name: V.Name = .{};
+            if (field.name.len == 0) {
+                const label = std.fmt.bufPrint(&name.bytes, "f{d}", .{index + 1}) catch return error.NameCapacity;
+                name.len = label.len;
+                return name;
+            }
+            if (field.name.len > name.bytes.len) return error.NameCapacity;
+            @memcpy(name.bytes[0..field.name.len], field.name);
+            name.len = field.name.len;
+            return name;
         }
 
         /// The domain a cast names (unqualified: the search path's first
@@ -6778,6 +7219,7 @@ pub fn Binder(comptime config: types.Config) type {
         }
 
         fn bindUserTypeCast(context: *const Context, scope: *const Scope, target: u16) Error!?types.NominalColumnType {
+            _ = scope;
             const n = context.node(target);
             if (n.kind != .cast or n.cast_type != .unknown) return null;
             if (context.dialect != .postgres) return error.UnsupportedStatement;
@@ -6819,11 +7261,8 @@ pub fn Binder(comptime config: types.Config) type {
                 n.enum_cast = true;
                 return .{ .oid = object.oid, .len = 4 };
             }
-            if (user_types.byName(.composite_type, namespace, name.slice(), context.snapshot)) |index| {
-                const object = &user_types.items[index];
-                try bindFlatRecordCast(context, scope, n, object);
-                return .{ .oid = object.oid, .len = -1, .representation = .flat_record };
-            }
+            // Composite casts bind in any expression (composite lane).
+            if (user_types.byName(.composite_type, namespace, name.slice(), context.snapshot) != null) return null;
             if (user_types.userTypeNameTaken(namespace, name.slice(), context.snapshot)) return error.UnsupportedStatement;
             return error.UndefinedObject;
         }
@@ -6896,6 +7335,20 @@ pub fn Binder(comptime config: types.Config) type {
                         out.typmods[out.count] = column.typmod;
                         if (context.dialect == .tds and fixedInt4(context, &.{origin}, id))
                             out.non_null_columns.set(out.count);
+                        out.count += 1;
+                    }
+                    continue;
+                }
+                if (recordStar(context, target.expr)) {
+                    // `(a).*`: one output column per field (composite lane).
+                    const width = try recordStarWidth(context, &scope, target.expr);
+                    for (0..width) |index| {
+                        if (out.count == config.columns) return error.ColumnCapacity;
+                        const id = try recordStarField(context, target.expr, index);
+                        out.targets[out.count] = id;
+                        out.names[out.count] = try recordStarName(context, target.expr, index);
+                        out.types[out.count] = types.dataTypeOf(context.node(id).ty);
+                        out.typmods[out.count] = outputTypmod(context, id);
                         out.count += 1;
                     }
                     continue;
@@ -7125,6 +7578,7 @@ pub fn Binder(comptime config: types.Config) type {
                 values[position] = value_id;
                 const value_node = context.node(value_id);
                 supplied[position].ty = value_node.ty;
+                supplied[position].typmod = value_node.typmod;
                 supplied[position].unknown = value_node.ty == .unknown;
             }
             var best: ?usize = null;
@@ -7156,8 +7610,12 @@ pub fn Binder(comptime config: types.Config) type {
             // FROM binds it as a table function (0A000). A set of one
             // column is a select-list set-returning call (B11 wave 5,
             // ProjectSet; typeFunction admits it there only).
-            if (!from and (routine.return_oid == routine_catalog.record_oid or (routine.retset and routine.out_count > 1))) return error.UnsupportedStatement;
-            const result: types.DataType = if (routine.return_oid == routine_catalog.record_oid) .text else types.typeFromOid(routine.return_oid) orelse return error.UnsupportedStatement;
+            // A record result in an expression (composite lane): several OUT
+            // parameters make an anonymous record, a composite result type
+            // a record of that type. Sets of records stay FROM items.
+            if (!from and routine.retset and (routine.out_count > 1 or routine.return_oid == routine_catalog.record_oid)) return error.UnsupportedStatement;
+            const record_result = !from and (routine.return_oid == routine_catalog.record_oid or RC.userTypeOid(routine.return_oid));
+            const result: types.DataType = if (routine.return_oid == routine_catalog.record_oid) (if (from) .text else .record) else if (RC.userTypeOid(routine.return_oid)) .record else types.typeFromOid(routine.return_oid) orelse return error.UnsupportedStatement;
             // A void routine's value is the void type (B11 wave 5): NULL from
             // a SQL body, an empty value from PL/pgSQL, as in PostgreSQL.
             // One bound argument per input, in parameter order: converted
@@ -7166,7 +7624,8 @@ pub fn Binder(comptime config: types.Config) type {
             var head: u16 = none;
             var tail: u16 = none;
             for (0..routine.arg_count) |input| {
-                const to = types.typeOfData(types.typeFromOid(routine.arg_oids[input]) orelse return error.UndefinedFunction);
+                const typed = types.oidType(routine.arg_oids[input], -1) orelse return error.UndefinedFunction;
+                const to = typed.ty;
                 const slot = best_match.slots[input];
                 const bound: u16 = if (slot == RC.default_slot)
                     try context.pool.add(.{ .kind = .default_value, .ty = to, .constant = false })
@@ -7181,7 +7640,7 @@ pub fn Binder(comptime config: types.Config) type {
                         element_tail = converted;
                     }
                     break :blk array;
-                } else try convert(context, values[slot], to, -1, .implicit);
+                } else try convert(context, values[slot], to, if (to == .record) typed.typmod else -1, .implicit);
                 context.node(bound).next = none;
                 if (tail == none) head = bound else context.node(tail).next = bound;
                 tail = bound;
@@ -7190,12 +7649,15 @@ pub fn Binder(comptime config: types.Config) type {
             n.func = .routine;
             n.integer = @intCast(chosen);
             n.ty = types.typeOfData(result);
-            n.typmod = routine.return_typmod;
+            n.typmod = if (result == .record) (if (RC.userTypeOid(routine.return_oid)) @as(i32, @intCast(routine.return_oid)) else -1) else routine.return_typmod;
             n.constant = false;
             n.boolean = routine.retset;
             n.c = none;
             // A select-list set-returning call runs through the routine hook.
             if (!from and routine.retset) return;
+            // A record result runs through the routine hook too (an inlined
+            // body yields one column).
+            if (record_result) return;
             for (context.inline_calls) |entry| {
                 if (entry.node == node_id and entry.routine == chosen) {
                     n.c = try bindInlineBody(context, routine, entry, from);
@@ -7213,7 +7675,8 @@ pub fn Binder(comptime config: types.Config) type {
             var variables: RoutineVariables = .{};
             for (0..routine.arg_count) |input| {
                 if (variables.count == variables.items.len) return error.ColumnCapacity;
-                variables.items[variables.count] = .{ .name = routine.arg_names[input], .ty = types.typeOfData(types.typeFromOid(routine.arg_oids[input]) orelse return error.UndefinedFunction), .typmod = routine.arg_typmods[input] };
+                const typed = types.oidType(routine.arg_oids[input], routine.arg_typmods[input]) orelse return error.UndefinedFunction;
+                variables.items[variables.count] = .{ .name = routine.arg_names[input], .ty = typed.ty, .typmod = typed.typmod };
                 variables.count += 1;
             }
             variables.parameters = variables.count;
@@ -7292,6 +7755,19 @@ pub fn Binder(comptime config: types.Config) type {
                     bindVariableNode(n, 0, index, 0, item.ty, item.typmod);
                     return true;
                 }
+                // `variable.field` of a composite variable (composite lane),
+                // unless a FROM item has that name.
+                if (variables.find(q.slice())) |index| {
+                    const item = &variables.items[index];
+                    if (item.ty != .record or relationNamed(scope, q.slice())) return false;
+                    const base = try context.pool.add(.{});
+                    bindVariableNode(context.node(base), 0, index, 0, item.ty, item.typmod);
+                    const field = (try recordField(context, base, wanted.slice(), 0)) orelse return error.ColumnNotFound;
+                    const name = n.name;
+                    n.* = .{ .kind = .field_select, .a = base, .name = name, .integer = @intCast(field.index), .ty = field.ty, .typmod = field.typmod, .next = n.next };
+                    try context.pool.raise(nodeIndex(context, n), base);
+                    return true;
+                }
                 return false;
             }
             const index = variables.find(wanted.slice()) orelse return false;
@@ -7302,6 +7778,10 @@ pub fn Binder(comptime config: types.Config) type {
             const item = &variables.items[index];
             bindVariableNode(n, 0, index, 0, item.ty, item.typmod);
             return true;
+        }
+
+        fn nodeIndex(context: *const Context, n: *const ast.Node) u16 {
+            return @intCast((@intFromPtr(n) - @intFromPtr(&context.pool.nodes[0])) / @sizeOf(ast.Node));
         }
 
         fn bindVariableNode(n: *ast.Node, record: u8, index: usize, column: u16, ty: ast.Type, typmod: i32) void {
@@ -9647,6 +10127,12 @@ pub fn Binder(comptime config: types.Config) type {
                     try expandStar(context, &scope, q, p, target);
                     continue;
                 }
+                if (recordStar(context, target.expr)) {
+                    // `(a).*`: one output column per field (composite lane).
+                    const width = try recordStarWidth(context, &scope, target.expr);
+                    for (0..width) |index| try addTarget(context, p, try recordStarField(context, target.expr, index), try recordStarName(context, target.expr, index));
+                    continue;
+                }
                 const call = context.node(target.expr);
                 if (call.kind == .function and (unnestName(context, call.name, functionSchema(call)) or subscriptsName(context, call.name, functionSchema(call)))) {
                     if (q.lock.strength != .none) return error.UnsupportedStatement;
@@ -10478,6 +10964,7 @@ pub fn Binder(comptime config: types.Config) type {
                         for (out.columns[0..index]) |*previous|
                             if (types.same(previous.name.slice(), column.name.slice())) return error.DuplicateColumn;
                         column.data_type = columnType(context, definition);
+                        if (column.data_type == .record) column.typmod = try compositeColumnTypmod(context, definition);
                         if (column.data_type == .mysql_bigint_unsigned and
                             (context.dialect != .mysql or !types.validTypeTypmod(config, column.data_type, column.typmod) or
                                 definition.default_kind != .none or create.partition_by != .none or create.inherits != null))
@@ -11151,6 +11638,7 @@ pub fn Binder(comptime config: types.Config) type {
                     if (out.count == config.columns) return error.ColumnCapacity;
                     var column: V.Column = .{ .name = name, .not_null = definition.not_null, .typmod = definition.typmod, .default_kind = definition.default_kind };
                     column.data_type = columnType(context, definition);
+                    if (column.data_type == .record) column.typmod = try compositeColumnTypmod(context, definition);
                     if (column.data_type == .mysql_bigint_unsigned) return error.UnsupportedStatement;
                     switch (definition.default_kind) {
                         // Identity and stored generation need per-row values

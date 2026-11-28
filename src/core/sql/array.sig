@@ -321,7 +321,7 @@ pub fn Arrays(comptime V: type) type {
                     try putInt(out, u64, @bitCast(value.y));
                 },
                 .box => |value| for ([_]f64{ value.high.x, value.high.y, value.low.x, value.low.y }) |coordinate| try putInt(out, u64, @bitCast(coordinate)),
-                .array => return error.TypeMismatch,
+                .array, .record => return error.TypeMismatch,
             }
         }
 
@@ -334,7 +334,7 @@ pub fn Arrays(comptime V: type) type {
 
         fn decode(bytes: []const u8, at: *usize, element: DataType) Cell {
             return switch (V.cellTag(element)) {
-                .null_value, .array => unreachable,
+                .null_value, .array, .record => unreachable,
                 .integer => .{ .integer = switch (element) {
                     .smallint => getInt(i16, bytes, at),
                     .integer32 => getInt(i32, bytes, at),

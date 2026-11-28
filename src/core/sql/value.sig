@@ -31,6 +31,8 @@ const multirange = @import("multirange.sig");
 const xml = @import("xml.sig");
 const jsonpath = @import("jsonpath.sig");
 const text_search = @import("text_search.sig");
+const record_module = @import("record.sig");
+const catalog_objects = @import("catalog_objects.sig");
 const Error = types.Error;
 const Type = types.Type;
 
@@ -176,7 +178,17 @@ pub const SequenceHook = struct {
     /// A user type's regtype output (domains, enums, composite types;
     /// schema-qualified when the search path does not find it; S071).
     type_name: ?*const fn (ptr: *anyopaque, oid: u32, out: []u8) Error!?usize = null,
+    /// The fields of a composite type (B11 wave 5, composite lane): its
+    /// catalog_objects.CompositeFields bytes, null when no such type.
+    composite_layout: ?*const fn (ptr: *anyopaque, oid: u32) ?[]const u8 = null,
 };
+
+/// The fields of composite type `oid` through the session's catalog hook.
+pub fn compositeLayout(session: *const Session, oid: u32) ?[]const u8 {
+    const hook = session.sequences orelse return null;
+    const layout = hook.composite_layout orelse return null;
+    return layout(hook.ptr, oid);
+}
 
 /// The receiver of an xml_query (B11 wave 5 xml lane).
 pub const XmlQuerySink = struct {
@@ -608,6 +620,7 @@ pub fn Io(comptime config: types.Config) type {
         pub const rangeSubtype = types.rangeSubtype;
         pub const Arrays = V.Arrays;
         pub const Ranges = V.Ranges;
+        pub const Records = V.Records;
         pub const ArrayShape = @import("array.sig").Shape;
         /// Largest text form of one cell (codec buffers).
         pub const format_bytes: usize = @as(usize, @max(config.text_bytes * 8, numeric.format_bytes)) + 64;
@@ -708,6 +721,93 @@ pub fn Io(comptime config: types.Config) type {
                     copy(buffer, &.{value})
                 else
                     copy(buffer, &.{ '\\', '0' + (value >> 6), '0' + ((value >> 3) & 7), '0' + (value & 7) }),
+                .record => |*value| try formatRecord(value.slice(), session, buffer),
+            };
+        }
+
+        /// record_out (B11 wave 5, composite lane): `(f1,f2,...)`, each
+        /// field's output text quoted as rowtypes.c does, NULL as nothing.
+        fn formatRecord(bytes: []const u8, session: *const Session, buffer: []u8) Error![]const u8 {
+            if (buffer.len < 2) return error.TextCapacity;
+            buffer[0] = '(';
+            var used: usize = 1;
+            var reader = V.Records.Reader.init(bytes);
+            var item: V.Records.Field = .{};
+            var field_text: [format_bytes]u8 = undefined;
+            while (reader.next(&item)) {
+                if (reader.index > 1) {
+                    if (used == buffer.len) return error.TextCapacity;
+                    buffer[used] = ',';
+                    used += 1;
+                }
+                if (item.cell == .null_value) continue;
+                const text = try format(&item.cell, false, session, &field_text);
+                try record_module.appendQuoted(buffer, &used, text);
+            }
+            if (used == buffer.len) return error.TextCapacity;
+            buffer[used] = ')';
+            return buffer[0 .. used + 1];
+        }
+
+        /// record_in (B11 wave 5, composite lane) of composite type `oid`
+        /// whose fields are `layout`: 22P02 for malformed input (too few or
+        /// too many columns, junk after the right parenthesis).
+        pub fn parseRecord(input: []const u8, oid: u32, layout: []const u8, session: *const Session) Error!V.Cell {
+            var at: usize = 0;
+            while (at < input.len and record_module.space(input[at])) at += 1;
+            if (at >= input.len or input[at] != '(') return error.InvalidTextRepresentation;
+            at += 1;
+            var out: V.Text = .{};
+            var builder = try V.Records.Builder.begin(&out, oid);
+            var fields: catalog_objects.CompositeFields = .{ .bytes = layout };
+            var field_text: [format_bytes]u8 = undefined;
+            var first = true;
+            while (fields.next()) |field| {
+                if (!first) {
+                    // A missing comma: too few columns.
+                    if (at >= input.len or input[at] != ',') return error.InvalidTextRepresentation;
+                    at += 1;
+                }
+                first = false;
+                const data_type = types.typeFromOid(field.oid) orelse return error.UnsupportedStatement;
+                const scanned = try record_module.scanField(input, &at, &field_text);
+                const cell: V.Cell = if (scanned.null_value) .null_value else try parse(types.typeOfData(data_type), field.typmod, field_text[0..scanned.len], session);
+                try builder.append(data_type, field.typmod, &cell);
+            }
+            if (at >= input.len or input[at] != ')') return error.InvalidTextRepresentation;
+            at += 1;
+            while (at < input.len and record_module.space(input[at])) at += 1;
+            if (at != input.len) return error.InvalidTextRepresentation;
+            return .{ .record = out };
+        }
+
+        /// Record casts: to and from the string types by I/O conversion,
+        /// between records when the target is anonymous or the same type,
+        /// or when its fields have exactly the value's field types.
+        fn castRecord(cell: V.Cell, to: Type, typmod: i32, session: *const Session) Error!V.Cell {
+            if (cell == .record) {
+                const bytes = cell.record.slice();
+                if (to == .record) {
+                    if (typmod <= 0 or V.Records.typeOf(bytes) == @as(u32, @intCast(typmod))) return cell;
+                    const layout = compositeLayout(session, @intCast(typmod)) orelse return error.CannotCoerce;
+                    var fields: catalog_objects.CompositeFields = .{ .bytes = layout };
+                    var reader = V.Records.Reader.init(bytes);
+                    var item: V.Records.Field = .{};
+                    while (fields.next()) |field| {
+                        if (!reader.next(&item)) return error.CannotCoerce;
+                        if (types.typeOid(item.data_type) != field.oid or item.typmod != field.typmod) return error.CannotCoerce;
+                    }
+                    if (reader.index != reader.total) return error.CannotCoerce;
+                    return .{ .record = V.Records.retyped(bytes, @intCast(typmod)) };
+                }
+                if (!characterType(to)) return error.CannotCoerce;
+                var buffer: [format_bytes]u8 = undefined;
+                return cast(try textCell(try format(&cell, false, session, &buffer)), .text, to, typmod, session);
+            }
+            return switch (cell) {
+                .text => |*value| parse(.record, typmod, value.slice(), session),
+                .bpchar => |*value| parse(.record, typmod, value.slice(), session),
+                else => error.CannotCoerce,
             };
         }
 
@@ -973,6 +1073,13 @@ pub fn Io(comptime config: types.Config) type {
                 .aclitem => return error.UnsupportedStatement,
                 // void_in ignores its input.
                 .void => .{ .text = .{} },
+                // record_in: a named composite type's fields (the typmod
+                // holds its OID); anonymous records have no input (0A000).
+                .record => {
+                    if (typmod <= 0) return error.UnsupportedStatement;
+                    const layout = compositeLayout(session, @intCast(typmod)) orelse return error.UndefinedObject;
+                    return parseRecord(input, @intCast(typmod), layout, session);
+                },
                 .pg_internal_char => .{ .pg_internal_char = parseInternalChar(input) },
                 .tsvector, .tsquery => blk: {
                     var out: TS.Out = .{};
@@ -1188,6 +1295,7 @@ pub fn Io(comptime config: types.Config) type {
                 if (from == to) return applyTypmodExplicit(cell, to, typmod);
                 return ArrayText.cast(cell.array.slice(), types.elementType(from) orelse return error.CannotCoerce, types.elementType(to).?, typmod, session);
             }
+            if (cell == .record or to == .record) return castRecord(cell, to, typmod, session);
             if (cell == .bpchar and to != .bpchar) {
                 // text(bpchar) drops trailing spaces for the string types;
                 // other targets read bpcharout's padded text (I/O conversion).
@@ -1199,6 +1307,7 @@ pub fn Io(comptime config: types.Config) type {
                 .aclitem => return error.UnsupportedStatement,
                 // void_in ignores its input (I/O conversion from a string).
                 .void => V.Cell{ .text = .{} },
+                .record => unreachable,
                 .pg_internal_char => switch (cell) {
                     .integer => |value| blk: {
                         if (value < -128 or value > 127) return error.NumericValueOutOfRange;

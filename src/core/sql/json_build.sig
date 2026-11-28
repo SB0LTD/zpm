@@ -22,11 +22,14 @@ const array_module = @import("array.sig");
 const Error = types.Error;
 const Type = types.Type;
 
-pub const Category = enum { boolean, number, date, timestamp, timestamptz, json, jsonb, array, other };
+pub const Category = enum { boolean, number, date, timestamp, timestamptz, json, jsonb, array, other,
+    // Composite values as objects (B11 wave 5, composite lane).
+    composite };
 
 pub fn category(ty: Type) Category {
     if (types.isArray(ty)) return .array;
     return switch (ty) {
+        .record => .composite,
         .boolean => .boolean,
         .int2, .int4, .int8, .float4, .float8, .numeric => .number,
         .date => .date,
@@ -131,7 +134,7 @@ pub fn JsonBuild(comptime config: types.Config) type {
             if (types.pseudoRecord(ty)) return error.UnsupportedStatement;
             const kind = category(ty);
             if (key) switch (kind) {
-                .array, .json => return error.InvalidParameterValue,
+                .array, .json, .composite => return error.InvalidParameterValue,
                 .jsonb => if (jsonb) return error.InvalidParameterValue,
                 else => {},
             };
@@ -160,11 +163,37 @@ pub fn JsonBuild(comptime config: types.Config) type {
                     out.len += text.len;
                 },
                 .array => try appendArray(out, cell.array.slice(), types.elementType(ty) orelse .text, jsonb, session),
+                .composite => try appendRecord(out, cell, false, jsonb, session),
                 .other => {
                     var buffer: [Io.format_bytes]u8 = undefined;
                     try escaped(out, try Io.format(cell, false, session, &buffer));
                 },
             }
+        }
+
+        /// composite_to_json: an object of the fields in order, named after
+        /// the composite type's fields (f1, f2, ... for an anonymous
+        /// record); `pretty` puts each field after the first on a new line.
+        pub fn appendRecord(out: *Out, cell: *const V.Cell, pretty: bool, jsonb: bool, session: *const Session) Error!void {
+            if (cell.* != .record) return error.TypeMismatch;
+            const bytes = cell.record.slice();
+            const oid = V.Records.typeOf(bytes);
+            var names: @import("catalog_objects.sig").CompositeFields = .{ .bytes = if (oid == types.record_oid) &.{} else value_module.compositeLayout(session, oid) orelse &.{} };
+            var reader = V.Records.Reader.init(bytes);
+            var item: V.Records.Field = .{};
+            try out.byte('{');
+            while (reader.next(&item)) {
+                if (reader.index > 1) try out.append(if (pretty) ",\n " else ",");
+                if (names.next()) |field| {
+                    try escaped(out, field.name);
+                } else {
+                    var label: [8]u8 = undefined;
+                    try escaped(out, @import("std").fmt.bufPrint(&label, "f{d}", .{reader.index}) catch return error.TextCapacity);
+                }
+                try out.byte(':');
+                try append(out, &item.cell, types.typeOfData(item.data_type), false, jsonb, session);
+            }
+            try out.byte('}');
         }
 
         /// array_to_json: one bracket level per dimension, elements by

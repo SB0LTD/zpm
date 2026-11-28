@@ -610,7 +610,9 @@ pub fn Catalog(comptime config: types.Config) type {
 
         /// One argument of a call: its name in named notation (else
         /// empty), its type and whether it is an untyped literal or NULL.
-        pub const Supplied = struct { name: Name = .{}, ty: types.Type = .unknown, unknown: bool = false };
+        pub const Supplied = struct { name: Name = .{}, ty: types.Type = .unknown, unknown: bool = false,
+            /// A record's composite type OID (-1 anonymous; composite lane).
+            typmod: i32 = -1 };
 
         pub const default_slot: u8 = 0xff;
         pub const expanded_slot: u8 = 0xfe;
@@ -706,6 +708,18 @@ pub fn Catalog(comptime config: types.Config) type {
             for (params, 0..) |param, position| {
                 const slot = out.slots[position];
                 if (slot == default_slot) continue;
+                // A composite parameter (composite lane): the same type is
+                // exact; an anonymous record or untyped literal may convert.
+                if (userTypeOid(param.oid)) {
+                    if (slot == expanded_slot) return false;
+                    const arg = supplied[slot];
+                    if (arg.unknown or arg.ty == .unknown) continue;
+                    if (arg.ty != .record) return false;
+                    if (arg.typmod == @as(i64, param.oid)) {
+                        out.exact += 2;
+                    } else if (arg.typmod > 0) return false;
+                    continue;
+                }
                 const data = types.typeFromOid(param.oid) orelse return false;
                 const declared = types.typeOfData(data);
                 if (slot == expanded_slot) {
@@ -922,8 +936,33 @@ pub fn Catalog(comptime config: types.Config) type {
             return len;
         }
 
+        /// A built-in type, or an allocated OID: a composite type (B11
+        /// wave 5, composite lane) that replay checks against the catalog.
         fn knownType(oid: u32) bool {
-            return types.typeFromOid(oid) != null;
+            return types.typeFromOid(oid) != null or (oid >= 16384 and oid != 0xffffffff);
+        }
+
+        /// Whether `oid` names no built-in type (a composite type).
+        pub fn userTypeOid(oid: u32) bool {
+            return types.typeFromOid(oid) == null and oid >= 16384 and oid != 0xffffffff;
+        }
+
+        /// Every composite type a routine's signature names is live.
+        fn compositeTypesLive(item: *const Routine, context: anytype) bool {
+            for (item.arg_oids[0..item.arg_count]) |oid| if (userTypeOid(oid) and !context.compositeLive(oid)) return false;
+            for (item.out_oids[0..item.out_count]) |oid| if (userTypeOid(oid) and !context.compositeLive(oid)) return false;
+            if (userTypeOid(item.return_oid) and !context.compositeLive(item.return_oid)) return false;
+            return true;
+        }
+
+        /// Whether a live routine of the overlay names composite type `oid`.
+        pub fn overlayUsesType(overlay: *const Overlay, oid: u32) bool {
+            for (&overlay.objects) |*object| {
+                if (!object.live or object.class != .routine) continue;
+                if (object.return_oid == oid) return true;
+                for (object.arg_oids[0..object.arg_count]) |arg| if (arg == oid) return true;
+            }
+            return false;
         }
 
         pub fn decodeRoutine(payload: []const u8, out: *Routine) Error!void {
@@ -1279,6 +1318,7 @@ pub fn Catalog(comptime config: types.Config) type {
                     if (tag == create_routine_extended) try decodeRoutineExtended(payload, &item) else try decodeRoutine(payload, &item);
                     if (item.oid < 16384 or item.oid == 0xffffffff or overlayHas(overlay, item.oid) or context.oidTaken(item.oid)) return error.ChangeRecordConflict;
                     if (!context.namespaceKnown(item.namespace)) return error.ChangeRecordConflict;
+                    if (!compositeTypesLive(&item, context)) return error.ChangeRecordConflict;
                     for (&overlay.objects) |*object| {
                         if (object.live and object.class == .routine and object.namespace == item.namespace and types.same(object.name.slice(), item.name.slice()) and
                             sameArgs(object.arg_oids[0..object.arg_count], item.args())) return error.ChangeRecordConflict;
