@@ -190,7 +190,7 @@ def main():
                        ', .rows = &.{' + rows + '} },')
         out.append('    } },')
     out.append('};')
-    OUTPUT.write_text('\n'.join(out) + '\n', encoding='utf8')
+    OUTPUT.write_text('\n'.join(out) + '\n', encoding='utf8', newline='\n')
     print(f'wrote {OUTPUT}')
 
 

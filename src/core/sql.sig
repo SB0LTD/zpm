@@ -7861,6 +7861,12 @@ pub fn Database(comptime config: Config) type {
             if (self.privilegedRole(snap)) return;
             try self.checkColumnReads(snap);
             switch (bound.*) {
+                // FOR UPDATE / SHARE also needs UPDATE on the table or on
+                // some column (PostgreSQL's ACL_SELECT_FOR_UPDATE).
+                .select => |*select| if (select.lock.strength != .none) if (select.table) |table_slot| {
+                    const none: [config.columns]bool = @splat(false);
+                    try self.needColumns(table_slot, CO.priv_update, &none, snap);
+                },
                 .insert => |*insert| try self.insertPrivileges(insert, snap),
                 .update => |*update| try self.updatePrivileges(update, snap),
                 .delete => |*delete| try self.deletePrivileges(delete, snap),
