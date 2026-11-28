@@ -4160,7 +4160,8 @@ pub fn Parser(comptime config: types.Config) type {
             // Fast path for the common bare column (projection lists).
             const niladic = wordIs(self.source, self.current, "current_timestamp") or wordIs(self.source, self.current, "current_date") or
                 (self.mode == .standard and (wordIs(self.source, self.current, "current_user") or wordIs(self.source, self.current, "current_role") or
-                wordIs(self.source, self.current, "session_user") or wordIs(self.source, self.current, "user")));
+                wordIs(self.source, self.current, "session_user") or wordIs(self.source, self.current, "user") or
+                wordIs(self.source, self.current, "current_catalog") or wordIs(self.source, self.current, "current_schema")));
             if ((self.current.kind == .word and !lexer.reserved(self.current.keyword) and !niladic) or self.current.kind == .quoted_word) {
                 const after = try self.peek();
                 // COLLATE and SIMILAR (not lexer keywords) continue the expression.
@@ -5836,6 +5837,15 @@ pub fn Parser(comptime config: types.Config) type {
                     const session = wordIs(self.source, token, "session_user");
                     const name = try self.identifier();
                     return self.pool.add(.{ .kind = .function, .name = name, .func = if (session) .session_user else .current_user });
+                }
+                // CURRENT_CATALOG (F762) and CURRENT_SCHEMA (F763) without
+                // parentheses: current_database() and current_schema().
+                // current_catalog is reserved: `current_catalog()` is 42601.
+                if (self.mode == .standard and wordIs(self.source, token, "current_catalog") and lparenNext(try self.peek())) return error.Syntax;
+                if (self.mode == .standard and (wordIs(self.source, token, "current_catalog") or wordIs(self.source, token, "current_schema")) and !lparenNext(try self.peek())) {
+                    const catalog_name = wordIs(self.source, token, "current_catalog");
+                    const name = try self.identifier();
+                    return self.pool.add(.{ .kind = .function, .name = name, .func = if (catalog_name) .current_database else .current_schema });
                 }
                 if (self.mode == .standard and lparenNext(try self.peek())) {
                     if (self.tokens.dialect == .mysql) {
