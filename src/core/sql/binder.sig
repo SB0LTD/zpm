@@ -1569,6 +1569,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "lo_truncate", .func = .lo_truncate },
                 .{ .name = "lo_truncate64", .func = .lo_truncate64 },
                 .{ .name = "current_database", .func = .current_database },
+                .{ .name = "version", .func = .version },
                 .{ .name = "current_schemas", .func = .current_schemas },
                 .{ .name = "pg_encoding_to_char", .func = .pg_encoding_to_char },
                 .{ .name = "current_schema", .func = .current_schema },
@@ -1766,6 +1767,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "pg_typeof", .func = .pg_typeof },
                 .{ .name = "pg_get_serial_sequence", .func = .pg_get_serial_sequence },
                 .{ .name = "pg_table_is_visible", .func = .pg_table_is_visible },
+                .{ .name = "pg_function_is_visible", .func = .pg_function_is_visible },
                 .{ .name = "acldefault", .func = .acldefault },
             };
             for (table) |entry| if (types.same(name.slice(), entry.name)) return entry.func;
@@ -2777,6 +2779,10 @@ pub fn Binder(comptime config: types.Config) type {
                     if (count != 0) return error.UndefinedFunction;
                     n.ty = .name;
                 },
+                .version => {
+                    if (count != 0) return error.UndefinedFunction;
+                    n.ty = .text;
+                },
                 .current_schemas => {
                     try bindSignature(context, n, &.{.boolean}, types.arrayType(.name).?, true);
                     n.constant = false;
@@ -2990,7 +2996,7 @@ pub fn Binder(comptime config: types.Config) type {
                     try bindSignature(context, n, &[_]ast.Type{ .pg_internal_char, .oid }, types.arrayType(.aclitem).?, true);
                     n.constant = false;
                 },
-                .pg_table_is_visible => {
+                .pg_table_is_visible, .pg_function_is_visible => {
                     try bindSignature(context, n, &[_]ast.Type{.oid}, .boolean, true);
                     n.constant = false;
                 },
@@ -6161,7 +6167,14 @@ pub fn Binder(comptime config: types.Config) type {
                 .exists_subquery => .{ .name = "exists", .strength = 2 },
                 .nullif => .{ .name = "nullif", .strength = 2 },
                 .at_zone => .{ .name = "timezone", .strength = 2 },
-                .case_expr => .{ .name = "case", .strength = 1 },
+                // FigureColnameInternal: a named ELSE result names the CASE.
+                .case_expr => blk: {
+                    if (n.c != none) {
+                        const inner = figure(context, n.c, buffer);
+                        if (inner.strength > 1) break :blk inner;
+                    }
+                    break :blk .{ .name = "case", .strength = 1 };
+                },
                 .cast => blk: {
                     if (n.flat_record_cast and context.node(n.a).kind == .row_constructor)
                         break :blk .{ .name = "row", .strength = 2 };
@@ -6965,7 +6978,7 @@ pub fn Binder(comptime config: types.Config) type {
         }
 
         fn relationColumnTypmod(context: *const Context, rel: *const Relation, column: usize) i32 {
-            if (rel.view != null) return -1;
+            if (rel.view) |view| return catalog.viewColumns(view)[column].typmod;
             if (rel.table) |index| return context.tables[index].columns[column].typmod;
             return plansOf(context).items[rel.plan].typmods[column];
         }

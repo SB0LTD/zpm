@@ -597,6 +597,7 @@ pub fn Eval(comptime config: types.Config) type {
         fn catalogValue(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
             switch (n.func) {
                 .current_database => return textCell(ctx.session.database),
+                .version => return textCell(catalog.version_text),
                 // The first schema of the search path (ddl-dml, wave 4).
                 .current_schema => {
                     const hook = ctx.session.sequences orelse return if (ctx.session.public_schema_on_path) textCell("public") else .null_value;
@@ -637,6 +638,11 @@ pub fn Eval(comptime config: types.Config) type {
                 .pg_table_is_visible => {
                     const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
                     const visible = hook.relation_visible orelse return error.UnsupportedStatement;
+                    return if (visible(hook.ptr, @intCast(first.integer))) |found| boolCell(found) else .null_value;
+                },
+                .pg_function_is_visible => {
+                    const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
+                    const visible = hook.function_visible orelse return error.UnsupportedStatement;
                     return if (visible(hook.ptr, @intCast(first.integer))) |found| boolCell(found) else .null_value;
                 },
                 .to_regtype, .regtype_in => {
@@ -1623,9 +1629,9 @@ pub fn Eval(comptime config: types.Config) type {
                 },
                 .nextval, .currval, .setval, .lastval, .identity_next => return sequenceValue(ctx, n),
                 .lo_truncate, .lo_truncate64, .lo_from_bytea, .lo_get, .lo_create, .lo_creat, .lo_unlink, .lo_import, .lo_export => unreachable,
-                .current_database, .current_schema, .current_schemas, .pg_encoding_to_char, .to_regtype, .to_regclass, .to_regproc, .format_type, .pg_get_expr, .regclass_in, .regtype_in, .regclass_out, .regtype_out,
+                .current_database, .current_schema, .current_schemas, .version, .pg_encoding_to_char, .to_regtype, .to_regclass, .to_regproc, .format_type, .pg_get_expr, .regclass_in, .regtype_in, .regclass_out, .regtype_out,
                 .to_regnamespace, .regnamespace_in, .regnamespace_out,
-                .acldefault, .pg_get_userbyid, .pg_tablespace_location, .pg_table_is_visible, .pg_get_indexdef, .pg_get_constraintdef, .pg_get_triggerdef, .pg_get_ruledef, .pg_get_viewdef, .pg_get_statisticsobjdef_columns, .pg_relation_is_publishable, .pg_get_partkeydef => return catalogValue(ctx, n),
+                .acldefault, .pg_get_userbyid, .pg_tablespace_location, .pg_table_is_visible, .pg_function_is_visible, .pg_get_indexdef, .pg_get_constraintdef, .pg_get_triggerdef, .pg_get_ruledef, .pg_get_viewdef, .pg_get_statisticsobjdef_columns, .pg_relation_is_publishable, .pg_get_partkeydef => return catalogValue(ctx, n),
                 .pg_get_function_arguments, .pg_get_function_identity_arguments, .pg_get_function_result, .pg_get_function_sqlbody => return functionCatalogValue(ctx, n),
                 .pg_partition_ancestors, .array_subquery => return error.UnsupportedStatement,
                 .obj_description, .col_description, .shobj_description, .current_user, .session_user => return objectText(ctx, n),

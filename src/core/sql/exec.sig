@@ -963,6 +963,27 @@ pub fn Exec(comptime config: types.Config) type {
                     },
                     .and_op, .or_op => self.availableWithin(n.a, first, stage, require_infallible) and self.availableWithin(n.b, first, stage, require_infallible),
                     .not_op, .test_op => self.availableWithin(n.a, first, stage, require_infallible),
+                    // [NOT] IN (list): equality over available operands.
+                    .in_list => blk: {
+                        if (!self.availableWithin(n.a, first, stage, require_infallible)) break :blk false;
+                        var item = n.b;
+                        while (item != none) : (item = self.pool.nodes[item].next) if (!self.availableWithin(item, first, stage, require_infallible)) break :blk false;
+                        break :blk true;
+                    },
+                    // [NOT] [I]LIKE with a literal pattern and the default
+                    // escape cannot fail unless the pattern ends in a lone
+                    // escape character (22025).
+                    .like => blk: {
+                        if (n.op == .regex_match or n.c != none) break :blk false;
+                        if (!self.availableWithin(n.a, first, stage, require_infallible)) break :blk false;
+                        const pattern = self.pool.nodes[n.b];
+                        if (pattern.kind != .text_literal or pattern.text.len > 256) break :blk false;
+                        var decoded: [256]u8 = undefined;
+                        @import("lexer.sig").decodeQuoted(self.source, pattern.text, &decoded);
+                        var trailing: usize = 0;
+                        while (trailing < pattern.text.len and decoded[pattern.text.len - 1 - trailing] == '\\') trailing += 1;
+                        break :blk trailing % 2 == 0;
+                    },
                     else => false,
                 };
             }
@@ -984,8 +1005,13 @@ pub fn Exec(comptime config: types.Config) type {
             fn catalogJoinPredicate(self: *const Query, p: *const B.Plan) u16 {
                 var has_catalog = false;
                 for (p.sources[0..p.source_count]) |source| has_catalog = has_catalog or source.view != null;
-                if (!has_catalog or p.where == none or
-                    !self.availableAtStage(p.where, p.source_count - 1, true)) return none;
+                if (!has_catalog or p.where == none) return none;
+                // A lone catalog source keeps the rows its available,
+                // infallible conjuncts accept (earlyKeepWithin keeps rows the
+                // others would judge), so wide catalog views such as
+                // information_schema.columns need not hold every row.
+                if (p.source_count == 1) return p.where;
+                if (!self.availableAtStage(p.where, p.source_count - 1, true)) return none;
                 for (p.sources[1..p.source_count], 1..) |source, stage| {
                     if (source.join == .left or source.join == .right or source.join == .full or
                         !self.availableAtStage(source.on, stage, true)) return none;

@@ -1264,7 +1264,8 @@ fn tupleAssignment() !void {
 const schema_probes = [_][]const u8{
     "SELECT nspname FROM pg_namespace ORDER BY nspname",
     "SELECT schema_name FROM information_schema.schemata ORDER BY schema_name",
-    "SELECT table_schema, table_name FROM information_schema.tables ORDER BY table_schema, table_name",
+    // information_schema.tables lists the system relations too.
+    "SELECT table_schema, table_name FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog', 'information_schema') ORDER BY table_schema, table_name",
     "SELECT n.nspname, c.relname, c.relkind FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid WHERE n.nspname <> 'pg_catalog' ORDER BY n.nspname, c.relname",
     "SELECT * FROM tdd_schema.t ORDER BY id",
 };

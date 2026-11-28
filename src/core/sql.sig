@@ -105,6 +105,8 @@ const dml_module = @import("sql/dml.sig");
 const mvcc_module = @import("sql/mvcc.sig");
 const locks_module = @import("sql/locks.sig");
 const catalog_module = @import("sql/catalog.sig");
+const information_schema = @import("sql/information_schema.sig");
+const information_schema_rows = @import("sql/information_schema_rows.sig");
 const collation = @import("sql/collation.sig");
 const value_module = @import("sql/value.sig");
 const flat_record = @import("sql/flat_record.sig");
@@ -1592,7 +1594,7 @@ pub fn Database(comptime config: Config) type {
                     switch(node.func) {
                         .nextval,.currval,.setval,.lastval,.identity_next,.lo_create,.lo_creat,.lo_unlink,.lo_from_bytea,.lo_get,.lo_truncate,.lo_truncate64,.lo_import,.lo_export=>return error.UnsupportedStatement,
                         // These catalog lookups use the serialized database hook.
-                        .to_regclass,.regclass_in,.regclass_out,.pg_get_serial_sequence,.pg_table_is_visible,.pg_get_indexdef,.pg_get_constraintdef,.pg_get_triggerdef,.pg_get_viewdef,.pg_partition_ancestors,
+                        .to_regclass,.regclass_in,.regclass_out,.pg_get_serial_sequence,.pg_table_is_visible,.pg_function_is_visible,.pg_get_indexdef,.pg_get_constraintdef,.pg_get_triggerdef,.pg_get_viewdef,.pg_partition_ancestors,
                         .pg_get_function_arguments,.pg_get_function_identity_arguments,.pg_get_function_result,.pg_get_function_sqlbody,
                         .to_regnamespace,.regnamespace_in,.regnamespace_out,.to_regproc=>return error.UnsupportedStatement,
                         .pg_get_statisticsobjdef_columns,.pg_relation_is_publishable,.pg_get_partkeydef,.acldefault,.current_schemas=>return error.UnsupportedStatement,
@@ -7252,7 +7254,7 @@ pub fn Database(comptime config: Config) type {
 
         /// Rows of the catalog-object system views.
         fn catalogObjectRows(self: *const Self, session_values: *const value_module.Session, snapshot: Snapshot, view: catalog_module.View, sink: *X.RowSink) Error!void {
-            const database = session_values.database;
+            _ = session_values;
             switch (view) {
                 .pg_default_acl => {
                     const include_acl = sink.referencesColumn(4);
@@ -7310,7 +7312,7 @@ pub fn Database(comptime config: Config) type {
                             .update => "w",
                             .delete => "d",
                         };
-                        try sink.add(&.{ intCell(o.oid), nameCell(o.name.slice()), intCell(o.target), nameCell(code), boolCell(o.flags & CO.policy_permissive != 0), try self.roleArray(o, false, snapshot), qual, check });
+                        try sink.add(&.{ intCell(o.oid), nameCell(o.name.slice()), intCell(o.target), .{ .pg_internal_char = code[0] }, boolCell(o.flags & CO.policy_permissive != 0), try self.roleArray(o, false, snapshot), qual, check });
                         continue;
                     }
                     const table_slot = self.visibleTableSlot(o.target, snapshot) orelse continue;
@@ -7367,28 +7369,17 @@ pub fn Database(comptime config: Config) type {
                         if (o.sub == -1) .null_value else intCell(o.sub), try objectTextCell(keys.slice()), .{ .array = kinds }, .null_value });
                 },
                 .pg_extension => try sink.add(&.{ intCell(CO.plpgsql_extension_oid), nameCell("plpgsql"), intCell(CO.bootstrap_role), intCell(catalog_module.catalog_namespace), boolCell(false), nameCell("1.0"), .null_value, .null_value }),
-                .pg_tables, .table_privileges => {
+                .pg_tables => {
                     var relations: [K.relation_rows]K.Found = undefined;
                     const count = self.catalog.visibleRelations(snapshot, &relations);
                     for (relations[0..count]) |found| {
                         if (found.kind == 'S') continue;
                         const table = &self.tables[found.slot];
-                        if (table.relkind != 'r' and table.relkind != 'p' and view == .pg_tables) continue;
+                        if (table.relkind != 'r' and table.relkind != 'p') continue;
                         const owner = self.catalog_objects.owner(table.oid, snapshot);
                         const owner_name = self.catalog_objects.roleName(owner, snapshot) orelse "";
                         const schema_name = self.namespaceName(table.namespace);
-                        if (view == .pg_tables) {
-                            try sink.add(&.{ nameCell(schema_name), nameCell(table.name.slice()), nameCell(owner_name), .null_value, boolCell(S.keyed(table) or table.index_count != 0), boolCell(false), boolCell(false), boolCell(self.catalog_objects.securityFlags(table.oid, snapshot) & CO.rls_enabled != 0) });
-                            continue;
-                        }
-                        // aclexplode(coalesce(relacl, acldefault)): the owner's
-                        // privileges, then each grant, in privilege-bit order.
-                        try self.privilegeRows(database, schema_name, table, owner_name, owner_name, CO.table_privileges, CO.table_privileges, sink);
-                        for (&self.catalog_objects.items) |*o| if (o.kind == .acl and o.target == table.oid and O.visible(o, snapshot)) {
-                            const grantor = self.catalog_objects.roleName(o.owner, snapshot) orelse "";
-                            const grantee = if (o.grantee == CO.public_role) "PUBLIC" else self.catalog_objects.roleName(o.grantee, snapshot) orelse "";
-                            try self.privilegeRows(database, schema_name, table, grantor, grantee, o.flags, o.grant_flags, sink);
-                        };
+                        try sink.add(&.{ nameCell(schema_name), nameCell(table.name.slice()), nameCell(owner_name), .null_value, boolCell(S.keyed(table) or table.index_count != 0), boolCell(false), boolCell(false), boolCell(self.catalog_objects.securityFlags(table.oid, snapshot) & CO.rls_enabled != 0) });
                     }
                 },
                 else => {},
@@ -7399,14 +7390,6 @@ pub fn Database(comptime config: Config) type {
         fn objectTextCell(bytes: []const u8) Error!Cell {
             if (bytes.len > config.text_bytes) return error.TextCapacity;
             return nameCell(bytes);
-        }
-
-        fn privilegeRows(self: *const Self, database: []const u8, schema_name: []const u8, table: *const S.Table, grantor: []const u8, grantee: []const u8, flags: u32, grant_flags: u32, sink: *X.RowSink) Error!void {
-            _ = self;
-            for (CO.privilege_bits, CO.privilege_sql) |bit, spelling| {
-                if (flags & bit == 0) continue;
-                try sink.add(&.{ nameCell(grantor), nameCell(grantee), nameCell(database), nameCell(schema_name), nameCell(table.name.slice()), nameCell(spelling), nameCell(if (grant_flags & bit != 0) "YES" else "NO"), nameCell(if (bit == CO.priv_select) "YES" else "NO") });
-            }
         }
 
         fn roleRow(self: *const Self, view: catalog_module.View, o: *const O.Object, sink: *X.RowSink) Error!void {
@@ -7968,6 +7951,28 @@ pub fn Database(comptime config: Config) type {
             return self.inRelationSearchPath(identity.namespace, identity.name);
         }
 
+        /// pg_function_is_visible (FunctionIsVisible): built-in routines
+        /// live in pg_catalog, which is searched first; a user routine is
+        /// visible when its schema is on the path, no earlier schema has a
+        /// routine of the same name and argument types, and no built-in
+        /// shadows it.
+        fn functionVisible(ptr: *anyopaque, oid: u32) ?bool {
+            const self: *const Self = @ptrCast(@alignCast(ptr));
+            if (catalog_module.builtinRoutineName(oid) != null) return true;
+            for (&self.objects.routines) |*routine| {
+                if (!routine.live or routine.oid != oid or !routine.stamp.visible(self.seq_snap)) continue;
+                if (builtinShadowsRoutine(routine)) return false;
+                var path: [routine_path_capacity]u32 = undefined;
+                const count = self.routinePath(self.seq_snap, &path);
+                for (path[0..count]) |candidate| {
+                    if (candidate == routine.namespace) return true;
+                    if (self.objects.findRoutine(candidate, routine.name.slice(), routine.args(), self.seq_snap) != null) return false;
+                }
+                return false;
+            }
+            return null;
+        }
+
         fn relationPublishable(ptr: *anyopaque, oid: u32) ?bool {
             const self: *const Self = @ptrCast(@alignCast(ptr));
             if (self.visibleTableSlot(oid, self.seq_snap)) |index| return CO.publicationRelationKind(self.tables[index].relkind);
@@ -8149,7 +8154,7 @@ pub fn Database(comptime config: Config) type {
 
         /// Canonical text of a column's DEFAULT / generation expression,
         /// re-parsed from its stored source into scratch pool nodes.
-        fn expressionTextWithPool(pool:*A.Pool,column:*const V.Column) V.Cell {
+        pub fn expressionTextWithPool(pool:*A.Pool,column:*const V.Column) V.Cell {
             const saved = pool.len;
             defer pool.len = saved;
             var text: V.Text = .{};
@@ -8200,36 +8205,6 @@ pub fn Database(comptime config: Config) type {
             return if (found.kind == 'S') &self.seqs[found.slot] else null;
         }
 
-        fn numericPrecision(column: *const V.Column) [3]?i64 {
-            return switch (column.data_type) {
-                .smallint => .{ 16, 2, 0 },
-                .integer32 => .{ 32, 2, 0 },
-                .integer => .{ 64, 2, 0 },
-                .real => .{ 24, 2, null },
-                .double => .{ 53, 2, null },
-                .numeric => if (column.typmod >= 4) .{ (column.typmod - 4) >> 16, 10, (column.typmod - 4) & 0xffff } else .{ null, 10, null },
-                else => .{ null, null, null },
-            };
-        }
-
-        /// information_schema character_maximum_length (_pg_char_max_length).
-        fn characterMaximumLength(column: *const V.Column) ?i64 {
-            return switch (column.data_type) {
-                .varchar, .bpchar => if (column.typmod > 4) column.typmod - 4 else null,
-                .bit, .varbit => if (column.typmod > 0) column.typmod else null,
-                else => null,
-            };
-        }
-
-        fn datetimePrecision(column: *const V.Column) ?i64 {
-            return switch (column.data_type) {
-                .date => 0,
-                .timestamp, .timestamptz, .time, .timetz => if (column.typmod >= 0) column.typmod else 6,
-                .interval => 6,
-                else => null,
-            };
-        }
-
         fn viewRows(ptr: *anyopaque, view: catalog_module.View, sink: *X.RowSink) Error!void {
             const self: *Self = @ptrCast(@alignCast(ptr));
             if (view == .pg_settings) return settingRows(self.sessionState(), sink);
@@ -8259,14 +8234,14 @@ pub fn Database(comptime config: Config) type {
                 'i', 'I' => if (properties.access != 0) properties.access else catalog_module.btree_access_method,
                 else => 0,
             };
-            const identity = switch (kind) { 'r', 'p', 'm' => "d", else => "n" };
+            const identity: u8 = switch (kind) { 'r', 'p', 'm' => 'd', else => 'n' };
             // Relations use the database's tablespace and inline value
             // storage. The current engine has no typed table definitions.
             try sink.add(&.{
                 intCell(oid), nameCell(name), intCell(namespace), .{ .pg_internal_char = kind }, intCell(@intCast(columns)),
                 intCell(properties.checks), boolCell(properties.has_index), boolCell(properties.has_rule), boolCell(properties.has_trigger),
                 boolCell(properties.security & CO.rls_enabled != 0), boolCell(properties.security & CO.rls_forced != 0), boolCell(properties.partition),
-                intCell(0), intCell(0), nameCell("p"), nameCell(identity), intCell(0), intCell(access), boolCell(properties.populated), properties.partition_bound,
+                intCell(0), intCell(0), .{ .pg_internal_char = 'p' }, .{ .pg_internal_char = identity }, intCell(0), intCell(access), boolCell(properties.populated), properties.partition_bound,
                 // This engine does not use pages, visibility maps or native
                 // PostgreSQL transaction IDs. It has no ANALYZE row estimate.
                 intCell(properties.row_type), intCell(properties.owner), intCell(0), .{ .float4 = -1 },
@@ -8487,6 +8462,8 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn fillViewRows(self: *const Self, session_values: *const value_module.Session, snapshot: Snapshot, pool: *A.Pool, view: catalog_module.View, sink: *X.RowSink) Error!void {
+            // information_schema (B11 wave 5): information_schema_rows.sig.
+            if (information_schema.isInformationSchema(view)) return information_schema_rows.Rows(config).fill(self, session_values, snapshot, pool, view, sink);
             // Object catalogs bypass the relation and type row builders.
             return switch (view) {
                 .pg_largeobject => self.largeObjectRows(session_values, snapshot, sink),
@@ -8495,7 +8472,7 @@ pub fn Database(comptime config: Config) type {
                 .pg_default_acl, .pg_largeobject_metadata, .pg_roles, .pg_authid, .pg_auth_members,
                 .pg_db_role_setting, .pg_policy, .pg_policies, .pg_description, .pg_shdescription,
                 .pg_foreign_data_wrapper, .pg_foreign_server, .pg_publication, .pg_publication_rel,
-                .pg_publication_namespace, .pg_statistic_ext, .pg_extension, .pg_tables, .table_privileges,
+                .pg_publication_namespace, .pg_statistic_ext, .pg_extension, .pg_tables,
                 => self.catalogObjectRows(session_values, snapshot, view, sink),
                 else => self.fillSchemaViewRows(session_values, snapshot, pool, view, sink),
             };
@@ -8526,7 +8503,6 @@ pub fn Database(comptime config: Config) type {
             // function holding all of them reached 3 MiB of the 4 MiB stack
             // CI runs wide-cell contracts on.
             if (try self.fixedSchemaViewRows(session_values, view, sink)) return;
-            const database = session_values.database;
             var relations: [K.relation_rows]K.Found = undefined;
             const count = self.catalog.visibleRelations(snapshot, &relations);
             if (view == .pg_class or view == .pg_attribute) try self.compositeCatalogRows(view, snapshot, sink);
@@ -8541,27 +8517,23 @@ pub fn Database(comptime config: Config) type {
                         try sink.add(&.{ intCell(object.oid + 1 + order), intCell(object.oid), .{ .float4 = @floatFromInt(order) }, nameCell(label) });
                     }
                 },
-                .pg_namespace, .schemata => {
-                    const include_acl = view == .pg_namespace and sink.referencesColumn(catalog_module.pg_namespace_acl_column);
+                .pg_namespace => {
+                    const include_acl = sink.referencesColumn(catalog_module.pg_namespace_acl_column);
                     for (catalog_module.namespaces) |namespace| {
-                        if (view == .pg_namespace) {
-                            const acl = if (!include_acl or namespace.oid == catalog_module.toast_namespace) .null_value else
-                                try @import("sql/catalog_acl.sig").Acl(V).ownerAndPublic(CO.bootstrap_name, "UC", "U");
-                            try sink.add(&.{ intCell(namespace.oid), nameCell(namespace.name), intCell(CO.bootstrap_role), acl });
-                        } else try sink.add(&.{ nameCell(database), nameCell(namespace.name) });
+                        const acl = if (!include_acl or namespace.oid == catalog_module.toast_namespace) .null_value else
+                            try @import("sql/catalog_acl.sig").Acl(V).ownerAndPublic(CO.bootstrap_name, "UC", "U");
+                        try sink.add(&.{ intCell(namespace.oid), nameCell(namespace.name), intCell(CO.bootstrap_role), acl });
                     }
                     var schemas: [K.relation_rows]K.SchemaFound = undefined;
                     const schema_count = self.catalog.visibleSchemas(snapshot, &schemas);
                     for (schemas[0..schema_count]) |found| {
                         const schema = &self.schemas[found.slot];
-                        if (view == .pg_namespace) {
-                            const owner = self.schemaOwner(schema, snapshot);
-                            try sink.add(&.{ intCell(found.oid), nameCell(schema.name.slice()), intCell(owner),
-                                if (include_acl) try self.namespaceAcl(found.oid, owner, snapshot) else .null_value });
-                        } else try sink.add(&.{ nameCell(database), nameCell(schema.name.slice()) });
+                        const owner = self.schemaOwner(schema, snapshot);
+                        try sink.add(&.{ intCell(found.oid), nameCell(schema.name.slice()), intCell(owner),
+                            if (include_acl) try self.namespaceAcl(found.oid, owner, snapshot) else .null_value });
                     }
                 },
-                else => try self.relationSchemaViewRows(session_values, snapshot, pool, view, sink, database, relations[0..count]),
+                else => try self.relationSchemaViewRows(session_values, snapshot, pool, view, sink, relations[0..count]),
             }
         }
 
@@ -8708,9 +8680,9 @@ pub fn Database(comptime config: Config) type {
             }
             if (view == .pg_collation) {
                 for (collation.names, collation.oids) |name, oid| {
-                    const native_provider = switch (oid) { 100 => "d", 962 => "b", else => "c" };
+                    const native_provider: u8 = switch (oid) { 100 => 'd', 962 => 'b', else => 'c' };
                     const encoding: i64 = if (oid == 962) 6 else -1;
-                    try sink.add(&.{ intCell(oid), nameCell(name), intCell(catalog_module.catalog_namespace), intCell(CO.bootstrap_role), nameCell(native_provider), boolCell(true), intCell(encoding) });
+                    try sink.add(&.{ intCell(oid), nameCell(name), intCell(catalog_module.catalog_namespace), intCell(CO.bootstrap_role), .{ .pg_internal_char = native_provider }, boolCell(true), intCell(encoding) });
                 }
                 return true;
             }
@@ -8737,20 +8709,19 @@ pub fn Database(comptime config: Config) type {
         /// pg_type: pseudo-types, built-in types and their arrays, user types.
         noinline fn typeCatalogRows(self: *const Self, snapshot: Snapshot, sink: *X.RowSink) Error!void {
             for (catalog_module.builtin_pseudo_types) |info| {
-                try sink.add(&.{ intCell(info.oid), nameCell(info.name), intCell(catalog_module.catalog_namespace), intCell(info.bytes), .{ .pg_internal_char = 'p' }, nameCell("P"), intCell(0), nameCell(","), nameCell(info.input), intCell(0), intCell(0), intCell(CO.bootstrap_role), intCell(-1), boolCell(false), intCell(0), intCell(0), .null_value, boolCell(true), .{ .pg_internal_char = info.storage } });
+                try sink.add(&.{ intCell(info.oid), nameCell(info.name), intCell(catalog_module.catalog_namespace), intCell(info.bytes), .{ .pg_internal_char = 'p' }, .{ .pg_internal_char = 'P' }, intCell(0), .{ .pg_internal_char = ',' }, nameCell(info.input), intCell(0), intCell(0), intCell(CO.bootstrap_role), intCell(-1), boolCell(false), intCell(0), intCell(0), .null_value, boolCell(true), .{ .pg_internal_char = info.storage } });
             }
             // Reuse the wide row temporary across type entries.
             for (std.enums.values(DataType)) |data_type| {
                 // void is a builtin pseudo-type row above.
                 if (data_type == .mysql_bigint_unsigned or data_type == .void) continue;
                 const info = types.typeInfo(data_type);
-                const category: [1]u8 = .{info.category};
                 const type_collation = intCell(collation.typeCollation(types.typeOfData(data_type)));
                 const kind: u8 = if (types.rangeSubtype(types.typeOfData(data_type)) != null) 'r' else if (@import("sql/multirange.sig").rangeOf(data_type) != null) 'm' else 'b';
-                try sink.add(&.{ intCell(info.oid), nameCell(info.name), intCell(catalog_module.catalog_namespace), intCell(info.len), .{ .pg_internal_char = kind }, nameCell(&category), intCell(info.array), nameCell(","), nameCell(types.typeInputName(data_type)), intCell(0), intCell(0), intCell(CO.bootstrap_role), intCell(-1), boolCell(false), intCell(0), type_collation, .null_value, boolCell(true), .{ .pg_internal_char = types.typeStorage(data_type) } });
+                try sink.add(&.{ intCell(info.oid), nameCell(info.name), intCell(catalog_module.catalog_namespace), intCell(info.len), .{ .pg_internal_char = kind }, .{ .pg_internal_char = info.category }, intCell(info.array), .{ .pg_internal_char = ',' }, nameCell(types.typeInputName(data_type)), intCell(0), intCell(0), intCell(CO.bootstrap_role), intCell(-1), boolCell(false), intCell(0), type_collation, .null_value, boolCell(true), .{ .pg_internal_char = types.typeStorage(data_type) } });
                 if (types.arrayData(data_type)) |array_type| {
                     const array_info = types.typeInfo(array_type);
-                    try sink.add(&.{ intCell(array_info.oid), nameCell(array_info.name), intCell(catalog_module.catalog_namespace), intCell(array_info.len), .{ .pg_internal_char = 'b' }, nameCell("A"), intCell(0), nameCell(","), nameCell(types.typeInputName(array_type)), intCell(0), intCell(info.oid), intCell(CO.bootstrap_role), intCell(-1), boolCell(false), intCell(0), type_collation, .null_value, boolCell(true), .{ .pg_internal_char = types.typeStorage(array_type) } });
+                    try sink.add(&.{ intCell(array_info.oid), nameCell(array_info.name), intCell(catalog_module.catalog_namespace), intCell(array_info.len), .{ .pg_internal_char = 'b' }, .{ .pg_internal_char = 'A' }, intCell(0), .{ .pg_internal_char = ',' }, nameCell(types.typeInputName(array_type)), intCell(0), intCell(info.oid), intCell(CO.bootstrap_role), intCell(-1), boolCell(false), intCell(0), type_collation, .null_value, boolCell(true), .{ .pg_internal_char = types.typeStorage(array_type) } });
                 }
             }
             for (&self.catalog_objects.items) |*object| {
@@ -8759,18 +8730,18 @@ pub fn Database(comptime config: Config) type {
                 switch (object.kind) {
                     .domain => {
                         const info = types.typeInfo(types.dataTypeOf(object.domain.base));
-                        try sink.add(&.{ intCell(object.oid), nameCell(object.name.slice()), intCell(object.target), intCell(info.len), .{ .pg_internal_char = 'd' }, nameCell("N"), intCell(object.oid + 1), nameCell(","), nameCell("domain_in"), intCell(info.oid), intCell(0), intCell(object.owner), intCell(-1), boolCell(object.domain.not_null), intCell(0), type_collation, .null_value, boolCell(true), .{ .pg_internal_char = types.typeStorage(types.dataTypeOf(object.domain.base)) } });
+                        try sink.add(&.{ intCell(object.oid), nameCell(object.name.slice()), intCell(object.target), intCell(info.len), .{ .pg_internal_char = 'd' }, .{ .pg_internal_char = 'N' }, intCell(object.oid + 1), .{ .pg_internal_char = ',' }, nameCell("domain_in"), intCell(info.oid), intCell(0), intCell(object.owner), intCell(-1), boolCell(object.domain.not_null), intCell(0), type_collation, .null_value, boolCell(true), .{ .pg_internal_char = types.typeStorage(types.dataTypeOf(object.domain.base)) } });
                     },
-                    .enum_type => try sink.add(&.{ intCell(object.oid), nameCell(object.name.slice()), intCell(object.target), intCell(4), .{ .pg_internal_char = 'e' }, nameCell("E"), intCell(object.oid + 1), nameCell(","), nameCell("enum_in"), intCell(0), intCell(0), intCell(object.owner), intCell(-1), boolCell(false), intCell(0), type_collation, .null_value, boolCell(true), .{ .pg_internal_char = 'p' } }),
-                    .composite_type => try sink.add(&.{ intCell(object.oid), nameCell(object.name.slice()), intCell(object.target), intCell(-1), .{ .pg_internal_char = 'c' }, nameCell("C"), intCell(object.oid + 1), nameCell(","), nameCell("record_in"), intCell(0), intCell(0), intCell(object.owner), intCell(-1), boolCell(false), intCell(object.compositeRelationOid()), type_collation, .null_value, boolCell(true), .{ .pg_internal_char = 'x' } }),
+                    .enum_type => try sink.add(&.{ intCell(object.oid), nameCell(object.name.slice()), intCell(object.target), intCell(4), .{ .pg_internal_char = 'e' }, .{ .pg_internal_char = 'E' }, intCell(object.oid + 1), .{ .pg_internal_char = ',' }, nameCell("enum_in"), intCell(0), intCell(0), intCell(object.owner), intCell(-1), boolCell(false), intCell(0), type_collation, .null_value, boolCell(true), .{ .pg_internal_char = 'p' } }),
+                    .composite_type => try sink.add(&.{ intCell(object.oid), nameCell(object.name.slice()), intCell(object.target), intCell(-1), .{ .pg_internal_char = 'c' }, .{ .pg_internal_char = 'C' }, intCell(object.oid + 1), .{ .pg_internal_char = ',' }, nameCell("record_in"), intCell(0), intCell(0), intCell(object.owner), intCell(-1), boolCell(false), intCell(object.compositeRelationOid()), type_collation, .null_value, boolCell(true), .{ .pg_internal_char = 'x' } }),
                     else => unreachable,
                 }
-                try sink.add(&.{ intCell(object.oid + 1), nameCell(object.arrayName()), intCell(object.target), intCell(-1), .{ .pg_internal_char = 'b' }, nameCell("A"), intCell(0), nameCell(","), nameCell("array_in"), intCell(0), intCell(object.oid), intCell(object.owner), intCell(-1), boolCell(false), intCell(0), type_collation, .null_value, boolCell(true), .{ .pg_internal_char = 'x' } });
+                try sink.add(&.{ intCell(object.oid + 1), nameCell(object.arrayName()), intCell(object.target), intCell(-1), .{ .pg_internal_char = 'b' }, .{ .pg_internal_char = 'A' }, intCell(0), .{ .pg_internal_char = ',' }, nameCell("array_in"), intCell(0), intCell(object.oid), intCell(object.owner), intCell(-1), boolCell(false), intCell(0), type_collation, .null_value, boolCell(true), .{ .pg_internal_char = 'x' } });
             }
         }
 
         /// Per-relation rows of the schema views (pg_class, pg_index, columns, ...).
-        noinline fn relationSchemaViewRows(self: *const Self, session_values: *const value_module.Session, snapshot: Snapshot, pool: *A.Pool, view: catalog_module.View, sink: *X.RowSink, database: []const u8, relations: []const K.Found) Error!void {
+        noinline fn relationSchemaViewRows(self: *const Self, session_values: *const value_module.Session, snapshot: Snapshot, pool: *A.Pool, view: catalog_module.View, sink: *X.RowSink, relations: []const K.Found) Error!void {
             const include_class_acl = view == .pg_class and sink.referencesColumn(catalog_module.pg_class_acl_column);
             for (relations) |found| {
                 if (found.kind == 'S') {
@@ -8784,25 +8755,6 @@ pub fn Database(comptime config: Config) type {
                     continue;
                 }
                 const table = &self.tables[found.slot];
-                // PostgreSQL's information-schema views use different
-                // privilege lists. This engine supports table-wide grants.
-                const column_privileges = CO.priv_select | CO.priv_insert | CO.priv_update | CO.priv_references;
-                const constraint_privileges = CO.priv_insert | CO.priv_update | CO.priv_delete |
-                    CO.priv_truncate | CO.priv_references | CO.priv_trigger;
-                const discovery_privileges: u32 = switch (view) {
-                    .tables, .columns => switch (table.relkind) {
-                        'r', 'v', 'f', 'p' => if (view == .tables) constraint_privileges | CO.priv_select else column_privileges,
-                        else => continue,
-                    },
-                    .table_constraints, .key_column_usage => switch (table.relkind) {
-                        'r', 'p' => if (view == .table_constraints) constraint_privileges else column_privileges,
-                        else => continue,
-                    },
-                    else => 0,
-                };
-                if (discovery_privileges != 0 and !self.catalog_objects.tableHasAnyPrivilege(
-                    session_values.role, table.oid, discovery_privileges, snapshot,
-                )) continue;
                 const schema_name = self.namespaceName(table.namespace);
                 const name = table.name.slice();
                 const oid: i64 = table.oid;
@@ -8819,14 +8771,6 @@ pub fn Database(comptime config: Config) type {
                             try classRow(sink, index.oid, index.name.slice(), table.namespace, 'i', index.key_count + index.include_count, .{ .owner = self.catalog_objects.owner(table.oid, snapshot), .access = if (index.hash) catalog_module.hash_access_method else 0 });
                         }
                     },
-                    .tables => {
-                        const table_type: []const u8 = switch (table.relkind) {
-                            'v' => "VIEW",
-                            'f' => "FOREIGN",
-                            else => "BASE TABLE",
-                        };
-                        try sink.add(&.{ nameCell(database), nameCell(schema_name), nameCell(name), nameCell(table_type) });
-                    },
                     .pg_index => {
                         if (S.keyed(table)) try indexCatalogRow(sink, S.primaryIndexOid(table), oid, primary_columns, null);
                         for (table.indexes[0..table.index_count]) |*index| {
@@ -8837,11 +8781,11 @@ pub fn Database(comptime config: Config) type {
                     .pg_constraint => {
                         const primary = if (S.primaryConstraint(table)) |position| &table.constraints[position] else null;
                         if (table.primary_constraint_oid != 0) {
-                            try self.constraintRow(sink, table, table.primary_constraint_oid, pkey.slice(), primary, .primary, snapshot);
+                            try self.constraintRow(sink, table, table.primary_constraint_oid, pkey.slice(), primary, .primary, snapshot, pool);
                         }
                         for (table.constraints[0..table.constraint_count]) |*constraint| {
                             if (constraint.kind == .primary) continue;
-                            try self.constraintRow(sink, table, constraint.oid, constraint.name.slice(), constraint, constraint.kind, snapshot);
+                            try self.constraintRow(sink, table, constraint.oid, constraint.name.slice(), constraint, constraint.kind, snapshot, pool);
                         }
                     },
                     .pg_indexes => {
@@ -8886,30 +8830,7 @@ pub fn Database(comptime config: Config) type {
                     .pg_inherits => if (table.parent != 0) {
                         try sink.add(&.{ intCell(oid), intCell(table.parent), intCell(1), boolCell(false) });
                     },
-                    .table_constraints => {
-                        if (S.keyed(table)) try sink.add(&.{ nameCell(database), nameCell(schema_name), nameCell(pkey.slice()), nameCell(database), nameCell(schema_name), nameCell(name), nameCell("PRIMARY KEY") });
-                        for (table.constraints[0..table.constraint_count]) |*constraint| {
-                            const kind: []const u8 = switch (constraint.kind) {
-                                .primary, .exclusion => continue,
-                                .check => "CHECK",
-                                .unique => "UNIQUE",
-                                .foreign => "FOREIGN KEY",
-                            };
-                            try sink.add(&.{ nameCell(database), nameCell(schema_name), nameCell(constraint.name.slice()), nameCell(database), nameCell(schema_name), nameCell(name), nameCell(kind) });
-                        }
-                    },
-                    .key_column_usage => {
-                        for (primary_columns, 0..) |column, position| {
-                            try sink.add(&.{ nameCell(database), nameCell(schema_name), nameCell(pkey.slice()), nameCell(database), nameCell(schema_name), nameCell(name), nameCell(table.columns[column].name.slice()), intCell(@intCast(position + 1)) });
-                        }
-                        for (table.constraints[0..table.constraint_count]) |*constraint| {
-                            if (constraint.kind != .unique and constraint.kind != .foreign) continue;
-                            for (constraint.keyColumns(), 0..) |column, position| {
-                                try sink.add(&.{ nameCell(database), nameCell(schema_name), nameCell(constraint.name.slice()), nameCell(database), nameCell(schema_name), nameCell(name), nameCell(table.columns[column].name.slice()), intCell(@intCast(position + 1)) });
-                            }
-                        }
-                    },
-                    .pg_attribute, .pg_attrdef, .columns => for (table.columns[0..table.column_count], 0..) |*column, index| {
+                    .pg_attribute, .pg_attrdef => for (table.columns[0..table.column_count], 0..) |*column, index| {
                         const attnum: i64 = @intCast(index + 1);
                         const kind = column.default_kind;
                         const identity: u8 = switch (kind) {
@@ -8937,16 +8858,6 @@ pub fn Database(comptime config: Config) type {
                                     }
                                 }
                                 try sink.add(&.{ intCell(oid), intCell(attnum), expression, intCell(column.default_oid) });
-                            },
-                            .columns => {
-                                const numeric = numericPrecision(column);
-                                try sink.add(&.{
-                                    nameCell(database),                                       nameCell(schema_name),                          nameCell(name),            nameCell(column.name.slice()),
-                                    intCell(attnum),                                          if (kind == .default) expressionTextWithPool(pool,column) else .null_value, nameCell(if (column.not_null) "NO" else "YES"), nameCell(if (types.elementData(column.data_type) != null) "ARRAY" else types.sqlTypeName(column.data_type)),
-                                    optionalInt(characterMaximumLength(column)),              optionalInt(numeric[0]),                     optionalInt(numeric[1]),   optionalInt(numeric[2]),
-                                    optionalInt(datetimePrecision(column)),                   nameCell(if (identity != 0) "YES" else "NO"), if (identity == 0) .null_value else nameCell(if (kind == .identity_always) "ALWAYS" else "BY DEFAULT"), nameCell(if (kind == .generated) "ALWAYS" else "NEVER"),
-                                    if (kind == .generated) expressionTextWithPool(pool,column) else .null_value,
-                                });
                             },
                             else => unreachable,
                         }
@@ -9057,23 +8968,70 @@ pub fn Database(comptime config: Config) type {
             return switch (action) { .no_action => "NO ACTION", .restrict => "RESTRICT", .cascade => "CASCADE", .set_null => "SET NULL", .set_default => "SET DEFAULT" };
         }
 
-        fn constraintRow(self: *const Self, sink: *X.RowSink, table: *const S.Table, oid: u32, name: []const u8, constraint: ?*const S.Constraint, kind: S.ConstraintKind, snapshot: Snapshot) Error!void {
-            const label = switch (kind) { .check => "c", .unique => "u", .primary => "p", .foreign => "f", .exclusion => "x" };
+        /// An int2[] of attnums (pg_constraint.conkey / confkey).
+        fn attnumArray(columns: []const u8) Error!V.Cell {
+            var out: V.Text = .{};
+            var shape: array_module.Shape = .{ .element = .smallint, .ndim = 1 };
+            shape.dims[0] = @intCast(columns.len);
+            var writer = try V.Arrays.Writer.begin(&out, &shape);
+            for (columns) |column| try writer.append(&intCell(@as(i64, column) + 1));
+            return .{ .array = out };
+        }
+
+        /// The columns a CHECK expression names, each once in order of
+        /// first appearance (StoreRelCheck's pull_var_clause), parsed into
+        /// the pool above its live nodes.
+        fn checkColumns(table: *const S.Table, source: []const u8, pool: *A.Pool, out: *[config.columns]u8) []const u8 {
+            const node_len = pool.len;
+            const query_len = pool.query_len;
+            const window_len = pool.window_len;
+            const complex = pool.complex;
+            defer {
+                pool.len = node_len;
+                pool.query_len = query_len;
+                pool.window_len = window_len;
+                pool.complex = complex;
+            }
+            _ = P.parseExpression(source, pool) catch return out[0..0];
+            var count: usize = 0;
+            for (pool.nodes[node_len..pool.len]) |*node| {
+                if (node.kind != .column or node.star) continue;
+                const wanted = identName(source, node.name);
+                for (table.columns[0..table.column_count], 0..) |*column, index| {
+                    if (!types.same(column.name.slice(), wanted.slice())) continue;
+                    if (std.mem.indexOfScalar(u8, out[0..count], @intCast(index)) != null) break;
+                    out[count] = @intCast(index);
+                    count += 1;
+                    break;
+                }
+            }
+            return out[0..count];
+        }
+
+        fn constraintRow(self: *const Self, sink: *X.RowSink, table: *const S.Table, oid: u32, name: []const u8, constraint: ?*const S.Constraint, kind: S.ConstraintKind, snapshot: Snapshot, pool: *A.Pool) Error!void {
+            const label: u8 = switch (kind) { .check => 'c', .unique => 'u', .primary => 'p', .foreign => 'f', .exclusion => 'x' };
             const deferrable = if (constraint) |item| item.deferrable else false;
             const deferred = if (constraint) |item| item.initially_deferred else false;
             const validated = if (constraint) |item| !item.not_valid and !item.not_enforced else true;
             const enforced = if (constraint) |item| !item.not_enforced else true;
             const foreign = if (kind == .foreign) constraint else null;
             const index = if (kind == .primary) S.primaryIndexOid(table) else if (foreign) |item| self.referencedConstraintIndex(item, snapshot) else 0;
+            var key_buffer: [config.columns]u8 = undefined;
+            const keys: []const u8 = switch (kind) {
+                .primary => primaryColumns(table, &key_buffer),
+                .check => if (constraint) |item| checkColumns(table, item.expression.slice(), pool, &key_buffer) else key_buffer[0..0],
+                else => if (constraint) |item| item.keyColumns() else key_buffer[0..0],
+            };
             try sink.add(&.{
-                intCell(oid), nameCell(name), intCell(table.namespace), nameCell(label),
+                intCell(oid), nameCell(name), intCell(table.namespace), .{ .pg_internal_char = label },
                 boolCell(deferrable), boolCell(deferred), boolCell(enforced), boolCell(validated),
                 intCell(table.oid), intCell(0), intCell(index), intCell(0),
                 intCell(if (foreign) |item| item.ref_oid else 0),
-                nameCell(if (foreign) |item| foreignActionCode(item.on_update) else " "),
-                nameCell(if (foreign) |item| foreignActionCode(item.on_delete) else " "),
-                nameCell(if (foreign != null) "s" else " "), boolCell(false),
+                .{ .pg_internal_char = if (foreign) |item| foreignActionCode(item.on_update)[0] else ' ' },
+                .{ .pg_internal_char = if (foreign) |item| foreignActionCode(item.on_delete)[0] else ' ' },
+                .{ .pg_internal_char = if (foreign != null) 's' else ' ' }, boolCell(false),
                 boolCell(kind != .check or self.checkConstraintIsLocal(table, name, snapshot)),
+                try attnumArray(keys), if (foreign) |item| try attnumArray(item.refColumns()) else .null_value,
             });
         }
 
@@ -9202,7 +9160,7 @@ pub fn Database(comptime config: Config) type {
             return count;
         }
 
-        fn postgresViewDefinition(ptr: *anyopaque, oid: u32, _: bool, out: []u8) Error!?usize {
+        pub fn postgresViewDefinition(ptr: *anyopaque, oid: u32, _: bool, out: []u8) Error!?usize {
             const self: *Self = @ptrCast(@alignCast(ptr));
             const slot = self.visibleTableSlot(oid, self.seq_snap) orelse return null;
             const view = &self.tables[slot];
@@ -9343,7 +9301,7 @@ pub fn Database(comptime config: Config) type {
             return text.len + query_len;
         }
 
-        fn postgresTriggerDefinition(ptr: *anyopaque, oid: u32, pretty: bool, out: []u8) Error!?usize {
+        pub fn postgresTriggerDefinition(ptr: *anyopaque, oid: u32, pretty: bool, out: []u8) Error!?usize {
             const self: *const Self = @ptrCast(@alignCast(ptr));
             const snapshot = self.seq_snap;
             for (&self.objects.triggers) |*trigger| {
@@ -11706,7 +11664,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn statementHooks(self: *Self, slot: u16, snap: Snapshot) void {
-            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .large_object = &largeObjectCall, .large_object_data = &largeObjectDataCall, .large_object_truncate = &truncateLargeObject, .large_object_file = .{ .authorize = &authorizeLargeObjectFile, .call = &largeObjectFileCall }, .relation_name = &relationName, .relation_display_name = &relationDisplayName, .catalog_text = &catalogText, .schema_path = &catalogSchemaPath, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .view_definition = &postgresViewDefinition, .trigger_definition = &postgresTriggerDefinition, .rule_definition = &postgresRuleDefinition, .statistics_columns = &postgresStatisticsColumns, .relation_publishable = &relationPublishable, .partition_key_definition = &postgresPartitionKey, .partition_ancestors = &postgresPartitionAncestors, .namespace_lookup = &postgresNamespaceLookup, .namespace_name = &postgresNamespaceName, .routine_lookup = &postgresRoutineLookup, .routine_name = &postgresRoutineName, .xml_query = &xmlQuery, .xml_cursor = &xmlCursor, .type_name = &postgresTypeName };
+            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .large_object = &largeObjectCall, .large_object_data = &largeObjectDataCall, .large_object_truncate = &truncateLargeObject, .large_object_file = .{ .authorize = &authorizeLargeObjectFile, .call = &largeObjectFileCall }, .relation_name = &relationName, .relation_display_name = &relationDisplayName, .catalog_text = &catalogText, .schema_path = &catalogSchemaPath, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .function_visible = &functionVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .view_definition = &postgresViewDefinition, .trigger_definition = &postgresTriggerDefinition, .rule_definition = &postgresRuleDefinition, .statistics_columns = &postgresStatisticsColumns, .relation_publishable = &relationPublishable, .partition_key_definition = &postgresPartitionKey, .partition_ancestors = &postgresPartitionAncestors, .namespace_lookup = &postgresNamespaceLookup, .namespace_name = &postgresNamespaceName, .routine_lookup = &postgresRoutineLookup, .routine_name = &postgresRoutineName, .xml_query = &xmlQuery, .xml_cursor = &xmlCursor, .type_name = &postgresTypeName };
             self.session.sequences = &self.seq_hook;
             // A statement starts with the whole XML scratch region free.
             self.xml_region = .{ .bytes = &self.xml_backing };

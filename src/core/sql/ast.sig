@@ -204,7 +204,9 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     // (`name` its prefix, `integer` 1 for DEFAULT, `b` the URI) and a
     // column (`name`, type in cast_type / typmod, `a` PATH, `b` DEFAULT,
     // `integer` an XmlTableColumn). Exec reads the table's members.
-    xml_call, xmltable, xmltable_namespace, xmltable_column };
+    xml_call, xmltable, xmltable_namespace, xmltable_column,
+    // pg_function_is_visible(oid) and version() (B11 wave 5 catalog lane).
+    pg_function_is_visible, version };
 
 /// xml_call variants (xml_eval.sig).
 pub const XmlFn = enum(u8) {
@@ -335,7 +337,7 @@ pub fn strictFunction(func: Func) bool {
         .to_char, .round, .abs, .ceil, .floor, .trunc, .sign, .sqrt, .jsonb_typeof, .jsonb_array_length,
         .nextval, .currval, .setval, .lastval, .identity_next, .lo_create, .lo_creat, .lo_unlink, .lo_from_bytea, .lo_get, .lo_truncate, .lo_truncate64, .lo_import, .lo_export,
         .now, .transaction_timestamp, .statement_timestamp, .clock_timestamp,
-        .current_timestamp, .current_date, .current_database, .current_schema, .current_schemas, .pg_encoding_to_char,
+        .current_timestamp, .current_date, .current_database, .current_schema, .current_schemas, .pg_encoding_to_char, .version,
         .to_regtype, .to_regclass, .to_regproc, .pg_get_expr, .acldefault, .pg_get_userbyid, .pg_tablespace_location,
         .pg_get_function_arguments, .pg_get_function_identity_arguments, .pg_get_function_result, .pg_get_function_sqlbody,
         .pg_advisory_lock, .pg_advisory_lock_shared, .pg_advisory_xact_lock, .pg_advisory_xact_lock_shared,
@@ -357,6 +359,7 @@ pub fn strictFunction(func: Func) bool {
         // jsonb_set_lax reads NULL arguments itself.
         .jsonb_set_lax => false,
         .pg_get_serial_sequence, .pg_table_is_visible, .pg_get_indexdef, .pg_get_constraintdef, .pg_get_triggerdef, .pg_get_ruledef, .pg_get_viewdef, .pg_partition_ancestors, .pg_get_statisticsobjdef_columns, .pg_relation_is_publishable, .pg_get_partkeydef => true,
+        .pg_function_is_visible => true,
         .regexp_like, .similar_to_escape => true,
         .regexp_match, .regexp_matches, .regexp_replace, .regexp_split_to_array, .regexp_split_to_table, .regexp_count, .regexp_instr, .regexp_substr, .substring_regex, .substring_similar => true,
         .tsvector_length, .ts_strip, .ts_setweight, .tsvector_to_array, .array_to_tsvector, .ts_delete, .ts_filter, .ts_numnode => true,

@@ -48,7 +48,7 @@ fn durable(source: []const u8) !void {
 
 fn catalog(db: *DB) ![4]i64 {
     try db.execute("SELECT oid,typarray,typowner,typnamespace,typlen,typcategory FROM pg_type WHERE typname='Mood' AND typtype='e'", &result);
-    try check(result.row_count == 1 and result.rows[0].cells[4].integer == 4 and equal(result.rows[0].cells[5].text.slice(), "E"));
+    try check(result.row_count == 1 and result.rows[0].cells[4].integer == 4 and result.rows[0].cells[5].pg_internal_char == 'E');
     const fields = &result.rows[0].cells;
     const identity = [4]i64{ fields[0].integer, fields[1].integer, fields[2].integer, fields[3].integer };
     try check(identity[0] >= sql.change_records.first_oid and identity[1] > identity[0] and identity[2] != 10 and identity[3] != 2200);

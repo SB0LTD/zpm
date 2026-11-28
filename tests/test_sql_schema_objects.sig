@@ -467,7 +467,8 @@ fn foreignKeys() !void {
     try run("CREATE TABLE p (id INT PRIMARY KEY, g INT UNIQUE)");
     try run("INSERT INTO p VALUES (1, 10), (2, 20), (3, 30)");
     try run("CREATE TABLE c (id INT PRIMARY KEY, pid INT REFERENCES p)");
-    try expect("SELECT constraint_name, constraint_type FROM information_schema.table_constraints WHERE table_name = 'c' ORDER BY constraint_name", "c_pid_fkey|FOREIGN KEY;c_pkey|PRIMARY KEY");
+    // PostgreSQL 18 lists the primary key's NOT NULL constraint as CHECK.
+    try expect("SELECT constraint_name, constraint_type FROM information_schema.table_constraints WHERE table_name = 'c' ORDER BY constraint_name", "c_id_not_null|CHECK;c_pid_fkey|FOREIGN KEY;c_pkey|PRIMARY KEY");
     try run("INSERT INTO c VALUES (1, 1), (2, NULL), (3, 3)");
     try rejects("INSERT INTO c VALUES (4, 9)", error.ForeignKeyViolation, fk_probes[1], "1|1;2|NULL;3|3");
     try rejects("UPDATE c SET pid = 9 WHERE id = 1", error.ForeignKeyViolation, fk_probes[1], "1|1;2|NULL;3|3");
@@ -524,7 +525,7 @@ fn foreignKeys() !void {
     // ALTER TABLE ADD FOREIGN KEY checks existing rows.
     try run("CREATE TABLE late (id INT PRIMARY KEY, pid INT)");
     try run("INSERT INTO late VALUES (1, 1), (2, 7)");
-    try rejects("ALTER TABLE late ADD CONSTRAINT late_fk FOREIGN KEY (pid) REFERENCES p", error.ForeignKeyViolation, "SELECT COUNT(*) FROM information_schema.table_constraints WHERE table_name = 'late'", "1");
+    try rejects("ALTER TABLE late ADD CONSTRAINT late_fk FOREIGN KEY (pid) REFERENCES p", error.ForeignKeyViolation, "SELECT COUNT(*) FROM information_schema.table_constraints WHERE table_name = 'late'", "2");
     try run("DELETE FROM late WHERE id = 2");
     try run("ALTER TABLE late ADD CONSTRAINT late_fk FOREIGN KEY (pid) REFERENCES p");
     try rejects("INSERT INTO late VALUES (3, 8)", error.ForeignKeyViolation, "SELECT COUNT(*) FROM late", "1");
