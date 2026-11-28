@@ -694,6 +694,23 @@ pub const catalog_anyarray: Type = @enumFromInt(127);
 const catalog_anyarray_data: DataType = @enumFromInt(127);
 pub const catalog_anyarray_oid: u32 = 2277;
 
+// The anonymous record and record[] pseudo-types (OIDs 2249 and 2287) of the
+// SEARCH sequence and CYCLE path columns (T133, B11 wave 5 proc-tx). A value
+// is its PostgreSQL text form in a text cell; no table or view column has
+// them (42P16) and, like catalog_anyarray, they stay out of the registry and
+// the array encodings.
+pub const record_type: Type = @enumFromInt(126);
+const record_data: DataType = @enumFromInt(126);
+pub const record_array_type: Type = @enumFromInt(125);
+const record_array_data: DataType = @enumFromInt(125);
+pub const record_oid: u32 = 2249;
+pub const record_array_oid: u32 = 2287;
+
+/// record or record[] (pseudo-types no table column can have).
+pub fn pseudoRecord(ty: Type) bool {
+    return ty == record_type or ty == record_array_type;
+}
+
 /// The array type of a named element type (null for an array).
 pub fn arrayData(element: DataType) ?DataType {
     const raw = @intFromEnum(element);
@@ -768,6 +785,8 @@ pub fn isRange(ty: Type) bool {
 pub fn dataTypeOf(ty: Type) DataType {
     return switch (ty) {
         catalog_anyarray => catalog_anyarray_data,
+        record_type => record_data,
+        record_array_type => record_array_data,
         .int2 => .smallint,
         .int4 => .integer32,
         .int8 => .integer,
@@ -836,6 +855,8 @@ pub fn dataTypeOf(ty: Type) DataType {
 pub fn typeOfData(data_type: DataType) Type {
     return switch (data_type) {
         catalog_anyarray_data => catalog_anyarray,
+        record_data => record_type,
+        record_array_data => record_array_type,
         .smallint => .int2,
         .integer32 => .int4,
         .integer => .int8,
@@ -958,6 +979,8 @@ const array_sql_names = blk: {
 fn baseInfo(data_type: DataType) TypeInfo {
     return switch (data_type) {
         catalog_anyarray_data => .{ .oid = catalog_anyarray_oid, .name = "anyarray", .len = -1, .category = 'P', .array = 0, .alignment = 'd' },
+        record_data => .{ .oid = record_oid, .name = "record", .len = -1, .category = 'P', .array = record_array_oid, .alignment = 'd' },
+        record_array_data => .{ .oid = record_array_oid, .name = "_record", .len = -1, .category = 'P', .array = 0, .alignment = 'd' },
         .aclitem => .{ .oid = 1033, .name = "aclitem", .len = 16, .category = 'U', .array = 1034, .alignment = 'd' },
         .pg_internal_char => .{ .oid = 18, .name = "char", .len = 1, .category = 'Z', .array = 1002, .alignment = 'c' },
         .boolean => .{ .oid = 16, .name = "bool", .len = 1, .category = 'B', .array = 1000, .alignment = 'c' },
@@ -1057,6 +1080,8 @@ pub fn sqlTypeName(data_type: DataType) []const u8 {
 
 fn baseSqlName(data_type: DataType) []const u8 {
     return switch (data_type) {
+        record_data => "record",
+        record_array_data => "record[]",
         .integer => "bigint",
         .integer32 => "integer",
         .smallint => "smallint",
@@ -1265,6 +1290,8 @@ pub fn regtypeName(oid: u32) ?[]const u8 {
         705 => return "unknown",
         2205 => return "regclass",
         catalog_anyarray_oid => return "anyarray",
+        record_oid => return "record",
+        record_array_oid => return "record[]",
         4089 => return "regnamespace",
         else => {},
     }

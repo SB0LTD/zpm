@@ -5390,7 +5390,9 @@ pub fn Exec(comptime config: types.Config) type {
                 const definition = &self.plans.ctes[id];
                 const p = &self.plans.items[definition.plan];
                 const width = p.count;
-                const compared = width - 1;
+                // UNION compares the visible columns (PostgreSQL's), not
+                // the hidden keys, parent link or row handle.
+                const compared = definition.visible_columns;
                 var at = self.mark();
                 var seed = try self.run(p.left, outer);
                 try self.searchCycleRows(definition, seed, true);
@@ -5434,12 +5436,22 @@ pub fn Exec(comptime config: types.Config) type {
                 for (self.handles(rows)) |handle| self.work.cells[handle + definition.self_column] = .{ .integer = handle };
             }
 
-            /// Sequence keys and cycle marks for new rows (`seed`: no parent).
+            /// Sequence keys and cycle marks for new rows (`seed`: no parent),
+            /// and since B11 wave 5 (T133, proc-tx) the sequence and path
+            /// values: PostgreSQL's record / record[] text, built from the
+            /// parent's, and the path's order-preserving key.
             fn searchCycleRows(self: *Query, definition: *const B.CteDef, rows: List, seed: bool) Error!void {
+                // Only the values the statement reads are built (UNION
+                // compares them all), so a deep path costs nothing unread.
+                const distinct = !self.plans.items[definition.plan].set_all;
+                const with_ord = definition.ord_used or distinct;
+                const with_path = definition.path_used or distinct;
+                const with_path_key = definition.path_keyable and definition.path_key_used;
                 for (self.handles(rows)) |handle| {
                     try self.session.checkpoint();
                     const row_cells = self.work.cells[handle..];
-                    const parent: ?u32 = if (seed or row_cells[definition.path_column] == .null_value or !definition.cycle and !definition.search) null else @intCast(row_cells[definition.path_column].integer);
+                    const link = definition.link_column;
+                    const parent: ?u32 = if (seed or row_cells[link] == .null_value or !definition.cycle and !definition.search) null else @intCast(row_cells[link].integer);
                     if (definition.cycle) {
                         var cycle = false;
                         var ancestor = parent;
@@ -5456,29 +5468,107 @@ pub fn Exec(comptime config: types.Config) type {
                                 cycle = true;
                                 break;
                             }
-                            const link = &self.work.cells[up + definition.path_column];
-                            ancestor = if (link.* == .null_value) null else @intCast(link.integer);
+                            const above = &self.work.cells[up + link];
+                            ancestor = if (above.* == .null_value) null else @intCast(above.integer);
                         }
                         row_cells[definition.mark_column] = if (cycle) definition.mark_value else definition.mark_default;
+                        if (with_path) try self.recordPath(definition, row_cells, parent, definition.path_column, definition.cycle_columns[0..definition.cycle_count]);
+                        if (with_path_key) {
+                            var key: V.Text = .{};
+                            if (parent) |up| try appendKeyBytes(&key, self.work.cells[up + definition.path_key_column].text.slice());
+                            for (definition.cycle_columns[0..definition.cycle_count]) |column| try appendKeyCell(&key, &row_cells[column]);
+                            row_cells[definition.path_key_column] = .{ .text = key };
+                        }
                     }
                     if (definition.search) {
                         var key: V.Text = .{};
+                        var depth: i64 = 0;
                         if (definition.breadth) {
-                            var depth: i64 = 0;
                             if (parent) |up| {
-                                const above = &self.work.cells[up + definition.ord_column].text;
+                                const above = &self.work.cells[up + definition.ord_key_column].text;
                                 depth = decodeDepth(above.slice()) + 1;
                             }
                             try appendKeyCell(&key, &.{ .integer = depth });
                         } else if (parent) |up| {
-                            const above = &self.work.cells[up + definition.ord_column].text;
+                            const above = &self.work.cells[up + definition.ord_key_column].text;
                             try appendKeyBytes(&key, above.slice());
                         }
                         for (definition.search_columns[0..definition.search_count]) |column| try appendKeyCell(&key, &row_cells[column]);
-                        row_cells[definition.ord_column] = .{ .text = key };
+                        row_cells[definition.ord_key_column] = .{ .text = key };
+                        if (!with_ord) {} else if (definition.breadth) {
+                            var text: V.Text = .{};
+                            try self.recordText(&text, row_cells, definition.search_columns[0..definition.search_count], depth);
+                            row_cells[definition.ord_column] = .{ .text = text };
+                        } else try self.recordPath(definition, row_cells, parent, definition.ord_column, definition.search_columns[0..definition.search_count]);
                     }
-                    if (definition.cycle and seed) row_cells[definition.path_column] = .null_value;
+                    if (seed) row_cells[link] = .null_value;
                 }
+            }
+
+            /// A record[] path value: the parent's elements, then this row's
+            /// record (array_out quoting).
+            noinline fn recordPath(self: *Query, definition: *const B.CteDef, row_cells: []V.Cell, parent: ?u32, column: u16, fields: []const u16) Error!void {
+                _ = definition;
+                var element: V.Text = .{};
+                try self.recordText(&element, row_cells, fields, null);
+                var text: V.Text = .{};
+                if (parent) |up| {
+                    const above = &self.work.cells[up + column];
+                    if (above.* != .text or above.text.len < 2) return error.InvalidParameterValue;
+                    try appendKeyBytes(&text, above.text.slice()[0 .. above.text.len - 1]);
+                    try appendKeyBytes(&text, ",");
+                } else try appendKeyBytes(&text, "{");
+                try appendArrayElement(&text, element.slice());
+                try appendKeyBytes(&text, "}");
+                row_cells[column] = .{ .text = text };
+            }
+
+            /// record_out: `(f1,f2,...)`, each field its type's output text,
+            /// double-quoted when empty or holding a quote, backslash,
+            /// parenthesis, comma or white space (quotes and backslashes
+            /// doubled); NULL is empty. `depth` leads BREADTH FIRST's record.
+            noinline fn recordText(self: *Query, out: *V.Text, row_cells: []const V.Cell, fields: []const u16, depth: ?i64) Error!void {
+                var buffer: [config.text_bytes]u8 = undefined;
+                try appendKeyBytes(out, "(");
+                if (depth) |value| {
+                    const digits = try Io.format(&.{ .integer = value }, false, self.session, &buffer);
+                    try appendKeyBytes(out, digits);
+                }
+                for (fields, 0..) |column, index| {
+                    if (index != 0 or depth != null) try appendKeyBytes(out, ",");
+                    const cell = &row_cells[column];
+                    if (cell.* == .null_value) continue;
+                    const text = try Io.format(cell, false, self.session, &buffer);
+                    var quote = text.len == 0;
+                    for (text) |byte| switch (byte) {
+                        '"', '\\', '(', ')', ',', ' ', '\t', '\n', '\r', 0x0b, 0x0c => quote = true,
+                        else => {},
+                    };
+                    if (quote) try appendKeyBytes(out, "\"");
+                    for (text) |byte| {
+                        if (byte == '"' or byte == '\\') try appendKeyBytes(out, &.{byte});
+                        try appendKeyBytes(out, &.{byte});
+                    }
+                    if (quote) try appendKeyBytes(out, "\"");
+                }
+                try appendKeyBytes(out, ")");
+            }
+
+            /// array_out's element: double-quoted when it holds a brace,
+            /// comma, quote, backslash or white space (or is empty or NULL
+            /// spelled out), quotes and backslashes backslash-escaped.
+            fn appendArrayElement(out: *V.Text, element: []const u8) Error!void {
+                var quote = element.len == 0 or (element.len == 4 and (element[0] | 0x20) == 'n' and (element[1] | 0x20) == 'u' and (element[2] | 0x20) == 'l' and (element[3] | 0x20) == 'l');
+                for (element) |byte| switch (byte) {
+                    '{', '}', ',', '"', '\\', ' ', '\t', '\n', '\r', 0x0b, 0x0c => quote = true,
+                    else => {},
+                };
+                if (quote) try appendKeyBytes(out, "\"");
+                for (element) |byte| {
+                    if (byte == '"' or byte == '\\') try appendKeyBytes(out, "\\");
+                    try appendKeyBytes(out, &.{byte});
+                }
+                if (quote) try appendKeyBytes(out, "\"");
             }
 
             fn decodeDepth(bytes: []const u8) i64 {
@@ -5510,6 +5600,19 @@ pub fn Exec(comptime config: types.Config) type {
                     const raw: u64 = @as(u64, @bitCast(value)) ^ (@as(u64, 1) << 63);
                     var bytes: [8]u8 = undefined;
                     for (0..8) |index| bytes[index] = @truncate(raw >> @intCast(56 - index * 8));
+                    return appendKeyBytes(key, &bytes);
+                }
+                // Floats (wave 5): PostgreSQL's order, -0 = 0 and NaN last.
+                const float: ?f64 = switch (cell.*) {
+                    .float8 => |value| value,
+                    .float4 => |value| value,
+                    else => null,
+                };
+                if (float) |value| {
+                    var bits: u64 = if (value != value) 0x7ff8000000000000 else if (value == 0) 0 else @bitCast(value);
+                    bits = if (bits >> 63 != 0) ~bits else bits | (@as(u64, 1) << 63);
+                    var bytes: [8]u8 = undefined;
+                    for (0..8) |index| bytes[index] = @truncate(bits >> @intCast(56 - index * 8));
                     return appendKeyBytes(key, &bytes);
                 }
                 switch (cell.*) {

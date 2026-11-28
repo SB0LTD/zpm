@@ -738,14 +738,33 @@ pub fn Binder(comptime config: types.Config) type {
             cycle_columns: [config.columns]u16 = undefined,
             cycle_count: usize = 0,
             user_columns: usize = 0,
-            /// The sequence column: an opaque order-preserving key (text),
-            /// usable only as a plain ORDER BY item.
+            /// The sequence column: record (BREADTH) or record[] (DEPTH)
+            /// text; ORDER BY over the CTE sorts by its hidden key (T133,
+            /// B11 wave 5 proc-tx).
             ord_column: u16 = none,
             mark_column: u16 = none,
-            /// The path column: an opaque link to the parent row.
+            /// The path column: record[] text.
             path_column: u16 = none,
             /// Hidden: the row's own workspace handle (never visible).
             self_column: u16 = none,
+            /// Hidden (wave 5): the sequence's order-preserving key, the
+            /// path's (when every cycle column has one), the parent link.
+            ord_key_column: u16 = none,
+            path_key_column: u16 = none,
+            path_keyable: bool = false,
+            link_column: u16 = none,
+            /// User and visible SEARCH / CYCLE columns (UNION compares them).
+            visible_columns: usize = 0,
+            /// Whether the statement reads the sequence or path values or
+            /// sorts by the path: the executor builds only what is read.
+            ord_used: bool = false,
+            path_used: bool = false,
+            path_key_used: bool = false,
+            /// SEARCH / CYCLE names while the recursive term binds: a
+            /// reference to a WITH column sharing one is ambiguous (42702).
+            extras: [3]V.Name = undefined,
+            extra_count: usize = 0,
+            extras_pending: bool = false,
             mark_value: V.Cell = .null_value,
             mark_default: V.Cell = .null_value,
             /// Data-modifying entry (B11): index into Plans.dml, and whether
@@ -1901,7 +1920,7 @@ pub fn Binder(comptime config: types.Config) type {
                 for (spec.order[0..spec.order_count], 0..) |*key, index| {
                     try typeExpr(context, inner, key.expr);
                     if (context.node(key.expr).ty == .unknown) try coerce(context, key.expr, .text);
-                    try sortableType(context.node(key.expr).ty);
+                    try orderableType(context.node(key.expr).ty);
                     if (n.distinct) {
                         var found = false;
                         var value_item = n.b;
@@ -2006,7 +2025,7 @@ pub fn Binder(comptime config: types.Config) type {
                     },
                     .percentile_disc, .mode => {
                         if (key_ty == .unknown) return error.TypeMismatch;
-                        try sortableType(key_ty);
+                        try orderableType(key_ty);
                         result = key_ty;
                     },
                     else => return error.UndefinedFunction,
@@ -2386,7 +2405,7 @@ pub fn Binder(comptime config: types.Config) type {
         fn typeWindowSpec(context:*const Context,scope:*const Scope,spec:*Ast.Window) Error!void {
             var inner=scope.*;inner.windows=false;inner.inside_window=true;
             if(!spec.partition_typed) for(spec.partition[0..spec.partition_count]) |id| {try valueExpr(context,&inner,id);try sortableType(context.node(id).ty);};
-            if(!spec.order_typed) for(spec.order[0..spec.order_count]) |key| {try valueExpr(context,&inner,key.expr);try sortableType(context.node(key.expr).ty);};
+            if(!spec.order_typed) for(spec.order[0..spec.order_count]) |key| {try valueExpr(context,&inner,key.expr);try orderableType(context.node(key.expr).ty);};
             if(spec.frame==.groups and spec.order_count==0) return error.WindowingError;
             if(spec.frame==.range and (spec.start.offset!=none or spec.end.offset!=none)) {
                 if(spec.order_count!=1) return error.WindowingError;
@@ -5188,6 +5207,8 @@ pub fn Binder(comptime config: types.Config) type {
                                 n.ty = try arrayConcatTypes(context, &n.a, &n.b, .operator);
                                 return;
                             }
+                            // record[] || x appends to the array in PostgreSQL (T133).
+                            if (types.pseudoRecord(left_ty) or types.pseudoRecord(right_ty)) return error.UnsupportedStatement;
                             if ((left_ty == .jsonb and (right_ty == .jsonb or right_ty == .unknown)) or
                                 (right_ty == .jsonb and left_ty == .unknown)) {
                                 try coerce(context, n.a, .jsonb);
@@ -6993,6 +7014,12 @@ pub fn Binder(comptime config: types.Config) type {
                 n.typmod = relationColumnTypmod(context, rel, column);
             }
             markCorrelated(context, scope, level);
+            if (rel.cte != no_cte) {
+                // SEARCH / CYCLE values the statement reads (T133).
+                const def = &plansOf(context).ctes[rel.cte];
+                if (column == def.ord_column) def.ord_used = true;
+                if (column == def.path_column) def.path_used = true;
+            }
         }
 
         fn columnNode(context: *const Context, scope: *const Scope, relation: usize, column: usize) Error!u16 {
@@ -7366,15 +7393,50 @@ pub fn Binder(comptime config: types.Config) type {
             return if (qualifier != null) error.TableNotFound else error.ColumnNotFound;
         }
 
-        /// SEARCH sequence and CYCLE path columns have record-array types in
-        /// PostgreSQL; here they are opaque (0A000) except a plain ORDER BY
-        /// of the sequence column, which sorts by its order-preserving key.
+        /// SEARCH sequence and CYCLE path columns are record / record[]
+        /// values (T133); their keys, the parent link and the row handle
+        /// stay hidden. PostgreSQL binds the recursive term with the SEARCH
+        /// / CYCLE columns already added, so a reference there to a WITH
+        /// column named like one of them is ambiguous (42702).
         fn opaqueColumn(context: *const Context, scope: *const Scope, rel: *const Relation, column: usize) Error!void {
+            _ = scope;
             if (rel.cte == no_cte) return;
             const def = &plansOf(context).ctes[rel.cte];
+            if (def.extras_pending) for (def.extras[0..def.extra_count]) |*extra| {
+                if (types.same(extra.slice(), relationColumnName(context, rel, column))) return error.AmbiguousColumn;
+            };
             if (!def.search and !def.cycle) return;
-            if (column == def.path_column or column == def.self_column) return error.UnsupportedStatement;
-            if (column == def.ord_column and !scope.search_order) return error.UnsupportedStatement;
+            if (column == def.self_column or column == def.link_column or column == def.ord_key_column or column == def.path_key_column) return error.UnsupportedStatement;
+        }
+
+        /// ORDER BY / DISTINCT ON a SEARCH sequence or CYCLE path column read
+        /// straight from its CTE sorts by the order-preserving key:
+        /// PostgreSQL compares the records field by field, which their text
+        /// does not. A path without a key (a cycle column type without one)
+        /// is 0A000, as is ordering grouped or DISTINCT output by one. `id`
+        /// is a bound column node; it is retargeted.
+        fn searchKey(context: *const Context, scope: *const Scope, p: *const Plan, id: u16) Error!void {
+            const n = context.node(id);
+            if (n.kind != .column) return;
+            var owner: *const Scope = scope;
+            var level = n.level;
+            while (level != 0) : (level -= 1) owner = owner.parent orelse return;
+            if (n.relation >= owner.rel_count) return;
+            const rel = &owner.rels[n.relation];
+            if (rel.cte == no_cte) return;
+            const def = &plansOf(context).ctes[rel.cte];
+            const keyed = (def.search and n.column == def.ord_column) or (def.cycle and n.column == def.path_column);
+            // Grouped or DISTINCT output has no key column to sort by.
+            if (keyed and (p.grouped or p.distinct != .none or p.key_count != 0 or p.agg_count != 0 or p.having != none or p.grouping_sets != none)) return error.UnsupportedStatement;
+            if (def.search and n.column == def.ord_column) {
+                n.column = @intCast(def.ord_key_column);
+                n.ty = .text;
+            } else if (def.cycle and n.column == def.path_column) {
+                if (!def.path_keyable) return error.UnsupportedStatement;
+                def.path_key_used = true;
+                n.column = @intCast(def.path_key_column);
+                n.ty = .text;
+            }
         }
 
         fn typeSubquery(context: *const Context, scope: *const Scope, n: *ast.Node) Error!void {
@@ -7617,7 +7679,7 @@ pub fn Binder(comptime config: types.Config) type {
                     if (column == null) return error.ColumnNotFound;
                 }
                 const index = column orelse return error.UnsupportedStatement;
-                try sortableType(p.tys[index]);
+                try orderableType(p.tys[index]);
                 p.order[p.order_count] = .{ .column = @intCast(index), .descending = key.descending, .nulls_first = nullsFirst(key) };
                 p.order_count += 1;
             }
@@ -7676,7 +7738,22 @@ pub fn Binder(comptime config: types.Config) type {
                 var with_self = local.*;
                 with_self.ids[with_self.count] = id;
                 with_self.count += 1;
+                // The SEARCH / CYCLE names exist while the recursive term
+                // binds (T133, B11 wave 5 proc-tx).
+                {
+                    const def = &plans.ctes[id];
+                    def.extra_count = 0;
+                    if (cte.search.present) def.extras[def.extra_count] = toName(context, cte.search.set);
+                    if (cte.search.present) def.extra_count += 1;
+                    if (cte.cycle.present) {
+                        def.extras[def.extra_count] = toName(context, cte.cycle.mark);
+                        def.extras[def.extra_count + 1] = toName(context, cte.cycle.path);
+                        def.extra_count += 2;
+                    }
+                    def.extras_pending = def.extra_count != 0;
+                }
                 const right = try bindPlan(context, body.right, parent, &with_self, true);
+                plans.ctes[id].extras_pending = false;
                 const r = &plans.items[right];
                 if (r.count != p.count) return error.Syntax;
                 p.right = right;
@@ -7799,10 +7876,7 @@ pub fn Binder(comptime config: types.Config) type {
             var name_count: usize = 0;
             if (cte.search.present) {
                 try searchListed(context, p, user, cte.search.columns, &def.search_columns, &def.search_count);
-                for (def.search_columns[0..def.search_count]) |column| switch (p.tys[column]) {
-                    .int2, .int4, .int8, .boolean, .text, .date, .timestamp, .timestamptz => {},
-                    else => return error.UnsupportedStatement,
-                };
+                for (def.search_columns[0..def.search_count]) |column| if (!searchKeyType(p.tys[column])) return error.UnsupportedStatement;
                 names[name_count] = toName(context, cte.search.set);
                 name_count += 1;
                 def.search = true;
@@ -7852,38 +7926,67 @@ pub fn Binder(comptime config: types.Config) type {
                 reference = index;
             };
             const working = reference orelse return error.UnsupportedStatement;
-            // Without CYCLE the parent link is a hidden column too.
-            var hidden_parent: V.Name = .{ .len = 7 };
-            @memcpy(hidden_parent.bytes[0..7], "\x00parent");
-            var hidden_self: V.Name = .{ .len = 5 };
-            @memcpy(hidden_self.bytes[0..5], "\x00self");
-            if (!def.cycle) {
-                names[name_count] = hidden_parent;
-                name_count += 1;
-            }
-            if (user + name_count + 1 > config.columns) return error.ColumnCapacity;
-            // Final positions: user columns, then the extras in order.
-            var position: u16 = @intCast(user);
+            // Final positions (PostgreSQL's): the user columns, [sequence]
+            // [mark, path], then hidden: the sequence key, the path key, the
+            // parent link and the row handle (T133, B11 wave 5 proc-tx).
+            const Extra = struct { name: V.Name, ty: ast.Type };
+            var extras: [7]Extra = undefined;
+            var count: usize = 0;
+            var at: usize = 0;
             if (def.search) {
-                def.ord_column = position;
-                position += 1;
+                def.ord_column = @intCast(user + count);
+                extras[count] = .{ .name = names[at], .ty = if (def.breadth) types.record_type else types.record_array_type };
+                count += 1;
+                at += 1;
             }
             if (def.cycle) {
-                def.mark_column = position;
-                position += 1;
+                def.mark_column = @intCast(user + count);
+                extras[count] = .{ .name = names[at], .ty = mark_ty };
+                def.path_column = @intCast(user + count + 1);
+                extras[count + 1] = .{ .name = names[at + 1], .ty = types.record_array_type };
+                count += 2;
             }
-            def.path_column = position;
-            def.self_column = position + 1;
-            var extra: usize = 0;
-            while (extra <= name_count) : (extra += 1) {
-                const column: u16 = @intCast(user + extra);
-                const ty: ast.Type = if (column == def.ord_column) .text else if (column == def.mark_column) mark_ty else .int8;
-                const name = if (extra < name_count) names[extra] else hidden_self;
-                try appendColumn(context, p, none, name, ty);
-                try appendColumn(context, left, try context.pool.add(.{ .kind = .null_literal, .ty = ty, .constant = true }), name, ty);
-                const link = if (column == def.path_column) try context.pool.add(.{ .kind = .column, .relation = @intCast(working), .column = def.self_column, .ty = .int8 }) else try context.pool.add(.{ .kind = .null_literal, .ty = ty, .constant = true });
-                try appendColumn(context, right, link, name, ty);
+            def.visible_columns = user + count;
+            if (def.search) {
+                def.ord_key_column = @intCast(user + count);
+                extras[count] = .{ .name = hiddenName("\x00ord"), .ty = .text };
+                count += 1;
             }
+            if (def.cycle) {
+                def.path_key_column = @intCast(user + count);
+                extras[count] = .{ .name = hiddenName("\x00pathkey"), .ty = .text };
+                count += 1;
+                def.path_keyable = true;
+                for (def.cycle_columns[0..def.cycle_count]) |column| def.path_keyable = def.path_keyable and searchKeyType(p.tys[column]);
+            }
+            def.link_column = @intCast(user + count);
+            extras[count] = .{ .name = hiddenName("\x00parent"), .ty = .int8 };
+            def.self_column = @intCast(user + count + 1);
+            extras[count + 1] = .{ .name = hiddenName("\x00self"), .ty = .int8 };
+            count += 2;
+            if (user + count > config.columns) return error.ColumnCapacity;
+            for (extras[0..count], 0..) |extra, index| {
+                const column = user + index;
+                try appendColumn(context, p, none, extra.name, extra.ty);
+                try appendColumn(context, left, try context.pool.add(.{ .kind = .null_literal, .ty = extra.ty, .constant = true }), extra.name, extra.ty);
+                const link = if (column == def.link_column) try context.pool.add(.{ .kind = .column, .relation = @intCast(working), .column = def.self_column, .ty = .int8 }) else try context.pool.add(.{ .kind = .null_literal, .ty = extra.ty, .constant = true });
+                try appendColumn(context, right, link, extra.name, extra.ty);
+            }
+        }
+
+        fn hiddenName(comptime text: []const u8) V.Name {
+            var name: V.Name = .{ .len = text.len };
+            @memcpy(name.bytes[0..text.len], text);
+            return name;
+        }
+
+        /// SEARCH / CYCLE column types with an order-preserving key
+        /// (Exec.appendKeyCell).
+        fn searchKeyType(ty: ast.Type) bool {
+            return switch (ty) {
+                .int2, .int4, .int8, .boolean, .text, .date, .timestamp, .timestamptz, .float4, .float8 => true,
+                else => false,
+            };
         }
 
         fn nullsFirst(key: *const Ast.OrderKey) bool {
@@ -8027,6 +8130,14 @@ pub fn Binder(comptime config: types.Config) type {
             return referencesLevel(context, n.b, level);
         }
 
+        /// An ORDER BY key type. record / record[] values sort by their
+        /// order-preserving key, which only the CTE that made them has
+        /// (searchKey); their text would sort wrongly (0A000, T133).
+        fn orderableType(ty: ast.Type) Error!void {
+            if (types.pseudoRecord(ty)) return error.UnsupportedStatement;
+            return sortableType(ty);
+        }
+
         fn sortableType(ty: ast.Type) Error!void {
             if (ty == .json) return error.UndefinedFunction;
             // No btree or hash operator classes (could not identify an
@@ -8080,7 +8191,7 @@ pub fn Binder(comptime config: types.Config) type {
                     };
                 }
                 const index = column orelse return error.UnsupportedStatement;
-                try sortableType(p.tys[index]);
+                try orderableType(p.tys[index]);
                 p.order[p.order_count] = .{ .column = @intCast(index), .descending = key.descending, .nulls_first = nullsFirst(key) };
                 p.order_count += 1;
             }
@@ -8099,20 +8210,33 @@ pub fn Binder(comptime config: types.Config) type {
             const n = context.node(id);
             if (n.kind == .int_literal) {
                 if (n.integer < 1 or n.integer > p.count) return error.InvalidColumnReference;
-                return .{ .column = @intCast(n.integer - 1) };
+                return searchTarget(context, scope, p, @intCast(n.integer - 1));
             }
             if (n.kind == .column and n.qualifier.len == 0 and !n.star) {
                 const wanted = toName(context, n.name);
-                for (p.names[0..p.count], 0..) |*name, index| if (types.same(name.slice(), wanted.slice())) return .{ .column = @intCast(index) };
+                for (p.names[0..p.count], 0..) |*name, index| if (types.same(name.slice(), wanted.slice())) return searchTarget(context, scope, p, @intCast(index));
             }
             if (n.kind == .column and !n.star) {
                 var inner = scope.*;
                 inner.search_order = true;
                 try valueExpr(context, &inner, id);
+                try searchKey(context, scope, p, id);
                 return .{ .expr = id };
             }
             try valueExpr(context, scope, id);
             return .{ .expr = id };
+        }
+
+        /// An output column as an order item; a SEARCH sequence or CYCLE path
+        /// column taken straight from its CTE sorts by its key instead.
+        fn searchTarget(context: *const Context, scope: *const Scope, p: *const Plan, column: u16) Error!OrderRef {
+            const target = p.targets[column];
+            if (target == none or context.node(target).kind != .column) return .{ .column = column };
+            const copy = try context.pool.add(context.node(target).*);
+            context.node(copy).next = none;
+            try searchKey(context, scope, p, copy);
+            if (context.node(copy).column == context.node(target).column) return .{ .column = column };
+            return .{ .expr = copy };
         }
 
         /// The materialized column of an order item; input expressions equal
@@ -9617,7 +9741,7 @@ pub fn Binder(comptime config: types.Config) type {
             var order: [config.columns]SortKey = undefined;
             for (q.order[0..q.order_count], 0..) |*key, index| {
                 const column = try refColumn(context, p, order_refs[index], plain_distinct);
-                try sortableType(planColumnType(p, context, column));
+                try orderableType(planColumnType(p, context, column));
                 order[index] = .{ .column = column, .descending = key.descending, .nulls_first = nullsFirst(key) };
             }
             const order_count = q.order_count;
@@ -11950,6 +12074,8 @@ pub fn Binder(comptime config: types.Config) type {
             if (plan.count > config.columns) return error.ColumnCapacity;
             for (0..plan.count) |index| {
                 const typmod = if (plan.typmods[index] == ast.mysql_unsigned_sum_typmod) -1 else plan.typmods[index];
+                // PostgreSQL: column has pseudo-type record (42P16).
+                if (types.pseudoRecord(plan.tys[index])) return error.InvalidTableDefinition;
                 var column: V.Column = .{ .name = plan.names[index], .data_type = dataType(plan.tys[index]), .typmod = typmod };
                 if (index < create.column_count) column.name = toName(context, create.columns[index]);
                 for (out.columns[0..index]) |*previous| if (types.same(previous.name.slice(), column.name.slice())) return error.DuplicateColumn;
@@ -12100,6 +12226,8 @@ pub fn Binder(comptime config: types.Config) type {
             var out: Create = .{ .name = name, .columns = @splat(.{}), .count = plan.count, .namespace = namespace, .command = .create_table_as };
             for (0..plan.count) |index| {
                 const typmod = if (plan.typmods[index] == ast.mysql_unsigned_sum_typmod) -1 else plan.typmods[index];
+                // PostgreSQL: column has pseudo-type record (42P16).
+                if (types.pseudoRecord(plan.tys[index])) return error.InvalidTableDefinition;
                 var column: V.Column = .{ .name = plan.names[index], .data_type = dataType(plan.tys[index]), .typmod = typmod };
                 if (index < create.as_column_count) column.name = toName(context, create.as_columns[index]);
                 for (out.columns[0..index]) |*previous| if (types.same(previous.name.slice(), column.name.slice())) return error.DuplicateColumn;

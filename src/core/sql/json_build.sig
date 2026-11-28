@@ -126,6 +126,9 @@ pub fn JsonBuild(comptime config: types.Config) type {
         /// `ty`; `key` asks for an object key (always a string).
         pub fn append(out: *Out, cell: *const V.Cell, ty: Type, key: bool, jsonb: bool, session: *const Session) Error!void {
             if (cell.* == .null_value) return out.append("null");
+            // A SEARCH / CYCLE record becomes an object per record in
+            // PostgreSQL; its text form is not that (T133, wave 5).
+            if (types.pseudoRecord(ty)) return error.UnsupportedStatement;
             const kind = category(ty);
             if (key) switch (kind) {
                 .array, .json => return error.InvalidParameterValue,

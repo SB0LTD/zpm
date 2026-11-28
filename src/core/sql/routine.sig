@@ -1927,9 +1927,14 @@ pub fn Routines(comptime config: types.Config) type {
                     // A block with handlers is a subtransaction: COMMIT and
                     // ROLLBACK are not allowed inside it (PostgreSQL 2D000).
                     const atomic = mode == .run and (self.purpose == .procedure or self.purpose == .do_block) and try self.hasHandlers();
-                    if (atomic) self.atomic_depth += 1;
+                    if (atomic) {
+                        self.atomic_depth += 1;
+                        // Routines it calls cannot end the transaction either.
+                        self.host.routineAtomic(true);
+                    }
                     defer if (atomic) {
                         self.atomic_depth -= 1;
+                        self.host.routineAtomic(false);
                     };
                     if (mode == .run) {
                         signal = self.statementList(.run) catch |err| blk: {
@@ -1970,6 +1975,16 @@ pub fn Routines(comptime config: types.Config) type {
                             const run_handler = mode == .run and caught != null and matches and !handled;
                             if (run_handler) {
                                 handled = true;
+                                // The block's subtransaction is gone: its
+                                // handler may end the transaction (PostgreSQL).
+                                if (atomic) {
+                                    self.atomic_depth -= 1;
+                                    self.host.routineAtomic(false);
+                                }
+                                defer if (atomic) {
+                                    self.atomic_depth += 1;
+                                    self.host.routineAtomic(true);
+                                };
                                 signal = try self.handler(caught.?);
                             } else _ = try self.statementList(if (mode == .check) .check else .skip);
                         }
@@ -2454,20 +2469,22 @@ pub fn Routines(comptime config: types.Config) type {
 
                 /// COMMIT / ROLLBACK [AND [NO] CHAIN] in a procedure or DO
                 /// block: the host decides (2D000 where PostgreSQL forbids
-                /// it; the allowed case needs a commit inside the running
-                /// statement, which the store does not offer: 0A000).
+                /// it; else the transaction ends and the next one begins,
+                /// B11 wave 5 proc-tx). Variables keep their values.
                 noinline fn transactionStatement(self: *Self, mode: Mode) Error!Signal {
                     const c = &self.cursor;
+                    const commit = c.is("commit");
                     try c.advance();
                     _ = try c.take("transaction") or try c.take("work");
+                    var chain = false;
                     if (try c.take("and")) {
-                        _ = try c.take("no");
+                        chain = !try c.take("no");
                         try c.expect("chain");
                     }
                     try c.expectSymbol(.semicolon);
                     if (mode != .run) return .normal;
                     if (self.purpose != .procedure and self.purpose != .do_block) return error.InvalidTransactionTermination;
-                    try self.host.routineTransaction(self.atomic_depth != 0);
+                    try self.host.routineTransaction(self.frame, self.atomic_depth != 0, commit, chain);
                     return .normal;
                 }
 
