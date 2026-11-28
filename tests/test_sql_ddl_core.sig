@@ -796,7 +796,8 @@ fn alterErrors() !void {
     try rejects("ALTER TABLE a ADD COLUMN x INT, DROP COLUMN nope", error.ColumnNotFound, probe, "id;v");
     try rejects("ALTER TABLE a ADD COLUMN x INT DEFAULT nextval('s')", error.UnsupportedStatement, probe, "id;v");
     try rejects("ALTER TABLE a ADD COLUMN x INT PRIMARY KEY", error.UnsupportedStatement, probe, "id;v");
-    try rejects("ALTER TABLE a ALTER COLUMN v TYPE BIGINT", error.UnsupportedStatement, probe, "id;v");
+    // ALTER COLUMN TYPE without an assignment cast (42804, ddl-alter).
+    try rejects("ALTER TABLE a ALTER COLUMN v TYPE DATE", error.TypeMismatch, probe, "id;v");
     try rejects("ALTER TABLE a ADD COLUMN x INT DEFAULT 'text'", error.InvalidTextRepresentation, probe, "id;v");
     try rejects("ALTER TABLE ident DROP COLUMN id", error.UnsupportedStatement, "SELECT COUNT(*) FROM ident", "0");
     try rejects("ALTER TABLE ident ALTER COLUMN id SET DEFAULT 1", error.Syntax, "SELECT COUNT(*) FROM ident", "0");

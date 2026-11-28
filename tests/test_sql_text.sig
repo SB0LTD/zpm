@@ -425,12 +425,16 @@ fn collations() !void {
     // A BETWEEN lower bound is a b_expr: COLLATE cannot follow it.
     try rejects("SELECT 'a' BETWEEN 'a' COLLATE \"C\" AND 'b'", error.Syntax);
 
-    // Column collations: only the database collation (the default).
-    try rejects("CREATE TABLE ct(a TEXT COLLATE \"C\")", error.UnsupportedStatement);
+    // Column collations (stored since ddl-alter, wave 5; ICU ones are 0A000).
+    try exec("CREATE TABLE ct(a TEXT COLLATE \"C\")");
+    try exec("DROP TABLE ct");
     try rejects("CREATE TABLE ct(a INT COLLATE \"C\")", error.TypeMismatch);
     try rejects("CREATE TABLE ct(a TEXT COLLATE \"nope\")", error.UndefinedObject);
+    try rejects("CREATE TABLE ct(a TEXT COLLATE \"unicode\")", error.UnsupportedStatement);
     // DEFAULT takes a b_expr, so this COLLATE is the column's.
-    try rejects("CREATE TABLE ct(a TEXT DEFAULT 'x' COLLATE \"C\")", error.UnsupportedStatement);
+    try exec("CREATE TABLE ct(a TEXT DEFAULT 'x' COLLATE \"C\")");
+    try rows("SELECT collation_name FROM information_schema.columns WHERE table_name = 'ct'", "C");
+    try exec("DROP TABLE ct");
     try exec("CREATE TABLE ct(id INT PRIMARY KEY, a TEXT COLLATE \"default\" DEFAULT ('q' COLLATE \"C\"))");
     try exec("INSERT INTO ct(id) VALUES (1)");
     try exec("INSERT INTO ct VALUES (2, 'b' COLLATE \"POSIX\")");

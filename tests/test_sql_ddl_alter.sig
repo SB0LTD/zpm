@@ -653,7 +653,13 @@ fn constraintsAndCollations() !void {
     try run("ALTER TABLE t DROP CONSTRAINT bb_set");
     try run("INSERT INTO t VALUES (2, NULL)");
     try expect(constraint_probes[0], "t_a_not_null|n;t_key|p");
+    try expect("SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 't_a_not_null'", "NOT NULL a");
+    // Inherited and partition NOT NULL constraints keep the parent's name.
+    try run("CREATE TABLE m(id INT NOT NULL, v INT)");
+    try run("CREATE TABLE mc(v INT NOT NULL) INHERITS (m)");
+    try expect("SELECT conname FROM pg_constraint WHERE conrelid = 'mc'::regclass ORDER BY 1", "m_id_not_null;mc_v_not_null");
     try sameState(&constraint_probes);
+    try sameState(&.{"SELECT conname, contype FROM pg_constraint WHERE conrelid = 'mc'::regclass ORDER BY 1"});
     // F690 probe: column collations ("C", "POSIX", "default", ucs_basic and
     // the C.utf8 libc collation; code point order like the database's).
     try expect("SELECT 'a' < 'B' COLLATE \"C\", 'a' < 'B' COLLATE \"POSIX\", 'abc' COLLATE \"C\" = 'abc'", "f|f|t");

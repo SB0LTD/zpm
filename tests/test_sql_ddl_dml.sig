@@ -382,7 +382,9 @@ fn inheritsMerge() !void {
     try expect("SELECT id, v FROM m", "1|cv");
     try rejects("INSERT INTO mc (id, w) VALUES (2, 0)", error.CheckViolation, "SELECT COUNT(*) FROM mc", "1");
     try run("CREATE TABLE mc4 (w INT NOT NULL CHECK (w < 10)) INHERITS (m)");
-    try expect("SELECT conname FROM pg_constraint WHERE conrelid = 'mc4'::regclass ORDER BY 1", "m_w_check;mc4_w_check");
+    // PostgreSQL 18 NOT NULL constraints (ddl-alter): an inherited one keeps
+    // the parent's name.
+    try expect("SELECT conname FROM pg_constraint WHERE conrelid = 'mc4'::regclass ORDER BY 1", "m_id_not_null;m_w_check;mc4_w_check;mc4_w_not_null");
     try rejects("INSERT INTO mc4 (id, w) VALUES (1, NULL)", error.NotNullViolation, "SELECT COUNT(*) FROM mc4", "0");
     try rejects("INSERT INTO mc4 (id, w) VALUES (1, 10)", error.CheckViolation, "SELECT COUNT(*) FROM mc4", "0");
     // An empty element list inherits every column.
@@ -614,7 +616,8 @@ fn constraintCommands() !void {
     const valid = record[0..used];
     const version_at = (std.mem.indexOf(u8, valid, &[_]u8{ 3, 'n', 'v', 't', 7, 0 }) orelse return error.DefinitionVersionNotFound) + 4;
     @memcpy(crafted[0..used], valid);
-    crafted[version_at] = 8;
+    // Version 8 is the ddl-alter lane's column-extension format (wave 5).
+    crafted[version_at] = 9;
     try check(replica.applyChangeRecord(crafted[0..used], &scratch) == error.UnsupportedLogVersion);
     const unique_at = (std.mem.indexOf(u8, valid, &[_]u8{ 2, 9, 'n', 'v', 't', '_', 'b', '_', 'k', 'e', 'y' }) orelse return error.ConstraintNotFound) + 11;
     @memcpy(crafted[0..used], valid);
@@ -946,9 +949,11 @@ fn searchPath() !void {
     try expect("SELECT nextval('sq'), nextval('s1.sq')", "1|2");
     try run("CREATE FUNCTION f() RETURNS INT LANGUAGE sql AS 'SELECT 42'");
     try expect("SELECT f()", "42");
-    // A view stores its text: an unqualified name outside public must be
-    // written with its schema (0A000 otherwise).
-    try rejects("CREATE VIEW v AS SELECT a FROM t", error.UnsupportedStatement, homes, "u|s2;v1|s1");
+    // A view stores its text: an unqualified name outside public is stored
+    // with its schema (ddl-alter, wave 5; 0A000 before).
+    try run("CREATE VIEW v AS SELECT a FROM t");
+    try expect("SELECT definition FROM pg_views WHERE viewname = 'v'", "SELECT a FROM s1.t");
+    try run("DROP VIEW v");
     try run("CREATE VIEW v2 AS SELECT a FROM s1.t");
     try expect("SELECT * FROM v2", "1");
     try run("TRUNCATE t");

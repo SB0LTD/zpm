@@ -1336,10 +1336,13 @@ fn constraintDefinitionCatalog() !void {
     try run("CREATE INDEX tooling_label ON tooling (label)");
     try run("CREATE TABLE catalog_child(id INT PRIMARY KEY, parent INT, score INT, CONSTRAINT uq UNIQUE NULLS NOT DISTINCT(score) DEFERRABLE INITIALLY DEFERRED, CONSTRAINT min_score CHECK (score > 0), CONSTRAINT fk_parent FOREIGN KEY (parent) REFERENCES tooling(id) ON UPDATE CASCADE ON DELETE SET NULL DEFERRABLE)");
     const definitions = "SELECT conname,contype,condeferrable,condeferred,pg_catalog.pg_get_constraintdef(oid,true) FROM pg_catalog.pg_constraint ORDER BY conname";
+    // PostgreSQL 18 lists NOT NULL constraints too (ddl-alter, wave 5).
     try expect(definitions,
+        "catalog_child_id_not_null|n|f|f|NOT NULL id;" ++
         "catalog_child_pkey|p|f|f|PRIMARY KEY (id);" ++
         "fk_parent|f|t|f|FOREIGN KEY (parent) REFERENCES tooling(id) ON UPDATE CASCADE ON DELETE SET NULL DEFERRABLE;" ++
         "min_score|c|f|f|CHECK (score > 0);" ++
+        "tooling_id_not_null|n|f|f|NOT NULL id;" ++
         "tooling_pkey|p|f|f|PRIMARY KEY (id);" ++
         "uq|u|t|t|UNIQUE NULLS NOT DISTINCT (score) DEFERRABLE INITIALLY DEFERRED");
     const references = "SELECT conname,confupdtype,confdeltype,confmatchtype,conindid FROM pg_constraint WHERE contype='f'";

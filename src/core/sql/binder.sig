@@ -13407,6 +13407,13 @@ pub fn Binder(comptime config: types.Config) type {
             for (source.columns[0..source.column_count], 0..) |column, index| {
                 var copy = column;
                 copy.primary_key = column.primary_key and like.indexes;
+                // A copied NOT NULL constraint keeps its name (PostgreSQL 18:
+                // `<parent>_<column>_not_null` in a child, ddl-alter).
+                copy.not_null_name = .{};
+                if (column.not_null) {
+                    const inherited = notNullName(source.name, &column);
+                    if (!types.same(inherited.slice(), objectName(out.name.slice(), column.name.slice(), "not_null").slice())) copy.not_null_name = inherited;
+                }
                 switch (column.default_kind) {
                     .mysql_auto_increment => return error.UnsupportedStatement,
                     .default => if (!like.defaults) {

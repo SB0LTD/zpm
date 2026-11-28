@@ -4477,7 +4477,7 @@ pub fn Database(comptime config: Config) type {
         /// its objects are created there; naming another schema is 42P15
         /// and any other element is 42601. GRANT runs as the privilege
         /// statements run (that lane's hook).
-        fn schemaElements(self: *Self, slot: u16, schema: Name, text: []const u8, result: *Result) Error!void {
+        noinline fn schemaElements(self: *Self, slot: u16, schema: Name, text: []const u8, result: *Result) Error!void {
             var starts: [config.schema_elements]usize = undefined;
             var kinds: [config.schema_elements]u8 = undefined;
             var count: usize = 0;
@@ -4539,7 +4539,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         /// One schema element as its own command of the transaction.
-        fn schemaElement(self: *Self, slot: u16, schema: Name, element: []const u8, result: *Result) Error!void {
+        noinline fn schemaElement(self: *Self, slot: u16, schema: Name, element: []const u8, result: *Result) Error!void {
             const snap = self.routineSnapshot(slot, true);
             // CREATE TRIGGER runs through the routine catalog statements.
             if (R.classify(element) != null) return self.routineBody(slot, element, snap, result);
@@ -10243,7 +10243,8 @@ pub fn Database(comptime config: Config) type {
             if (view == .pg_collation) {
                 for (collation.names, collation.oids) |name, oid| {
                     const native_provider: u8 = switch (oid) { 100 => 'd', 962 => 'b', else => 'c' };
-                    const encoding: i64 = if (oid == 962) 6 else -1;
+                    // ucs_basic and C.utf8 (ddl-alter) belong to UTF8 (6).
+                    const encoding: i64 = if (oid == 962 or oid == 12359) 6 else -1;
                     try sink.add(&.{ intCell(oid), nameCell(name), intCell(catalog_module.catalog_namespace), intCell(CO.bootstrap_role), .{ .pg_internal_char = native_provider }, boolCell(true), intCell(encoding) });
                 }
                 return true;
@@ -10352,8 +10353,8 @@ pub fn Database(comptime config: Config) type {
                             if (constraint.kind == .primary) continue;
                             try self.constraintRow(sink, table, constraint.oid, constraint.name.slice(), constraint, constraint.kind, snapshot, pool);
                         }
-                        if (table.relkind == 'r' or table.relkind == 'p') for (table.columns[0..table.column_count]) |*column| {
-                            if (column.not_null) try notNullRow(sink, table, B.notNullName(table.name, column).slice());
+                        if (table.relkind == 'r' or table.relkind == 'p') for (table.columns[0..table.column_count], 1..) |*column, attnum| {
+                            if (column.not_null) try notNullRow(sink, table, B.notNullName(table.name, column).slice(), attnum);
                         };
                     },
                     .pg_indexes => {
@@ -10606,10 +10607,9 @@ pub fn Database(comptime config: Config) type {
         }
 
         /// A NOT NULL constraint row (PostgreSQL 18 contype 'n', ddl-alter).
-        /// Its definition stores no constraint OID: the row reports 0.
-        fn notNullRow(sink: *X.RowSink, table: *const S.Table, name: []const u8) Error!void {
+        fn notNullRow(sink: *X.RowSink, table: *const S.Table, name: []const u8, attnum: usize) Error!void {
             try sink.add(&.{
-                intCell(0), nameCell(name), intCell(table.namespace), .{ .pg_internal_char = 'n' },
+                intCell(notNullOid(table, attnum)), nameCell(name), intCell(table.namespace), .{ .pg_internal_char = 'n' },
                 boolCell(false), boolCell(false), boolCell(true), boolCell(true),
                 intCell(table.oid), intCell(0), intCell(0), intCell(0), intCell(0),
                 .{ .pg_internal_char = ' ' }, .{ .pg_internal_char = ' ' }, .{ .pg_internal_char = ' ' }, boolCell(false), boolCell(true),
@@ -10686,6 +10686,19 @@ pub fn Database(comptime config: Config) type {
             return text.len;
         }
 
+        /// pg_constraint OIDs of NOT NULL constraints (ddl-alter, wave 5).
+        /// Definitions store no OID for them, so each row's OID is derived
+        /// from its table's OID and column number, in a range the constraint
+        /// OID counter never reaches (pg_constraint OIDs need only be unique
+        /// within pg_constraint); 0 for a table OID beyond that range.
+        const not_null_oid_base: u32 = 0xc0000000;
+
+        fn notNullOid(table: *const S.Table, attnum: usize) u32 {
+            const relative = table.oid -% change_log.first_oid;
+            if (table.oid < change_log.first_oid or relative >= 1 << 22 or attnum > 255) return 0;
+            return not_null_oid_base | (relative << 8) | @as(u32, @intCast(attnum));
+        }
+
         fn postgresConstraintDefinition(ptr: *anyopaque, oid: u32, pretty: bool, out: []u8) Error!?usize {
             const self: *const Self = @ptrCast(@alignCast(ptr));
             var relations: [K.relation_rows]K.Found = undefined;
@@ -10693,6 +10706,18 @@ pub fn Database(comptime config: Config) type {
             for (relations[0..count]) |found| {
                 if (found.kind == 'S') continue;
                 const table = &self.tables[found.slot];
+                // NOT NULL constraints: "NOT NULL column".
+                if (oid >= not_null_oid_base) for (table.columns[0..table.column_count], 1..) |*column, attnum| {
+                    if (!column.not_null or notNullOid(table, attnum) != oid) continue;
+                    const parts = [_][]const u8{ "NOT NULL ", column.name.slice() };
+                    var length: usize = 0;
+                    for (parts) |part| {
+                        if (part.len > out.len - length) return error.TextCapacity;
+                        @memcpy(out[length..][0..part.len], part);
+                        length += part.len;
+                    }
+                    return length;
+                };
                 if (oid != 0 and table.primary_constraint_oid == oid) {
                     const primary = if (S.primaryConstraint(table)) |position| &table.constraints[position] else null;
                     return try self.renderConstraint(table, primary, .primary, pretty, out);
@@ -11855,7 +11880,7 @@ pub fn Database(comptime config: Config) type {
         /// this transaction's own writes) is converted in the copy and every
         /// other version is dropped. A transaction snapshot that sees a row
         /// differently cannot keep reading it consistently (40001).
-        fn rewriteRows(self: *Self, slot: u16, copy: *S.Table, source: *const S.Table, alter: *const B.AlterTable, snap: Snapshot) Error!void {
+        noinline fn rewriteRows(self: *Self, slot: u16, copy: *S.Table, source: *const S.Table, alter: *const B.AlterTable, snap: Snapshot) Error!void {
             var latest = snap;
             latest.csn = self.csn;
             const isolation_snapshot = transactionSnapshot(self.txs[slot].isolation);
@@ -11887,7 +11912,7 @@ pub fn Database(comptime config: Config) type {
         /// alter type of a column used by a view or rule"); a dropped one
         /// is 2BP01, or with CASCADE the view (and its dependents) is
         /// dropped. Usage is the view query's bound column references.
-        fn alterViewCheck(self: *Self, slot: u16, alter: *const B.AlterTable, snap: Snapshot) Error!void {
+        noinline fn alterViewCheck(self: *Self, slot: u16, alter: *const B.AlterTable, snap: Snapshot) Error!void {
             const source = &self.tables[alter.table];
             var kept: [config.columns]bool = @splat(false);
             var retyped: [config.columns]bool = @splat(false);
@@ -11921,7 +11946,7 @@ pub fn Database(comptime config: Config) type {
 
         /// Binds view `view`'s stored query as a nested statement, recording
         /// which columns of `usage.table` it references.
-        fn viewColumnUsage(self: *Self, slot: u16, view: usize, columns_used: *B.ColumnUsage, snap: Snapshot) Error!void {
+        noinline fn viewColumnUsage(self: *Self, slot: u16, view: usize, columns_used: *B.ColumnUsage, snap: Snapshot) Error!void {
             const mark = try self.nestedEnter(slot);
             defer self.nestedLeave(slot, mark);
             const text = self.tables[view].query.slice();
@@ -11945,7 +11970,7 @@ pub fn Database(comptime config: Config) type {
 
         /// DROP COLUMN ... CASCADE: foreign keys of other tables that
         /// reference a dropped column are dropped from those tables.
-        fn dropReferencingKeys(self: *Self, slot: u16, alter: *const B.AlterTable, snap: Snapshot) Error!void {
+        noinline fn dropReferencingKeys(self: *Self, slot: u16, alter: *const B.AlterTable, snap: Snapshot) Error!void {
             const source = &self.tables[alter.table];
             var kept: [config.columns]bool = @splat(false);
             for (alter.sources[0..alter.count]) |origin| if (origin != 0xff) {
@@ -14004,7 +14029,7 @@ pub fn Database(comptime config: Config) type {
         /// them. Each row kept one version then (committed, or this
         /// transaction's from an earlier command); later commands of the
         /// transaction only add newer versions, encoded by their own entries.
-        fn encodeRewrite(self: *const Self, writer: *change_log.Writer, slot: u16, index: usize, cid: u32) Error!void {
+        noinline fn encodeRewrite(self: *const Self, writer: *change_log.Writer, slot: u16, index: usize, cid: u32) Error!void {
             const table = &self.tables[index];
             const alter = &self.alters[index];
             const epoch = self.txs[slot].epoch;
