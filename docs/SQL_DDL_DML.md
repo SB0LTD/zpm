@@ -186,11 +186,11 @@ machine (shared with other builds; Debug and ReleaseSafe):
 
 | Query | Debug index / scan | ReleaseSafe index / scan |
 |---|---|---|
-| `k = c` (1 row) | 24 µs / 205 µs | 11 µs / 39 µs |
-| `k BETWEEN c AND c + 99` (100 rows) | 73 µs / 21.5 ms | 19 µs / 6.4 ms |
-| `ORDER BY k DESC LIMIT 10` | 27 µs / 1.16 ms | 7 µs / 273 µs |
-| `min(k), max(k)` | 38 µs / 21.3 ms | 8 µs / 7.8 ms |
-| `count(*), sum(g)` over 1,200 rows | 400 µs / 398 µs | 213 µs / 336 µs |
+| `k = c` (1 row) | 24 µs / 205 µs | 4.5 µs / 27 µs |
+| `k BETWEEN c AND c + 99` (100 rows) | 73 µs / 21.5 ms | 14 µs / 4.8 ms |
+| `ORDER BY k DESC LIMIT 10` | 27 µs / 1.16 ms | 5.7 µs / 162 µs |
+| `min(k), max(k)` | 38 µs / 21.3 ms | 5.1 µs / 3.0 ms |
+| `count(*), sum(g)` over 1,200 rows | 400 µs / 398 µs | 51 µs / 50 µs |
 
 The last row streams the compact projection in both forms (see above).
 Index walks read only their range's entries (asserted).
