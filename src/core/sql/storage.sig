@@ -1182,6 +1182,12 @@ pub fn Storage(comptime config: types.Config) type {
             return true;
         }
 
+        /// Whether one row's entry fits ordered index `index` (replay of an
+        /// ALTER COLUMN TYPE rewrite, ddl-alter).
+        pub fn entryFits(index: *const Index, cells: []const V.Cell) bool {
+            return index.hash or entryBytes(index, cells) <= config.index_key_bytes;
+        }
+
         /// Ordered index admission of a new version (before it is created):
         /// the entry's key and INCLUDE bytes stay within index_key_bytes
         /// (IndexCapacity, 54000). Nodes need no check: indexRoom keeps the

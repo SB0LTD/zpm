@@ -224,7 +224,9 @@ fn alterColumnType() !void {
     // "cannot alter type of column twice" (0A000).
     try rejects("ALTER TABLE t ALTER COLUMN b TYPE INT, ALTER COLUMN b TYPE BIGINT", error.UnsupportedStatement, type_probes[0], "1|10|bigint|integer;2|20|bigint|integer");
     // A USING expression reads the old row: every column, old types.
+    try run("CREATE INDEX t_b ON t (b)");
     try run("ALTER TABLE t ALTER COLUMN b TYPE TEXT USING (a * 100 + b)::text || '!'");
+    try check(db.indexTreesValid("t").? and replica.indexTreesValid("t").?);
     try expect(type_probes[0], "1|110!|bigint|text;2|220!|bigint|text");
     try expect(type_probes[1], "a|bigint;b|text");
     try run("ALTER TABLE t ALTER COLUMN a TYPE NUMERIC(6,2), ALTER COLUMN b TYPE VARCHAR(8) USING left(b, 3)");
@@ -266,12 +268,19 @@ fn alterColumnType() !void {
     // Constraints and indexes over a rewritten column are checked again.
     try run("CREATE TABLE k(id INT PRIMARY KEY, v TEXT UNIQUE, n INT NOT NULL, e INT CHECK (e > 0))");
     try run("INSERT INTO k VALUES (1, 'a', 1, 1), (2, 'b', 2, 2)");
+    try run("CREATE INDEX k_n ON k (n)");
+    try run("CREATE INDEX k_ve ON k (v, e)");
     try rejects("ALTER TABLE k ALTER COLUMN id TYPE INT USING 7", error.PrimaryKeyViolation, "SELECT * FROM k ORDER BY id", "1|a|1|1;2|b|2|2");
     try rejects("ALTER TABLE k ALTER COLUMN v TYPE INT USING 1", error.PrimaryKeyViolation, "SELECT * FROM k ORDER BY id", "1|a|1|1;2|b|2|2");
     try rejects("ALTER TABLE k ALTER COLUMN n TYPE INT USING NULL", error.NotNullViolation, "SELECT * FROM k ORDER BY id", "1|a|1|1;2|b|2|2");
     try rejects("ALTER TABLE k ALTER COLUMN e TYPE INT USING -e", error.CheckViolation, "SELECT * FROM k ORDER BY id", "1|a|1|1;2|b|2|2");
     try run("ALTER TABLE k ALTER COLUMN id TYPE BIGINT USING id + 100, ALTER COLUMN v TYPE VARCHAR(4) USING v || v");
-    try expect("SELECT * FROM k WHERE id = 102", "102|bb|2|2");
+    try run("ALTER TABLE k ALTER COLUMN n TYPE TEXT USING (n * 10)::text");
+    // The ordered indexes are rebuilt over the rewritten keys (B+trees).
+    try check(db.indexTreesValid("k").? and replica.indexTreesValid("k").?);
+    try expect("SELECT id FROM k WHERE n = '20'", "102");
+    try expect("SELECT id FROM k WHERE v = 'aa' AND e = 1", "101");
+    try expect("SELECT * FROM k WHERE id = 102", "102|bb|20|2");
     try expect("SELECT id FROM k WHERE v = 'aa'", "101");
     try rejects("INSERT INTO k VALUES (101, 'z', 1, 1)", error.PrimaryKeyViolation, "SELECT count(*) FROM k", "2");
     try rejects("INSERT INTO k VALUES (5, 'aa', 1, 1)", error.PrimaryKeyViolation, "SELECT count(*) FROM k", "2");

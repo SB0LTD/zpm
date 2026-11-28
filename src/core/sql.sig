@@ -11797,6 +11797,9 @@ pub fn Database(comptime config: Config) type {
             if (rewriting) {
                 S.copyRelayoutPending(copy, source, alter.sources[0..alter.count], fills[0..alter.count]);
                 try self.rewriteRows(slot, copy, source, alter, snap);
+                // Every ordered index entry of the rewritten rows within
+                // index_key_bytes (54000) before the trees are rebuilt.
+                for (copy.indexes[0..copy.index_count]) |*ordered| if (!S.keysFit(copy, ordered)) return error.IndexCapacity;
                 S.finishRelayout(copy);
             } else S.copyRelayout(copy, source, alter.sources[0..alter.count], fills[0..alter.count]);
             copy.live = true;

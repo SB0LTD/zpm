@@ -2120,7 +2120,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
         /// each once, complete and typed by the new definition, with unique
         /// keys. A rewritten key column leaves the database's key index
         /// stale, so the overlay then holds every row and key of the table.
-        fn validateRewriteRows(db: anytype, scratch: *Scratch, record: []const u8, reader: *Reader, index: u8, rewritten: *const [config.columns]bool, row: *V.Row) Error!void {
+        fn validateRewriteRows(db: anytype, scratch: *Scratch, record: []const u8, reader: *Reader, index: u8, rewritten: *const [config.columns]bool, row: *V.Row, extras: *const S.Extras) Error!void {
             const vt = &scratch.tables[index];
             var any = false;
             for (rewritten[0..vt.column_count]) |flag| any = any or flag;
@@ -2149,6 +2149,8 @@ pub fn ChangeLog(comptime config: types.Config) type {
                 if (existing) |position| if (scratch.rows[position].rewritten) return error.InvalidChangeRecord;
                 var key_offset: u32 = 0;
                 try decodeRow(reader, vt, row, &key_offset);
+                // Each ordered index entry fits this database's index_key_bytes.
+                for (extras.indexes[0..extras.index_count]) |*entry| if (!S.entryFits(entry, row.cells[0..vt.column_count])) return error.ChangeRecordConflict;
                 if (vt.primary) |column| {
                     const base = vt.base;
                     if (rekey) vt.base = false;
@@ -2434,7 +2436,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         vt.primary = primary;
                         vt.keyed = definition.keyed();
                         vt.primary_index_oid = definition.primary_index_oid;
-                        if (rewrite) try validateRewriteRows(db, scratch, record, &reader, index, &rewritten, &row);
+                        if (rewrite) try validateRewriteRows(db, scratch, record, &reader, index, &rewritten, &row, &definition.extras);
                     },
                     @intFromEnum(Op.view_check_option) => {
                         const index = try findVTable(scratch, try reader.int(u32));
@@ -2874,7 +2876,7 @@ pub fn ChangeLog(comptime config: types.Config) type {
                         if (!S.indexFits(table, definition.extras.index_count, 0)) return error.ChangeRecordConflict;
                         // Existing rows must fit every ordered index entry
                         // (a replica with a smaller index_key_bytes).
-                        var identity = definition.count == table.column_count;
+                        var identity = !rewrite and definition.count == table.column_count;
                         for (sources[0..definition.count], 0..) |origin, position| identity = identity and origin == position;
                         if (identity) for (definition.extras.indexes[0..definition.extras.index_count]) |*index| {
                             if (!S.keysFit(table, index)) return error.ChangeRecordConflict;
