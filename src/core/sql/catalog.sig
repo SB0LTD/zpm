@@ -103,8 +103,8 @@ fn col(name: []const u8, ty: types.Type) ViewColumn {
 }
 
 const pg_type_columns = [_]ViewColumn{
-    col("oid", .oid), col("typname", .name), col("typnamespace", .oid), col("typlen", .int2), col("typtype", .pg_internal_char), col("typcategory", .text),
-    col("typarray", .oid), col("typdelim", .text), col("typinput", .text), col("typbasetype", .oid), col("typelem", .oid),
+    col("oid", .oid), col("typname", .name), col("typnamespace", .oid), col("typlen", .int2), col("typtype", .pg_internal_char), col("typcategory", .pg_internal_char),
+    col("typarray", .oid), col("typdelim", .pg_internal_char), col("typinput", .text), col("typbasetype", .oid), col("typelem", .oid),
     col("typowner", .oid), col("typtypmod", .int4), col("typnotnull", .boolean), col("typrelid", .oid), col("typcollation", .oid),
     col("typacl", types.arrayType(.aclitem).?), col("typisdefined", .boolean), col("typstorage", .pg_internal_char),
 };
@@ -306,7 +306,7 @@ const pg_amproc_columns = [_]ViewColumn{
 };
 const pg_collation_columns = [_]ViewColumn{
     col("oid", .oid), col("collname", .name), col("collnamespace", .oid), col("collowner", .oid),
-    col("collprovider", .text), col("collisdeterministic", .boolean), col("collencoding", .int4),
+    col("collprovider", .pg_internal_char), col("collisdeterministic", .boolean), col("collencoding", .int4),
 };
 const pg_tablespace_columns = [_]ViewColumn{
     col("oid", .oid), col("spcname", .name), col("spcowner", .oid),
@@ -319,7 +319,7 @@ const pg_class_columns = [_]ViewColumn{
     col("oid", .oid), col("relname", .name), col("relnamespace", .oid), col("relkind", .pg_internal_char), col("relnatts", .int2),
     col("relchecks", .int2), col("relhasindex", .boolean), col("relhasrules", .boolean), col("relhastriggers", .boolean),
     col("relrowsecurity", .boolean), col("relforcerowsecurity", .boolean), col("relispartition", .boolean),
-    col("reltablespace", .oid), col("reloftype", .oid), col("relpersistence", .text), col("relreplident", .text),
+    col("reltablespace", .oid), col("reloftype", .oid), col("relpersistence", .pg_internal_char), col("relreplident", .pg_internal_char),
     col("reltoastrelid", .oid), col("relam", .oid), col("relispopulated", .boolean), col("relpartbound", .text),
     col("reltype", .oid), col("relowner", .oid), col("relpages", .int4), col("reltuples", .float4),
     col("relallvisible", .int4), col("relallfrozen", .int4), col("relfrozenxid", .xid), col("relminmxid", .xid),
@@ -343,10 +343,10 @@ const pg_index_columns = [_]ViewColumn{
     col("indnullsnotdistinct", .boolean), col("indexprs", .text),
 };
 const pg_constraint_columns = [_]ViewColumn{
-    col("oid", .oid), col("conname", .name), col("connamespace", .oid), col("contype", .text),
+    col("oid", .oid), col("conname", .name), col("connamespace", .oid), col("contype", .pg_internal_char),
     col("condeferrable", .boolean), col("condeferred", .boolean), col("conenforced", .boolean), col("convalidated", .boolean),
     col("conrelid", .oid), col("contypid", .oid), col("conindid", .oid), col("conparentid", .oid),
-    col("confrelid", .oid), col("confupdtype", .text), col("confdeltype", .text), col("confmatchtype", .text),
+    col("confrelid", .oid), col("confupdtype", .pg_internal_char), col("confdeltype", .pg_internal_char), col("confmatchtype", .pg_internal_char),
     col("conperiod", .boolean), col("conislocal", .boolean),
 };
 const pg_depend_columns = [_]ViewColumn{
@@ -476,7 +476,7 @@ const pg_subscription_columns = [_]ViewColumn{
 const pg_roles_columns = [_]ViewColumn{ col("rolname", .name), col("rolsuper", .boolean), col("rolinherit", .boolean), col("rolcreaterole", .boolean), col("rolcreatedb", .boolean), col("rolcanlogin", .boolean), col("rolreplication", .boolean), col("rolconnlimit", .int4), col("rolpassword", .text), col("rolvaliduntil", .timestamptz), col("rolbypassrls", .boolean), col("rolconfig", text_array), col("oid", .oid) };
 const pg_authid_columns = [_]ViewColumn{ col("oid", .oid), col("rolname", .name), col("rolsuper", .boolean), col("rolinherit", .boolean), col("rolcreaterole", .boolean), col("rolcreatedb", .boolean), col("rolcanlogin", .boolean), col("rolreplication", .boolean), col("rolbypassrls", .boolean), col("rolconnlimit", .int4), col("rolpassword", .text), col("rolvaliduntil", .timestamptz) };
 const pg_auth_members_columns = [_]ViewColumn{ col("oid", .oid), col("roleid", .oid), col("member", .oid), col("grantor", .oid), col("admin_option", .boolean), col("inherit_option", .boolean), col("set_option", .boolean) };
-const pg_policy_columns = [_]ViewColumn{ col("oid", .oid), col("polname", .name), col("polrelid", .oid), col("polcmd", .text), col("polpermissive", .boolean), col("polroles", oid_array), col("polqual", .text), col("polwithcheck", .text) };
+const pg_policy_columns = [_]ViewColumn{ col("oid", .oid), col("polname", .name), col("polrelid", .oid), col("polcmd", .pg_internal_char), col("polpermissive", .boolean), col("polroles", oid_array), col("polqual", .text), col("polwithcheck", .text) };
 const pg_policies_columns = [_]ViewColumn{ col("schemaname", .name), col("tablename", .name), col("policyname", .name), col("permissive", .text), col("roles", name_array), col("cmd", .text), col("qual", .text), col("with_check", .text) };
 const pg_description_columns = [_]ViewColumn{ col("objoid", .oid), col("classoid", .oid), col("objsubid", .int4), col("description", .text) };
 const pg_shdescription_columns = [_]ViewColumn{ col("objoid", .oid), col("classoid", .oid), col("description", .text) };

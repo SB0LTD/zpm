@@ -639,6 +639,11 @@ pub fn Eval(comptime config: types.Config) type {
                     const visible = hook.relation_visible orelse return error.UnsupportedStatement;
                     return if (visible(hook.ptr, @intCast(first.integer))) |found| boolCell(found) else .null_value;
                 },
+                .pg_function_is_visible => {
+                    const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
+                    const visible = hook.function_visible orelse return error.UnsupportedStatement;
+                    return if (visible(hook.ptr, @intCast(first.integer))) |found| boolCell(found) else .null_value;
+                },
                 .to_regtype, .regtype_in => {
                     if (types.typeByName(first.text.slice())) |data_type| return .{ .integer = types.typeOid(data_type) };
                     if (n.func == .to_regtype) return .null_value;
@@ -1625,7 +1630,7 @@ pub fn Eval(comptime config: types.Config) type {
                 .lo_truncate, .lo_truncate64, .lo_from_bytea, .lo_get, .lo_create, .lo_creat, .lo_unlink, .lo_import, .lo_export => unreachable,
                 .current_database, .current_schema, .current_schemas, .pg_encoding_to_char, .to_regtype, .to_regclass, .to_regproc, .format_type, .pg_get_expr, .regclass_in, .regtype_in, .regclass_out, .regtype_out,
                 .to_regnamespace, .regnamespace_in, .regnamespace_out,
-                .acldefault, .pg_get_userbyid, .pg_tablespace_location, .pg_table_is_visible, .pg_get_indexdef, .pg_get_constraintdef, .pg_get_triggerdef, .pg_get_ruledef, .pg_get_viewdef, .pg_get_statisticsobjdef_columns, .pg_relation_is_publishable, .pg_get_partkeydef => return catalogValue(ctx, n),
+                .acldefault, .pg_get_userbyid, .pg_tablespace_location, .pg_table_is_visible, .pg_function_is_visible, .pg_get_indexdef, .pg_get_constraintdef, .pg_get_triggerdef, .pg_get_ruledef, .pg_get_viewdef, .pg_get_statisticsobjdef_columns, .pg_relation_is_publishable, .pg_get_partkeydef => return catalogValue(ctx, n),
                 .pg_get_function_arguments, .pg_get_function_identity_arguments, .pg_get_function_result, .pg_get_function_sqlbody => return functionCatalogValue(ctx, n),
                 .pg_partition_ancestors, .array_subquery => return error.UnsupportedStatement,
                 .obj_description, .col_description, .shobj_description, .current_user, .session_user => return objectText(ctx, n),

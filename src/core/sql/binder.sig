@@ -1766,6 +1766,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "pg_typeof", .func = .pg_typeof },
                 .{ .name = "pg_get_serial_sequence", .func = .pg_get_serial_sequence },
                 .{ .name = "pg_table_is_visible", .func = .pg_table_is_visible },
+                .{ .name = "pg_function_is_visible", .func = .pg_function_is_visible },
                 .{ .name = "acldefault", .func = .acldefault },
             };
             for (table) |entry| if (types.same(name.slice(), entry.name)) return entry.func;
@@ -2990,7 +2991,7 @@ pub fn Binder(comptime config: types.Config) type {
                     try bindSignature(context, n, &[_]ast.Type{ .pg_internal_char, .oid }, types.arrayType(.aclitem).?, true);
                     n.constant = false;
                 },
-                .pg_table_is_visible => {
+                .pg_table_is_visible, .pg_function_is_visible => {
                     try bindSignature(context, n, &[_]ast.Type{.oid}, .boolean, true);
                     n.constant = false;
                 },
@@ -6161,7 +6162,14 @@ pub fn Binder(comptime config: types.Config) type {
                 .exists_subquery => .{ .name = "exists", .strength = 2 },
                 .nullif => .{ .name = "nullif", .strength = 2 },
                 .at_zone => .{ .name = "timezone", .strength = 2 },
-                .case_expr => .{ .name = "case", .strength = 1 },
+                // FigureColnameInternal: a named ELSE result names the CASE.
+                .case_expr => blk: {
+                    if (n.c != none) {
+                        const inner = figure(context, n.c, buffer);
+                        if (inner.strength > 1) break :blk inner;
+                    }
+                    break :blk .{ .name = "case", .strength = 1 };
+                },
                 .cast => blk: {
                     if (n.flat_record_cast and context.node(n.a).kind == .row_constructor)
                         break :blk .{ .name = "row", .strength = 2 };

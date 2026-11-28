@@ -45,7 +45,7 @@ fn catalog(db: *DB) ![5]i64 {
     try db.execute("SELECT oid,typarray,typrelid,typowner,typnamespace,typlen,typcategory,typinput FROM pg_type WHERE typname='Point' AND typtype='c'", &result);
     try check(result.row_count == 1 and result.column_count == 8 and result.rows[0].cells[5].integer == -1);
     const cells = &result.rows[0].cells;
-    try check(equal(cells[6].text.slice(), "C") and equal(cells[7].text.slice(), "record_in"));
+    try check(cells[6].pg_internal_char == 'C' and equal(cells[7].text.slice(), "record_in"));
     const identity = [5]i64{ cells[0].integer, cells[1].integer, cells[2].integer, cells[3].integer, cells[4].integer };
     try check(identity[0] >= sql.change_records.first_oid and identity[1] > identity[0] and identity[2] > identity[1]);
     try check(identity[3] != 10 and identity[4] != 2200);

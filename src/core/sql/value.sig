@@ -148,6 +148,9 @@ pub const SequenceHook = struct {
     serial_sequence: ?*const fn (ptr: *anyopaque, table: []const u8, column: []const u8, out: *[serial_name_bytes]u8) Error!?usize = null,
     /// Visibility of an existing relation in the owning catalog snapshot.
     relation_visible: ?*const fn (ptr: *anyopaque, oid: u32) ?bool = null,
+    /// pg_function_is_visible: a routine of that OID visible on the path
+    /// (null: no such routine).
+    function_visible: ?*const fn (ptr: *anyopaque, oid: u32) ?bool = null,
     /// Index definition or one index attribute in the owning snapshot.
     index_definition: ?*const fn (ptr: *anyopaque, oid: u32, column: i32, pretty: bool, out: []u8) Error!?usize = null,
     constraint_definition: ?*const fn (ptr: *anyopaque, oid: u32, pretty: bool, out: []u8) Error!?usize = null,
