@@ -163,7 +163,7 @@ pub fn XmlEval(comptime config: types.Config, comptime E: type) type {
                     try out.add(try Io.format(&cell, false, ctx.session, &buffer));
                 },
                 .string => |text| try tree.escapeText(text, out),
-                .nodes => unreachable,
+                .nodes => return error.UnsupportedStatement,
             }
         }
 
@@ -331,7 +331,7 @@ pub fn XmlEval(comptime config: types.Config, comptime E: type) type {
             return out[0..ident.len];
         }
 
-        const Column = struct { compiled: xpath.Compiled = undefined, ordinality: bool = false };
+        const Column = struct { compiled: ?xpath.Compiled, ordinality: bool };
 
         /// The rows of XMLTABLE node `id` (nodeTableFuncscan.c with
         /// xml.c's XmlTable* routines): a NULL document gives no rows; then
@@ -389,7 +389,7 @@ pub fn XmlEval(comptime config: types.Config, comptime E: type) type {
                 if (node(ctx, member).func == .xmltable_column) declared += 1;
             }
             const columns = try s.take(Column, declared);
-            for (columns) |*column| column.* = .{};
+            for (columns) |*column| column.* = .{ .compiled = null, .ordinality = false };
             const cells = try s.take(V.Cell, declared);
             var column_count: usize = 0;
             member = table.b;
@@ -461,7 +461,7 @@ pub fn XmlEval(comptime config: types.Config, comptime E: type) type {
             const mark = s.mark();
             defer s.release(mark);
             var storage = space(s);
-            var xctx: xpath.Context = .{ .tree = parsed, .space = &storage, .path = &column.compiled, .bindings = bindings, .control = ctx.session.control };
+            var xctx: xpath.Context = .{ .tree = parsed, .space = &storage, .path = &column.compiled.?, .bindings = bindings, .control = ctx.session.control };
             const result = try xpath.evaluate(&xctx, row_node);
             var out: tree.Out = .{ .bytes = storage.bytes[storage.used..] };
             var number_buffer: [64]u8 = undefined;
@@ -509,10 +509,12 @@ pub fn XmlEval(comptime config: types.Config, comptime E: type) type {
 
         // ---- SQL/XML table mapping ---------------------------------------------------
 
+        /// No defaults: a slice default cannot be lowered by the native SB0
+        /// backend.
         const Options = struct {
-            nulls: bool = false,
-            tableforest: bool = false,
-            targetns: []const u8 = "",
+            nulls: bool,
+            tableforest: bool,
+            targetns: []const u8,
         };
 
         /// map_sql_identifier_to_xml_name: ':' (anywhere when fully
@@ -1340,7 +1342,7 @@ pub fn XmlEval(comptime config: types.Config, comptime E: type) type {
                         return wideCell(ctx, .xml, data.slice());
                     }
                 },
-                else => unreachable,
+                else => return error.UnsupportedStatement,
             }
             return wideCell(ctx, .xml, w.slice());
         }

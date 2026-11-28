@@ -1,5 +1,72 @@
 # SQL conformance TDD checkpoint
 
+## SQL/XML (lane B11 wave 5, xml) — 28 November 2026
+
+Branch `w5/xml` replaces libxml2 with pure Sig and closes the open SQL/XML
+features. `contract-sql-xml` (tests/test_sql_xml.sig) checks values, result
+OIDs, typmods and names, exact SQLSTATEs with statement atomicity, Config
+capacities, work budgets and cancellation, and change-record replay. Its
+expectations are native PostgreSQL 18.7 output, generated, never edited by
+hand. Separate differential batteries were also run: 499 XPath
+expressions all match native PostgreSQL 18.7. Of 235 SQL statements, all
+match except three: a set-returning call under a cast in a select list
+and constant folding of an unused `DEFAULT 1/0` (both general engine
+behavior), and a DTD default attribute under INDENT.
+
+- **XML tree** (xml_tree.sig): what libxml2 2.9 builds for PostgreSQL.
+  Line ends are normalized and references decoded. Character data is merged
+  into one text node per run; CDATA sections, comments, processing
+  instructions and the DOCTYPE are kept. Namespaces resolve with libxml2's
+  errors, which XPath and XMLTABLE reject as 2200M: an undeclared prefix, a
+  URI that is not RFC 3986, reserved prefixes, an empty prefixed namespace,
+  duplicate expanded attributes.
+- **Serialization**: a node copy written as xmlCopyNode + xmlNodeDump
+  writes it, with namespace declarations reconciled and character
+  references in attribute values. XMLSERIALIZE ... INDENT follows libxml2's
+  NOBLANKS heuristic, xml:space, its formatting rules and its escaping.
+- **XPath 1.0** (xpath.sig): every axis, name and node-type tests,
+  predicates with proximity positions, and the core function library. It
+  follows libxml2's grammar quirks, number parsing and formatting, and its
+  substring and round rules; id() uses xml:id.
+- **Functions**: xpath() and xpath_exists(), with namespace arrays (22000,
+  22004, XX000); XMLEXISTS with PASSING BY REF / BY VALUE; IS [NOT]
+  DOCUMENT. xml_is_well_formed follows xmloption. XMLAGG works without
+  ORDER BY.
+- **XMLTABLE** in FROM: XMLNAMESPACES, PATH, DEFAULT, NOT NULL and FOR
+  ORDINALITY, with PostgreSQL's parse-time (42601) and run-time (22004,
+  10608, 21000, 0A000) errors. It is lateral and set-returning.
+- **Table mapping**: table_to_xml, query_to_xml, cursor_to_xml,
+  schema_to_xml and database_to_xml, their XML Schema forms and the
+  `_and_xmlschema` forms. They cover nulls (absent or xsi:nil), table forest
+  or element, target namespace, data mapping and name mapping. The xmlbinary
+  setting (base64 with CRLF every 72 characters, or hex) also applies to
+  XMLELEMENT and XMLFOREST. Queries run nested in the running statement,
+  read-only, under its snapshot: a write or utility statement is 0A000 and
+  an empty one 22000.
+- **Storage and work control**: Config.xml_nodes, xpath_nodes, xpath_depth
+  and xml_bytes size one Database scratch region. It is used in stack order,
+  so XPath inside an XMLTABLE DEFAULT or a mapping query works. Going over a
+  capacity is 54000. Every node visit is a work checkpoint.
+
+Deviations kept on purpose:
+
+- Wide XML results (beyond Config.text_bytes) are large values. Without
+  bound result value memory they are 54000, so X047's 860-byte schema fails
+  the 512-byte features gate configuration.
+- Mapping functions list every table without a privilege filter
+  (has_table_privilege is not available).
+- A DTD's default attributes are not applied by INDENT.
+- Non-ASCII characters count as XML name characters in name mapping.
+
+Not done: X014 needs composite-type values (ROW(...)::type, composite
+columns, (expr).field). X410 waits for the ddl-alter lane's ALTER COLUMN
+TYPE: text -> xml USING x::xml and the implicit xml -> text already
+behave as in PostgreSQL.
+
+New SQLSTATE mappings: 10608 (InvalidArgumentForXquery) and XX000
+(InternalError). Change records: no new op, value tag or format; XML
+results store as ordinary xml (value tag 27).
+
 ## Integrated wave-4 reassessment — qualification pending, 27 November 2026
 
 Stronger local plain/custom stock archive fixtures found stored view SQL tied

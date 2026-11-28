@@ -607,15 +607,20 @@ pub fn compile(text: []const u8, bindings: []const Binding, exprs: []Expr, depth
 
 // ---- numbers ----------------------------------------------------------------
 
+/// pow(10.0, exponent), correctly rounded as glibc returns it: exact up
+/// to 1e22, else the nearest double of "1e<exponent>".
 fn pow10(exponent: i32) f64 {
-    var result: f64 = 1;
-    var base: f64 = 10;
-    var rest: u32 = @intCast(if (exponent < 0) -exponent else exponent);
-    while (rest != 0) : (rest >>= 1) {
-        if (rest & 1 != 0) result *= base;
-        base *= base;
+    const magnitude: u32 = @intCast(if (exponent < 0) -exponent else exponent);
+    if (magnitude <= 22) {
+        var exact: f64 = 1;
+        for (0..magnitude) |_| exact *= 10;
+        return if (exponent < 0) 1 / exact else exact;
     }
-    return if (exponent < 0) 1 / result else result;
+    if (exponent > 400) return infinity;
+    if (exponent < -400) return 0;
+    var buffer: [16]u8 = undefined;
+    const text = std.fmt.bufPrint(&buffer, "1e{d}", .{exponent}) catch return nan;
+    return std.fmt.parseFloat(f64, text) catch nan;
 }
 
 /// The digits libxml2's number parsers accept at `at.*` (xmlXPathCompNumber

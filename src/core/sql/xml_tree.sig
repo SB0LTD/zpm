@@ -669,7 +669,7 @@ pub fn nodeBound(text: []const u8) usize {
             else => {},
         }
     }
-    return markup + equals + runs + 2 + markup * (declarations + 1);
+    return markup +| equals +| runs +| 2 +| markup *| (declarations +| 1);
 }
 
 pub const Options = struct {
