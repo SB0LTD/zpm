@@ -3884,7 +3884,8 @@ pub fn Binder(comptime config: types.Config) type {
                     } else {
                         if (common == .unknown) common = .text;
                         n.b = try convertList(context, n.b, common);
-                        n.ty = types.arrayType(common) orelse return error.UndefinedObject;
+                        // Arrays of composite values are not provided (composite lane).
+                        n.ty = types.arrayType(common) orelse return if (common == .record) error.UnsupportedStatement else error.UndefinedObject;
                     }
                     n.constant = listConstant(context, n.b);
                 },
@@ -4033,7 +4034,7 @@ pub fn Binder(comptime config: types.Config) type {
                     if (element == .unknown) return error.TypeMismatch;
                     if (types.isArray(element)) return error.UndefinedObject;
                     try convertTail(context, n.b, types.arrayType(.int4).?, .implicit);
-                    n.ty = types.arrayType(element) orelse return error.UndefinedObject;
+                    n.ty = types.arrayType(element) orelse return if (element == .record) error.UnsupportedStatement else error.UndefinedObject;
                     n.constant = listConstant(context, n.b);
                 },
                 .string_to_array => {
@@ -8200,7 +8201,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .scalar_subquery => {
                     if (n.func == .array_subquery) {
                         if (plan.tys[0] == .unknown) try castColumn(context, plan_id, 0, .text);
-                        n.ty = if (types.isArray(plan.tys[0])) plan.tys[0] else types.arrayType(plan.tys[0]) orelse return error.UndefinedObject;
+                        n.ty = if (types.isArray(plan.tys[0])) plan.tys[0] else types.arrayType(plan.tys[0]) orelse return if (plan.tys[0] == .record) error.UnsupportedStatement else error.UndefinedObject;
                     } else {
                         n.ty = plan.tys[0];
                         n.typmod = plan.typmods[0];
@@ -12765,7 +12766,7 @@ pub fn Binder(comptime config: types.Config) type {
             for (0..plan.count) |index| {
                 const typmod = if (plan.typmods[index] == ast.mysql_unsigned_sum_typmod) -1 else plan.typmods[index];
                 // PostgreSQL: column has pseudo-type record (42P16).
-                if (types.pseudoRecord(plan.tys[index])) return error.InvalidTableDefinition;
+                if (types.pseudoColumn(plan.tys[index], plan.typmods[index])) return error.InvalidTableDefinition;
                 var column: V.Column = .{ .name = plan.names[index], .data_type = dataType(plan.tys[index]), .typmod = typmod };
                 if (index < create.column_count) column.name = toName(context, create.columns[index]);
                 for (out.columns[0..index]) |*previous| if (types.same(previous.name.slice(), column.name.slice())) return error.DuplicateColumn;
@@ -12917,7 +12918,7 @@ pub fn Binder(comptime config: types.Config) type {
             for (0..plan.count) |index| {
                 const typmod = if (plan.typmods[index] == ast.mysql_unsigned_sum_typmod) -1 else plan.typmods[index];
                 // PostgreSQL: column has pseudo-type record (42P16).
-                if (types.pseudoRecord(plan.tys[index])) return error.InvalidTableDefinition;
+                if (types.pseudoColumn(plan.tys[index], plan.typmods[index])) return error.InvalidTableDefinition;
                 var column: V.Column = .{ .name = plan.names[index], .data_type = dataType(plan.tys[index]), .typmod = typmod };
                 if (index < create.as_column_count) column.name = toName(context, create.as_columns[index]);
                 for (out.columns[0..index]) |*previous| if (types.same(previous.name.slice(), column.name.slice())) return error.DuplicateColumn;

@@ -5593,13 +5593,25 @@ pub fn Exec(comptime config: types.Config) type {
                         for (definition.search_columns[0..definition.search_count]) |column| try appendKeyCell(&key, &row_cells[column]);
                         row_cells[definition.ord_key_column] = .{ .text = key };
                         if (!with_ord) {} else if (definition.breadth) {
-                            var text: V.Text = .{};
-                            try self.recordText(&text, row_cells, definition.search_columns[0..definition.search_count], depth);
-                            row_cells[definition.ord_column] = .{ .text = text };
+                            row_cells[definition.ord_column] = try self.breadthRecord(definition, row_cells, depth);
                         } else try self.recordPath(definition, row_cells, parent, definition.ord_column, definition.search_columns[0..definition.search_count]);
                     }
                     if (seed) row_cells[link] = .null_value;
                 }
+            }
+
+            /// BREADTH FIRST's sequence value: an anonymous record of the
+            /// depth (bigint) and the search columns (a record cell, B11
+            /// wave 5 composite lane).
+            noinline fn breadthRecord(self: *Query, definition: *const B.CteDef, row_cells: []const V.Cell, depth: i64) Error!V.Cell {
+                const tys = &self.plans.items[definition.plan].tys;
+                var out: V.Text = .{};
+                var builder = try V.Records.Builder.begin(&out, types.record_oid);
+                try builder.append(.integer, -1, &.{ .integer = depth });
+                for (definition.search_columns[0..definition.search_count]) |column| {
+                    try builder.append(types.dataTypeOf(tys[column]), -1, &row_cells[column]);
+                }
+                return .{ .record = out };
             }
 
             /// A record[] path value: the parent's elements, then this row's
