@@ -1995,7 +1995,10 @@ pub fn Rows(comptime config: types.Config) type {
                                     trigger_instead => "INSTEAD OF",
                                     else => "AFTER",
                                 }),
-                                .null_value, .null_value, .null_value, .null_value, .null_value,
+                                // REFERENCING OLD / NEW TABLE names (T212).
+                                if (trigger.old_table.len != 0) try self.text(trigger.old_table.slice()) else .null_value,
+                                if (trigger.new_table.len != 0) try self.text(trigger.new_table.slice()) else .null_value,
+                                .null_value, .null_value, .null_value,
                             });
                         }
                     }

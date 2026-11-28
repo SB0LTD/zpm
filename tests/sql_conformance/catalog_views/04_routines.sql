@@ -35,3 +35,7 @@ CREATE SEQUENCE s1 START 5 INCREMENT 2;
 CREATE SEQUENCE s2 AS SMALLINT MINVALUE -10 MAXVALUE 100 CYCLE;
 CREATE SEQUENCE s3 AS INTEGER INCREMENT -1;
 SELECT * FROM information_schema.sequences ORDER BY sequence_name;
+CREATE TRIGGER trt AFTER UPDATE ON t REFERENCING OLD TABLE AS old_rows NEW TABLE AS new_rows FOR EACH STATEMENT EXECUTE FUNCTION tf();
+CREATE TRIGGER tri AFTER INSERT ON t REFERENCING NEW TABLE AS added FOR EACH ROW EXECUTE FUNCTION tf();
+CREATE CONSTRAINT TRIGGER ctr AFTER INSERT ON t DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION tf();
+SELECT trigger_name, event_manipulation, action_order, action_statement, action_orientation, action_timing, action_reference_old_table, action_reference_new_table FROM information_schema.triggers WHERE event_object_table = 't' ORDER BY trigger_name, event_manipulation;

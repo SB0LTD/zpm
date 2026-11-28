@@ -114,7 +114,10 @@ CHECK constraints (`table_constraints`, `check_constraints`,
 automatically updatable view chain, unconditional INSTEAD rules) and the
 INSTEAD OF trigger flags; `columns.is_updatable` follows
 pg_column_is_updatable. `routines` and `parameters` cover user routines
-(modes, typed `parameter_default`) and the built-ins pg_proc lists.
+(modes, typed `parameter_default`, `security_type` DEFINER / INVOKER) and
+the built-ins pg_proc lists. `triggers` reports the REFERENCING transition
+table names (routines-trig lane) in `action_reference_old_table` /
+`action_reference_new_table`.
 `sql_features`, `sql_implementation_info`, `sql_parts` and `sql_sizing` hold
 PostgreSQL 18's rows in physical order, PostgreSQL's own `is_supported`
 values included; DBMS VERSION is `16.00.0000` (the wire's server_version
