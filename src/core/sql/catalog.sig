@@ -73,6 +73,12 @@ pub const View = enum(u8) { pg_type, pg_namespace, pg_class, pg_attribute, pg_in
     user_mappings, view_column_usage, view_routine_usage, view_table_usage, views,
     _pg_foreign_data_wrappers, _pg_foreign_servers, _pg_foreign_table_columns, _pg_foreign_tables, _pg_user_mappings };
 
+/// The server_version the PostgreSQL wire reports (src/db/store.sig) and
+/// version()'s text: PostgreSQL's format with this build's target.
+pub const server_version = "16.0";
+pub const version_text = "PostgreSQL " ++ server_version ++ " on " ++ @tagName(@import("builtin").cpu.arch) ++ "-" ++
+    @tagName(@import("builtin").os.tag) ++ ", compiled by Sig, " ++ (if (@sizeOf(usize) == 8) "64-bit" else "32-bit");
+
 pub const sql_language_oid: u32 = 14;
 pub const plpgsql_language_oid: u32 = 13002;
 
@@ -348,6 +354,8 @@ const pg_constraint_columns = [_]ViewColumn{
     col("conrelid", .oid), col("contypid", .oid), col("conindid", .oid), col("conparentid", .oid),
     col("confrelid", .oid), col("confupdtype", .pg_internal_char), col("confdeltype", .pg_internal_char), col("confmatchtype", .pg_internal_char),
     col("conperiod", .boolean), col("conislocal", .boolean),
+    // B11 wave 5: the constrained and referenced columns (attnums).
+    col("conkey", types.arrayType(.int2).?), col("confkey", types.arrayType(.int2).?),
 };
 const pg_depend_columns = [_]ViewColumn{
     col("classid", .oid), col("objid", .oid), col("objsubid", .int4),

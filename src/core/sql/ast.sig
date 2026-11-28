@@ -205,8 +205,8 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     // column (`name`, type in cast_type / typmod, `a` PATH, `b` DEFAULT,
     // `integer` an XmlTableColumn). Exec reads the table's members.
     xml_call, xmltable, xmltable_namespace, xmltable_column,
-    // pg_function_is_visible(oid) (B11 wave 5 catalog lane).
-    pg_function_is_visible };
+    // pg_function_is_visible(oid) and version() (B11 wave 5 catalog lane).
+    pg_function_is_visible, version };
 
 /// xml_call variants (xml_eval.sig).
 pub const XmlFn = enum(u8) {
@@ -337,7 +337,7 @@ pub fn strictFunction(func: Func) bool {
         .to_char, .round, .abs, .ceil, .floor, .trunc, .sign, .sqrt, .jsonb_typeof, .jsonb_array_length,
         .nextval, .currval, .setval, .lastval, .identity_next, .lo_create, .lo_creat, .lo_unlink, .lo_from_bytea, .lo_get, .lo_truncate, .lo_truncate64, .lo_import, .lo_export,
         .now, .transaction_timestamp, .statement_timestamp, .clock_timestamp,
-        .current_timestamp, .current_date, .current_database, .current_schema, .current_schemas, .pg_encoding_to_char,
+        .current_timestamp, .current_date, .current_database, .current_schema, .current_schemas, .pg_encoding_to_char, .version,
         .to_regtype, .to_regclass, .to_regproc, .pg_get_expr, .acldefault, .pg_get_userbyid, .pg_tablespace_location,
         .pg_get_function_arguments, .pg_get_function_identity_arguments, .pg_get_function_result, .pg_get_function_sqlbody,
         .pg_advisory_lock, .pg_advisory_lock_shared, .pg_advisory_xact_lock, .pg_advisory_xact_lock_shared,

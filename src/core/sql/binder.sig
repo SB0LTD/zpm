@@ -1569,6 +1569,7 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "lo_truncate", .func = .lo_truncate },
                 .{ .name = "lo_truncate64", .func = .lo_truncate64 },
                 .{ .name = "current_database", .func = .current_database },
+                .{ .name = "version", .func = .version },
                 .{ .name = "current_schemas", .func = .current_schemas },
                 .{ .name = "pg_encoding_to_char", .func = .pg_encoding_to_char },
                 .{ .name = "current_schema", .func = .current_schema },
@@ -2777,6 +2778,10 @@ pub fn Binder(comptime config: types.Config) type {
                 .current_database, .current_schema => {
                     if (count != 0) return error.UndefinedFunction;
                     n.ty = .name;
+                },
+                .version => {
+                    if (count != 0) return error.UndefinedFunction;
+                    n.ty = .text;
                 },
                 .current_schemas => {
                     try bindSignature(context, n, &.{.boolean}, types.arrayType(.name).?, true);

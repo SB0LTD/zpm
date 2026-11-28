@@ -8781,11 +8781,11 @@ pub fn Database(comptime config: Config) type {
                     .pg_constraint => {
                         const primary = if (S.primaryConstraint(table)) |position| &table.constraints[position] else null;
                         if (table.primary_constraint_oid != 0) {
-                            try self.constraintRow(sink, table, table.primary_constraint_oid, pkey.slice(), primary, .primary, snapshot);
+                            try self.constraintRow(sink, table, table.primary_constraint_oid, pkey.slice(), primary, .primary, snapshot, pool);
                         }
                         for (table.constraints[0..table.constraint_count]) |*constraint| {
                             if (constraint.kind == .primary) continue;
-                            try self.constraintRow(sink, table, constraint.oid, constraint.name.slice(), constraint, constraint.kind, snapshot);
+                            try self.constraintRow(sink, table, constraint.oid, constraint.name.slice(), constraint, constraint.kind, snapshot, pool);
                         }
                     },
                     .pg_indexes => {
@@ -8968,7 +8968,47 @@ pub fn Database(comptime config: Config) type {
             return switch (action) { .no_action => "NO ACTION", .restrict => "RESTRICT", .cascade => "CASCADE", .set_null => "SET NULL", .set_default => "SET DEFAULT" };
         }
 
-        fn constraintRow(self: *const Self, sink: *X.RowSink, table: *const S.Table, oid: u32, name: []const u8, constraint: ?*const S.Constraint, kind: S.ConstraintKind, snapshot: Snapshot) Error!void {
+        /// An int2[] of attnums (pg_constraint.conkey / confkey).
+        fn attnumArray(columns: []const u8) Error!V.Cell {
+            var out: V.Text = .{};
+            var shape: array_module.Shape = .{ .element = .smallint, .ndim = 1 };
+            shape.dims[0] = @intCast(columns.len);
+            var writer = try V.Arrays.Writer.begin(&out, &shape);
+            for (columns) |column| try writer.append(&intCell(@as(i64, column) + 1));
+            return .{ .array = out };
+        }
+
+        /// The columns a CHECK expression names, each once in order of
+        /// first appearance (StoreRelCheck's pull_var_clause), parsed into
+        /// the pool above its live nodes.
+        fn checkColumns(table: *const S.Table, source: []const u8, pool: *A.Pool, out: *[config.columns]u8) []const u8 {
+            const node_len = pool.len;
+            const query_len = pool.query_len;
+            const window_len = pool.window_len;
+            const complex = pool.complex;
+            defer {
+                pool.len = node_len;
+                pool.query_len = query_len;
+                pool.window_len = window_len;
+                pool.complex = complex;
+            }
+            _ = P.parseExpression(source, pool) catch return out[0..0];
+            var count: usize = 0;
+            for (pool.nodes[node_len..pool.len]) |*node| {
+                if (node.kind != .column or node.star) continue;
+                const wanted = identName(source, node.name);
+                for (table.columns[0..table.column_count], 0..) |*column, index| {
+                    if (!types.same(column.name.slice(), wanted.slice())) continue;
+                    if (std.mem.indexOfScalar(u8, out[0..count], @intCast(index)) != null) break;
+                    out[count] = @intCast(index);
+                    count += 1;
+                    break;
+                }
+            }
+            return out[0..count];
+        }
+
+        fn constraintRow(self: *const Self, sink: *X.RowSink, table: *const S.Table, oid: u32, name: []const u8, constraint: ?*const S.Constraint, kind: S.ConstraintKind, snapshot: Snapshot, pool: *A.Pool) Error!void {
             const label: u8 = switch (kind) { .check => 'c', .unique => 'u', .primary => 'p', .foreign => 'f', .exclusion => 'x' };
             const deferrable = if (constraint) |item| item.deferrable else false;
             const deferred = if (constraint) |item| item.initially_deferred else false;
@@ -8976,6 +9016,12 @@ pub fn Database(comptime config: Config) type {
             const enforced = if (constraint) |item| !item.not_enforced else true;
             const foreign = if (kind == .foreign) constraint else null;
             const index = if (kind == .primary) S.primaryIndexOid(table) else if (foreign) |item| self.referencedConstraintIndex(item, snapshot) else 0;
+            var key_buffer: [config.columns]u8 = undefined;
+            const keys: []const u8 = switch (kind) {
+                .primary => primaryColumns(table, &key_buffer),
+                .check => if (constraint) |item| checkColumns(table, item.expression.slice(), pool, &key_buffer) else key_buffer[0..0],
+                else => if (constraint) |item| item.keyColumns() else key_buffer[0..0],
+            };
             try sink.add(&.{
                 intCell(oid), nameCell(name), intCell(table.namespace), .{ .pg_internal_char = label },
                 boolCell(deferrable), boolCell(deferred), boolCell(enforced), boolCell(validated),
@@ -8985,6 +9031,7 @@ pub fn Database(comptime config: Config) type {
                 .{ .pg_internal_char = if (foreign) |item| foreignActionCode(item.on_delete)[0] else ' ' },
                 .{ .pg_internal_char = if (foreign != null) 's' else ' ' }, boolCell(false),
                 boolCell(kind != .check or self.checkConstraintIsLocal(table, name, snapshot)),
+                try attnumArray(keys), if (foreign) |item| try attnumArray(item.refColumns()) else .null_value,
             });
         }
 
