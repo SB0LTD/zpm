@@ -232,6 +232,24 @@ pub const StatementOptions = struct {
     /// The statement runs in an implicit (autocommit) transaction: LOCK
     /// TABLE and DECLARE without WITH HOLD are 25P01 there.
     implicit: bool = false,
+    /// The caller runs the statement non-atomically (PostgreSQL's top-level
+    /// CALL / DO outside a transaction block, B11 wave 5 proc-tx): a
+    /// procedure's COMMIT / ROLLBACK ends the transaction through it in the
+    /// middle of the statement. Null: transaction control is 2D000 (0A000
+    /// for an implicit statement whose caller cannot end it).
+    transaction_control: ?TransactionControl = null,
+};
+
+/// Ends the running statement's transaction for a COMMIT / ROLLBACK inside a
+/// procedure or DO block (B11 wave 5, proc-tx). `end` commits transaction
+/// `slot` as the caller commits any (deferred checks, its change record
+/// written, synced and published) or aborts it; the slot is inactive
+/// afterwards either way, and an error means the transaction rolled back.
+/// The engine then begins the next transaction in the same slot and the
+/// statement continues in it.
+pub const TransactionControl = struct {
+    context: *anyopaque,
+    end: *const fn (context: *anyopaque, slot: u16, commit: bool) Error!void,
 };
 
 pub fn Database(comptime config: Config) type {
@@ -2118,6 +2136,21 @@ pub fn Database(comptime config: Config) type {
         /// Settings saved by routines with SET clauses, one per nesting
         /// level (kept off the stack).
         routine_saved: [config.routine_depth]Sess.Values = undefined,
+        /// Transaction control inside procedures (B11 wave 5, proc-tx): the
+        /// running statement's caller hook (StatementOptions), how many
+        /// transactions a COMMIT / ROLLBACK inside it ended (a lock wait
+        /// after one fails instead of re-running the statement), the
+        /// EXCEPTION blocks of every routine on the stack, and whether the
+        /// transaction such a COMMIT began has run no SQL statement yet
+        /// (SET TRANSACTION may still change its isolation level).
+        statement_control: ?TransactionControl = null,
+        call_commits: u32 = 0,
+        /// While such a CALL / DO runs, routine versions it may still read
+        /// (its own body among them) are not reclaimed past the csn it
+        /// started at.
+        call_object_horizon: ?u64 = null,
+        routine_atomic: usize = 0,
+        routine_fresh_transaction: bool = false,
         /// Write-set index where the running statement's writes begin (its
         /// AFTER ROW triggers read them); kept across a park.
         statement_start: usize = 0,
@@ -2649,6 +2682,12 @@ pub fn Database(comptime config: Config) type {
             self.nested_depth = 0;
             self.nested_ran = false;
             self.routine_volatility = 0;
+            // proc-tx (wave 5): never copy the caller's transaction hook.
+            self.statement_control = null;
+            self.call_commits = 0;
+            self.call_object_horizon = null;
+            self.routine_atomic = 0;
+            self.routine_fresh_transaction = false;
             // Per-statement state added in wave 4: a copy starts with none
             // of it, as a fresh database does (Debug leaves undefined bytes).
             self.family_root = null;
@@ -3411,13 +3450,27 @@ pub fn Database(comptime config: Config) type {
                 tx.sub_len += 1;
             }
             self.statement_implicit = options.implicit;
+            self.statement_control = options.transaction_control;
+            self.call_commits = 0;
+            self.routine_atomic = 0;
+            self.routine_fresh_transaction = false;
+            // Other entry points (COPY rows, detached reads) never see them.
+            defer {
+                self.statement_control = null;
+                self.call_commits = 0;
+                self.call_object_horizon = null;
+            }
             tx.running_snap = snap;
             defer tx.running_snap = null;
-            const start = tx.subs[tx.sub_len - 1].write_start;
+            var start = tx.subs[tx.sub_len - 1].write_start;
             self.statementHooks(slot, snap);
             self.routine_result = result;
             self.statement_start = start;
             const ran = if (routine) self.routineBody(slot, source, snap, result) else self.body(slot, source, parsed, snap, result, .{ .mode = options.mode, .explain = top.explain });
+            // A COMMIT / ROLLBACK inside the CALL / DO ended the transaction
+            // the statement began in: it ends in the one begun last, whose
+            // statement scope starts at its first write (proc-tx, wave 5).
+            if (self.call_commits != 0) start = tx.subs[tx.sub_len - 1].write_start;
             ran catch |err| {
                 if (err == error.WouldBlock) {
                     // A nested statement ran (trigger or function SQL): the
@@ -4295,7 +4348,9 @@ pub fn Database(comptime config: Config) type {
                 schema.dead_csn = 0;
                 freed = true;
             };
-            if (self.objects.reclaim(at)) freed = true;
+            // A running CALL / DO that committed keeps the routine versions
+            // it may still read (proc-tx, wave 5).
+            if (self.objects.reclaim(if (self.call_object_horizon) |held| @min(at, held) else at)) freed = true;
             if (freed) _ = self.catalog.vacuum(at);
         }
 
@@ -9572,6 +9627,18 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn park(self: *Self, slot: u16, waits: L.Set) Error {
+            // A CALL / DO whose COMMIT or ROLLBACK already ended a
+            // transaction cannot park: the re-delivered statement would run
+            // the committed part again, and nothing else runs while it
+            // waits. The wait fails at once, as lock_timeout ends one
+            // (55P03; B11 wave 5 proc-tx, docs/SQL_PROC_TX.md).
+            if (self.call_commits != 0) {
+                const tx = &self.txs[slot];
+                tx.waiting_for = .{};
+                tx.fresh = false;
+                self.setTableWait(slot, null);
+                return error.LockNotAvailable;
+            }
             self.txs[slot].waiting_for = waits;
             return error.WouldBlock;
         }
@@ -12382,9 +12449,13 @@ pub fn Database(comptime config: Config) type {
         /// BEGIN / SET TRANSACTION modes with PostgreSQL's check hooks
         /// (25001 after the first query or inside a subtransaction).
         fn applyModes(self: *Self, slot: u16, modes: ast.Characteristics, from_begin: bool) Error!void {
+            return self.applyModesStarted(slot, modes, from_begin, self.txs[slot].snapshot_csn != null);
+        }
+
+        /// `started`: PostgreSQL's FirstSnapshotSet (a query ran).
+        fn applyModesStarted(self: *Self, slot: u16, modes: ast.Characteristics, from_begin: bool, started: bool) Error!void {
             const tx = &self.txs[slot];
             const in_sub = tx.userSavepoints() != 0;
-            const started = tx.snapshot_csn != null;
             const level = levelOf(modes.isolation, tx.isolation);
             if (!from_begin and level != tx.isolation and (started or in_sub)) return error.ActiveSqlTransaction;
             var read_only = tx.read_only;
@@ -13878,16 +13949,134 @@ pub fn Database(comptime config: Config) type {
             self.context_captured = false;
         }
 
-        /// COMMIT / ROLLBACK inside a procedure or DO block (B11 wave 4).
-        /// PostgreSQL forbids it (2D000) inside an explicit transaction
-        /// block, below a function or trigger, inside a block with an
-        /// EXCEPTION clause and in a SECURITY DEFINER routine. Where it is
-        /// allowed it ends the transaction in the middle of the CALL; the
-        /// change-record protocol commits once per statement, so that
-        /// case is 0A000 (docs/SQL_ROUTINES.md).
-        pub fn routineTransaction(self: *Self, atomic: bool) Error!void {
-            if (!self.statement_implicit or self.routine_nested != 0 or atomic or self.routine_definer != null or self.routine_configured != 0) return error.InvalidTransactionTermination;
-            return error.UnsupportedStatement;
+        /// COMMIT / ROLLBACK [AND [NO] CHAIN] inside a procedure or DO block
+        /// (B11 wave 4; wave 5 proc-tx, docs/SQL_PROC_TX.md). PostgreSQL
+        /// forbids it (2D000) inside a transaction block (explicit, or the
+        /// implicit one of a multi-statement Query), below a function,
+        /// trigger or SQL-language routine, inside a block with an EXCEPTION
+        /// clause in any routine on the stack and with a SECURITY DEFINER or
+        /// SET routine on the stack. Where it is allowed (a top-level CALL /
+        /// DO run non-atomically) the caller's TransactionControl ends the
+        /// transaction in the middle of the statement: a COMMIT writes,
+        /// syncs and publishes its own change record. The next transaction
+        /// begins at once in the same slot (the session's default modes, or
+        /// the ended one's with AND CHAIN) and the CALL / DO goes on in it
+        /// as the same statement, its variables intact. A caller that runs
+        /// an implicit statement without a hook cannot end it: 0A000.
+        pub fn routineTransaction(self: *Self, frame: *R.Frame, atomic: bool, commit: bool, chain: bool) Error!void {
+            if (self.routine_nested != 0 or atomic or self.routine_atomic != 0 or self.routine_definer != null or self.routine_configured != 0) return error.InvalidTransactionTermination;
+            const hook = self.statement_control orelse
+                return if (self.statement_implicit) error.UnsupportedStatement else error.InvalidTransactionTermination;
+            const slot = self.routine_slot;
+            if (!self.active(slot)) return error.NoActiveTransaction;
+            // COMMIT first fires the deferred constraint triggers' events in
+            // the transaction it ends (PostgreSQL's AfterTriggerFireDeferred
+            // at each COMMIT in a procedure); a failing one fails the COMMIT
+            // and rolls that transaction back with the statement.
+            if (commit and self.deferredTriggersPending(slot)) _ = try self.routineStatement(frame, "SET CONSTRAINTS ALL IMMEDIATE", null);
+            const modes = if (chain) self.chainCharacteristics(slot, false) else null;
+            if (self.call_object_horizon == null) self.call_object_horizon = if (self.txs[slot].running_snap) |snap| snap.csn else self.csn;
+            self.txs[slot].running_snap = null;
+            // Whatever the outcome the slot is inactive now: the statement
+            // goes on (or unwinds) in a new transaction.
+            const ended = hook.end(hook.context, slot, commit);
+            self.call_commits +%= 1;
+            if (self.call_commits == 0) self.call_commits = 1;
+            try self.continueStatement(slot);
+            try ended;
+            if (modes) |chained| try self.beginModes(slot, chained);
+        }
+
+        /// The transaction a COMMIT / ROLLBACK inside the running CALL / DO
+        /// begins in `slot`: the session's default modes, a statement scope
+        /// from its first write and a new command id and snapshot for the
+        /// routine (and its sequence and catalog lookups).
+        fn continueStatement(self: *Self, slot: u16) Error!void {
+            // reserveTransaction takes the first free slot: the free ones
+            // before `slot` are hidden from it for the call.
+            var hidden: L.Set = .{};
+            for (self.txs[0..slot], 0..) |*other, index| if (!other.active) {
+                other.active = true;
+                hidden.add(index);
+            };
+            const reserved = self.reserveTransaction();
+            for (self.txs[0..slot], 0..) |*other, index| if (hidden.has(index)) {
+                other.active = false;
+            };
+            // The hook left the slot active: end what was reserved instead.
+            const got = try reserved;
+            if (got != slot) {
+                self.abort(got);
+                return error.ObjectNotInPrerequisiteState;
+            }
+            const tx = &self.txs[slot];
+            const state = self.sessionState();
+            tx.isolation = state.values.isolation;
+            tx.read_only = state.values.read_only;
+            tx.deferrable = state.values.deferrable;
+            tx.session = state.id;
+            state.beginTransaction(tx.epoch);
+            tx.subs[0] = .{ .statement = true, .write_start = 0, .lock_start = 0 };
+            tx.sub_len = 1;
+            tx.cid = 1;
+            tx.progress = 0;
+            tx.progress_affected = 0;
+            self.modifying[slot] = .{};
+            const snap: Snapshot = .{ .csn = self.csn, .slot = slot, .epoch = tx.epoch, .cid = tx.cid };
+            tx.running_snap = snap;
+            self.routine_snap = snap;
+            self.seq_snap = snap;
+            self.statement_start = 0;
+            self.routine_fresh_transaction = true;
+        }
+
+        /// A snapshot a routine statement saved before it ran, when it
+        /// still belongs to the running transaction; after a COMMIT /
+        /// ROLLBACK inside it ended that transaction, the next command's
+        /// snapshot of the new one (proc-tx, wave 5).
+        fn routineSnapAfter(self: *Self, saved: Snapshot) Snapshot {
+            const slot = self.routine_slot;
+            const tx = &self.txs[slot];
+            if (saved.epoch == 0 or saved.slot != slot or saved.epoch == tx.epoch or !tx.active) return saved;
+            return .{ .csn = self.csn, .slot = slot, .epoch = tx.epoch, .cid = tx.cid +% 1 };
+        }
+
+        /// `SET TRANSACTION ...` (the statement a routine runs without a
+        /// snapshot).
+        fn setTransactionText(text: []const u8) bool {
+            var cursor = R.Cursor.init(text, 0) catch return false;
+            if (!cursor.is("set")) return false;
+            cursor.advance() catch return false;
+            return cursor.is("transaction");
+        }
+
+        /// SET TRANSACTION as a statement of a procedure or DO block: the
+        /// transaction's modes with PostgreSQL's checks (25001 for a new
+        /// isolation level, READ WRITE or DEFERRABLE once a query ran; the
+        /// CALL / DO itself counts until a COMMIT / ROLLBACK in it began a
+        /// new transaction that has run nothing yet).
+        fn routineSetTransaction(self: *Self, slot: u16, text: []const u8) Error!usize {
+            const parsed = try P.parse(text, &self.workspace.nodes, .standard);
+            const modes = switch (parsed) {
+                .control => |command| switch (command) {
+                    .set_transaction => |modes| modes,
+                    else => return error.UnsupportedStatement,
+                },
+                else => return error.UnsupportedStatement,
+            };
+            const started = !self.routine_fresh_transaction or self.txs[slot].snapshot_csn != null;
+            try self.applyModesStarted(slot, modes, false, started);
+            self.outcome = .{ .command = .set };
+            return 0;
+        }
+
+        /// StatementOptions.transaction_control's type (Store checks for it).
+        pub const StatementTransactionControl = TransactionControl;
+
+        /// A block with an EXCEPTION clause runs: transaction control below
+        /// it, in this routine or one it calls, is 2D000.
+        pub fn routineAtomic(self: *Self, enter: bool) void {
+            if (enter) self.routine_atomic += 1 else self.routine_atomic -|= 1;
         }
 
         fn enterRoutine(self: *Self) Error!void {
@@ -13922,11 +14111,19 @@ pub fn Database(comptime config: Config) type {
             var mark: usize = 0;
             if (nested) mark = try self.nestedEnter(slot);
             defer if (nested) self.nestedLeave(slot, mark);
+            // SET TRANSACTION in a procedure or DO block takes no snapshot;
+            // after a COMMIT / ROLLBACK in it nothing has run yet, so the
+            // isolation level may still change (proc-tx, wave 5).
+            if (!nested and !read_only and kind == null and setTransactionText(text)) return self.routineSetTransaction(slot, text);
+            self.routine_fresh_transaction = false;
             const snap: Snapshot = if (read_only) self.routine_snap else self.routineSnapshot(slot, true);
             tx.progress = 0;
             tx.progress_affected = 0;
             self.modifying[slot] = .{};
             const start = tx.write_len;
+            // A CALL / DO statement may end the transaction (proc-tx): what
+            // was saved for the old one does not apply to the next.
+            const epoch = tx.epoch;
             const saved_snap = self.routine_snap;
             const saved_frame = self.routine_frame;
             const saved_shared = self.session.routine_frame;
@@ -13939,11 +14136,12 @@ pub fn Database(comptime config: Config) type {
             // statement or routed ON CONFLICT (ddl-dml, wave 4).
             const saved_family = .{ self.family_root, self.family_returning, self.conflict_routed };
             defer {
-                self.routine_snap = saved_snap;
+                const ended = tx.epoch != epoch;
+                self.routine_snap = if (ended) self.routineSnapAfter(saved_snap) else saved_snap;
                 self.routine_frame = saved_frame;
                 self.session.routine_frame = saved_shared;
-                self.statement_start = saved_start;
-                self.seq_snap = saved_sequences;
+                self.statement_start = if (ended) 0 else saved_start;
+                self.seq_snap = if (ended) self.routineSnapAfter(saved_sequences) else saved_sequences;
                 self.routine_volatility = saved_volatility;
                 self.active_params = saved_params;
                 self.session.params = saved_session_params;
@@ -15165,6 +15363,12 @@ pub fn Database(comptime config: Config) type {
                     break :blk if (from != to) try E.cast(arg.cell, from, to, param.typmod, &self.session) else arg.cell;
                 };
             }
+            // A SQL-language body runs atomically: a procedure it calls
+            // cannot end the transaction (PostgreSQL 2D000, proc-tx).
+            const sql_body = routine.language != 1;
+            if (sql_body) self.routineAtomic(true);
+            defer if (sql_body) self.routineAtomic(false);
+
             try self.enterScope(routine, &scope);
             const text_body = routine.body.slice();
             if (routine.language == 1) {

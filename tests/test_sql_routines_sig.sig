@@ -599,8 +599,8 @@ fn transactionControl() !void {
     try run("CREATE PROCEDURE tcexc() LANGUAGE plpgsql AS $$BEGIN BEGIN INSERT INTO tc VALUES (400); COMMIT; EXCEPTION WHEN invalid_transaction_termination THEN INSERT INTO tc VALUES (401); END; END$$");
     try run("CALL tcexc()");
     try expect("SELECT v FROM tc", "401");
-    // Allowed by PostgreSQL at top level, but a commit inside a running
-    // statement needs a store protocol this engine lacks (0A000).
+    // Allowed by PostgreSQL at top level; without the store's transaction
+    // hook (B11 wave 5 proc-tx) this autocommit API cannot end it (0A000).
     try rejects("CALL tcp(2)", error.UnsupportedStatement, "SELECT v FROM tc", "401");
     try rejects("DO $$BEGIN INSERT INTO tc VALUES (200); COMMIT; END$$", error.UnsupportedStatement, "SELECT v FROM tc", "401");
     try sameState(&.{"SELECT v FROM tc"});

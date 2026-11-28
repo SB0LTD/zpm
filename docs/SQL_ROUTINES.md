@@ -273,12 +273,12 @@ and replay; every expectation was checked against native PostgreSQL 18.7.
   where PostgreSQL forbids them (an explicit transaction block, a function
   or trigger below, a block with an EXCEPTION clause, a SECURITY DEFINER or
   SET routine on the stack). Where PostgreSQL allows them (a top-level
-  CALL / DO in autocommit) the transaction would have to end in the
-  middle of a statement: the change-log protocol writes one record per
-  statement and a CALL that waits for a lock restarts from its start, so
-  that case is 0A000. It needs a store callback that writes, syncs and
-  publishes a record mid-statement and a lock wait that blocks instead of
-  restarting the CALL once it has committed.
+  CALL / DO run non-atomically) they end the transaction in the middle of
+  the statement since B11 wave 5 (proc-tx lane, docs/SQL_PROC_TX.md): each
+  COMMIT writes, syncs and publishes its own record through the store, and
+  a lock wait after one fails with 55P03 instead of re-running the CALL.
+  Callers without the store's transaction hook (Database.execute and
+  executeChanges in autocommit) still get 0A000.
 
 Change-log op 80 (create_routine_extended) carries routines with these
 features: an extension (modes, OUT / TABLE parameter types, DEFAULT
@@ -464,7 +464,8 @@ Not covered (open):
   expression) are 0A000; RETURNS record without OUT parameters,
   polymorphic types, %TYPE / %ROWTYPE / record variables, cursors,
   FOREACH and FOR over queries remain open (see Wave 5 for the rest).
-- COMMIT / ROLLBACK where PostgreSQL allows them (see Wave 4) are 0A000.
+- COMMIT / ROLLBACK where PostgreSQL allows them work through the store
+  (docs/SQL_PROC_TX.md); a lock wait after one fails instead of waiting.
 - A SQL body is validated under the session's settings, not the
   routine's SET clauses (PostgreSQL applies them at CREATE).
 - A SQL function whose query body calls itself exceeds the inlining

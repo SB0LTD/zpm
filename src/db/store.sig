@@ -705,6 +705,9 @@ pub fn Store(comptime Raw: type) type {
             copy: bool = false,
             /// Rows the parked COPY had inserted before the blocked one.
             rows_done: usize = 0,
+            /// The parked statement may end its transaction (a top-level
+            /// CALL / DO run non-atomically; proc-tx, B11 wave 5).
+            nonatomic: bool = false,
         };
 
         const SavedSettings = struct { current: Settings, base: Settings };
@@ -776,6 +779,9 @@ pub fn Store(comptime Raw: type) type {
             /// Engine session state: transaction-mode defaults, engine
             /// settings, cursors, prepared statements, LISTEN.
             engine_session: EngineSession = .{},
+            /// Why a COMMIT inside the running CALL / DO failed (the store's
+            /// own error, persistence included), reported for the statement.
+            statement_commit_error: ?anyerror = null,
 
             pub const Notification = NotificationType;
 
@@ -1807,7 +1813,7 @@ pub fn Store(comptime Raw: type) type {
                 }
             }
 
-            fn run(self: *Connection, source: []const u8, result: *Result, slot: u16, implicit: bool, resuming: bool) !void {
+            fn run(self: *Connection, source: []const u8, result: *Result, slot: u16, implicit: bool, resuming: bool, nonatomic: bool) !void {
                 if (comptime has_control) {
                     if (!resuming) {
                         self.execution.reset(self.store.max_query_work);
@@ -1826,7 +1832,17 @@ pub fn Store(comptime Raw: type) type {
                     if (comptime has_control) self.store.database.session.control = null;
                 }
                 const writes = if (self.store.storageReady()) |_| true else |_| false;
-                const outcome = if (comptime has_engine_session)
+                // A COMMIT inside the statement moves the transaction start;
+                // an implicit statement's ends with it (proc-tx).
+                const transaction_us = self.transaction_us;
+                defer if (implicit) {
+                    self.transaction_us = transaction_us;
+                };
+                self.statement_commit_error = null;
+                const outcome = if (comptime has_engine_session and @hasDecl(Raw, "StatementTransactionControl"))
+                    self.db().statement(slot, source, result, .{ .@"resume" = resuming, .writes = writes, .hold_result = implicit, .implicit = implicit,
+                        .transaction_control = if (nonatomic) Raw.StatementTransactionControl{ .context = @ptrCast(self), .end = &endStatementTransaction } else null })
+                else if (comptime has_engine_session)
                     self.db().statement(slot, source, result, .{ .@"resume" = resuming, .writes = writes, .hold_result = implicit, .implicit = implicit })
                 else
                     self.db().statement(slot, source, result, .{ .@"resume" = resuming, .writes = writes, .hold_result = implicit });
@@ -1834,11 +1850,16 @@ pub fn Store(comptime Raw: type) type {
                     if (err == error.WouldBlock) {
                         if (!resuming) {
                             self.park(source, implicit);
+                            self.pending.nonatomic = nonatomic;
                             return err;
                         }
                         return self.stillBlocked(slot, implicit);
                     }
                     self.terminal(implicit);
+                    if (self.statement_commit_error) |stashed| {
+                        self.statement_commit_error = null;
+                        return stashed;
+                    }
                     // Writes refused for unavailable storage; a READ ONLY
                     // transaction's own refusal stays 25006.
                     return if (err == error.ReadOnlyTransaction and !writes) error.StorageUnavailable else err;
@@ -1920,7 +1941,7 @@ pub fn Store(comptime Raw: type) type {
                     self.terminal(implicit);
                     return error.QueryCanceled;
                 }
-                return self.run(source, result, slot, implicit, true);
+                return self.run(source, result, slot, implicit, true, self.pending.nonatomic);
             }
 
             // ---- COPY (design §4.7, §5.17) ----------------------------------
@@ -2244,6 +2265,10 @@ pub fn Store(comptime Raw: type) type {
                     self.failTransaction();
                     return err;
                 };
+                // PostgreSQL runs the first command of an extended group
+                // outside a transaction block: a CALL / DO there may end the
+                // transaction; a later pipelined one may not (proc-tx).
+                const fresh_group = extended and !self.in_transaction;
                 if (extended and !self.in_transaction) switch (command_kind) {
                     .none, .set, .reset, .set_transaction, .set_session_characteristics, .show => {
                         try self.beginExtendedGroup();
@@ -2268,7 +2293,42 @@ pub fn Store(comptime Raw: type) type {
                     self.refreshTransactionTimeout();
                     break :blk slot;
                 };
-                return self.run(source, result, slot, implicit, false);
+                const nonatomic = implicit or (fresh_group and self.postgres_extended_implicit);
+                return self.run(source, result, slot, implicit, false, nonatomic);
+            }
+
+            /// TransactionControl.end for a COMMIT / ROLLBACK inside the
+            /// running CALL / DO (proc-tx, B11 wave 5): the transaction ends
+            /// exactly as COMMIT ends one (deferred checks, its record
+            /// written and synced through commit_fn, then published) or as
+            /// ROLLBACK does, and the engine begins the next one in the same
+            /// slot. The next transaction starts its clock and deadline; in
+            /// a block-like extended group SET LOCAL values end too. A
+            /// failure (the transaction rolled back, the store's error kept
+            /// for the statement) ends the CALL with that error.
+            fn endStatementTransaction(context: *anyopaque, slot: u16, committing: bool) ExecutionError!void {
+                const self: *Connection = @ptrCast(@alignCast(context));
+                var ended: anyerror!void = {};
+                if (committing) {
+                    // The engine fired the deferred trigger events already.
+                    ended = self.store.commit(slot, null);
+                } else self.store.database.abort(slot);
+                const committed = if (ended) |_| committing else |_| false;
+                if (self.in_transaction) {
+                    self.settings = if (committed) self.base else self.tx_start;
+                    self.base = self.settings;
+                    self.tx_start = self.settings;
+                    self.saved_len = 0;
+                }
+                self.transaction_us = self.store.wallNow();
+                if (comptime has_session) self.store.database.session.transaction_us = self.transaction_us orelse self.statement_us;
+                self.transaction_deadline_ns = null;
+                self.refreshTransactionTimeout();
+                ended catch |err| {
+                    self.statement_commit_error = err;
+                    // Reported as `err` by run(); this only unwinds the CALL.
+                    return error.TransactionLogCapacity;
+                };
             }
         };
     };

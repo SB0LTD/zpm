@@ -266,6 +266,12 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
         importEntry("sql", "src/core/sql.sig"),       importEntry("db_store", "src/db/store.sig"),
         importEntry("postgres", "src/db/postgres.sig"), importEntry("scram", "src/db/scram.sig"),
     });
+    // B11 wave 5 proc-tx lane: COMMIT / ROLLBACK inside procedures and DO
+    // blocks, SEARCH / CYCLE values (docs/SQL_PROC_TX.md).
+    _ = try addContract(ctx, test_sql, "contract-sql-proc-tx", "tests/test_sql_proc_tx.sig", &.{
+        importEntry("sql", "src/core/sql.sig"),       importEntry("db_store", "src/db/store.sig"),
+        importEntry("postgres", "src/db/postgres.sig"), importEntry("scram", "src/db/scram.sig"),
+    });
     // B11 wave 5 dml-temp lane: DML subqueries, query shapes, cursors,
     // AND CHAIN and WITH CHECK OPTION (docs/SQL_DML_TEMP.md).
     _ = try addContract(ctx, test_sql, "contract-sql-dml-temp", "tests/test_sql_dml_temp.sig", &.{
