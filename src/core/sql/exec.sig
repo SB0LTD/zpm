@@ -352,6 +352,7 @@ pub fn Exec(comptime config: types.Config) type {
                 if (p.series == .routine) return self.routineRows(p, &ctx);
                 if (p.series == .subscripts) return self.subscriptRows(p, &ctx);
                 if (p.series == .set_function) return self.setFunctionRows(p, &ctx);
+                if (p.series == .transition) return self.transitionRows(p);
                 if (p.series == .none) {
                     const at = try self.cells(p.width);
                     self.work.cells[at] = try E.eval(&ctx, p.function);
@@ -385,7 +386,7 @@ pub fn Exec(comptime config: types.Config) type {
                         const zero: V.Cell = .{ .interval = .{} };
                         direction = V.compare(&step, &zero);
                     },
-                    .none, .json_table, .partition_ancestors, .options_to_table, .unnest, .routine, .subscripts, .set_function, .xml_table => unreachable,
+                    .none, .json_table, .partition_ancestors, .options_to_table, .unnest, .routine, .subscripts, .set_function, .xml_table, .transition => unreachable,
                 }
                 if (direction == 0) return error.InvalidParameterValue;
                 var current = args[0];
@@ -494,6 +495,17 @@ pub fn Exec(comptime config: types.Config) type {
                 return self.finish(p, sink.list);
             }
 
+            /// A REFERENCING transition table (B11 wave 5): the rows of the
+            /// firing trigger's statement, from the routine hook.
+            fn transitionRows(self: *Query, p: *const B.Plan) Error!List {
+                const hook = self.session.routines orelse return error.UnsupportedStatement;
+                const transition = hook.transition orelse return error.UnsupportedStatement;
+                const code: u64 = @intCast(self.pool.nodes[p.function].integer);
+                var sink: RoutineSink = .{ .query = self, .plan = p, .columns = p.count - @intFromBool(p.ordinality), .list = .{ .start = @intCast(self.work.ref_low) } };
+                try transition(hook.ptr, code, &sink, &RoutineSink.emitOpaque);
+                return self.finish(p, sink.list);
+            }
+
             const RoutineSink = struct {
                 query: *Query,
                 plan: *const B.Plan,
@@ -599,8 +611,40 @@ pub fn Exec(comptime config: types.Config) type {
                 return switch (n.func) {
                     .regexp_matches, .regexp_split_to_table => regex_eval.RegexEval(config, E).rows(ctx, n, sink),
                     .jsonb_path_query => json_eval.JsonEval(config, E).pathRows(ctx, n, sink.context, sink.row),
+                    .routine => routineSetRows(ctx, n, sink),
                     else => error.UnsupportedStatement,
                 };
+            }
+
+            /// A user set-returning function in a select list (B11 wave 5):
+            /// its rows from the routine hook, one value each.
+            fn routineSetRows(ctx: *const E.Context, call: *const ast.Node, sink: regex_eval.RegexEval(config, E).Sink) Error!void {
+                const hook = ctx.session.routines orelse return error.UnsupportedStatement;
+                const rows = hook.rows orelse return error.UnsupportedStatement;
+                var args: [config.routine_args]V.Cell = undefined;
+                var count: usize = 0;
+                var defaulted: u64 = 0;
+                var item = call.b;
+                while (item != none) : (item = ctx.pool.nodes[item].next) {
+                    if (count == args.len or count == 64) return error.ColumnCapacity;
+                    if (ctx.pool.nodes[item].kind == .default_value) {
+                        defaulted |= @as(u64, 1) << @intCast(count);
+                        args[count] = .null_value;
+                    } else args[count] = try E.eval(ctx, item);
+                    count += 1;
+                }
+                const Adapter = struct {
+                    sink: regex_eval.RegexEval(config, E).Sink,
+                    open: bool = true,
+                    fn emit(ptr: *anyopaque, row_cells: *const anyopaque) Error!void {
+                        const self: *@This() = @ptrCast(@alignCast(ptr));
+                        if (!self.open) return;
+                        const values: [*]const V.Cell = @ptrCast(@alignCast(row_cells));
+                        self.open = try self.sink.row(self.sink.context, &values[0]);
+                    }
+                };
+                var adapter: Adapter = .{ .sink = sink };
+                try rows(hook.ptr, @intCast(call.integer), &args, count, defaulted, &adapter, &Adapter.emit);
             }
 
             /// A set-returning built-in in FROM: one row per value, ORDINALITY

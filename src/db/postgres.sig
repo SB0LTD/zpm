@@ -424,6 +424,13 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             command_start: usize,
         };
 
+        /// Sync: the implicit extended group commits; deferred constraint
+        /// triggers may use the session's result storage (B11 wave 5).
+        fn finishGroup(self: *Self, db: *DB) !void {
+            if (comptime @hasDecl(DB, "finishExtendedWith")) return db.finishExtendedWith(&self.result);
+            return db.finishExtended();
+        }
+
         fn valueSession(db: *DB) *const T.Session {
             if (@hasDecl(DB, "valueSession")) return db.valueSession();
             return &utc_session;
@@ -1493,7 +1500,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                 'S' => {
                     try r.done();
                     self.failed = false;
-                    if (comptime @hasDecl(DB, "finishExtended")) db.finishExtended() catch |err| {
+                    if (comptime @hasDecl(DB, "finishExtended")) self.finishGroup(db) catch |err| {
                         if (@as(anyerror, err) == error.TransactionTimeout) return err;
                         try failure(w, sqlstate(err), @errorName(err));
                     };
@@ -1624,7 +1631,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             }
             if (source.len > sql_capacity) return error.StatementCapacity;
             if (batch) |frame| if (frame.source.len >= sql_capacity) return error.StatementCapacity;
-            const begun = try db.copyBegin(source);
+            const begun = if (comptime @hasDecl(DB, "copyBeginWith")) try db.copyBeginWith(source, &self.result) else try db.copyBegin(source);
             self.copy.mode = .in;
             self.copy.portal = portal_index;
             self.copy.remaining = 0;

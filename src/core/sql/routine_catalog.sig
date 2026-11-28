@@ -34,11 +34,18 @@
 //!   64: oid u32, name, table OID u32, event u8 ('2' UPDATE, '3' INSERT,
 //!       '4' DELETE), instead u8, WHERE text (empty: unconditional).
 //!   61 / 63 / 65: oid u32.
+//!   120 (B11 wave 5): a trigger with REFERENCING transition tables or a
+//!       constraint trigger: flags u8 (1 OLD TABLE, 2 NEW TABLE, 4
+//!       constraint, 8 DEFERRABLE, 16 INITIALLY DEFERRED), the OLD TABLE
+//!       name and the NEW TABLE name (when flagged), for a constraint
+//!       trigger its constraint OID u32 and FROM table OID u32 (0: none),
+//!       then the op-62 payload. Other triggers keep op 62 byte for byte.
 //!   80 (B11 wave 4): a routine with parameter modes, DEFAULT values,
 //!       RETURNS SETOF / TABLE, SECURITY DEFINER or SET clauses:
 //!       extension length u16, extension, then the op-60 payload. The
 //!       extension: version u8 (1), flags u8 (1 retset, 2 security
-//!       definer), parameter count u8 and every parameter's mode u8 in
+//!       definer, 4 SETOF a table's row type: its TABLE columns are no
+//!       routine variables, B11 wave 5), parameter count u8 and every parameter's mode u8 in
 //!       declaration order ('i', 'o', 'b', 'v', 't'), then per 'o' / 't'
 //!       parameter: name (len u8, may be 0), type OID u32, typmod i32;
 //!       default count u8, defaults text (NUL-terminated expressions of the
@@ -61,6 +68,14 @@ pub const trigger_oid: u32 = 2279;
 pub const record_oid: u32 = 2249;
 /// The extended creation op (B11 wave 4, routines-sig lane: ops 80-84).
 pub const create_routine_extended: u8 = 80;
+/// Transition tables and constraint triggers (B11 wave 5, routines-trig
+/// lane: ops 120-124).
+pub const create_trigger_extended: u8 = 120;
+pub const trigger_old_table: u8 = 1;
+pub const trigger_new_table: u8 = 2;
+pub const trigger_constraint: u8 = 4;
+pub const trigger_deferrable: u8 = 8;
+pub const trigger_initially_deferred: u8 = 16;
 
 /// PostgreSQL pg_trigger.tgtype bits.
 pub const tg_row: u8 = 1;
@@ -74,7 +89,7 @@ pub const tg_instead: u8 = 64;
 /// Object class of a write-set entry (Mvcc.Write.new) and of an overlay slot.
 pub const Class = enum(u8) { routine = 0, trigger = 1, rule = 2 };
 
-pub const Op = enum(u8) { create_routine = 60, drop_routine = 61, create_trigger = 62, drop_trigger = 63, create_rule = 64, drop_rule = 65, create_rule_action = 85 };
+pub const Op = enum(u8) { create_routine = 60, drop_routine = 61, create_trigger = 62, drop_trigger = 63, create_rule = 64, drop_rule = 65, create_rule_action = 85, create_trigger_extended = 120 };
 
 /// The MVCC stamps of one object version (the storage.Version rules).
 pub const Stamp = struct {
@@ -314,6 +329,9 @@ pub fn Catalog(comptime config: types.Config) type {
             defaults_len: usize = 0,
             /// RETURNS SETOF / TABLE (proretset).
             retset: bool = false,
+            /// RETURNS SETOF a table's row type (B11 wave 5): the TABLE
+            /// columns are its columns, not PL/pgSQL variables.
+            rowtype: bool = false,
             security_definer: bool = false,
             /// SET clauses (proconfig): NUL-terminated `name=value` entries.
             setting_count: usize = 0,
@@ -386,6 +404,25 @@ pub fn Catalog(comptime config: types.Config) type {
             /// NUL-terminated argument strings.
             args: [arg_bytes]u8 = @splat(0),
             args_len: usize = 0,
+            /// B11 wave 5 (op 120): REFERENCING transition table names
+            /// (empty: none), constraint trigger flags, its pg_constraint
+            /// OID and FROM table (tgconstrrelid, 0: none).
+            old_table: Name = .{},
+            new_table: Name = .{},
+            constraint: bool = false,
+            deferrable: bool = false,
+            initially_deferred: bool = false,
+            constraint_oid: u32 = 0,
+            constraint_relid: u32 = 0,
+
+            /// Whether the trigger needs the extended record (op 120).
+            pub fn extended(self: *const Trigger) bool {
+                return self.old_table.len != 0 or self.new_table.len != 0 or self.constraint;
+            }
+
+            pub fn transitions(self: *const Trigger) bool {
+                return self.old_table.len != 0 or self.new_table.len != 0;
+            }
 
             pub fn argument(self: *const Trigger, index: usize) []const u8 {
                 var start: usize = 0;
@@ -785,7 +822,7 @@ pub fn Catalog(comptime config: types.Config) type {
             try out.int(u16, 0);
             const start = out.used;
             try out.int(u8, 1);
-            try out.int(u8, @as(u8, @intFromBool(item.retset)) | (@as(u8, @intFromBool(item.security_definer)) << 1));
+            try out.int(u8, @as(u8, @intFromBool(item.retset)) | (@as(u8, @intFromBool(item.security_definer)) << 1) | (@as(u8, @intFromBool(item.rowtype)) << 2));
             try out.int(u8, @intCast(item.param_count));
             try out.bytes(item.param_modes[0..item.param_count]);
             for (0..item.out_count) |index| {
@@ -805,7 +842,33 @@ pub fn Catalog(comptime config: types.Config) type {
             try encodeRoutine(out, item);
         }
 
+        /// Op 62 carries plain triggers only; catalog images refuse
+        /// transition tables and constraint triggers (op 120).
         pub fn encodeTrigger(out: *Payload, item: *const Trigger) Error!void {
+            if (item.extended()) return error.UnsupportedStatement;
+            try encodeTriggerFields(out, item);
+        }
+
+        /// Op 120 (B11 wave 5): the extension, then the op-62 payload.
+        pub fn encodeTriggerExtended(out: *Payload, item: *const Trigger) Error!void {
+            if (!item.extended()) return error.UnsupportedStatement;
+            var flags: u8 = 0;
+            if (item.old_table.len != 0) flags |= trigger_old_table;
+            if (item.new_table.len != 0) flags |= trigger_new_table;
+            if (item.constraint) flags |= trigger_constraint;
+            if (item.deferrable) flags |= trigger_deferrable;
+            if (item.initially_deferred) flags |= trigger_initially_deferred;
+            try out.int(u8, flags);
+            if (item.old_table.len != 0) try out.name(item.old_table.slice());
+            if (item.new_table.len != 0) try out.name(item.new_table.slice());
+            if (item.constraint) {
+                try out.int(u32, item.constraint_oid);
+                try out.int(u32, item.constraint_relid);
+            }
+            try encodeTriggerFields(out, item);
+        }
+
+        fn encodeTriggerFields(out: *Payload, item: *const Trigger) Error!void {
             try out.int(u32, item.oid);
             try out.name(item.name.slice());
             try out.int(u32, item.table_oid);
@@ -933,9 +996,11 @@ pub fn Catalog(comptime config: types.Config) type {
             var ext = Reader{ .bytes = extension };
             if (try ext.int(u8) != 1) return error.InvalidChangeRecord;
             const flags = try ext.int(u8);
-            if (flags & ~@as(u8, 3) != 0) return error.InvalidChangeRecord;
+            if (flags & ~@as(u8, 7) != 0) return error.InvalidChangeRecord;
             out.retset = flags & 1 != 0;
             out.security_definer = flags & 2 != 0;
+            out.rowtype = flags & 4 != 0;
+            if (out.rowtype and !out.retset) return error.InvalidChangeRecord;
             const count = try ext.int(u8);
             if (count > config.routine_args or (count != 0 and count < out.arg_count)) return error.InvalidChangeRecord;
             out.param_count = count;
@@ -1006,8 +1071,55 @@ pub fn Catalog(comptime config: types.Config) type {
         pub fn decodeTrigger(payload: []const u8, out: *Trigger) Error!void {
             var reader = Reader{ .bytes = payload };
             out.* = .{};
+            try decodeTriggerFields(&reader, out);
+        }
+
+        /// Op 120: every extension byte is validated against PostgreSQL's
+        /// rules (transition tables only on AFTER triggers of one event
+        /// without columns, OLD for DELETE / UPDATE, NEW for INSERT /
+        /// UPDATE, different names; constraint triggers AFTER ROW,
+        /// INITIALLY DEFERRED only when DEFERRABLE).
+        pub fn decodeTriggerExtended(payload: []const u8, out: *Trigger) Error!void {
+            var reader = Reader{ .bytes = payload };
+            const flags = try reader.int(u8);
+            if (flags == 0 or flags & ~@as(u8, 31) != 0) return error.InvalidChangeRecord;
+            var old_table: Name = .{};
+            var new_table: Name = .{};
+            if (flags & trigger_old_table != 0) try readName(&reader, &old_table);
+            if (flags & trigger_new_table != 0) try readName(&reader, &new_table);
+            var constraint_oid: u32 = 0;
+            var constraint_relid: u32 = 0;
+            const constraint = flags & trigger_constraint != 0;
+            if (constraint) {
+                constraint_oid = try reader.int(u32);
+                constraint_relid = try reader.int(u32);
+                if (constraint_oid == 0) return error.InvalidChangeRecord;
+            } else if (flags & (trigger_deferrable | trigger_initially_deferred) != 0) return error.InvalidChangeRecord;
+            if (flags & trigger_initially_deferred != 0 and flags & trigger_deferrable == 0) return error.InvalidChangeRecord;
+            out.* = .{};
+            try decodeTriggerFields(&reader, out);
+            out.old_table = old_table;
+            out.new_table = new_table;
+            out.constraint = constraint;
+            out.deferrable = flags & trigger_deferrable != 0;
+            out.initially_deferred = flags & trigger_initially_deferred != 0;
+            out.constraint_oid = constraint_oid;
+            out.constraint_relid = constraint_relid;
+            const kind = out.tgtype;
+            const events = kind & (tg_insert | tg_delete | tg_update | tg_truncate);
+            if (out.transitions()) {
+                if (constraint or kind & (tg_before | tg_instead) != 0 or kind & tg_truncate != 0 or out.column_count != 0) return error.InvalidChangeRecord;
+                if (events != tg_insert and events != tg_delete and events != tg_update) return error.InvalidChangeRecord;
+                if (old_table.len != 0 and events == tg_insert) return error.InvalidChangeRecord;
+                if (new_table.len != 0 and events == tg_delete) return error.InvalidChangeRecord;
+                if (old_table.len != 0 and new_table.len != 0 and types.same(old_table.slice(), new_table.slice())) return error.InvalidChangeRecord;
+            }
+            if (constraint and (kind & (tg_before | tg_instead | tg_truncate) != 0 or kind & tg_row == 0)) return error.InvalidChangeRecord;
+        }
+
+        fn decodeTriggerFields(reader: *Reader, out: *Trigger) Error!void {
             out.oid = try reader.int(u32);
-            try readName(&reader, &out.name);
+            try readName(reader, &out.name);
             out.table_oid = try reader.int(u32);
             out.function_oid = try reader.int(u32);
             out.tgtype = try reader.int(u8);
@@ -1019,9 +1131,9 @@ pub fn Catalog(comptime config: types.Config) type {
                 out.columns[index] = try reader.int(u8);
                 if (out.columns[index] >= config.columns) return error.InvalidChangeRecord;
             }
-            out.when.len = try readText(&reader, &out.when.bytes);
+            out.when.len = try readText(reader, &out.when.bytes);
             out.nargs = try reader.int(u8);
-            out.args_len = try readText(&reader, &out.args);
+            out.args_len = try readText(reader, &out.args);
             var terminators: usize = 0;
             for (out.args[0..out.args_len]) |byte| {
                 if (byte == 0) terminators += 1;
@@ -1174,18 +1286,22 @@ pub fn Catalog(comptime config: types.Config) type {
                     try overlayAdd(overlay, .{ .live = true, .class = .routine, .oid = item.oid, .namespace = item.namespace, .owner = item.owner, .acl = item.acl, .kind = item.kind, .return_oid = item.return_oid, .name = item.name, .arg_count = item.arg_count, .arg_oids = item.arg_oids });
                     return item.oid;
                 },
-                @intFromEnum(Op.create_trigger) => {
+                @intFromEnum(Op.create_trigger), create_trigger_extended => {
                     var item: Trigger = undefined;
-                    try decodeTrigger(payload, &item);
+                    if (tag == create_trigger_extended) try decodeTriggerExtended(payload, &item) else try decodeTrigger(payload, &item);
                     if (item.oid < 16384 or item.oid == 0xffffffff or overlayHas(overlay, item.oid) or context.oidTaken(item.oid)) return error.ChangeRecordConflict;
                     if (!context.tableLive(item.table_oid)) return error.ChangeRecordConflict;
+                    if (item.constraint) {
+                        if (item.constraint_oid < 16384 or item.constraint_oid == 0xffffffff or item.constraint_oid == item.oid or overlayHas(overlay, item.constraint_oid) or context.oidTaken(item.constraint_oid)) return error.ChangeRecordConflict;
+                        if (item.constraint_relid != 0 and !context.tableLive(item.constraint_relid)) return error.ChangeRecordConflict;
+                    }
                     const function = overlayFind(overlay, .routine, item.function_oid) orelse return error.ChangeRecordConflict;
                     if (function.return_oid != trigger_oid or function.arg_count != 0) return error.ChangeRecordConflict;
                     for (&overlay.objects) |*object| {
                         if (object.live and object.class == .trigger and object.table_oid == item.table_oid and types.same(object.name.slice(), item.name.slice())) return error.ChangeRecordConflict;
                     }
                     try overlayAdd(overlay, .{ .live = true, .class = .trigger, .oid = item.oid, .table_oid = item.table_oid, .function_oid = item.function_oid, .name = item.name });
-                    return item.oid;
+                    return @max(item.oid, item.constraint_oid);
                 },
                 @intFromEnum(Op.create_rule), @intFromEnum(Op.create_rule_action) => {
                     var item: Rule = undefined;

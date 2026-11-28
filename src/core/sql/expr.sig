@@ -663,6 +663,10 @@ pub fn Eval(comptime config: types.Config) type {
                 .regtype_out => {
                     const data_type = if (first.integer >= 0 and first.integer <= 0xffffffff) types.typeFromOid(@intCast(first.integer)) else null;
                     if (data_type != null) return formatType(first.integer, null, ctx.session.quote_all_identifiers);
+                    if (first.integer >= 0 and first.integer <= 0xffffffff) if (ctx.session.sequences) |hook| if (hook.type_name) |name| {
+                        var buffer: [config.text_bytes]u8 = undefined;
+                        if (try name(hook.ptr, @intCast(first.integer), &buffer)) |length| return textCell(buffer[0..length]);
+                    };
                     return digitsCell(first.integer);
                 },
                 .regclass_out => {
@@ -1873,7 +1877,8 @@ pub fn Eval(comptime config: types.Config) type {
                     // Routine frames already own their parameters/records.
                     // Keep these reads and calls out of the scalar dispatcher's
                     // unrelated wide-cell temporaries on a bounded stack.
-                    .routine => return routineCall(ctx, n),
+                    // A select-list set-returning call reads the row's value.
+                    .routine => return if (n.boolean and ctx.set_value != null) ctx.set_value.?.* else routineCall(ctx, n),
                     .routine_param => return routineValue(ctx, n),
                     .lo_import, .lo_export => return evalLargeObjectFile(ctx, n),
                     .lo_truncate, .lo_truncate64, .lo_from_bytea, .lo_get, .lo_create, .lo_creat, .lo_unlink => return evalLargeObject(ctx, n),

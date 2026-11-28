@@ -1360,6 +1360,8 @@ pub fn Database(comptime config: Config) type {
         /// the routine hook) unless the routine returns a set or a record.
         fn inlineBody(routine: *const RC.Routine) ?[]const u8 {
             if (routine.language != 0 or routine.security_definer or routine.setting_count != 0 or routine.kind != 'f') return null;
+            // A void function's value is NULL whatever its body returns.
+            if (routine.return_oid == tg.void_oid) return null;
             // A volatile body runs as nested statements (B11 wave 4): each
             // takes a new snapshot and command id, which an inlined plan
             // under the caller's snapshot would not (PostgreSQL inlines
@@ -1564,6 +1566,8 @@ pub fn Database(comptime config: Config) type {
                 // Metadata-only Describe does not call evaluation hooks.
                 if(!describe_only) for(self.workspace.nodes.nodes[0..self.workspace.nodes.len]) |node| {
                     if (node.ty == .regproc or types.elementType(node.ty) == .regproc) return error.UnsupportedStatement;
+                    // A user type's regtype name needs the catalog hook (S071).
+                    if (node.ty == .regtype or types.elementType(node.ty) == .regtype) return error.UnsupportedStatement;
                     switch(node.func) {
                         .nextval,.currval,.setval,.lastval,.identity_next,.lo_create,.lo_creat,.lo_unlink,.lo_from_bytea,.lo_get,.lo_truncate,.lo_truncate64,.lo_import,.lo_export=>return error.UnsupportedStatement,
                         // These catalog lookups use the serialized database hook.
@@ -2019,6 +2023,8 @@ pub fn Database(comptime config: Config) type {
         default_sequences: Q.Session = .{},
         sequence_session: ?*Q.Session = null,
         seq_hook: value_module.SequenceHook = undefined,
+        /// Output-formatting hook (installOutputHooks).
+        output_hook: value_module.SequenceHook = undefined,
         seq_slot: u16 = 0,
         seq_snap: Snapshot = .{ .csn = 0 },
         txs: [config.transactions]M.Tx = @splat(.{}),
@@ -2127,6 +2133,41 @@ pub fn Database(comptime config: Config) type {
         /// under them) and the tables the running statement scans.
         nested_tables: [(config.tables + 63) / 64]u64 = @splat(0),
         scan_tables: [(config.tables + 63) / 64]u64 = @splat(0),
+        /// Tables the running statement uses (sources and targets) and the
+        /// ones the suspended statements use (B11 wave 5): DDL in a nested
+        /// statement on one of them is 55006, PostgreSQL's
+        /// CheckTableNotInUse.
+        use_tables: [(config.tables + 63) / 64]u64 = @splat(0),
+        nested_use: [(config.tables + 63) / 64]u64 = @splat(0),
+        /// The routine error context (B11 wave 5): one item per PL/pgSQL
+        /// body, SPI statement, query-evaluated expression and SQL function
+        /// statement running now, and the context the last error had where
+        /// it was raised (PG_EXCEPTION_CONTEXT).
+        context_items: [context_capacity]R.ContextItem = undefined,
+        context_len: usize = 0,
+        context_captured: bool = false,
+        context_error: Error = error.RaiseException,
+        context_overflow: bool = false,
+        context_bytes: [config.text_bytes]u8 = undefined,
+        context_bytes_len: usize = 0,
+        /// Windows of the firing triggers with transition tables (B11
+        /// wave 5), innermost last.
+        transition_windows: [config.routine_depth]TransitionWindow = undefined,
+        transition_len: usize = 0,
+        /// COPY FROM (B11 wave 5): statement storage its triggers' SQL may
+        /// use (copyStorage) and whether a BEFORE ROW trigger skipped the
+        /// row copyBuild built.
+        copy_result: ?*Result = null,
+        copy_skip: bool = false,
+        /// Referential actions' statement triggers (B11 wave 5): one entry
+        /// per (referencing table, event) the running statement's actions
+        /// reached (BEFORE STATEMENT fires once), with the write-set index
+        /// after its latest action (its AFTER STATEMENT fires there, after
+        /// the statement's own AFTER events). Entries from `ri_base` on
+        /// belong to the running statement.
+        ri_pairs: [config.triggers]RiPair = undefined,
+        ri_len: usize = 0,
+        ri_base: usize = 0,
         routine_volatility: u8 = 0,
         /// PostgreSQL's errdetail of the last view error (lastErrorDetail).
         error_detail: []const u8 = "",
@@ -2617,6 +2658,15 @@ pub fn Database(comptime config: Config) type {
             self.rule_active_len = 0;
             self.nested_tables = @splat(0);
             self.scan_tables = @splat(0);
+            self.use_tables = @splat(0);
+            self.nested_use = @splat(0);
+            self.context_len = 0;
+            self.context_captured = false;
+            self.transition_len = 0;
+            self.copy_result = null;
+            self.copy_skip = false;
+            self.ri_len = 0;
+            self.ri_base = 0;
             self.row_staging = null;
             self.xml_region = .{};
             self.routine_definer = null;
@@ -2631,6 +2681,7 @@ pub fn Database(comptime config: Config) type {
             self.sequence_session = null;
             self.default_sequences = .{};
             self.seq_hook = undefined; // installed before a sequence expression
+            self.output_hook = undefined; // installed before output formatting
             self.seq_slot = 0;
             self.seq_snap = .{ .csn = 0 };
             self.wake_epoch = 0;
@@ -2752,7 +2803,12 @@ pub fn Database(comptime config: Config) type {
                 self.abort(slot);
                 return err;
             };
-            // Deferred constraints are checked as the transaction commits.
+            // Deferred constraint triggers fire, then deferred constraints
+            // are checked, as the transaction commits.
+            self.fireDeferredTriggers(slot, result) catch |err| {
+                self.abort(slot);
+                return err;
+            };
             self.deferredViolation(slot) catch |err| {
                 self.abort(slot);
                 return err;
@@ -2827,6 +2883,7 @@ pub fn Database(comptime config: Config) type {
                 tx.statement_checks = false;
                 tx.constraints_all = null;
                 tx.constraint_mode_count = 0;
+                tx.trigger_handled = @splat(0);
                 tx.isolation = .read_committed;
                 tx.read_only = false;
                 tx.deferrable = false;
@@ -3409,8 +3466,9 @@ pub fn Database(comptime config: Config) type {
 
         fn bindContext(self: *Self, source: []const u8, mode: ParseMode, snap: Snapshot) B.Context {
             self.routine_path_len = self.routinePath(snap, &self.routine_path_items);
+            const catalog_rank = self.routineCatalogRank(snap);
             const inlined = self.workspace.inline_count != 0 and source.ptr == &self.workspace.expansion and source.len == self.workspace.inline_source_len;
-            return .{ .inline_calls = if (inlined) self.workspace.inline_calls[0..self.workspace.inline_count] else &.{}, .routine_path = self.routine_path_items[0..self.routine_path_len], .routine_path_known = true, .source = source, .tables = &self.tables, .catalog = &self.catalog, .snapshot = snap, .pool = &self.workspace.nodes, .legacy = mode == .legacy_alpha, .dialect = self.dialect, .session = &self.session, .plans = &self.workspace.plans, .params = self.active_params,
+            return .{ .inline_calls = if (inlined) self.workspace.inline_calls[0..self.workspace.inline_count] else &.{}, .routine_path = self.routine_path_items[0..self.routine_path_len], .routine_path_known = true, .catalog_rank = catalog_rank, .source = source, .tables = &self.tables, .catalog = &self.catalog, .snapshot = snap, .pool = &self.workspace.nodes, .legacy = mode == .legacy_alpha, .dialect = self.dialect, .session = &self.session, .plans = &self.workspace.plans, .params = self.active_params,
                 .routines = &self.objects, .variables = if (self.routine_frame) |frame| &frame.variables else null,
                 .namespace_usage = .{ .ptr = self, .check = &bindNamespaceUsage },
                 .namespace_create = .{ .ptr = self, .check = &bindNamespaceCreate } };
@@ -3488,7 +3546,9 @@ pub fn Database(comptime config: Config) type {
             var context = self.bindContext(source, mode, snap);
             context.stored_source_start = original.len;
             if (explain) |options| context.describe_only = !options.analyze;
-            if (parsed.* == .select and self.routine_frame == null and self.active_params == null) context.user_type_catalog = &self.catalog_objects;
+            // Domains resolve in any query (S071, B11 wave 5); enum and
+            // composite values only as a simple SELECT's projected roots.
+            if ((parsed.* == .select or statement_copy == .query) and self.routine_frame == null and self.active_params == null) context.user_type_catalog = &self.catalog_objects;
             var bound: B.Bound = undefined;
             try B.bindInto(&context, &statement_copy, &bound);
             if (self.workspace.view_check_count != 0) try self.bindViewChecks(&context, &bound);
@@ -3535,6 +3595,12 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn runBoundMutation(self: *Self, slot: u16, source: []const u8, bound: *const B.Bound, snap: Snapshot, result: *Result) Error!void {
+            const saved_ri_base = self.ri_base;
+            self.ri_base = self.ri_len;
+            defer {
+                self.ri_len = self.ri_base;
+                self.ri_base = saved_ri_base;
+            }
             const affected: usize = switch (bound.*) {
                 .noop => 0,
                 .create_table => |*create| blk: {
@@ -3586,6 +3652,7 @@ pub fn Database(comptime config: Config) type {
                     const affected = try self.insertRows(slot, source, insert, snap);
                     try self.afterTriggers(slot, self.statement_start, if (upsert) &insert.conflict.update.values else null, snap);
                     try self.statementTriggers(insert.table, 0, events, snap);
+                    try self.cascadedStatements(snap, null);
                     if (actions) _ = try self.insertRuleActions(source, insert, snap);
                     break :blk affected;
                 },
@@ -3603,8 +3670,7 @@ pub fn Database(comptime config: Config) type {
                     if (try self.insteadNothing(update.table, '2', update.returning.count != 0, snap)) break :blk instead_affected;
                     try self.statementTriggers(update.table, routine_catalog.tg_before, &.{routine_catalog.tg_update}, snap);
                     const affected = try self.updateRows(slot, source, update, snap);
-                    try self.afterTriggers(slot, self.statement_start, &update.values, snap);
-                    try self.statementTriggers(update.table, 0, &.{routine_catalog.tg_update}, snap);
+                    try self.afterEvents(slot, update.table, &update.values, &.{routine_catalog.tg_update}, snap);
                     break :blk affected;
                 },
                 .delete => |*delete| blk: {
@@ -3618,8 +3684,7 @@ pub fn Database(comptime config: Config) type {
                     if (try self.insteadNothing(delete.table, '4', delete.returning.count != 0, snap)) break :blk instead_affected;
                     try self.statementTriggers(delete.table, routine_catalog.tg_before, &.{routine_catalog.tg_delete}, snap);
                     const affected = try self.deleteRows(slot, source, delete, snap);
-                    try self.afterTriggers(slot, self.statement_start, null, snap);
-                    try self.statementTriggers(delete.table, 0, &.{routine_catalog.tg_delete}, snap);
+                    try self.afterEvents(slot, delete.table, null, &.{routine_catalog.tg_delete}, snap);
                     break :blk affected;
                 },
                 .truncate => |*truncate| blk: {
@@ -3677,6 +3742,7 @@ pub fn Database(comptime config: Config) type {
                     if (self.anyRule(merge.table, snap)) return error.UnsupportedStatement;
                     const affected = try self.mergeRows(slot, source, merge, snap);
                     try self.afterTriggers(slot, self.statement_start, null, snap);
+                    try self.cascadedStatements(snap, null);
                     break :blk affected;
                 },
                 .select, .query, .control => unreachable,
@@ -3804,6 +3870,7 @@ pub fn Database(comptime config: Config) type {
             }
             try self.afterTriggers(slot, self.statement_start, if (bound == .update) &bound.update.values else null, snap);
             try self.statementTriggers(root, 0, &.{event}, snap);
+            try self.cascadedStatements(snap, null);
             self.outcome = .{ .affected = affected, .command = command };
             if (returning == 0) return;
             const source = try self.bindFamily(original, mode, root, snap, &bound);
@@ -7709,6 +7776,36 @@ pub fn Database(comptime config: Config) type {
             return writer.len;
         }
 
+        /// regtype output of a user type: its name, qualified when the
+        /// search path's first schema holding a type of that name is
+        /// another one (S071, B11 wave 5).
+        fn postgresTypeName(ptr: *anyopaque, oid: u32, out: []u8) Error!?usize {
+            const self: *const Self = @ptrCast(@alignCast(ptr));
+            // Output formatting can follow the statement: read the latest
+            // committed catalog (and the statement's own changes).
+            var snap = self.seq_snap;
+            snap.csn = @max(snap.csn, self.csn);
+            const kinds = [_]CO.Kind{ .domain, .enum_type, .composite_type };
+            const found = for (kinds) |kind| {
+                if (self.catalog_objects.byOid(kind, oid, snap)) |index| break index;
+            } else return null;
+            const object = &self.catalog_objects.items[found];
+            const name = object.name.slice();
+            var path: [routine_path_capacity]u32 = undefined;
+            const count = self.routinePath(snap, &path);
+            const first = for (path[0..count]) |namespace| {
+                if (self.catalog_objects.userTypeNameTaken(namespace, name, snap)) break namespace;
+            } else null;
+            var writer: CatalogTextWriter = .{ .out = out, .quote_all = self.session.quote_all_identifiers };
+            if (first == null or first.? != object.target) {
+                writer.ident(self.namespaceName(object.target));
+                writer.add(".");
+            }
+            writer.ident(name);
+            if (writer.shortened) return error.TextCapacity;
+            return writer.len;
+        }
+
         fn writeNamespaceName(self: *const Self, name: []const u8, out: []u8) Error!usize {
             var text: CatalogTextWriter = .{ .out = out, .quote_all = self.session.quote_all_identifiers };
             text.ident(name);
@@ -9173,7 +9270,7 @@ pub fn Database(comptime config: Config) type {
                 const routine_slot = self.objects.routineByOid(trigger.function_oid, snapshot) orelse return null;
                 const routine = &self.objects.routines[routine_slot];
                 var text: CatalogTextWriter = .{ .out = out, .quote_all = self.session.quote_all_identifiers };
-                text.add("CREATE TRIGGER ");
+                text.add(if (trigger.constraint) "CREATE CONSTRAINT TRIGGER " else "CREATE TRIGGER ");
                 text.ident(trigger.name.slice());
                 text.add(if (trigger.tgtype & tg.tg_before != 0) " BEFORE " else if (trigger.tgtype & tg.tg_instead != 0) " INSTEAD OF " else " AFTER ");
                 var preceding_event = false;
@@ -9198,7 +9295,37 @@ pub fn Database(comptime config: Config) type {
                     text.add(".");
                 }
                 text.ident(table.name.slice());
-                text.add(if (trigger.tgtype & tg.tg_row != 0) " FOR EACH ROW " else " FOR EACH STATEMENT ");
+                text.add(" ");
+                // pg_get_triggerdef: FROM, deferral and REFERENCING (B11 wave 5).
+                if (trigger.constraint) {
+                    if (trigger.constraint_relid != 0) {
+                        const from_slot = self.visibleTableSlot(trigger.constraint_relid, snapshot) orelse return null;
+                        const from = &self.tables[from_slot];
+                        text.add("FROM ");
+                        if (!self.inRelationSearchPath(from.namespace, from.name.slice())) {
+                            text.ident(self.namespaceName(from.namespace));
+                            text.add(".");
+                        }
+                        text.ident(from.name.slice());
+                        text.add(" ");
+                    }
+                    if (!trigger.deferrable) text.add("NOT ");
+                    text.add(if (trigger.initially_deferred) "DEFERRABLE INITIALLY DEFERRED " else "DEFERRABLE INITIALLY IMMEDIATE ");
+                }
+                if (trigger.transitions()) {
+                    text.add("REFERENCING ");
+                    if (trigger.old_table.len != 0) {
+                        text.add("OLD TABLE AS ");
+                        text.ident(trigger.old_table.slice());
+                        text.add(" ");
+                    }
+                    if (trigger.new_table.len != 0) {
+                        text.add("NEW TABLE AS ");
+                        text.ident(trigger.new_table.slice());
+                        text.add(" ");
+                    }
+                }
+                text.add(if (trigger.tgtype & tg.tg_row != 0) "FOR EACH ROW " else "FOR EACH STATEMENT ");
                 if (trigger.when.len != 0) {
                     text.add("WHEN (");
                     text.add(trigger.when.slice());
@@ -9788,6 +9915,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn dropTable(self: *Self, slot: u16, index: usize, cascade: bool, snap: Snapshot) Error!usize {
+            try self.checkNotInUse(index);
             try checkPendingLatePrimary(&self.tables[index]);
             try self.fenceBankPlacement(slot, false);
             try self.lockTable(slot, index, .access_exclusive);
@@ -9853,6 +9981,7 @@ pub fn Database(comptime config: Config) type {
         /// truncate entry per table covers all latest rows. Commit stamps
         /// those marks, and abort or ROLLBACK TO clears them.
         fn truncateTables(self: *Self, slot: u16, truncate: *const B.Truncate, snap: Snapshot) Error!void {
+            for (truncate.tables[0..truncate.count]) |index| try self.checkNotInUse(index);
             for (truncate.tables[0..truncate.count]) |index| try self.lockTable(slot, index, .access_exclusive);
             var current = snap;
             current.csn = self.csn;
@@ -9912,6 +10041,7 @@ pub fn Database(comptime config: Config) type {
             // ALTER acquires a new bank live and replays in place. Even a
             // dense bank move can change later heterogeneous CREATE choices.
             if (S.anyIntegralBank(&self.tables)) return error.UnsupportedStatement;
+            if (alter.command != .create_view) try self.checkNotInUse(alter.table);
             const source = &self.tables[alter.table];
             try checkPendingLatePrimary(source);
             var primary = false;
@@ -10642,6 +10772,13 @@ pub fn Database(comptime config: Config) type {
             const child = &self.tables[child_index];
             const tx = &self.txs[slot];
             if (action == .no_action or action == .restrict) try self.lockTable(slot, child_index, .access_share) else try self.lockTable(slot, child_index, .row_exclusive);
+            // A referential action runs as a statement on the referencing
+            // table: its triggers fire (B11 wave 5; PostgreSQL's RI query).
+            const action_event: u8 = if (action == .cascade and new == null) tg.tg_delete else tg.tg_update;
+            const pair: ?usize = if (action == .no_action or action == .restrict) null else try self.referentialBegin(child_index, action_event, snap);
+            defer if (pair) |index| {
+                self.ri_pairs[index].end = tx.write_len;
+            };
             var version: u32 = 0;
             while (version < child.version_high) : (version += 1) {
                 const entry = &child.versions[version];
@@ -10675,9 +10812,14 @@ pub fn Database(comptime config: Config) type {
                     .cascade => if (new) |cells| {
                         var updated: E.Row = undefined;
                         S.copyVersionRow(child, goal, &updated);
+                        var prior_row = updated;
                         for (constraint.keyColumns(), constraint.refColumns()) |column, key| updated[column] = try D.store(&child.columns[column], cells[key], &self.session);
+                        if (!try self.referentialRow(child_index, tg.tg_update, &updated, &prior_row, goal, snap)) continue;
                         try self.cascadeUpdate(slot, child_index, goal, &updated, .none, snap);
                     } else {
+                        var prior_row: E.Row = undefined;
+                        S.copyVersionRow(child, goal, &prior_row);
+                        if (!try self.referentialRow(child_index, tg.tg_delete, null, &prior_row, goal, snap)) continue;
                         var row_scratch: S.VersionRowScratch = undefined;
                         const prior = S.borrowVersionRow(child, goal, &row_scratch);
                         try self.referencedChange(slot, child_index, prior, null, snap);
@@ -10707,10 +10849,24 @@ pub fn Database(comptime config: Config) type {
                             if (updated[column] == .null_value or V.compare(&updated[column], &old[key]) != 0) still = false;
                         }
                         if (still) return error.ForeignKeyViolation;
+                        var prior_row: E.Row = undefined;
+                        S.copyVersionRow(child, goal, &prior_row);
+                        if (!try self.referentialRow(child_index, tg.tg_update, &updated, &prior_row, goal, snap)) continue;
                         try self.cascadeUpdate(slot, child_index, goal, &updated, if (action == .set_default) .all else .changed, snap);
                     },
                 }
             }
+        }
+
+        /// A referential action's row: the referencing table's BEFORE ROW
+        /// triggers (NULL skips it, NEW may change it); a row a trigger
+        /// changed itself is 27000, as PostgreSQL's RI query finds it.
+        fn referentialRow(self: *Self, child: usize, event: u8, new: ?*E.Row, old: *const E.Row, version: u32, snap: Snapshot) Error!bool {
+            if (!self.beforeRowTriggers(child, event, snap)) return true;
+            if (!try self.beforeRow(child, event, new, old, null, snap)) return false;
+            const entry = &self.tables[child].versions[version];
+            if (entry.hasDeletion()) return error.TriggeredDataChangeViolation;
+            return true;
         }
 
         /// A referencing row rewritten by a referential action: CHECK and
@@ -10791,7 +10947,10 @@ pub fn Database(comptime config: Config) type {
                     tx.constraint_mode_count += 1;
                 }
             }
-            if (!set.deferred) try self.deferredCheck(slot, 0, true, false);
+            if (!set.deferred) {
+                try self.firePendingTriggers(slot, self.routine_snap);
+                try self.deferredCheck(slot, 0, true, false);
+            }
         }
 
         /// The deferred checks of a transaction (COMMIT, SET CONSTRAINTS
@@ -11364,7 +11523,39 @@ pub fn Database(comptime config: Config) type {
                 self.wake_epoch +%= 1;
                 return err;
             };
+            // BEFORE STATEMENT triggers of the target (B11 wave 5).
+            self.copyTriggers(slot, routine_catalog.tg_before) catch |err| {
+                self.dropStatement(slot);
+                self.wake_epoch +%= 1;
+                return if (err == error.WouldBlock) error.LockNotAvailable else err;
+            };
             return info;
+        }
+
+        /// Statement storage for the triggers COPY FROM fires (the caller's
+        /// result, kept until the COPY ends).
+        pub fn copyStorage(self: *Self, result: ?*Result) void {
+            self.copy_result = result;
+        }
+
+        pub fn copyStorageResult(self: *const Self) ?*Result {
+            return self.copy_result;
+        }
+
+        /// COPY FROM's statement triggers (and, after it, the AFTER ROW
+        /// triggers of its rows), as for INSERT. A lock wait inside them is
+        /// 55P03 (the COPY cannot park there).
+        fn copyTriggers(self: *Self, slot: u16, timing: u8) Error!void {
+            const tx = &self.txs[slot];
+            const table_index = tx.copy_table orelse return;
+            var list: [config.triggers]u8 = undefined;
+            if (self.objects.tableTriggers(self.tables[table_index].oid, tx.copy_snap, &list) == 0) return;
+            const snap = tx.copy_snap;
+            self.statementHooks(slot, snap);
+            self.routine_result = self.copy_result;
+            self.statement_start = tx.subs[tx.sub_len - 1].write_start;
+            if (timing == 0) try self.afterTriggers(slot, self.statement_start, null, snap);
+            try self.statementTriggers(table_index, timing, &.{routine_catalog.tg_insert}, snap);
         }
 
         fn openCopy(self: *Self, slot: u16, source: []const u8, snap: Snapshot) Error!CopyInfo {
@@ -11394,8 +11585,16 @@ pub fn Database(comptime config: Config) type {
             return info;
         }
 
+        /// Catalog names for output formatted after the statement (regproc
+        /// and regtype text; the Store's wire session has no statement
+        /// hooks then; S071, B11 wave 5).
+        pub fn installOutputHooks(self: *Self) void {
+            self.output_hook = .{ .ptr = self, .call = &sequenceCall, .relation_name = &relationName, .routine_name = &postgresRoutineName, .type_name = &postgresTypeName };
+            self.session.sequences = &self.output_hook;
+        }
+
         fn statementHooks(self: *Self, slot: u16, snap: Snapshot) void {
-            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .large_object = &largeObjectCall, .large_object_data = &largeObjectDataCall, .large_object_truncate = &truncateLargeObject, .large_object_file = .{ .authorize = &authorizeLargeObjectFile, .call = &largeObjectFileCall }, .relation_name = &relationName, .relation_display_name = &relationDisplayName, .catalog_text = &catalogText, .schema_path = &catalogSchemaPath, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .view_definition = &postgresViewDefinition, .trigger_definition = &postgresTriggerDefinition, .rule_definition = &postgresRuleDefinition, .statistics_columns = &postgresStatisticsColumns, .relation_publishable = &relationPublishable, .partition_key_definition = &postgresPartitionKey, .partition_ancestors = &postgresPartitionAncestors, .namespace_lookup = &postgresNamespaceLookup, .namespace_name = &postgresNamespaceName, .routine_lookup = &postgresRoutineLookup, .routine_name = &postgresRoutineName, .xml_query = &xmlQuery, .xml_cursor = &xmlCursor };
+            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .large_object = &largeObjectCall, .large_object_data = &largeObjectDataCall, .large_object_truncate = &truncateLargeObject, .large_object_file = .{ .authorize = &authorizeLargeObjectFile, .call = &largeObjectFileCall }, .relation_name = &relationName, .relation_display_name = &relationDisplayName, .catalog_text = &catalogText, .schema_path = &catalogSchemaPath, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .view_definition = &postgresViewDefinition, .trigger_definition = &postgresTriggerDefinition, .rule_definition = &postgresRuleDefinition, .statistics_columns = &postgresStatisticsColumns, .relation_publishable = &relationPublishable, .partition_key_definition = &postgresPartitionKey, .partition_ancestors = &postgresPartitionAncestors, .namespace_lookup = &postgresNamespaceLookup, .namespace_name = &postgresNamespaceName, .routine_lookup = &postgresRoutineLookup, .routine_name = &postgresRoutineName, .xml_query = &xmlQuery, .xml_cursor = &xmlCursor, .type_name = &postgresTypeName };
             self.session.sequences = &self.seq_hook;
             // A statement starts with the whole XML scratch region free.
             self.xml_region = .{ .bytes = &self.xml_backing };
@@ -11405,7 +11604,7 @@ pub fn Database(comptime config: Config) type {
             self.workspace.query.views = .{ .ptr = self, .rows = &viewRows, .sequence_rows = &sequenceRows };
             self.session_hook = .{ .ptr = self, .call = &sessionCall };
             self.session.engine = &self.session_hook;
-            self.routine_hook = .{ .ptr = self, .call = &routineHookCall, .call_defaults = &routineHookDefaults, .prepare = &routineHookPrepare, .rows = &routineHookRows };
+            self.routine_hook = .{ .ptr = self, .call = &routineHookCall, .call_defaults = &routineHookDefaults, .prepare = &routineHookPrepare, .rows = &routineHookRows, .transition = &routineHookTransition };
             self.session.routines = &self.routine_hook;
             self.session.routine_frame = null;
             self.routine_slot = slot;
@@ -11423,6 +11622,13 @@ pub fn Database(comptime config: Config) type {
             self.rule_active_len = 0;
             self.nested_tables = @splat(0);
             self.scan_tables = @splat(0);
+            self.use_tables = @splat(0);
+            self.nested_use = @splat(0);
+            self.context_len = 0;
+            self.context_captured = false;
+            self.transition_len = 0;
+            self.ri_len = 0;
+            self.ri_base = 0;
             self.installRole();
         }
 
@@ -11450,7 +11656,36 @@ pub fn Database(comptime config: Config) type {
                 provided[bound.mapping[position]] = if (field) |text| try Io.parse(types.typeOfData(column.data_type), column.typmod, text, &self.session) else .null_value;
             }
             var ctx = self.evalContext(source);
-            out.cells = try D.copiedRow(&ctx, table, &provided, .{ .defaults = &bound.defaults, .generated = &bound.generated, .checks = &bound.checks });
+            const derived: D.Derived = .{ .defaults = &bound.defaults, .generated = &bound.generated, .checks = &bound.checks };
+            self.copy_skip = false;
+            // BEFORE ROW triggers between the defaults and NOT NULL,
+            // generated columns and CHECK (B11 wave 5; COPY applies no rules).
+            if (self.beforeRowTriggers(table_index, routine_catalog.tg_insert, snap)) {
+                var cells = try D.copiedRowDeferred(&ctx, table, &provided, derived);
+                self.routine_result = self.copy_result;
+                self.statement_start = tx.subs[tx.sub_len - 1].write_start;
+                if (!(self.beforeRow(table_index, routine_catalog.tg_insert, &cells, null, null, snap) catch |err| return if (err == error.WouldBlock) error.LockNotAvailable else err)) {
+                    self.copy_skip = true;
+                    out.cells = cells;
+                    return;
+                }
+                var check_ctx = self.evalContext(source);
+                try D.finishRow(&check_ctx, table, derived, &cells);
+                out.cells = cells;
+                return;
+            }
+            out.cells = try D.copiedRow(&ctx, table, &provided, derived);
+        }
+
+        /// Whether table `index` (or a partitioned ancestor) has BEFORE ROW
+        /// triggers for `event`.
+        fn beforeRowTriggers(self: *const Self, index: usize, event: u8, snap: Snapshot) bool {
+            var list: [config.triggers]u8 = undefined;
+            const count = self.rowTriggerList(index, snap, &list);
+            for (list[0..count]) |position| {
+                if (triggerMatches(&self.objects.triggers[position], routine_catalog.tg_before, true, event)) return true;
+            }
+            return false;
         }
 
         /// Inserts a built row under the open COPY. A key held by a live
@@ -11461,6 +11696,12 @@ pub fn Database(comptime config: Config) type {
             if (!self.active(slot)) return error.NoActiveTransaction;
             const tx = &self.txs[slot];
             const table_index = tx.copy_table orelse return error.NoActiveTransaction;
+            // A BEFORE ROW trigger returned NULL: the row is not inserted
+            // and not counted (B11 wave 5).
+            if (self.copy_skip) {
+                self.copy_skip = false;
+                return;
+            }
             tx.pin = null;
             tx.waiting_for = .{};
             const snap = tx.copy_snap;
@@ -11500,6 +11741,9 @@ pub fn Database(comptime config: Config) type {
             if (!self.active(slot)) return error.NoActiveTransaction;
             const tx = &self.txs[slot];
             if (tx.copy_table == null) return error.NoActiveTransaction;
+            // AFTER ROW, then AFTER STATEMENT triggers (B11 wave 5); an
+            // error leaves the COPY to the caller's rollback.
+            self.copyTriggers(slot, 0) catch |err| return if (err == error.WouldBlock) error.LockNotAvailable else err;
             const rows = tx.copy_rows;
             tx.copy_table = null;
             tx.copy_rows = 0;
@@ -13381,6 +13625,12 @@ pub fn Database(comptime config: Config) type {
         /// Parses, binds (names read `frame`'s variables) and evaluates an
         /// expression at the top of the statement pool, then restores it.
         pub fn routineEvaluate(self: *Self, frame: *R.Frame, source: []const u8, start: usize, end: usize, goal: ?*const V.Column) Error!V.Cell {
+            return self.routineEvaluateTyped(frame, source, start, end, goal, null);
+        }
+
+        /// routineEvaluate that also reports the expression's type (EXECUTE
+        /// ... USING, B11 wave 5).
+        pub fn routineEvaluateTyped(self: *Self, frame: *R.Frame, source: []const u8, start: usize, end: usize, goal: ?*const V.Column, ty: ?*types.Type) Error!V.Cell {
             const pool = &self.workspace.nodes;
             const mark = poolMark(pool);
             defer poolRestore(pool, mark);
@@ -13395,23 +13645,33 @@ pub fn Database(comptime config: Config) type {
                 };
                 if (!reads) continue;
                 poolRestore(pool, mark);
-                return self.routineQueryValue(frame, source[start..end], goal);
+                return self.routineQueryValue(frame, source[start..end], goal, ty);
             }
-            return self.routineValue(frame, source, id, mark.len, goal);
+            return self.routineValue(frame, source, id, mark.len, goal, ty);
         }
 
         /// `SELECT expr` as a statement of the routine: its one value,
         /// converted like an assignment to `goal`.
-        fn routineQueryValue(self: *Self, frame: *R.Frame, expression: []const u8, goal: ?*const V.Column) Error!V.Cell {
+        fn routineQueryValue(self: *Self, frame: *R.Frame, expression: []const u8, goal: ?*const V.Column, ty: ?*types.Type) Error!V.Cell {
             const prefix = "SELECT ";
             var buffer: [config.routine_bytes + prefix.len]u8 = undefined;
             if (expression.len > config.routine_bytes) return error.TextCapacity;
             @memcpy(buffer[0..prefix.len], prefix);
             @memcpy(buffer[prefix.len..][0..expression.len], expression);
             var capture: R.Capture = .{};
-            _ = try self.routineStatement(frame, buffer[0 .. prefix.len + expression.len], &capture);
+            {
+                // 'PL/pgSQL expression "..."' (or assignment) in the context.
+                const plpgsql = self.contextBody();
+                if (plpgsql) |item| try self.routineContextEnter(.{ .kind = .expression, .current = item.current, .source = item.source });
+                defer if (plpgsql != null) self.routineContextLeave();
+                _ = self.routineStatement(frame, buffer[0 .. prefix.len + expression.len], &capture) catch |err| {
+                    if (plpgsql != null) self.routineContextCapture(err);
+                    return err;
+                };
+            }
             if (capture.count != 1) return error.Syntax;
             var cell: V.Cell = if (capture.rows == 0) .null_value else capture.cells[0];
+            if (ty) |out| out.* = capture.tys[0];
             const column = goal orelse return cell;
             const from = capture.tys[0];
             const to = types.typeOfData(column.data_type);
@@ -13420,7 +13680,7 @@ pub fn Database(comptime config: Config) type {
             return D.store(column, cell, &self.session);
         }
 
-        fn routineValue(self: *Self, frame: *R.Frame, source: []const u8, id: u16, low: usize, goal: ?*const V.Column) Error!V.Cell {
+        fn routineValue(self: *Self, frame: *R.Frame, source: []const u8, id: u16, low: usize, goal: ?*const V.Column, ty: ?*types.Type) Error!V.Cell {
             // A volatile routine's expression sees every earlier change of
             // its transaction (PostgreSQL: CommandCounterIncrement and a new
             // snapshot per evaluation); STABLE / IMMUTABLE keep the caller's.
@@ -13433,9 +13693,20 @@ pub fn Database(comptime config: Config) type {
             context.plans = null;
             context.variables = &frame.variables;
             const bound = try B.bindRoutineExpression(&context, id, goal);
+            if (ty) |out| out.* = self.workspace.nodes.nodes[bound].ty;
             var ctx = self.evalContext(source);
             ctx.frame = frame.evalFrame();
-            return E.eval(&ctx, bound);
+            // PostgreSQL folds a constant expression while planning it, so
+            // its error reports the expression (B11 wave 5); inside a SQL
+            // statement (PERFORM) the statement is reported instead.
+            const direct = self.context_len != 0 and self.context_items[self.context_len - 1].kind == .plpgsql;
+            const plpgsql = if (direct and self.workspace.nodes.nodes[bound].constant) self.contextBody() else null;
+            if (plpgsql) |item| try self.routineContextEnter(.{ .kind = .expression, .current = item.current, .source = item.source });
+            defer if (plpgsql != null) self.routineContextLeave();
+            return E.eval(&ctx, bound) catch |err| {
+                if (plpgsql != null) self.routineContextCapture(err);
+                return err;
+            };
         }
 
         /// `(left) = (right)` (simple CASE statement arms).
@@ -13447,7 +13718,7 @@ pub fn Database(comptime config: Config) type {
             const b = try P.parseExpressionAt(source, right.start, right.end, pool);
             const id = try pool.add(.{ .kind = .binary, .op = .eq, .a = a, .b = b });
             const column: V.Column = .{ .data_type = .boolean };
-            const cell = try self.routineValue(frame, source, id, mark.len, &column);
+            const cell = try self.routineValue(frame, source, id, mark.len, &column, null);
             return cell == .boolean and cell.boolean;
         }
 
@@ -13489,6 +13760,32 @@ pub fn Database(comptime config: Config) type {
                 count += 1;
             }
             return count;
+        }
+
+        /// How many routinePath namespaces precede pg_catalog when the
+        /// search path lists it explicitly (0 when it does not: it is then
+        /// searched first; S071, B11 wave 5).
+        fn routineCatalogRank(self: *const Self, snap: Snapshot) usize {
+            const values = if (self.session_state) |state| &state.values else &self.default_session_state.values;
+            var items = std.mem.splitSequence(u8, values.search_path.slice(), ", ");
+            var seen: [routine_path_capacity]u32 = undefined;
+            var count: usize = 0;
+            while (items.next()) |raw| {
+                var item = raw;
+                if (item.len >= 2 and item[0] == '"' and item[item.len - 1] == '"') item = item[1 .. item.len - 1];
+                if (types.same(item, "pg_catalog")) return count;
+                if (item.len == 0 or types.same(item, "pg_temp")) continue;
+                const namespace: u32 = if (types.same(item, "public")) catalog_module.public_namespace else blk: {
+                    const name = if (types.same(item, "$user")) (self.catalog_objects.roleName(self.session.role, snap) orelse continue) else item;
+                    const found = self.catalog.findSchema(name, snap) orelse continue;
+                    break :blk found.oid;
+                };
+                if (std.mem.indexOfScalar(u32, seen[0..count], namespace) != null) continue;
+                if (count == seen.len) break;
+                seen[count] = namespace;
+                count += 1;
+            }
+            return 0;
         }
 
         /// The first schema of the search path holding a relation (table,
@@ -13568,6 +13865,17 @@ pub fn Database(comptime config: Config) type {
                 out.* = self.routine_diag;
             } else R.Diagnostics.describe(err, out);
             self.routine_diag.active = false;
+            // The context the error had where it was raised.
+            out.context = .{};
+            out.context_overflow = false;
+            if (self.context_captured and self.context_error == err) {
+                out.context_overflow = self.context_overflow;
+                const length = @min(self.context_bytes_len, config.text_bytes);
+                @memcpy(out.context.bytes[0..length], self.context_bytes[0..length]);
+                out.context.len = length;
+                if (self.context_bytes_len > config.text_bytes) out.context_overflow = true;
+            }
+            self.context_captured = false;
         }
 
         /// COMMIT / ROLLBACK inside a procedure or DO block (B11 wave 4).
@@ -13608,9 +13916,8 @@ pub fn Database(comptime config: Config) type {
             // nested deeper inside it.
             const staging = self.row_staging;
             self.row_staging = null;
-            // Inside a running statement only queries, data changes, CALL
-            // and DO run (DDL there is outside the subset).
-            if (nested) if (kind) |which| if (which != .call and which != .do_block) return error.UnsupportedStatement;
+            // Routine DDL (CREATE FUNCTION, TRIGGER, RULE ...) runs nested
+            // too (T651, B11 wave 5); a non-volatile routine runs none.
             if (read_only and kind != null) return error.UnsupportedStatement;
             var mark: usize = 0;
             if (nested) mark = try self.nestedEnter(slot);
@@ -13742,8 +14049,12 @@ pub fn Database(comptime config: Config) type {
                 else => return error.UnsupportedStatement,
             };
             const plans = &self.workspace.plans;
+            self.use_tables = @splat(0);
             for (plans.items[0..plans.len]) |*plan| {
-                for (plan.sources[0..plan.source_count]) |*item| if (item.table) |table| try self.lockTable(slot, table, .access_share);
+                for (plan.sources[0..plan.source_count]) |*item| if (item.table) |table| {
+                    try self.lockTable(slot, table, .access_share);
+                    markTable(&self.use_tables, table);
+                };
             }
             defer {
                 self.workspace.query.pinned_cells = 0;
@@ -13972,9 +14283,25 @@ pub fn Database(comptime config: Config) type {
         /// CREATE [OR REPLACE] FUNCTION / PROCEDURE: validates the signature
         /// and optionally analyzes the quoted body before writing its version.
         fn createRoutine(self: *Self, slot: u16, source: []const u8, definition: *const R.CreateRoutine, snap: Snapshot) Error!void {
+            if (definition.has_setof_table) return self.createSetofRoutine(slot, source, definition, snap);
+            return self.createRoutineFrom(slot, source, definition, snap);
+        }
+
+        /// RETURNS SETOF table: its columns are the TABLE columns, as of
+        /// CREATE (B11 wave 5; PostgreSQL keeps the row type, whose pg_type
+        /// this catalog does not have, so prorettype is record).
+        noinline fn createSetofRoutine(self: *Self, slot: u16, source: []const u8, given: *const R.CreateRoutine, snap: Snapshot) Error!void {
+            var widened = given.*;
+            try self.setofTableColumns(&widened, snap);
+            widened.has_setof_table = false;
+            return self.createRoutineFrom(slot, source, &widened, snap);
+        }
+
+        fn createRoutineFrom(self: *Self, slot: u16, source: []const u8, definition: *const R.CreateRoutine, snap: Snapshot) Error!void {
             const namespace = try self.routineCreateNamespace(definition.has_schema, definition.schema, snap);
             var built: RC.Routine = .{};
             try routineFromDefinition(source, definition, &built);
+            try self.settingsFromCurrent(slot, &built);
             const args = built.args();
             const name = definition.name.slice();
             if (self.objects.routineWriter(namespace, name, args, snap)) |other| return self.waitObject(slot, other);
@@ -14023,8 +14350,30 @@ pub fn Database(comptime config: Config) type {
         /// inputs (the signature), modes, result columns, DEFAULT texts
         /// (from the statement source), RETURNS SETOF / TABLE, SECURITY
         /// DEFINER and SET clauses.
+        /// The table (or view) RETURNS SETOF names: its columns become
+        /// TABLE columns (42704 when no relation has that name; a routine
+        /// with OUT parameters is 42P13).
+        fn setofTableColumns(self: *Self, definition: *R.CreateRoutine, snap: Snapshot) Error!void {
+            const table_index = self.namedTable(&definition.setof_table, snap) catch |err| return if (err == error.TableNotFound) error.UndefinedObject else err;
+            const table = &self.tables[table_index];
+            for (definition.args[0..definition.arg_count]) |arg| if (R.outputMode(arg.mode)) return error.InvalidFunctionDefinition;
+            if (definition.arg_count + table.column_count > config.routine_args) return error.ColumnCapacity;
+            for (table.columns[0..table.column_count]) |*column| {
+                definition.args[definition.arg_count] = .{ .mode = 't', .name = column.name, .oid = types.typeOid(column.data_type), .typmod = column.typmod };
+                definition.arg_count += 1;
+            }
+            definition.rowtype = true;
+            if (table.column_count == 1) {
+                definition.return_oid = types.typeOid(table.columns[0].data_type);
+                definition.return_typmod = table.columns[0].typmod;
+            } else {
+                definition.return_oid = tg.record_oid;
+                definition.return_typmod = -1;
+            }
+        }
+
         fn routineFromDefinition(source: []const u8, definition: *const R.CreateRoutine, item: *RC.Routine) Error!void {
-            item.* = .{ .name = definition.name, .kind = if (definition.procedure) 'p' else 'f', .language = definition.language, .volatility = definition.volatility, .strict = definition.strict, .return_oid = definition.return_oid, .return_typmod = definition.return_typmod, .body = definition.body, .retset = definition.retset, .security_definer = definition.security_definer };
+            item.* = .{ .name = definition.name, .kind = if (definition.procedure) 'p' else 'f', .language = definition.language, .volatility = definition.volatility, .strict = definition.strict, .return_oid = definition.return_oid, .return_typmod = definition.return_typmod, .body = definition.body, .retset = definition.retset, .security_definer = definition.security_definer, .rowtype = definition.rowtype };
             var plain = true;
             for (definition.args[0..definition.arg_count], 0..) |arg, position| {
                 item.param_modes[position] = arg.mode;
@@ -14123,6 +14472,95 @@ pub fn Database(comptime config: Config) type {
             }
         }
 
+        /// `SET name FROM CURRENT` takes the session's value at CREATE, kept
+        /// as SQL text (a search path as its list, others as a string).
+        fn settingsFromCurrent(self: *Self, slot: u16, routine: *RC.Routine) Error!void {
+            var any = false;
+            for (0..routine.setting_count) |index| {
+                const entry = routine.setting(index);
+                any = any or std.mem.endsWith(u8, entry, "=" ++ R.from_current);
+            }
+            if (!any) return;
+            var rebuilt: [RC.arg_bytes]u8 = undefined;
+            var at: usize = 0;
+            for (0..routine.setting_count) |index| {
+                const entry = routine.setting(index);
+                const eq = std.mem.indexOfScalar(u8, entry, '=') orelse return error.InvalidChangeRecord;
+                var value_text: Text = .{};
+                var piece: []const u8 = entry;
+                var quoted: [2 * config.text_bytes + 2]u8 = undefined;
+                if (std.mem.eql(u8, entry[eq + 1 ..], R.from_current)) {
+                    value_text.len = try self.settingText(slot, entry[0..eq], &value_text.bytes);
+                    var writer: CatalogTextWriter = .{ .out = &quoted };
+                    if (Sess.sameInsensitive(entry[0..eq], "search_path")) writer.add(value_text.slice()) else writer.literal(value_text.slice());
+                    if (writer.shortened) return error.TextCapacity;
+                    piece = writer.slice();
+                    if (eq + 1 + piece.len + 1 > rebuilt.len - at) return error.TextCapacity;
+                    @memcpy(rebuilt[at..][0 .. eq + 1], entry[0 .. eq + 1]);
+                    @memcpy(rebuilt[at + eq + 1 ..][0..piece.len], piece);
+                    at += eq + 1 + piece.len;
+                } else {
+                    if (entry.len + 1 > rebuilt.len - at) return error.TextCapacity;
+                    @memcpy(rebuilt[at..][0..entry.len], entry);
+                    at += entry.len;
+                }
+                rebuilt[at] = 0;
+                at += 1;
+            }
+            @memcpy(routine.settings[0..at], rebuilt[0..at]);
+            routine.settings_len = at;
+        }
+
+        /// pg_proc.proconfig: `name=value` per SET clause, the value
+        /// flattened as PostgreSQL's flatten_set_variable_args does (a
+        /// string's content, a search path's items as quoted identifiers
+        /// joined by ", ").
+        fn routineConfig(routine: *const RC.Routine) Error!V.Cell {
+            if (routine.setting_count == 0) return .null_value;
+            var out: Text = .{};
+            var shape: array_module.Shape = .{ .element = .text, .ndim = 1 };
+            shape.dims[0] = @intCast(routine.setting_count);
+            var writer = try V.Arrays.Writer.begin(&out, &shape);
+            for (0..routine.setting_count) |index| {
+                const entry = routine.setting(index);
+                const eq = std.mem.indexOfScalar(u8, entry, '=') orelse return error.InvalidChangeRecord;
+                var cell: V.Cell = .{ .text = .{} };
+                var text: CatalogTextWriter = .{ .out = &cell.text.bytes };
+                for (entry[0..eq]) |byte| text.add(&.{types.lower(byte)});
+                text.add("=");
+                const list = Sess.sameInsensitive(entry[0..eq], "search_path");
+                var cursor = R.Cursor.init(entry, eq + 1) catch return error.InvalidChangeRecord;
+                var first = true;
+                while (!cursor.atEnd()) {
+                    if (!first) text.add(", ");
+                    first = false;
+                    const negative = cursor.takeSymbol(.minus) catch return error.InvalidChangeRecord;
+                    var item: Text = .{};
+                    switch (cursor.current.kind) {
+                        .string => item.len = cursor.string(&item.bytes) catch return error.InvalidChangeRecord,
+                        .word, .quoted_word => {
+                            const ident = cursor.anyIdentifier() catch return error.InvalidChangeRecord;
+                            @memcpy(item.bytes[0..ident.len], ident.slice());
+                            item.len = ident.len;
+                        },
+                        else => {
+                            const raw = entry[cursor.start()..cursor.after()];
+                            @memcpy(item.bytes[0..raw.len], raw);
+                            item.len = raw.len;
+                            cursor.advance() catch return error.InvalidChangeRecord;
+                        },
+                    }
+                    if (negative) text.add("-");
+                    if (list) text.ident(item.slice()) else text.add(item.slice());
+                    if (!(cursor.takeSymbol(.comma) catch return error.InvalidChangeRecord)) break;
+                }
+                if (text.shortened) return error.TextCapacity;
+                cell.text.len = text.len;
+                try writer.append(&cell);
+            }
+            return .{ .array = out };
+        }
+
         fn validateSettings(self: *Self, routine: *const RC.Routine) Error!void {
             if (routine.setting_count == 0) return;
             var scratch_values = self.sessionState().values;
@@ -14185,7 +14623,8 @@ pub fn Database(comptime config: Config) type {
             for (routine.arg_names[0..routine.arg_count], routine.arg_oids[0..routine.arg_count], routine.arg_typmods[0..routine.arg_count]) |*name, oid, typmod| _ = try frame.declare(name.slice(), typeOfOid(oid), typmod);
             for (0..routine.out_count) |output| {
                 if (routine.out_inputs[output] != 0xff) continue;
-                _ = try frame.declare(routine.out_names[output].slice(), typeOfOid(routine.out_oids[output]), routine.out_typmods[output]);
+                // A row type's columns are no variables (no name binds them).
+                _ = try frame.declare(if (routine.rowtype) "" else routine.out_names[output].slice(), typeOfOid(routine.out_oids[output]), routine.out_typmods[output]);
             }
             frame.variables.parameters = frame.variables.count;
             frame.variables.routine_name = routine.name;
@@ -14219,11 +14658,14 @@ pub fn Database(comptime config: Config) type {
         }
 
         /// The statements of a SQL routine body (PostgreSQL's
-        /// check_function_bodies): analyzed until a utility statement.
+        /// check_function_bodies): every statement but utility ones is
+        /// analyzed, also after a utility statement (which does not run:
+        /// a later statement naming a table it creates is 42P01, as in
+        /// PostgreSQL 18).
         fn validateSql(self: *Self, definition: *const RC.Routine, frame: *R.Frame, snap: Snapshot) Error!void {
             const text_body = definition.body.slice();
             var statements: R.Statements = .{ .source = text_body };
-            var analyzable = true;
+            const analyzable = true;
             var final_type: ?types.Type = null;
             var final_types: [config.routine_args]types.Type = @splat(.unknown);
             var final_count: usize = 0;
@@ -14238,17 +14680,13 @@ pub fn Database(comptime config: Config) type {
                 if (R.classify(text) != null) {
                     var routine: R.Statement = undefined;
                     try R.parse(text, &self.workspace.nodes, &routine);
-                    analyzable = false;
                     continue;
                 }
                 var parsed = try P.parse(text, &self.workspace.nodes, .standard);
                 switch (parsed) {
                     .control, .copy => return error.UnsupportedStatement,
                     .select, .query, .insert, .update, .delete, .merge => {},
-                    else => {
-                        analyzable = false;
-                        continue;
-                    },
+                    else => continue,
                 }
                 if (!analyzable) continue;
                 if (parsed == .select) {
@@ -14730,18 +15168,20 @@ pub fn Database(comptime config: Config) type {
             try self.enterScope(routine, &scope);
             const text_body = routine.body.slice();
             if (routine.language == 1) {
-                var interpreter: Interp = .{ .host = self, .source = text_body, .frame = &frame, .purpose = .procedure, .void_result = true };
+                var interpreter: Interp = .{ .host = self, .source = text_body, .frame = &frame, .purpose = .procedure, .void_result = true, .routine_index = chosen, .routine_oid = routine.oid };
                 try interpreter.execute(.run);
             } else {
                 var statements: R.Statements = .{ .source = text_body };
                 var capture: R.Capture = .{};
+                var number: usize = 0;
                 while (try statements.next()) |span| {
                     try self.session.checkpoint();
                     var ahead = statements;
                     const last = (try ahead.next()) == null;
                     // A SQL procedure's outputs come from its final query.
                     const wanted = last and routine.out_count != 0;
-                    _ = try self.routineStatement(&frame, text_body[span.start..span.end], if (wanted) &capture else null);
+                    number += 1;
+                    _ = try self.sqlFunctionStatement(&frame, text_body[span.start..span.end], if (wanted) &capture else null, chosen, number);
                     if (wanted) for (0..routine.out_count) |output| {
                         const value: V.Cell = if (capture.rows == 0 or output >= capture.count) .null_value else capture.cells[output];
                         frame.cells[outputVariable(routine, output)] = try self.castCell(value, if (output < capture.count) capture.tys[output] else .unknown, routine.out_oids[output], routine.out_typmods[output]);
@@ -14862,14 +15302,19 @@ pub fn Database(comptime config: Config) type {
             const result_column = columnOfOid(routine.return_oid, routine.return_typmod);
             const text_body = routine.body.slice();
             if (routine.language == 1) {
-                var interpreter: Interp = .{ .host = self, .source = text_body, .frame = &frame, .purpose = .function, .return_column = result_column, .void_result = routine.out_count != 0 or routine.retset, .retset = routine.retset, .rows = .{ .ptr = sink, .call = emit } };
+                var interpreter: Interp = .{ .host = self, .source = text_body, .frame = &frame, .purpose = .function, .return_column = result_column, .void_result = routine.out_count != 0 or routine.retset or routine.return_oid == tg.void_oid, .retset = routine.retset, .rows = .{ .ptr = sink, .call = emit }, .routine_index = index, .routine_oid = routine.oid };
                 for (0..routine.out_count) |output| interpreter.outputs[output] = @intCast(outputVariable(routine, output));
                 interpreter.output_count = routine.out_count;
                 try interpreter.execute(.run);
                 if (routine.retset) return;
                 if (routine.out_count != 0) {
                     for (0..routine.out_count) |output| row[output] = frame.cells[outputVariable(routine, output)];
-                } else row[0] = interpreter.result;
+                } else row[0] = if (routine.return_oid == tg.void_oid) V.Cell{ .text = .{} } else interpreter.result;
+                return emit(sink, &row);
+            }
+            // A void SQL function runs its statements and gives NULL.
+            if (routine.return_oid == tg.void_oid and !routine.retset) {
+                _ = try self.sqlFunctionBody(&frame, text_body, &result_column, true, index);
                 return emit(sink, &row);
             }
             // SQL: one `SELECT expression, ...`; other bodies that are not
@@ -14898,12 +15343,12 @@ pub fn Database(comptime config: Config) type {
                 var result_columns: [config.columns]V.Column = undefined;
                 if (columns > config.columns) return error.ColumnCapacity;
                 for (0..columns) |column| result_columns[column] = if (routine.out_count != 0) columnOfOid(routine.out_oids[column], routine.out_typmods[column]) else result_column;
-                return self.sqlFunctionRows(&frame, text_body, result_columns[0..columns], routine.retset, .{ .ptr = sink, .call = emit });
+                return self.sqlFunctionRows(&frame, text_body, result_columns[0..columns], routine.retset, .{ .ptr = sink, .call = emit }, index);
             };
             for (0..columns) |column| {
                 if (q.targets[column].star) return error.UnsupportedStatement;
                 const target_column = if (routine.out_count != 0) columnOfOid(routine.out_oids[column], routine.out_typmods[column]) else result_column;
-                const value = try self.routineValue(&frame, text_body, q.targets[column].expr, mark.len, &target_column);
+                const value = try self.routineValue(&frame, text_body, q.targets[column].expr, mark.len, &target_column, null);
                 row[column] = try D.store(&target_column, value, &self.session);
             }
             return emit(sink, &row);
@@ -14951,16 +15396,17 @@ pub fn Database(comptime config: Config) type {
             if (routine.language == 1) {
                 // A function with OUT parameters returns their final values.
                 const outputs = routine.out_count != 0;
-                var interpreter: Interp = .{ .host = self, .source = text_body, .frame = &frame, .purpose = .function, .return_column = result_column, .void_result = outputs or routine.return_oid == tg.void_oid };
+                var interpreter: Interp = .{ .host = self, .source = text_body, .frame = &frame, .purpose = .function, .return_column = result_column, .void_result = outputs or routine.return_oid == tg.void_oid, .routine_index = index, .routine_oid = routine.oid };
                 try interpreter.execute(.run);
-                out.* = if (outputs) frame.cells[outputVariable(routine, 0)] else interpreter.result;
+                // PL/pgSQL returns void as an empty, non-NULL value.
+                out.* = if (outputs) frame.cells[outputVariable(routine, 0)] else if (routine.return_oid == tg.void_oid) V.Cell{ .text = .{} } else interpreter.result;
                 return;
             }
-            if (try self.sqlFunctionExpression(&frame, text_body, &result_column)) |value| {
+            if (routine.return_oid != tg.void_oid) if (try self.sqlFunctionExpression(&frame, text_body, &result_column)) |value| {
                 out.* = value;
                 return;
-            }
-            out.* = try self.sqlFunctionBody(&frame, text_body, &result_column, routine.return_oid == tg.void_oid);
+            };
+            out.* = try self.sqlFunctionBody(&frame, text_body, &result_column, routine.return_oid == tg.void_oid, index);
         }
 
         /// A SQL body that is one SELECT of one expression without FROM is
@@ -14982,7 +15428,7 @@ pub fn Database(comptime config: Config) type {
                 .scalar_subquery, .exists_subquery, .in_subquery => return null,
                 else => {},
             };
-            const value = try self.routineValue(frame, text_body, q.targets[0].expr, mark.len, result_column);
+            const value = try self.routineValue(frame, text_body, q.targets[0].expr, mark.len, result_column, null);
             return try D.store(result_column, value, &self.session);
         }
 
@@ -14994,13 +15440,15 @@ pub fn Database(comptime config: Config) type {
         /// function returns void. This is the entry point for SQL function
         /// bodies beyond one expression: DML bodies, and set-returning bodies
         /// once they collect every row of the final statement.
-        pub fn sqlFunctionBody(self: *Self, frame: *R.Frame, text_body: []const u8, result_column: *const V.Column, void_result: bool) Error!V.Cell {
+        pub fn sqlFunctionBody(self: *Self, frame: *R.Frame, text_body: []const u8, result_column: *const V.Column, void_result: bool, routine: ?usize) Error!V.Cell {
             var statements: R.Statements = .{ .source = text_body };
             var last: R.Capture = .{};
+            var number: usize = 0;
             while (try statements.next()) |span| {
                 try self.session.checkpoint();
                 last = .{};
-                _ = try self.routineStatement(frame, text_body[span.start..span.end], &last);
+                number += 1;
+                _ = try self.sqlFunctionStatement(frame, text_body[span.start..span.end], &last, routine, number);
             }
             if (void_result or last.rows == 0 or last.count == 0) return .null_value;
             var cell = last.cells[0];
@@ -15010,6 +15458,155 @@ pub fn Database(comptime config: Config) type {
                 if (from != to) cell = try E.cast(cell, if (from == .unknown) .text else from, to, result_column.typmod, &self.session);
             }
             return D.store(result_column, cell, &self.session);
+        }
+
+        /// Statement `number` of SQL routine `routine` ('SQL function "f"
+        /// statement N' in the error context).
+        fn sqlFunctionStatement(self: *Self, frame: *R.Frame, text: []const u8, capture: ?*R.Capture, routine: ?usize, number: usize) Error!usize {
+            try self.routineContextEnter(.{ .kind = .sql_function, .routine = routine, .number = number });
+            defer self.routineContextLeave();
+            return self.routineStatement(frame, text, capture) catch |err| {
+                self.routineContextCapture(err);
+                return err;
+            };
+        }
+
+        // ---- routine error context (B11 wave 5) ------------------------------
+
+        pub const context_capacity = 3 * config.routine_depth + config.nested_statements + 4;
+
+        pub fn routineContextEnter(self: *Self, item: R.ContextItem) Error!void {
+            if (self.context_len == context_capacity) return error.StackDepthExceeded;
+            self.context_items[self.context_len] = item;
+            self.context_len += 1;
+        }
+
+        pub fn routineContextLeave(self: *Self) void {
+            self.context_len -= 1;
+        }
+
+        /// The innermost frame of an error records the context it had
+        /// (PG_EXCEPTION_CONTEXT); a handler takes it.
+        pub fn routineContextCapture(self: *Self, err: Error) void {
+            if (self.context_captured) return;
+            self.context_captured = true;
+            self.context_error = err;
+            self.context_overflow = false;
+            self.context_bytes_len = self.renderContext(&self.context_bytes) orelse blk: {
+                self.context_overflow = true;
+                break :blk 0;
+            };
+        }
+
+        /// PG_CONTEXT: the context now.
+        pub fn routineContextText(self: *Self, out: *V.Text) Error!void {
+            const length = self.renderContext(&out.bytes) orelse return error.TextCapacity;
+            out.len = length;
+        }
+
+        /// The context lines, innermost first, as PostgreSQL's error context
+        /// callbacks write them; null when they do not fit `out`.
+        fn renderContext(self: *const Self, out: []u8) ?usize {
+            var writer: ContextWriter = .{ .out = out };
+            var index = self.context_len;
+            while (index != 0) {
+                index -= 1;
+                const item = &self.context_items[index];
+                if (writer.len != 0) writer.add("\n");
+                switch (item.kind) {
+                    .plpgsql => {
+                        writer.add("PL/pgSQL function ");
+                        if (item.routine) |routine| self.writeRoutineSignature(&writer, routine) else writer.add("inline_code_block");
+                        const current = item.current.?;
+                        writer.add(" line ");
+                        var line: usize = 1;
+                        for (item.source[0..@min(current.start, item.source.len)]) |byte| line += @intFromBool(byte == '\n');
+                        writer.number(line);
+                        if (current.during) {
+                            writer.add(" during statement block local variable initialization");
+                        } else {
+                            writer.add(" at ");
+                            writer.add(current.kind);
+                        }
+                    },
+                    .statement => {
+                        writer.add("SQL statement \"");
+                        writer.add(item.source);
+                        writer.add("\"");
+                    },
+                    .expression => {
+                        const current = item.current.?;
+                        writer.add(if (current.assignment) "PL/pgSQL assignment \"" else "PL/pgSQL expression \"");
+                        const end = @min(current.expr_end, item.source.len);
+                        writer.add(std.mem.trim(u8, item.source[@min(current.expr_start, end)..end], " \t\r\n"));
+                        writer.add("\"");
+                    },
+                    .sql_function => {
+                        writer.add("SQL function \"");
+                        if (item.routine) |routine| writer.add(self.objects.routines[routine].name.slice());
+                        writer.add("\" statement ");
+                        writer.number(item.number);
+                    },
+                }
+            }
+            return if (writer.overflow) null else writer.len;
+        }
+
+        /// format_procedure: name(argument types), schema-qualified when
+        /// the search path does not find it.
+        fn writeRoutineSignature(self: *const Self, writer: *ContextWriter, index: usize) void {
+            const routine = &self.objects.routines[index];
+            var path: [routine_path_capacity]u32 = undefined;
+            const count = self.routinePath(self.seq_snap, &path);
+            if (std.mem.indexOfScalar(u32, path[0..count], routine.namespace) == null or self.routineHidden(index, path[0..count], self.seq_snap)) {
+                writer.add(self.namespaceName(routine.namespace));
+                writer.add(".");
+            }
+            writer.add(routine.name.slice());
+            writer.add("(");
+            for (routine.args(), 0..) |oid, position| {
+                if (position != 0) writer.add(",");
+                writer.add(functionTypeName(oid) catch "?");
+            }
+            writer.add(")");
+        }
+
+        const ContextWriter = struct {
+            out: []u8,
+            len: usize = 0,
+            overflow: bool = false,
+
+            fn add(self: *ContextWriter, bytes: []const u8) void {
+                if (bytes.len > self.out.len - self.len) {
+                    self.overflow = true;
+                    return;
+                }
+                @memcpy(self.out[self.len..][0..bytes.len], bytes);
+                self.len += bytes.len;
+            }
+
+            fn number(self: *ContextWriter, value: usize) void {
+                var digits: [24]u8 = undefined;
+                var at = digits.len;
+                var rest = value;
+                while (true) {
+                    at -= 1;
+                    digits[at] = @intCast('0' + rest % 10);
+                    rest /= 10;
+                    if (rest == 0) break;
+                }
+                self.add(digits[at..]);
+            }
+        };
+
+        /// The innermost PL/pgSQL body on the context stack.
+        fn contextBody(self: *const Self) ?R.ContextItem {
+            var index = self.context_len;
+            while (index != 0) {
+                index -= 1;
+                if (self.context_items[index].kind == .plpgsql) return self.context_items[index];
+            }
+            return null;
         }
 
         // ---- triggers -------------------------------------------------------
@@ -15176,9 +15773,69 @@ pub fn Database(comptime config: Config) type {
             frame.cells[first + 7] = textValue(self.namespaceName(table.namespace));
             frame.cells[first + 8] = .{ .integer = @intCast(trigger.nargs) };
             frame.cells[first + 9] = try self.triggerArguments(trigger);
-            var interpreter: Interp = .{ .host = self, .source = routine.body.slice(), .frame = &frame, .purpose = .trigger };
+            // REFERENCING transition tables of an AFTER trigger: its
+            // statement's rows of the trigger's table (T212, B11 wave 5).
+            if (trigger.transitions() and timing == 0) {
+                if (self.transition_len == self.transition_windows.len) return error.StackDepthExceeded;
+                const owner = self.visibleTableSlot(trigger.table_oid, snap) orelse table_index;
+                self.transition_windows[self.transition_len] = .{ .table = owner, .slot = snap.slot, .start = self.statement_start, .end = self.txs[snap.slot].write_len, .cid = snap.cid, .event = event };
+                frame.variables.transition_old = trigger.old_table;
+                frame.variables.transition_new = trigger.new_table;
+                frame.variables.transition = self.transition_len;
+                frame.variables.transition_table = &self.tables[owner];
+                self.transition_len += 1;
+            }
+            defer if (trigger.transitions() and timing == 0) {
+                self.transition_len -= 1;
+            };
+            var interpreter: Interp = .{ .host = self, .source = routine.body.slice(), .frame = &frame, .purpose = .trigger, .routine_index = function, .routine_oid = routine.oid };
             try interpreter.execute(.run);
             return interpreter.record;
+        }
+
+        /// The window of a firing trigger with transition tables: the
+        /// statement's write-set slice, command id and event.
+        pub const TransitionWindow = struct { table: usize = 0, slot: u16 = 0, start: usize = 0, end: usize = 0, cid: u32 = 0, event: u8 = 0 };
+
+        /// A transition table's rows: the row versions the statement wrote
+        /// for the trigger's table (or its partitions), in write order; OLD
+        /// TABLE reads the versions an UPDATE or DELETE replaced.
+        fn routineHookTransition(ptr: *anyopaque, code: u64, sink: *anyopaque, emit: *const fn (sink: *anyopaque, cells: *const anyopaque) Error!void) Error!void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            const index: usize = @intCast(code / 2);
+            const old = code % 2 == 1;
+            if (index >= self.transition_len) return error.TableNotFound;
+            const window = self.transition_windows[index];
+            const tx = &self.txs[window.slot];
+            const owner = &self.tables[window.table];
+            var row: E.Row = undefined;
+            var cells: [config.columns]V.Cell = @splat(.null_value);
+            var position = window.start;
+            while (position < @min(window.end, tx.write_len)) : (position += 1) {
+                const entry = tx.writes[position];
+                const wanted = switch (entry.kind) {
+                    .insert => window.event == tg.tg_insert and !old,
+                    .update => window.event == tg.tg_update,
+                    .delete => window.event == tg.tg_delete and old,
+                    else => false,
+                };
+                if (!wanted) continue;
+                if (entry.table != window.table and !self.descends(entry.table, window.table)) continue;
+                if (self.writeCid(entry) != window.cid) continue;
+                try self.session.checkpoint();
+                const table = &self.tables[entry.table];
+                S.copyVersionRow(table, if (old) entry.old else entry.new, &row);
+                if (entry.table == window.table) {
+                    for (0..owner.column_count) |column| cells[column] = row[column];
+                } else for (owner.columns[0..owner.column_count], 0..) |*column, at| {
+                    // A partition's columns by name (its layout may differ).
+                    cells[at] = .null_value;
+                    for (table.columns[0..table.column_count], 0..) |*own, own_at| {
+                        if (types.same(own.name.slice(), column.name.slice())) cells[at] = row[own_at];
+                    }
+                }
+                try emit(sink, &cells);
+            }
         }
 
         fn anyTrigger(self: *const Self, timing: u8, row: bool, event: u8, snap: Snapshot) bool {
@@ -15231,7 +15888,91 @@ pub fn Database(comptime config: Config) type {
         /// at statement end). `assigned`: the statement's SET list for
         /// UPDATE OF on its own target.
         fn afterTriggers(self: *Self, slot: u16, start: usize, assigned: ?*const [config.columns]u16, snap: Snapshot) Error!void {
-            if (!self.anyTrigger(0, true, tg.tg_insert, snap) and !self.anyTrigger(0, true, tg.tg_update, snap) and !self.anyTrigger(0, true, tg.tg_delete, snap)) return;
+            return self.afterTriggersIn(slot, start, assigned, snap, .{});
+        }
+
+        /// Which writes an AFTER ROW pass fires for: every one, the target
+        /// table's (and its partitions'), or the rows referential actions
+        /// wrote elsewhere (their AFTER STATEMENT triggers interleaved).
+        const AfterScope = struct { target: ?usize = null, cascaded: bool = false };
+
+        /// A referential action's statement triggers (see ri_pairs).
+        pub const RiPair = struct { table: usize = 0, event: u8 = 0, end: usize = 0, done: bool = false };
+
+        /// The AFTER events of an UPDATE / DELETE: when referential actions
+        /// ran, PostgreSQL fires the statement's own AFTER ROW and AFTER
+        /// STATEMENT triggers first, then the actions' row events in write
+        /// order with each action table's AFTER STATEMENT after its latest
+        /// action (B11 wave 5).
+        fn afterEvents(self: *Self, slot: u16, statement_table: usize, assigned: ?*const [config.columns]u16, events: []const u8, snap: Snapshot) Error!void {
+            if (self.ri_len == self.ri_base and !self.cascadedWrites(slot, statement_table, snap)) {
+                try self.afterTriggers(slot, self.statement_start, assigned, snap);
+                return self.statementTriggers(statement_table, 0, events, snap);
+            }
+            try self.afterTriggersIn(slot, self.statement_start, assigned, snap, .{ .target = statement_table });
+            try self.statementTriggers(statement_table, 0, events, snap);
+            try self.afterTriggersIn(slot, self.statement_start, null, snap, .{ .target = statement_table, .cascaded = true });
+            try self.cascadedStatements(snap, null);
+        }
+
+        /// The statement wrote rows of other tables (referential actions).
+        fn cascadedWrites(self: *const Self, slot: u16, statement_table: usize, snap: Snapshot) bool {
+            const tx = &self.txs[slot];
+            for (tx.writes[@min(self.statement_start, tx.write_len)..tx.write_len]) |entry| {
+                switch (entry.kind) {
+                    .insert, .update, .delete => {},
+                    else => continue,
+                }
+                if (self.writeCid(entry) != snap.cid) continue;
+                if (entry.table != statement_table and !self.descends(entry.table, statement_table)) return true;
+            }
+            return false;
+        }
+
+        /// AFTER STATEMENT triggers of the referential actions whose
+        /// latest action ended at or before write index `upto` (all when
+        /// null), in that order.
+        fn cascadedStatements(self: *Self, snap: Snapshot, upto: ?usize) Error!void {
+            while (true) {
+                var next: ?usize = null;
+                for (self.ri_pairs[self.ri_base..self.ri_len], self.ri_base..) |pair, index| {
+                    if (pair.done) continue;
+                    if (upto) |limit| if (pair.end > limit) continue;
+                    if (next == null or pair.end < self.ri_pairs[next.?].end) next = index;
+                }
+                const index = next orelse return;
+                self.ri_pairs[index].done = true;
+                try self.statementTriggers(self.ri_pairs[index].table, 0, &.{self.ri_pairs[index].event}, snap);
+            }
+        }
+
+        /// A referential action on `child` (`event` its DELETE or UPDATE)
+        /// begins: its BEFORE STATEMENT triggers fire once per statement.
+        fn referentialBegin(self: *Self, child: usize, event: u8, snap: Snapshot) Error!?usize {
+            var list: [config.triggers]u8 = undefined;
+            const count = self.objects.tableTriggers(self.tables[child].oid, snap, &list);
+            var statement_triggers = false;
+            for (list[0..count]) |position| {
+                const trigger = &self.objects.triggers[position];
+                statement_triggers = statement_triggers or (trigger.tgtype & tg.tg_row == 0 and trigger.tgtype & event != 0);
+            }
+            if (!statement_triggers) return null;
+            for (self.ri_pairs[self.ri_base..self.ri_len], self.ri_base..) |pair, index| {
+                if (pair.table == child and pair.event == event) return index;
+            }
+            if (self.ri_len == self.ri_pairs.len) return error.ProgramLimitExceeded;
+            const index = self.ri_len;
+            self.ri_pairs[index] = .{ .table = child, .event = event };
+            self.ri_len += 1;
+            try self.statementTriggers(child, tg.tg_before, &.{event}, snap);
+            return index;
+        }
+
+        fn afterTriggersIn(self: *Self, slot: u16, start: usize, assigned: ?*const [config.columns]u16, snap: Snapshot, scope: AfterScope) Error!void {
+            if (!self.anyTrigger(0, true, tg.tg_insert, snap) and !self.anyTrigger(0, true, tg.tg_update, snap) and !self.anyTrigger(0, true, tg.tg_delete, snap)) {
+                if (scope.cascaded) try self.cascadedStatements(snap, null);
+                return;
+            }
             const tx = &self.txs[slot];
             // Statements the triggers run append after `end` and fire their
             // own AFTER triggers; writes of nested statements in between
@@ -15247,6 +15988,11 @@ pub fn Database(comptime config: Config) type {
                     else => continue,
                 };
                 if (self.writeCid(entry) != snap.cid) continue;
+                if (scope.target) |statement_table| {
+                    const own = entry.table == statement_table or self.descends(entry.table, statement_table);
+                    if (own == scope.cascaded) continue;
+                    if (scope.cascaded) try self.cascadedStatements(snap, index);
+                }
                 var list: [config.triggers]u8 = undefined;
                 const count = self.rowTriggerList(entry.table, snap, &list);
                 if (count == 0) continue;
@@ -15261,9 +16007,130 @@ pub fn Database(comptime config: Config) type {
                     try self.session.checkpoint();
                     const trigger = &self.objects.triggers[position];
                     if (!triggerMatches(trigger, 0, true, event)) continue;
+                    // A deferred constraint trigger fires at COMMIT or SET
+                    // CONSTRAINTS ... IMMEDIATE (B11 wave 5).
+                    if (self.triggerDeferred(slot, trigger)) continue;
                     if (!updateOfFires(trigger, event, assigned, new, old)) continue;
                     if (!try self.triggerWhen(trigger, entry.table, new, old)) continue;
                     _ = try self.callTrigger(trigger, entry.table, 0, true, event, new, old, snap);
+                }
+            }
+            if (scope.cascaded) try self.cascadedStatements(snap, null);
+            // The immediate constraint triggers handled everything so far.
+            for (&self.objects.triggers, 0..) |*trigger, trigger_index| {
+                if (trigger.live and trigger.constraint and !self.triggerDeferred(slot, trigger)) tx.trigger_handled[trigger_index] = @intCast(tx.write_len);
+            }
+        }
+
+        /// Whether a constraint trigger is deferred now in transaction
+        /// `slot`: SET CONSTRAINTS by name, else ALL, else INITIALLY.
+        fn triggerDeferred(self: *const Self, slot: u16, trigger: *const RC.Trigger) bool {
+            if (!trigger.constraint or !trigger.deferrable) return false;
+            const tx = &self.txs[slot];
+            for (tx.constraint_modes[0..tx.constraint_mode_count]) |mode| {
+                if (mode.oid == trigger.table_oid and types.same(mode.name.slice(), trigger.name.slice())) return mode.deferred;
+            }
+            if (tx.constraints_all) |deferred| return deferred;
+            return trigger.initially_deferred;
+        }
+
+        /// A deferred constraint trigger has events left (COMMIT fires
+        /// them first).
+        pub fn deferredTriggersPending(self: *const Self, slot: u16) bool {
+            if (!self.active(slot)) return false;
+            const tx = &self.txs[slot];
+            for (&self.objects.triggers, 0..) |*trigger, index| {
+                if (!trigger.live or !trigger.constraint or !trigger.deferrable) continue;
+                var position: usize = @min(tx.trigger_handled[index], tx.write_len);
+                while (position < tx.write_len) : (position += 1) {
+                    const entry = tx.writes[position];
+                    const event: u8 = switch (entry.kind) {
+                        .insert => tg.tg_insert,
+                        .update => tg.tg_update,
+                        .delete => tg.tg_delete,
+                        else => continue,
+                    };
+                    if (trigger.tgtype & event == 0) continue;
+                    if (self.tables[entry.table].oid == trigger.table_oid) return true;
+                    for (&self.tables, 0..) |*table, table_index| {
+                        if (table.live and table.oid == trigger.table_oid and self.descends(entry.table, table_index)) return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        /// COMMIT (and PREPARE TRANSACTION) first fire the deferred
+        /// constraint triggers' events, as SET CONSTRAINTS ALL IMMEDIATE
+        /// does, inside the transaction (an error rolls it back); `result`
+        /// is caller-owned statement storage the trigger statements may use.
+        pub fn fireDeferredTriggers(self: *Self, slot: u16, result: *Result) Error!void {
+            if (!self.deferredTriggersPending(slot)) return;
+            // An autocommit statement's RETURNING rows wait in the workspace
+            // the trigger statements reuse: that case is 0A000.
+            if (self.statement_implicit and self.outcome.returning.count != 0) return error.UnsupportedStatement;
+            const saved = self.outcome;
+            defer self.outcome = saved;
+            try self.statement(slot, "SET CONSTRAINTS ALL IMMEDIATE", result, .{ .hold_result = true });
+        }
+
+        /// The events of the constraint triggers that are immediate now and
+        /// were not handled: in write order, each row's triggers in name
+        /// order (PostgreSQL's after-trigger queue); new writes they make
+        /// are handled by their own statements.
+        fn firePendingTriggers(self: *Self, slot: u16, snap: Snapshot) Error!void {
+            const tx = &self.txs[slot];
+            var order: [config.triggers]u8 = undefined;
+            var count: usize = 0;
+            for (&self.objects.triggers, 0..) |*trigger, index| {
+                if (!trigger.live or !trigger.constraint or !trigger.stamp.visible(snap) or self.triggerDeferred(slot, trigger)) continue;
+                var at = count;
+                while (at > 0 and types.bytesOrder(self.objects.triggers[order[at - 1]].name.slice(), trigger.name.slice()) > 0) : (at -= 1) order[at] = order[at - 1];
+                order[at] = @intCast(index);
+                count += 1;
+            }
+            if (count == 0) return;
+            var marks: [config.triggers]u32 = undefined;
+            while (true) {
+                const end = tx.write_len;
+                var low: usize = end;
+                for (order[0..count]) |index| {
+                    marks[index] = @min(tx.trigger_handled[index], @as(u32, @intCast(end)));
+                    low = @min(low, marks[index]);
+                    tx.trigger_handled[index] = @intCast(end);
+                }
+                if (low >= end) return;
+                var position = low;
+                while (position < end) : (position += 1) {
+                    const entry = tx.writes[position];
+                    const event: u8 = switch (entry.kind) {
+                        .insert => tg.tg_insert,
+                        .update => tg.tg_update,
+                        .delete => tg.tg_delete,
+                        else => continue,
+                    };
+                    const table = &self.tables[entry.table];
+                    var new_row: E.Row = undefined;
+                    var old_row: E.Row = undefined;
+                    var loaded = false;
+                    for (order[0..count]) |index| {
+                        if (position < marks[index]) continue;
+                        const trigger = &self.objects.triggers[index];
+                        if (trigger.tgtype & event == 0) continue;
+                        const owner = self.visibleTableSlot(trigger.table_oid, snap) orelse continue;
+                        if (entry.table != owner and !self.descends(entry.table, owner)) continue;
+                        try self.session.checkpoint();
+                        if (!loaded) {
+                            if (entry.kind != .delete) S.copyVersionRow(table, entry.new, &new_row);
+                            if (entry.kind != .insert) S.copyVersionRow(table, entry.old, &old_row);
+                            loaded = true;
+                        }
+                        const new: ?*E.Row = if (entry.kind != .delete) &new_row else null;
+                        const old: ?*E.Row = if (entry.kind != .insert) &old_row else null;
+                        if (!updateOfFires(trigger, event, null, new, old)) continue;
+                        if (!try self.triggerWhen(trigger, entry.table, new, old)) continue;
+                        _ = try self.callTrigger(trigger, entry.table, 0, true, event, new, old, snap);
+                    }
                 }
             }
         }
@@ -15290,6 +16157,30 @@ pub fn Database(comptime config: Config) type {
             const kind = definition.tgtype;
             const row = kind & tg.tg_row != 0;
             if (table.relkind == 'm' or table.relkind == 'S') return error.WrongObjectType;
+            // REFERENCING transition tables (T212, B11 wave 5): PostgreSQL's
+            // checks in its order.
+            const transitions = definition.old_table.len != 0 or definition.new_table.len != 0;
+            if (transitions) {
+                if (table.relkind == 'v') return error.WrongObjectType;
+                if (row and table.parent != 0) return error.UnsupportedStatement;
+                if (kind & (tg.tg_before | tg.tg_instead) != 0) return error.InvalidObjectDefinition;
+                if (kind & tg.tg_truncate != 0) return error.UnsupportedStatement;
+                const events = kind & (tg.tg_insert | tg.tg_delete | tg.tg_update);
+                if (@popCount(events) > 1) return error.UnsupportedStatement;
+                if (definition.column_count != 0) return error.UnsupportedStatement;
+                if (definition.row_variable) return error.UnsupportedStatement;
+                if (definition.old_table.len != 0 and events & (tg.tg_delete | tg.tg_update) == 0) return error.InvalidObjectDefinition;
+                if (definition.new_table.len != 0 and events & (tg.tg_insert | tg.tg_update) == 0) return error.InvalidObjectDefinition;
+                if (definition.repeated != 0) return error.InvalidObjectDefinition;
+                if (definition.old_table.len != 0 and definition.new_table.len != 0 and types.same(definition.old_table.slice(), definition.new_table.slice())) return error.InvalidObjectDefinition;
+            }
+            // A constraint trigger's FROM table (tgconstrrelid).
+            var constraint_relid: u32 = 0;
+            if (definition.has_from) {
+                const from_index = try self.namedTable(&definition.from, snap);
+                try self.lockTable(slot, from_index, .access_share);
+                constraint_relid = self.tables[from_index].oid;
+            }
             // INSTEAD OF triggers are row triggers of views without column
             // lists or WHEN (B11 wave 4); views have no BEFORE / AFTER row
             // triggers (42809, 0A000 as PostgreSQL).
@@ -15327,12 +16218,17 @@ pub fn Database(comptime config: Config) type {
             try self.reserveWrites(slot, 2);
             const index = try self.objectSlot(.trigger);
             const oid = try self.takeOid();
+            const constraint_oid = if (definition.constraint) try self.takeOid() else 0;
             if (existing) |old| try self.dropObject(slot, .trigger, old, snap);
             const item = &self.objects.triggers[index];
-            item.* = .{ .oid = oid, .name = definition.name, .table_oid = table.oid, .function_oid = routine.oid, .tgtype = kind, .column_count = definition.column_count, .nargs = definition.nargs, .args_len = definition.args_len };
+            item.* = .{ .oid = oid, .name = definition.name, .table_oid = table.oid, .function_oid = routine.oid, .tgtype = kind, .column_count = definition.column_count, .nargs = definition.nargs, .args_len = definition.args_len,
+                .old_table = definition.old_table, .new_table = definition.new_table, .constraint = definition.constraint, .deferrable = definition.deferrable,
+                .initially_deferred = definition.initially_deferred, .constraint_oid = constraint_oid, .constraint_relid = constraint_relid };
             @memcpy(item.columns[0..definition.column_count], columns[0..definition.column_count]);
             @memcpy(item.args[0..definition.args_len], definition.args[0..definition.args_len]);
             try item.when.set(when);
+            // Writes before the trigger existed are not its events.
+            self.txs[slot].trigger_handled[index] = @intCast(self.txs[slot].write_len);
             self.createdObject(slot, .trigger, index, snap);
         }
 
@@ -16556,24 +17452,35 @@ pub fn Database(comptime config: Config) type {
         /// runs nested; a set-returning body emits every row of its final
         /// statement (a query or a RETURNING), another one the first row
         /// (a row of NULLs without one).
-        fn sqlFunctionRows(self: *Self, frame: *R.Frame, text_body: []const u8, columns: []const V.Column, retset: bool, sink: R.Emit) Error!void {
+        fn sqlFunctionRows(self: *Self, frame: *R.Frame, text_body: []const u8, columns: []const V.Column, retset: bool, sink: R.Emit, routine: usize) Error!void {
             var statements: R.Statements = .{ .source = text_body };
             var pending: ?R.Span = null;
+            var number: usize = 0;
             while (try statements.next()) |span| {
                 if (pending) |earlier| {
                     try self.session.checkpoint();
-                    _ = try self.routineStatement(frame, text_body[earlier.start..earlier.end], null);
+                    number += 1;
+                    _ = try self.sqlFunctionStatement(frame, text_body[earlier.start..earlier.end], null, routine, number);
                 }
                 pending = span;
             }
             const last = pending orelse return error.InvalidFunctionDefinition;
             const text = text_body[last.start..last.end];
+            number += 1;
+            try self.routineContextEnter(.{ .kind = .sql_function, .routine = routine, .number = number });
+            defer self.routineContextLeave();
             if (retset) {
-                _ = try self.routineReturnQuery(frame, text, sink, columns);
+                _ = self.routineReturnQuery(frame, text, sink, columns) catch |err| {
+                    self.routineContextCapture(err);
+                    return err;
+                };
                 return;
             }
             var capture: R.Capture = .{};
-            _ = try self.routineStatement(frame, text, &capture);
+            _ = self.routineStatement(frame, text, &capture) catch |err| {
+                self.routineContextCapture(err);
+                return err;
+            };
             var row: [config.columns]V.Cell = @splat(.null_value);
             if (capture.rows != 0) {
                 if (capture.count != columns.len) return error.TypeMismatch;
@@ -16708,12 +17615,15 @@ pub fn Database(comptime config: Config) type {
             stream.value(&self.routine_volatility);
             stream.value(&self.nested_tables);
             stream.value(&self.scan_tables);
+            stream.value(&self.use_tables);
+            stream.value(&self.nested_use);
         }
 
         /// The tables a bound statement scans while it runs (UPDATE / DELETE
         /// / MERGE targets and query sources).
         fn noteScans(self: *Self, bound: *const B.Bound) void {
             self.scan_tables = @splat(0);
+            self.use_tables = @splat(0);
             const scanned: ?usize = switch (bound.*) {
                 .update => |*update| update.table,
                 .delete => |*delete| delete.table,
@@ -16722,6 +17632,12 @@ pub fn Database(comptime config: Config) type {
                 else => null,
             };
             if (scanned) |index| self.markScan(index);
+            if (bound.* == .insert) markTable(&self.use_tables, bound.insert.table);
+            self.noteUses();
+        }
+
+        /// The query sources of the bound plans, scanned while they run.
+        fn noteUses(self: *Self) void {
             const plans = &self.workspace.plans;
             for (plans.items[0..plans.len]) |*plan| {
                 for (plan.sources[0..plan.source_count]) |*item| if (item.table) |table| self.markScan(table);
@@ -16731,6 +17647,20 @@ pub fn Database(comptime config: Config) type {
         fn markScan(self: *Self, index: usize) void {
             if (index >= config.tables) return;
             self.scan_tables[index / 64] |= @as(u64, 1) << @intCast(index % 64);
+            markTable(&self.use_tables, index);
+        }
+
+        fn markTable(set: *[(config.tables + 63) / 64]u64, index: usize) void {
+            if (index >= config.tables) return;
+            set[index / 64] |= @as(u64, 1) << @intCast(index % 64);
+        }
+
+        /// DDL on a table a suspended statement uses (55006, PostgreSQL's
+        /// "cannot DROP TABLE ... because it is being used by active
+        /// queries in this session").
+        fn checkNotInUse(self: *const Self, index: usize) Error!void {
+            if (self.nested_depth == 0 or index >= config.tables) return;
+            if (self.nested_use[index / 64] & (@as(u64, 1) << @intCast(index % 64)) != 0) return error.ObjectInUse;
         }
 
         /// Suspends the running statement for a nested one: saves its state
@@ -16758,6 +17688,8 @@ pub fn Database(comptime config: Config) type {
             X.resetWork(work);
             for (&self.nested_tables, self.scan_tables) |*suspended, scanned| suspended.* |= scanned;
             self.scan_tables = @splat(0);
+            for (&self.nested_use, self.use_tables) |*suspended, used| suspended.* |= used;
+            self.use_tables = @splat(0);
             self.nested_depth += 1;
             self.nested_ran = true;
             return at;
@@ -16835,14 +17767,15 @@ pub fn Database(comptime config: Config) type {
             }
             const extended = class == .routine and self.objects.routines[index].extended();
             const action = class == .rule and self.objects.rules[index].action.len != 0;
+            const trigger_extended = class == .trigger and self.objects.triggers[index].extended();
             const tag: change_log.Op = switch (class) {
                 .routine => if (extended) .create_routine_extended else .create_routine,
-                .trigger => .create_trigger,
+                .trigger => if (trigger_extended) .create_trigger_extended else .create_trigger,
                 .rule => if (action) .create_rule_action else .create_rule,
             };
             switch (class) {
                 .routine => if (extended) try RC.encodeRoutineExtended(&payload, &self.objects.routines[index]) else try RC.encodeRoutine(&payload, &self.objects.routines[index]),
-                .trigger => try RC.encodeTrigger(&payload, &self.objects.triggers[index]),
+                .trigger => if (trigger_extended) try RC.encodeTriggerExtended(&payload, &self.objects.triggers[index]) else try RC.encodeTrigger(&payload, &self.objects.triggers[index]),
                 .rule => if (action) try RC.encodeRuleAction(&payload, &self.objects.rules[index]) else try RC.encodeRule(&payload, &self.objects.rules[index]),
             }
             return C.encodeObject(writer, tag, buffer[0..payload.used]);
@@ -16889,13 +17822,13 @@ pub fn Database(comptime config: Config) type {
                     item.stamp = stamp;
                     oid = item.oid;
                 },
-                @intFromEnum(change_log.Op.create_trigger) => {
+                @intFromEnum(change_log.Op.create_trigger), @intFromEnum(change_log.Op.create_trigger_extended) => {
                     const index = try self.replaySlot(.trigger);
                     const item = &self.objects.triggers[index];
-                    try RC.decodeTrigger(payload, item);
+                    if (tag == @intFromEnum(change_log.Op.create_trigger_extended)) try RC.decodeTriggerExtended(payload, item) else try RC.decodeTrigger(payload, item);
                     item.live = true;
                     item.stamp = stamp;
-                    oid = item.oid;
+                    oid = @max(item.oid, item.constraint_oid);
                 },
                 @intFromEnum(change_log.Op.create_rule), @intFromEnum(change_log.Op.create_rule_action) => {
                     const index = try self.replaySlot(.rule);
@@ -16955,18 +17888,18 @@ pub fn Database(comptime config: Config) type {
 
         /// pg_proc, pg_trigger, pg_rewrite and pg_rules rows.
         fn procRow(sink: *X.RowSink, base: *const [13]Cell) Error!void {
-            return procRowWith(sink, base, false, false);
+            return procRowWith(sink, base, false, false, .null_value);
         }
 
         /// A user routine's row also reports RETURNS SETOF (proretset,
-        /// prorows 1000) and SECURITY DEFINER (B11 wave 4); proconfig
-        /// stays NULL.
-        fn procRowWith(sink: *X.RowSink, base: *const [13]Cell, retset: bool, definer: bool) Error!void {
+        /// prorows 1000), SECURITY DEFINER (B11 wave 4) and its SET clauses
+        /// (proconfig, wave 5).
+        fn procRowWith(sink: *X.RowSink, base: *const [13]Cell, retset: bool, definer: bool, settings: Cell) Error!void {
             var cells: [23]Cell = undefined;
             @memcpy(cells[0..13], base);
             // Built-in routines return one value, run as invoker, have no
             // per-routine settings, transforms or planner support callback.
-            cells[13..].* = .{ boolCell(retset), .null_value, boolCell(definer), .null_value,
+            cells[13..].* = .{ boolCell(retset), .null_value, boolCell(definer), settings,
                 .{ .float4 = if (base[4].integer == operator_catalog.internal_language_oid) 1 else 100 },
                 .{ .float4 = if (retset) 1000 else 0 }, boolCell(false), .null_value, .{ .pg_internal_char = 'u' }, .{ .regproc = 0 } };
             try sink.add(&cells);
@@ -17039,12 +17972,14 @@ pub fn Database(comptime config: Config) type {
                         }
                         const language = if (routine.language == 0) catalog_module.sql_language_oid else catalog_module.plpgsql_language_oid;
                         const acl = if (sink.referencesColumn(12)) try self.routineAcl(routine, snapshot, sink.valueBytes()) else .null_value;
-                        try procRowWith(sink, &.{ intCell(routine.oid), nameCell(routine.name.slice()), intCell(routine.namespace), .{ .pg_internal_char = routine.kind }, intCell(language), .{ .pg_internal_char = routine.volatility }, boolCell(routine.strict), intCell(@intCast(routine.arg_count)), intCell(routine.return_oid), nameCell(argtypes[0..at]), nameCell(routine.body.slice()), intCell(routine.owner), acl }, routine.retset, routine.security_definer);
+                        try procRowWith(sink, &.{ intCell(routine.oid), nameCell(routine.name.slice()), intCell(routine.namespace), .{ .pg_internal_char = routine.kind }, intCell(language), .{ .pg_internal_char = routine.volatility }, boolCell(routine.strict), intCell(@intCast(routine.arg_count)), intCell(routine.return_oid), nameCell(argtypes[0..at]), nameCell(routine.body.slice()), intCell(routine.owner), acl }, routine.retset, routine.security_definer, if (sink.referencesColumn(16)) try routineConfig(routine) else .null_value);
                     }
                 },
                 .pg_trigger => for (&self.objects.triggers) |*trigger| {
                     if (!trigger.live or !trigger.stamp.visible(snapshot)) continue;
-                    try sink.add(&.{ intCell(trigger.oid), intCell(trigger.table_oid), nameCell(trigger.name.slice()), intCell(trigger.function_oid), intCell(trigger.tgtype), .{ .pg_internal_char = 'O' }, boolCell(false), intCell(@intCast(trigger.nargs)), intCell(0) });
+                    try sink.add(&.{ intCell(trigger.oid), intCell(trigger.table_oid), nameCell(trigger.name.slice()), intCell(trigger.function_oid), intCell(trigger.tgtype), .{ .pg_internal_char = 'O' }, boolCell(false), intCell(@intCast(trigger.nargs)), intCell(0),
+                        intCell(trigger.constraint_relid), intCell(trigger.constraint_oid), boolCell(trigger.deferrable), boolCell(trigger.initially_deferred),
+                        if (trigger.old_table.len != 0) nameCell(trigger.old_table.slice()) else .null_value, if (trigger.new_table.len != 0) nameCell(trigger.new_table.slice()) else .null_value });
                 },
                 .pg_rewrite => {
                     for (&self.objects.rules) |*rule| {

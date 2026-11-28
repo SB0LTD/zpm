@@ -392,6 +392,10 @@ pub fn Binder(comptime config: types.Config) type {
             /// public when it is on the path.
             routine_path: []const u32 = &.{},
             routine_path_known: bool = false,
+            /// How many `routine_path` namespaces precede an explicitly
+            /// listed pg_catalog (0: pg_catalog is searched first; S071,
+            /// B11 wave 5).
+            catalog_rank: usize = 0,
             /// The FROM item's call node bindTableFunction binds: it may be
             /// a set-returning routine or return a record (B11 wave 4).
             table_function: u16 = none,
@@ -462,6 +466,13 @@ pub fn Binder(comptime config: types.Config) type {
             routine_name: V.Name = .{},
             /// Parameters of the routine (the first `parameters` items).
             parameters: usize = 0,
+            /// REFERENCING transition tables of the firing trigger (T212,
+            /// B11 wave 5): FROM names reading its statement's rows through
+            /// the trigger's window (Database.transition_windows).
+            transition_old: V.Name = .{},
+            transition_new: V.Name = .{},
+            transition: usize = 0,
+            transition_table: ?*const S.Table = null,
             /// Only nodes in pool[node_low..node_high] (the routine's own
             /// statement or expression) see the variables; view texts and
             /// stored expressions bound with it never do.
@@ -600,7 +611,10 @@ pub fn Binder(comptime config: types.Config) type {
             // `function` is the call (regexp_matches, regexp_split_to_table).
             set_function,
             // XMLTABLE (B11 wave 5 xml lane): `function` is the table node.
-            xml_table };
+            xml_table,
+            // A REFERENCING transition table (B11 wave 5): `function` is an
+            // integer node holding the trigger window's code.
+            transition };
 
         /// A bound query block of the general engine (design §4.9). Its
         /// materialized rows are `width` cells: the `count` visible output
@@ -1309,7 +1323,7 @@ pub fn Binder(comptime config: types.Config) type {
             const n = context.node(id);
             switch (n.kind) {
                 .function => {
-                    if (ast.setFunction(n.func)) return id;
+                    if (ast.setFunction(n.func) or (n.func == .routine and n.boolean)) return id;
                     if (n.window != none) return none;
                     var item = n.b;
                     while (item != none) : (item = context.node(item).next) {
@@ -2433,6 +2447,47 @@ pub fn Binder(comptime config: types.Config) type {
         }
 
         fn typeFunction(context: *const Context, scope: *const Scope, n: *ast.Node) Error!void {
+            const unqualified = n.qualifier.len == 0 and n.func != .routine;
+            typeFunctionCall(context, scope, n) catch |err| {
+                // No built-in takes these arguments: a user function of the
+                // name may (PostgreSQL's candidates span every schema).
+                const builtin = unqualified and n.func != .none and n.func != .routine;
+                if (err != error.UndefinedFunction or !builtin or n.kind != .function or !userRoutineNamed(context, n)) return err;
+                if (n.window != none or n.within_group or n.order != none or n.distinct or n.star or n.c != none) return err;
+                var count: usize = 0;
+                var item = n.b;
+                while (item != none) : (item = context.node(item).next) count += 1;
+                n.func = .none;
+                try bindRoutineCall(context, n, count);
+                return setReturningCall(context, scope, n);
+            };
+            try catalogPlacement(context, n);
+            try setReturningCall(context, scope, n);
+        }
+
+        /// A user set-returning call outside FROM: only one select-list
+        /// target may hold it (ProjectSet, B11 wave 5); elsewhere 0A000.
+        fn setReturningCall(context: *const Context, scope: *const Scope, n: *ast.Node) Error!void {
+            if (n.kind != .function or n.func != .routine or !n.boolean) return;
+            const node_id: u16 = @intCast((@intFromPtr(n) - @intFromPtr(&context.pool.nodes[0])) / @sizeOf(ast.Node));
+            if (context.table_function == node_id) return;
+            const seen = scope.set_calls orelse return error.UnsupportedStatement;
+            seen.* +|= 1;
+        }
+
+        /// A visible user routine of the call's name on the search path.
+        fn userRoutineNamed(context: *const Context, n: *const ast.Node) bool {
+            const set = context.routines orelse return false;
+            if (!context.routine_path_known) return false;
+            const name = toName(context, n.name);
+            for (&set.routines) |*routine| {
+                if (!routine.live or routine.kind != 'f' or !routine.stamp.visible(context.snapshot) or !types.same(routine.name.slice(), name.slice())) continue;
+                if (std.mem.indexOfScalar(u32, context.routine_path, routine.namespace) != null) return true;
+            }
+            return false;
+        }
+
+        fn typeFunctionCall(context: *const Context, scope: *const Scope, n: *ast.Node) Error!void {
             // SQL/XML publishing parts (B11 wave 4): names, not calls.
             if (n.func == .xml_name) {
                 n.ty = .text;
@@ -2892,6 +2947,10 @@ pub fn Binder(comptime config: types.Config) type {
                         .regnamespace => 4089,
                         .none => if (argument.ty == .unknown) 705 else types.typeOid(types.dataTypeOf(argument.ty)),
                     };
+                    // A domain cast's type is the domain (S071).
+                    if (argument.kind == .cast and argument.domain_cast) {
+                        if (try domainIndex(context, argument)) |index| n.integer = context.user_type_catalog.?.items[index].oid;
+                    }
                     n.ty = .regtype;
                     n.constant = false;
                 },
@@ -5332,7 +5391,9 @@ pub fn Binder(comptime config: types.Config) type {
                 .cast => {
                     n.date_bound=false;
                     if (n.flat_record_cast) return;
-                    if (n.cast_type == .unknown) return error.UnsupportedStatement;
+                    // A domain named anywhere in an expression (S071, B11
+                    // wave 5); other user types only as a projected root.
+                    if (n.cast_type == .unknown and !try bindDomainCast(context, n)) return error.UnsupportedStatement;
                     if (ast.regKind(n.typmod) != .none) return regCast(context, scope, n);
                     if (n.typmod == ast.mysql_integer_cast_typmod) {
                         if (context.dialect != .mysql or (n.cast_type == .mysql_bigint_unsigned and config.numeric_digits < 20))
@@ -6093,6 +6154,67 @@ pub fn Binder(comptime config: types.Config) type {
             n.integer = object.composite_field_count;
         }
 
+        /// The domain a cast names (unqualified: the search path's first
+        /// schema with a user type of that name), or null.
+        fn domainIndex(context: *const Context, n: *const ast.Node) Error!?usize {
+            const user_types = context.user_type_catalog orelse return null;
+            const name = toName(context, n.name);
+            const namespace = if (n.qualifier.len == 0 and context.routine_path_known) blk: {
+                for (context.routine_path) |candidate| {
+                    if (user_types.byName(.domain, candidate, name.slice(), context.snapshot) != null or
+                        user_types.byName(.enum_type, candidate, name.slice(), context.snapshot) != null or
+                        user_types.byName(.composite_type, candidate, name.slice(), context.snapshot) != null) break :blk candidate;
+                }
+                break :blk catalog.public_namespace;
+            } else try qualifierNamespace(context, if (n.qualifier.len == 0) null else n.qualifier);
+            return user_types.byName(.domain, namespace, name.slice(), context.snapshot);
+        }
+
+        /// A cast to a domain inside an expression: the base type's cast
+        /// with the domain's constraint; false for other user types.
+        fn bindDomainCast(context: *const Context, n: *ast.Node) Error!bool {
+            if (context.dialect != .postgres or context.user_type_catalog == null or n.name.len == 0) return false;
+            const index = (try domainIndex(context, n)) orelse return false;
+            const info = context.user_type_catalog.?.items[index].domain;
+            n.cast_type = info.base;
+            n.domain_cast = true;
+            n.domain_not_null = info.not_null;
+            n.domain_comparison = info.comparison;
+            n.integer = info.bound;
+            return true;
+        }
+
+        /// pg_catalog placed after a schema of the search path (S071):
+        /// a user function there with the same input types as the
+        /// built-in the call bound hides it, as PostgreSQL's candidate
+        /// list keeps the earlier schema's function of a signature.
+        fn catalogPlacement(context: *const Context, n: *ast.Node) Error!void {
+            if (context.catalog_rank == 0 or n.kind != .function or n.qualifier.len != 0 or n.func == .none or n.func == .routine) return;
+            if (n.window != none or n.within_group or n.order != none or n.distinct or n.star or n.c != none) return;
+            const set = context.routines orelse return;
+            const name = toName(context, n.name);
+            var arg_types: [config.routine_args]types.Type = undefined;
+            var count: usize = 0;
+            var item = n.b;
+            while (item != none) : (item = context.node(item).next) {
+                if (count == arg_types.len) return;
+                arg_types[count] = context.node(item).ty;
+                count += 1;
+            }
+            const path = context.routine_path[0..@min(context.catalog_rank, context.routine_path.len)];
+            for (&set.routines, 0..) |*routine, index| {
+                if (!routine.live or !routine.stamp.visible(context.snapshot) or routine.kind != 'f') continue;
+                if (!types.same(routine.name.slice(), name.slice()) or routine.arg_count != count) continue;
+                if (std.mem.indexOfScalar(u32, path, routine.namespace) == null or routineHidden(set, index, context.routine_path, context.snapshot)) continue;
+                const same_types = for (routine.args(), arg_types[0..count]) |oid, ty| {
+                    if (types.typeFromOid(oid) != types.dataTypeOf(ty)) break false;
+                } else true;
+                if (!same_types) continue;
+                n.func = .none;
+                return bindRoutineCall(context, n, count);
+            }
+        }
+
         fn bindUserTypeCast(context: *const Context, scope: *const Scope, target: u16) Error!?types.NominalColumnType {
             const n = context.node(target);
             if (n.kind != .cast or n.cast_type != .unknown) return null;
@@ -6461,12 +6583,14 @@ pub fn Binder(comptime config: types.Config) type {
             if (routine.return_oid == routine_catalog.trigger_oid) return error.UnsupportedStatement;
             const node_id: u16 = @intCast((@intFromPtr(n) - @intFromPtr(&context.pool.nodes[0])) / @sizeOf(ast.Node));
             const from = context.table_function == node_id;
-            // A record (several OUT parameters) or a set has no scalar
-            // value here; FROM binds them as table functions (0A000).
-            if (!from and (routine.retset or routine.return_oid == routine_catalog.record_oid)) return error.UnsupportedStatement;
+            // A record (several OUT parameters) has no scalar value here;
+            // FROM binds it as a table function (0A000). A set of one
+            // column is a select-list set-returning call (B11 wave 5,
+            // ProjectSet; typeFunction admits it there only).
+            if (!from and (routine.return_oid == routine_catalog.record_oid or (routine.retset and routine.out_count > 1))) return error.UnsupportedStatement;
             const result: types.DataType = if (routine.return_oid == routine_catalog.record_oid) .text else types.typeFromOid(routine.return_oid) orelse return error.UnsupportedStatement;
-            // void routines stay outside expressions (the void type, B11 wave 4).
-            if (result == .void) return error.UnsupportedStatement;
+            // A void routine's value is the void type (B11 wave 5): NULL from
+            // a SQL body, an empty value from PL/pgSQL, as in PostgreSQL.
             // One bound argument per input, in parameter order: converted
             // values, a DEFAULT placeholder, or ARRAY[...] of the variadic
             // elements.
@@ -6501,6 +6625,8 @@ pub fn Binder(comptime config: types.Config) type {
             n.constant = false;
             n.boolean = routine.retset;
             n.c = none;
+            // A select-list set-returning call runs through the routine hook.
+            if (!from and routine.retset) return;
             for (context.inline_calls) |entry| {
                 if (entry.node == node_id and entry.routine == chosen) {
                     n.c = try bindInlineBody(context, routine, entry, from);
@@ -6756,6 +6882,50 @@ pub fn Binder(comptime config: types.Config) type {
                 else => unreachable,
             }
             n.constant = false;
+        }
+
+        /// A FROM name of the firing trigger's own statement that is one of
+        /// its REFERENCING transition tables (after CTE names, before
+        /// relations, as PostgreSQL's ephemeral named relations).
+        fn transitionOf(context: *const Context, item: *const Ast.FromItem) ?u64 {
+            const variables = context.variables orelse return null;
+            if (item.schema != null or (variables.transition_old.len == 0 and variables.transition_new.len == 0)) return null;
+            if (context.stored_source_start != 0 and item.name.span.start >= context.stored_source_start) return null;
+            const name = toName(context, item.name);
+            if (variables.transition_old.len != 0 and types.same(name.slice(), variables.transition_old.slice())) return variables.transition * 2 + 1;
+            if (variables.transition_new.len != 0 and types.same(name.slice(), variables.transition_new.slice())) return variables.transition * 2;
+            return null;
+        }
+
+        /// A transition table's rows: the trigger table's columns.
+        fn bindTransition(context: *const Context, code: u64) Error!u16 {
+            const table = context.variables.?.transition_table orelse return error.TableNotFound;
+            const plans = plansOf(context);
+            const id = try plans.add();
+            const p = &plans.items[id];
+            if (table.column_count > p.names.len) return error.ColumnCapacity;
+            p.series = .transition;
+            p.function = try context.pool.add(.{ .kind = .int_literal, .integer = @intCast(code), .ty = .int8, .constant = true });
+            for (table.columns[0..table.column_count], 0..) |*column, index| {
+                const ty = types.typeOfData(column.data_type);
+                p.targets[index] = try context.pool.add(.{ .kind = .null_literal, .ty = ty, .constant = true });
+                p.tys[index] = ty;
+                p.typmods[index] = column.typmod;
+                p.names[index] = column.name;
+            }
+            p.count = table.column_count;
+            p.width = p.count;
+            return id;
+        }
+
+        /// A transition table cannot be modified (0A000, PostgreSQL's
+        /// "cannot be the target of a modifying statement").
+        fn notTransition(context: *const Context, schema: ?ast.Ident, name: ast.Ident) Error!void {
+            const variables = context.variables orelse return;
+            if (schema != null) return;
+            const wanted = toName(context, name);
+            if ((variables.transition_old.len != 0 and types.same(wanted.slice(), variables.transition_old.slice())) or
+                (variables.transition_new.len != 0 and types.same(wanted.slice(), variables.transition_new.slice()))) return error.UnsupportedStatement;
         }
 
         fn lookupCte(context: *const Context, env: ?*const CteEnv, ident: ast.Ident) ?u8 {
@@ -8699,6 +8869,10 @@ pub fn Binder(comptime config: types.Config) type {
                     // PostgreSQL: WITH query "x" does not have a RETURNING clause.
                     if (plans.ctes[cte].dml != no_dml and !plans.ctes[cte].returning) return error.UnsupportedStatement;
                     if (plans.items[rel.plan].correlated) plans.items[id].correlated = true;
+                } else if (transitionOf(context, item)) |code| {
+                    rel.plan = try bindTransition(context, code);
+                    rel.name = toName(context, item.name);
+                    source.plan = rel.plan;
                 } else if (viewOf(context, item.schema, item.name)) |view| {
                     rel.view = view;
                     if (context.dialect == .postgres) rel.catalog_oid = catalog.bootstrapRelationOid(view) orelse 0;
@@ -9732,6 +9906,7 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 .insert => {
                     const insert = &statement.insert;
+                    try notTransition(context, insert.schema, insert.table);
                     const index = try modifyingTable(context, try resolveQualified(context, insert.schema, insert.table), true);
                     const entry = &context.tables[index];
                     var mapping: [config.columns]usize = @splat(0);
@@ -9813,6 +9988,7 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 .update => {
                     const update = &statement.update;
+                    try notTransition(context, update.schema, update.table);
                     const family = context.family_target != null;
                     const index = try modifyingTable(context, context.family_target orelse try resolveQualified(context, update.schema, update.table), family);
                     const entry = &context.tables[index];
@@ -9852,6 +10028,7 @@ pub fn Binder(comptime config: types.Config) type {
                 },
                 .delete => {
                     const delete = &statement.delete;
+                    try notTransition(context, delete.schema, delete.table);
                     const family = context.family_target != null;
                     const index = try modifyingTable(context, context.family_target orelse try resolveQualified(context, delete.schema, delete.table), family);
                     var scope = tableScope(context, index);
@@ -11539,6 +11716,15 @@ pub fn Binder(comptime config: types.Config) type {
                         found = true;
                     }
                 }
+                // Constraint triggers are constraints too (B11 wave 5).
+                if (context.routines) |objects| for (&objects.triggers) |*trigger| {
+                    if (!trigger.live or !trigger.constraint or !trigger.stamp.visible(context.snapshot) or !types.same(trigger.name.slice(), name.slice())) continue;
+                    if (!trigger.deferrable) return error.WrongObjectType;
+                    if (out.count == out.names.len) return error.TableCapacity;
+                    out.names[out.count] = .{ .oid = trigger.table_oid, .name = name };
+                    out.count += 1;
+                    found = true;
+                };
                 if (!found) return error.UndefinedObject;
             }
             return .{ .set_constraints = out };

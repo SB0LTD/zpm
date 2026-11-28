@@ -46,6 +46,10 @@ pub fn Routines(comptime config: types.Config) type {
         pub const Text = RC.Text;
         pub const Name = V.Name;
 
+        /// CreateRoutine.language of a LANGUAGE C routine while it parses
+        /// (B11 wave 5; never stored: it is 58P01).
+        const c_language: u8 = 2;
+
         pub const Kind = enum { create_function, create_procedure, drop_function, drop_procedure, call, do_block, create_trigger, drop_trigger, create_rule, drop_rule, grant_execute, revoke_execute, alter_function, alter_procedure };
 
         /// A byte range of the statement source.
@@ -91,6 +95,12 @@ pub fn Routines(comptime config: types.Config) type {
             settings: [RC.arg_bytes]u8 = @splat(0),
             settings_len: usize = 0,
             setting_count: usize = 0,
+            /// RETURNS SETOF a table's row type (B11 wave 5): the host adds
+            /// the table's columns as TABLE columns at CREATE.
+            has_setof_table: bool = false,
+            setof_table: TableName = .{},
+            /// The TABLE columns came from that table (not variables).
+            rowtype: bool = false,
 
             /// The input types (the routine's signature).
             pub fn argOids(self: *const CreateRoutine, out: *[config.routine_args]u32) []const u32 {
@@ -172,6 +182,19 @@ pub fn Routines(comptime config: types.Config) type {
             args: [RC.arg_bytes]u8 = @splat(0),
             args_len: usize = 0,
             nargs: usize = 0,
+            /// B11 wave 5: REFERENCING transition tables (`old_row` /
+            /// `new_row`: a ROW variable was named, 0A000), CREATE CONSTRAINT
+            /// TRIGGER with FROM and its deferral; `repeated` names the
+            /// transition listed twice (1 OLD, 2 NEW; 42P17).
+            old_table: Name = .{},
+            new_table: Name = .{},
+            row_variable: bool = false,
+            repeated: u8 = 0,
+            constraint: bool = false,
+            deferrable: bool = false,
+            initially_deferred: bool = false,
+            has_from: bool = false,
+            from: TableName = .{},
         };
 
         pub const DropObject = struct { if_exists: bool = false, cascade: bool = false, name: Name = .{}, table: TableName = .{} };
@@ -508,6 +531,7 @@ pub fn Routines(comptime config: types.Config) type {
             var volatility = false;
             var strictness = false;
             var body = false;
+            var c_symbol = false;
             while (!cursor.atEnd() and !cursor.symbol(.semicolon)) {
                 if (try cursor.take("returns")) {
                     if (cursor.is("null")) {
@@ -551,9 +575,18 @@ pub fn Routines(comptime config: types.Config) type {
                         out.record = true;
                         out.return_oid = routine_catalog.record_oid;
                     } else {
-                        const ret = try typeAt(cursor, pool);
-                        out.return_oid = ret.oid;
-                        out.return_typmod = ret.typmod;
+                        const before = cursor.*;
+                        if (typeAt(cursor, pool)) |ret| {
+                            out.return_oid = ret.oid;
+                            out.return_typmod = ret.typmod;
+                        } else |err| {
+                            // SETOF a relation's row type (resolved at CREATE).
+                            if (!out.retset or (before.current.kind != .word and before.current.kind != .quoted_word)) return err;
+                            cursor.* = before;
+                            out.setof_table = try tableName(cursor);
+                            out.has_setof_table = true;
+                            out.return_oid = routine_catalog.record_oid;
+                        }
                     }
                 } else if (try cursor.take("language")) {
                     if (language) return error.Syntax;
@@ -567,7 +600,9 @@ pub fn Routines(comptime config: types.Config) type {
                         raw = cursor.lexeme();
                         try cursor.advance();
                     } else return error.Syntax;
-                    if (types.keyword(raw, "sql")) out.language = 0 else if (types.keyword(raw, "plpgsql")) out.language = 1 else return error.UndefinedObject;
+                    // C (B11 wave 5): no library can be loaded here, so a C
+                    // routine fails as PostgreSQL's does for a missing file.
+                    if (types.keyword(raw, "sql")) out.language = 0 else if (types.keyword(raw, "plpgsql")) out.language = 1 else if (types.keyword(raw, "c")) out.language = c_language else return error.UndefinedObject;
                 } else if (cursor.is("immutable") or cursor.is("stable") or cursor.is("volatile")) {
                     if (volatility) return error.Syntax;
                     volatility = true;
@@ -609,8 +644,12 @@ pub fn Routines(comptime config: types.Config) type {
                     if (body) return error.Syntax;
                     body = true;
                     out.body.len = try cursor.string(&out.body.bytes);
-                    // AS 'obj_file', 'link_symbol' (C functions) is outside the subset.
-                    if (cursor.symbol(.comma)) return error.UnsupportedStatement;
+                    // AS 'obj_file', 'link_symbol' (C functions).
+                    if (try cursor.takeSymbol(.comma)) {
+                        var symbol: [RC.arg_bytes]u8 = undefined;
+                        _ = try cursor.string(&symbol);
+                        c_symbol = true;
+                    }
                 } else if (cursor.is("return") or cursor.is("begin")) {
                     // SQL-standard bodies (B11 wave 4): RETURN expression,
                     // kept as `SELECT expression`, and BEGIN ATOMIC
@@ -627,6 +666,10 @@ pub fn Routines(comptime config: types.Config) type {
             }
             try finish(cursor);
             if (!body) return error.InvalidFunctionDefinition;
+            // LANGUAGE C: the object file cannot be accessed (58P01, as
+            // PostgreSQL for a missing library); a link symbol needs C.
+            if (language and out.language == c_language) return error.UndefinedFile;
+            if (c_symbol) return error.InvalidFunctionDefinition;
             if (out.sql_body and language and out.language != 0) return error.InvalidFunctionDefinition;
             if (!language and !out.sql_body) return error.InvalidFunctionDefinition;
             if (out.procedure and (volatility or strictness)) return error.InvalidFunctionDefinition;
@@ -677,23 +720,40 @@ pub fn Routines(comptime config: types.Config) type {
             out.body.len = statements.len;
         }
 
-        /// `SET name { TO | = } value [, ...]` or `SET name FROM CURRENT`
-        /// (0A000): kept as `name=value`, the value's source text.
+        /// The value text of `SET name FROM CURRENT` until CREATE replaces
+        /// it with the session's current value (B11 wave 5).
+        pub const from_current = "FROM CURRENT";
+
+        /// `SET name { TO | = } value [, ...]` or `SET name FROM CURRENT`:
+        /// kept as `name=value`, the value's source text (a custom
+        /// `prefix.name` too, B11 wave 5).
         fn settingClause(cursor: *Cursor, out: *CreateRoutine) Error!void {
-            const name = try cursor.anyIdentifier();
-            if (cursor.is("from")) return error.UnsupportedStatement;
-            if (!try cursor.take("to")) try cursor.expectSymbol(.eq);
-            const begin = cursor.start();
-            var end = begin;
-            while (true) {
-                _ = try cursor.takeSymbol(.minus);
-                const kind = cursor.current.kind;
-                if (kind != .word and kind != .quoted_word and kind != .string and kind != .integer and kind != .decimal) return error.Syntax;
-                end = cursor.after();
-                try cursor.advance();
-                if (!try cursor.takeSymbol(.comma)) break;
+            var name = try cursor.anyIdentifier();
+            if (try cursor.takeSymbol(.dot)) {
+                const field = try cursor.anyIdentifier();
+                if (name.len + 1 + field.len > config.name_bytes) return error.NameCapacity;
+                name.bytes[name.len] = '.';
+                @memcpy(name.bytes[name.len + 1 ..][0..field.len], field.slice());
+                name.len += 1 + field.len;
             }
-            const value = std.mem.trim(u8, cursor.source[begin..end], " \t\r\n");
+            var value: []const u8 = undefined;
+            if (try cursor.take("from")) {
+                try cursor.expect("current");
+                value = from_current;
+            } else {
+                if (!try cursor.take("to")) try cursor.expectSymbol(.eq);
+                const begin = cursor.start();
+                var end = begin;
+                while (true) {
+                    _ = try cursor.takeSymbol(.minus);
+                    const kind = cursor.current.kind;
+                    if (kind != .word and kind != .quoted_word and kind != .string and kind != .integer and kind != .decimal) return error.Syntax;
+                    end = cursor.after();
+                    try cursor.advance();
+                    if (!try cursor.takeSymbol(.comma)) break;
+                }
+                value = std.mem.trim(u8, cursor.source[begin..end], " \t\r\n");
+            }
             const length = name.len + 1 + value.len + 1;
             if (out.settings_len + length > out.settings.len or out.setting_count == 255) return error.TextCapacity;
             @memcpy(out.settings[out.settings_len..][0..name.len], name.slice());
@@ -963,10 +1023,15 @@ pub fn Routines(comptime config: types.Config) type {
                 try cursor.expect("replace");
                 out.replace = true;
             }
-            if (cursor.is("constraint")) return error.UnsupportedStatement;
+            // CREATE OR REPLACE CONSTRAINT TRIGGER is 0A000 in PostgreSQL.
+            if (out.replace and cursor.is("constraint")) return error.UnsupportedStatement;
+            out.constraint = try cursor.take("constraint");
             try cursor.expect("trigger");
             out.name = try cursor.identifier();
-            if (try cursor.take("before")) {
+            if (out.constraint) {
+                // A constraint trigger is AFTER ... FOR EACH ROW (grammar).
+                try cursor.expect("after");
+            } else if (try cursor.take("before")) {
                 out.tgtype |= routine_catalog.tg_before;
             } else if (try cursor.take("instead")) {
                 try cursor.expect("of");
@@ -990,12 +1055,54 @@ pub fn Routines(comptime config: types.Config) type {
             }
             try cursor.expect("on");
             out.table = try tableName(cursor);
-            if (cursor.is("from") or cursor.is("referencing") or cursor.is("deferrable") or cursor.is("initially") or cursor.is("not")) return error.UnsupportedStatement;
-            if (try cursor.take("for")) {
+            if (out.constraint) {
+                if (try cursor.take("from")) {
+                    out.from = try tableName(cursor);
+                    out.has_from = true;
+                }
+                // [NOT] DEFERRABLE and INITIALLY IMMEDIATE / DEFERRED, in
+                // any order; INITIALLY DEFERRED alone is DEFERRABLE.
+                var not_deferrable = false;
+                var said_deferrable = false;
+                while (true) {
+                    if (try cursor.take("deferrable")) {
+                        said_deferrable = true;
+                    } else if (cursor.is("not")) {
+                        try cursor.advance();
+                        try cursor.expect("deferrable");
+                        not_deferrable = true;
+                    } else if (try cursor.take("initially")) {
+                        if (try cursor.take("deferred")) {
+                            out.initially_deferred = true;
+                        } else try cursor.expect("immediate");
+                    } else break;
+                }
+                if (not_deferrable and (said_deferrable or out.initially_deferred)) return error.Syntax;
+                out.deferrable = said_deferrable or out.initially_deferred;
+                try cursor.expect("for");
                 _ = try cursor.take("each");
-                if (try cursor.take("row")) {
-                    out.tgtype |= routine_catalog.tg_row;
-                } else try cursor.expect("statement");
+                try cursor.expect("row");
+                out.tgtype |= routine_catalog.tg_row;
+            } else {
+                if (try cursor.take("referencing")) while (true) {
+                    const new = try cursor.take("new");
+                    if (!new) try cursor.expect("old");
+                    if (try cursor.take("row")) {
+                        out.row_variable = true;
+                    } else try cursor.expect("table");
+                    _ = try cursor.take("as");
+                    const name = try cursor.identifier();
+                    const slot = if (new) &out.new_table else &out.old_table;
+                    if (slot.len != 0 and out.repeated == 0) out.repeated = if (new) 2 else 1;
+                    if (slot.len == 0) slot.* = name;
+                    if (!cursor.is("old") and !cursor.is("new")) break;
+                };
+                if (try cursor.take("for")) {
+                    _ = try cursor.take("each");
+                    if (try cursor.take("row")) {
+                        out.tgtype |= routine_catalog.tg_row;
+                    } else try cursor.expect("statement");
+                }
             }
             if (try cursor.take("when")) out.when = try parenthesized(cursor);
             try cursor.expect("execute");
@@ -1268,6 +1375,35 @@ pub fn Routines(comptime config: types.Config) type {
 
         pub const Mode = enum { check, run, skip };
 
+        /// What a running PL/pgSQL body does now (B11 wave 5): PG_CONTEXT
+        /// and PG_EXCEPTION_CONTEXT render it as PostgreSQL's
+        /// plpgsql_exec_error_callback does ("line N at KIND").
+        pub const Current = struct {
+            start: usize = 0,
+            kind: []const u8 = "statement block",
+            /// DECLARE initialization of the block at `start`.
+            during: bool = false,
+            /// The expression being evaluated (an assignment's text runs
+            /// from its target).
+            expr_start: usize = 0,
+            expr_end: usize = 0,
+            assignment: bool = false,
+        };
+
+        /// One line of the routine error context, innermost last: a
+        /// PL/pgSQL body (`current` of its interpreter), a SQL statement it
+        /// runs through SPI, an expression it evaluates as a query, or a
+        /// statement of a SQL function.
+        pub const ContextKind = enum { plpgsql, statement, expression, sql_function };
+        pub const ContextItem = struct {
+            kind: ContextKind,
+            current: ?*const Current = null,
+            source: []const u8 = "",
+            /// The routine's slot (null: a DO block).
+            routine: ?usize = null,
+            number: usize = 0,
+        };
+
         /// Receives one result row (B11 wave 4: set-returning routines).
         pub const Emit = struct { ptr: *anyopaque, call: *const fn (ptr: *anyopaque, cells: *const anyopaque) Error!void };
 
@@ -1449,6 +1585,10 @@ pub fn Routines(comptime config: types.Config) type {
             datatype: V.Text = .{},
             table: V.Text = .{},
             schema: V.Text = .{},
+            /// PG_EXCEPTION_CONTEXT (B11 wave 5); longer than a text value
+            /// it is 54000 when read.
+            context: V.Text = .{},
+            context_overflow: bool = false,
 
             /// The error's own description (no RAISE text).
             pub fn describe(err: Error, out: *Diagnostics) void {
@@ -1514,9 +1654,24 @@ pub fn Routines(comptime config: types.Config) type {
                 /// Blocks with an EXCEPTION clause around the running
                 /// statement (transaction control is 2D000 inside one).
                 atomic_depth: usize = 0,
+                /// The routine's slot and OID (PG_CONTEXT, PG_ROUTINE_OID;
+                /// null / 0 for a DO block) and the statement it runs.
+                routine_index: ?usize = null,
+                routine_oid: u32 = 0,
+                current: Current = .{},
 
                 /// Validates (`check`) or runs the routine body.
                 pub fn execute(self: *Self, mode: Mode) Error!void {
+                    if (mode != .run) return self.executeBody(mode);
+                    try self.host.routineContextEnter(.{ .kind = .plpgsql, .current = &self.current, .source = self.source, .routine = self.routine_index });
+                    defer self.host.routineContextLeave();
+                    self.executeBody(mode) catch |err| {
+                        self.host.routineContextCapture(err);
+                        return err;
+                    };
+                }
+
+                fn executeBody(self: *Self, mode: Mode) Error!void {
                     self.cursor = try Cursor.init(self.source, 0);
                     const name = try self.label();
                     if (!self.cursor.is("declare") and !self.cursor.is("begin")) return error.Syntax;
@@ -1578,8 +1733,57 @@ pub fn Routines(comptime config: types.Config) type {
                 }
 
                 fn statement(self: *Self, mode: Mode) Error!Signal {
+                    if (mode != .run) return self.statementKind(mode);
+                    // PostgreSQL's err_stmt: the innermost statement, the
+                    // enclosing one again once it completed.
+                    const saved = self.current;
+                    const signal = self.statementKind(mode) catch |err| {
+                        self.host.routineContextCapture(err);
+                        return err;
+                    };
+                    self.current = saved;
+                    return signal;
+                }
+
+                /// PostgreSQL's plpgsql_stmt_typename of the statement at the
+                /// cursor (after its label).
+                fn kindName(self: *Self) Error![]const u8 {
+                    const c = &self.cursor;
+                    if (c.is("declare") or c.is("begin")) return "statement block";
+                    if (c.is("loop")) return "LOOP";
+                    if (c.is("while")) return "WHILE";
+                    if (c.is("for")) return "FOR with integer loop variable";
+                    if (c.is("if")) return "IF";
+                    if (c.is("case")) return "CASE";
+                    if (c.is("exit")) return "EXIT";
+                    if (c.is("continue")) return "CONTINUE";
+                    if (c.is("raise")) return "RAISE";
+                    if (c.is("perform")) return "PERFORM";
+                    if (c.is("assert")) return "ASSERT";
+                    if (c.is("commit")) return "COMMIT";
+                    if (c.is("rollback")) return "ROLLBACK";
+                    if (c.is("execute")) return "EXECUTE";
+                    if (c.is("call")) return "CALL";
+                    if (c.is("do")) return "DO";
+                    if (c.is("return")) {
+                        const next = try c.peek();
+                        if (next.kind == .word and types.same(self.source[next.start..next.end], "next")) return "RETURN NEXT";
+                        if (next.kind == .word and types.same(self.source[next.start..next.end], "query")) return "RETURN QUERY";
+                        return "RETURN";
+                    }
+                    if (c.is("get")) {
+                        const next = try c.peek();
+                        if (next.kind == .word and types.same(self.source[next.start..next.end], "stacked")) return "GET STACKED DIAGNOSTICS";
+                        return "GET DIAGNOSTICS";
+                    }
+                    if (sqlWord(c)) return "SQL statement";
+                    return "assignment";
+                }
+
+                fn statementKind(self: *Self, mode: Mode) Error!Signal {
                     const name = try self.label();
                     const c = &self.cursor;
+                    if (mode == .run) self.current = .{ .start = c.start(), .kind = try self.kindName() };
                     if (c.is("declare") or c.is("begin")) return self.block(mode, name, false);
                     if (c.is("loop") or c.is("while") or c.is("for")) return self.loopStatement(mode, name);
                     if (name.len != 0) return error.Syntax;
@@ -1600,6 +1804,7 @@ pub fn Routines(comptime config: types.Config) type {
                         }
                     }
                     if (c.is("commit") or c.is("rollback")) return self.transactionStatement(mode);
+                    if (c.is("execute")) return self.dynamicStatement(mode);
                     if (sqlWord(c)) return self.sqlStatement(mode);
                     return self.assignment(mode);
                 }
@@ -1673,8 +1878,20 @@ pub fn Routines(comptime config: types.Config) type {
                             try self.host.routineCheck(self.source, span.start, span.end);
                             return .null_value;
                         },
-                        .run => return self.host.routineEvaluate(self.frame, self.source, span.start, span.end, goal),
+                        .run => {
+                            self.noteExpression(span, false);
+                            return self.host.routineEvaluate(self.frame, self.source, span.start, span.end, goal);
+                        },
                     }
+                }
+
+                /// The expression a query-evaluated (or constant) expression
+                /// error reports: "PL/pgSQL expression" or, from the
+                /// assignment's target on, "PL/pgSQL assignment".
+                fn noteExpression(self: *Self, span: Span, assigned: bool) void {
+                    self.current.expr_start = if (assigned) self.current.start else span.start;
+                    self.current.expr_end = span.end;
+                    self.current.assignment = assigned;
                 }
 
                 fn boolean(self: *Self, span: Span, mode: Mode) Error!bool {
@@ -1693,12 +1910,15 @@ pub fn Routines(comptime config: types.Config) type {
                     const c = &self.cursor;
                     const saved = self.frame.variables.count;
                     defer self.frame.variables.count = saved;
+                    const statement_current = self.current;
+                    if (mode == .run) self.current = .{ .start = c.start(), .during = true };
                     if (try c.take("declare")) {
                         while (!c.is("begin")) {
                             if (c.atEnd()) return error.Syntax;
                             try self.declaration(mode);
                         }
                     }
+                    if (mode == .run) self.current = statement_current;
                     try c.expect("begin");
                     const body = c.*;
                     const mark = if (mode == .run) self.host.routineMark() else undefined;
@@ -1841,15 +2061,16 @@ pub fn Routines(comptime config: types.Config) type {
                     self.frame.not_null[index] = not_null;
                     if (initial) |span| {
                         if (mode == .run) {
-                            const column = columnOf(typed.spec.ty, typed.spec.typmod);
                             // The default sees the variables declared before it.
                             self.frame.variables.count = index;
-                            const value = self.evaluate(span, mode, &column) catch |err| {
+                            self.noteExpression(span, false);
+                            var from: types.Type = .unknown;
+                            const value = self.host.routineEvaluateTyped(self.frame, self.source, span.start, span.end, null, &from) catch |err| {
                                 self.frame.variables.count = index + 1;
                                 return err;
                             };
                             self.frame.variables.count = index + 1;
-                            try self.store(.{ .index = index, .ty = typed.spec.ty, .typmod = typed.spec.typmod }, value, true);
+                            try self.storeCast(.{ .index = index, .ty = typed.spec.ty, .typmod = typed.spec.typmod }, value, from);
                         } else {
                             self.frame.variables.count = index;
                             _ = try self.evaluate(span, mode, null);
@@ -1912,12 +2133,19 @@ pub fn Routines(comptime config: types.Config) type {
                     }
                 }
 
-                /// Converts a value of type `from` to the target (assignment).
+                /// Converts a value of type `from` to the target (assignment;
+                /// without an assignment cast PL/pgSQL converts through the
+                /// types' text forms, as exec_cast_value's I/O coercion).
                 fn storeCast(self: *Self, place: Target, value: V.Cell, from: types.Type) Error!void {
                     var cell = value;
                     if (cell != .null_value and from != place.ty and from != .unknown) {
-                        if (!value_module.castable(from, place.ty, .assignment) and !(value_module.integral(from) and value_module.integral(place.ty))) return error.TypeMismatch;
-                        cell = try E.cast(cell, from, place.ty, place.typmod, self.host.routineSession());
+                        const session = self.host.routineSession();
+                        if (value_module.castable(from, place.ty, .assignment) or (value_module.integral(from) and value_module.integral(place.ty))) {
+                            cell = try E.cast(cell, from, place.ty, place.typmod, session);
+                        } else {
+                            const text = try E.cast(cell, from, .text, -1, session);
+                            cell = try E.cast(text, .text, place.ty, place.typmod, session);
+                        }
                     } else if (cell != .null_value and from == .unknown and cell == .text and place.ty != .text) {
                         cell = try E.cast(cell, .text, place.ty, place.typmod, self.host.routineSession());
                     }
@@ -1933,9 +2161,10 @@ pub fn Routines(comptime config: types.Config) type {
                         _ = try self.evaluate(span, mode, null);
                         return .normal;
                     }
-                    const column = columnOf(place.ty, place.typmod);
-                    const value = try self.evaluate(span, mode, &column);
-                    try self.store(place, value, false);
+                    var from: types.Type = .unknown;
+                    self.noteExpression(span, true);
+                    const value = try self.host.routineEvaluateTyped(self.frame, self.source, span.start, span.end, null, &from);
+                    try self.storeCast(place, value, from);
                     return .normal;
                 }
 
@@ -2277,7 +2506,7 @@ pub fn Routines(comptime config: types.Config) type {
                     const c = &self.cursor;
                     try c.expect("query");
                     if (self.purpose != .function or !self.retset) return error.TypeMismatch;
-                    if (c.is("execute")) return error.UnsupportedStatement;
+                    if (c.is("execute")) return self.returnQueryExecute(mode);
                     const begin = c.start();
                     var depth: usize = 0;
                     while (!c.atEnd()) {
@@ -2304,7 +2533,12 @@ pub fn Routines(comptime config: types.Config) type {
                                     columns[column] = columnOf(item.ty, item.typmod);
                                 }
                             } else columns[0] = self.return_column;
-                            const rows = try self.host.routineReturnQuery(self.frame, self.source[begin..end], sink, columns[0..count]);
+                            try self.host.routineContextEnter(.{ .kind = .statement, .source = self.source[begin..end] });
+                            defer self.host.routineContextLeave();
+                            const rows = self.host.routineReturnQuery(self.frame, self.source[begin..end], sink, columns[0..count]) catch |err| {
+                                self.host.routineContextCapture(err);
+                                return err;
+                            };
                             self.frame.row_count = rows;
                             self.frame.cells[self.frame.found] = .{ .boolean = rows != 0 };
                         },
@@ -2470,25 +2704,32 @@ pub fn Routines(comptime config: types.Config) type {
                     const begin = c.start();
                     const span = try self.expression(.{});
                     try c.expectSymbol(.semicolon);
+                    // PERFORM runs `SELECT query` and discards it.
+                    var buffer: [config.routine_bytes + 8]u8 = undefined;
+                    const text = self.source[begin..span.end];
+                    if (text.len + 7 > buffer.len) return error.TextCapacity;
+                    @memcpy(buffer[0..7], "SELECT ");
+                    @memcpy(buffer[7..][0..text.len], text);
                     if (findWord(self.source, span, "from") != null or findWord(self.source, span, "where") != null) {
-                        // PERFORM query: run `SELECT query` and discard it.
-                        var buffer: [config.routine_bytes + 8]u8 = undefined;
-                        const text = self.source[begin..span.end];
-                        if (text.len + 7 > buffer.len) return error.TextCapacity;
-                        @memcpy(buffer[0..7], "SELECT ");
-                        @memcpy(buffer[7..][0..text.len], text);
                         if (mode == .skip) return .normal;
                         if (mode == .check) {
                             try self.host.routineCheckStatement(buffer[0 .. 7 + text.len]);
                             return .normal;
                         }
                         var capture: Capture = .{ .rows_only = true };
-                        const rows = try self.host.routineStatement(self.frame, buffer[0 .. 7 + text.len], &capture);
+                        const rows = try self.spiStatement(self.frame, buffer[0 .. 7 + text.len], &capture);
                         self.frame.cells[self.frame.found] = .{ .boolean = rows != 0 };
                         self.frame.row_count = rows;
                         return .normal;
                     }
-                    _ = try self.evaluate(span, mode, null);
+                    if (mode == .run) {
+                        try self.host.routineContextEnter(.{ .kind = .statement, .source = buffer[0 .. 7 + text.len] });
+                        defer self.host.routineContextLeave();
+                        _ = self.evaluate(span, mode, null) catch |err| {
+                            self.host.routineContextCapture(err);
+                            return err;
+                        };
+                    } else _ = try self.evaluate(span, mode, null);
                     if (mode == .run) {
                         self.frame.cells[self.frame.found] = .{ .boolean = true };
                         self.frame.row_count = 1;
@@ -2532,8 +2773,9 @@ pub fn Routines(comptime config: types.Config) type {
                 /// GET [CURRENT] DIAGNOSTICS (ROW_COUNT) and GET STACKED
                 /// DIAGNOSTICS inside a handler (the caught error's SQLSTATE,
                 /// message, detail, hint and RAISE USING names; 0Z002 outside
-                /// a handler). PG_CONTEXT, PG_EXCEPTION_CONTEXT and
-                /// PG_ROUTINE_OID are 0A000.
+                /// a handler). PG_CONTEXT renders the routine context now,
+                /// PG_EXCEPTION_CONTEXT the one the caught error had and
+                /// PG_ROUTINE_OID is the routine's OID (0 in DO; B11 wave 5).
                 fn diagnosticsStatement(self: *Self, mode: Mode) Error!Signal {
                     const c = &self.cursor;
                     try c.expect("get");
@@ -2549,13 +2791,22 @@ pub fn Routines(comptime config: types.Config) type {
                         const item = try c.anyIdentifier();
                         const i = item.slice();
                         if (!stacked) {
-                            if (!types.same(i, "row_count")) return if (types.same(i, "pg_context") or types.same(i, "pg_routine_oid")) error.UnsupportedStatement else error.Syntax;
-                            if (mode == .run) try self.storeCast(place, .{ .integer = @intCast(self.frame.row_count) }, .int8);
+                            if (types.same(i, "row_count")) {
+                                if (mode == .run) try self.storeCast(place, .{ .integer = @intCast(self.frame.row_count) }, .int8);
+                            } else if (types.same(i, "pg_routine_oid")) {
+                                if (mode == .run) try self.storeCast(place, .{ .integer = self.routine_oid }, .oid);
+                            } else if (types.same(i, "pg_context")) {
+                                if (mode == .run) {
+                                    var cell: V.Cell = .{ .text = .{} };
+                                    try self.host.routineContextText(&cell.text);
+                                    try self.storeCast(place, cell, .text);
+                                }
+                            } else return error.Syntax;
                         } else {
-                            if (types.same(i, "pg_exception_context")) return error.UnsupportedStatement;
                             const diag = self.diag;
-                            const value: ?*const V.Text = if (diag == null) null else if (types.same(i, "message_text")) &diag.?.message else if (types.same(i, "pg_exception_detail")) &diag.?.detail else if (types.same(i, "pg_exception_hint")) &diag.?.hint else if (types.same(i, "column_name")) &diag.?.column else if (types.same(i, "constraint_name")) &diag.?.constraint else if (types.same(i, "pg_datatype_name")) &diag.?.datatype else if (types.same(i, "table_name")) &diag.?.table else if (types.same(i, "schema_name")) &diag.?.schema else null;
-                            const known = types.same(i, "returned_sqlstate") or types.same(i, "message_text") or types.same(i, "pg_exception_detail") or types.same(i, "pg_exception_hint") or types.same(i, "column_name") or types.same(i, "constraint_name") or types.same(i, "pg_datatype_name") or types.same(i, "table_name") or types.same(i, "schema_name");
+                            if (types.same(i, "pg_exception_context") and mode == .run and diag != null and diag.?.context_overflow) return error.TextCapacity;
+                            const value: ?*const V.Text = if (diag == null) null else if (types.same(i, "pg_exception_context")) &diag.?.context else if (types.same(i, "message_text")) &diag.?.message else if (types.same(i, "pg_exception_detail")) &diag.?.detail else if (types.same(i, "pg_exception_hint")) &diag.?.hint else if (types.same(i, "column_name")) &diag.?.column else if (types.same(i, "constraint_name")) &diag.?.constraint else if (types.same(i, "pg_datatype_name")) &diag.?.datatype else if (types.same(i, "table_name")) &diag.?.table else if (types.same(i, "schema_name")) &diag.?.schema else null;
+                            const known = types.same(i, "returned_sqlstate") or types.same(i, "pg_exception_context") or types.same(i, "message_text") or types.same(i, "pg_exception_detail") or types.same(i, "pg_exception_hint") or types.same(i, "column_name") or types.same(i, "constraint_name") or types.same(i, "pg_datatype_name") or types.same(i, "table_name") or types.same(i, "schema_name");
                             if (!known) return error.Syntax;
                             if (mode == .run) {
                                 var cell: V.Cell = .{ .text = .{} };
@@ -2630,7 +2881,7 @@ pub fn Routines(comptime config: types.Config) type {
                     const select = types.keyword(firstWord(text), "select") or types.keyword(firstWord(text), "with") or types.keyword(firstWord(text), "values");
                     if (select and into_start == null) return error.Syntax;
                     var capture: Capture = .{};
-                    const rows = try self.host.routineStatement(self.frame, text, if (into_start != null) &capture else null);
+                    const rows = try self.spiStatement(self.frame, text, if (into_start != null) &capture else null);
                     self.frame.row_count = rows;
                     self.frame.cells[self.frame.found] = .{ .boolean = rows != 0 };
                     if (into_start != null) {
@@ -2643,6 +2894,162 @@ pub fn Routines(comptime config: types.Config) type {
                         }
                     }
                     return .normal;
+                }
+
+                /// The parts of EXECUTE: the command expression, INTO targets
+                /// and USING expressions (either clause first, each once).
+                const Dynamic = struct {
+                    command: Span = .{},
+                    into: bool = false,
+                    strict: bool = false,
+                    targets: [config.columns]Target = undefined,
+                    target_count: usize = 0,
+                    using: [config.routine_variables]Span = undefined,
+                    using_count: usize = 0,
+                };
+
+                fn dynamicClauses(self: *Self, mode: Mode, out: *Dynamic, comptime allow_into: bool) Error!void {
+                    const c = &self.cursor;
+                    out.command = try self.expression(.{ .into = allow_into, .using = true });
+                    var has_using = false;
+                    while (!c.symbol(.semicolon)) {
+                        if (allow_into and !out.into and c.is("into")) {
+                            out.into = true;
+                            try c.advance();
+                            out.strict = try c.take("strict");
+                            while (true) {
+                                if (out.target_count == out.targets.len) return error.ColumnCapacity;
+                                out.targets[out.target_count] = try self.target(mode);
+                                out.target_count += 1;
+                                if (!try c.takeSymbol(.comma)) break;
+                            }
+                            continue;
+                        }
+                        if (!has_using and c.is("using")) {
+                            has_using = true;
+                            try c.advance();
+                            while (true) {
+                                if (out.using_count == out.using.len) return error.ColumnCapacity;
+                                out.using[out.using_count] = try self.expression(.{ .comma = true, .into = allow_into });
+                                out.using_count += 1;
+                                if (!try c.takeSymbol(.comma)) break;
+                            }
+                            continue;
+                        }
+                        return error.Syntax;
+                    }
+                    try c.expectSymbol(.semicolon);
+                    if (mode == .check) {
+                        _ = try self.evaluate(out.command, .check, null);
+                        for (out.using[0..out.using_count]) |span| _ = try self.evaluate(span, .check, null);
+                    }
+                }
+
+                /// The command string (22004 when NULL) and a frame holding
+                /// the USING values as $1..$n: dynamic SQL sees no routine
+                /// variables, as in PostgreSQL (an untyped literal is text).
+                fn dynamicPrepare(self: *Self, parts: *const Dynamic, frame: *Frame, string: *V.Cell) Error!void {
+                    const text_column: V.Column = .{ .data_type = .text };
+                    string.* = try self.evaluate(parts.command, .run, &text_column);
+                    if (string.* == .null_value) return error.NullValueNotAllowed;
+                    if (string.* != .text) return error.TypeMismatch;
+                    for (parts.using[0..parts.using_count]) |span| {
+                        var ty: types.Type = .unknown;
+                        self.noteExpression(span, false);
+                        const value = try self.host.routineEvaluateTyped(self.frame, self.source, span.start, span.end, null, &ty);
+                        const index = try frame.declare("", if (ty == .unknown) .text else ty, -1);
+                        frame.cells[index] = value;
+                    }
+                    frame.variables.parameters = frame.variables.count;
+                    // A trigger's transition tables stay visible (SPI).
+                    frame.variables.transition_old = self.frame.variables.transition_old;
+                    frame.variables.transition_new = self.frame.variables.transition_new;
+                    frame.variables.transition = self.frame.variables.transition;
+                    frame.variables.transition_table = self.frame.variables.transition_table;
+                }
+
+                /// EXECUTE command [INTO [STRICT] targets] [USING values]
+                /// (T653, B11 wave 5): every statement of the string runs as
+                /// a statement of the routine (nested inside a running
+                /// statement); the last one's first row fills INTO and its
+                /// row count is ROW_COUNT. FOUND does not change. INTO with a
+                /// command that returns no data is 42601.
+                noinline fn dynamicStatement(self: *Self, mode: Mode) Error!Signal {
+                    try self.cursor.expect("execute");
+                    var parts: Dynamic = .{};
+                    try self.dynamicClauses(mode, &parts, true);
+                    if (mode != .run) return .normal;
+                    var frame: Frame = .{};
+                    var string: V.Cell = .null_value;
+                    try self.dynamicPrepare(&parts, &frame, &string);
+                    const text = string.text.slice();
+                    var statements: Statements = .{ .source = text };
+                    var capture: Capture = .{};
+                    var rows: usize = 0;
+                    var any = false;
+                    while (try statements.next()) |span| {
+                        capture = .{};
+                        any = true;
+                        rows = try self.spiStatement(&frame, text[span.start..span.end], if (parts.into) &capture else null);
+                    }
+                    if (!any) return error.Syntax;
+                    self.frame.row_count = rows;
+                    if (parts.into) {
+                        if (capture.count == 0) return error.Syntax;
+                        if (parts.strict and capture.rows == 0) return error.NoDataFound;
+                        if (parts.strict and capture.rows > 1) return error.TooManyRows;
+                        for (parts.targets[0..parts.target_count], 0..) |place, index| {
+                            const value: V.Cell = if (capture.rows == 0 or index >= capture.count) .null_value else capture.cells[index];
+                            try self.storeCast(place, value, if (index < capture.count) capture.tys[index] else .unknown);
+                        }
+                    }
+                    return .normal;
+                }
+
+                /// RETURN QUERY EXECUTE command [USING values].
+                noinline fn returnQueryExecute(self: *Self, mode: Mode) Error!Signal {
+                    try self.cursor.expect("execute");
+                    var parts: Dynamic = .{};
+                    try self.dynamicClauses(mode, &parts, false);
+                    if (mode != .run) return .normal;
+                    var frame: Frame = .{};
+                    var string: V.Cell = .null_value;
+                    try self.dynamicPrepare(&parts, &frame, &string);
+                    const sink = self.rows orelse return error.UnsupportedStatement;
+                    var columns: [config.routine_args]V.Column = undefined;
+                    var count: usize = 1;
+                    if (self.output_count != 0) {
+                        count = self.output_count;
+                        for (self.outputs[0..count], 0..) |variable, column| {
+                            const item = &self.frame.variables.items[variable];
+                            columns[column] = columnOf(item.ty, item.typmod);
+                        }
+                    } else columns[0] = self.return_column;
+                    const text = string.text.slice();
+                    var statements: Statements = .{ .source = text };
+                    const span = (try statements.next()) orelse return error.Syntax;
+                    if ((try statements.next()) != null) return error.Syntax;
+                    try self.host.routineContextEnter(.{ .kind = .statement, .source = text[span.start..span.end] });
+                    defer self.host.routineContextLeave();
+                    const rows = self.host.routineReturnQuery(&frame, text[span.start..span.end], sink, columns[0..count]) catch |err| {
+                        self.host.routineContextCapture(err);
+                        return err;
+                    };
+                    self.frame.row_count = rows;
+                    self.frame.cells[self.frame.found] = .{ .boolean = rows != 0 };
+                    return .normal;
+                }
+
+                /// A statement run through SPI: 'SQL statement "text"' in the
+                /// error context (trailing blanks trimmed, as PostgreSQL's
+                /// make_execsql_stmt does).
+                fn spiStatement(self: *Self, frame: *Frame, text: []const u8, capture: ?*Capture) Error!usize {
+                    try self.host.routineContextEnter(.{ .kind = .statement, .source = std.mem.trimEnd(u8, text, " \t\r\n") });
+                    defer self.host.routineContextLeave();
+                    return self.host.routineStatement(frame, text, capture) catch |err| {
+                        self.host.routineContextCapture(err);
+                        return err;
+                    };
                 }
 
                 fn firstWord(text: []const u8) []const u8 {

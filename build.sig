@@ -191,6 +191,7 @@ pub fn build(ctx: *sig_build.Build_Context) !void {
     _ = try addContract(ctx, test_sql, "contract-sql-routines", "tests/test_sql_routines.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-routines-sig", "tests/test_sql_routines_sig.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-nested-stmts", "tests/test_sql_nested_stmts.sig", &.{importEntry("sql", "src/core/sql.sig")});
+    _ = try addContract(ctx, test_sql, "contract-sql-routines-trig", "tests/test_sql_routines_trig.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-json-agg", "tests/test_sql_json_agg.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-catalog-security", "tests/test_sql_catalog_security.sig", &.{importEntry("sql", "src/core/sql.sig")});
     _ = try addContract(ctx, test_sql, "contract-sql-text", "tests/test_sql_text.sig", &.{importEntry("sql", "src/core/sql.sig"), importEntry("pg_types", "src/db/pg_types.sig")});

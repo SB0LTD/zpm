@@ -557,10 +557,11 @@ fn setFunctions() !void {
     try fails("CREATE FUNCTION bad2() RETURNS SETOF INT LANGUAGE plpgsql AS $$BEGIN RETURN 1; END$$", error.TypeMismatch);
     try fails("CREATE FUNCTION bad3(OUT a INT) RETURNS SETOF INT LANGUAGE plpgsql AS $$BEGIN RETURN NEXT 1; END$$", error.TypeMismatch);
     try fails("CREATE FUNCTION bad4() RETURNS SETOF INT LANGUAGE plpgsql AS $$BEGIN RETURN NEXT; END$$", error.Syntax);
-    // Not here (0A000): set-returning calls in the target list
-    // (ProjectSet). RETURN QUERY, multi-statement and data-modifying
-    // bodies run as nested statements (contract-sql-nested-stmts).
-    try fails("SELECT names(20)", error.UnsupportedStatement);
+    // A set-returning call in the target list runs per row (ProjectSet,
+    // B11 wave 5, contract-sql-routines-trig). RETURN QUERY,
+    // multi-statement and data-modifying bodies run as nested statements
+    // (contract-sql-nested-stmts).
+    try expect("SELECT names(20)", "a;b");
     try run("CREATE FUNCTION evq(n INT) RETURNS SETOF INT LANGUAGE plpgsql AS $$BEGIN RETURN QUERY SELECT g FROM generate_series(1, n) g; END$$");
     try expect("SELECT * FROM evq(3)", "1;2;3");
     try run("CREATE FUNCTION sqlmulti(a INT) RETURNS INT LANGUAGE sql AS 'SELECT 1; SELECT a + 1'");

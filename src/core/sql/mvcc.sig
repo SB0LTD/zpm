@@ -122,6 +122,11 @@ pub fn Mvcc(comptime config: types.Config) type {
             statement_checks: bool = false,
             /// SET CONSTRAINTS ALL mode (null: each constraint's INITIALLY).
             constraints_all: ?bool = null,
+            /// Per trigger slot (B11 wave 5): the write-set index below which
+            /// a constraint trigger's events were handled (fired, or before
+            /// it existed); its deferred events are the matching writes from
+            /// here on. A rolled-back slice lowers it (abortSlice).
+            trigger_handled: [config.triggers]u32 = @splat(0),
             /// SET CONSTRAINTS name modes, newest last.
             constraint_modes: [config.constraint_modes]ConstraintMode = undefined,
             constraint_mode_count: usize = 0,
@@ -170,6 +175,7 @@ pub fn Mvcc(comptime config: types.Config) type {
         /// Undoes writes[start..] newest first and releases locks[lock_start..].
         pub fn abortSlice(db: anytype, slot: usize, start: usize, lock_start: usize) void {
             const tx = &db.txs[slot];
+            for (&tx.trigger_handled) |*mark| mark.* = @min(mark.*, @as(u32, @intCast(start)));
             var index = tx.write_len;
             while (index > start) {
                 index -= 1;

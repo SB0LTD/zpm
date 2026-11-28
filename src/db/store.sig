@@ -542,8 +542,21 @@ pub fn Store(comptime Raw: type) type {
         }
 
         /// Read-only transactions publish directly; others persist first.
-        fn commit(self: *Self, slot: u16) !void {
+        /// Deferred constraint triggers fire first (B11 wave 5); without
+        /// statement storage (`result`) pending ones are 0A000.
+        fn commit(self: *Self, slot: u16, result: ?*Raw.Result) !void {
             const db = &self.database;
+            if (@hasDecl(@TypeOf(db.*), "fireDeferredTriggers")) {
+                if (result) |storage| {
+                    db.fireDeferredTriggers(slot, storage) catch |err| {
+                        db.abort(slot);
+                        return err;
+                    };
+                } else if (db.deferredTriggersPending(slot)) {
+                    db.abort(slot);
+                    return error.UnsupportedStatement;
+                }
+            }
             // Deferred constraints (SQL COMMIT checks) fail the commit and
             // roll the transaction back, durable or not.
             if (@hasDecl(@TypeOf(db.*), "deferredViolation")) db.deferredViolation(slot) catch |err| {
@@ -899,7 +912,10 @@ pub fn Store(comptime Raw: type) type {
             /// Session values (zone, clocks) for output formatting.
             pub fn valueSession(self: *Connection) *const Raw.SessionValues {
                 if(comptime @hasDecl(Raw,"ReadContext")) if(self.read_context) |context| return &context.session;
-                return &self.db().session;
+                const raw = self.db();
+                // Catalog names for regproc / regtype text (B11 wave 5).
+                if (comptime @hasDecl(Raw, "installOutputHooks")) raw.installOutputHooks();
+                return &raw.session;
             }
             pub fn detachedReadEligible(self:*const Connection) bool {
                 // Detached reads run as the bootstrap superuser: a session
@@ -1032,6 +1048,11 @@ pub fn Store(comptime Raw: type) type {
             }
 
             pub fn commitTransaction(self: *Connection) !void {
+                return self.commitTransactionWith(null);
+            }
+
+            /// COMMIT with statement storage for deferred constraint triggers.
+            pub fn commitTransactionWith(self: *Connection, result: ?*Result) !void {
                 if (self.id == 0) return error.InvalidConnection;
                 if (!self.in_transaction) return;
                 const slot = self.tx.?;
@@ -1046,7 +1067,7 @@ pub fn Store(comptime Raw: type) type {
                 try self.checkTransactionTimeout();
                 // Once durable commit begins, finish its atomic publication.
                 self.transaction_deadline_ns = null;
-                self.store.commit(slot) catch |err| {
+                self.store.commit(slot, result) catch |err| {
                     // The transaction is gone either way, as in PostgreSQL.
                     self.endTransaction(false);
                     return err;
@@ -1057,6 +1078,11 @@ pub fn Store(comptime Raw: type) type {
             /// Sync ends an implicit extended group.
             pub fn finishExtended(self: *Connection) !void {
                 if (self.postgres_extended_implicit) try self.commitTransaction();
+            }
+
+            /// Sync with statement storage for deferred constraint triggers.
+            pub fn finishExtendedWith(self: *Connection, result: *Result) !void {
+                if (self.postgres_extended_implicit) try self.commitTransactionWith(result);
             }
 
             pub fn beginExtendedGroup(self: *Connection) !void {
@@ -1530,7 +1556,7 @@ pub fn Store(comptime Raw: type) type {
                     },
                     .commit => {
                         const explicit = self.in_transaction and !self.postgres_extended_implicit and !self.implicitSimpleQueryBlock();
-                        try self.commitTransaction();
+                        try self.commitTransactionWith(result);
                         if (!explicit) self.warn("25P01", "there is no transaction in progress");
                         result.clear(0);
                         result.command = .commit;
@@ -1555,7 +1581,7 @@ pub fn Store(comptime Raw: type) type {
                         const failed = self.failed;
                         const modes = self.db().chainCharacteristics(self.tx.?, failed);
                         const committing = command == .commit_chain;
-                        if (committing) try self.commitTransaction() else try self.rollbackTransaction();
+                        if (committing) try self.commitTransactionWith(result) else try self.rollbackTransaction();
                         try self.beginTransaction();
                         if (modes) |chained| try self.db().beginModes(self.tx.?, chained);
                         result.clear(0);
@@ -1574,6 +1600,12 @@ pub fn Store(comptime Raw: type) type {
                                     result.command = .rollback;
                                     return;
                                 }
+                                // Deferred constraint triggers fire first (B11 wave 5).
+                                if (comptime @hasDecl(Raw, "fireDeferredTriggers")) self.db().fireDeferredTriggers(slot, result) catch |err| {
+                                    self.db().abort(slot);
+                                    self.endTransaction(false);
+                                    return err;
+                                };
                                 self.store.prepareTransaction(slot, prepared.gid orelse {
                                     self.db().abort(slot);
                                     self.endTransaction(false);
@@ -1767,7 +1799,7 @@ pub fn Store(comptime Raw: type) type {
                 if (implicit) {
                     self.tx = null;
                     self.transaction_deadline_ns = null;
-                    try self.store.commit(slot);
+                    try self.store.commit(slot, result);
                     self.store.database.lastOutcomeInto(result);
                 }
                 if (comptime @hasField(Result, "mysql_generated_id")) {
@@ -1908,8 +1940,19 @@ pub fn Store(comptime Raw: type) type {
             /// subtransaction until copyEnd; copyFail, an error or a
             /// disconnect rolls the whole COPY back. A table-lock wait
             /// parks it (WouldBlock): re-deliver the same statement.
+            /// copyBegin with statement storage for the triggers COPY fires
+            /// (B11 wave 5); it must outlive the COPY.
+            pub fn copyBeginWith(self: *Connection, source: []const u8, result: *Result) !Raw.CopyInfo {
+                return self.copyOpen(source, result);
+            }
+
             pub fn copyBegin(self: *Connection, source: []const u8) !Raw.CopyInfo {
+                return self.copyOpen(source, null);
+            }
+
+            fn copyOpen(self: *Connection, source: []const u8, storage: ?*Result) !Raw.CopyInfo {
                 if (self.id == 0) return error.InvalidConnection;
+                if (comptime @hasDecl(Raw, "copyStorage")) self.db().copyStorage(storage);
                 if (self.pending.active) {
                     const slot = self.tx.?;
                     const implicit = self.pending.implicit;
@@ -2024,11 +2067,15 @@ pub fn Store(comptime Raw: type) type {
                 const slot = self.tx orelse return error.NoActiveTransaction;
                 if (self.pending.active) return error.QueryCanceled;
                 try self.checkTransactionTimeout();
-                const rows = try self.db().copyEnd(slot);
+                const rows = self.db().copyEnd(slot) catch |err| {
+                    self.terminal(self.copy_implicit);
+                    return err;
+                };
+                const storage: ?*Result = if (comptime @hasDecl(Raw, "copyStorageResult")) self.db().copyStorageResult() else null;
                 if (self.copy_implicit) {
                     self.tx = null;
                     self.transaction_deadline_ns = null;
-                    try self.store.commit(slot);
+                    try self.store.commit(slot, storage);
                 }
                 return rows;
             }
