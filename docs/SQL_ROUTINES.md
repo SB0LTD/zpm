@@ -292,8 +292,8 @@ before applying it. RSBASE10 images refuse such routines before writing
 
 ## Wave 5: schema statements, paths, context, transition tables (routines-trig lane)
 
-`contract-sql-routines-trig` (tests/test_sql_routines_trig.sig) covers this
-section with values in PostgreSQL text output, command tags, exact errors
+`contract-sql-routines-trig` (tests/test_sql_routines_trig.sig, 444
+assertions, 223 replayed records) covers this section with values in PostgreSQL text output, command tags, exact errors
 (the SQLSTATE through the error name), atomicity after a failure and
 replay: every committed record is applied to a replica that must answer
 every probe like the primary. Expected values were checked against native
@@ -349,7 +349,14 @@ PostgreSQL 18.7.
   target, which is evaluated per row it returns (PostgreSQL's
   ProjectSet); anywhere else it is 0A000.
 - **RETURNS SETOF table.** The table's (or view's) columns become the
-  routine's TABLE columns, as of CREATE.
+  routine's TABLE columns, as of CREATE (PostgreSQL keeps the row type;
+  this catalog has no pg_type rows for tables, so prorettype is record or
+  the single column's type). They are no PL/pgSQL variables (op-80 flag
+  4). A missing relation is 42704.
+- **External routines (T653).** No C library can be loaded here: CREATE
+  FUNCTION ... LANGUAGE C (AS 'obj_file' [, 'link_symbol']) is 58P01,
+  PostgreSQL's answer for a missing object file. Other unknown languages
+  are 42704 as before.
 
 Triggers:
 
@@ -399,12 +406,14 @@ the transition names, for a constraint trigger its constraint OID and
 FROM table OID, then the op-62 payload. Replay validates every byte
 against PostgreSQL's rules and the overlay (live tables, unused OIDs).
 Op 62 records stay byte-identical; catalog images (RSBASE) refuse op-120
-triggers (0A000). Ops 121-124 stay reserved. Nothing else changed in the
-log: proconfig and FROM CURRENT live in op-80 SET texts.
+triggers (0A000). Ops 121-124 stay reserved. Op 80 gains flag 4 (SETOF
+a table's row type); records without it are unchanged. Nothing else
+changed in the log: proconfig and FROM CURRENT live in op-80 SET texts.
 
-New SQLSTATEs: none (55006 ObjectInUse and 22004 were mapped). Used:
-55006, 22004, 42601, P0002, P0003, 42P02, 42703, 22P02, 22007, 54000,
-42P17, 0A000, 42809, 42P01, P0001, 27000, 23514, 42883, 42704, 55P03.
+New SQLSTATEs: none (55006 ObjectInUse, 58P01 UndefinedFile and 22004
+were mapped). Used: 55006, 58P01, 22004, 42601, P0002, P0003, 42P02,
+42703, 22P02, 22007, 54000, 42P17, 0A000, 42809, 42P01, P0001, 27000,
+23514, 42883, 42704, 55P03.
 
 Not covered (open):
 
@@ -421,17 +430,27 @@ Not covered (open):
   triggers; PostgreSQL runs the actions from its after-trigger queue,
   interleaved with the parent's AFTER ROW triggers. Multi-level cascades
   fire their AFTER events in write order.
-- Constraint triggers have no pg_constraint row (contype 't').
+- Constraint triggers have no pg_constraint row (contype 't'). An
+  autocommit statement with RETURNING whose rows leave deferred
+  constraint-trigger events is 0A000 (its rows wait in the workspace the
+  trigger statements reuse); PostgreSQL returns them.
 - A lock wait inside COPY's triggers is 55P03 (the COPY cannot park
   there); deferred constraint triggers left at a COMMIT without statement
   storage (a Store commit from copyEnd without copyBeginWith) are 0A000.
 - PG_EXCEPTION_CONTEXT for errors PostgreSQL raises while planning (for
   example while inlining a SQL function) can differ.
-- T323: information_schema.routines (security_type) belongs to the
-  catalog lane. T653 needs no C-language routines.
-- Rule actions: SELECT and NOTIFY actions, RETURNING in actions, ALSO and
-  conditional rules on views without INSTEAD OF triggers, and
-  PostgreSQL's query-tree semantics for aggregating actions stay open.
+- T323: SECURITY DEFINER / INVOKER work (wave 4);
+  information_schema.routines (security_type) belongs to the catalog
+  lane. LANGUAGE internal routines are 42704 (PostgreSQL maps them to
+  its built-in C symbols).
+- Rule actions stay as wave 4 left them (docs/SQL_NESTED_STATEMENTS.md):
+  SELECT and NOTIFY actions and RETURNING in actions are 0A000 at CREATE
+  RULE; ALSO or conditional INSTEAD rules on a view without INSTEAD OF
+  triggers are 0A000 where PostgreSQL runs the automatic update beside an
+  ALSO action and reports 55000 otherwise; an action runs once per row
+  where PostgreSQL runs it once joined with all the original rows (an
+  aggregating ALSO action over 3 inserted rows sums 3 times in
+  PostgreSQL).
 
 ## Not covered (open)
 

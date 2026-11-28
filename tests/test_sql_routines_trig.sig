@@ -632,6 +632,9 @@ fn constraintTriggers() !void {
     // Autocommit statements fire their deferred events before committing.
     try run("INSERT INTO t VALUES (5)");
     try expect("SELECT what, n FROM log ORDER BY what", "cdef:INSERT:5|3;cimm:INSERT:5|3");
+    // An autocommit RETURNING statement with deferred events is 0A000
+    // here (PostgreSQL returns its rows).
+    try rejects("INSERT INTO t VALUES (6) RETURNING a", error.UnsupportedStatement, "SELECT count(*) FROM t", "3");
     // A deferred raise rolls the whole transaction back at COMMIT.
     try run("DELETE FROM log");
     try run("CREATE FUNCTION fail() RETURNS TRIGGER LANGUAGE plpgsql AS $$BEGIN IF NEW.a < 0 THEN RAISE EXCEPTION 'negative %', NEW.a; END IF; RETURN NULL; END$$");

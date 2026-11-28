@@ -16066,6 +16066,9 @@ pub fn Database(comptime config: Config) type {
         /// is caller-owned statement storage the trigger statements may use.
         pub fn fireDeferredTriggers(self: *Self, slot: u16, result: *Result) Error!void {
             if (!self.deferredTriggersPending(slot)) return;
+            // An autocommit statement's RETURNING rows wait in the workspace
+            // the trigger statements reuse: that case is 0A000.
+            if (self.statement_implicit and self.outcome.returning.count != 0) return error.UnsupportedStatement;
             const saved = self.outcome;
             defer self.outcome = saved;
             try self.statement(slot, "SET CONSTRAINTS ALL IMMEDIATE", result, .{ .hold_result = true });
