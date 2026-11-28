@@ -518,6 +518,36 @@ fn joins() !void {
     try both("DROP TABLE p");
 }
 
+/// Rows that BEFORE triggers change and that referential actions update or
+/// delete reach the trees through the same version writes.
+fn triggersAndActions() !void {
+    try both("CREATE TABLE tp (id INT PRIMARY KEY, k INT)");
+    try both("CREATE TABLE tc (id INT PRIMARY KEY, pid INT REFERENCES tp (id) ON UPDATE CASCADE ON DELETE CASCADE, k INT)");
+    try both("CREATE FUNCTION tk_scale() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN NEW.k := NEW.k * 10; RETURN NEW; END$$");
+    try both("CREATE TRIGGER tc_scale BEFORE INSERT OR UPDATE ON tc FOR EACH ROW EXECUTE FUNCTION tk_scale()");
+    try primary("CREATE INDEX tc_pid ON tc (pid)");
+    try primary("CREATE INDEX tc_k ON tc (k DESC)");
+    try both("INSERT INTO tp SELECT g, g % 4 FROM generate_series(1, 12) g");
+    try both("INSERT INTO tc SELECT g, g % 12 + 1, g % 5 FROM generate_series(1, 60) g");
+    const cases = [_][]const u8{
+        "SELECT id, pid, k FROM tc WHERE pid = 3",
+        "SELECT id, k FROM tc WHERE k >= 20 ORDER BY k DESC, id",
+        "SELECT tp.id, tc.id FROM tp JOIN tc ON tc.pid = tp.id WHERE tp.k = 1",
+        "SELECT min(k), max(k), count(*) FROM tc",
+    };
+    for (cases) |source| try agree(source);
+    try both("UPDATE tp SET id = id + 100 WHERE id % 3 = 0");
+    try both("UPDATE tc SET k = k + 1 WHERE id % 4 = 0");
+    try both("DELETE FROM tp WHERE id IN (1, 2, 104)");
+    for (cases) |source| try agree(source);
+    try agree("SELECT id, pid FROM tc WHERE pid > 100 ORDER BY pid, id");
+    try valid(&with, "tc");
+    try valid(&replica, "tc");
+    try replicated("SELECT id, pid, k FROM tc ORDER BY id");
+    try both("DROP TABLE tc");
+    try both("DROP TABLE tp");
+}
+
 // ---- UNIQUE through the btree ----------------------------------------------
 
 fn parks(slot: u16, source: []const u8) !void {
@@ -790,6 +820,7 @@ pub fn main(init: std.process.Init) !void {
     try minMax();
     try joins();
     try uniqueness();
+    try triggersAndActions();
     try capacity();
     try craftedRecords();
     try benchmark(init.io);
