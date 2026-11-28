@@ -214,8 +214,7 @@ and replay; every expectation was checked against native PostgreSQL 18.7.
   lookup. Unqualified names search the search path in order (`"$user"`,
   public); a routine with the same input types in an earlier schema hides
   later ones, and unqualified CREATE uses the first existing schema.
-  pg_catalog's built-ins still match first, whatever pg_catalog's place
-  in the path. DROP SCHEMA RESTRICT keeps routines (2BP01); CASCADE drops
+  pg_catalog's place in the path counts since wave 5 (below). DROP SCHEMA RESTRICT keeps routines (2BP01); CASCADE drops
   them (and their triggers) before the schema. SET search_path itself
   accepts only `$user`, public, pg_catalog and pg_temp (session lane), so
   paths over other schemas cannot be set yet.
@@ -258,7 +257,7 @@ and replay; every expectation was checked against native PostgreSQL 18.7.
   undone afterwards together with any setting the routine changed; an
   unknown setting is 42704 and a bad value 22023 at CREATE; settings the
   store implements, SET ROLE and transaction modes are 0A000. pg_proc
-  reports prosecdef, proretset and prorows; proconfig stays NULL.
+  reports prosecdef, proretset and prorows; proconfig since wave 5.
 - **Diagnostics.** SQLSTATE and SQLERRM inside handlers, GET STACKED
   DIAGNOSTICS (RETURNED_SQLSTATE, MESSAGE_TEXT, PG_EXCEPTION_DETAIL,
   PG_EXCEPTION_HINT, COLUMN_NAME, CONSTRAINT_NAME, PG_DATATYPE_NAME,
@@ -268,7 +267,7 @@ and replay; every expectation was checked against native PostgreSQL 18.7.
   (P0004), which OTHERS does not catch. SQLERRM is PostgreSQL's text for
   RAISE, ASSERT and conditions with a fixed message; other engine errors
   report the engine's diagnostic text. PG_EXCEPTION_CONTEXT, PG_CONTEXT
-  and PG_ROUTINE_OID are 0A000.
+  and PG_ROUTINE_OID: wave 5 (below).
 - **Transaction control.** COMMIT / ROLLBACK [AND [NO] CHAIN] in PL/pgSQL
   procedures and DO blocks are accepted at CREATE and fail with 2D000
   where PostgreSQL forbids them (an explicit transaction block, a function
@@ -290,6 +289,150 @@ types against the OUT parameters, NUL-terminated defaults and settings)
 before applying it. RSBASE10 images refuse such routines before writing
 (SnapshotUnsupportedState). Ops 81-84 stay reserved for this lane.
 
+
+## Wave 5: schema statements, paths, context, transition tables (routines-trig lane)
+
+`contract-sql-routines-trig` (tests/test_sql_routines_trig.sig) covers this
+section with values in PostgreSQL text output, command tags, exact errors
+(the SQLSTATE through the error name), atomicity after a failure and
+replay: every committed record is applied to a replica that must answer
+every probe like the primary. Expected values were checked against native
+PostgreSQL 18.7.
+
+- **SQL-schema statements in routines (T651, T653).** DDL runs inside SQL
+  and PL/pgSQL functions called from expressions (as nested statements),
+  in procedures and DO blocks, routine DDL (CREATE FUNCTION, TRIGGER,
+  RULE ...) included; a STABLE or IMMUTABLE routine runs none (0A000).
+  DROP / ALTER / TRUNCATE / CREATE INDEX of a table a suspended statement
+  uses (its sources and its target) is 55006, PostgreSQL's
+  CheckTableNotInUse. Void functions are values of the void type in
+  expressions and FROM (NULL from a SQL body, an empty non-NULL value from
+  PL/pgSQL, as in PostgreSQL). SQL bodies are analyzed past utility
+  statements, as PostgreSQL 18 does: a later statement naming a table an
+  earlier one would create is 42P01 at CREATE.
+- **EXECUTE.** `EXECUTE command [INTO [STRICT] targets] [USING values]`
+  (either clause first) and `RETURN QUERY EXECUTE ... USING`: the string's
+  statements run as statements of the routine (nested inside a running
+  statement) with the USING values as `$1..$n` and none of the routine's
+  variables; INTO takes the last statement's first row (42601 for a
+  command that returns no data), ROW_COUNT changes and FOUND does not; a
+  NULL string is 22004; an untyped USING literal is text.
+- **Assignment.** PL/pgSQL assignment, INTO targets and DECLARE defaults
+  convert through the types' text forms when no assignment cast exists
+  (exec_cast_value's I/O coercion): `r INT := '7'::text` works and
+  `r INT := true` is 22P02.
+- **Routine context.** `GET DIAGNOSTICS PG_CONTEXT` and `GET STACKED
+  DIAGNOSTICS PG_EXCEPTION_CONTEXT` render PostgreSQL's error-context
+  lines, innermost first: `PL/pgSQL function name(argument types) line N
+  at STATEMENT` (schema-qualified when the path does not find it;
+  `inline_code_block` for DO; `during statement block local variable
+  initialization`), `SQL statement "..."` for statements run through SPI
+  (SQL statements, PERFORM, EXECUTE, RETURN QUERY, CALL), `PL/pgSQL
+  expression "..."` / `PL/pgSQL assignment "..."` for expressions that
+  read tables or are constant (PostgreSQL folds those while planning),
+  and `SQL function "f" statement N`. PG_EXCEPTION_CONTEXT is the context
+  the caught error had where it was raised. `PG_ROUTINE_OID` is the
+  routine's OID (0 in DO). A context longer than a text value is 54000.
+- **proconfig and SET clauses.** pg_proc.proconfig lists the SET clauses
+  as PostgreSQL stores them (`name=value`, a string's content, a search
+  path's items as quoted identifiers joined by `, `). `SET name FROM
+  CURRENT` stores the session's value at CREATE, and custom
+  `prefix.name` settings are accepted.
+- **SQL paths (S071).** A domain resolves through search_path anywhere in
+  a query, and pg_typeof reports it; regtype output names user types
+  (schema-qualified when the path does not find them), also on the wire.
+  pg_catalog listed after a schema lets that schema's function with a
+  built-in's input types hide the built-in; a user function takes calls
+  no built-in of its name accepts (`length(5)` with `public.length(int)`).
+- **Set-returning functions in the select list.** One user set-returning
+  call (RETURNS SETOF / TABLE of one column) may sit in a select-list
+  target, which is evaluated per row it returns (PostgreSQL's
+  ProjectSet); anywhere else it is 0A000.
+- **RETURNS SETOF table.** The table's (or view's) columns become the
+  routine's TABLE columns, as of CREATE.
+
+Triggers:
+
+- **Transition tables (T212).** `REFERENCING OLD TABLE AS o NEW TABLE AS
+  n` on AFTER triggers: the statement's rows of the trigger's table (and
+  its partitions), also none, read like relations by the trigger
+  function's own statements and its EXECUTE (not by functions it calls),
+  after CTE names and before relations. They cannot be modified (0A000).
+  CREATE TRIGGER follows PostgreSQL's checks and order: views 42809, ROW
+  triggers on partitions or inheritance children 0A000, non-AFTER 42P17,
+  TRUNCATE 0A000, more than one event 0A000, column lists 0A000, ROW
+  variables 0A000, OLD without DELETE / UPDATE and NEW without INSERT /
+  UPDATE 42P17, a transition named twice or both with one name 42P17.
+- **Constraint triggers.** `CREATE CONSTRAINT TRIGGER name AFTER events ON
+  t [FROM r] [NOT] DEFERRABLE [INITIALLY IMMEDIATE | DEFERRED] FOR EACH ROW
+  ...`. An immediate one fires like an AFTER ROW trigger. A deferred one's
+  events fire at COMMIT and PREPARE TRANSACTION (an autocommit statement
+  before it commits), or when SET CONSTRAINTS name /
+  ALL IMMEDIATE makes it immediate, in write order with each row's
+  triggers in name order; an error there rolls the transaction back. SET
+  CONSTRAINTS on a NOT DEFERRABLE one is 42809. CREATE OR REPLACE
+  CONSTRAINT TRIGGER is 0A000; BEFORE, FOR EACH STATEMENT, REFERENCING and
+  NOT DEFERRABLE INITIALLY DEFERRED are 42601.
+- **pg_trigger / pg_get_triggerdef.** pg_trigger gains tgconstrrelid,
+  tgconstraint, tgdeferrable, tginitdeferred, tgoldtable and tgnewtable;
+  pg_get_triggerdef renders CONSTRAINT, FROM, the deferral and REFERENCING
+  in PostgreSQL's layout.
+- **Referential actions fire the referencing table's triggers.** ON DELETE
+  / UPDATE CASCADE, SET NULL and SET DEFAULT run as statements on the
+  referencing table: its BEFORE STATEMENT triggers fire once per
+  statement (also when no row references the key), BEFORE ROW triggers
+  per row (NULL keeps the row; a row a trigger changed itself is 27000),
+  and the action rows' AFTER ROW events and each action table's AFTER
+  STATEMENT follow the statement's own AFTER ROW and AFTER STATEMENT
+  events, in PostgreSQL's order.
+- **COPY FROM fires triggers.** BEFORE STATEMENT at its start, BEFORE ROW
+  per row after the defaults (NULL skips the row; NEW may fix it before
+  NOT NULL, generated columns and CHECK), AFTER ROW and AFTER STATEMENT
+  at its end. The triggers' SQL uses statement storage the caller gives
+  with the COPY (Store.copyBeginWith; the PostgreSQL wire passes its
+  result).
+
+Durability: change-log op 120 (`create_trigger_extended`) carries a
+trigger with transition tables or a constraint trigger: flags u8 (1 OLD
+TABLE, 2 NEW TABLE, 4 constraint, 8 DEFERRABLE, 16 INITIALLY DEFERRED),
+the transition names, for a constraint trigger its constraint OID and
+FROM table OID, then the op-62 payload. Replay validates every byte
+against PostgreSQL's rules and the overlay (live tables, unused OIDs).
+Op 62 records stay byte-identical; catalog images (RSBASE) refuse op-120
+triggers (0A000). Ops 121-124 stay reserved. Nothing else changed in the
+log: proconfig and FROM CURRENT live in op-80 SET texts.
+
+New SQLSTATEs: none (55006 ObjectInUse and 22004 were mapped). Used:
+55006, 22004, 42601, P0002, P0003, 42P02, 42703, 22P02, 22007, 54000,
+42P17, 0A000, 42809, 42P01, P0001, 27000, 23514, 42883, 42704, 55P03.
+
+Not covered (open):
+
+- Record values: a function with several OUT parameters in an
+  expression, `ROW(...)` without a declared type, field access
+  `(f()).a` and `(f()).*` (0A000 / 42601); RETURNS SETOF table in a
+  select list; RETURNS a single composite row.
+- S211 user-defined casts (CREATE / DROP CAST): composite-type parameters
+  and field access are missing first.
+- Two set-returning calls in one select list (PostgreSQL runs them in
+  lockstep) are 0A000; generate_series in a select list is 42883.
+- Referential actions run while the parent rows change, so the
+  referencing table's BEFORE triggers fire before the parent's AFTER ROW
+  triggers; PostgreSQL runs the actions from its after-trigger queue,
+  interleaved with the parent's AFTER ROW triggers. Multi-level cascades
+  fire their AFTER events in write order.
+- Constraint triggers have no pg_constraint row (contype 't').
+- A lock wait inside COPY's triggers is 55P03 (the COPY cannot park
+  there); deferred constraint triggers left at a COMMIT without statement
+  storage (a Store commit from copyEnd without copyBeginWith) are 0A000.
+- PG_EXCEPTION_CONTEXT for errors PostgreSQL raises while planning (for
+  example while inlining a SQL function) can differ.
+- T323: information_schema.routines (security_type) belongs to the
+  catalog lane. T653 needs no C-language routines.
+- Rule actions: SELECT and NOTIFY actions, RETURNING in actions, ALSO and
+  conditional rules on views without INSTEAD OF triggers, and
+  PostgreSQL's query-tree semantics for aggregating actions stay open.
+
 ## Not covered (open)
 
 - INSTEAD OF triggers, automatically updatable views, rule actions, SQL
@@ -298,19 +441,15 @@ before applying it. RSBASE10 images refuse such routines before writing
   expression, RETURN QUERY and CALL from a function run as nested
   statements (wave 4 nested-stmts lane, docs/SQL_NESTED_STATEMENTS.md,
   which lists what stays open).
-- Set-returning calls in the target list (ProjectSet) and record values
-  (a function with several OUT parameters in an expression) are 0A000;
-  RETURNS SETOF a table type, RETURNS record without OUT parameters,
+- Record values (a function with several OUT parameters in an
+  expression) are 0A000; RETURNS record without OUT parameters,
   polymorphic types, %TYPE / %ROWTYPE / record variables, cursors,
-  FOREACH, FOR over queries and dynamic EXECUTE remain open.
+  FOREACH and FOR over queries remain open (see Wave 5 for the rest).
 - COMMIT / ROLLBACK where PostgreSQL allows them (see Wave 4) are 0A000.
 - A SQL body is validated under the session's settings, not the
   routine's SET clauses (PostgreSQL applies them at CREATE).
 - A SQL function whose query body calls itself exceeds the inlining
   capacity (Config.subqueries, 54000).
-- REFERENCING transition tables (TG_ARGV and TG_NARGS are provided);
-  constraint triggers; referential actions and COPY FROM do not fire user
-  triggers (AFTER ROW triggers do see rows a referential action wrote).
 - RAISE messages are not delivered to the client (no notice channel);
   RAISE / USING ERRCODE accept the conditions of the handler table only
   (an unknown five-character SQLSTATE is 0A000).

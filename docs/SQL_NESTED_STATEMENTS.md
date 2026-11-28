@@ -70,8 +70,9 @@ PL/pgSQL function called from an expression, or a rule action
   single-table SELECTs that call a user function run in the query engine.
   The simple path evaluates projections twice, once to validate and once
   to publish, and keeps its scan state outside the workspace.
-- Inside a running statement, only queries, INSERT / UPDATE / DELETE /
-  MERGE, CALL and DO run. DDL there is 0A000.
+- Inside a running statement, queries, INSERT / UPDATE / DELETE / MERGE,
+  CALL, DO and (B11 wave 5) DDL run; DDL on a table a suspended statement
+  uses is 55006 (docs/SQL_ROUTINES.md, Wave 5).
 - **Values leaving a nested statement.** These are SELECT / RETURNING ...
   INTO captures, table-reading PL/pgSQL expressions, SQL body results, and
   rows kept for RETURN QUERY and set-returning bodies. Each value is copied
@@ -233,11 +234,10 @@ raised yet. Also used: 54001, 54000, 0A000, 55000, 42P17, 42809, 42703,
   - base-relation row security, which is applied as the current user,
     not the view owner;
   - COPY into a view.
-- **Trigger extras:**
-  - transition tables (REFERENCING, T212);
-  - constraint triggers;
-  - referential actions and COPY FROM do not fire user triggers;
-  - T217 (TRIGGER privilege) belongs to the privileges lane.
+- **Trigger extras:** transition tables, constraint triggers and
+  triggers fired by referential actions and COPY FROM are done in wave 5
+  (docs/SQL_ROUTINES.md); T217 (TRIGGER privilege) belongs to the
+  privileges lane.
 - **Other:**
   - `INSERT ... VALUES ((subquery))` is 0A000 in every context;
   - a value wider than Config.text_bytes cannot leave a nested statement
