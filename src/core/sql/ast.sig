@@ -214,7 +214,12 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     // 2 timestamp series), unnest and generate_subscripts.
     srf_series, srf_unnest, srf_subscripts,
     // information_schema._pg_expandarray(anyarray) -> setof (x, n).
-    srf_expandarray };
+    srf_expandarray,
+    // Access privilege inquiry (privileges lane, B11 wave 5): an optional
+    // user, the object, has_column_privilege's column, then the privilege
+    // text; bit i of `integer` marks argument i as an OID or a number.
+    has_table_privilege, has_column_privilege, has_any_column_privilege, has_schema_privilege,
+    has_sequence_privilege, has_type_privilege, pg_has_role };
 
 /// xml_call variants (xml_eval.sig).
 pub const XmlFn = enum(u8) {

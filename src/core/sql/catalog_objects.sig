@@ -91,7 +91,91 @@ pub fn restrictedRoutine(oid: u32) bool {
 /// database). PostgreSQL assigns its OID at initdb; ZPM fixes it.
 pub const plpgsql_extension_oid: u32 = 13001;
 
-pub const Kind = enum(u8) { role = 1, member = 2, acl = 3, relation = 4, policy = 5, comment = 6, fdw = 7, server = 8, publication = 9, domain = 10, enum_type = 11, composite_type = 12, statistics = 13, publication_table = 14, publication_schema = 15, schema_acl = 16, schema_acl_state = 17, schema_owner = 18, role_settings = 19, large_object = 20, large_object_acl = 21, large_object_default_acl = 22, builtin_routine_acl = 23, routine_default_acl = 24, _ };
+pub const Kind = enum(u8) { role = 1, member = 2, acl = 3, relation = 4, policy = 5, comment = 6, fdw = 7, server = 8, publication = 9, domain = 10, enum_type = 11, composite_type = 12, statistics = 13, publication_table = 14, publication_schema = 15, schema_acl = 16, schema_acl_state = 17, schema_owner = 18, role_settings = 19, large_object = 20, large_object_acl = 21, large_object_default_acl = 22, builtin_routine_acl = 23, routine_default_acl = 24,
+    // Privileges lane (B11 wave 5): kinds 100-104 match the lane's reserved
+    // change-log range so concurrent lanes never collide on a kind number.
+    /// Column grants of one (table, grantee, grantor): text byte c holds
+    /// column c's privileges (low nibble) and grant options (high nibble).
+    column_acl = 100,
+    /// USAGE grants on a domain, enum or composite type.
+    type_acl = 101,
+    /// USAGE / SELECT / UPDATE grants on a sequence.
+    sequence_acl = 102,
+    _ };
+
+/// Lowest and highest kind numbers of the privileges lane.
+pub const first_lane_kind: u8 = @intFromEnum(Kind.column_acl);
+pub const last_lane_kind: u8 = @intFromEnum(Kind.sequence_acl);
+
+/// Grant rows (acl, schema_acl, column_acl, type_acl, sequence_acl): `sub`
+/// is 0 for a grant issued by the object owner (`owner` holds the owner) and
+/// the grantor's OID for a delegated grant (`owner` holds the grantor too).
+pub fn grantRow(kind: Kind) bool {
+    return kind == .acl or kind == .schema_acl or kind == .column_acl or kind == .type_acl or kind == .sequence_acl;
+}
+
+/// Marks the owner's own row (grantee = grantor = owner, sub 0) of a grant
+/// kind: `flags` then holds the owner's explicit privileges, which replace
+/// the kind's default. Its presence also materializes the ACL (relacl /
+/// typacl stop being NULL), as PostgreSQL's first GRANT / REVOKE does.
+pub const acl_explicit_owner: u32 = 1 << 31;
+
+/// The grantor key of a grant row.
+pub fn grantorKey(object_owner: u32, grantor: u32) i32 {
+    return if (object_owner == grantor) 0 else @bitCast(grantor);
+}
+
+/// Column privilege nibble <-> AclMode bits (INSERT, SELECT, UPDATE,
+/// REFERENCES; PostgreSQL's ACL_ALL_RIGHTS_COLUMN).
+pub fn columnNibble(flags: u32) u8 {
+    var out: u8 = 0;
+    if (flags & priv_insert != 0) out |= 1;
+    if (flags & priv_select != 0) out |= 2;
+    if (flags & priv_update != 0) out |= 4;
+    if (flags & priv_references != 0) out |= 8;
+    return out;
+}
+
+pub fn columnFlags(nibble: u8) u32 {
+    var out: u32 = 0;
+    if (nibble & 1 != 0) out |= priv_insert;
+    if (nibble & 2 != 0) out |= priv_select;
+    if (nibble & 4 != 0) out |= priv_update;
+    if (nibble & 8 != 0) out |= priv_references;
+    return out;
+}
+
+/// PostgreSQL's predefined roles (initdb OIDs, pg_authid.dat): they exist
+/// in every database, cannot log in and hold the documented effects
+/// (pg_read_all_data, pg_write_all_data, pg_maintain, pg_database_owner).
+pub const predefined_oids = [_]u32{ 3373, 3374, 3375, 3377, 4200, 4544, 4550, 4569, 4570, 4571, 6171, 6181, 6182, 6304, 6337, 6392 };
+pub const predefined_names = [_][]const u8{ "pg_monitor", "pg_read_all_settings", "pg_read_all_stats", "pg_stat_scan_tables", "pg_signal_backend", "pg_checkpoint", "pg_use_reserved_connections", "pg_read_server_files", "pg_write_server_files", "pg_execute_server_program", "pg_database_owner", "pg_read_all_data", "pg_write_all_data", "pg_create_subscription", "pg_maintain", "pg_signal_autovacuum_worker" };
+pub const role_pg_monitor: u32 = 3373;
+pub const role_pg_database_owner: u32 = 6171;
+pub const role_pg_read_all_data: u32 = 6181;
+pub const role_pg_write_all_data: u32 = 6182;
+pub const role_pg_maintain: u32 = 6337;
+/// pg_monitor is a member of these three (bootstrap grants, pg_auth_members
+/// OIDs 10308-10310).
+pub const monitor_members = [_]u32{ 3374, 3375, 3377 };
+pub const monitor_member_oids = [_]u32{ 10308, 10309, 10310 };
+/// The built-in public schema.
+pub const public_namespace: u32 = 2200;
+
+pub fn predefinedRole(oid: u32) bool {
+    for (predefined_oids) |known| if (known == oid) return true;
+    return false;
+}
+
+pub fn predefinedName(oid: u32) ?[]const u8 {
+    for (predefined_oids, predefined_names) |known, name| if (known == oid) return name;
+    return null;
+}
+
+pub fn predefinedByName(name: []const u8) ?u32 {
+    for (predefined_oids, predefined_names) |known, spelled| if (types.same(spelled, name)) return known;
+    return null;
+}
 
 /// PUBLIC's routine default is stored with the owner marker, not as a role row.
 pub const routine_default_public: u32 = 1 << 31;
@@ -261,9 +345,51 @@ pub const priv_truncate: u32 = 1 << 4;
 pub const priv_references: u32 = 1 << 5;
 pub const priv_trigger: u32 = 1 << 6;
 pub const priv_schema_usage: u32 = 1 << 8;
-const priv_schema_create: u32 = 1 << 9;
+pub const priv_schema_create: u32 = 1 << 9;
 pub const priv_maintain: u32 = 1 << 14;
+pub const priv_temporary: u32 = 1 << 10;
+pub const priv_connect: u32 = 1 << 11;
 pub const table_privileges: u32 = priv_insert | priv_select | priv_update | priv_delete | priv_truncate | priv_references | priv_trigger | priv_maintain;
+/// ACL_USAGE (sequences, schemas, types) and the per-kind privilege sets.
+pub const priv_usage: u32 = priv_schema_usage;
+pub const priv_create: u32 = priv_schema_create;
+pub const column_privileges: u32 = priv_insert | priv_select | priv_update | priv_references;
+pub const sequence_privileges: u32 = priv_usage | priv_select | priv_update;
+pub const schema_privileges: u32 = priv_usage | priv_create;
+pub const type_privileges: u32 = priv_usage;
+
+/// The privilege set of a grant kind.
+pub fn kindPrivileges(kind: Kind) u32 {
+    return switch (kind) {
+        .acl => table_privileges,
+        .column_acl => column_privileges,
+        .sequence_acl => sequence_privileges,
+        .schema_acl => schema_privileges,
+        .type_acl => type_privileges,
+        else => 0,
+    };
+}
+
+/// aclitem letters in PostgreSQL's ACL_ALL_RIGHTS_STR order (acl.h):
+/// a r w d D x t X U C T c s A m.
+pub const acl_letter_bits = [_]u32{ priv_insert, priv_select, priv_update, priv_delete, priv_truncate, priv_references, priv_trigger, priv_execute, priv_usage, priv_create, priv_maintain };
+pub const acl_letters = "arwdDxtXUCm";
+
+/// Writes the aclitem privilege letters of `flags` with `*` after each
+/// privilege whose grant option `options` holds.
+pub fn aclLetters(flags: u32, options: u32, out: *[2 * acl_letters.len]u8) []const u8 {
+    var used: usize = 0;
+    for (acl_letter_bits, acl_letters) |bit, letter| {
+        if (flags & bit == 0) continue;
+        out[used] = letter;
+        used += 1;
+        if (options & bit != 0) {
+            out[used] = '*';
+            used += 1;
+        }
+    }
+    return out[0..used];
+}
 
 /// The table privileges in aclexplode order: bits, keywords and the
 /// information_schema spelling (parallel arrays: no slice-holding structs).
@@ -335,10 +461,24 @@ pub const RoleSpec = struct {
 pub const GranteeKind = enum(u8) { name, public, current_user, session_user, current_role };
 pub const Grantee = struct { kind: GranteeKind = .name, name: Ident = .{} };
 
+/// What a privilege GRANT / REVOKE names after ON (privileges lane).
+pub const GrantObject = enum(u8) { table, sequence, schema, domain, type_name, all_tables, all_sequences };
+
+/// `GRANT SELECT (a, b), UPDATE (c)`: one entry per (privilege, column).
+pub const ColumnGrant = struct { privileges: u32 = 0, column: Ident = .{} };
+/// (privilege, column) pairs in one GRANT / REVOKE (54000 beyond).
+pub const column_grant_capacity: usize = 2 * list_capacity;
+
 pub const Grant = struct {
     /// GRANT role TO role (membership) instead of table privileges.
     membership: bool = false,
     schema: bool = false,
+    object: GrantObject = .table,
+    /// Column privileges; `privileges` holds only the table-wide ones.
+    columns: [column_grant_capacity]ColumnGrant = @splat(.{}),
+    column_count: usize = 0,
+    /// The privilege words as written, for 0LP01 checks per object kind.
+    written: u32 = 0,
     all_privileges: bool = false,
     privileges: u32 = 0,
     tables: [list_capacity]Qualified = @splat(.{}),
@@ -357,7 +497,11 @@ pub const Grant = struct {
     set: ?bool = null,
     grantor: ?Grantee = null,
     cascade: bool = false,
+    /// REVOKE INHERIT / SET OPTION FOR role (PostgreSQL 16+).
+    revoke_option: RevokeOption = .none,
 };
+
+pub const RevokeOption = enum(u8) { none, inherit, set };
 
 pub const Policy = struct {
     name: Ident = .{},
@@ -1107,8 +1251,23 @@ const Parser = struct {
         if (types.keyword(raw, "execute")) return priv_execute;
         if (types.keyword(raw, "usage")) return priv_schema_usage;
         if (types.keyword(raw, "create")) return priv_schema_create;
+        // Database privileges: recognized, never valid on the objects here (0LP01).
+        if (types.keyword(raw, "temporary") or types.keyword(raw, "temp")) return priv_temporary;
+        if (types.keyword(raw, "connect")) return priv_connect;
         for (privilege_words, privilege_bits) |spelled, bit| if (types.keyword(raw, spelled)) return bit;
         return null;
+    }
+
+    /// `( column [, ...] )` after a privilege word (ALL: every column privilege).
+    fn columnList(self: *Parser, out: *Grant, privileges: u32) Error!void {
+        try self.expectSymbol(.lparen);
+        while (true) {
+            if (out.column_count == column_grant_capacity) return error.ProgramLimitExceeded;
+            out.columns[out.column_count] = .{ .privileges = privileges, .column = try self.ident() };
+            out.column_count += 1;
+            if (!try self.takeSymbol(.comma)) break;
+        }
+        try self.expectSymbol(.rparen);
     }
 
     fn objectId(self: *Parser) Error!u32 {
@@ -1161,6 +1320,18 @@ const Parser = struct {
                 try self.expect("for");
                 out.option = true;
                 out.membership = admin;
+            } else if (self.word("inherit") or self.word("set")) {
+                // REVOKE { INHERIT | SET } OPTION FOR role FROM member.
+                const inherit = self.word("inherit");
+                var lookahead = self.tokens;
+                const next = try lookahead.next();
+                if (next.kind == .word and types.keyword(next.raw(self.source), "option")) {
+                    try self.advance();
+                    try self.expect("option");
+                    try self.expect("for");
+                    out.revoke_option = if (inherit) .inherit else .set;
+                    out.membership = true;
+                }
             }
         }
         // Items up to ON (privileges) or TO / FROM (roles).
@@ -1172,11 +1343,12 @@ const Parser = struct {
             if (self.word("all")) {
                 try self.advance();
                 _ = try self.take("privileges");
-                all = true;
                 names_ok = false;
+                // ALL (columns): every column privilege on those columns.
+                if (self.symbol(.lparen)) try self.columnList(&out, column_privileges) else all = true;
             } else {
                 const bit = if (self.current.kind == .word) privilegeWord(self.current.raw(self.source)) else null;
-                if (bit) |known| privileges |= known else only_privileges = false;
+                if (bit) |known| out.written |= known else only_privileges = false;
                 if (out.granted_count == list_capacity) return error.ProgramLimitExceeded;
                 if (bit != null and self.current.keyword != .none and lexer.reserved(self.current.keyword)) {
                     // SELECT / UPDATE / DELETE / INSERT are reserved words: never role names.
@@ -1186,8 +1358,12 @@ const Parser = struct {
                     out.granted[out.granted_count] = try self.roleName();
                     out.granted_count += 1;
                 }
-                // Column lists (GRANT SELECT (a) ...) are outside the subset.
-                if (self.symbol(.lparen)) return error.UnsupportedStatement;
+                if (self.symbol(.lparen)) {
+                    // GRANT SELECT (a, b) ...: column privileges.
+                    const known = bit orelse return error.Syntax;
+                    names_ok = false;
+                    try self.columnList(&out, known);
+                } else if (bit) |known| privileges |= known;
             }
             if (!try self.takeSymbol(.comma)) break;
         }
@@ -1197,10 +1373,29 @@ const Parser = struct {
             const large_object = !out.schema and postgres and try self.take("large");
             if (defaults and !large_object and !out.routine_defaults) return error.UnsupportedStatement;
             if (large_object) try self.expect(if (defaults) "objects" else "object");
-            if (!out.schema and !large_object and (self.word("sequence") or self.word("database") or self.word("function") or self.word("procedure") or
-                self.word("routine") or self.word("language") or self.word("type") or self.word("domain") or self.word("foreign") or
-                self.word("large") or self.word("tablespace") or self.word("parameter") or self.word("all"))) return error.UnsupportedStatement;
+            if (!out.schema and !large_object and !out.routine_defaults) {
+                if (postgres and try self.take("sequence")) {
+                    out.object = .sequence;
+                } else if (postgres and try self.take("domain")) {
+                    out.object = .domain;
+                } else if (postgres and try self.take("type")) {
+                    out.object = .type_name;
+                } else if (postgres and self.word("all")) {
+                    try self.advance();
+                    if (try self.take("tables")) {
+                        out.object = .all_tables;
+                    } else if (try self.take("sequences")) {
+                        out.object = .all_sequences;
+                    } else return error.UnsupportedStatement;
+                    try self.expect("in");
+                    try self.expect("schema");
+                } else if (self.word("sequence") or self.word("database") or self.word("function") or self.word("procedure") or
+                    self.word("routine") or self.word("language") or self.word("type") or self.word("domain") or self.word("foreign") or
+                    self.word("large") or self.word("tablespace") or self.word("parameter") or self.word("all")) return error.UnsupportedStatement;
+            }
+            if (out.schema) out.object = .schema;
             if (!only_privileges and !all) return error.Syntax;
+            if (out.column_count != 0 and (large_object or out.routine_defaults or out.object != .table)) return error.InvalidGrantOperation;
             if (large_object) {
                 if (out.membership) return error.Syntax;
                 if (privileges & ~large_object_privileges != 0) return error.InvalidGrantOperation;
@@ -1217,14 +1412,14 @@ const Parser = struct {
                 if (privileges & ~priv_execute != 0) return error.InvalidGrantOperation;
                 out.privileges = if (all) priv_execute else privileges;
                 out.all_privileges = all;
-            } else if (out.schema) {
-                if (all or privileges != priv_schema_usage) return error.UnsupportedStatement;
-            } else {
-                if (privileges & ~table_privileges != 0) return error.UnsupportedStatement;
+            } else if (out.object == .table) {
                 _ = try self.take("table");
             }
             if (!large_object and !out.routine_defaults) {
-                out.privileges = if (all) table_privileges else privileges;
+                // Privilege types are validated per object at execution
+                // (0LP01 after the objects and grantees resolve).
+                out.privileges = privileges;
+                out.all_privileges = all;
                 while (true) {
                     if (out.table_count == list_capacity) return error.ProgramLimitExceeded;
                     out.tables[out.table_count] = try self.qualified();
@@ -1267,7 +1462,6 @@ const Parser = struct {
         }
         if (try self.take("granted")) {
             if (defaults) return error.Syntax;
-            if (out.large_object_count == 0 and (!out.membership or revoke)) return error.UnsupportedStatement;
             try self.expect("by");
             out.grantor = try self.grantee();
         }
@@ -1665,7 +1859,10 @@ pub fn Objects(comptime config: types.Config) type {
                 .role, .policy, .fdw, .server, .publication, .statistics => a.oid == b.oid,
                 .publication_table, .publication_schema => a.oid == b.oid and a.target == b.target and a.grantee == b.grantee,
                 .domain, .enum_type, .composite_type => a.oid == b.oid and a.target == b.target,
-                .member, .acl, .schema_acl, .large_object_default_acl => a.target == b.target and a.grantee == b.grantee,
+                .large_object_default_acl => a.target == b.target and a.grantee == b.grantee,
+                // Grant rows and memberships are keyed by their grantor too
+                // (sub: 0 for the owner / legacy rows, else the grantor).
+                .member, .acl, .schema_acl, .column_acl, .type_acl, .sequence_acl,
                 .large_object_acl, .builtin_routine_acl, .routine_default_acl => a.target == b.target and a.grantee == b.grantee and a.sub == b.sub,
                 .relation, .schema_acl_state, .schema_owner, .role_settings, .large_object => a.target == b.target,
                 .comment => a.grantee == b.grantee and a.target == b.target and a.sub == b.sub,
@@ -1822,18 +2019,21 @@ pub fn Objects(comptime config: types.Config) type {
         /// Role attributes (null: no such role).
         pub fn roleFlags(self: *const Self, oid: u32, snap: storage.Snapshot) ?u32 {
             if (oid == bootstrap_role) return role_attributes;
+            if (predefinedRole(oid)) return role_inherit;
             const index = self.byOid(.role, oid, snap) orelse return null;
             return self.items[index].flags;
         }
 
         pub fn roleName(self: *const Self, oid: u32, snap: storage.Snapshot) ?[]const u8 {
             if (oid == bootstrap_role) return bootstrap_name;
+            if (predefinedName(oid)) |name| return name;
             const index = self.byOid(.role, oid, snap) orelse return null;
             return self.items[index].name.slice();
         }
 
         pub fn roleByName(self: *const Self, name: []const u8, snap: storage.Snapshot) ?u32 {
             if (types.same(name, bootstrap_name)) return bootstrap_role;
+            if (predefinedByName(name)) |oid| return oid;
             const index = self.byName(.role, 0, name, snap) orelse return null;
             return self.items[index].oid;
         }
@@ -1863,6 +2063,14 @@ pub fn Objects(comptime config: types.Config) type {
             var next: usize = 0;
             while (next < count) : (next += 1) {
                 const current = queue[next];
+                // Built-in memberships: the database owner (the bootstrap
+                // role) is implicitly pg_database_owner; pg_monitor is a
+                // member of pg_read_all_settings, pg_read_all_stats and
+                // pg_stat_scan_tables (inherit and set, granted at initdb).
+                if (current == bootstrap_role and group == role_pg_database_owner) return true;
+                if (current == role_pg_monitor) {
+                    for (monitor_members) |implied| if (implied == group) return true;
+                }
                 for (&self.items) |*o| {
                     if (o.kind != .member or o.grantee != current or !visible(o, snap)) continue;
                     if (path == .inherit and !self.membershipInherits(o, snap)) continue;
@@ -1875,8 +2083,28 @@ pub fn Objects(comptime config: types.Config) type {
                         count += 1;
                     }
                 }
+                if (current == role_pg_monitor) for (monitor_members) |implied| {
+                    var known = false;
+                    for (queue[0..count]) |seen| known = known or seen == implied;
+                    if (!known and count < queue.len) {
+                        queue[count] = implied;
+                        count += 1;
+                    }
+                };
             }
             return false;
+        }
+
+        /// A role holds `privileged` through membership (inherited) in a
+        /// predefined role: pg_read_all_data (SELECT on every relation,
+        /// USAGE on every schema), pg_write_all_data (INSERT, UPDATE,
+        /// DELETE, USAGE on schemas) and pg_maintain (MAINTAIN).
+        pub fn predefinedPrivileges(self: *const Self, role: u32, snap: storage.Snapshot) u32 {
+            var held: u32 = 0;
+            if (self.memberOf(role, role_pg_read_all_data, true, snap)) held |= priv_select | priv_usage;
+            if (self.memberOf(role, role_pg_write_all_data, true, snap)) held |= priv_insert | priv_update | priv_delete | priv_usage;
+            if (self.memberOf(role, role_pg_maintain, true, snap)) held |= priv_maintain;
+            return held;
         }
 
         pub fn memberOf(self: *const Self, member: u32, group: u32, inherit: bool, snap: storage.Snapshot) bool {
@@ -1908,28 +2136,101 @@ pub fn Objects(comptime config: types.Config) type {
         /// The owner can revoke its ordinary privilege without losing the
         /// authority to grant it again.
         pub fn schemaUsage(self: *const Self, role: u32, namespace: u32, owner_role: u32, snap: storage.Snapshot) bool {
-            if (self.superuser(role, snap)) return true;
-            var owner_usage = true;
-            for (&self.items) |*o| {
-                if (o.kind != .schema_acl or o.target != namespace or !visible(o, snap)) continue;
-                if (o.grantee == owner_role) {
-                    owner_usage = o.flags == priv_schema_usage;
-                    continue;
-                }
-                if (o.grantee == public_role or self.memberOf(role, o.grantee, true, snap)) return true;
-            }
-            return owner_usage and self.memberOf(role, owner_role, true, snap);
+            return self.schemaPrivilegeMask(role, namespace, owner_role, snap) & priv_usage != 0;
         }
 
-        /// The privileges held through ownership and table-wide grants.
-        fn tablePrivilegeMask(self: *const Self, role: u32, table: u32, snap: storage.Snapshot) u32 {
-            if (self.ownsTable(role, table, snap)) return ~@as(u32, 0);
-            var held: u32 = 0;
+        /// The schema's ACL was materialized by a GRANT / REVOKE.
+        pub fn schemaMaterialized(self: *const Self, namespace: u32, snap: storage.Snapshot) bool {
+            const key: Object = .{ .kind = .schema_acl_state, .target = namespace };
+            return self.findKey(&key, snap) != null;
+        }
+
+        /// USAGE / CREATE on a schema (the public schema grants PUBLIC
+        /// USAGE until its ACL is materialized; pg_read_all_data and
+        /// pg_write_all_data hold USAGE everywhere).
+        pub fn schemaPrivilegeMask(self: *const Self, role: u32, namespace: u32, owner_role: u32, snap: storage.Snapshot) u32 {
+            var held = self.objectPrivilegeMask(.schema_acl, namespace, owner_role, role, 0, snap);
+            if (namespace == public_namespace and !self.schemaMaterialized(namespace, snap)) held |= priv_usage;
+            return held | (self.predefinedPrivileges(role, snap) & priv_usage);
+        }
+
+        /// The owner's marker row of a grant kind on `target`, if any.
+        pub fn ownerMarker(self: *const Self, kind: Kind, target: u32, owner_role: u32, snap: storage.Snapshot) ?usize {
+            for (&self.items, 0..) |*o, index| {
+                if (o.kind != kind or o.target != target or o.grantee != owner_role or o.sub != 0 or !visible(o, snap)) continue;
+                if (o.grant_flags & acl_explicit_owner != 0) return index;
+            }
+            return null;
+        }
+
+        /// The owner's own privileges on an object: its marker row's, else
+        /// every privilege of the kind (a legacy schema row without USAGE
+        /// leaves CREATE).
+        pub fn ownerPrivileges(self: *const Self, kind: Kind, target: u32, owner_role: u32, snap: storage.Snapshot) u32 {
             for (&self.items) |*o| {
-                if (o.kind != .acl or o.target != table or !visible(o, snap)) continue;
+                if (o.kind != kind or o.target != target or o.grantee != owner_role or o.sub != 0 or !visible(o, snap)) continue;
+                if (o.grant_flags & acl_explicit_owner != 0) return o.flags;
+                if (kind == .schema_acl and o.oid == 0 and o.flags == 0) return priv_schema_create;
+            }
+            return kindPrivileges(kind);
+        }
+
+        /// Whether a grant row is an ordinary grant (not the owner's marker
+        /// row and not a legacy no-op grant from the owner to itself).
+        pub fn grantEntry(o: *const Object, owner_role: u32) bool {
+            if (o.grant_flags & acl_explicit_owner != 0) return false;
+            return !(o.sub == 0 and o.grantee == owner_role);
+        }
+
+        /// Privileges `role` holds on an object through the rows of `kind`:
+        /// the owner's own ones when it inherits the owner, and every grant
+        /// to PUBLIC or to a role it inherits. `public_default` is PUBLIC's
+        /// privilege while the ACL is not materialized (types: USAGE).
+        pub fn objectPrivilegeMask(self: *const Self, kind: Kind, target: u32, owner_role: u32, role: u32, public_default: u32, snap: storage.Snapshot) u32 {
+            if (self.superuser(role, snap)) return ~@as(u32, 0);
+            var held: u32 = 0;
+            if (self.memberOf(role, owner_role, true, snap)) held |= self.ownerPrivileges(kind, target, owner_role, snap);
+            if (public_default != 0 and self.ownerMarker(kind, target, owner_role, snap) == null) held |= public_default;
+            for (&self.items) |*o| {
+                if (o.kind != kind or o.target != target or !visible(o, snap) or !grantEntry(o, owner_role)) continue;
                 if (o.grantee == public_role or self.memberOf(role, o.grantee, true, snap)) held |= o.flags;
             }
             return held;
+        }
+
+        /// The privileges held on a relation: ownership, table-wide grants
+        /// and the predefined data roles.
+        pub fn tablePrivilegeMask(self: *const Self, role: u32, table: u32, snap: storage.Snapshot) u32 {
+            const held = self.objectPrivilegeMask(.acl, table, self.owner(table, snap), role, 0, snap);
+            return held | (self.predefinedPrivileges(role, snap) & table_privileges);
+        }
+
+        /// Column privileges of `role` on column `column` (0-based) from
+        /// column grants alone (table-wide privileges apply separately).
+        pub fn columnGrantMask(self: *const Self, role: u32, table: u32, column: usize, snap: storage.Snapshot) u32 {
+            var held: u32 = 0;
+            const super = self.superuser(role, snap);
+            for (&self.items) |*o| {
+                if (o.kind != .column_acl or o.target != table or !visible(o, snap)) continue;
+                if (2 * column + 1 >= o.text_len) continue;
+                if (super or o.grantee == public_role or self.memberOf(role, o.grantee, true, snap)) held |= columnFlags(o.text[2 * column] & 0x0f);
+            }
+            return held;
+        }
+
+        /// The privileges `role` holds on one column: table-wide ones plus
+        /// the column's own grants.
+        pub fn columnPrivilegeMask(self: *const Self, role: u32, table: u32, column: usize, snap: storage.Snapshot) u32 {
+            return self.tablePrivilegeMask(role, table, snap) | self.columnGrantMask(role, table, column, snap);
+        }
+
+        /// Any column of the table (below `columns`) carries one of `wanted`
+        /// through a column grant.
+        pub fn anyColumnGrant(self: *const Self, role: u32, table: u32, columns: usize, wanted: u32, snap: storage.Snapshot) bool {
+            for (0..columns) |column| {
+                if (self.columnGrantMask(role, table, column, snap) & wanted != 0) return true;
+            }
+            return false;
         }
 
         /// Every requested privilege is required for statement access.
@@ -1940,17 +2241,6 @@ pub fn Objects(comptime config: types.Config) type {
         /// Any requested privilege suffices for information-schema discovery.
         pub fn tableHasAnyPrivilege(self: *const Self, role: u32, table: u32, wanted: u32, snap: storage.Snapshot) bool {
             return self.tablePrivilegeMask(role, table, snap) & wanted != 0;
-        }
-
-        /// Grant options held for `wanted` (owners hold them all).
-        pub fn grantOptions(self: *const Self, role: u32, table: u32, wanted: u32, snap: storage.Snapshot) bool {
-            if (self.ownsTable(role, table, snap)) return true;
-            var held: u32 = 0;
-            for (&self.items) |*o| {
-                if (o.kind != .acl or o.target != table or !visible(o, snap)) continue;
-                if (o.grantee == public_role or self.memberOf(role, o.grantee, true, snap)) held |= o.grant_flags;
-            }
-            return held & wanted == wanted;
         }
 
         /// Row security applies to `role` reading or writing `table`
@@ -2063,7 +2353,8 @@ pub fn Objects(comptime config: types.Config) type {
 
         fn decodeKind(cursor: Cursor) Error!Kind {
             const raw = try cursor.int(u8);
-            if (raw < 1 or raw > @intFromEnum(Kind.routine_default_acl)) return error.InvalidChangeRecord;
+            const known = (raw >= 1 and raw <= @intFromEnum(Kind.routine_default_acl)) or (raw >= first_lane_kind and raw <= last_lane_kind);
+            if (!known) return error.InvalidChangeRecord;
             return @enumFromInt(raw);
         }
 
@@ -2086,8 +2377,11 @@ pub fn Objects(comptime config: types.Config) type {
                 .domain, .enum_type, .composite_type => o.oid != 0 and o.target != 0 and o.grantee == 0 and o.sub == 0,
                 .statistics => o.oid != 0 and o.target != 0 and o.grantee != 0 and o.sub >= -1 and o.sub <= 10000,
                 .publication_table, .publication_schema => o.oid != 0 and o.target != 0 and o.grantee != 0 and o.sub == 0,
-                .member => o.oid != 0 and o.target != 0 and o.grantee != 0 and o.sub == 0,
-                .acl, .schema_acl => o.oid == 0 and o.target != 0 and o.sub == 0,
+                // Memberships and grant rows: sub 0 (owner / bootstrap /
+                // legacy grantor) or the grantor's OID. Grant rows carry
+                // their ACL position in `oid` (0 on legacy rows).
+                .member => o.oid != 0 and o.target != 0 and o.grantee != 0,
+                .acl, .schema_acl, .column_acl, .type_acl, .sequence_acl => o.target != 0,
                 // Legacy owner-issued grants keep sub = 0. Delegated grants
                 // put their grantor OID in that key field, including in drops.
                 .large_object_acl => o.oid == 0 and o.target != 0,
@@ -2140,8 +2434,16 @@ pub fn Objects(comptime config: types.Config) type {
                 .role => has_name and o.owner == 0 and o.flags & ~role_attributes == 0 and o.role_count == 0 and o.text_len == 0,
                 .member => !has_name and o.owner != 0 and
                     (o.flags == 0 or (o.flags & member_configured != 0 and o.flags & ~(member_configured | member_inherit | member_set) == 0)) and
-                    o.grant_flags <= member_admin and o.role_count == 0 and o.text_len == 0 and o.target != o.grantee,
-                .acl => !has_name and o.flags != 0 and o.flags & ~table_privileges == 0 and o.grant_flags & ~o.flags == 0 and o.role_count == 0 and o.text_len == 0 and o.owner != 0,
+                    o.grant_flags <= member_admin and o.role_count == 0 and o.text_len == 0 and o.target != o.grantee and
+                    (o.sub == 0 or o.owner == @as(u32, @bitCast(o.sub))),
+                // Legacy table grants (sub 0, ordinal 0) keep their old rule.
+                .acl => !has_name and o.role_count == 0 and o.text_len == 0 and o.owner != 0 and
+                    ((o.sub == 0 and o.oid == 0 and o.flags != 0 and o.flags & ~table_privileges == 0 and o.grant_flags & ~o.flags == 0) or
+                    grantRowValid(&o, table_privileges)),
+                .sequence_acl, .type_acl => !has_name and o.role_count == 0 and o.text_len == 0 and o.owner != 0 and
+                    grantRowValid(&o, kindPrivileges(o.kind)),
+                .column_acl => !has_name and o.role_count == 0 and o.owner != 0 and o.split == 0 and
+                    (o.sub == 0 or o.owner == @as(u32, @bitCast(o.sub))) and columnRowValid(&o),
                 .large_object => !has_name and o.owner != 0 and o.role_count == 0 and
                     (o.text_len == 0 or (o.text_len == 8 and o.largeObjectLength() != 0 and o.largeObjectLength() <= @import("large_object_pages.sig").max_size)) and o.split == 0 and
                     o.grant_flags & ~(large_object_generated_oid | large_object_privileges) == 0 and
@@ -2166,8 +2468,11 @@ pub fn Objects(comptime config: types.Config) type {
                     (o.flags != 0 or (o.owner == bootstrap_role and o.grantee == bootstrap_role)) and
                     o.flags & ~priv_execute == 0 and o.grant_flags & ~o.flags == 0 and
                     (o.grantee != public_role or o.grant_flags == 0),
-                .schema_acl => !has_name and o.owner != 0 and o.grant_flags == 0 and o.role_count == 0 and o.text_len == 0 and
-                    (o.flags == priv_schema_usage or (o.flags == 0 and o.grantee == o.owner)),
+                // Legacy schema rows: USAGE grants, or the owner without its
+                // USAGE (flags 0, no marker: the owner keeps CREATE).
+                .schema_acl => !has_name and o.owner != 0 and o.role_count == 0 and o.text_len == 0 and
+                    ((o.sub == 0 and o.oid == 0 and o.grant_flags == 0 and (o.flags == priv_schema_usage or (o.flags == 0 and o.grantee == o.owner))) or
+                    grantRowValid(&o, schema_privileges)),
                 .schema_acl_state, .schema_owner => !has_name and o.owner != 0 and o.flags == 0 and o.grant_flags == 0 and o.role_count == 0 and o.text_len == 0,
                 .role_settings => !has_name and o.owner == 0 and o.flags != 0 and o.flags & ~role_boolean_mask == 0 and
                     o.grant_flags & ~o.flags == 0 and o.role_count == 0 and o.text_len == 0,
@@ -2213,6 +2518,40 @@ pub fn Objects(comptime config: types.Config) type {
                 }
             }
             return o;
+        }
+
+        /// A grant row of privilege set `all` (privileges lane): the owner's
+        /// marker row (sub 0, grantee = owner, flags its explicit privileges
+        /// and options, `oid` its ACL position), or a grant with nonzero privileges,
+        /// options within them, PUBLIC without options, a grantor key that
+        /// matches `owner` when delegated, and a nonzero ACL position.
+        fn grantRowValid(o: *const Object, all: u32) bool {
+            if (o.split != 0) return false;
+            if (o.grant_flags & acl_explicit_owner != 0)
+                return o.sub == 0 and o.grantee == o.owner and o.flags & ~all == 0 and (o.grant_flags & ~acl_explicit_owner) & ~o.flags == 0;
+            return o.oid != 0 and o.flags != 0 and o.flags & ~all == 0 and o.grant_flags & ~o.flags == 0 and
+                (o.sub == 0 or o.owner == @as(u32, @bitCast(o.sub))) and !(o.sub == 0 and o.grantee == o.owner) and
+                (o.grantee != public_role or o.grant_flags == 0);
+        }
+
+        /// Column grant bytes: per column a privilege / option byte and its
+        /// ACL position (both zero for a column without privileges); the
+        /// row's flags and grant_flags are their unions.
+        fn columnRowValid(o: *const Object) bool {
+            if (o.oid != 0 or o.text_len < 2 or o.text_len % 2 != 0) return false;
+            var flags: u32 = 0;
+            var options: u32 = 0;
+            var index: usize = 0;
+            while (index + 1 < o.text_len) : (index += 2) {
+                const bits = o.text[index];
+                const privileges = bits & 0x0f;
+                const granted = bits >> 4;
+                if ((privileges == 0) != (o.text[index + 1] == 0) or granted & ~privileges != 0) return false;
+                flags |= columnFlags(privileges);
+                options |= columnFlags(granted);
+            }
+            if (o.text[o.text_len - 2] == 0) return false;
+            return flags != 0 and flags == o.flags and options == o.grant_flags and (o.grantee != public_role or options == 0);
         }
 
         fn validateEnumLabels(bytes: []const u8, expected: u16) Error!void {
@@ -2293,6 +2632,8 @@ pub fn Objects(comptime config: types.Config) type {
             array_name: V.Name = .{},
             oid_width: u32 = 0,
             last_statistics_column: u8 = 0,
+            /// Columns a column_acl row covers (privileges lane).
+            acl_columns: u16 = 0,
         };
 
         pub const Overlay = struct {
@@ -2309,6 +2650,7 @@ pub fn Objects(comptime config: types.Config) type {
                     out.acl_options = o.grant_flags;
                 }
                 if (o.kind == .statistics) out.last_statistics_column = o.text[o.text_len - 1];
+                if (o.kind == .column_acl) out.acl_columns = o.text_len / 2;
                 if (userType(o.kind)) {
                     const name = o.arrayName();
                     out.array_name.len = name.len;
@@ -2347,8 +2689,12 @@ pub fn Objects(comptime config: types.Config) type {
             }
 
             pub fn roleExists(self: *const Overlay, oid: u32) bool {
-                if (oid == bootstrap_role) return true;
+                if (oid == bootstrap_role or predefinedRole(oid)) return true;
                 return self.liveOid(.role, oid);
+            }
+
+            fn typeLive(self: *const Overlay, oid: u32) bool {
+                return self.liveOid(.domain, oid) or self.liveOid(.enum_type, oid) or self.liveOid(.composite_type, oid);
             }
 
             pub fn userTypeNameTaken(self: *const Overlay, namespace: u32, name: []const u8) bool {
@@ -2481,13 +2827,28 @@ pub fn Objects(comptime config: types.Config) type {
                         if (grantee != public_role and !self.roleExists(grantee)) return error.ChangeRecordConflict;
                     },
                     .schema_acl => {
-                        const original = ctx.objectPrivateSchemaOwner(target) orelse return error.ChangeRecordConflict;
-                        if (self.schemaOwner(target, original) != v.owner) return error.ChangeRecordConflict;
+                        // The public schema (owned by pg_database_owner)
+                        // carries grants since the privileges lane.
+                        const original = if (target == public_namespace) role_pg_database_owner else ctx.objectPrivateSchemaOwner(target) orelse return error.ChangeRecordConflict;
+                        if (v.sub == 0 and self.schemaOwner(target, original) != v.owner) return error.ChangeRecordConflict;
                         if (grantee != public_role and !self.roleExists(grantee)) return error.ChangeRecordConflict;
                     },
                     .schema_acl_state => {
-                        const original = ctx.objectPrivateSchemaOwner(target) orelse return error.ChangeRecordConflict;
+                        const original = if (target == public_namespace) role_pg_database_owner else ctx.objectPrivateSchemaOwner(target) orelse return error.ChangeRecordConflict;
                         if (self.schemaOwner(target, original) != v.owner) return error.ChangeRecordConflict;
+                    },
+                    .column_acl => {
+                        const columns = ctx.objectTableColumns(target) orelse return error.ChangeRecordConflict;
+                        if (v.acl_columns > columns) return error.ChangeRecordConflict;
+                        if (grantee != public_role and !self.roleExists(grantee)) return error.ChangeRecordConflict;
+                    },
+                    .type_acl => {
+                        if (!self.typeLive(target)) return error.ChangeRecordConflict;
+                        if (grantee != public_role and !self.roleExists(grantee)) return error.ChangeRecordConflict;
+                    },
+                    .sequence_acl => {
+                        if (!ctx.objectSequenceLive(target)) return error.ChangeRecordConflict;
+                        if (grantee != public_role and !self.roleExists(grantee)) return error.ChangeRecordConflict;
                     },
                     .schema_owner => if (ctx.objectPrivateSchemaOwner(target) == null) return error.ChangeRecordConflict,
                     .role_settings => if (!self.roleExists(target)) return error.ChangeRecordConflict,

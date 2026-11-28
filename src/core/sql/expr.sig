@@ -795,6 +795,46 @@ pub fn Eval(comptime config: types.Config) type {
             return textCell(buffer[0..length]);
         }
 
+        /// has_*_privilege / pg_has_role through the session's catalog hook
+        /// (privileges lane). Strict: a NULL argument gives NULL.
+        fn privilegeInquiry(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
+            const hook = ctx.session.sequences orelse return error.UnsupportedStatement;
+            const check = hook.privilege orelse return error.UnsupportedStatement;
+            var cells: [4]V.Cell = undefined;
+            var count: usize = 0;
+            var item = n.b;
+            while (item != none and count < cells.len) : (item = node(ctx, item).next) {
+                cells[count] = try eval(ctx, item);
+                if (cells[count] == .null_value) return .null_value;
+                count += 1;
+            }
+            const base: usize = if (n.func == .has_column_privilege) 3 else 2;
+            const first: usize = count - base;
+            const subject = struct {
+                fn of(cell: *const V.Cell, numeric: bool) value_module.PrivilegeSubject {
+                    return if (numeric) .{ .oid = cell.integer } else .{ .name = cell.text.slice() };
+                }
+            };
+            const numbers: u64 = @bitCast(n.integer);
+            var request: value_module.PrivilegeRequest = .{
+                .inquiry = switch (n.func) {
+                    .has_table_privilege => .table,
+                    .has_column_privilege => .column,
+                    .has_any_column_privilege => .any_column,
+                    .has_schema_privilege => .schema,
+                    .has_sequence_privilege => .sequence,
+                    .has_type_privilege => .type_usage,
+                    else => .role,
+                },
+                .object = subject.of(&cells[first], numbers & (@as(u64, 1) << @intCast(first)) != 0),
+                .privileges = cells[count - 1].text.slice(),
+            };
+            if (first == 1) request.user = subject.of(&cells[0], numbers & 1 != 0);
+            if (n.func == .has_column_privilege) request.column = subject.of(&cells[first + 1], numbers & (@as(u64, 1) << @intCast(first + 1)) != 0);
+            const verdict = (try check(hook.ptr, &request)) orelse return .null_value;
+            return .{ .boolean = verdict };
+        }
+
         /// The catalog OID named by obj_description's second argument.
         fn catalogClass(name: []const u8) ?u32 {
             const names = [_][]const u8{ "pg_class", "pg_namespace", "pg_authid", "pg_foreign_data_wrapper", "pg_foreign_server", "pg_publication", "pg_policy", "pg_largeobject" };
@@ -1649,6 +1689,8 @@ pub fn Eval(comptime config: types.Config) type {
                 .pg_get_function_arguments, .pg_get_function_identity_arguments, .pg_get_function_result, .pg_get_function_sqlbody => return functionCatalogValue(ctx, n),
                 .pg_partition_ancestors, .array_subquery => return error.UnsupportedStatement,
                 .obj_description, .col_description, .shobj_description, .current_user, .session_user => return objectText(ctx, n),
+                .has_table_privilege, .has_column_privilege, .has_any_column_privilege, .has_schema_privilege,
+                .has_sequence_privilege, .has_type_privilege, .pg_has_role => return privilegeInquiry(ctx, n),
                 .to_tsvector, .to_tsquery, .plainto_tsquery, .phraseto_tsquery => {
                     const TS = Io.TextSearch;
                     // One argument: default_text_search_config.

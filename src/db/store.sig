@@ -138,6 +138,9 @@ pub const ClientMessageLevel = enum {
     }
 };
 
+/// Bytes of one engine notice message a connection keeps.
+pub const notice_capacity: usize = 256;
+
 pub const ClientNotice = struct {
     level: ClientMessageLevel = .warning,
     state: []const u8,
@@ -756,6 +759,9 @@ pub fn Store(comptime Raw: type) type {
             execution_deadline_ns: ?i64 = null,
             transaction_deadline_ns: ?i64 = null,
             pending_notice: ?ClientNotice = null,
+            /// Engine notices carry formatted text (privilege warnings name
+            /// their object); the connection keeps a copy until it is sent.
+            notice_bytes: [notice_capacity]u8 = undefined,
             /// Savepoint depth of the last ROLLBACK TO, for the codec's portals.
             rolled_back_to: ?usize = null,
             /// Wall-clock start of the open (or implicit) transaction and of
@@ -1016,6 +1022,7 @@ pub fn Store(comptime Raw: type) type {
                     raw.session_state = &self.engine_session;
                     raw.settings_provider = .{ .context = @ptrCast(self), .show = &providerShow, .set = &providerSet };
                     if (comptime @hasField(@TypeOf(raw.settings_provider.?), "warn")) raw.settings_provider.?.warn = &providerWarn;
+                    if (comptime @hasField(@TypeOf(raw.settings_provider.?), "notice")) raw.settings_provider.?.notice = &providerNotice;
                     if (comptime has_session and @hasField(Raw.SessionValues, "restricted_relation_kinds")) {
                         raw.session.restricted_relation_kinds = self.engine_session.values.restricted_relation_kinds;
                     }
@@ -1202,12 +1209,21 @@ pub fn Store(comptime Raw: type) type {
 
             fn warn(self: *Connection, state: []const u8, message: []const u8) void {
                 if (self.dialect != .postgres) return;
-                self.pending_notice = .{ .state = state, .message = message };
+                // One notice per statement (the latest); cut at the buffer.
+                const length = @min(message.len, self.notice_bytes.len);
+                @memcpy(self.notice_bytes[0..length], message[0..length]);
+                self.pending_notice = .{ .state = state, .message = self.notice_bytes[0..length] };
             }
 
             fn providerWarn(context: ?*anyopaque, state: []const u8, message: []const u8) void {
                 const self: *Connection = @ptrCast(@alignCast(context.?));
                 self.warn(state, message);
+            }
+
+            fn providerNotice(context: ?*anyopaque, state: []const u8, message: []const u8) void {
+                const self: *Connection = @ptrCast(@alignCast(context.?));
+                self.warn(state, message);
+                if (self.pending_notice) |*pending| pending.level = .notice;
             }
 
             /// Current PostgreSQL idle limit in an open or failed block.

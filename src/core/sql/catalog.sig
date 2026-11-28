@@ -342,6 +342,7 @@ const pg_attribute_columns = [_]ViewColumn{
     col("attcompression", .pg_internal_char), col("atthasmissing", .boolean), col("attmissingval", types.catalog_anyarray),
     col("attacl", types.arrayType(.aclitem).?),
 };
+pub const pg_attribute_acl_column = pg_attribute_columns.len - 1;
 const pg_index_columns = [_]ViewColumn{
     col("indexrelid", .oid), col("indrelid", .oid), col("indisprimary", .boolean), col("indisunique", .boolean), col("indkey", .text),
     col("indisvalid", .boolean), col("indisclustered", .boolean), col("indisreplident", .boolean),
