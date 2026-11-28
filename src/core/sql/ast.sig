@@ -208,7 +208,11 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     // pg_function_is_visible(oid) and version() (B11 wave 5 catalog lane).
     pg_function_is_visible, version,
     // row_to_json(record [, pretty]) (B11 wave 5, composite lane).
-    row_to_json };
+    row_to_json,
+    // Set-returning built-ins in a select list (ProjectSet, B11 wave 5
+    // composite lane): generate_series (`integer`: 0 integer, 1 numeric,
+    // 2 timestamp series), unnest and generate_subscripts.
+    srf_series, srf_unnest, srf_subscripts };
 
 /// xml_call variants (xml_eval.sig).
 pub const XmlFn = enum(u8) {
@@ -374,6 +378,13 @@ pub fn strictFunction(func: Func) bool {
 /// or inside one target of a select list.
 pub fn setFunction(func: Func) bool {
     return func == .regexp_matches or func == .regexp_split_to_table or func == .jsonb_path_query;
+}
+
+/// A set-returning call a select list expands (ProjectSet): the built-ins,
+/// and user set-returning routines (`boolean`).
+pub fn selectSetCall(n: *const Node) bool {
+    if (n.kind != .function) return false;
+    return setFunction(n.func) or n.func == .srf_series or n.func == .srf_unnest or n.func == .srf_subscripts or (n.func == .routine and n.boolean);
 }
 
 /// Cast typmods marking `::regclass` / `::regtype` (OID-valued casts).

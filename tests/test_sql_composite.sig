@@ -415,12 +415,48 @@ fn corruption() !void {
     try run("DROP CAST (INT AS pair)");
 }
 
+// ---- set-returning functions in the select list (ProjectSet) ---------------
+
+fn projectSet() !void {
+    // Every set-returning call runs in lockstep; the longest decides the
+    // row count and the shorter ones yield NULL (PostgreSQL 10+).
+    try expectColumns("SELECT generate_series(1,3), generate_series(1,5)", "generate_series,generate_series", &.{ 23, 23 }, "", "1|1;2|2;3|3;NULL|4;NULL|5");
+    try expectColumns("SELECT generate_series(1,2), unnest(ARRAY['a','b','c'])", "generate_series,unnest", &.{ 23, 25 }, "", "1|a;2|b;NULL|c");
+    try expect("SELECT generate_series(1,3) * 10, 'x'", "10|x;20|x;30|x");
+    try expect("SELECT generate_series(1,3) + generate_series(10,11)", "11;13;NULL");
+    try expect("SELECT unnest(ARRAY[1,2]) AS u, generate_subscripts(ARRAY[5,6,7], 1) AS s", "1|1;2|2;NULL|3");
+    try expect("SELECT regexp_matches('a1b2c3', '[0-9]', 'g'), generate_series(1,2)", "{1}|1;{2}|2;{3}|NULL");
+    try expect("SELECT generate_series(1,0), 5", "");
+    try expectColumns("SELECT generate_series(1.5, 3.5), generate_series('2024-01-01'::timestamp, '2024-01-03', '1 day')", "generate_series,generate_series", &.{ 1700, 1114 }, "",
+        "1.5|2024-01-01 00:00:00;2.5|2024-01-02 00:00:00;3.5|2024-01-03 00:00:00");
+    try run("CREATE TABLE srf_t(a INT, arr INT[])");
+    try run("INSERT INTO srf_t VALUES (1, '{10,20}'), (2, '{30}'), (3, NULL)");
+    try expect("SELECT a, unnest(arr), generate_series(1, a) FROM srf_t ORDER BY 1, 3", "1|10|1;1|20|NULL;2|30|1;2|NULL|2;3|NULL|1;3|NULL|2;3|NULL|3");
+    try expect("SELECT a, generate_series(1, a) FROM srf_t WHERE a < 3 ORDER BY 1, 2 LIMIT 2", "1|1;2|1");
+    try expect("SELECT DISTINCT generate_series(1, 2) FROM srf_t ORDER BY 1", "1;2");
+    // Over groups: after aggregation.
+    try expect("SELECT count(*), generate_series(1,2) FROM srf_t", "3|1;3|2");
+    try expect("SELECT a, generate_series(1,2) FROM srf_t GROUP BY a ORDER BY 1,2", "1|1;1|2;2|1;2|2;3|1;3|2");
+    try run("CREATE FUNCTION three() RETURNS SETOF INT LANGUAGE SQL AS $$VALUES (7), (8), (9)$$");
+    try expect("SELECT three(), generate_series(1,2), unnest(ARRAY['p'])", "7|1|p;8|2|NULL;9|NULL|NULL");
+    try expect("SELECT three() + 1, three()", "8|7;9|8;10|9");
+    try expect("SELECT jsonb_path_query('[1,2,3]', '$[*]'), generate_series(1,4)", "1|1;2|2;3|3;NULL|4");
+    // Not in WHERE, CASE, COALESCE or an aggregate (0A000), a zero step
+    // is 22023.
+    try fails("SELECT 1 WHERE generate_series(1,2) > 0", error.UnsupportedStatement);
+    try fails("SELECT CASE WHEN true THEN generate_series(1,2) END", error.UnsupportedStatement);
+    try fails("SELECT COALESCE(generate_series(1,2), 0)", error.UnsupportedStatement);
+    try fails("SELECT sum(generate_series(1,3))", error.UnsupportedStatement);
+    try fails("SELECT generate_series(1, 3, 0)", error.InvalidParameterValue);
+}
+
 fn contract() !void {
     try values();
     try columns();
     try routines();
     try casts();
     try corruption();
+    try projectSet();
 }
 
 pub fn main(init: std.process.Init) !void {

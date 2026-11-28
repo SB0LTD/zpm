@@ -8889,9 +8889,12 @@ pub fn Database(comptime config: Config) type {
                 try sink.add(&.{ intCell(info.oid), nameCell(info.name), intCell(catalog_module.catalog_namespace), intCell(info.bytes), .{ .pg_internal_char = 'p' }, .{ .pg_internal_char = 'P' }, intCell(0), .{ .pg_internal_char = ',' }, nameCell(info.input), intCell(0), intCell(0), intCell(CO.bootstrap_role), intCell(-1), boolCell(false), intCell(0), intCell(0), .null_value, boolCell(true), .{ .pg_internal_char = info.storage } });
             }
             // Reuse the wide row temporary across type entries.
+            // record and _record (pseudo-types; composite lane).
+            try sink.add(&.{ intCell(types.record_oid), nameCell("record"), intCell(catalog_module.catalog_namespace), intCell(-1), .{ .pg_internal_char = 'p' }, nameCell("P"), intCell(2287), nameCell(","), nameCell("record_in"), intCell(0), intCell(0), intCell(CO.bootstrap_role), intCell(-1), boolCell(false), intCell(0), intCell(0), .null_value, boolCell(true), .{ .pg_internal_char = 'x' } });
+            try sink.add(&.{ intCell(2287), nameCell("_record"), intCell(catalog_module.catalog_namespace), intCell(-1), .{ .pg_internal_char = 'p' }, nameCell("P"), intCell(0), nameCell(","), nameCell("array_in"), intCell(0), intCell(types.record_oid), intCell(CO.bootstrap_role), intCell(-1), boolCell(false), intCell(0), intCell(0), .null_value, boolCell(true), .{ .pg_internal_char = 'x' } });
             for (std.enums.values(DataType)) |data_type| {
-                // void is a builtin pseudo-type row above.
-                if (data_type == .mysql_bigint_unsigned or data_type == .void) continue;
+                // void and record are builtin pseudo-type rows above.
+                if (data_type == .mysql_bigint_unsigned or data_type == .void or data_type == .record) continue;
                 const info = types.typeInfo(data_type);
                 const type_collation = intCell(collation.typeCollation(types.typeOfData(data_type)));
                 const kind: u8 = if (types.rangeSubtype(types.typeOfData(data_type)) != null) 'r' else if (@import("sql/multirange.sig").rangeOf(data_type) != null) 'm' else 'b';

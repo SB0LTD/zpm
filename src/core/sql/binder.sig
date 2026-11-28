@@ -670,15 +670,16 @@ pub fn Binder(comptime config: types.Config) type {
             window_aggregate_count:usize=0,
             having: u16 = none,
             targets: [2 * types.projectionColumns(config)]u16 = undefined,
-            /// One top-level set-returning UNNEST target, expanded after WHERE.
+            /// The first target holding a set-returning call (ProjectSet),
+            /// expanded after WHERE.
             unnest_column: u16 = none,
-            /// Every top-level set-returning target (unnest, generate_subscripts;
-            /// B11 wave 4); `unnest_column` is the first. They run in lockstep.
-            srf_set: std.StaticBitSet(types.projectionColumns(config)) = .empty,
-            /// The set-returning call inside target `unnest_column` when it is
-            /// not UNNEST (wave 4 text-json; exec evaluates the target once
-            /// per produced value).
-            set_call: u16 = none,
+            /// Every set-returning call of the select list (generate_series,
+            /// unnest, generate_subscripts, regexp_matches, regexp_split_to_table,
+            /// jsonb_path_query, user set-returning routines), anywhere in a
+            /// target: they run in lockstep, as PostgreSQL 10's ProjectSet,
+            /// and exhausted ones yield NULL (B11 wave 5, composite lane).
+            set_calls: [types.projectionColumns(config)]u16 = undefined,
+            set_call_count: usize = 0,
             count: usize = 0,
             width: usize = 0,
             names: [types.projectionColumns(config)]V.Name = undefined,
@@ -1357,12 +1358,150 @@ pub fn Binder(comptime config: types.Config) type {
         /// The set-returning call of a select-list target reachable through
         /// expressions PostgreSQL evaluates unconditionally (not CASE,
         /// COALESCE, aggregates, window calls or subqueries), or none.
+        /// Records the select list's set-returning calls of target `id`
+        /// (PostgreSQL's ProjectSet): not inside CASE / COALESCE or an
+        /// aggregate (0A000), and not nested in another one's arguments
+        /// (0A000 here; PostgreSQL stacks ProjectSet nodes).
+        fn collectSetCalls(context: *const Context, id: u16, p: *Plan, conditional: bool) Error!void {
+            if (id == none) return;
+            const n = context.node(id);
+            switch (n.kind) {
+                .function => {
+                    if (ast.selectSetCall(n)) {
+                        if (conditional) return error.UnsupportedStatement;
+                        var item = n.b;
+                        while (item != none) : (item = context.node(item).next) {
+                            if (setCallIn(context, item) != none) return error.UnsupportedStatement;
+                        }
+                        if (p.set_call_count == p.set_calls.len) return error.ColumnCapacity;
+                        p.set_calls[p.set_call_count] = id;
+                        p.set_call_count += 1;
+                        return;
+                    }
+                    var item = n.b;
+                    while (item != none) : (item = context.node(item).next) try collectSetCalls(context, item, p, conditional);
+                    try collectSetCalls(context, n.a, p, conditional);
+                },
+                .case_expr => {
+                    try collectSetCalls(context, n.a, p, true);
+                    var arm = n.b;
+                    while (arm != none) : (arm = context.node(arm).next) {
+                        try collectSetCalls(context, context.node(arm).a, p, true);
+                        try collectSetCalls(context, context.node(arm).b, p, true);
+                    }
+                    try collectSetCalls(context, n.c, p, true);
+                },
+                .coalesce, .in_list, .row_constructor, .row_compare, .row_in => {
+                    try collectSetCalls(context, n.a, p, conditional or n.kind == .coalesce);
+                    var item = n.b;
+                    while (item != none) : (item = context.node(item).next) try collectSetCalls(context, item, p, conditional or n.kind == .coalesce);
+                },
+                .aggregate => if (setCallIn(context, n.a) != none or setCallIn(context, n.c) != none) return error.UnsupportedStatement,
+                .scalar_subquery, .exists_subquery => {},
+                .in_subquery => try collectSetCalls(context, n.a, p, conditional),
+                else => {
+                    try collectSetCalls(context, n.a, p, conditional);
+                    try collectSetCalls(context, n.b, p, conditional);
+                    try collectSetCalls(context, n.c, p, conditional);
+                },
+            }
+        }
+
+        /// generate_series / unnest / generate_subscripts called in an
+        /// expression: set-returning built-ins of a select list (ProjectSet;
+        /// 0A000 elsewhere). False when the call is none of them.
+        fn selectSetBuiltin(context: *const Context, scope: *const Scope, n: *ast.Node) Error!bool {
+            if (n.kind != .function or n.func != .none or n.name.quoted or context.dialect != .postgres) return false;
+            if (n.qualifier.len != 0 and !types.same(toName(context, n.qualifier).slice(), "pg_catalog")) return false;
+            const name = toName(context, n.name);
+            const series = types.same(name.slice(), "generate_series");
+            const unnest = types.same(name.slice(), "unnest");
+            const subscripts = types.same(name.slice(), "generate_subscripts");
+            if (!series and !unnest and !subscripts) return false;
+            if (n.window != none) return error.WindowingError;
+            const seen = scope.set_calls orelse return error.UnsupportedStatement;
+            if (series) {
+                const kind = try bindSeriesArguments(context, scope, n);
+                n.ty = kind.ty;
+                n.integer = @intFromEnum(kind.series);
+                n.func = .srf_series;
+            } else if (unnest) {
+                n.ty = try bindUnnestArgument(context, scope, n);
+                n.func = .srf_unnest;
+            } else {
+                try bindSubscriptsArguments(context, scope, n);
+                n.ty = .int4;
+                n.func = .srf_subscripts;
+            }
+            n.typmod = -1;
+            n.constant = false;
+            seen.* +|= 1;
+            return true;
+        }
+
+        const SeriesKind = struct { ty: ast.Type, series: Series };
+
+        /// generate_series's arguments (FROM and select lists): integer,
+        /// numeric or timestamp series, converted to the series type.
+        fn bindSeriesArguments(context: *const Context, scope: *const Scope, call: *ast.Node) Error!SeriesKind {
+            if (call.star or call.distinct or call.c != none) return error.UndefinedFunction;
+            var args: [3]u16 = undefined;
+            var count: usize = 0;
+            var arg = call.b;
+            while (arg != none) : (arg = context.node(arg).next) {
+                if (count == 3) return error.UndefinedFunction;
+                try typeExpr(context, scope, arg);
+                args[count] = arg;
+                count += 1;
+            }
+            if (count < 2) return error.UndefinedFunction;
+            var target: ast.Type = .unknown;
+            for (args[0..2]) |a| try unifyInto(&target, context.node(a).ty);
+            // A numeric step selects the numeric series (all three
+            // arguments share one type); a timestamp series steps by interval.
+            const step_ty: ast.Type = if (count == 3) context.node(args[2]).ty else .unknown;
+            if (count == 3 and target != .date and target != .timestamp and target != .timestamptz and step_ty != .interval) try unifyInto(&target, step_ty);
+            switch (target) {
+                .unknown => return error.AmbiguousFunction,
+                .int2, .int4 => target = .int4,
+                .int8, .numeric => {},
+                .date, .timestamp, .timestamptz => {
+                    if (target == .date) target = .timestamptz;
+                    if (count != 3) return error.UndefinedFunction;
+                },
+                else => return error.UndefinedFunction,
+            }
+            const series: Series = switch (target) {
+                .int4, .int8 => .integer,
+                .numeric => .numeric,
+                else => .timestamp,
+            };
+            for (args[0..count], 0..) |a, position| {
+                const want: ast.Type = if (series == .timestamp and position == 2) .interval else target;
+                const arg_ty = context.node(a).ty;
+                if (arg_ty == .unknown) {
+                    try coerce(context, a, want);
+                } else if (arg_ty != want and !(value.integral(arg_ty) and value.integral(want))) {
+                    if (!value.castable(arg_ty, want, .implicit)) return error.UndefinedFunction;
+                    const converted = try convert(context, a, want, -1, .implicit);
+                    const next = context.node(a).next;
+                    context.node(converted).next = next;
+                    if (position == 0) {
+                        call.b = converted;
+                    } else context.node(args[position - 1]).next = converted;
+                    context.node(a).next = none;
+                    args[position] = converted;
+                }
+            }
+            return .{ .ty = target, .series = series };
+        }
+
         fn setCallIn(context: *const Context, id: u16) u16 {
             if (id == none) return none;
             const n = context.node(id);
             switch (n.kind) {
                 .function => {
-                    if (ast.setFunction(n.func) or (n.func == .routine and n.boolean)) return id;
+                    if (ast.selectSetCall(n)) return id;
                     if (n.window != none) return none;
                     var item = n.b;
                     while (item != none) : (item = context.node(item).next) {
@@ -2503,6 +2642,7 @@ pub fn Binder(comptime config: types.Config) type {
         }
 
         fn typeFunction(context: *const Context, scope: *const Scope, n: *ast.Node) Error!void {
+            if (try selectSetBuiltin(context, scope, n)) return;
             const unqualified = n.qualifier.len == 0 and n.func != .routine;
             typeFunctionCall(context, scope, n) catch |err| {
                 // No built-in takes these arguments: a user function of the
@@ -2650,6 +2790,8 @@ pub fn Binder(comptime config: types.Config) type {
             if ((n.func == .lower or n.func == .upper) and count == 1 and types.isRange(context.node(n.b).ty)) n.func = if (n.func == .lower) .range_lower else .range_upper;
             extFunctionOverload(context, n, count);
             switch (n.func) {
+                // Select-list set-returning built-ins are typed when bound.
+                .srf_series, .srf_unnest, .srf_subscripts => {},
                 .grouping => {
                     if(!scope.aggregates) return error.GroupingError;
                     if(count==0 or count>31) return error.InvalidParameterValue;
@@ -9765,56 +9907,9 @@ pub fn Binder(comptime config: types.Config) type {
             var unnest_types: [config.columns]ast.Type = undefined;
             var unnest_count: usize = 1;
             if (!call.name.quoted and types.same(name.slice(), "generate_series")) {
-                if (call.star or call.distinct or call.c != none) return error.UndefinedFunction;
-                var args: [3]u16 = undefined;
-                var count: usize = 0;
-                var arg = call.b;
-                while (arg != none) : (arg = context.node(arg).next) {
-                    if (count == 3) return error.UndefinedFunction;
-                    try typeExpr(context, &inner, arg);
-                    args[count] = arg;
-                    count += 1;
-                }
-                if (count < 2) return error.UndefinedFunction;
-                var target: ast.Type = .unknown;
-                for (args[0..2]) |a| try unifyInto(&target, context.node(a).ty);
-                // A numeric step selects the numeric series (all three
-                // arguments share one type); a timestamp series steps by interval.
-                const step_ty: ast.Type = if (count == 3) context.node(args[2]).ty else .unknown;
-                if (count == 3 and target != .date and target != .timestamp and target != .timestamptz and step_ty != .interval) try unifyInto(&target, step_ty);
-                switch (target) {
-                    .unknown => return error.AmbiguousFunction,
-                    .int2, .int4 => target = .int4,
-                    .int8, .numeric => {},
-                    .date, .timestamp, .timestamptz => {
-                        if (target == .date) target = .timestamptz;
-                        if (count != 3) return error.UndefinedFunction;
-                    },
-                    else => return error.UndefinedFunction,
-                }
-                series = switch (target) {
-                    .int4, .int8 => .integer,
-                    .numeric => .numeric,
-                    else => .timestamp,
-                };
-                for (args[0..count], 0..) |a, position| {
-                    const want: ast.Type = if (series == .timestamp and position == 2) .interval else target;
-                    const arg_ty = context.node(a).ty;
-                    if (arg_ty == .unknown) {
-                        try coerce(context, a, want);
-                    } else if (arg_ty != want and !(value.integral(arg_ty) and value.integral(want))) {
-                        if (!value.castable(arg_ty, want, .implicit)) return error.UndefinedFunction;
-                        const converted = try convert(context, a, want, -1, .implicit);
-                        const next = context.node(a).next;
-                        context.node(converted).next = next;
-                        if (position == 0) {
-                            call.b = converted;
-                        } else context.node(args[position - 1]).next = converted;
-                        context.node(a).next = none;
-                        args[position] = converted;
-                    }
-                }
-                ty = target;
+                const kind = try bindSeriesArguments(context, &inner, call);
+                series = kind.series;
+                ty = kind.ty;
             } else if (partitionAncestorsName(context, item.name, item.schema)) {
                 if (call.star or call.distinct or call.c != none or call.order != none or call.b == none or context.node(call.b).next != none) return error.UndefinedFunction;
                 const converted = try context.pool.add(.{ .kind = .cast, .cast_type = .oid, .typmod = ast.regclass_typmod, .a = call.b });
@@ -10216,35 +10311,15 @@ pub fn Binder(comptime config: types.Config) type {
                     for (0..width) |index| try addTarget(context, p, try recordStarField(context, target.expr, index), try recordStarName(context, target.expr, index));
                     continue;
                 }
-                const call = context.node(target.expr);
-                if (call.kind == .function and (unnestName(context, call.name, functionSchema(call)) or subscriptsName(context, call.name, functionSchema(call)))) {
+                // Set-returning calls anywhere in the target (ProjectSet).
+                var set_calls: u8 = 0;
+                scope.set_calls = &set_calls;
+                if (branch) try typeExpr(context, &scope, target.expr) else try valueExpr(context, &scope, target.expr);
+                scope.set_calls = null;
+                if (set_calls != 0) {
                     if (q.lock.strength != .none) return error.UnsupportedStatement;
-                    scope.windows = false;
-                    if (unnestName(context, call.name, functionSchema(call))) {
-                        call.ty = try bindUnnestArgument(context, &scope, call);
-                        call.integer = 0;
-                    } else {
-                        // `integer` 1 marks generate_subscripts for Exec.
-                        try bindSubscriptsArguments(context, &scope, call);
-                        call.integer = 1;
-                    }
-                    scope.windows = true;
-                    if (p.set_call != none) return error.UnsupportedStatement;
+                    try collectSetCalls(context, target.expr, p, false);
                     if (p.unnest_column == none) p.unnest_column = @intCast(p.count);
-                    p.srf_set.set(p.count);
-                } else {
-                    // One set-returning built-in may sit inside one target
-                    // (wave 4 text-json): exec evaluates the target per value.
-                    var set_calls: u8 = 0;
-                    scope.set_calls = &set_calls;
-                    if (branch) try typeExpr(context, &scope, target.expr) else try valueExpr(context, &scope, target.expr);
-                    scope.set_calls = null;
-                    if (set_calls != 0) {
-                        const found = setCallIn(context, target.expr);
-                        if (set_calls > 1 or found == none or p.unnest_column != none or q.lock.strength != .none) return error.UnsupportedStatement;
-                        p.unnest_column = @intCast(p.count);
-                        p.set_call = found;
-                    }
                 }
                 const name = if (target.alias) |alias| toName(context, alias) else targetName(context, target.expr);
                 try addTarget(context, p, target.expr, name);
@@ -10301,7 +10376,6 @@ pub fn Binder(comptime config: types.Config) type {
             }
             p.rollup=q.rollup;
             p.grouped = q.rollup or p.key_count != 0 or saw or p.having != none or p.grouping_sets != none;
-            if (p.grouped and p.unnest_column != none) return error.UnsupportedStatement;
             if (p.grouped) {
                 window_def=q.window_defs;
                 while(window_def!=none) : (window_def=context.pool.windows[window_def].next) {

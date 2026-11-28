@@ -3585,6 +3585,7 @@ pub fn Parser(comptime config: types.Config) type {
                     target.star = true;
                     star = true;
                 } else {
+                    const target_start = self.pool.len;
                     target.expr = try self.expression();
                     const n = &self.pool.nodes[target.expr];
                     if (n.kind == .column and n.star) {
@@ -3599,6 +3600,9 @@ pub fn Parser(comptime config: types.Config) type {
                                 if (types.same(name, "unnest") or types.same(name, "generate_subscripts")) self.pool.complex = true;
                             }
                         }
+                        // Set-returning built-ins anywhere in a target run in
+                        // the query engine's ProjectSet (composite lane).
+                        if (self.mode == .standard and self.tokens.dialect == .postgres and !self.pool.complex and self.setCallParsed(target_start)) self.pool.complex = true;
                         target.expression_end = self.previous_end;
                         target.alias = try self.bareAlias();
                     }
@@ -5946,6 +5950,21 @@ pub fn Parser(comptime config: types.Config) type {
             return node;
         }
 
+        /// Whether a parsed target holds a call to a set-returning built-in
+        /// (bounded walk; the binder checks where they may appear).
+        fn setCallParsed(self: *Self, start: usize) bool {
+            var index: usize = start;
+            while (index < self.pool.len) : (index += 1) {
+                const n = &self.pool.nodes[index];
+                if (n.kind != .function) continue;
+                var buf: [64]u8 = undefined;
+                const name = identText(self.source, n.name, &buf) orelse continue;
+                if (types.same(name, "generate_series") or types.same(name, "unnest") or types.same(name, "generate_subscripts") or
+                    types.same(name, "regexp_matches") or types.same(name, "regexp_split_to_table") or types.same(name, "jsonb_path_query")) return true;
+            }
+            return false;
+        }
+
         /// `(base).name` and `(base).*` field selection (B11 wave 5,
         /// composite lane), repeated and mixed with subscripts.
         fn fieldTail(self: *Self, base: u16) Error!u16 {
@@ -5957,7 +5976,8 @@ pub fn Parser(comptime config: types.Config) type {
                     try self.pool.raise(all, current);
                     return all;
                 }
-                const name = try self.identifier();
+                // A field name is any label (attr_name: ColLabel).
+                const name = try self.label();
                 const node = try self.pool.add(.{ .kind = .field_select, .a = current, .name = name });
                 try self.pool.raise(node, current);
                 current = try self.subscriptTail(node);

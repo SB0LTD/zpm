@@ -316,10 +316,13 @@ pub fn Eval(comptime config: types.Config) type {
             /// Routine frame (B11 wave 3) read by routine_param nodes; the
             /// innermost context with one wins, else Session.routine_frame.
             frame: ?*const Frame = null,
-            /// The current value of the select list's set-returning call
-            /// (wave 4 text-json; Exec.projectSet).
-            set_value: ?*const V.Cell = null,
+            /// The current value of each set-returning call of the select
+            /// list (ProjectSet; B11 wave 5 composite lane): Exec.projectSets.
+            set_values: []const SetValue = &.{},
         };
+
+        /// A set-returning call node and its value for the current row.
+        pub const SetValue = struct { node: u16, value: *const V.Cell };
 
         /// Values of a running routine: parameters / PL/pgSQL variables and
         /// the NEW and OLD rows of a trigger (null: a NULL record).
@@ -1749,7 +1752,8 @@ pub fn Eval(comptime config: types.Config) type {
                 .jsonb_set, .jsonb_set_lax, .jsonb_insert, .jsonb_delete_path, .jsonb_strip_nulls, .jsonb_pretty, .to_json, .to_jsonb, .row_to_json, .jsonb_path_exists, .jsonb_path_match, .jsonb_path_query_array, .jsonb_path_query_first, .jsonb_exists_any, .jsonb_exists_all, .jsonb_minus_op, .jsonb_delete_path_op, .jsonb_exists_any_op, .jsonb_exists_all_op, .jsonb_path_exists_op, .jsonb_path_match_op => return json_eval.JsonEval(config, @This()).call(ctx, n),
                 .regexp_match, .regexp_replace, .regexp_split_to_array, .regexp_count, .regexp_instr, .regexp_substr, .substring_regex, .substring_similar => return regex_eval.RegexEval(config, @This()).call(ctx, n),
                 // A set-returning call reads the value exec is expanding.
-                .regexp_matches, .regexp_split_to_table, .jsonb_path_query => return if (ctx.set_value) |current| current.* else error.UnsupportedStatement,
+                // Set-returning calls are expanded by Exec.projectSets.
+                .regexp_matches, .regexp_split_to_table, .jsonb_path_query, .srf_series, .srf_unnest, .srf_subscripts => return error.UnsupportedStatement,
                 .json_query_function => return json_eval.JsonEval(config, @This()).queryFunction(ctx, n),
                 .json_constructor => return json_eval.JsonEval(config, @This()).constructor(ctx, n),
                 .tsvector_length, .ts_strip, .ts_setweight, .tsvector_to_array, .array_to_tsvector, .ts_delete, .ts_filter, .ts_numnode => return textSearchUtility(ctx, n),
@@ -1890,12 +1894,16 @@ pub fn Eval(comptime config: types.Config) type {
         }
 
         fn evalCallable(ctx: *const Context, n: *const ast.Node) Error!V.Cell {
+            // A set-returning call of the select list reads the current row.
+            for (ctx.set_values) |slot| {
+                if (&ctx.pool.nodes[slot.node] == n) return slot.value.*;
+            }
             switch (n.func) {
                     // Routine frames already own their parameters/records.
                     // Keep these reads and calls out of the scalar dispatcher's
                     // unrelated wide-cell temporaries on a bounded stack.
                     // A select-list set-returning call reads the row's value.
-                    .routine => return if (n.boolean and ctx.set_value != null) ctx.set_value.?.* else routineCall(ctx, n),
+                    .routine => return if (n.boolean) error.UnsupportedStatement else routineCall(ctx, n),
                     .routine_param => return routineValue(ctx, n),
                     .lo_import, .lo_export => return evalLargeObjectFile(ctx, n),
                     .lo_truncate, .lo_truncate64, .lo_from_bytea, .lo_get, .lo_create, .lo_creat, .lo_unlink => return evalLargeObject(ctx, n),
