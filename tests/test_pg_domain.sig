@@ -86,7 +86,11 @@ fn sqlContracts() !void {
         try expectError(db, "SELECT 'invalid'::checked.positive", error.InvalidTextRepresentation);
         try expectError(db, "CREATE TABLE incompatible (i checked.positive)", error.UnsupportedStatement);
         try expectError(db, "CREATE DOMAIN nested AS checked.positive", error.UnsupportedStatement);
-        try expectError(db, "SELECT 1::checked.positive + 2", error.UnsupportedStatement);
+        // A domain value takes its base type's operators: 3, integer
+        // (checked against native PostgreSQL 18.7; S071 type resolution,
+        // B11 wave 5).
+        try db.execute("SELECT 1::checked.positive + 2", &result);
+        try check(result.row_count == 1 and result.column_types[0] == .integer32 and result.rows[0].cells[0].integer == 3);
         try expectError(db, "SELECT '1'::checked._positive", error.UnsupportedStatement);
         try expectError(db, "CREATE DOMAIN checked.positive AS INT", error.DuplicateObject);
         try expectError(db, "CREATE TABLE checked.positive (i INT)", error.DuplicateObject);
