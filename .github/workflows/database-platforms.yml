@@ -86,22 +86,25 @@ jobs:
     runs-on: ${{ matrix.os }}
     # Cold Linux and macOS builds were still compiling test-db/test-sql at the
     # previous 60/75 minute limits (run 44108798127). Leave room for the contract
-    # execution and native checks after the compile graph finishes.
+    # execution and native checks after the compile graph finishes. B11 waves 4
+    # and 5 added a dozen SQL contracts: Linux was still compiling them at 95
+    # minutes (run 46091516864) while macOS took 85 and Windows 92 for the same
+    # step, so every platform gets 180.
     timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
-            timeout_minutes: 95
+            timeout_minutes: 180
             asset: sig-0.6.5-zig0.17.0.3c72687-x86_64-linux.tar.xz
             sha256: 179094228e2e6b0db3a5a1e01a8a57e8e91db6aa3b5ca80094ca22d870cc373a
           - os: macos-latest
-            timeout_minutes: 110
+            timeout_minutes: 180
             asset: sig-0.6.5-zig0.17.0.3c72687-aarch64-macos.tar.xz
             sha256: a936b163c87b471b603caa78aa84d4542c28b9ce3885f502d6901d68a3d716ae
           - os: windows-latest
-            timeout_minutes: 110
+            timeout_minutes: 180
             asset: sig-0.6.5-zig0.17.0.3c72687-x86_64-windows.zip
             sha256: 291a3225ff33c32e8c479471c44be6db0d811d6023d759c64e0a7d5bf810576c
     defaults:
