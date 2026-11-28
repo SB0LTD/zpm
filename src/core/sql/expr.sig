@@ -1777,8 +1777,10 @@ pub fn Eval(comptime config: types.Config) type {
                         },
                         .xmlserialize => {
                             if (document and !xml_module.validDocument(argument.xml.slice())) return error.NotAnXmlDocument;
-                            if (n.integer & 2 != 0) return cast(try xml_eval.XmlEval(config, @This()).indent(ctx, argument.xml.slice(), document), .text, n.cast_type, n.typmod, ctx.session);
-                            return cast(.{ .text = argument.xml }, .text, n.cast_type, n.typmod, ctx.session);
+                            // The text, then an implicit length coercion
+                            // (22001 rather than truncation).
+                            const serialized = if (n.integer & 2 != 0) try xml_eval.XmlEval(config, @This()).indent(ctx, argument.xml.slice(), document) else V.Cell{ .text = argument.xml };
+                            return Io.applyTypmod(try cast(serialized, .text, n.cast_type, -1, ctx.session), n.cast_type, n.typmod);
                         },
                         // xml_is_well_formed follows xmloption (B11 wave 5).
                         .xml_is_well_formed => return .{ .boolean = if (ctx.session.xml_document) xml_module.validDocument(argument.text.slice()) else xml_module.validContent(argument.text.slice()) },

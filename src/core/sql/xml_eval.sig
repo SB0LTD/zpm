@@ -771,6 +771,12 @@ pub fn XmlEval(comptime config: types.Config, comptime E: type) type {
             return sequences;
         }
 
+        fn cursorRows(ctx: *const E.Context, name: []const u8, count: i64, fetch: bool, sink: value.XmlQuerySink) Error!void {
+            const sequences = ctx.session.sequences orelse return error.UnsupportedStatement;
+            const cursor = sequences.xml_cursor orelse return error.UnsupportedStatement;
+            try cursor(sequences.ptr, name, count, fetch, &sink);
+        }
+
         fn runQuery(ctx: *const E.Context, query: []const u8, collector: *Collector) Error!void {
             const sequences = try hook(ctx);
             const sink: value.XmlQuerySink = .{ .context = collector, .columns = &Collector.columns, .row = &Collector.row };
@@ -1287,7 +1293,7 @@ pub fn XmlEval(comptime config: types.Config, comptime E: type) type {
             defer s.release(mark);
             var w: Writer = .{ .s = s, .start = s.region.used };
             const database = which == .database_to_xml or which == .database_to_xmlschema or which == .database_to_xml_and_xmlschema;
-            const first: usize = if (database) 0 else 1;
+            const first: usize = if (database) 0 else if (which == .cursor_to_xml) 2 else 1;
             const options: Options = .{ .nulls = args[first].boolean, .tableforest = args[first + 1].boolean, .targetns = textArgument(&args[first + 2]) };
             switch (which) {
                 .table_to_xml => try tableToXml(ctx, &w, args[0].integer, null, options, true),
@@ -1337,7 +1343,20 @@ pub fn XmlEval(comptime config: types.Config, comptime E: type) type {
                         return wideCell(ctx, .xml, data.slice());
                     }
                 },
-                .cursor_to_xml, .cursor_to_xmlschema => return error.UnsupportedStatement,
+                .cursor_to_xml => {
+                    if (!options.tableforest) {
+                        try rootStart(&w, "table", null, options.targetns, true);
+                        try w.add("\n");
+                    }
+                    var collector: Collector = .{ .ctx = ctx, .w = &w, .options = options, .table_name = null, .top_level = true };
+                    try cursorRows(ctx, textArgument(&args[0]), args[1].integer, true, .{ .context = &collector, .columns = &Collector.columns, .row = &Collector.row });
+                    if (!options.tableforest) try rootEnd(&w, "table");
+                },
+                .cursor_to_xmlschema => {
+                    var shape: ShapeSink = .{};
+                    try cursorRows(ctx, textArgument(&args[0]), 0, false, .{ .context = &shape, .columns = &ShapeSink.columns, .row = &ShapeSink.row });
+                    try tableSchema(ctx, &w, &shape, null, options);
+                },
                 else => unreachable,
             }
             return wideCell(ctx, .xml, w.slice());

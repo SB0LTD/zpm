@@ -881,7 +881,12 @@ pub const Context = struct {
 
     fn uri(self: *const Context, prefix: []const u8) ?[]const u8 {
         if (types.same(prefix, "xml")) return tree_module.xml_namespace_uri;
-        for (self.bindings) |binding| if (types.same(binding.prefix, prefix)) return binding.uri;
+        // A prefix registered again replaces its URI (xmlHashUpdateEntry).
+        var index = self.bindings.len;
+        while (index > 0) {
+            index -= 1;
+            if (types.same(self.bindings[index].prefix, prefix)) return self.bindings[index].uri;
+        }
         return null;
     }
 };

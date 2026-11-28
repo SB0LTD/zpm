@@ -88,6 +88,10 @@ pub const Tree = struct {
     text_len: usize = 0,
     namespace_error: bool = false,
     control: ?*types.ExecutionControl = null,
+    /// The DOCTYPE (raw text; len 0: none) and how many document children
+    /// precede it. XPath does not see it; document dumps write it.
+    doctype: Span = .{},
+    doctype_at: u32 = 0,
 
     pub fn bytes(self: *const Tree, span: Span) []const u8 {
         const base = if (span.decoded) self.text[0..self.text_len] else self.source;
@@ -418,6 +422,14 @@ const Builder = struct {
     }
 
     fn doctype(self: *Builder) Error!void {
+        const start = self.at;
+        defer {
+            self.tree.doctype = .{ .start = @intCast(start), .len = @intCast(self.at - start) };
+            var children: u32 = 0;
+            var child_at = self.tree.nodes[0].first;
+            while (child_at != none) : (child_at = self.tree.nodes[child_at].next) children += 1;
+            self.tree.doctype_at = children;
+        }
         self.at += 9;
         var bracket = false;
         while (!self.end()) {
@@ -648,6 +660,7 @@ pub fn parse(tree: *Tree, options: Options) Error!void {
     tree.count = 0;
     tree.text_len = 0;
     tree.namespace_error = false;
+    tree.doctype = .{};
     const decl = xml.declaration(tree.source) orelse return error.InvalidXmlDocument;
     _ = try tree.add(.{ .kind = .document });
     var builder: Builder = .{ .tree = tree, .text = tree.source, .at = decl.len, .keep_blanks = options.keep_blanks, .replace_entities = options.replace_entities, .mode = options.mode };
@@ -992,15 +1005,20 @@ fn declOut(prefix_text: []const u8, uri: []const u8, out: *Out) Error!void {
     try quoted(uri, out);
 }
 
-/// xmlBufWriteQuotedString: double quotes unless the value contains one.
+/// `=` and the value quoted (a namespace declaration's URI).
 fn quoted(data: []const u8, out: *Out) Error!void {
+    try out.byte('=');
+    try quotedValue(data, out);
+}
+
+/// xmlBufWriteQuotedString: double quotes unless the value contains one.
+fn quotedValue(data: []const u8, out: *Out) Error!void {
     var has_double = false;
     var has_single = false;
     for (data) |c| {
         if (c == '"') has_double = true;
         if (c == '\'') has_single = true;
     }
-    try out.byte('=');
     if (has_double and has_single) {
         try out.byte('"');
         for (data) |c| if (c == '"') try out.add("&quot;") else try out.byte(c);
@@ -1014,6 +1032,94 @@ fn quoted(data: []const u8, out: *Out) Error!void {
         try out.add(data);
         try out.byte('"');
     }
+}
+
+/// xmlDtdDumpOutput of the DOCTYPE: the name, an external ID (PUBLIC
+/// "pub" "sys" or SYSTEM "sys", quoted again) and the internal subset's
+/// declarations one per line (white space runs collapsed).
+fn doctypeOut(tree: *const Tree, out: *Out) Error!void {
+    const raw = tree.bytes(tree.doctype);
+    var at: usize = 9;
+    const skip = struct {
+        fn run(text: []const u8, index: *usize) void {
+            while (index.* < text.len and space(text[index.*])) index.* += 1;
+        }
+    }.run;
+    skip(raw, &at);
+    const name_start = at;
+    while (at < raw.len and nameChar(raw[at])) at += 1;
+    try out.add("<!DOCTYPE ");
+    try out.add(raw[name_start..at]);
+    skip(raw, &at);
+    var literals: [2][]const u8 = .{ "", "" };
+    var public = false;
+    var external = false;
+    if (startsWith(raw, at, "PUBLIC") or startsWith(raw, at, "SYSTEM")) {
+        public = raw[at] == 'P';
+        external = true;
+        at += 6;
+        for (0..@as(usize, if (public) 2 else 1)) |index| {
+            skip(raw, &at);
+            if (at >= raw.len) break;
+            const quote = raw[at];
+            at += 1;
+            const start = at;
+            while (at < raw.len and raw[at] != quote) at += 1;
+            literals[index] = raw[start..@min(at, raw.len)];
+            at += 1;
+        }
+        skip(raw, &at);
+    }
+    if (external) {
+        try out.add(if (public) " PUBLIC " else " SYSTEM ");
+        try quotedValue(literals[0], out);
+        if (public) {
+            try out.byte(' ');
+            try quotedValue(literals[1], out);
+        }
+    }
+    if (at < raw.len and raw[at] == '[') {
+        at += 1;
+        var any = false;
+        var index = at;
+        while (index < raw.len and raw[index] != ']') {
+            if (raw[index] != '<') {
+                index += 1;
+                continue;
+            }
+            // One markup declaration (quoted strings may hold '>').
+            if (!any) try out.add(" [\n");
+            any = true;
+            var previous_space = false;
+            var quote: u8 = 0;
+            while (index < raw.len) : (index += 1) {
+                const c = raw[index];
+                if (quote != 0) {
+                    try out.byte(c);
+                    if (c == quote) quote = 0;
+                    continue;
+                }
+                if (c == '"' or c == '\'') quote = c;
+                if (space(c)) {
+                    previous_space = true;
+                    continue;
+                }
+                if (previous_space and c != '>') try out.byte(' ');
+                previous_space = false;
+                try out.byte(c);
+                if (c == '>') {
+                    index += 1;
+                    break;
+                }
+            }
+            try out.byte('\n');
+        }
+        if (any) {
+            try out.add("]>");
+            return;
+        }
+    }
+    try out.byte('>');
 }
 
 /// The namespace declarations xmlCopyNode adds to the root of a copied
@@ -1165,9 +1271,16 @@ pub fn dumpCopy(tree: *const Tree, index: u32, out: *Out) Error!void {
         // its attribute values keep non-ASCII characters.
         try out.add("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
         var child_at = n.first;
-        while (child_at != none) : (child_at = tree.nodes[child_at].next) {
+        var position: u32 = 0;
+        while (true) : (position += 1) {
+            if (tree.doctype.len != 0 and position == tree.doctype_at) {
+                try doctypeOut(tree, out);
+                try out.byte('\n');
+            }
+            if (child_at == none) break;
             try dump(tree, child_at, null, .{}, out);
             try out.byte('\n');
+            child_at = tree.nodes[child_at].next;
         }
         return;
     }
@@ -1208,9 +1321,16 @@ pub fn indented(tree: *const Tree, mode: Mode, declared: bool, version: []const 
             try out.add("?>\n");
         }
         var child_at = doc.first;
-        while (child_at != none) : (child_at = tree.nodes[child_at].next) {
+        var position: u32 = 0;
+        while (true) : (position += 1) {
+            if (tree.doctype.len != 0 and position == tree.doctype_at) {
+                try doctypeOut(tree, out);
+                try out.byte('\n');
+            }
+            if (child_at == none) break;
             try dump(tree, child_at, null, style, out);
             try out.byte('\n');
+            child_at = tree.nodes[child_at].next;
         }
         while (out.len > 0 and (out.bytes[out.len - 1] == '\n' or out.bytes[out.len - 1] == '\r')) out.len -= 1;
         return;

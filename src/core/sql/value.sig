@@ -166,6 +166,10 @@ pub const SequenceHook = struct {
     /// the running statement, read-only under its snapshot, and passes its
     /// columns and rows to `sink` (a query that is not a SELECT is 22000).
     xml_query: ?*const fn (ptr: *anyopaque, query: []const u8, sink: *const XmlQuerySink) Error!void = null,
+    /// cursor_to_xml / cursor_to_xmlschema (B11 wave 5 xml lane): the
+    /// session cursor `name` (34000 when there is none) passes its columns
+    /// to `sink`, then with `fetch` the rows of FETCH FORWARD `count`.
+    xml_cursor: ?*const fn (ptr: *anyopaque, name: []const u8, count: i64, fetch: bool, sink: *const XmlQuerySink) Error!void = null,
 };
 
 /// The receiver of an xml_query (B11 wave 5 xml lane).

@@ -11395,7 +11395,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn statementHooks(self: *Self, slot: u16, snap: Snapshot) void {
-            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .large_object = &largeObjectCall, .large_object_data = &largeObjectDataCall, .large_object_truncate = &truncateLargeObject, .large_object_file = .{ .authorize = &authorizeLargeObjectFile, .call = &largeObjectFileCall }, .relation_name = &relationName, .relation_display_name = &relationDisplayName, .catalog_text = &catalogText, .schema_path = &catalogSchemaPath, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .view_definition = &postgresViewDefinition, .trigger_definition = &postgresTriggerDefinition, .rule_definition = &postgresRuleDefinition, .statistics_columns = &postgresStatisticsColumns, .relation_publishable = &relationPublishable, .partition_key_definition = &postgresPartitionKey, .partition_ancestors = &postgresPartitionAncestors, .namespace_lookup = &postgresNamespaceLookup, .namespace_name = &postgresNamespaceName, .routine_lookup = &postgresRoutineLookup, .routine_name = &postgresRoutineName, .xml_query = &xmlQuery };
+            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .large_object = &largeObjectCall, .large_object_data = &largeObjectDataCall, .large_object_truncate = &truncateLargeObject, .large_object_file = .{ .authorize = &authorizeLargeObjectFile, .call = &largeObjectFileCall }, .relation_name = &relationName, .relation_display_name = &relationDisplayName, .catalog_text = &catalogText, .schema_path = &catalogSchemaPath, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .view_definition = &postgresViewDefinition, .trigger_definition = &postgresTriggerDefinition, .rule_definition = &postgresRuleDefinition, .statistics_columns = &postgresStatisticsColumns, .relation_publishable = &relationPublishable, .partition_key_definition = &postgresPartitionKey, .partition_ancestors = &postgresPartitionAncestors, .namespace_lookup = &postgresNamespaceLookup, .namespace_name = &postgresNamespaceName, .routine_lookup = &postgresRoutineLookup, .routine_name = &postgresRoutineName, .xml_query = &xmlQuery, .xml_cursor = &xmlCursor };
             self.session.sequences = &self.seq_hook;
             // A statement starts with the whole XML scratch region free.
             self.xml_region = .{ .bytes = &self.xml_backing };
@@ -16598,6 +16598,44 @@ pub fn Database(comptime config: Config) type {
         /// result columns, then every row while its cells are valid.
         fn xmlQuery(ptr: *anyopaque, text: []const u8, sink: *const value_module.XmlQuerySink) Error!void {
             const self: *Self = @ptrCast(@alignCast(ptr));
+            // Several statements run in turn; the last one's rows count. No
+            // statement at all is 22000.
+            var statements: R.Statements = .{ .source = text };
+            var pending: ?R.Span = null;
+            while (try statements.next()) |span| {
+                if (pending) |earlier| try self.xmlQueryStatement(text[earlier.start..earlier.end], null);
+                pending = span;
+            }
+            const last = pending orelse return error.DataException;
+            try self.xmlQueryStatement(text[last.start..last.end], sink);
+        }
+
+        /// Session hook xml_cursor (cursor_to_xml): the cursor's columns,
+        /// then with `fetch` the rows FETCH FORWARD `count` returns, moving
+        /// the cursor (SPI_cursor_fetch).
+        fn xmlCursor(ptr: *anyopaque, name: []const u8, count: i64, fetch: bool, sink: *const value_module.XmlQuerySink) Error!void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            const state = self.sessionState();
+            const index = self.cursors.find(state.id, name) orelse return error.PortalNotFound;
+            const cursor = &self.cursors.slots[index];
+            const columns = cursor.column_count;
+            var tys: [config.columns]types.Type = undefined;
+            for (0..columns) |column| tys[column] = types.typeOfData(cursor.column_types[column]);
+            try sink.columns(sink.context, columns, @ptrCast(&cursor.names), &tys, &cursor.typmods);
+            if (!fetch) return;
+            const step: Sess.Move = if (count == 0) Sess.relativePosition(cursor.position, cursor.count, 0) else Sess.relativeMove(cursor.position, cursor.count, count > 0, @abs(count));
+            if (!cursor.scroll and ((step.rows != 0 and step.first <= cursor.position) or step.position < cursor.position)) return error.ObjectNotInPrerequisiteState;
+            for (0..step.rows) |row| {
+                try self.session.checkpoint();
+                const at = if (step.backward) step.first - row else step.first + row;
+                try sink.row(sink.context, @ptrCast(&self.cursors.rows[cursor.base + at - 1].cells));
+            }
+            cursor.position = step.position;
+        }
+
+        /// One statement of an xml_query: only a query may run (a write or
+        /// utility statement is 0A000, as in a read-only SPI call).
+        fn xmlQueryStatement(self: *Self, text: []const u8, sink_or_null: ?*const value_module.XmlQuerySink) Error!void {
             const slot = self.routine_slot;
             const snap = self.routine_snap;
             const mark = try self.nestedEnter(slot);
@@ -16610,7 +16648,7 @@ pub fn Database(comptime config: Config) type {
                     self.workspace.nodes.complex = true;
                 },
                 .query => {},
-                else => return error.DataException,
+                else => return error.UnsupportedStatement,
             }
             for (self.workspace.nodes.queries[0..self.workspace.nodes.query_len]) |*block| {
                 if (block.lock.strength != .none) return error.UnsupportedStatement;
@@ -16624,7 +16662,7 @@ pub fn Database(comptime config: Config) type {
             try B.bindInto(&context, &parsed, &bound);
             const root = switch (bound) {
                 .query => |root| root,
-                else => return error.DataException,
+                else => return error.UnsupportedStatement,
             };
             const plans = &self.workspace.plans;
             if (plans.dml_len != 0) return error.UnsupportedStatement;
@@ -16638,6 +16676,7 @@ pub fn Database(comptime config: Config) type {
             const work = &self.workspace.query;
             const list = try X.queryRows(&self.tables, source, &self.workspace.nodes, plans, root, snap, &self.session, work);
             const plan = &plans.items[root];
+            const sink = sink_or_null orelse return;
             try sink.columns(sink.context, plan.count, @ptrCast(&plan.names), &plan.tys, &plan.typmods);
             for (0..list.count) |index| {
                 try self.session.checkpoint();
