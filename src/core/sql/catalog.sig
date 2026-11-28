@@ -107,9 +107,11 @@ pub const constraint_catalog: u32 = 2606;
 pub const attrdef_catalog: u32 = 2604;
 pub const heap_access_method: u32 = 2;
 pub const btree_access_method: u32 = 403;
+pub const hash_access_method: u32 = 405;
 pub const access_methods = [_]struct { oid: u32, name: []const u8, kind: u8, handler: u32, handler_name: []const u8, result: u32 }{
     .{ .oid = heap_access_method, .name = "heap", .kind = 't', .handler = 3, .handler_name = "heap_tableam_handler", .result = 269 },
     .{ .oid = btree_access_method, .name = "btree", .kind = 'i', .handler = 330, .handler_name = "bthandler", .result = 325 },
+    .{ .oid = hash_access_method, .name = "hash", .kind = 'i', .handler = 331, .handler_name = "hashhandler", .result = 325 },
 };
 pub const internal_type_oid: u32 = 2281;
 pub const builtin_pseudo_types = [_]struct { oid: u32, name: []const u8, bytes: i16, input: []const u8, storage: u8 = 'p' }{

@@ -291,6 +291,9 @@ pub fn Database(comptime config: Config) type {
         pub const StorageRowSlot = S.RowSlot;
         pub const StorageVersion = S.Version;
         pub const StorageVersionRow = S.VersionRow;
+        /// Words of one external index run (hash slots or btree node arena).
+        pub const indexRunWords = S.indexRunWords;
+        pub const index_node_words = S.node_words;
         pub const integralRowWords = S.integralRowWords;
         pub const ReplayScratch = C.Scratch;
         pub const BaseSnapshot = base_snapshot.Image(config, Self);
@@ -2289,7 +2292,9 @@ pub fn Database(comptime config: Config) type {
                 offsets[7] = if (S.presence_enabled) try appendLayout(&cursor, u64, try S.presenceWords(scan_rows)) else cursor;
                 const hashes = budget.secondary_hashes orelse S.bound_indexes;
                 if (hashes > S.bound_indexes) return error.InvalidParameterValue;
-                const index_slots = @mulWithOverflow(ki, hashes);
+                // A run holds a hash index's key-index-sized slots or an
+                // ordered index's node arena over every version.
+                const index_slots = @mulWithOverflow(try S.indexRunWords(ki, versions), hashes);
                 if (index_slots[1] != 0) return error.InvalidParameterValue;
                 offsets[8] = if (hashes != 0) try appendLayout(&cursor, u32, index_slots[0]) else cursor;
                 if (!S.integral_enabled and budget.integral_row_words != 0) return error.InvalidParameterValue;
@@ -2392,7 +2397,7 @@ pub fn Database(comptime config: Config) type {
                     .scan_live = try storageView(u8, bytes, offsets[6], scan_rows),
                     .scan_presence = if (S.presence_enabled) try storageView(u64, bytes, offsets[7], try S.presenceWords(scan_rows)) else &.{},
                     .omit_compact_scan = budget.omit_compact_scan,
-                    .index_slots = if (hashes != 0) try storageView(u32, bytes, offsets[8], ki * hashes) else &.{},
+                    .index_slots = if (hashes != 0) try storageView(u32, bytes, offsets[8], (try S.indexRunWords(ki, budget.versions)) * hashes) else &.{},
                     .scan_index_limit = if (hashes < S.bound_indexes) S.bound_indexes else 0,
                 };
             }
@@ -4038,7 +4043,9 @@ pub fn Database(comptime config: Config) type {
             switch (bound.*) {
                 .select => |*select| {
                     try self.lockSelect(slot, select);
-                    if (options.analyze) try self.runBoundSelect(slot, source, select, snap, &observation);
+                    if (options.analyze) try self.runBoundSelect(slot, source, select, snap, &observation) else if (X.plannedOperation(select)) |planned| {
+                        observation.operation = planned;
+                    }
                 },
                 .query => |root| {
                     try self.lockSources(slot);
@@ -8187,12 +8194,14 @@ pub fn Database(comptime config: Config) type {
             row_type: u32 = 0,
             owner: u32 = CO.bootstrap_role,
             acl: Cell = .null_value,
+            /// An index's access method (0: btree).
+            access: u32 = 0,
         };
 
         fn classRow(sink: *X.RowSink, oid: u32, name: []const u8, namespace: u32, kind: u8, columns: usize, properties: ClassProperties) Error!void {
             const access: u32 = switch (kind) {
                 'r', 'm' => catalog_module.heap_access_method,
-                'i', 'I' => catalog_module.btree_access_method,
+                'i', 'I' => if (properties.access != 0) properties.access else catalog_module.btree_access_method,
                 else => 0,
             };
             const identity = switch (kind) { 'r', 'p', 'm' => "d", else => "n" };
@@ -8732,7 +8741,7 @@ pub fn Database(comptime config: Config) type {
                             if (S.keyed(table)) try classRow(sink, S.primaryIndexOid(table), pkey.slice(), table.namespace, 'i', primary_columns.len, .{ .owner = self.catalog_objects.owner(table.oid, snapshot) });
                             for (table.indexes[0..table.index_count]) |*index| {
                                 if (index.oid == 0) continue;
-                                try classRow(sink, index.oid, index.name.slice(), table.namespace, 'i', index.key_count + index.include_count, .{ .owner = self.catalog_objects.owner(table.oid, snapshot) });
+                                try classRow(sink, index.oid, index.name.slice(), table.namespace, 'i', index.key_count + index.include_count, .{ .owner = self.catalog_objects.owner(table.oid, snapshot), .access = if (index.hash) catalog_module.hash_access_method else 0 });
                             }
                         },
                         .tables => {
@@ -8898,7 +8907,7 @@ pub fn Database(comptime config: Config) type {
             }
             text.ident(table.name.slice());
             text.add(" USING ");
-            text.ident("btree");
+            text.ident(if (index) |secondary| (if (secondary.hash) "hash" else "btree") else "btree");
             text.add(" (");
             var expressions = if (index) |secondary| secondary.expressions.slice() else &.{};
             for (keys, 0..) |column, position| {
@@ -10108,6 +10117,11 @@ pub fn Database(comptime config: Config) type {
                 if (value != .null_value) fills[position] = try D.store(column, value, &self.session);
             }
             if (!S.indexFits(copy, alter.extras.index_count, source.version_used)) return error.IndexCapacity;
+            // CREATE INDEX over existing rows: every entry within
+            // index_key_bytes (PostgreSQL's index row size limit, 54000).
+            if (alter.command == .create_index and alter.extras.index_count != 0) {
+                if (!S.keysFit(source, &alter.extras.indexes[alter.extras.index_count - 1])) return error.IndexCapacity;
+            }
             S.reset(copy, source.oid, alter.name, alter.columns[0..alter.count]);
             copy.namespace = source.namespace;
             S.setConstraints(copy, alter.constraints[0..alter.constraint_count]);
@@ -10912,6 +10926,7 @@ pub fn Database(comptime config: Config) type {
             try checkPendingLatePrimary(table);
             try self.reserveWrites(slot, 1);
             try S.ensureVersions(table, 1, self.horizon());
+            try S.admitVersion(table, cells[0..]);
             const version = S.createVersion(table, .{ .row = row, .xmin = tx.ref(slot), .cid = snap.cid, .older = old + 1 }, cells);
             table.versions[old].markDeletion(tx.ref(slot), snap.cid);
             S.indexKey(table, version);
@@ -11237,6 +11252,16 @@ pub fn Database(comptime config: Config) type {
             return null;
         }
 
+        /// Whether every ordered index tree of a committed table is
+        /// structurally valid (order, separators, occupancy, links, one entry
+        /// per allocated version): contracts check it after every change.
+        pub fn indexTreesValid(self: *const Self, table_name: []const u8) ?bool {
+            const index = self.committedIndex(table_name) orelse return null;
+            const table = &self.tables[index];
+            for (0..table.index_count) |which| if (!S.indexTreeValid(table, which)) return false;
+            return true;
+        }
+
         /// Whether every backed secondary hash covers the allocated versions.
         pub fn indexConsistent(self: *const Self, table_name: []const u8) ?bool {
             const index = self.committedIndex(table_name) orelse return null;
@@ -11263,6 +11288,7 @@ pub fn Database(comptime config: Config) type {
             try self.reserveWrites(slot, 1);
             const at = self.horizon();
             try S.ensureVersions(table, 1, at);
+            try S.admitVersion(table, cells[0..]);
             // A statement suspended under a nested one may be scanning this
             // table: its row slots must not move (B11 wave 4).
             if (self.nested_depth != 0 and table.row_high >= table.rows.len and self.suspendedTable(table_index)) return error.RowCapacity;

@@ -141,6 +141,20 @@ pub const Config = struct {
     /// (54000) with the statement rolled back. Entries live inline in the
     /// table: table_indexes x 2 x index_entries u32 per table (power of two).
     index_entries: usize = 0,
+    /// Ordered (btree) secondary indexes (B11 wave 5): entries per B+tree
+    /// node (even, 8..1024). A node is 4 + 4 x fanout u32 words; an
+    /// index's node arena holds the worst case (every non-root node half
+    /// full) for its entry capacity, so a write that fits the entries never
+    /// runs out of nodes.
+    index_fanout: usize = 32,
+    /// Tree height limit of an ordered index; 0 derives one that every
+    /// addressable entry count fits. A smaller limit caps the entries at
+    /// 2 x (fanout / 2)^depth - 1 per index: more raise IndexCapacity (54000).
+    index_depth: usize = 0,
+    /// Bytes of an ordered index entry's key and INCLUDE values (fixed-width
+    /// values count their width, text-like values their bytes); PostgreSQL's
+    /// btree tuple limit by default. A larger entry is IndexCapacity (54000).
+    index_key_bytes: usize = 2704,
     /// Statement text plus the view, inheritance and partition expansions
     /// it reads, copied into the statement workspace. A statement that reads
     /// a view, an inheritance parent or a partitioned table and needs more
@@ -464,7 +478,9 @@ pub const Error = error{
     /// SQLSTATE 23P01: a row conflicts with an EXCLUDE constraint.
     ExclusionViolation,
     /// SQLSTATE 54000: a table's secondary indexes (Config.table_indexes)
-    /// or a secondary index's entries (Config.index_entries) are full.
+    /// or a secondary index's entries (Config.index_entries) are full, or an
+    /// ordered index reached its depth (index_depth) or entry size
+    /// (index_key_bytes) limit.
     IndexCapacity,
     /// SQLSTATE 42830: a FOREIGN KEY whose referenced columns are not a
     /// primary key or unique constraint of the referenced table.

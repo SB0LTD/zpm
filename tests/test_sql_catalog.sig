@@ -435,8 +435,8 @@ fn relationMetadata() !void {
     try run("CREATE INDEX t_amount ON t (amount)");
     try run("CREATE VIEW v AS SELECT id FROM t");
     try expect("SELECT 't'::pg_catalog.regclass::pg_catalog.text", "t");
-    try expect("SELECT oid, amname, amhandler, amtype FROM pg_catalog.pg_am ORDER BY oid", "2|heap|heap_tableam_handler|t;403|btree|bthandler|i");
-    try expect("SELECT amhandler::oid,pg_typeof(amhandler)::text FROM pg_catalog.pg_am ORDER BY oid", "3|regproc;330|regproc");
+    try expect("SELECT oid, amname, amhandler, amtype FROM pg_catalog.pg_am ORDER BY oid", "2|heap|heap_tableam_handler|t;403|btree|bthandler|i;405|hash|hashhandler|i");
+    try expect("SELECT amhandler::oid,pg_typeof(amhandler)::text FROM pg_catalog.pg_am ORDER BY oid", "3|regproc;330|regproc;331|regproc");
     try expect("SELECT to_regproc('pg_catalog.bthandler')::oid, '-'::regproc::text, (NULL::regproc)::oid, to_regproc('nonexistent')::oid",
         "330|-|NULL|NULL");
     try rejects("SELECT 'nonexistent'::regproc", error.UndefinedFunction);
