@@ -203,7 +203,8 @@ const state_probes = [_][]const u8{
     "SELECT oid, nspname, nspowner FROM pg_namespace ORDER BY oid",
     "SELECT rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb, rolcanlogin, rolreplication, rolconnlimit, rolbypassrls, oid FROM pg_roles ORDER BY oid",
     "SELECT oid, roleid, member, grantor, admin_option FROM pg_auth_members ORDER BY oid",
-    "SELECT grantor, grantee, table_name, privilege_type, is_grantable FROM information_schema.table_privileges ORDER BY table_name, grantee, privilege_type",
+    // System relations are listed too (PUBLIC SELECT); compare user tables.
+    "SELECT grantor, grantee, table_name, privilege_type, is_grantable FROM information_schema.table_privileges WHERE table_schema = 'public' ORDER BY table_name, grantee, privilege_type",
     "SELECT schemaname, tablename, policyname, permissive, roles, cmd, qual, with_check FROM pg_policies ORDER BY tablename, policyname",
     "SELECT oid, polname, polrelid, polcmd, polpermissive, polroles FROM pg_policy ORDER BY oid",
     "SELECT objoid, classoid, objsubid, description FROM pg_description ORDER BY objoid, objsubid",
@@ -974,10 +975,13 @@ fn privileges() !void {
     try run("CREATE ROLE grp");
     try run("CREATE ROLE grp_member IN ROLE grp");
     try run("CREATE ROLE no_inherit NOINHERIT IN ROLE grp");
-    const grants = "SELECT grantor, grantee, table_name, privilege_type, is_grantable FROM information_schema.table_privileges WHERE grantee <> 'ramsql' ORDER BY table_name, grantee, privilege_type";
-    // The owner holds every privilege with grant option (acldefault).
-    try expect("SELECT privilege_type, is_grantable, with_hierarchy FROM information_schema.table_privileges WHERE table_name = 'tdd_b' AND grantee = 'ramsql' ORDER BY privilege_type", "DELETE|YES|NO;INSERT|YES|NO;MAINTAIN|YES|NO;REFERENCES|YES|NO;SELECT|YES|YES;TRIGGER|YES|NO;TRUNCATE|YES|NO;UPDATE|YES|NO");
-    try metadata("SELECT grantor, privilege_type FROM information_schema.table_privileges", &.{ "grantor", "privilege_type" }, &.{ 19, 25 });
+    const grants = "SELECT grantor, grantee, table_name, privilege_type, is_grantable FROM information_schema.table_privileges WHERE grantee <> 'ramsql' AND table_schema = 'public' ORDER BY table_name, grantee, privilege_type";
+    // The owner holds every privilege with grant option (acldefault);
+    // information_schema lists no MAINTAIN (PostgreSQL 18).
+    try expect("SELECT privilege_type, is_grantable, with_hierarchy FROM information_schema.table_privileges WHERE table_name = 'tdd_b' AND grantee = 'ramsql' ORDER BY privilege_type", "DELETE|YES|NO;INSERT|YES|NO;REFERENCES|YES|NO;SELECT|YES|YES;TRIGGER|YES|NO;TRUNCATE|YES|NO;UPDATE|YES|NO");
+    // sql_identifier is name; character_data is varchar (the wire reports
+    // the domain's base type).
+    try metadata("SELECT grantor, privilege_type FROM information_schema.table_privileges WHERE table_schema = 'public'", &.{ "grantor", "privilege_type" }, &.{ 19, 1043 });
     // Without a grant every read and write is 42501 (also through a view).
     try as("reader");
     try fails("SELECT * FROM tdd_a", error.InsufficientPrivilege);
@@ -990,7 +994,7 @@ fn privileges() !void {
     try run("GRANT SELECT ON tdd_a TO reader");
     try run("GRANT INSERT, UPDATE ON TABLE tdd_a, tdd_b TO writer WITH GRANT OPTION");
     try run("GRANT ALL PRIVILEGES ON tdd_b TO grp");
-    try expect(grants, "ramsql|reader|tdd_a|SELECT|NO;ramsql|writer|tdd_a|INSERT|YES;ramsql|writer|tdd_a|UPDATE|YES;ramsql|grp|tdd_b|DELETE|NO;ramsql|grp|tdd_b|INSERT|NO;ramsql|grp|tdd_b|MAINTAIN|NO;ramsql|grp|tdd_b|REFERENCES|NO;ramsql|grp|tdd_b|SELECT|NO;ramsql|grp|tdd_b|TRIGGER|NO;ramsql|grp|tdd_b|TRUNCATE|NO;ramsql|grp|tdd_b|UPDATE|NO;ramsql|writer|tdd_b|INSERT|YES;ramsql|writer|tdd_b|UPDATE|YES");
+    try expect(grants, "ramsql|reader|tdd_a|SELECT|NO;ramsql|writer|tdd_a|INSERT|YES;ramsql|writer|tdd_a|UPDATE|YES;ramsql|grp|tdd_b|DELETE|NO;ramsql|grp|tdd_b|INSERT|NO;ramsql|grp|tdd_b|REFERENCES|NO;ramsql|grp|tdd_b|SELECT|NO;ramsql|grp|tdd_b|TRIGGER|NO;ramsql|grp|tdd_b|TRUNCATE|NO;ramsql|grp|tdd_b|UPDATE|NO;ramsql|writer|tdd_b|INSERT|YES;ramsql|writer|tdd_b|UPDATE|YES");
     try sameState();
     try as("reader");
     try expect("SELECT id FROM tdd_a ORDER BY id", "1;2;3;4");
@@ -1065,7 +1069,7 @@ fn privileges() !void {
     try commit(granting);
     try resumed(dropping, "DROP TABLE tdd_a");
     try commit(dropping);
-    try expect("SELECT COUNT(*) FROM information_schema.table_privileges", "0");
+    try expect("SELECT COUNT(*) FROM information_schema.table_privileges WHERE table_schema = 'public'", "0");
     try run("DROP ROLE late");
     try sameState();
 }

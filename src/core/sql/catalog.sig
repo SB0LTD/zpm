@@ -58,7 +58,20 @@ pub const View = enum(u8) { pg_type, pg_namespace, pg_class, pg_attribute, pg_in
     pg_init_privs, pg_cast, pg_transform, pg_language, pg_operator, pg_opclass, pg_opfamily, pg_ts_parser, pg_ts_template, pg_ts_dict, pg_ts_config, pg_default_acl, pg_conversion, pg_range, pg_event_trigger, pg_partitioned_table, pg_subscription,
     pg_seclabel, pg_shseclabel, pg_seclabels, pg_db_role_setting, pg_amop, pg_amproc, pg_largeobject, pg_largeobject_metadata, sequence_state, pg_parameter_acl,
     // The session's open cursors (E121-08, B11 wave 5).
-    pg_cursors };
+    pg_cursors,
+    // The rest of information_schema (B11 wave 5, information_schema.sig).
+    administrable_role_authorizations, applicable_roles, attributes, character_sets, check_constraint_routine_usage,
+    check_constraints, collation_character_set_applicability, collations, column_column_usage, column_domain_usage,
+    column_options, column_privileges, column_udt_usage, constraint_column_usage, constraint_table_usage,
+    data_type_privileges, domain_constraints, domain_udt_usage, domains, element_types, enabled_roles,
+    foreign_data_wrapper_options, foreign_data_wrappers, foreign_server_options, foreign_servers,
+    foreign_table_options, foreign_tables, information_schema_catalog_name, parameters, referential_constraints,
+    role_column_grants, role_routine_grants, role_table_grants, role_udt_grants, role_usage_grants,
+    routine_column_usage, routine_privileges, routine_routine_usage, routine_sequence_usage, routine_table_usage,
+    routines, sequences, sql_features, sql_implementation_info, sql_parts, sql_sizing, transforms,
+    triggered_update_columns, triggers, udt_privileges, usage_privileges, user_defined_types, user_mapping_options,
+    user_mappings, view_column_usage, view_routine_usage, view_table_usage, views,
+    _pg_foreign_data_wrappers, _pg_foreign_servers, _pg_foreign_table_columns, _pg_foreign_tables, _pg_user_mappings };
 
 pub const sql_language_oid: u32 = 14;
 pub const plpgsql_language_oid: u32 = 13002;
@@ -78,7 +91,12 @@ pub const DatabaseCatalogProvider = struct {
     use_session_database_name: bool = false,
 };
 
-pub const ViewColumn = struct { name: []const u8, ty: types.Type };
+/// A system view column. information_schema columns carry their domain
+/// (sql_identifier, cardinal_number, character_data, yes_or_no,
+/// time_stamp); the wire reports the domain's base type and typmod.
+pub const ViewColumn = struct { name: []const u8, ty: types.Type, typmod: i32 = -1, domain: ?information_schema.Domain = null };
+
+const information_schema = @import("information_schema.sig");
 
 fn col(name: []const u8, ty: types.Type) ViewColumn {
     return .{ .name = name, .ty = ty };
@@ -342,10 +360,6 @@ const pg_statistic_ext_columns = [_]ViewColumn{
 const pg_attrdef_columns = [_]ViewColumn{ col("adrelid", .oid), col("adnum", .int2), col("adbin", .text), col("oid", .oid) };
 const pg_sequence_columns = [_]ViewColumn{ col("seqrelid", .oid), col("seqtypid", .oid), col("seqstart", .int8), col("seqincrement", .int8), col("seqmax", .int8), col("seqmin", .int8), col("seqcache", .int8), col("seqcycle", .boolean) };
 const sequence_state_columns = [_]ViewColumn{ col("last_value", .int8), col("log_cnt", .int8), col("is_called", .boolean) };
-const schemata_columns = [_]ViewColumn{ col("catalog_name", .name), col("schema_name", .name) };
-const tables_columns = [_]ViewColumn{ col("table_catalog", .name), col("table_schema", .name), col("table_name", .name), col("table_type", .text) };
-const columns_columns = [_]ViewColumn{ col("table_catalog", .name), col("table_schema", .name), col("table_name", .name), col("column_name", .name), col("ordinal_position", .int4), col("column_default", .text), col("is_nullable", .text), col("data_type", .varchar), col("character_maximum_length", .int4), col("numeric_precision", .int4), col("numeric_precision_radix", .int4), col("numeric_scale", .int4), col("datetime_precision", .int4), col("is_identity", .text), col("identity_generation", .text), col("is_generated", .text), col("generation_expression", .text) };
-const table_constraints_columns = [_]ViewColumn{ col("constraint_catalog", .name), col("constraint_schema", .name), col("constraint_name", .name), col("table_catalog", .name), col("table_schema", .name), col("table_name", .name), col("constraint_type", .text) };
 const pg_indexes_columns = [_]ViewColumn{ col("schemaname", .name), col("tablename", .name), col("indexname", .name), col("tablespace", .name), col("indexdef", .text) };
 const pg_views_columns = [_]ViewColumn{ col("schemaname", .name), col("viewname", .name), col("viewowner", .name), col("definition", .text) };
 const pg_matviews_columns = [_]ViewColumn{ col("schemaname", .name), col("matviewname", .name), col("matviewowner", .name), col("tablespace", .name), col("hasindexes", .boolean), col("ispopulated", .boolean), col("definition", .text) };
@@ -432,7 +446,6 @@ const pg_trigger_columns = [_]ViewColumn{ col("oid", .oid), col("tgrelid", .oid)
 pub const rewrite_catalog: u32 = 2618;
 const pg_rewrite_columns = [_]ViewColumn{ col("oid", .oid), col("rulename", .name), col("ev_class", .oid), col("ev_type", .pg_internal_char), col("ev_enabled", .pg_internal_char), col("is_instead", .boolean) };
 const pg_rules_columns = [_]ViewColumn{ col("schemaname", .name), col("tablename", .name), col("rulename", .name), col("definition", .text) };
-const key_column_usage_columns = [_]ViewColumn{ col("constraint_catalog", .name), col("constraint_schema", .name), col("constraint_name", .name), col("table_catalog", .name), col("table_schema", .name), col("table_name", .name), col("column_name", .name), col("ordinal_position", .int4) };
 
 const oid_array = types.arrayType(.oid).?;
 const name_array = types.arrayType(.name).?;
@@ -476,7 +489,6 @@ const pg_publication_rel_columns = [_]ViewColumn{
 const pg_publication_namespace_columns = [_]ViewColumn{ col("oid", .oid), col("pnpubid", .oid), col("pnnspid", .oid) };
 const pg_extension_columns = [_]ViewColumn{ col("oid", .oid), col("extname", .name), col("extowner", .oid), col("extnamespace", .oid), col("extrelocatable", .boolean), col("extversion", .text), col("extconfig", oid_array), col("extcondition", text_array) };
 const pg_tables_columns = [_]ViewColumn{ col("schemaname", .name), col("tablename", .name), col("tableowner", .name), col("tablespace", .name), col("hasindexes", .boolean), col("hasrules", .boolean), col("hastriggers", .boolean), col("rowsecurity", .boolean) };
-const table_privileges_columns = [_]ViewColumn{ col("grantor", .name), col("grantee", .name), col("table_catalog", .name), col("table_schema", .name), col("table_name", .name), col("privilege_type", .text), col("is_grantable", .text), col("with_hierarchy", .text) };
 
 const pg_cursors_columns = [_]ViewColumn{ col("name", .text), col("statement", .text), col("is_holdable", .boolean), col("is_binary", .boolean), col("is_scrollable", .boolean), col("creation_time", .timestamptz) };
 
@@ -508,11 +520,6 @@ pub fn viewColumns(view: View) []const ViewColumn {
         .pg_attrdef => &pg_attrdef_columns,
         .pg_sequence => &pg_sequence_columns,
         .sequence_state => &sequence_state_columns,
-        .schemata => &schemata_columns,
-        .tables => &tables_columns,
-        .columns => &columns_columns,
-        .table_constraints => &table_constraints_columns,
-        .key_column_usage => &key_column_usage_columns,
         .pg_indexes => &pg_indexes_columns,
         .pg_views => &pg_views_columns,
         .pg_matviews => &pg_matviews_columns,
@@ -561,7 +568,7 @@ pub fn viewColumns(view: View) []const ViewColumn {
         .pg_publication_namespace => &pg_publication_namespace_columns,
         .pg_extension => &pg_extension_columns,
         .pg_tables => &pg_tables_columns,
-        .table_privileges => &table_privileges_columns,
+        else => information_schema.columnsOf(view),
     };
 }
 
@@ -573,7 +580,6 @@ pub fn findView(schema: ?[]const u8, name: []const u8) ?View {
         .pg_init_privs, .pg_cast, .pg_transform, .pg_language, .pg_operator, .pg_opclass, .pg_opfamily, .pg_ts_parser, .pg_ts_template, .pg_ts_dict, .pg_ts_config, .pg_default_acl, .pg_conversion, .pg_range, .pg_event_trigger, .pg_partitioned_table, .pg_subscription,
         .pg_seclabel, .pg_shseclabel, .pg_seclabels, .pg_db_role_setting, .pg_amop, .pg_amproc, .pg_largeobject, .pg_largeobject_metadata, .pg_parameter_acl,
         .pg_cursors };
-    const information_views = [_]View{ .schemata, .tables, .columns, .table_constraints, .key_column_usage, .table_privileges };
     const qualified = schema orelse {
         for (catalog_views) |view| if (types.same(@tagName(view), name)) return view;
         return null;
@@ -581,7 +587,7 @@ pub fn findView(schema: ?[]const u8, name: []const u8) ?View {
     if (types.same(qualified, "pg_catalog")) {
         for (catalog_views) |view| if (types.same(@tagName(view), name)) return view;
     } else if (types.same(qualified, "information_schema")) {
-        for (information_views) |view| if (types.same(@tagName(view), name)) return view;
+        return information_schema.find(name);
     }
     return null;
 }

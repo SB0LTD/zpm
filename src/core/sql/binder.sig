@@ -6965,7 +6965,7 @@ pub fn Binder(comptime config: types.Config) type {
         }
 
         fn relationColumnTypmod(context: *const Context, rel: *const Relation, column: usize) i32 {
-            if (rel.view != null) return -1;
+            if (rel.view) |view| return catalog.viewColumns(view)[column].typmod;
             if (rel.table) |index| return context.tables[index].columns[column].typmod;
             return plansOf(context).items[rel.plan].typmods[column];
         }
