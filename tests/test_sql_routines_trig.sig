@@ -658,6 +658,97 @@ fn constraintTriggers() !void {
     try idle();
 }
 
+// ---- referential actions and COPY FROM fire user triggers ------------------------
+
+/// ON DELETE / UPDATE CASCADE, SET NULL and SET DEFAULT run as statements
+/// on the referencing table: its BEFORE STATEMENT triggers fire once per
+/// statement (also when no row references the key), BEFORE ROW triggers
+/// per row (NULL skips the row: it stays), and the AFTER ROW / AFTER
+/// STATEMENT events follow the statement's own, in PostgreSQL's order.
+fn referentialTriggers() !void {
+    reset();
+    try run("CREATE TABLE parent(id INT PRIMARY KEY)");
+    try run("CREATE TABLE child(id INT PRIMARY KEY, pid INT REFERENCES parent ON DELETE CASCADE ON UPDATE CASCADE, note TEXT)");
+    try run("CREATE TABLE child2(id INT PRIMARY KEY, pid INT REFERENCES parent ON DELETE SET NULL)");
+    try run("CREATE TABLE log(n SERIAL, what TEXT)");
+    try run("CREATE FUNCTION lg() RETURNS TRIGGER LANGUAGE plpgsql AS $$BEGIN INSERT INTO log(what) VALUES (TG_TABLE_NAME || ':' || TG_WHEN || ':' || TG_LEVEL || ':' || TG_OP || ':' || coalesce(OLD.id::text, '-') || ':' || coalesce(NEW.id::text, '-')); IF TG_OP = 'DELETE' THEN RETURN OLD; END IF; RETURN NEW; END$$");
+    try run("CREATE TRIGGER cb BEFORE DELETE OR UPDATE ON child FOR EACH ROW EXECUTE FUNCTION lg()");
+    try run("CREATE TRIGGER ca AFTER DELETE OR UPDATE ON child FOR EACH ROW EXECUTE FUNCTION lg()");
+    try run("CREATE TRIGGER cs BEFORE DELETE OR UPDATE ON child FOR EACH STATEMENT EXECUTE FUNCTION lg()");
+    try run("CREATE TRIGGER csa AFTER DELETE OR UPDATE ON child FOR EACH STATEMENT EXECUTE FUNCTION lg()");
+    try run("CREATE TRIGGER c2 BEFORE UPDATE ON child2 FOR EACH ROW EXECUTE FUNCTION lg()");
+    try run("INSERT INTO parent VALUES (1), (2), (3)");
+    try run("INSERT INTO child VALUES (10, 1, 'a'), (11, 1, 'b'), (12, 2, 'c')");
+    try run("INSERT INTO child2 VALUES (20, 1), (21, 3)");
+    try completes("DELETE FROM parent WHERE id = 1", .delete, 1);
+    try expect("SELECT what FROM log ORDER BY n", "child:BEFORE:STATEMENT:DELETE:-:-;child:BEFORE:ROW:DELETE:10:-;child:BEFORE:ROW:DELETE:11:-;child2:BEFORE:ROW:UPDATE:20:20;" ++
+        "child:AFTER:ROW:DELETE:10:-;child:AFTER:ROW:DELETE:11:-;child:AFTER:STATEMENT:DELETE:-:-");
+    try run("DELETE FROM log");
+    try completes("UPDATE parent SET id = 22 WHERE id = 2", .update, 1);
+    try expect("SELECT what FROM log ORDER BY n", "child:BEFORE:STATEMENT:UPDATE:-:-;child:BEFORE:ROW:UPDATE:12:12;child:AFTER:ROW:UPDATE:12:12;child:AFTER:STATEMENT:UPDATE:-:-");
+    try expect("SELECT * FROM child ORDER BY id", "12|22|c");
+    try expect("SELECT * FROM child2 ORDER BY id", "20|NULL;21|3");
+    // No referencing row: the statement triggers still fire.
+    try run("DELETE FROM log");
+    try run("CREATE TRIGGER c2s BEFORE UPDATE ON child2 FOR EACH STATEMENT EXECUTE FUNCTION lg()");
+    try run("INSERT INTO parent VALUES (4)");
+    try completes("DELETE FROM parent WHERE id = 4", .delete, 1);
+    try expect("SELECT what FROM log ORDER BY n", "child:BEFORE:STATEMENT:DELETE:-:-;child2:BEFORE:STATEMENT:UPDATE:-:-;child:AFTER:STATEMENT:DELETE:-:-");
+    // A BEFORE ROW trigger returning NULL keeps the referencing row.
+    try run("CREATE FUNCTION skip() RETURNS TRIGGER LANGUAGE plpgsql AS $$BEGIN RETURN NULL; END$$");
+    try run("CREATE TRIGGER cskip BEFORE DELETE ON child FOR EACH ROW EXECUTE FUNCTION skip()");
+    try completes("DELETE FROM parent WHERE id = 22", .delete, 1);
+    try expect("SELECT * FROM child ORDER BY id", "12|22|c");
+    try expect("SELECT * FROM parent ORDER BY id", "3");
+    // An error in a referencing table's trigger undoes the whole statement.
+    try run("CREATE FUNCTION no2() RETURNS TRIGGER LANGUAGE plpgsql AS $$BEGIN RAISE EXCEPTION 'no'; END$$");
+    try run("CREATE TRIGGER c2no BEFORE UPDATE ON child2 FOR EACH ROW EXECUTE FUNCTION no2()");
+    try rejects("DELETE FROM parent WHERE id = 3", error.RaiseException, "SELECT (SELECT count(*) FROM parent) || ':' || (SELECT pid FROM child2 WHERE id = 21)", "1:3");
+    try sameState(&.{ "SELECT what FROM log ORDER BY n", "SELECT * FROM child ORDER BY id", "SELECT * FROM child2 ORDER BY id" });
+    try idle();
+}
+
+/// COPY FROM fires BEFORE STATEMENT at its start, BEFORE ROW per row
+/// (after defaults; NULL skips the row, NEW may fix it before NOT NULL,
+/// generated columns and CHECK) and AFTER ROW / AFTER STATEMENT at its end.
+fn copyTriggers() !void {
+    reset();
+    try run("CREATE TABLE t(a INT NOT NULL, b TEXT CHECK (b <> 'bad'), c INT GENERATED ALWAYS AS (a * 2) STORED)");
+    try run("CREATE TABLE log(n SERIAL, what TEXT)");
+    try run("CREATE FUNCTION lg() RETURNS TRIGGER LANGUAGE plpgsql AS $$BEGIN INSERT INTO log(what) VALUES (TG_WHEN || ':' || TG_LEVEL || ':' || coalesce(NEW.a::text, '-') || ':' || coalesce(NEW.c::text, '-')); IF TG_LEVEL = 'ROW' AND TG_WHEN = 'BEFORE' THEN IF NEW.a = 0 THEN RETURN NULL; END IF; IF NEW.b = 'bad' THEN NEW.b := 'fixed'; END IF; IF NEW.a IS NULL THEN NEW.a := 99; END IF; END IF; RETURN NEW; END$$");
+    try run("CREATE TRIGGER bs BEFORE INSERT ON t FOR EACH STATEMENT EXECUTE FUNCTION lg()");
+    try run("CREATE TRIGGER br BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION lg()");
+    try run("CREATE TRIGGER ar AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION lg()");
+    try run("CREATE TRIGGER as_ AFTER INSERT ON t FOR EACH STATEMENT EXECUTE FUNCTION lg()");
+    const source = "COPY t (a, b) FROM STDIN";
+    const slot = try db.begin();
+    db.copyStorage(&other_slot);
+    _ = try db.copyBegin(slot, source, false);
+    var row: DB.Row = .{};
+    const lines = [_][2]?[]const u8{ .{ "1", "x" }, .{ "0", "y" }, .{ "2", "bad" }, .{ null, "z" } };
+    for (lines) |line| {
+        try db.copyBuild(slot, source, &line, &row);
+        try db.copyInsert(slot, &row);
+    }
+    try check(try db.copyEnd(slot) == 3);
+    try commitDeferred(slot);
+    try expect("SELECT * FROM t ORDER BY a", "1|x|2;2|fixed|4;99|z|198");
+    try expect("SELECT what FROM log ORDER BY n", "BEFORE:STATEMENT:-:-;BEFORE:ROW:1:-;BEFORE:ROW:0:-;BEFORE:ROW:2:-;BEFORE:ROW:-:-;AFTER:ROW:1:2;AFTER:ROW:2:4;AFTER:ROW:99:198;AFTER:STATEMENT:-:-");
+    // A trigger error ends the COPY; nothing of it stays.
+    try run("CREATE FUNCTION no() RETURNS TRIGGER LANGUAGE plpgsql AS $$BEGIN IF NEW.a = 7 THEN RAISE EXCEPTION 'seven'; END IF; RETURN NEW; END$$");
+    try run("CREATE TRIGGER zz BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION no()");
+    const second = try db.begin();
+    db.copyStorage(&other_slot);
+    _ = try db.copyBegin(second, source, false);
+    try db.copyBuild(second, source, &.{ "5", "e" }, &row);
+    try db.copyInsert(second, &row);
+    if (db.copyBuild(second, source, &.{ "7", "f" }, &row)) |_| return error.InvalidStatementAccepted else |err| try check(err == error.RaiseException);
+    db.abort(second);
+    try expect("SELECT count(*) FROM t", "3");
+    try sameState(&.{ "SELECT * FROM t ORDER BY a", "SELECT what FROM log ORDER BY n" });
+    try idle();
+}
+
 pub fn main() !void {
     try schemaStatements();
     try dynamicStatements();
@@ -667,5 +758,7 @@ pub fn main() !void {
     try sqlPaths();
     try transitionTables();
     try constraintTriggers();
+    try referentialTriggers();
+    try copyTriggers();
     std.debug.print("routines-trig: {d} assertions, {d} records replayed\n", .{ assertions, records_applied });
 }

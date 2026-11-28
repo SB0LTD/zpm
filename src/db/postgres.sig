@@ -1631,7 +1631,7 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
             }
             if (source.len > sql_capacity) return error.StatementCapacity;
             if (batch) |frame| if (frame.source.len >= sql_capacity) return error.StatementCapacity;
-            const begun = try db.copyBegin(source);
+            const begun = if (comptime @hasDecl(DB, "copyBeginWith")) try db.copyBeginWith(source, &self.result) else try db.copyBegin(source);
             self.copy.mode = .in;
             self.copy.portal = portal_index;
             self.copy.remaining = 0;

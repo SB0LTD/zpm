@@ -1934,8 +1934,19 @@ pub fn Store(comptime Raw: type) type {
             /// subtransaction until copyEnd; copyFail, an error or a
             /// disconnect rolls the whole COPY back. A table-lock wait
             /// parks it (WouldBlock): re-deliver the same statement.
+            /// copyBegin with statement storage for the triggers COPY fires
+            /// (B11 wave 5); it must outlive the COPY.
+            pub fn copyBeginWith(self: *Connection, source: []const u8, result: *Result) !Raw.CopyInfo {
+                return self.copyOpen(source, result);
+            }
+
             pub fn copyBegin(self: *Connection, source: []const u8) !Raw.CopyInfo {
+                return self.copyOpen(source, null);
+            }
+
+            fn copyOpen(self: *Connection, source: []const u8, storage: ?*Result) !Raw.CopyInfo {
                 if (self.id == 0) return error.InvalidConnection;
+                if (comptime @hasDecl(Raw, "copyStorage")) self.db().copyStorage(storage);
                 if (self.pending.active) {
                     const slot = self.tx.?;
                     const implicit = self.pending.implicit;
@@ -2050,11 +2061,15 @@ pub fn Store(comptime Raw: type) type {
                 const slot = self.tx orelse return error.NoActiveTransaction;
                 if (self.pending.active) return error.QueryCanceled;
                 try self.checkTransactionTimeout();
-                const rows = try self.db().copyEnd(slot);
+                const rows = self.db().copyEnd(slot) catch |err| {
+                    self.terminal(self.copy_implicit);
+                    return err;
+                };
+                const storage: ?*Result = if (comptime @hasDecl(Raw, "copyStorageResult")) self.db().copyStorageResult() else null;
                 if (self.copy_implicit) {
                     self.tx = null;
                     self.transaction_deadline_ns = null;
-                    try self.store.commit(slot, null);
+                    try self.store.commit(slot, storage);
                 }
                 return rows;
             }

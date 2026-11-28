@@ -2154,6 +2154,20 @@ pub fn Database(comptime config: Config) type {
         /// wave 5), innermost last.
         transition_windows: [config.routine_depth]TransitionWindow = undefined,
         transition_len: usize = 0,
+        /// COPY FROM (B11 wave 5): statement storage its triggers' SQL may
+        /// use (copyStorage) and whether a BEFORE ROW trigger skipped the
+        /// row copyBuild built.
+        copy_result: ?*Result = null,
+        copy_skip: bool = false,
+        /// Referential actions' statement triggers (B11 wave 5): one entry
+        /// per (referencing table, event) the running statement's actions
+        /// reached (BEFORE STATEMENT fires once), with the write-set index
+        /// after its latest action (its AFTER STATEMENT fires there, after
+        /// the statement's own AFTER events). Entries from `ri_base` on
+        /// belong to the running statement.
+        ri_pairs: [config.triggers]RiPair = undefined,
+        ri_len: usize = 0,
+        ri_base: usize = 0,
         routine_volatility: u8 = 0,
         /// PostgreSQL's errdetail of the last view error (lastErrorDetail).
         error_detail: []const u8 = "",
@@ -2649,6 +2663,10 @@ pub fn Database(comptime config: Config) type {
             self.context_len = 0;
             self.context_captured = false;
             self.transition_len = 0;
+            self.copy_result = null;
+            self.copy_skip = false;
+            self.ri_len = 0;
+            self.ri_base = 0;
             self.row_staging = null;
             self.xml_region = .{};
             self.routine_definer = null;
@@ -3577,6 +3595,12 @@ pub fn Database(comptime config: Config) type {
         }
 
         fn runBoundMutation(self: *Self, slot: u16, source: []const u8, bound: *const B.Bound, snap: Snapshot, result: *Result) Error!void {
+            const saved_ri_base = self.ri_base;
+            self.ri_base = self.ri_len;
+            defer {
+                self.ri_len = self.ri_base;
+                self.ri_base = saved_ri_base;
+            }
             const affected: usize = switch (bound.*) {
                 .noop => 0,
                 .create_table => |*create| blk: {
@@ -3628,6 +3652,7 @@ pub fn Database(comptime config: Config) type {
                     const affected = try self.insertRows(slot, source, insert, snap);
                     try self.afterTriggers(slot, self.statement_start, if (upsert) &insert.conflict.update.values else null, snap);
                     try self.statementTriggers(insert.table, 0, events, snap);
+                    try self.cascadedStatements(snap, null);
                     if (actions) _ = try self.insertRuleActions(source, insert, snap);
                     break :blk affected;
                 },
@@ -3645,8 +3670,7 @@ pub fn Database(comptime config: Config) type {
                     if (try self.insteadNothing(update.table, '2', update.returning.count != 0, snap)) break :blk instead_affected;
                     try self.statementTriggers(update.table, routine_catalog.tg_before, &.{routine_catalog.tg_update}, snap);
                     const affected = try self.updateRows(slot, source, update, snap);
-                    try self.afterTriggers(slot, self.statement_start, &update.values, snap);
-                    try self.statementTriggers(update.table, 0, &.{routine_catalog.tg_update}, snap);
+                    try self.afterEvents(slot, update.table, &update.values, &.{routine_catalog.tg_update}, snap);
                     break :blk affected;
                 },
                 .delete => |*delete| blk: {
@@ -3660,8 +3684,7 @@ pub fn Database(comptime config: Config) type {
                     if (try self.insteadNothing(delete.table, '4', delete.returning.count != 0, snap)) break :blk instead_affected;
                     try self.statementTriggers(delete.table, routine_catalog.tg_before, &.{routine_catalog.tg_delete}, snap);
                     const affected = try self.deleteRows(slot, source, delete, snap);
-                    try self.afterTriggers(slot, self.statement_start, null, snap);
-                    try self.statementTriggers(delete.table, 0, &.{routine_catalog.tg_delete}, snap);
+                    try self.afterEvents(slot, delete.table, null, &.{routine_catalog.tg_delete}, snap);
                     break :blk affected;
                 },
                 .truncate => |*truncate| blk: {
@@ -3719,6 +3742,7 @@ pub fn Database(comptime config: Config) type {
                     if (self.anyRule(merge.table, snap)) return error.UnsupportedStatement;
                     const affected = try self.mergeRows(slot, source, merge, snap);
                     try self.afterTriggers(slot, self.statement_start, null, snap);
+                    try self.cascadedStatements(snap, null);
                     break :blk affected;
                 },
                 .select, .query, .control => unreachable,
@@ -3846,6 +3870,7 @@ pub fn Database(comptime config: Config) type {
             }
             try self.afterTriggers(slot, self.statement_start, if (bound == .update) &bound.update.values else null, snap);
             try self.statementTriggers(root, 0, &.{event}, snap);
+            try self.cascadedStatements(snap, null);
             self.outcome = .{ .affected = affected, .command = command };
             if (returning == 0) return;
             const source = try self.bindFamily(original, mode, root, snap, &bound);
@@ -10747,6 +10772,13 @@ pub fn Database(comptime config: Config) type {
             const child = &self.tables[child_index];
             const tx = &self.txs[slot];
             if (action == .no_action or action == .restrict) try self.lockTable(slot, child_index, .access_share) else try self.lockTable(slot, child_index, .row_exclusive);
+            // A referential action runs as a statement on the referencing
+            // table: its triggers fire (B11 wave 5; PostgreSQL's RI query).
+            const action_event: u8 = if (action == .cascade and new == null) tg.tg_delete else tg.tg_update;
+            const pair: ?usize = if (action == .no_action or action == .restrict) null else try self.referentialBegin(child_index, action_event, snap);
+            defer if (pair) |index| {
+                self.ri_pairs[index].end = tx.write_len;
+            };
             var version: u32 = 0;
             while (version < child.version_high) : (version += 1) {
                 const entry = &child.versions[version];
@@ -10780,9 +10812,14 @@ pub fn Database(comptime config: Config) type {
                     .cascade => if (new) |cells| {
                         var updated: E.Row = undefined;
                         S.copyVersionRow(child, goal, &updated);
+                        var prior_row = updated;
                         for (constraint.keyColumns(), constraint.refColumns()) |column, key| updated[column] = try D.store(&child.columns[column], cells[key], &self.session);
+                        if (!try self.referentialRow(child_index, tg.tg_update, &updated, &prior_row, goal, snap)) continue;
                         try self.cascadeUpdate(slot, child_index, goal, &updated, .none, snap);
                     } else {
+                        var prior_row: E.Row = undefined;
+                        S.copyVersionRow(child, goal, &prior_row);
+                        if (!try self.referentialRow(child_index, tg.tg_delete, null, &prior_row, goal, snap)) continue;
                         var row_scratch: S.VersionRowScratch = undefined;
                         const prior = S.borrowVersionRow(child, goal, &row_scratch);
                         try self.referencedChange(slot, child_index, prior, null, snap);
@@ -10812,10 +10849,24 @@ pub fn Database(comptime config: Config) type {
                             if (updated[column] == .null_value or V.compare(&updated[column], &old[key]) != 0) still = false;
                         }
                         if (still) return error.ForeignKeyViolation;
+                        var prior_row: E.Row = undefined;
+                        S.copyVersionRow(child, goal, &prior_row);
+                        if (!try self.referentialRow(child_index, tg.tg_update, &updated, &prior_row, goal, snap)) continue;
                         try self.cascadeUpdate(slot, child_index, goal, &updated, if (action == .set_default) .all else .changed, snap);
                     },
                 }
             }
+        }
+
+        /// A referential action's row: the referencing table's BEFORE ROW
+        /// triggers (NULL skips it, NEW may change it); a row a trigger
+        /// changed itself is 27000, as PostgreSQL's RI query finds it.
+        fn referentialRow(self: *Self, child: usize, event: u8, new: ?*E.Row, old: *const E.Row, version: u32, snap: Snapshot) Error!bool {
+            if (!self.beforeRowTriggers(child, event, snap)) return true;
+            if (!try self.beforeRow(child, event, new, old, null, snap)) return false;
+            const entry = &self.tables[child].versions[version];
+            if (entry.hasDeletion()) return error.TriggeredDataChangeViolation;
+            return true;
         }
 
         /// A referencing row rewritten by a referential action: CHECK and
@@ -11472,7 +11523,39 @@ pub fn Database(comptime config: Config) type {
                 self.wake_epoch +%= 1;
                 return err;
             };
+            // BEFORE STATEMENT triggers of the target (B11 wave 5).
+            self.copyTriggers(slot, routine_catalog.tg_before) catch |err| {
+                self.dropStatement(slot);
+                self.wake_epoch +%= 1;
+                return if (err == error.WouldBlock) error.LockNotAvailable else err;
+            };
             return info;
+        }
+
+        /// Statement storage for the triggers COPY FROM fires (the caller's
+        /// result, kept until the COPY ends).
+        pub fn copyStorage(self: *Self, result: ?*Result) void {
+            self.copy_result = result;
+        }
+
+        pub fn copyStorageResult(self: *const Self) ?*Result {
+            return self.copy_result;
+        }
+
+        /// COPY FROM's statement triggers (and, after it, the AFTER ROW
+        /// triggers of its rows), as for INSERT. A lock wait inside them is
+        /// 55P03 (the COPY cannot park there).
+        fn copyTriggers(self: *Self, slot: u16, timing: u8) Error!void {
+            const tx = &self.txs[slot];
+            const table_index = tx.copy_table orelse return;
+            var list: [config.triggers]u8 = undefined;
+            if (self.objects.tableTriggers(self.tables[table_index].oid, tx.copy_snap, &list) == 0) return;
+            const snap = tx.copy_snap;
+            self.statementHooks(slot, snap);
+            self.routine_result = self.copy_result;
+            self.statement_start = tx.subs[tx.sub_len - 1].write_start;
+            if (timing == 0) try self.afterTriggers(slot, self.statement_start, null, snap);
+            try self.statementTriggers(table_index, timing, &.{routine_catalog.tg_insert}, snap);
         }
 
         fn openCopy(self: *Self, slot: u16, source: []const u8, snap: Snapshot) Error!CopyInfo {
@@ -11544,6 +11627,8 @@ pub fn Database(comptime config: Config) type {
             self.context_len = 0;
             self.context_captured = false;
             self.transition_len = 0;
+            self.ri_len = 0;
+            self.ri_base = 0;
             self.installRole();
         }
 
@@ -11571,7 +11656,36 @@ pub fn Database(comptime config: Config) type {
                 provided[bound.mapping[position]] = if (field) |text| try Io.parse(types.typeOfData(column.data_type), column.typmod, text, &self.session) else .null_value;
             }
             var ctx = self.evalContext(source);
-            out.cells = try D.copiedRow(&ctx, table, &provided, .{ .defaults = &bound.defaults, .generated = &bound.generated, .checks = &bound.checks });
+            const derived: D.Derived = .{ .defaults = &bound.defaults, .generated = &bound.generated, .checks = &bound.checks };
+            self.copy_skip = false;
+            // BEFORE ROW triggers between the defaults and NOT NULL,
+            // generated columns and CHECK (B11 wave 5; COPY applies no rules).
+            if (self.beforeRowTriggers(table_index, routine_catalog.tg_insert, snap)) {
+                var cells = try D.copiedRowDeferred(&ctx, table, &provided, derived);
+                self.routine_result = self.copy_result;
+                self.statement_start = tx.subs[tx.sub_len - 1].write_start;
+                if (!(self.beforeRow(table_index, routine_catalog.tg_insert, &cells, null, null, snap) catch |err| return if (err == error.WouldBlock) error.LockNotAvailable else err)) {
+                    self.copy_skip = true;
+                    out.cells = cells;
+                    return;
+                }
+                var check_ctx = self.evalContext(source);
+                try D.finishRow(&check_ctx, table, derived, &cells);
+                out.cells = cells;
+                return;
+            }
+            out.cells = try D.copiedRow(&ctx, table, &provided, derived);
+        }
+
+        /// Whether table `index` (or a partitioned ancestor) has BEFORE ROW
+        /// triggers for `event`.
+        fn beforeRowTriggers(self: *const Self, index: usize, event: u8, snap: Snapshot) bool {
+            var list: [config.triggers]u8 = undefined;
+            const count = self.rowTriggerList(index, snap, &list);
+            for (list[0..count]) |position| {
+                if (triggerMatches(&self.objects.triggers[position], routine_catalog.tg_before, true, event)) return true;
+            }
+            return false;
         }
 
         /// Inserts a built row under the open COPY. A key held by a live
@@ -11582,6 +11696,12 @@ pub fn Database(comptime config: Config) type {
             if (!self.active(slot)) return error.NoActiveTransaction;
             const tx = &self.txs[slot];
             const table_index = tx.copy_table orelse return error.NoActiveTransaction;
+            // A BEFORE ROW trigger returned NULL: the row is not inserted
+            // and not counted (B11 wave 5).
+            if (self.copy_skip) {
+                self.copy_skip = false;
+                return;
+            }
             tx.pin = null;
             tx.waiting_for = .{};
             const snap = tx.copy_snap;
@@ -11621,6 +11741,9 @@ pub fn Database(comptime config: Config) type {
             if (!self.active(slot)) return error.NoActiveTransaction;
             const tx = &self.txs[slot];
             if (tx.copy_table == null) return error.NoActiveTransaction;
+            // AFTER ROW, then AFTER STATEMENT triggers (B11 wave 5); an
+            // error leaves the COPY to the caller's rollback.
+            self.copyTriggers(slot, 0) catch |err| return if (err == error.WouldBlock) error.LockNotAvailable else err;
             const rows = tx.copy_rows;
             tx.copy_table = null;
             tx.copy_rows = 0;
@@ -15727,7 +15850,91 @@ pub fn Database(comptime config: Config) type {
         /// at statement end). `assigned`: the statement's SET list for
         /// UPDATE OF on its own target.
         fn afterTriggers(self: *Self, slot: u16, start: usize, assigned: ?*const [config.columns]u16, snap: Snapshot) Error!void {
-            if (!self.anyTrigger(0, true, tg.tg_insert, snap) and !self.anyTrigger(0, true, tg.tg_update, snap) and !self.anyTrigger(0, true, tg.tg_delete, snap)) return;
+            return self.afterTriggersIn(slot, start, assigned, snap, .{});
+        }
+
+        /// Which writes an AFTER ROW pass fires for: every one, the target
+        /// table's (and its partitions'), or the rows referential actions
+        /// wrote elsewhere (their AFTER STATEMENT triggers interleaved).
+        const AfterScope = struct { target: ?usize = null, cascaded: bool = false };
+
+        /// A referential action's statement triggers (see ri_pairs).
+        pub const RiPair = struct { table: usize = 0, event: u8 = 0, end: usize = 0, done: bool = false };
+
+        /// The AFTER events of an UPDATE / DELETE: when referential actions
+        /// ran, PostgreSQL fires the statement's own AFTER ROW and AFTER
+        /// STATEMENT triggers first, then the actions' row events in write
+        /// order with each action table's AFTER STATEMENT after its latest
+        /// action (B11 wave 5).
+        fn afterEvents(self: *Self, slot: u16, statement_table: usize, assigned: ?*const [config.columns]u16, events: []const u8, snap: Snapshot) Error!void {
+            if (self.ri_len == self.ri_base and !self.cascadedWrites(slot, statement_table, snap)) {
+                try self.afterTriggers(slot, self.statement_start, assigned, snap);
+                return self.statementTriggers(statement_table, 0, events, snap);
+            }
+            try self.afterTriggersIn(slot, self.statement_start, assigned, snap, .{ .target = statement_table });
+            try self.statementTriggers(statement_table, 0, events, snap);
+            try self.afterTriggersIn(slot, self.statement_start, null, snap, .{ .target = statement_table, .cascaded = true });
+            try self.cascadedStatements(snap, null);
+        }
+
+        /// The statement wrote rows of other tables (referential actions).
+        fn cascadedWrites(self: *const Self, slot: u16, statement_table: usize, snap: Snapshot) bool {
+            const tx = &self.txs[slot];
+            for (tx.writes[@min(self.statement_start, tx.write_len)..tx.write_len]) |entry| {
+                switch (entry.kind) {
+                    .insert, .update, .delete => {},
+                    else => continue,
+                }
+                if (self.writeCid(entry) != snap.cid) continue;
+                if (entry.table != statement_table and !self.descends(entry.table, statement_table)) return true;
+            }
+            return false;
+        }
+
+        /// AFTER STATEMENT triggers of the referential actions whose
+        /// latest action ended at or before write index `upto` (all when
+        /// null), in that order.
+        fn cascadedStatements(self: *Self, snap: Snapshot, upto: ?usize) Error!void {
+            while (true) {
+                var next: ?usize = null;
+                for (self.ri_pairs[self.ri_base..self.ri_len], self.ri_base..) |pair, index| {
+                    if (pair.done) continue;
+                    if (upto) |limit| if (pair.end > limit) continue;
+                    if (next == null or pair.end < self.ri_pairs[next.?].end) next = index;
+                }
+                const index = next orelse return;
+                self.ri_pairs[index].done = true;
+                try self.statementTriggers(self.ri_pairs[index].table, 0, &.{self.ri_pairs[index].event}, snap);
+            }
+        }
+
+        /// A referential action on `child` (`event` its DELETE or UPDATE)
+        /// begins: its BEFORE STATEMENT triggers fire once per statement.
+        fn referentialBegin(self: *Self, child: usize, event: u8, snap: Snapshot) Error!?usize {
+            var list: [config.triggers]u8 = undefined;
+            const count = self.objects.tableTriggers(self.tables[child].oid, snap, &list);
+            var statement_triggers = false;
+            for (list[0..count]) |position| {
+                const trigger = &self.objects.triggers[position];
+                statement_triggers = statement_triggers or (trigger.tgtype & tg.tg_row == 0 and trigger.tgtype & event != 0);
+            }
+            if (!statement_triggers) return null;
+            for (self.ri_pairs[self.ri_base..self.ri_len], self.ri_base..) |pair, index| {
+                if (pair.table == child and pair.event == event) return index;
+            }
+            if (self.ri_len == self.ri_pairs.len) return error.ProgramLimitExceeded;
+            const index = self.ri_len;
+            self.ri_pairs[index] = .{ .table = child, .event = event };
+            self.ri_len += 1;
+            try self.statementTriggers(child, tg.tg_before, &.{event}, snap);
+            return index;
+        }
+
+        fn afterTriggersIn(self: *Self, slot: u16, start: usize, assigned: ?*const [config.columns]u16, snap: Snapshot, scope: AfterScope) Error!void {
+            if (!self.anyTrigger(0, true, tg.tg_insert, snap) and !self.anyTrigger(0, true, tg.tg_update, snap) and !self.anyTrigger(0, true, tg.tg_delete, snap)) {
+                if (scope.cascaded) try self.cascadedStatements(snap, null);
+                return;
+            }
             const tx = &self.txs[slot];
             // Statements the triggers run append after `end` and fire their
             // own AFTER triggers; writes of nested statements in between
@@ -15743,6 +15950,11 @@ pub fn Database(comptime config: Config) type {
                     else => continue,
                 };
                 if (self.writeCid(entry) != snap.cid) continue;
+                if (scope.target) |statement_table| {
+                    const own = entry.table == statement_table or self.descends(entry.table, statement_table);
+                    if (own == scope.cascaded) continue;
+                    if (scope.cascaded) try self.cascadedStatements(snap, index);
+                }
                 var list: [config.triggers]u8 = undefined;
                 const count = self.rowTriggerList(entry.table, snap, &list);
                 if (count == 0) continue;
@@ -15765,6 +15977,7 @@ pub fn Database(comptime config: Config) type {
                     _ = try self.callTrigger(trigger, entry.table, 0, true, event, new, old, snap);
                 }
             }
+            if (scope.cascaded) try self.cascadedStatements(snap, null);
             // The immediate constraint triggers handled everything so far.
             for (&self.objects.triggers, 0..) |*trigger, trigger_index| {
                 if (trigger.live and trigger.constraint and !self.triggerDeferred(slot, trigger)) tx.trigger_handled[trigger_index] = @intCast(tx.write_len);

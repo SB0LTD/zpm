@@ -143,6 +143,20 @@ pub fn Dml(comptime config: types.Config) type {
             return cells;
         }
 
+        /// copiedRow up to the BEFORE ROW triggers (B11 wave 5: COPY FROM
+        /// fires them): inputs and defaults stored, NOT NULL, generated
+        /// columns and CHECKs left to finishRow.
+        pub fn copiedRowDeferred(ctx: *E.Context, table: *const S.Table, provided: *const [config.columns]?V.Cell, derived: Derived) Error!E.Row {
+            var cells: E.Row = @splat(.null_value);
+            ctx.row = null;
+            for (table.columns[0..table.column_count], 0..) |*column, index| {
+                if (column.default_kind == .generated) continue;
+                const evaluated: V.Cell = if (provided[index]) |cell| cell else try defaultCell(ctx, table, derived, index);
+                cells[index] = try storeRelaxed(column, evaluated, ctx.session);
+            }
+            return cells;
+        }
+
         /// Every SET expression sees the old row, never a partly updated one.
         pub fn updatedRow(ctx: *E.Context, table: *const S.Table, values: *const [config.columns]u16, derived: Derived, old: *const E.Row) Error!E.Row {
             var cells = old.*;
