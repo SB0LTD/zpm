@@ -57,6 +57,29 @@ unmodified main (20e7528): `server_profile_bytes` 13,172,624 and `small_bytes`
 298,304 (the server profile's inline index slots are 8 x 4 x 8,192 = 262,144
 bytes).
 
+### Ordered indexes (B11 wave 5)
+
+CREATE INDEX now defaults to btree (docs/SQL_DDL_DML.md). A run holds a
+hash index's slots or an ordered index's node arena, whichever is larger:
+`max(pow2(2 x versions), (1 + treeNodes(versions)) x (4 + 4 x
+index_fanout))` u32 words (`Database.indexRunWords`), about 35 bytes per
+version per index at the default fanout 32 (the arena holds the worst case
+of half-full nodes, so it never runs out while the entries fit):
+
+| Runtime versions per table | Bytes per table per index |
+|---|---|
+| 1,024 | 36,960 |
+| 8,192 (RAMSQL default) | 289,344 |
+| 1,048,576 | 36,910,368 |
+
+RAMSQL's default plan with four bound indexes per table is 92,129,280
+bytes (84,967,424 with hash-only runs). Inline storage sizes each run the
+same way from `index_entries`: the sql-storage suite reports
+`server_profile_bytes` 14,796,032 (13,172,624 before) and `small_bytes`
+637,568 (298,304 before).
+`contract-sql-index-external` asserts the run sizes through
+`indexRunWords`.
+
 ## Turning it on in RAMSQL
 
 Add `.external_indexes = 4` (or fewer) to the `sql.Config` in RAMSQL's

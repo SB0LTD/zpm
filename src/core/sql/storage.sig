@@ -581,11 +581,12 @@ pub fn Storage(comptime config: types.Config) type {
         pub const expression_key: u8 = 0xff;
 
         /// CREATE [UNIQUE] INDEX stores the key elements, INCLUDE columns and
-        /// partial predicate. Each optional hash entry stores version + 1
-        /// under its plain keys and validates visibility on probes.
-        /// Scanned indexes use the same version arena. Expression
-        /// elements and predicates are definitions bound per statement;
-        /// unique indexes use plain columns only.
+        /// partial predicate. A btree index (the default) keeps a B+tree of
+        /// version references in its run; a USING hash index keeps hash
+        /// entries (version + 1 under its plain keys). Both validate
+        /// visibility on probes. Scanned indexes use the same version
+        /// arena. Expression elements and predicates are definitions bound
+        /// per statement; unique indexes use plain columns only.
         pub const Index = struct {
             oid: u32 = 0,
             name: V.Name = .{},
