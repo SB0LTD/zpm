@@ -5849,7 +5849,7 @@ pub fn Database(comptime config: Config) type {
         /// (42704 when none; domains and enums are 0A000 here).
         fn castTypeOid(self: *const Self, arg: *const R.Arg, snap: Snapshot) Error!u32 {
             if (!arg.user_type.named()) return arg.oid;
-            return (try self.userCompositeOid(&arg.user_type, snap)) orelse error.UndefinedObject;
+            return (try self.dependedCompositeOid(&arg.user_type, snap)) orelse error.UndefinedObject;
         }
 
         /// Whether the session's role owns type `oid` (built-in types: the
@@ -5950,19 +5950,26 @@ pub fn Database(comptime config: Config) type {
             return false;
         }
 
-        /// Whether a visible routine or cast has a parameter, result,
-        /// source or target of type `oid`.
+        /// Whether a routine or cast has a parameter, result, source or
+        /// target of type `oid`: a visible one, or one another transaction
+        /// is creating or committed after this snapshot (not one this
+        /// transaction dropped).
         fn routineUsesType(self: *const Self, oid: u32, snap: Snapshot) bool {
             for (&self.objects.casts) |*cast| {
-                if (cast.live and cast.stamp.visible(snap) and (cast.source == oid or cast.target == oid)) return true;
+                if (cast.live and typeDependent(&cast.stamp, snap) and (cast.source == oid or cast.target == oid)) return true;
             }
             for (&self.objects.routines) |*routine| {
-                if (!routine.live or !routine.stamp.visible(snap)) continue;
+                if (!routine.live or !typeDependent(&routine.stamp, snap)) continue;
                 if (routine.return_oid == oid) return true;
                 for (routine.arg_oids[0..routine.arg_count]) |arg| if (arg == oid) return true;
                 for (routine.out_oids[0..routine.out_count]) |out| if (out == oid) return true;
             }
             return false;
+        }
+
+        fn typeDependent(stamp: *const routine_catalog.Stamp, snap: Snapshot) bool {
+            if (stamp.deleted(snap)) return false;
+            return stamp.visible(snap) or stamp.committedLive() or stamp.creatorOther(snap) != null;
         }
 
         fn dropTypes(self: *Self, slot: u16, source: []const u8, drop: *const CO.DropTypes, domain_only: bool, snap: Snapshot) Error!void {
@@ -14730,13 +14737,27 @@ pub fn Database(comptime config: Config) type {
         /// composite lane): an unqualified name searches the path. A
         /// domain or enum is 0A000, no such type 42704.
         fn userCompositeOid(self: *const Self, user: *const R.UserType, snap: Snapshot) Error!?u32 {
+            return self.compositeOidFor(user, snap, false);
+        }
+
+        /// A composite type a new cast or routine depends on: one another
+        /// transaction is dropping (or dropped after this snapshot) is
+        /// 40001, so no committed dependent outlives its type (PostgreSQL
+        /// waits on the type's lock instead).
+        fn dependedCompositeOid(self: *const Self, user: *const R.UserType, snap: Snapshot) Error!?u32 {
+            return self.compositeOidFor(user, snap, true);
+        }
+
+        fn compositeOidFor(self: *const Self, user: *const R.UserType, snap: Snapshot, depended: bool) Error!?u32 {
             const name = user.name.slice();
             var path: [routine_path_capacity]u32 = undefined;
             const count = try self.routineSearch(user.has_schema, user.schema, snap, &path);
             for (path[0..count]) |namespace| {
                 if (!self.catalog_objects.userTypeNameTaken(namespace, name, snap)) continue;
                 const index = self.catalog_objects.byName(.composite_type, namespace, name, snap) orelse return error.UnsupportedStatement;
-                return self.catalog_objects.items[index].oid;
+                const object = &self.catalog_objects.items[index];
+                if (depended and object.xmax.epoch != 0 and !snap.own(object.xmax)) return error.SerializationFailure;
+                return object.oid;
             }
             return null;
         }
@@ -14748,12 +14769,12 @@ pub fn Database(comptime config: Config) type {
             var resolved = given.*;
             for (resolved.args[0..resolved.arg_count]) |*arg| {
                 if (!arg.user_type.named()) continue;
-                arg.oid = (try self.userCompositeOid(&arg.user_type, snap)) orelse return error.UndefinedObject;
+                arg.oid = (try self.dependedCompositeOid(&arg.user_type, snap)) orelse return error.UndefinedObject;
                 arg.typmod = -1;
                 arg.user_type = .{};
             }
             if (resolved.return_user.named()) {
-                if (try self.userCompositeOid(&resolved.return_user, snap)) |oid| {
+                if (try self.dependedCompositeOid(&resolved.return_user, snap)) |oid| {
                     if (resolved.outputCount() != 0) return error.InvalidFunctionDefinition;
                     resolved.return_oid = oid;
                     resolved.return_typmod = -1;

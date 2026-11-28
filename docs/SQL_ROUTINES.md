@@ -449,8 +449,8 @@ Not covered (open):
 
 ## Wave 5: composite values, user casts, ProjectSet (composite lane)
 
-`contract-sql-composite` (tests/test_sql_composite.sig, 399 assertions,
-53 replayed records) covers this section with values in PostgreSQL text
+`contract-sql-composite` (tests/test_sql_composite.sig, 408 assertions,
+55 replayed records) covers this section with values in PostgreSQL text
 output, column names and type OIDs, exact errors (the SQLSTATE through the
 error name), atomicity after a failure, replay (every committed record is
 applied to a replica that must answer every probe like the primary) and
@@ -471,7 +471,9 @@ against native PostgreSQL 18.7.
   by field when evaluated. `'...'::record` and an untyped side of a
   record comparison are 0A000 (input of anonymous composite types). Text
   output is record_out (`(1,"a b",)`), binary output record_send.
-  `pg_typeof`, RowDescription and pg_attribute name the composite type.
+  `pg_typeof`, RowDescription and pg_attribute name the composite type:
+  a result column of a composite type carries the type's OID as its
+  nominal type with typmod -1 (an anonymous record is OID 2249).
 - **Field selection.** `(x).field` (42809 when `x` is no record, 42703
   for a missing field; a field name may be any keyword), `(x).*` in a
   select list (one column per field), `variable.field` for composite
@@ -502,7 +504,11 @@ against native PostgreSQL 18.7.
   type's OID); a SQL body may return a record or one column per field.
   A function with several OUT parameters is an anonymous record in an
   expression (`f()`, `(f()).a`, `(f()).*`). DROP TYPE of a type a
-  column, routine or cast uses is 2BP01 (CASCADE is 0A000 here).
+  column, routine or cast uses is 2BP01 (CASCADE is 0A000 here), also
+  when another transaction is creating that dependent or committed it
+  after the dropper's snapshot; a column, routine or cast naming a type
+  another transaction is dropping is 40001 (PostgreSQL waits on the
+  type's lock), so a dependent never outlives its type in the log.
 - **PL/pgSQL variables.** `DECLARE p pt` and `DECLARE r record`;
   assignment, field assignment (a NULL composite becomes a row of NULLs),
   `SELECT ... INTO` a lone composite or record target from separate
@@ -556,7 +562,7 @@ A record value fits one cell (Config.text_bytes; TextCapacity, 54000).
 
 New SQLSTATE mappings: none. Used: 42846, 42809, 42703, 42804, 42P16,
 42704, 22P02, 0A000, 2BP01, 42710, 42P17, 42501, 55000, 22023, 2200N,
-54000.
+54000, 40001.
 
 Not covered (open):
 

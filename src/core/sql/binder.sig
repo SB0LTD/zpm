@@ -6922,6 +6922,13 @@ pub fn Binder(comptime config: types.Config) type {
         /// The composite type a type name denotes (an unqualified name: the
         /// search path's first schema with a user type of that name).
         fn compositeNamed(context: *const Context, name_ident: ast.Ident, qualifier: ast.Ident) Error!?u32 {
+            return compositeLookup(context, name_ident, qualifier, false);
+        }
+
+        /// compositeNamed for a column definition: a type another
+        /// transaction is dropping (or dropped after this snapshot) is
+        /// 40001, so no committed column outlives its type.
+        fn compositeLookup(context: *const Context, name_ident: ast.Ident, qualifier: ast.Ident, depended: bool) Error!?u32 {
             const user_types = compositeCatalog(context) orelse return null;
             const name = toName(context, name_ident);
             const namespace = if (qualifier.len == 0) blk: {
@@ -6932,7 +6939,9 @@ pub fn Binder(comptime config: types.Config) type {
                 return null;
             } else try qualifierNamespace(context, qualifier);
             const index = user_types.byName(.composite_type, namespace, name.slice(), context.snapshot) orelse return null;
-            return user_types.items[index].oid;
+            const object = &user_types.items[index];
+            if (depended and object.xmax.epoch != 0 and !context.snapshot.own(object.xmax)) return error.SerializationFailure;
+            return object.oid;
         }
 
         /// Whether a comparison is PostgreSQL's row-wise comparison: two
@@ -7350,7 +7359,7 @@ pub fn Binder(comptime config: types.Config) type {
         /// and an unknown name is 42704.
         fn compositeColumnTypmod(context: *const Context, definition: *const Ast.ColumnDef) Error!i32 {
             if (definition.user_type.len == 0) return error.InvalidTableDefinition;
-            if (try compositeNamed(context, definition.user_type, definition.user_type_schema)) |oid| return @intCast(oid);
+            if (try compositeLookup(context, definition.user_type, definition.user_type_schema, true)) |oid| return @intCast(oid);
             const name = toName(context, definition.user_type);
             if (definition.user_type_schema.len == 0 and types.keyword(name.slice(), "record")) return error.InvalidTableDefinition;
             const user_types = compositeCatalog(context) orelse return error.UnsupportedStatement;

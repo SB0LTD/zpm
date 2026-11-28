@@ -476,6 +476,57 @@ fn projectSet() !void {
     try fails("SELECT generate_series(1, 3, 0)", error.InvalidParameterValue);
 }
 
+// ---- concurrent DDL on a composite type ------------------------------------
+
+/// A statement in an open transaction.
+fn txRun(slot: u16, source: []const u8) !void {
+    var result: DB.Result = .{};
+    result.bindValueMemory(&query_values);
+    db.statement(slot, source, &result, .{}) catch |err| {
+        std.debug.print("{s}: {s}\n", .{ source, @errorName(err) });
+        return err;
+    };
+    try check(true);
+}
+
+/// A statement in an open transaction fails with `wanted`.
+fn txFails(slot: u16, source: []const u8, wanted: anyerror) !void {
+    var result: DB.Result = .{};
+    result.bindValueMemory(&query_values);
+    if (db.statement(slot, source, &result, .{})) |_| {
+        std.debug.print("accepted: {s}\n", .{source});
+        return error.InvalidStatementAccepted;
+    } else |err| {
+        if (err != wanted) std.debug.print("{s}: {s} (wanted {s})\n", .{ source, @errorName(err), @errorName(wanted) });
+        try check(err == wanted);
+    }
+}
+
+/// A dependent and its type's drop never both commit: a column, routine or
+/// cast naming a type another transaction drops is 40001, and DROP TYPE
+/// counts a dependent another transaction is creating (2BP01).
+fn concurrency() !void {
+    try run("CREATE TYPE cc AS (n INT)");
+    const dropper = try db.begin();
+    try txRun(dropper, "DROP TYPE cc");
+    inline for (.{ "CREATE TABLE ccuse(c cc)", "CREATE FUNCTION ccf(v cc) RETURNS INT LANGUAGE SQL AS $$SELECT 1$$", "CREATE CAST (cc AS TEXT) WITH INOUT" }) |source| {
+        const other = try db.begin();
+        try txFails(other, source, error.SerializationFailure);
+        db.abort(other);
+    }
+    db.abort(dropper);
+    inline for (.{ "CREATE FUNCTION ccf(v cc) RETURNS INT LANGUAGE SQL AS $$SELECT 1$$", "CREATE TABLE ccuse(c cc)" }) |source| {
+        const creator = try db.begin();
+        try txRun(creator, source);
+        const other = try db.begin();
+        try txFails(other, "DROP TYPE cc", error.DependentObjects);
+        db.abort(other);
+        db.abort(creator);
+    }
+    try run("DROP TYPE cc");
+    try sameState(&.{"SELECT count(*) FROM pg_type WHERE typname = 'cc'"});
+}
+
 fn contract() !void {
     try values();
     try columns();
@@ -484,6 +535,7 @@ fn contract() !void {
     try casts();
     try corruption();
     try projectSet();
+    try concurrency();
 }
 
 pub fn main(init: std.process.Init) !void {
