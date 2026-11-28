@@ -211,6 +211,9 @@ pub fn Rows(comptime config: types.Config) type {
                 role: u32,
                 database: []const u8,
                 relations: []const K.Found,
+                /// seesColumn's table and whether all its columns show.
+                column_memo: u32 = 0,
+                column_memo_all: bool = false,
 
                 fn objects(self: *const Self) *const O {
                     return &self.db.catalog_objects;
@@ -326,8 +329,14 @@ pub fn Rows(comptime config: types.Config) type {
                 /// columns / key_column_usage: pg_has_role(owner) or
                 /// has_column_privilege(SELECT, INSERT, UPDATE, REFERENCES)
                 /// on the column (`index` 0-based); table grants cover it.
-                fn seesColumn(self: *const Self, table: *const S.Table, index: usize) bool {
-                    return self.columnAllowed(table, index, column_privilege_mask);
+                fn seesColumn(self: *Self, table: *const S.Table, index: usize) bool {
+                    // Owner or table-wide privileges decide once per table.
+                    if (self.column_memo != table.oid) {
+                        self.column_memo = table.oid;
+                        self.column_memo_all = self.hasRole(self.tableOwner(table)) or self.tableAny(table, column_privilege_mask);
+                    }
+                    if (self.column_memo_all) return true;
+                    return self.objects().columnGrantMask(self.role, table.oid, index, self.snap) & column_privilege_mask != 0;
                 }
 
                 fn columnAllowed(self: *const Self, table: *const S.Table, index: usize, mask: u32) bool {
