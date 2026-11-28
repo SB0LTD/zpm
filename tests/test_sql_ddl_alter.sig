@@ -323,6 +323,19 @@ fn alterColumnType() !void {
     try rejects("ALTER TABLE cp ALTER COLUMN id TYPE pt", error.TypeMismatch, "SELECT (p).x FROM cp", "1");
     try run("ALTER TABLE cp ALTER COLUMN p TYPE INT USING (p).x");
     try expect("SELECT p FROM cp", "1");
+    // A column changing to a composite type needs USAGE on it (42501,
+    // the privileges lane's check, as native).
+    try run("CREATE ROLE r");
+    try run("REVOKE USAGE ON TYPE pt FROM PUBLIC");
+    try run("CREATE TABLE ro(a TEXT)");
+    try run("ALTER TABLE ro OWNER TO r");
+    try run("SET ROLE r");
+    try rejects("ALTER TABLE ro ALTER COLUMN a TYPE pt USING NULL", error.InsufficientPrivilege, "SELECT count(*) FROM ro", "0");
+    try run("RESET ROLE");
+    try run("GRANT USAGE ON TYPE pt TO r");
+    try run("SET ROLE r");
+    try run("ALTER TABLE ro ALTER COLUMN a TYPE pt USING NULL");
+    try run("RESET ROLE");
     // User casts: an assignment cast converts without USING, an explicit
     // one does not (42804).
     try run("CREATE FUNCTION d2i(date) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT extract(year from $1)::int'");
@@ -636,7 +649,9 @@ fn schemaElements() !void {
     try rejects("INSERT INTO s4.b VALUES (1)", error.ForeignKeyViolation, "SELECT count(*) FROM s4.b", "0");
     // Triggers and grants run as their own statements do.
     try run("CREATE FUNCTION tf() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.a := NEW.a + 1; RETURN NEW; END $$");
-    try run("CREATE SCHEMA s5 CREATE TABLE t(a INT) CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION public.tf() GRANT SELECT ON t TO PUBLIC");
+    try run("CREATE ROLE gr");
+    try run("CREATE SCHEMA s5 CREATE TABLE t(a INT) CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION public.tf() GRANT SELECT ON t TO gr");
+    try expect("SELECT has_table_privilege('gr', 's5.t', 'SELECT'), has_table_privilege('gr', 's5.t', 'INSERT')", "t|f");
     try run("INSERT INTO s5.t VALUES (1)");
     try expect("SELECT a FROM s5.t", "2");
     try expect("SELECT tgname FROM pg_trigger WHERE tgrelid = 's5.t'::regclass", "tr");
