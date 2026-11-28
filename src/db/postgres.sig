@@ -2778,6 +2778,8 @@ pub fn knownSqlstate(err: anyerror) ?[]const u8 {
     if (equal(name, "NotAnXmlDocument")) return "2200L";
     if (equal(name, "InvalidXmlProcessingInstruction")) return "2200T";
     if (equal(name, "InvalidXmlComment")) return "2200S";
+    if (equal(name, "InvalidArgumentForXquery")) return "10608";
+    if (equal(name, "InternalError")) return "XX000";
     if (equal(name, "CollationMismatch")) return "42P21";
     if (equal(name, "InvalidRegularExpression")) return "2201B";
     if (equal(name, "InvalidEscapeCharacterUse")) return "2200C";

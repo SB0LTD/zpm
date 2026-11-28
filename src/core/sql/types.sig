@@ -245,6 +245,19 @@ pub const Config = struct {
     /// and expansion text in the free query workspace (WorkspaceCapacity,
     /// 54000, when they do not fit).
     nested_statements: usize = 8,
+    /// SQL/XML (B11 wave 5 xml lane, xml_tree.sig / xpath.sig / xml_eval.sig):
+    /// nodes of one parsed XML document (elements, attributes, text,
+    /// comments, processing instructions, namespace declarations and the
+    /// namespace-axis nodes XPath materializes), the nodes and syntax depth
+    /// of one compiled XPath expression, and the scratch bytes one XML
+    /// operation uses at once (decoded values, node sets, XPath strings,
+    /// serialized results and table-mapping output). Going over any of
+    /// them is ProgramLimitExceeded (54000). The Database keeps
+    /// xml_nodes x node + xpath_nodes x expression + xml_bytes bytes.
+    xml_nodes: usize = 1024,
+    xpath_nodes: usize = 256,
+    xpath_depth: usize = 64,
+    xml_bytes: usize = 65536,
 };
 
 pub fn workRows(comptime config: Config) usize {
@@ -571,6 +584,13 @@ pub const Error = error{
     /// row, not a simply updatable scan of the table, or held from a
     /// previous transaction (B11 wave 5).
     InvalidCursorState,
+    /// SQLSTATE 10608: an invalid or failing XPath expression (B11 wave 5
+    /// xml: libxml2's compile and evaluation errors).
+    InvalidArgumentForXquery,
+    /// SQLSTATE XX000: an internal error PostgreSQL raises without a code
+    /// (an XPath namespace with an empty name cannot be registered; B11
+    /// wave 5 xml).
+    InternalError,
 };
 
 /// Caller-owned execution accounting and interrupt polling. This is independent
@@ -1387,7 +1407,8 @@ pub fn Values(comptime config: Config) type {
 
         pub fn largeBytes(value: *const Cell) ?[]const u8 {
             return switch (value.*) {
-                .text, .array, .bpchar => |*text| if (text.indirect()) text.slice() else null,
+                // xml: wide SQL/XML results (B11 wave 5 xml lane).
+                .text, .array, .bpchar, .xml => |*text| if (text.indirect()) text.slice() else null,
                 else => null,
             };
         }
@@ -1398,6 +1419,7 @@ pub fn Values(comptime config: Config) type {
                 .text => .{ .text = text },
                 .array => .{ .array = text },
                 .bpchar => .{ .bpchar = text },
+                .xml => .{ .xml = text },
                 else => unreachable,
             };
         }

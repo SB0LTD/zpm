@@ -17,6 +17,7 @@ const tablesample = @import("tablesample.sig");
 const collect_module = @import("aggregates_collect.sig");
 const array_module = @import("array.sig");
 const json_eval = @import("json_eval.sig");
+const xml_eval = @import("xml_eval.sig");
 const types_ext_eval = @import("types_ext_eval.sig");
 const regex_eval = @import("regex_eval.sig");
 const temporal = @import("temporal.sig");
@@ -344,6 +345,7 @@ pub fn Exec(comptime config: types.Config) type {
                 var ctx = self.context(outer);
                 var out: List = .{ .start = @intCast(self.work.ref_low) };
                 if (p.series == .json_table) return self.jsonTableRows(p, outer);
+                if (p.series == .xml_table) return self.xmlTableRows(p, outer);
                 if (p.series == .partition_ancestors) return self.partitionAncestorRows(p, &ctx);
                 if (p.series == .options_to_table) return self.optionRows(p, &ctx);
                 if (p.series == .unnest) return self.unnestRows(p, &ctx);
@@ -383,7 +385,7 @@ pub fn Exec(comptime config: types.Config) type {
                         const zero: V.Cell = .{ .interval = .{} };
                         direction = V.compare(&step, &zero);
                     },
-                    .none, .json_table, .partition_ancestors, .options_to_table, .unnest, .routine, .subscripts, .set_function => unreachable,
+                    .none, .json_table, .partition_ancestors, .options_to_table, .unnest, .routine, .subscripts, .set_function, .xml_table => unreachable,
                 }
                 if (direction == 0) return error.InvalidParameterValue;
                 var current = args[0];
@@ -641,6 +643,27 @@ pub fn Exec(comptime config: types.Config) type {
                 };
                 var rows: Emit = .{ .query = self, .list = &out, .width = p.width };
                 try json_eval.JsonEval(config, E).jsonTable(&ctx, p.function, p.names[0..p.count], p.tys[0..p.count], p.typmods[0..p.count], .{ .context = &rows, .row = Emit.row });
+                return self.finish(p, out);
+            }
+
+            /// XMLTABLE rows (B11 wave 5 xml lane, xml_eval.sig): each row's
+            /// cells go to the workspace as they are produced.
+            fn xmlTableRows(self: *Query, p: *const B.Plan, outer: ?*const E.Context) Error!List {
+                var ctx = self.context(outer);
+                var out: List = .{ .start = @intCast(self.work.ref_low) };
+                const Emit = struct {
+                    query: *Query,
+                    list: *List,
+                    width: usize,
+                    fn row(raw: *anyopaque, values: []const V.Cell) Error!void {
+                        const state: *@This() = @ptrCast(@alignCast(raw));
+                        const at = try state.query.cells(state.width);
+                        for (values, 0..) |cell, index| state.query.work.cells[at + index] = cell;
+                        try state.query.push(state.list, at);
+                    }
+                };
+                var rows: Emit = .{ .query = self, .list = &out, .width = p.width };
+                try xml_eval.XmlEval(config, E).xmlTable(&ctx, p.function, p.tys[0..p.count], p.typmods[0..p.count], .{ .context = &rows, .row = Emit.row });
                 return self.finish(p, out);
             }
 

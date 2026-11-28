@@ -195,7 +195,40 @@ pub const Func = enum { none, grouping, window_call, to_char, now, transaction_t
     // length(tsvector), strip, setweight (2 or 3 arguments),
     // tsvector_to_array, array_to_tsvector, ts_delete (text or text[]),
     // ts_filter and numnode.
-    tsvector_length, ts_strip, ts_setweight, tsvector_to_array, array_to_tsvector, ts_delete, ts_filter, ts_numnode };
+    tsvector_length, ts_strip, ts_setweight, tsvector_to_array, array_to_tsvector, ts_delete, ts_filter, ts_numnode,
+    // SQL/XML (B11 wave 5 xml lane, xml_eval.sig): xml_call is an XmlFn
+    // (`integer`) with its arguments in `b`: xpath, xpath_exists,
+    // XMLEXISTS, IS DOCUMENT and the table mapping functions. XMLTABLE in
+    // FROM: the table node (`a` the PASSING document, `c` the row path,
+    // `b` -> next the namespaces then the columns), an XMLNAMESPACES entry
+    // (`name` its prefix, `integer` 1 for DEFAULT, `b` the URI) and a
+    // column (`name`, type in cast_type / typmod, `a` PATH, `b` DEFAULT,
+    // `integer` an XmlTableColumn). Exec reads the table's members.
+    xml_call, xmltable, xmltable_namespace, xmltable_column };
+
+/// xml_call variants (xml_eval.sig).
+pub const XmlFn = enum(u8) {
+    xpath, xpath_exists, xmlexists, is_document,
+    table_to_xml, query_to_xml, cursor_to_xml, table_to_xmlschema, query_to_xmlschema, cursor_to_xmlschema,
+    table_to_xml_and_xmlschema, query_to_xml_and_xmlschema, schema_to_xml, schema_to_xmlschema, schema_to_xml_and_xmlschema,
+    database_to_xml, database_to_xmlschema, database_to_xml_and_xmlschema,
+};
+
+/// XMLTABLE column flags (Node.integer of an xmltable_column).
+pub const XmlTableColumn = struct {
+    ordinality: bool = false,
+    not_null: bool = false,
+    /// NULL or NOT NULL was written (a second one is 42601).
+    nullability: bool = false,
+
+    pub fn encode(self: XmlTableColumn) i64 {
+        return @as(i64, @intFromBool(self.ordinality)) | @as(i64, @intFromBool(self.not_null)) << 1 | @as(i64, @intFromBool(self.nullability)) << 2;
+    }
+
+    pub fn decode(raw: i64) XmlTableColumn {
+        return .{ .ordinality = raw & 1 != 0, .not_null = raw & 2 != 0, .nullability = raw & 4 != 0 };
+    }
+};
 
 
 /// mr_call variants: the range accessors applied to a multirange's span.

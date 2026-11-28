@@ -153,6 +153,8 @@ pub fn SettingsOf(comptime Zone: type) type {
         idle_in_transaction_session_timeout_ms: u32 = 0,
         transaction_timeout_ms: u32 = 0,
         xml_document: bool = false,
+        /// xmlbinary = hex (B11 wave 5 xml lane; base64 by default).
+        xml_binary_hex: bool = false,
         client_min_messages: ClientMessageLevel = .notice,
         application_name: [64]u8 = @splat(0),
         application_name_len: u8 = 0,
@@ -265,7 +267,7 @@ pub const deadlock_timeout_ms: u32 = 1000;
 
 /// Settings this store implements; the engine owns the others it knows
 /// (transaction_*, default_transaction_*, search_path, placeholders).
-const Parameter = enum { lock_timeout, statement_timeout, idle_in_transaction_session_timeout, transaction_timeout, deadlock_timeout, timezone, xmloption, application_name, client_encoding, client_min_messages, standard_conforming_strings, datestyle, intervalstyle, extra_float_digits, default_table_access_method, default_tablespace, server_version, server_encoding, integer_datetimes };
+const Parameter = enum { lock_timeout, statement_timeout, idle_in_transaction_session_timeout, transaction_timeout, deadlock_timeout, timezone, xmloption, application_name, client_encoding, client_min_messages, standard_conforming_strings, datestyle, intervalstyle, extra_float_digits, default_table_access_method, default_tablespace, server_version, server_encoding, integer_datetimes, xmlbinary };
 
 fn parameter(name: []const u8) ?Parameter {
     inline for (@typeInfo(Parameter).@"enum".field_names) |field| {
@@ -848,6 +850,9 @@ pub fn Store(comptime Raw: type) type {
                 if (comptime has_session) if (which == .xmloption) {
                     self.store.database.session.xml_document = self.settings.xml_document;
                 };
+                if (comptime has_session) if (which == .xmlbinary) {
+                    self.store.database.session.xml_binary_hex = self.settings.xml_binary_hex;
+                };
             }
 
             pub const CopyInfo = Raw.CopyInfo;
@@ -918,7 +923,7 @@ pub fn Store(comptime Raw: type) type {
             /// A caller using named-zone operations must provide a read-safe
             /// resolver or keep those operations on the serialized path.
             pub fn detachedReadSession(self:*const Connection,execution_control:*ExecutionControl,statement_us:?i64) Raw.SessionValues {
-                var session: Raw.SessionValues = .{.zone=self.settings.zone,.xml_document=self.settings.xml_document,.transaction_us=statement_us,.statement_us=statement_us,
+                var session: Raw.SessionValues = .{.zone=self.settings.zone,.xml_document=self.settings.xml_document,.xml_binary_hex=self.settings.xml_binary_hex,.transaction_us=statement_us,.statement_us=statement_us,
                     .clock=self.store.wall_clock,.database=if(self.database_len==0) "postgres" else self.database_name[0..self.database_len],.control=execution_control};
                 if (comptime @hasField(Raw.SessionValues, "extra_float_digits")) session.extra_float_digits = self.settings.extra_float_digits;
                 if (comptime has_engine_session and @hasField(Raw.SessionValues, "public_schema_on_path")) {
@@ -943,7 +948,7 @@ pub fn Store(comptime Raw: type) type {
                 const settings = &self.engine_session.values;
                 if (self.dialect != .postgres or
                     self.store.max_query_work != 0 or self.settings.statement_timeout_ms != 0 or
-                    self.settings.lock_timeout_ms != 0 or self.settings.xml_document or self.settings.date_order != .mdy or
+                    self.settings.lock_timeout_ms != 0 or self.settings.xml_document or self.settings.xml_binary_hex or self.settings.date_order != .mdy or
                     !same(self.settings.timeZone(), "UTC") or settings.isolation != .read_committed or
                     settings.read_only or settings.deferrable or !same(settings.search_path.slice(), "\"$user\", public") or
                     !same(settings.text_search_config.slice(), "pg_catalog.english")) return false;
@@ -974,6 +979,7 @@ pub fn Store(comptime Raw: type) type {
                 if (comptime has_session) raw.session = .{
                     .zone = self.settings.zone,
                     .xml_document = self.settings.xml_document,
+                    .xml_binary_hex = self.settings.xml_binary_hex,
                     .resolver = .{ .context = @ptrCast(self.store), .lookup = &resolverLookup },
                     .transaction_us = self.transaction_us orelse self.statement_us,
                     .statement_us = self.statement_us,
@@ -1330,6 +1336,13 @@ pub fn Store(comptime Raw: type) type {
                             target.xml_document = true;
                         } else return error.InvalidSettingValue;
                     },
+                    .xmlbinary => {
+                        if ((is_default and value.len == 0) or sameInsensitive(value, "base64")) {
+                            target.xml_binary_hex = false;
+                        } else if (sameInsensitive(value, "hex")) {
+                            target.xml_binary_hex = true;
+                        } else return error.InvalidSettingValue;
+                    },
                     .client_encoding => if (!(value.len == 0 or sameInsensitive(value, "UTF8") or sameInsensitive(value, "UTF-8"))) return error.InvalidSettingValue,
                     .client_min_messages => target.client_min_messages = if (is_default and value.len == 0) .notice else
                         ClientMessageLevel.threshold(value) orelse return error.InvalidSettingValue,
@@ -1418,6 +1431,7 @@ pub fn Store(comptime Raw: type) type {
                     .application_name => self.settings.applicationName(),
                     .timezone => self.settings.timeZone(),
                     .xmloption => if (self.settings.xml_document) "document" else "content",
+                    .xmlbinary => if (self.settings.xml_binary_hex) "hex" else "base64",
                     .client_encoding, .server_encoding => "UTF8",
                     .client_min_messages => @tagName(self.settings.client_min_messages),
                     .standard_conforming_strings, .integer_datetimes => "on",
@@ -1682,6 +1696,7 @@ pub fn Store(comptime Raw: type) type {
                     .idle_in_transaction_session_timeout => target.idle_in_transaction_session_timeout_ms = source.idle_in_transaction_session_timeout_ms,
                     .transaction_timeout => target.transaction_timeout_ms = source.transaction_timeout_ms,
                     .xmloption => target.xml_document = source.xml_document,
+                    .xmlbinary => target.xml_binary_hex = source.xml_binary_hex,
                     .client_min_messages => target.client_min_messages = source.client_min_messages,
                     .application_name => {
                         target.application_name = source.application_name;

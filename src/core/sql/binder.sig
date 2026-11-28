@@ -598,7 +598,9 @@ pub fn Binder(comptime config: types.Config) type {
             subscripts,
             // A set-returning built-in in FROM (wave 4 text-json):
             // `function` is the call (regexp_matches, regexp_split_to_table).
-            set_function };
+            set_function,
+            // XMLTABLE (B11 wave 5 xml lane): `function` is the table node.
+            xml_table };
 
         /// A bound query block of the general engine (design §4.9). Its
         /// materialized rows are `width` cells: the `count` visible output
@@ -1641,6 +1643,15 @@ pub fn Binder(comptime config: types.Config) type {
                 .{ .name = "point", .func = .point_constructor },   .{ .name = "box", .func = .box_constructor },
                 .{ .name = "area", .func = .area },                 .{ .name = "center", .func = .center },
                 .{ .name = "width", .func = .width },               .{ .name = "height", .func = .height },
+                // SQL/XML XPath and table mapping (B11 wave 5 xml lane).
+                .{ .name = "xpath", .func = .xml_call },             .{ .name = "xpath_exists", .func = .xml_call },
+                .{ .name = "table_to_xml", .func = .xml_call },      .{ .name = "query_to_xml", .func = .xml_call },
+                .{ .name = "cursor_to_xml", .func = .xml_call },     .{ .name = "table_to_xmlschema", .func = .xml_call },
+                .{ .name = "query_to_xmlschema", .func = .xml_call }, .{ .name = "cursor_to_xmlschema", .func = .xml_call },
+                .{ .name = "table_to_xml_and_xmlschema", .func = .xml_call }, .{ .name = "query_to_xml_and_xmlschema", .func = .xml_call },
+                .{ .name = "schema_to_xml", .func = .xml_call },     .{ .name = "schema_to_xmlschema", .func = .xml_call },
+                .{ .name = "schema_to_xml_and_xmlschema", .func = .xml_call }, .{ .name = "database_to_xml", .func = .xml_call },
+                .{ .name = "database_to_xmlschema", .func = .xml_call }, .{ .name = "database_to_xml_and_xmlschema", .func = .xml_call },
                 // XML predicates (B11 advanced types).
                 .{ .name = "xml_is_well_formed", .func = .xml_is_well_formed },
                 .{ .name = "xml_is_well_formed_document", .func = .xml_is_well_formed_document },
@@ -2798,6 +2809,9 @@ pub fn Binder(comptime config: types.Config) type {
                     n.constant = isConstant(context, n.b);
                 },
                 .xml_is_well_formed, .xml_is_well_formed_document, .xml_is_well_formed_content => try bindSignature(context, n, &[_]ast.Type{.text}, .boolean, true),
+                .xml_call => try typeXmlCall(context, n, count),
+                // Bound by bindXmlTable only (B11 wave 5 xml lane).
+                .xmltable, .xmltable_namespace, .xmltable_column => return error.Syntax,
                 // Session functions (tx-session lane): volatile.
                 .current_setting => {
                     if (count == 2) try bindSignature(context, n, &[_]ast.Type{ .text, .boolean }, .text, true) else try bindSignature(context, n, &[_]ast.Type{.text}, .text, true);
@@ -5513,6 +5527,7 @@ pub fn Binder(comptime config: types.Config) type {
                         .jsonb_minus_op, .jsonb_delete_path_op, .jsonb_exists_any_op, .jsonb_exists_all_op, .jsonb_path_exists_op, .jsonb_path_match_op, .is_json => break :blk .{ .name = "?column?", .strength = 0 },
                         .ext_op => break :blk .{ .name = "?column?", .strength = 0 },
                         .xmlelement, .xmlforest, .xmlpi, .xmlroot => break :blk .{ .name = @tagName(n.func), .strength = 2 },
+                        .xml_call => if (n.name.len == 0) break :blk .{ .name = "?column?", .strength = 0 },
                         .inet_abbrev => break :blk .{ .name = "abbrev", .strength = 2 },
                         .to_macaddr8 => break :blk .{ .name = "macaddr8", .strength = 2 },
                         .to_macaddr => break :blk .{ .name = "macaddr", .strength = 2 },
@@ -7990,6 +8005,148 @@ pub fn Binder(comptime config: types.Config) type {
             return id;
         }
 
+        /// coerce_to_specific_type[_typmod] (B11 wave 5 xml lane): an
+        /// expression of another type converts by assignment (42804 when it
+        /// cannot); the same type stays as it is.
+        fn specificType(context: *const Context, id: u16, target: ast.Type, typmod: i32) Error!u16 {
+            const ty = context.node(id).ty;
+            if (ty == target) return id;
+            if (ty != .unknown and !value.castable(ty, target, .assignment)) return error.TypeMismatch;
+            return convert(context, id, target, typmod, .assignment);
+        }
+
+        /// XMLTABLE (B11 wave 5 xml lane) as a plan of its own, after
+        /// transformRangeTableFunc: the row expression becomes text and the
+        /// document xml; per column (unique names, one FOR ORDINALITY
+        /// column of int4, else 42601) PATH becomes text and DEFAULT the
+        /// column's type; namespace URIs become text (unique names, one
+        /// DEFAULT, else 42601). They see the FROM items before it.
+        /// Exec.xmlTableRows produces the rows (xml_eval.sig).
+        fn bindXmlTable(context: *const Context, scope: *Scope, item: *const Ast.FromItem, env: ?*const CteEnv) Error!u16 {
+            const plans = plansOf(context);
+            const id = try plans.add();
+            var inner: Scope = .{ .parent = scope, .plan = id, .ctes = env };
+            const table = context.node(item.function);
+            try typeExpr(context, &inner, table.c);
+            table.c = try specificType(context, table.c, .text, -1);
+            try typeExpr(context, &inner, table.a);
+            table.a = try specificType(context, table.a, .xml, -1);
+            const p = &plans.items[id];
+            var count: usize = 0;
+            var ordinality = false;
+            var entry = table.b;
+            while (entry != none) : (entry = context.node(entry).next) {
+                const n = context.node(entry);
+                if (n.func != .xmltable_column) continue;
+                if (count == config.columns) return error.ColumnCapacity;
+                const spec = ast.XmlTableColumn.decode(n.integer);
+                if (spec.ordinality) {
+                    if (ordinality) return error.Syntax;
+                    ordinality = true;
+                }
+                const ty: ast.Type = if (spec.ordinality) .int4 else n.cast_type;
+                const typmod: i32 = if (spec.ordinality) -1 else n.typmod;
+                if (n.a != none) {
+                    try typeExpr(context, &inner, n.a);
+                    n.a = try specificType(context, n.a, .text, -1);
+                }
+                if (n.b != none) {
+                    try typeExpr(context, &inner, n.b);
+                    n.b = try specificType(context, n.b, ty, typmod);
+                }
+                const name = toName(context, n.name);
+                for (p.names[0..count]) |previous| if (types.same(previous.slice(), name.slice())) return error.Syntax;
+                p.names[count] = name;
+                p.tys[count] = ty;
+                p.typmods[count] = typmod;
+                p.targets[count] = try context.pool.add(.{ .kind = .null_literal, .ty = ty, .constant = true });
+                count += 1;
+            }
+            var default_namespace = false;
+            entry = table.b;
+            while (entry != none) : (entry = context.node(entry).next) {
+                const n = context.node(entry);
+                if (n.func != .xmltable_namespace) continue;
+                try typeExpr(context, &inner, n.b);
+                n.b = try specificType(context, n.b, .text, -1);
+                if (n.integer == 1) {
+                    if (default_namespace) return error.Syntax;
+                    default_namespace = true;
+                    continue;
+                }
+                var other = table.b;
+                while (other != entry) : (other = context.node(other).next) {
+                    const earlier = context.node(other);
+                    if (earlier.func == .xmltable_namespace and earlier.integer != 1 and types.same(toName(context, earlier.name).slice(), toName(context, n.name).slice())) return error.Syntax;
+                }
+            }
+            if (count == 0) return error.Syntax;
+            p.function = item.function;
+            p.series = .xml_table;
+            p.count = count;
+            p.width = count;
+            return id;
+        }
+
+        /// A regclass argument of the table mapping functions: an untyped
+        /// literal is looked up (42P01 when missing); an OID stays.
+        fn regclassArgument(context: *const Context, n: *ast.Node) Error!void {
+            const first = n.b;
+            if (context.node(first).ty != .unknown) return;
+            try coerce(context, first, .text);
+            const lookup = try context.pool.add(.{ .kind = .function, .func = .regclass_in, .b = first, .ty = .oid, .typmod = -1, .reg = .regclass, .next = context.node(first).next });
+            context.node(first).next = none;
+            n.b = lookup;
+        }
+
+        /// xml_call (B11 wave 5 xml lane): the XmlFn from the call's name
+        /// (IS DOCUMENT arrives bound), typed as pg_proc declares it.
+        fn typeXmlCall(context: *const Context, n: *ast.Node, count: usize) Error!void {
+            const T = ast.Type;
+            var which: ast.XmlFn = @enumFromInt(n.integer);
+            if (n.name.len != 0) which = std.meta.stringToEnum(ast.XmlFn, toName(context, n.name).slice()) orelse return error.UndefinedFunction;
+            n.integer = @intFromEnum(which);
+            switch (which) {
+                .xpath, .xpath_exists => {
+                    const result: T = if (which == .xpath) types.arrayType(.xml).? else .boolean;
+                    if (count == 2) {
+                        try bindSignature(context, n, &[_]T{ .text, .xml }, result, true);
+                    } else if (count == 3) {
+                        try bindSignature(context, n, &[_]T{ .text, .xml, types.arrayType(.text).? }, result, true);
+                    } else return error.UndefinedFunction;
+                },
+                .xmlexists => try bindSignature(context, n, &[_]T{ .text, .xml }, .boolean, true),
+                .is_document => {
+                    if (count != 1) return error.UndefinedFunction;
+                    n.b = try specificType(context, n.b, .xml, -1);
+                    n.ty = .boolean;
+                    n.constant = isConstant(context, n.b);
+                },
+                .table_to_xml, .table_to_xmlschema, .table_to_xml_and_xmlschema => {
+                    if (count != 4) return error.UndefinedFunction;
+                    try regclassArgument(context, n);
+                    try bindSignature(context, n, &[_]T{ .oid, .boolean, .boolean, .text }, .xml, true);
+                    n.constant = false;
+                },
+                .query_to_xml, .query_to_xmlschema, .query_to_xml_and_xmlschema, .cursor_to_xmlschema => {
+                    try bindSignature(context, n, &[_]T{ .text, .boolean, .boolean, .text }, .xml, true);
+                    n.constant = false;
+                },
+                .cursor_to_xml => {
+                    try bindSignature(context, n, &[_]T{ .text, .int4, .boolean, .boolean, .text }, .xml, true);
+                    n.constant = false;
+                },
+                .schema_to_xml, .schema_to_xmlschema, .schema_to_xml_and_xmlschema => {
+                    try bindSignature(context, n, &[_]T{ .name, .boolean, .boolean, .text }, .xml, true);
+                    n.constant = false;
+                },
+                .database_to_xml, .database_to_xmlschema, .database_to_xml_and_xmlschema => {
+                    try bindSignature(context, n, &[_]T{ .boolean, .boolean, .text }, .xml, true);
+                    n.constant = false;
+                },
+            }
+        }
+
         /// JSON_OBJECT / JSON_ARRAY / JSON_SCALAR / JSON_SERIALIZE (wave 4
         /// text-json): untyped arguments are text; the result is the
         /// RETURNING type (json, jsonb or a string type; json by default,
@@ -8157,6 +8314,7 @@ pub fn Binder(comptime config: types.Config) type {
         /// `ordinality` column.
         fn bindTableFunction(context: *const Context, scope: *Scope, item: *const Ast.FromItem, env: ?*const CteEnv) Error!u16 {
             if (context.node(item.function).func == .json_table) return bindJsonTable(context, scope, item, env);
+            if (context.node(item.function).func == .xmltable) return bindXmlTable(context, scope, item, env);
             const plans = plansOf(context);
             const id = try plans.add();
             var inner: Scope = .{ .parent = scope, .plan = id, .ctes = env };

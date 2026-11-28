@@ -98,6 +98,14 @@ pub const Session = struct {
     /// every wire session authenticates as; SET ROLE changes `role`.
     role: u32 = 10,
     session_role: u32 = 10,
+    /// SQL/XML scratch storage (B11 wave 5 xml lane): the Database's
+    /// Config-sized region, used in stack order by XPath, XMLTABLE,
+    /// XMLSERIALIZE ... INDENT and the table mapping functions; null
+    /// outside a Database (0A000 then).
+    xml_scratch: ?*types.ValueBytes = null,
+    /// xmlbinary (B11 wave 5 xml lane): bytea values map to hex instead of
+    /// base64 in SQL/XML.
+    xml_binary_hex: bool = false,
 
     pub fn checkpoint(self: *const Session) Error!void {
         if (self.control) |control| try control.checkpoint();
@@ -154,6 +162,24 @@ pub const SequenceHook = struct {
     namespace_name: ?*const fn (ptr: *anyopaque, oid: u32, out: []u8) Error!?usize = null,
     routine_lookup: ?*const fn (ptr: *anyopaque, name: []const u8, strict: bool) Error!?u32 = null,
     routine_name: ?*const fn (ptr: *anyopaque, oid: u32, out: []u8) Error!?usize = null,
+    /// SQL/XML table mapping (B11 wave 5 xml lane): runs `query` nested in
+    /// the running statement, read-only under its snapshot, and passes its
+    /// columns and rows to `sink` (a query that is not a SELECT is 22000).
+    xml_query: ?*const fn (ptr: *anyopaque, query: []const u8, sink: *const XmlQuerySink) Error!void = null,
+    /// cursor_to_xml / cursor_to_xmlschema (B11 wave 5 xml lane): the
+    /// session cursor `name` (34000 when there is none) passes its columns
+    /// to `sink`, then with `fetch` the rows of FETCH FORWARD `count`.
+    xml_cursor: ?*const fn (ptr: *anyopaque, name: []const u8, count: i64, fetch: bool, sink: *const XmlQuerySink) Error!void = null,
+};
+
+/// The receiver of an xml_query (B11 wave 5 xml lane).
+pub const XmlQuerySink = struct {
+    context: *anyopaque,
+    /// Once, before the rows: the column count, names (Values(config).Name),
+    /// types and typmods.
+    columns: *const fn (context: *anyopaque, count: usize, names: *const anyopaque, tys: [*]const Type, typmods: [*]const i32) Error!void,
+    /// Each row: its cells (Values(config).Cell), valid during the call.
+    row: *const fn (context: *anyopaque, cells: *const anyopaque) Error!void,
 };
 
 pub const SessionCall = enum { current_setting, set_config, advisory_lock, advisory_try_lock, advisory_unlock, advisory_unlock_all, notify, backend_pid, recovery_status,
@@ -647,7 +673,7 @@ pub fn Io(comptime config: types.Config) type {
                 .multirange => |*value| try MultirangeText.format(value.slice(), session, buffer),
                 .point => |value| geometric.formatPoint(value, session.extra_float_digits, buffer),
                 .box => |value| geometric.formatBox(value, session.extra_float_digits, buffer),
-                .xml => |*value| xml.output(value.slice(), buffer),
+                .xml => |*value| try xml.output(value.slice(), buffer),
                 // regtypeout: the type's SQL name, or the number.
                 .regtype => |oid| if (types.regtypeName(oid)) |name| copy(buffer, name) else integerText(oid, buffer),
                 .regproc => |oid| blk: {
@@ -1117,8 +1143,10 @@ pub fn Io(comptime config: types.Config) type {
                 return cast(try textCell(try format(&cell, true, session, &buffer)), .text, to, typmod, session);
             }
             if (cell == .xml and to != .xml) {
-                // xml -> text is binary coercible: the stored text.
+                // xml -> text is binary coercible: the stored text (a wide
+                // SQL/XML result keeps pointing at its bytes).
                 if (!characterType(to)) return error.CannotCoerce;
+                if (cell.xml.indirect()) return cast(.{ .text = cell.xml }, .text, to, typmod, session);
                 return cast(try textCell(cell.xml.slice()), .text, to, typmod, session);
             }
             if ((cell == .regtype and to != .regtype) or (cell == .regproc and to != .regproc)) {
