@@ -2550,6 +2550,8 @@ pub fn SessionWithAdmission(comptime DB: type, comptime external_admission: bool
                 .drop_trigger => "DROP TRIGGER",
                 .create_rule => "CREATE RULE",
                 .drop_rule => "DROP RULE",
+                .create_cast => "CREATE CAST",
+                .drop_cast => "DROP CAST",
                 else => "",
             };
         }

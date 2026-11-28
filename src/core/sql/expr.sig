@@ -647,6 +647,14 @@ pub fn Eval(comptime config: types.Config) type {
                 },
                 .to_regtype, .regtype_in => {
                     if (types.typeByName(first.text.slice())) |data_type| return .{ .integer = types.typeOid(data_type) };
+                    // A user type (composite lane).
+                    if (ctx.session.sequences) |hook| if (hook.type_oid) |lookup| {
+                        const found = lookup(hook.ptr, first.text.slice()) catch |err| {
+                            if (n.func == .to_regtype) return .null_value;
+                            return err;
+                        };
+                        if (found) |oid| return .{ .integer = oid };
+                    };
                     if (n.func == .to_regtype) return .null_value;
                     return error.UndefinedObject;
                 },

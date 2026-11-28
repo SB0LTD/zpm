@@ -218,6 +218,9 @@ pub const Config = struct {
     triggers: usize = 8,
     /// Rewrite-rule versions (CREATE RULE); more are TableCapacity (54000).
     rules: usize = 4,
+    /// User cast versions (CREATE CAST, B11 wave 5 composite lane); more
+    /// are TableCapacity (54000).
+    casts: usize = 4,
     /// Arguments per routine and CALL (more are ColumnCapacity, 54000).
     routine_args: usize = 8,
     /// Explicit EXECUTE grantees per routine, excluding the owner and PUBLIC.
@@ -1368,7 +1371,9 @@ pub const CommandTag = enum { none, select, insert, update, delete, create_table
     create_role, alter_role, drop_role, grant, revoke, grant_role, revoke_role, create_policy, alter_policy, drop_policy, comment,
     alter_default_privileges,
     create_foreign_data_wrapper, drop_foreign_data_wrapper, create_server, drop_server, create_publication, drop_publication, create_extension, explain, create_domain, drop_domain, vacuum, analyze, create_type, drop_type, create_statistics, alter_statistics, drop_statistics, alter_schema, alter_large_object,
-    prepare_transaction, commit_prepared, rollback_prepared, alter_function, alter_procedure };
+    prepare_transaction, commit_prepared, rollback_prepared, alter_function, alter_procedure,
+    // B11 wave 5 (composite lane).
+    create_cast, drop_cast };
 
 pub fn lower(byte: u8) u8 {
     return if (byte >= 'A' and byte <= 'Z') byte + ('a' - 'A') else byte;

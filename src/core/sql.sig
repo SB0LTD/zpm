@@ -5823,6 +5823,101 @@ pub fn Database(comptime config: Config) type {
             object.text_len = @intCast(@as(usize, object.split) + used);
         }
 
+        // ---- user casts (B11 wave 5, composite lane) --------------------------
+
+        /// The type OID a cast names: a built-in type or a composite type
+        /// (42704 when none; domains and enums are 0A000 here).
+        fn castTypeOid(self: *const Self, arg: *const R.Arg, snap: Snapshot) Error!u32 {
+            if (!arg.user_type.named()) return arg.oid;
+            return (try self.userCompositeOid(&arg.user_type, snap)) orelse error.UndefinedObject;
+        }
+
+        /// Whether the session's role owns type `oid` (built-in types: the
+        /// bootstrap superuser).
+        fn ownsType(self: *const Self, oid: u32, snap: Snapshot) bool {
+            const index = self.catalog_objects.byOid(.composite_type, oid, snap) orelse return false;
+            return self.catalog_objects.memberOf(self.session.role, self.catalog_objects.items[index].owner, true, snap);
+        }
+
+        /// Whether a built-in cast (pg_cast) already converts `source` to
+        /// `target`: PostgreSQL's casts, not its I/O conversions to and
+        /// from the string types.
+        fn builtinCast(source: u32, destination: u32) bool {
+            const from = types.typeFromOid(source) orelse return false;
+            const to = types.typeFromOid(destination) orelse return false;
+            const a = types.typeOfData(from);
+            const b = types.typeOfData(to);
+            if (value_module.stringType(a) != value_module.stringType(b)) return false;
+            return value_module.castable(a, b, .explicit);
+        }
+
+        /// CREATE CAST (PostgreSQL's CreateCast checks): types exist and
+        /// differ (42P17), no pseudo-type (42809), the caller owns one of
+        /// them (42501), no cast exists yet (42710); WITH FUNCTION names a
+        /// normal, non-set function of one to three arguments (the source
+        /// type, int4, boolean) returning the target type (42P17);
+        /// WITHOUT FUNCTION needs binary-compatible built-in types.
+        fn createCast(self: *Self, slot: u16, definition: *const R.CreateCast, snap: Snapshot) Error!void {
+            const source = try self.castTypeOid(&definition.source, snap);
+            const destination = try self.castTypeOid(&definition.target, snap);
+            for ([_]u32{ source, destination }) |oid| if (oid == tg.record_oid or oid == tg.void_oid or oid == tg.trigger_oid) return error.WrongObjectType;
+            if (source == destination) return error.InvalidObjectDefinition;
+            if (!self.privilegedRole(snap) and !self.ownsType(source, snap) and !self.ownsType(destination, snap)) return error.InsufficientPrivilege;
+            var cast: RC.Cast = .{ .source = source, .target = destination, .context = definition.context, .method = definition.method };
+            switch (definition.method) {
+                'f' => {
+                    const index = (try self.findRoutineTarget(slot, &definition.function, snap)) orelse return error.UndefinedFunction;
+                    const routine = &self.objects.routines[index];
+                    if (routine.kind != 'f') return error.InvalidObjectDefinition;
+                    if (routine.arg_count < 1 or routine.arg_count > 3) return error.InvalidObjectDefinition;
+                    if (routine.arg_oids[0] != source) return error.InvalidObjectDefinition;
+                    if (routine.arg_count > 1 and routine.arg_oids[1] != types.typeOid(.integer32)) return error.InvalidObjectDefinition;
+                    if (routine.arg_count > 2 and routine.arg_oids[2] != types.typeOid(.boolean)) return error.InvalidObjectDefinition;
+                    if (routine.return_oid != destination) return error.InvalidObjectDefinition;
+                    if (routine.retset) return error.InvalidObjectDefinition;
+                    cast.function = routine.oid;
+                },
+                'b' => {
+                    // Binary coercion: superuser only, never composite types,
+                    // and here only between types of one representation.
+                    if (!self.privilegedRole(snap)) return error.InsufficientPrivilege;
+                    const from = types.typeFromOid(source) orelse return error.InvalidObjectDefinition;
+                    const to = types.typeFromOid(destination) orelse return error.InvalidObjectDefinition;
+                    const left = types.typeInfo(from);
+                    const right = types.typeInfo(to);
+                    if (left.len != right.len or left.alignment != right.alignment) return error.InvalidObjectDefinition;
+                    if (V.cellTag(from) != V.cellTag(to)) return error.UnsupportedStatement;
+                },
+                else => {},
+            }
+            if (self.objects.castWriter(source, destination, snap)) |other| return self.waitObject(slot, other);
+            if (self.objects.findCast(source, destination, snap) != null or builtinCast(source, destination)) return error.DuplicateObject;
+            try self.reserveWrites(slot, 1);
+            const index = try self.objectSlot(.cast);
+            cast.oid = try self.takeOid();
+            self.objects.casts[index] = cast;
+            self.createdObject(slot, .cast, index, snap);
+        }
+
+        /// DROP CAST: 42704 when there is no such cast (IF EXISTS: a no-op).
+        fn dropCast(self: *Self, slot: u16, drop: *const R.DropCast, snap: Snapshot) Error!void {
+            const source = self.castTypeOid(&drop.source, snap) catch |err| {
+                if (drop.if_exists and (err == error.UndefinedObject or err == error.UndefinedSchema)) return;
+                return err;
+            };
+            const destination = self.castTypeOid(&drop.target, snap) catch |err| {
+                if (drop.if_exists and (err == error.UndefinedObject or err == error.UndefinedSchema)) return;
+                return err;
+            };
+            if (self.objects.castWriter(source, destination, snap)) |other| return self.waitObject(slot, other);
+            const index = self.objects.findCast(source, destination, snap) orelse {
+                if (drop.if_exists) return;
+                return error.UndefinedObject;
+            };
+            if (!self.privilegedRole(snap) and !self.ownsType(source, snap) and !self.ownsType(destination, snap)) return error.InsufficientPrivilege;
+            try self.dropObject(slot, .cast, index, snap);
+        }
+
         /// Whether a live table has a column of composite type `oid` (B11
         /// wave 5, composite lane).
         fn compositeTypeUsed(self: *const Self, oid: u32) bool {
@@ -5835,8 +5930,12 @@ pub fn Database(comptime config: Config) type {
             return false;
         }
 
-        /// Whether a visible routine has a parameter or result of type `oid`.
+        /// Whether a visible routine or cast has a parameter, result,
+        /// source or target of type `oid`.
         fn routineUsesType(self: *const Self, oid: u32, snap: Snapshot) bool {
+            for (&self.objects.casts) |*cast| {
+                if (cast.live and cast.stamp.visible(snap) and (cast.source == oid or cast.target == oid)) return true;
+            }
             for (&self.objects.routines) |*routine| {
                 if (!routine.live or !routine.stamp.visible(snap)) continue;
                 if (routine.return_oid == oid) return true;
@@ -7864,6 +7963,36 @@ pub fn Database(comptime config: Config) type {
             return self.catalog_objects.items[index].compositeFields().bytes;
         }
 
+        /// regtype input of a user type (domain, enum, composite type):
+        /// `name` searches the path, `schema.name` that schema.
+        fn postgresTypeOid(ptr: *anyopaque, input: []const u8) Error!?u32 {
+            const self: *const Self = @ptrCast(@alignCast(ptr));
+            var snap = self.seq_snap;
+            snap.csn = @max(snap.csn, self.csn);
+            const raw = std.mem.trim(u8, input, " \t\r\n");
+            var dot: ?usize = null;
+            var quoted = false;
+            for (raw, 0..) |byte, index| {
+                if (byte == '"') quoted = !quoted;
+                if (byte == '.' and !quoted) dot = index;
+            }
+            const name = try namespaceIdentifier(if (dot) |at| raw[at + 1 ..] else raw);
+            var path: [routine_path_capacity]u32 = undefined;
+            var count: usize = 0;
+            if (dot) |at| {
+                const schema = try namespaceIdentifier(raw[0..at]);
+                path[0] = namespaceFor(&self.catalog, schema.slice(), snap) orelse return error.UndefinedSchema;
+                count = 1;
+            } else count = self.routinePath(snap, &path);
+            const kinds = [_]CO.Kind{ .domain, .enum_type, .composite_type };
+            for (path[0..count]) |namespace| {
+                for (kinds) |kind| {
+                    if (self.catalog_objects.byName(kind, namespace, name.slice(), snap)) |index| return self.catalog_objects.items[index].oid;
+                }
+            }
+            return null;
+        }
+
         fn postgresTypeName(ptr: *anyopaque, oid: u32, out: []u8) Error!?usize {
             const self: *const Self = @ptrCast(@alignCast(ptr));
             // Output formatting can follow the statement: read the latest
@@ -8545,7 +8674,7 @@ pub fn Database(comptime config: Config) type {
             // literal has its own slot (a wide Cell is about 8 KiB), and one
             // function holding all of them reached 3 MiB of the 4 MiB stack
             // CI runs wide-cell contracts on.
-            if (try self.fixedSchemaViewRows(session_values, view, sink)) return;
+            if (try self.fixedSchemaViewRows(session_values, snapshot, view, sink)) return;
             var relations: [K.relation_rows]K.Found = undefined;
             const count = self.catalog.visibleRelations(snapshot, &relations);
             if (view == .pg_class or view == .pg_attribute) try self.compositeCatalogRows(view, snapshot, sink);
@@ -8581,7 +8710,7 @@ pub fn Database(comptime config: Config) type {
         }
 
         /// Bootstrap and fixed catalog views; true when the view was one of them.
-        noinline fn fixedSchemaViewRows(self: *const Self, session_values: *const value_module.Session, view: catalog_module.View, sink: *X.RowSink) Error!bool {
+        noinline fn fixedSchemaViewRows(self: *const Self, session_values: *const value_module.Session, snapshot: Snapshot, view: catalog_module.View, sink: *X.RowSink) Error!bool {
             if (view == .pg_settings or view == .pg_cursors) return error.UnsupportedStatement;
             if (view == .sequence_state) return error.UnsupportedStatement;
             // Parameter grants have no persisted objects. Stock tools still
@@ -8636,6 +8765,11 @@ pub fn Database(comptime config: Config) type {
             if (view == .pg_cast) {
                 for (catalog_module.binary_casts) |cast| {
                     try sink.add(&.{ intCell(cast.oid), intCell(types.typeOid(cast.source)), intCell(types.typeOid(cast.target)), intCell(0), .{ .pg_internal_char = 'i' }, .{ .pg_internal_char = 'b' } });
+                }
+                // User casts (B11 wave 5, composite lane).
+                for (&self.objects.casts) |*cast| {
+                    if (!cast.live or !cast.stamp.visible(snapshot)) continue;
+                    try sink.add(&.{ intCell(cast.oid), intCell(cast.source), intCell(cast.target), intCell(cast.function), .{ .pg_internal_char = cast.context }, .{ .pg_internal_char = cast.method } });
                 }
                 return true;
             }
@@ -11702,12 +11836,12 @@ pub fn Database(comptime config: Config) type {
         /// and regtype text; the Store's wire session has no statement
         /// hooks then; S071, B11 wave 5).
         pub fn installOutputHooks(self: *Self) void {
-            self.output_hook = .{ .ptr = self, .call = &sequenceCall, .relation_name = &relationName, .routine_name = &postgresRoutineName, .type_name = &postgresTypeName, .composite_layout = &compositeLayoutHook };
+            self.output_hook = .{ .ptr = self, .call = &sequenceCall, .relation_name = &relationName, .routine_name = &postgresRoutineName, .type_name = &postgresTypeName, .composite_layout = &compositeLayoutHook, .type_oid = &postgresTypeOid };
             self.session.sequences = &self.output_hook;
         }
 
         fn statementHooks(self: *Self, slot: u16, snap: Snapshot) void {
-            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .large_object = &largeObjectCall, .large_object_data = &largeObjectDataCall, .large_object_truncate = &truncateLargeObject, .large_object_file = .{ .authorize = &authorizeLargeObjectFile, .call = &largeObjectFileCall }, .relation_name = &relationName, .relation_display_name = &relationDisplayName, .catalog_text = &catalogText, .schema_path = &catalogSchemaPath, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .function_visible = &functionVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .view_definition = &postgresViewDefinition, .trigger_definition = &postgresTriggerDefinition, .rule_definition = &postgresRuleDefinition, .statistics_columns = &postgresStatisticsColumns, .relation_publishable = &relationPublishable, .partition_key_definition = &postgresPartitionKey, .partition_ancestors = &postgresPartitionAncestors, .namespace_lookup = &postgresNamespaceLookup, .namespace_name = &postgresNamespaceName, .routine_lookup = &postgresRoutineLookup, .routine_name = &postgresRoutineName, .xml_query = &xmlQuery, .xml_cursor = &xmlCursor, .type_name = &postgresTypeName, .composite_layout = &compositeLayoutHook };
+            self.seq_hook = .{ .ptr = self, .call = &sequenceCall, .large_object = &largeObjectCall, .large_object_data = &largeObjectDataCall, .large_object_truncate = &truncateLargeObject, .large_object_file = .{ .authorize = &authorizeLargeObjectFile, .call = &largeObjectFileCall }, .relation_name = &relationName, .relation_display_name = &relationDisplayName, .catalog_text = &catalogText, .schema_path = &catalogSchemaPath, .serial_sequence = &serialSequence, .relation_visible = &relationVisible, .function_visible = &functionVisible, .index_definition = &postgresIndexDefinition, .constraint_definition = &postgresConstraintDefinition, .view_definition = &postgresViewDefinition, .trigger_definition = &postgresTriggerDefinition, .rule_definition = &postgresRuleDefinition, .statistics_columns = &postgresStatisticsColumns, .relation_publishable = &relationPublishable, .partition_key_definition = &postgresPartitionKey, .partition_ancestors = &postgresPartitionAncestors, .namespace_lookup = &postgresNamespaceLookup, .namespace_name = &postgresNamespaceName, .routine_lookup = &postgresRoutineLookup, .routine_name = &postgresRoutineName, .xml_query = &xmlQuery, .xml_cursor = &xmlCursor, .type_name = &postgresTypeName, .composite_layout = &compositeLayoutHook, .type_oid = &postgresTypeOid };
             self.session.sequences = &self.seq_hook;
             // A statement starts with the whole XML scratch region free.
             self.xml_region = .{ .bytes = &self.xml_backing };
@@ -14351,6 +14485,8 @@ pub fn Database(comptime config: Config) type {
                 .drop_trigger => |*drop| try self.dropTrigger(slot, drop, snap),
                 .create_rule => |*definition| try self.createRule(slot, source, definition, snap),
                 .drop_rule => |*drop| try self.dropRule(slot, drop, snap),
+                .create_cast => |*definition| try self.createCast(slot, definition, snap),
+                .drop_cast => |*drop| try self.dropCast(slot, drop, snap),
             }
             self.outcome = .{ .affected = 0, .command = R.command(kind), .noop = kind == .call or kind == .do_block };
             // A top-level CALL's output row (B11 wave 4).
@@ -14413,6 +14549,9 @@ pub fn Database(comptime config: Config) type {
                         if (!item.live) return index;
                     },
                     .rule => for (&self.objects.rules, 0..) |*item, index| {
+                        if (!item.live) return index;
+                    },
+                    .cast => for (&self.objects.casts, 0..) |*item, index| {
                         if (!item.live) return index;
                     },
                 }
@@ -15378,6 +15517,12 @@ pub fn Database(comptime config: Config) type {
                 if (!trigger.live or trigger.function_oid != routine.oid or !trigger.stamp.visible(snap)) continue;
                 if (!drop.cascade) return error.DependentObjects;
                 try self.dropObject(slot, .trigger, position, snap);
+            }
+            // Casts the function implements (composite lane).
+            for (&self.objects.casts, 0..) |*cast, position| {
+                if (!cast.live or cast.function != routine.oid or !cast.stamp.visible(snap)) continue;
+                if (!drop.cascade) return error.DependentObjects;
+                try self.dropObject(slot, .cast, position, snap);
             }
             try self.dropObject(slot, .routine, index, snap);
         }
@@ -18163,6 +18308,7 @@ pub fn Database(comptime config: Config) type {
                     .routine => .drop_routine,
                     .trigger => .drop_trigger,
                     .rule => .drop_rule,
+                    .cast => .drop_cast,
                 };
                 return C.encodeObject(writer, tag, buffer[0..payload.used]);
             }
@@ -18173,11 +18319,13 @@ pub fn Database(comptime config: Config) type {
                 .routine => if (extended) .create_routine_extended else .create_routine,
                 .trigger => if (trigger_extended) .create_trigger_extended else .create_trigger,
                 .rule => if (action) .create_rule_action else .create_rule,
+                .cast => .create_cast,
             };
             switch (class) {
                 .routine => if (extended) try RC.encodeRoutineExtended(&payload, &self.objects.routines[index]) else try RC.encodeRoutine(&payload, &self.objects.routines[index]),
                 .trigger => if (trigger_extended) try RC.encodeTriggerExtended(&payload, &self.objects.triggers[index]) else try RC.encodeTrigger(&payload, &self.objects.triggers[index]),
                 .rule => if (action) try RC.encodeRuleAction(&payload, &self.objects.rules[index]) else try RC.encodeRule(&payload, &self.objects.rules[index]),
+                .cast => try RC.encodeCast(&payload, &self.objects.casts[index]),
             }
             return C.encodeObject(writer, tag, buffer[0..payload.used]);
         }
@@ -18186,6 +18334,7 @@ pub fn Database(comptime config: Config) type {
             for (&self.objects.routines) |*item| if (item.live and item.oid == oid) return true;
             for (&self.objects.triggers) |*item| if (item.live and item.oid == oid) return true;
             for (&self.objects.rules) |*item| if (item.live and item.oid == oid) return true;
+            for (&self.objects.casts) |*item| if (item.live and item.oid == oid) return true;
             return false;
         }
 
@@ -18239,17 +18388,27 @@ pub fn Database(comptime config: Config) type {
                     item.stamp = stamp;
                     oid = item.oid;
                 },
+                @intFromEnum(change_log.Op.create_cast) => {
+                    const index = try self.replaySlot(.cast);
+                    const item = &self.objects.casts[index];
+                    try RC.decodeCast(payload, item);
+                    item.live = true;
+                    item.stamp = stamp;
+                    oid = item.oid;
+                },
                 else => {
                     const target_oid = try RC.decodeOid(payload);
                     const class: tg.Class = switch (tag) {
                         @intFromEnum(change_log.Op.drop_routine) => .routine,
                         @intFromEnum(change_log.Op.drop_trigger) => .trigger,
+                        @intFromEnum(change_log.Op.drop_cast) => .cast,
                         else => .rule,
                     };
                     const count: usize = switch (class) {
                         .routine => config.routines,
                         .trigger => config.triggers,
                         .rule => config.rules,
+                        .cast => config.casts,
                     };
                     for (0..count) |index| {
                         if (!self.objects.liveOf(class, index).* or self.objects.oidOf(class, index) != target_oid) continue;
@@ -18272,6 +18431,9 @@ pub fn Database(comptime config: Config) type {
                     if (!item.live) return index;
                 },
                 .rule => for (&self.objects.rules, 0..) |*item, index| {
+                    if (!item.live) return index;
+                },
+                .cast => for (&self.objects.casts, 0..) |*item, index| {
                     if (!item.live) return index;
                 },
             }

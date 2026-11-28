@@ -50,7 +50,9 @@ pub fn Routines(comptime config: types.Config) type {
         /// (B11 wave 5; never stored: it is 58P01).
         const c_language: u8 = 2;
 
-        pub const Kind = enum { create_function, create_procedure, drop_function, drop_procedure, call, do_block, create_trigger, drop_trigger, create_rule, drop_rule, grant_execute, revoke_execute, alter_function, alter_procedure };
+        pub const Kind = enum { create_function, create_procedure, drop_function, drop_procedure, call, do_block, create_trigger, drop_trigger, create_rule, drop_rule, grant_execute, revoke_execute, alter_function, alter_procedure,
+            // B11 wave 5 (composite lane).
+            create_cast, drop_cast };
 
         /// A byte range of the statement source.
         pub const Span = struct { start: usize = 0, end: usize = 0 };
@@ -180,6 +182,21 @@ pub fn Routines(comptime config: types.Config) type {
 
         pub const DoBlock = struct { body: Text = .{} };
 
+        /// CREATE CAST (source AS target) {WITH FUNCTION f[(args)] | WITHOUT
+        /// FUNCTION | WITH INOUT} [AS ASSIGNMENT | AS IMPLICIT] (B11 wave 5).
+        pub const CreateCast = struct {
+            source: Arg = .{},
+            target: Arg = .{},
+            /// 'f' WITH FUNCTION, 'i' WITH INOUT, 'b' WITHOUT FUNCTION.
+            method: u8 = 'f',
+            function: DropRoutine = .{},
+            /// 'e' explicit, 'a' AS ASSIGNMENT, 'i' AS IMPLICIT.
+            context: u8 = 'e',
+        };
+
+        /// DROP CAST [IF EXISTS] (source AS target) [CASCADE | RESTRICT].
+        pub const DropCast = struct { source: Arg = .{}, target: Arg = .{}, if_exists: bool = false, cascade: bool = false };
+
         pub const TableName = struct { schema: Name = .{}, name: Name = .{} };
 
         pub const CreateTrigger = struct {
@@ -242,6 +259,8 @@ pub fn Routines(comptime config: types.Config) type {
             revoke_execute: ExecuteGrant,
             alter_function: AlterOwner,
             alter_procedure: AlterOwner,
+            create_cast: CreateCast,
+            drop_cast: DropCast,
         };
 
         // ---- tokens -------------------------------------------------------
@@ -399,7 +418,62 @@ pub fn Routines(comptime config: types.Config) type {
             if (cursor.is("trigger")) return if (create) .create_trigger else .drop_trigger;
             if (cursor.is("constraint") and create) return .create_trigger;
             if (cursor.is("rule")) return if (create) .create_rule else .drop_rule;
+            if (cursor.is("cast")) return if (create) .create_cast else .drop_cast;
             return null;
+        }
+
+        /// `(source AS target)` of CREATE / DROP CAST.
+        fn castTypes(cursor: *Cursor, pool: anytype, source: *Arg, target: *Arg) Error!void {
+            try cursor.expectSymbol(.lparen);
+            source.* = try typeOrUser(cursor, pool);
+            try cursor.expect("as");
+            target.* = try typeOrUser(cursor, pool);
+            try cursor.expectSymbol(.rparen);
+        }
+
+        fn createCast(cursor: *Cursor, pool: anytype, out: *CreateCast) Error!void {
+            out.* = .{};
+            try cursor.expect("create");
+            try cursor.expect("cast");
+            try castTypes(cursor, pool, &out.source, &out.target);
+            if (try cursor.take("without")) {
+                try cursor.expect("function");
+                out.method = 'b';
+            } else {
+                try cursor.expect("with");
+                if (try cursor.take("inout")) {
+                    out.method = 'i';
+                } else {
+                    try cursor.expect("function");
+                    out.method = 'f';
+                    out.function.name = try qualifiedName(cursor, &out.function.has_schema, &out.function.schema);
+                    try routineSignature(cursor, pool, &out.function);
+                }
+            }
+            if (try cursor.take("as")) {
+                if (try cursor.take("assignment")) {
+                    out.context = 'a';
+                } else {
+                    try cursor.expect("implicit");
+                    out.context = 'i';
+                }
+            }
+            try finish(cursor);
+        }
+
+        fn dropCast(cursor: *Cursor, pool: anytype, out: *DropCast) Error!void {
+            out.* = .{};
+            try cursor.expect("drop");
+            try cursor.expect("cast");
+            if (try cursor.take("if")) {
+                try cursor.expect("exists");
+                out.if_exists = true;
+            }
+            try castTypes(cursor, pool, &out.source, &out.target);
+            if (try cursor.take("cascade")) {
+                out.cascade = true;
+            } else _ = try cursor.take("restrict");
+            try finish(cursor);
         }
 
         // ---- routine statements -------------------------------------------
@@ -1316,6 +1390,14 @@ pub fn Routines(comptime config: types.Config) type {
                     out.* = .{ .revoke_execute = .{} };
                     try executeGrant(&cursor, pool, &out.revoke_execute, true);
                 },
+                .create_cast => {
+                    out.* = .{ .create_cast = .{} };
+                    try createCast(&cursor, pool, &out.create_cast);
+                },
+                .drop_cast => {
+                    out.* = .{ .drop_cast = .{} };
+                    try dropCast(&cursor, pool, &out.drop_cast);
+                },
             }
         }
 
@@ -1335,6 +1417,8 @@ pub fn Routines(comptime config: types.Config) type {
                 .drop_rule => .drop_rule,
                 .grant_execute => .grant,
                 .revoke_execute => .revoke,
+                .create_cast => .create_cast,
+                .drop_cast => .drop_cast,
             };
         }
 

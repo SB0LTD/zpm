@@ -181,6 +181,10 @@ pub const SequenceHook = struct {
     /// The fields of a composite type (B11 wave 5, composite lane): its
     /// catalog_objects.CompositeFields bytes, null when no such type.
     composite_layout: ?*const fn (ptr: *anyopaque, oid: u32) ?[]const u8 = null,
+    /// regtype input of a user type name (`name` or `schema.name`, quoted
+    /// or not; the search path finds an unqualified one): its OID, null
+    /// when there is none (composite lane).
+    type_oid: ?*const fn (ptr: *anyopaque, input: []const u8) Error!?u32 = null,
 };
 
 /// The fields of composite type `oid` through the session's catalog hook.
@@ -1068,7 +1072,13 @@ pub fn Io(comptime config: types.Config) type {
                     var buffer: [config.text_bytes]u8 = undefined;
                     break :blk try textCell(try jsonpath.Engine(config).canonical(input, &buffer, session.control));
                 },
-                .regtype => .{ .regtype = try types.regtypeInput(input) },
+                .regtype => .{ .regtype = types.regtypeInput(input) catch |err| blk: {
+                    // A user type name through the catalog hook (composite lane).
+                    if (err != error.UndefinedObject) return err;
+                    const hook = session.sequences orelse return err;
+                    const lookup = hook.type_oid orelse return err;
+                    break :blk (try lookup(hook.ptr, input)) orelse return err;
+                } },
                 .regproc => .{ .regproc = (try routineOid(session, input, true)) orelse return error.UndefinedFunction },
                 .aclitem => return error.UnsupportedStatement,
                 // void_in ignores its input.
